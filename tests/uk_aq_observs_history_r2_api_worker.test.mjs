@@ -16,6 +16,7 @@ const v3WorkerSource = readFileSync(
   "workers/uk_aq_observs_history_r2_api_worker/worker_v3.mjs",
   "utf8",
 );
+const VERIFICATION_LATEST_KEY = "history/_index_v3/verification/latest.json";
 
 function makeJsonR2Object(payload) {
   const text = `${JSON.stringify(payload)}\n`;
@@ -157,6 +158,22 @@ test("observations Cache API keys use the corrected cache generation and retain 
   const url = new URL(cacheKey.url);
   assert.equal(url.searchParams.get("__ukaq_observs_history_cache_gen"), "3");
   assert.notEqual(url.searchParams.get("__ukaq_observs_history_cache_gen"), "1");
+  const overlayCacheKey = buildCanonicalCacheKey("https://example.test/?ignored=yes", {
+    timeseriesId: 1001,
+    connectorId: 396,
+    pollutantKey: "pm25",
+    startIso: "2026-04-03T00:00:00.000Z",
+    endIso: "2026-04-04T00:00:00.000Z",
+    sinceIso: null,
+    limit: null,
+  }, "v2", "connector-manifest-sha256");
+  const overlayUrl = new URL(overlayCacheKey.url);
+  assert.equal(
+    overlayUrl.searchParams.get("__ukaq_verification_identity"),
+    "connector-manifest-sha256",
+  );
+  assert.notEqual(overlayCacheKey.url, cacheKey.url, "overlay changes invalidate cached responses");
+  assert.equal(url.searchParams.has("__ukaq_verification_identity"), false, "legacy cache identity remains unchanged");
   assert.doesNotMatch(workerSource, /OBSERVATIONS_CACHE_GENERATION = "1"/, "old-generation Cache API keys are not read by the new code");
   const env = {
     UK_AQ_OBSERVS_HISTORY_R2_CACHE_MAX_AGE_SECONDS: "300",
@@ -219,6 +236,7 @@ test("observations Worker v2 uses the fixed generation prefixes", async () => {
       "history/_index_v2/observations_timeseries",
     );
     assert.deepEqual(harness.getKeys, [
+      VERIFICATION_LATEST_KEY,
       "history/_index_v2/observations_timeseries/day_utc=2026-04-03/connector_id=396/pollutant_code=pm25/manifest.json",
     ]);
   } finally {
@@ -244,7 +262,7 @@ test("observations Worker v2 requires pollutant partition and does not broad sca
     assert.equal(payload.response_complete, false);
     assert.equal(payload.coverage.pollutant_partition, null);
     assert.equal(payload.coverage.r2_object_reads, 0);
-    assert.equal(harness.getKeys.length, 0);
+    assert.deepEqual(harness.getKeys, [VERIFICATION_LATEST_KEY]);
     assert.ok(payload.coverage.timeseries_index.warnings.some((warning) =>
       warning.includes("pollutant is required")
     ));
@@ -299,7 +317,11 @@ test("observations Worker v2 reads pollutant index path and reports missing parq
     assert.deepEqual(payload.coverage.missing_parquet_keys, [parquetKey]);
     assert.equal(payload.coverage.r2_object_reads, 2);
     assert.equal(payload.coverage.parquet_matched_rows, 0);
-    assert.deepEqual(harness.getKeys, [indexKey, parquetKey]);
+    assert.deepEqual(harness.getKeys, [
+      VERIFICATION_LATEST_KEY,
+      indexKey,
+      parquetKey,
+    ]);
     assert.equal(harness.getKeys.some((key) => key.includes("history/v1/observations")), false);
   } finally {
     await harness.restore();

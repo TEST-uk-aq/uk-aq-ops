@@ -42,9 +42,6 @@ import {
   validateObservationMonthState,
   validateObservationRunManifestInventoryShard,
   validateObservationRunManifestStateShard,
-  validateVerificationInventory,
-  validateVerificationState,
-  verificationStateIsComplete,
 } from "./lib/hierarchical_backup_v2.mjs";
 import {
   syncTimeseriesBindingsToDropbox,
@@ -74,9 +71,6 @@ import {
 import {
   requireLockedHistoryBackupMutation,
 } from "./uk_aq_run_locked_history_backup.mjs";
-import {
-  validateObservationVerificationLatest,
-} from "../../workers/shared/uk_aq_observation_verification_overlay.mjs";
 
 const DEFAULT_RCLONE_BIN =
   String(process.env.UK_AQ_R2_HISTORY_BACKUP_RCLONE_BIN || "").trim() || "rclone";
@@ -492,170 +486,6 @@ function copyAndVerifyJsonFile({
     verified: true,
     dry_run: false,
   };
-}
-
-function syncVerificationDomain({ args, inventoryRoot, stateRoot }) {
-  const inventory = validateVerificationInventory(inventoryRoot.verification);
-  const previousState = validateVerificationState(stateRoot.verification);
-  const report = {
-    active: Boolean(inventory),
-    source_root_hash: inventory?.source_root_hash || null,
-    processed_source_root_hash: previousState?.processed_source_root_hash || null,
-    connector_manifests_inventoried: inventory?.connector_manifests.length || 0,
-    connector_manifests_copied: 0,
-    connector_manifests_reused: 0,
-    connector_manifest_bytes_copied: 0,
-    changed_connector_ids: [],
-    latest_key: inventory?.latest.relative_path || null,
-    latest_copied: false,
-    latest_reused: false,
-    complete: !inventory,
-    error: null,
-  };
-  if (!inventory) {
-    if (previousState) {
-      throw new Error(
-        "Verification backup state exists but current inventory omits verification authority",
-      );
-    }
-    return { report, state_root_dirty: false };
-  }
-
-  const latestSource = readJsonRequired(
-    args.rclone_bin,
-    args.source_root,
-    inventory.latest.relative_path,
-  );
-  const latest = validateObservationVerificationLatest(latestSource.parsed);
-  const expectedVerificationRoot = sha256Hex(stableJson({
-    latest: inventory.latest,
-    connector_manifests: inventory.connector_manifests,
-  }));
-  if (
-    expectedVerificationRoot !== inventory.source_root_hash ||
-    sha256Hex(latestSource.text) !== inventory.latest.sha256 ||
-    Buffer.byteLength(latestSource.text, "utf8") !== inventory.latest.byte_size ||
-    stableJson(latest.connectors) !== stableJson(
-      inventory.connector_manifests.map((entry) => ({
-        connector_id: entry.connector_id,
-        key: entry.relative_path,
-        byte_size: entry.byte_size,
-        sha256: entry.sha256,
-      })),
-    )
-  ) {
-    throw new Error("Verification inventory does not match current latest authority");
-  }
-
-  const previousByConnector = new Map(
-    (previousState?.connector_manifests || []).map((entry) => [
-      entry.connector_id,
-      entry,
-    ]),
-  );
-  const nextConnectorStates = [];
-  try {
-    // Canonical connector manifests are always planned and verified before
-    // the compact latest authority can be copied.
-    for (const expected of inventory.connector_manifests) {
-      const prior = previousByConnector.get(expected.connector_id);
-      const destinationIdentity = readRemoteFileIdentity(
-        args.rclone_bin,
-        args.dest_root,
-        expected.relative_path,
-      );
-      if (
-        prior?.verified === true && destinationIdentity.verified === true &&
-        prior.relative_path === expected.relative_path &&
-        prior.sha256 === expected.sha256 &&
-        prior.byte_size === expected.byte_size &&
-        destinationIdentity.sha256 === expected.sha256 &&
-        destinationIdentity.size === expected.byte_size
-      ) {
-        nextConnectorStates.push({ ...prior });
-        report.connector_manifests_reused += 1;
-        continue;
-      }
-      const copy = copyAndVerifyJsonFile({
-        rcloneBin: args.rclone_bin,
-        sourceRoot: args.source_root,
-        destRoot: args.dest_root,
-        relativePath: expected.relative_path,
-        dryRun: args.dry_run,
-      });
-      if (
-        copy.source_hash !== expected.sha256 ||
-        copy.source_size !== expected.byte_size
-      ) throw new Error(`Verification source identity mismatch: ${expected.relative_path}`);
-      if (!args.dry_run && !copy.verified) {
-        throw new Error(`Verification destination check failed: ${expected.relative_path}`);
-      }
-      nextConnectorStates.push({
-        ...expected,
-        copied_at: args.dry_run ? null : new Date().toISOString(),
-        verified: !args.dry_run,
-      });
-      report.connector_manifests_copied += args.dry_run ? 0 : 1;
-      report.connector_manifest_bytes_copied += args.dry_run
-        ? 0
-        : expected.byte_size;
-      report.changed_connector_ids.push(expected.connector_id);
-    }
-
-    if (args.dry_run) return { report, state_root_dirty: false };
-
-    const nextState = {
-      processed_source_root_hash: null,
-      connector_manifests: nextConnectorStates,
-      latest: previousState?.latest || null,
-    };
-    const latestDestinationIdentity = readRemoteFileIdentity(
-      args.rclone_bin,
-      args.dest_root,
-      inventory.latest.relative_path,
-    );
-    const latestMatches = nextState.latest?.verified === true &&
-      latestDestinationIdentity.verified === true &&
-      nextState.latest.relative_path === inventory.latest.relative_path &&
-      nextState.latest.sha256 === inventory.latest.sha256 &&
-      nextState.latest.byte_size === inventory.latest.byte_size &&
-      latestDestinationIdentity.sha256 === inventory.latest.sha256 &&
-      latestDestinationIdentity.size === inventory.latest.byte_size;
-    if (latestMatches) {
-      report.latest_reused = true;
-    } else {
-      const copy = copyAndVerifyJsonFile({
-        rcloneBin: args.rclone_bin,
-        sourceRoot: args.source_root,
-        destRoot: args.dest_root,
-        relativePath: inventory.latest.relative_path,
-        dryRun: false,
-      });
-      if (
-        copy.source_hash !== inventory.latest.sha256 ||
-        copy.source_size !== inventory.latest.byte_size ||
-        !copy.verified
-      ) throw new Error("Verification latest copy or identity verification failed");
-      nextState.latest = {
-        ...inventory.latest,
-        copied_at: new Date().toISOString(),
-        verified: true,
-      };
-      report.latest_copied = true;
-    }
-    if (!verificationStateIsComplete(nextState, inventory)) {
-      throw new Error("Verification backup state is incomplete after copy");
-    }
-    nextState.processed_source_root_hash = inventory.source_root_hash;
-    stateRoot.verification = nextState;
-    report.processed_source_root_hash = nextState.processed_source_root_hash;
-    report.complete = true;
-    return { report, state_root_dirty: true };
-  } catch (error) {
-    report.error = error instanceof Error ? error.message : String(error);
-    report.complete = false;
-    return { report, state_root_dirty: false };
-  }
 }
 
 function readRemoteFileIdentity(rcloneBin, root, relativePath) {
@@ -1268,21 +1098,6 @@ async function main() {
       incomplete: true,
       error: null,
     },
-    verification: {
-      active: false,
-      source_root_hash: null,
-      processed_source_root_hash: null,
-      connector_manifests_inventoried: 0,
-      connector_manifests_copied: 0,
-      connector_manifests_reused: 0,
-      connector_manifest_bytes_copied: 0,
-      changed_connector_ids: [],
-      latest_key: null,
-      latest_copied: false,
-      latest_reused: false,
-      complete: true,
-      error: null,
-    },
     prune: {
       enabled: args.prune_stale_parquet,
       force_recheck: args.force_prune_recheck,
@@ -1857,14 +1672,6 @@ async function main() {
     verified: processedLatestState.verified,
   };
 
-  const verificationSync = syncVerificationDomain({
-    args,
-    inventoryRoot,
-    stateRoot,
-  });
-  report.verification = verificationSync.report;
-  stateRootDirty = stateRootDirty || verificationSync.state_root_dirty;
-
   if (!args.dry_run && allYearsComplete(stateRoot, inventoryRoot)) {
     copyAndVerifyJsonFile({
       rcloneBin: args.rclone_bin,
@@ -1904,11 +1711,9 @@ async function main() {
     && report.timeseries_binding_packs.complete
     && report.core.complete
     && report.run_manifests.complete
-    && !report.latest_timeseries.incomplete
-    && report.verification.complete;
+    && !report.latest_timeseries.incomplete;
   report.ok = report.prune.forced_failed_days === 0
-    && report.latest_timeseries.error === null
-    && report.verification.error === null;
+    && report.latest_timeseries.error === null;
   writeReport(args.report_out, report);
   console.log(JSON.stringify(report, null, 2));
   if (!report.ok) {

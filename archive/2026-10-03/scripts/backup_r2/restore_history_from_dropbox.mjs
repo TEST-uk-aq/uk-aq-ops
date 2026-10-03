@@ -4,19 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import {
-  OBSERVATION_VERIFICATION_LATEST_KEY,
-  OBSERVATION_VERIFICATION_ROOT,
-  validateObservationVerificationConnectorManifest,
-  validateObservationVerificationLatest,
-} from "../../workers/shared/uk_aq_observation_verification_overlay.mjs";
 
-const DOMAIN_NAMES = Object.freeze([
-  "observations",
-  "aqilevels",
-  "core",
-  "verification",
-]);
+const DOMAIN_NAMES = Object.freeze(["observations", "aqilevels", "core"]);
 
 function normalizePrefix(rawPrefix) {
   return String(rawPrefix || "").trim().replace(/^\/+|\/+$/g, "");
@@ -26,7 +15,6 @@ const DEFAULT_DOMAIN_PREFIXES = Object.freeze({
   observations: normalizePrefix(process.env.UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX || "history/v1/observations"),
   aqilevels: normalizePrefix(process.env.UK_AQ_R2_HISTORY_AQILEVELS_PREFIX || "history/v1/aqilevels/hourly"),
   core: normalizePrefix(process.env.UK_AQ_R2_HISTORY_CORE_PREFIX || "history/v1/core"),
-  verification: OBSERVATION_VERIFICATION_ROOT,
 });
 
 const DEFAULT_RCLONE_BIN =
@@ -48,7 +36,7 @@ function usage() {
       "  --dest-root     Example: uk_aq_r2:uk-aq-history-cic-test",
       "",
       "Optional:",
-      "  --domain <name>              observations | aqilevels | core | verification (repeatable; default all)",
+      "  --domain <name>              observations | aqilevels | core (repeatable; default all)",
       "  --day-utc <YYYY-MM-DD>       Restore only one day folder under selected domains",
       "  --rclone-bin <name>          Default: rclone",
       "  --report-out <file>          Write JSON report to file",
@@ -131,9 +119,6 @@ function parseArgs(argv) {
 
   if (args.day_utc && !/^\d{4}-\d{2}-\d{2}$/.test(args.day_utc)) {
     throw new Error("--day-utc must be in YYYY-MM-DD format");
-  }
-  if (args.day_utc && args.domains.includes("verification")) {
-    throw new Error("--day-utc is not supported for the verification domain");
   }
 
   if (args.domains.some((domain) => domain === "observations" || domain === "core")) {
@@ -301,85 +286,6 @@ function copyPath(rcloneBin, sourcePath, destPath, dryRun) {
   runRclone(rcloneBin, args);
 }
 
-function copyFile(rcloneBin, sourcePath, destPath, dryRun) {
-  const args = ["copyto", sourcePath, destPath, "--check-first"];
-  if (dryRun) args.push("--dry-run");
-  runRclone(rcloneBin, args);
-}
-
-function restoreVerificationDomain(args) {
-  const sourceLatestPath = joinTargetPath(
-    args.source_root,
-    OBSERVATION_VERIFICATION_LATEST_KEY,
-  );
-  const sourceLatest = rcloneCatMaybe(args.rclone_bin, sourceLatestPath);
-  if (!sourceLatest.found) return {
-    prefix: OBSERVATION_VERIFICATION_ROOT,
-    source_path: sourceLatestPath,
-    dest_path: joinTargetPath(args.dest_root, OBSERVATION_VERIFICATION_ROOT),
-    copied: false,
-    skipped_missing_source: true,
-    connector_manifests_restored: 0,
-    latest_restored_last: false,
-    failure: null,
-  };
-  const latest = validateObservationVerificationLatest(
-    parseManifestOrThrow(sourceLatest.text, sourceLatestPath),
-  );
-  let restored = 0;
-  for (const identity of latest.connectors) {
-    const sourcePath = joinTargetPath(args.source_root, identity.key);
-    const source = rcloneCatMaybe(args.rclone_bin, sourcePath);
-    if (!source.found) {
-      throw new Error(`Verification connector manifest is missing: ${identity.key}`);
-    }
-    if (
-      Buffer.byteLength(source.text, "utf8") !== identity.byte_size ||
-      sha256Hex(source.text) !== identity.sha256
-    ) throw new Error(`Verification connector manifest identity mismatch: ${identity.key}`);
-    const manifest = validateObservationVerificationConnectorManifest(
-      parseManifestOrThrow(source.text, sourcePath),
-    );
-    if (manifest.connector_id !== identity.connector_id) {
-      throw new Error(`Verification connector manifest contradiction: ${identity.key}`);
-    }
-    const destPath = joinTargetPath(args.dest_root, identity.key);
-    copyFile(args.rclone_bin, sourcePath, destPath, args.dry_run);
-    if (!args.dry_run) {
-      const destination = rcloneCatMaybe(args.rclone_bin, destPath);
-      if (
-        !destination.found ||
-        Buffer.byteLength(destination.text, "utf8") !== identity.byte_size ||
-        sha256Hex(destination.text) !== identity.sha256
-      ) throw new Error(`Restored verification connector identity mismatch: ${identity.key}`);
-    }
-    restored += 1;
-  }
-  // Publish the compact discovery authority only after every referenced
-  // connector manifest is restored and verified.
-  const destLatestPath = joinTargetPath(
-    args.dest_root,
-    OBSERVATION_VERIFICATION_LATEST_KEY,
-  );
-  copyFile(args.rclone_bin, sourceLatestPath, destLatestPath, args.dry_run);
-  if (!args.dry_run) {
-    const destination = rcloneCatMaybe(args.rclone_bin, destLatestPath);
-    if (!destination.found || destination.text !== sourceLatest.text) {
-      throw new Error("Restored verification latest exact-byte verification failed");
-    }
-  }
-  return {
-    prefix: OBSERVATION_VERIFICATION_ROOT,
-    source_path: sourceLatestPath,
-    dest_path: joinTargetPath(args.dest_root, OBSERVATION_VERIFICATION_ROOT),
-    copied: true,
-    skipped_missing_source: false,
-    connector_manifests_restored: restored,
-    latest_restored_last: true,
-    failure: null,
-  };
-}
-
 async function main(args) {
   const startedAt = new Date().toISOString();
   const report = {
@@ -403,28 +309,6 @@ async function main(args) {
     const domainPrefix = args.domain_prefixes[domain];
     if (!domainPrefix) {
       throw new Error(`No configured prefix for domain: ${domain}`);
-    }
-
-    if (domain === "verification") {
-      try {
-        const verificationSummary = restoreVerificationDomain(args);
-        report.domains[domain] = verificationSummary;
-        if (verificationSummary.skipped_missing_source) {
-          report.totals.skipped_missing_source += 1;
-        } else {
-          report.totals.copied_domains += 1;
-        }
-      } catch (error) {
-        report.domains[domain] = {
-          prefix: OBSERVATION_VERIFICATION_ROOT,
-          copied: false,
-          skipped_missing_source: false,
-          failure: error instanceof Error ? error.message : String(error),
-        };
-        report.totals.failed_domains += 1;
-        report.ok = false;
-      }
-      continue;
     }
 
     const summary = {

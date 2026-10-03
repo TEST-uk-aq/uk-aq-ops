@@ -12,7 +12,6 @@ import {
   sha256Hex,
   validateHierarchicalStateRoot,
   validateObservationMonthState,
-  validateVerificationState,
 } from "./lib/hierarchical_backup_v2.mjs";
 import { validateCoreState } from "./lib/hierarchical_core_backup_v2.mjs";
 import { normalizeTimeseriesBindingRootState, validateTimeseriesBindingRangeState } from "./lib/hierarchical_timeseries_binding_sync_v2.mjs";
@@ -24,10 +23,6 @@ import { validateCanonicalHistoryV2Manifest } from "../../workers/shared/uk_aq_r
 import { classifyManifestFileIdentity } from "../../workers/shared/uk_aq_r2_file_identity.mjs";
 import { validateR2HistoryV2ObservationsAggregateManifest } from "../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs";
 import { resolveObservationHistoryGeneration } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
-import {
-  validateObservationVerificationConnectorManifest,
-  validateObservationVerificationLatest,
-} from "../../workers/shared/uk_aq_observation_verification_overlay.mjs";
 
 function parseArgs(argv) {
   const args = {};
@@ -308,45 +303,6 @@ export function verifyLocalBackupMaterialisation(args) {
     if (bindingUnits !== Number(report.timeseries_binding.files_copied)) throw new Error("Individual binding changed-unit count disagrees with exact backup report");
   }
 
-  let verificationObjects = 0;
-  if (report.verification?.active === true) {
-    const verificationState = validateVerificationState(stateRoot.verification);
-    const expectedRoot = assertSha256(
-      report.verification.source_root_hash,
-      "backup report verification source root",
-    );
-    if (verificationState?.processed_source_root_hash !== expectedRoot) {
-      throw new Error("Local checkpoint verification root does not match exact backup report");
-    }
-    const latestObject = readJson(root, verificationState.latest.relative_path);
-    if (
-      latestObject.bytes.byteLength !== verificationState.latest.byte_size ||
-      sha256Hex(latestObject.bytes) !== verificationState.latest.sha256
-    ) throw new Error("Local verification latest identity mismatch");
-    const latest = validateObservationVerificationLatest(latestObject.value);
-    const stateByConnector = new Map(verificationState.connector_manifests.map(
-      (entry) => [entry.connector_id, entry],
-    ));
-    for (const expected of latest.connectors) {
-      const state = stateByConnector.get(expected.connector_id);
-      if (
-        state?.verified !== true || state.relative_path !== expected.key ||
-        state.sha256 !== expected.sha256 || state.byte_size !== expected.byte_size
-      ) throw new Error(`Verification checkpoint identity mismatch: ${expected.key}`);
-      const object = readJson(root, expected.key);
-      if (
-        object.bytes.byteLength !== expected.byte_size ||
-        sha256Hex(object.bytes) !== expected.sha256
-      ) throw new Error(`Local verification connector identity mismatch: ${expected.key}`);
-      const manifest = validateObservationVerificationConnectorManifest(object.value);
-      if (manifest.connector_id !== expected.connector_id) {
-        throw new Error(`Local verification connector mismatch: ${expected.key}`);
-      }
-      verificationObjects += 1;
-    }
-    verificationObjects += 1;
-  }
-
   return {
     ok: true,
     phase: "local_materialisation_verified",
@@ -359,7 +315,6 @@ export function verifyLocalBackupMaterialisation(args) {
     verified_core_unit_count: coreUnits,
     verified_core_object_count: coreObjects,
     verified_binding_unit_count: bindingUnits,
-    verified_verification_object_count: verificationObjects,
     authenticated_state_shard_count: monthShards.size + (coreUnits > 0 ? 1 : 0) + bindingUnits,
   };
 }

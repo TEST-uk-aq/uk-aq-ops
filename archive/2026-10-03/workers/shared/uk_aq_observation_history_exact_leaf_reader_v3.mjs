@@ -11,12 +11,6 @@ import {
   readObservationHistoryV3ByteRanges,
   sha256ObservationHistoryV3Bytes,
 } from "./uk_aq_observation_history_random_access_v3.mjs";
-import {
-  OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
-  OBSERVATION_HISTORY_SCHEMA_VERSION_V4,
-  OBSERVATION_HISTORY_WRITER_VERSION_V3,
-  OBSERVATION_HISTORY_WRITER_VERSION_V4,
-} from "./uk_aq_observation_history_schema.mjs";
 
 const DAY_MS = 86_400_000;
 const MAX_LOGICAL_REQUEST_MS = DAY_MS;
@@ -168,16 +162,8 @@ function normalizeIndex(index) {
     leafKind: required(index.leafKind, "index.leafKind"),
     additionalCommonFields: Object.freeze({ ...additionalCommonFields }),
   });
-  const supportedPhysicalIdentity = (
-    normalized.historySchemaVersion === OBSERVATION_HISTORY_SCHEMA_VERSION_V3 &&
-    normalized.writerVersion === OBSERVATION_HISTORY_WRITER_VERSION_V3
-  ) || (
-    normalized.historySchemaVersion === OBSERVATION_HISTORY_SCHEMA_VERSION_V4 &&
-    normalized.writerVersion === OBSERVATION_HISTORY_WRITER_VERSION_V4
-  );
   if (
     normalized.historyVersion !== "v2" ||
-    !supportedPhysicalIdentity ||
     normalized.physicalLayoutVersion !== "timeseries-aligned-v2" ||
     normalized.alignedRowCap !== MAX_PHYSICAL_SEGMENT_ROWS ||
     normalized.decodeProfileId !== SUPPORTED_DECODE_PROFILE_ID
@@ -231,18 +217,14 @@ function validateIdentity(raw, label) {
   return Object.freeze({ key, byte_size: byteSize, sha256 });
 }
 
-function validateProfile(profile, index) {
-  const expectedRootChildren = index.historySchemaVersion ===
-      OBSERVATION_HISTORY_SCHEMA_VERSION_V4
-    ? 6
-    : 7;
+function validateProfile(profile) {
   if (
     profile?.version !== SUPPORTED_DECODE_PROFILE.version ||
     profile?.hyparquet_version !== SUPPORTED_DECODE_PROFILE.hyparquet_version ||
     profile?.page_headers !== SUPPORTED_DECODE_PROFILE.page_headers ||
     profile?.root_schema_element?.name !== SUPPORTED_DECODE_PROFILE.root_schema_element.name ||
     profile.root_schema_element.repetition_type !== SUPPORTED_DECODE_PROFILE.root_schema_element.repetition_type ||
-    profile.root_schema_element.num_children !== expectedRootChildren
+    profile.root_schema_element.num_children !== SUPPORTED_DECODE_PROFILE.root_schema_element.num_children
   ) throw new Error("unsupported physical decode profile");
   const expected = {
     observed_at_utc: { physical: "INT64", converted: "TIMESTAMP_MILLIS" },
@@ -265,21 +247,7 @@ function validateProfile(profile, index) {
       (name === "value" && column.schema_element.logical_type !== undefined)
     ) throw new Error(`unsupported physical decode profile for ${name}`);
   }
-  return profile;
-}
-
-function decodeProfileForIndex(index) {
-  const expectedRootChildren = index.historySchemaVersion ===
-      OBSERVATION_HISTORY_SCHEMA_VERSION_V4
-    ? 6
-    : 7;
-  return Object.freeze({
-    ...SUPPORTED_DECODE_PROFILE,
-    root_schema_element: Object.freeze({
-      ...SUPPORTED_DECODE_PROFILE.root_schema_element,
-      num_children: expectedRootChildren,
-    }),
-  });
+  return SUPPORTED_DECODE_PROFILE;
 }
 
 function validateFile(raw, expectedScope, index) {
@@ -336,7 +304,7 @@ function validateManifest(payload, expected, key, scope, index) {
     typeof payload.leaves_by_timeseries_id !== "object" ||
     Array.isArray(payload.leaves_by_timeseries_id)
   ) throw new Error("exact-leaf scoped manifest key or lookup is contradictory");
-  const profile = validateProfile(payload.decode_profile, index);
+  const profile = validateProfile(payload.decode_profile);
   const lookupKeys = Object.keys(payload.leaves_by_timeseries_id);
   if (
     positiveInteger(payload.coverage?.timeseries_count, "coverage.timeseries_count") !== lookupKeys.length ||
@@ -1092,7 +1060,7 @@ export async function readObservationHistoryExactLeafPageV3({
         parseJson(leafBody, descriptor.key),
         expected,
         descriptor,
-        decodeProfileForIndex(normalizedIndex),
+        SUPPORTED_DECODE_PROFILE,
         normalizedIndex,
       );
       const scopedSegments = segments

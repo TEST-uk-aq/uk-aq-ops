@@ -1,10 +1,6 @@
 import observationHistoryV3 from "./worker_v3.mjs";
 import { resolveObservationHistoryGeneration } from "../shared/uk_aq_observation_history_generation.mjs";
 import { observationHistoryPhysicalSchemaForColumns, selectObservationVerificationStatusColumn } from "../shared/uk_aq_observation_history_schema.mjs";
-import {
-  applyObservationVerificationOverlay,
-  loadObservationVerificationAuthority,
-} from "../shared/uk_aq_observation_verification_overlay.mjs";
 import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
 import {
@@ -746,11 +742,7 @@ function aggregateDailyProvenance(rows) {
 }
 
 async function handleDailyProvenanceV2(params, env) {
-  const verificationAuthority = await loadObservationVerificationAuthority({
-    bucket: env.UK_AQ_HISTORY_BUCKET,
-    connectorId: params.connectorId,
-  });
-  const observations = await handleRequest(params, env, verificationAuthority);
+  const observations = await handleRequest(params, env);
   const payload = await observations.json();
   if (!observations.ok || payload.response_complete !== true || payload.has_gap === true) {
     return jsonResponse({ ok: false, error: "observation provenance is incomplete" }, { status: 502, noStore: true });
@@ -806,7 +798,7 @@ export function buildCanonicalCacheKey(requestUrl, {
   endIso,
   sinceIso,
   limit,
-}, readVersion = "v1", verificationIdentity = null) {
+}, readVersion = "v1") {
   const cacheUrl = new URL(requestUrl);
   cacheUrl.pathname = "/v1/observations";
   cacheUrl.search = "";
@@ -815,9 +807,6 @@ export function buildCanonicalCacheKey(requestUrl, {
   cacheUrl.searchParams.set("connector_id", String(connectorId));
   cacheUrl.searchParams.set("__ukaq_observs_history_read_v", parseReadVersion(readVersion));
   cacheUrl.searchParams.set("__ukaq_observs_history_cache_gen", OBSERVATIONS_CACHE_GENERATION);
-  if (verificationIdentity) {
-    cacheUrl.searchParams.set("__ukaq_verification_identity", verificationIdentity);
-  }
   if (pollutantKey) {
     cacheUrl.searchParams.set("pollutant", pollutantKey);
   }
@@ -1312,7 +1301,7 @@ async function readHistoryRows({
   };
 }
 
-async function handleRequest(requestParams, env, verificationAuthority = null) {
+async function handleRequest(requestParams, env) {
   const {
     timeseriesId,
     connectorId,
@@ -1413,17 +1402,6 @@ async function handleRequest(requestParams, env, verificationAuthority = null) {
   }));
   // --- END DIAG ---
   const completeness = summarizeCoverageCompleteness(historyRead);
-  const authority = verificationAuthority ||
-    await loadObservationVerificationAuthority({
-      bucket: env.UK_AQ_HISTORY_BUCKET,
-      connectorId,
-    });
-  const effectiveRows = applyObservationVerificationOverlay({
-    rows: historyRead.rows,
-    authority,
-    timeseriesId,
-    timestampField: "observed_at",
-  });
 
   return jsonResponse({
     ok: true,
@@ -1440,12 +1418,12 @@ async function handleRequest(requestParams, env, verificationAuthority = null) {
     end_utc: endIso,
     since_utc: sinceIso,
     cache_scope: cacheScope,
-    row_count: effectiveRows.length,
+    row_count: historyRead.rows.length,
     response_complete: completeness.response_complete,
     has_gap: completeness.has_gap,
     coverage_state: completeness.coverage_state,
     partial_reasons: completeness.partial_reasons,
-    rows: effectiveRows,
+    rows: historyRead.rows,
     coverage: {
       read_version: readVersion,
       index_version: historyRead.timeseries_index?.index_version || readVersion,
@@ -1612,18 +1590,7 @@ export default {
     }
 
     const readVersion = resolveR2HistoryVersion(env, { context: "R2 observations history API reads" });
-    const verificationAuthority = await loadObservationVerificationAuthority({
-      bucket: env.UK_AQ_HISTORY_BUCKET,
-      connectorId: requestParams.connectorId,
-    });
-    const cacheKey = buildCanonicalCacheKey(
-      request.url,
-      requestParams,
-      readVersion,
-      verificationAuthority.overlay_authoritative
-        ? verificationAuthority.cache_identity
-        : null,
-    );
+    const cacheKey = buildCanonicalCacheKey(request.url, requestParams, readVersion);
     const cached = await caches.default.match(cacheKey);
     if (cached) {
       return withCacheMarker(cached, "HIT");
@@ -1632,11 +1599,7 @@ export default {
     const _fetchStart = Date.now();
     let response;
     try {
-      response = await handleRequest(
-        requestParams,
-        env,
-        verificationAuthority,
-      );
+      response = await handleRequest(requestParams, env);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const errorName = error instanceof Error ? error.name : "UnknownError";

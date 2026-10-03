@@ -6,7 +6,6 @@ export { selectObservationVerificationStatusColumn } from "./uk_aq_observation_h
 
 export const OBSERVATION_CONTENT_HASH_ALGORITHM = "sha256";
 export const OBSERVATION_CONTENT_HASH_CONTRACT_VERSION = 1;
-export const OBSERVATION_MEASUREMENT_CONTENT_HASH_CONTRACT_VERSION = 2;
 export const OBSERVATION_CONTENT_HASH_COLUMNS = Object.freeze([
   "connector_id",
   "station_id",
@@ -16,18 +15,8 @@ export const OBSERVATION_CONTENT_HASH_COLUMNS = Object.freeze([
   "value",
   "verification_status",
 ]);
-export const OBSERVATION_MEASUREMENT_CONTENT_HASH_COLUMNS = Object.freeze([
-  "connector_id",
-  "station_id",
-  "timeseries_id",
-  "pollutant_code",
-  "observed_at_utc",
-  "value",
-]);
 export const OBSERVATION_CONTENT_HASH_PREFIX =
   "uk-aq-observation-content-hash:v1\n";
-export const OBSERVATION_MEASUREMENT_CONTENT_HASH_PREFIX =
-  "uk-aq-observation-measurement-content-hash:v2\n";
 
 const EXACT_UTC_MILLISECOND_TIMESTAMP =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -153,57 +142,6 @@ export function encodeCanonicalObservationRow(row) {
   ]);
 }
 
-export function normalizeCanonicalObservationMeasurementRow(row) {
-  if (!row || typeof row !== "object" || Array.isArray(row)) {
-    throw new TypeError("canonical observation measurement row must be an object");
-  }
-  const pollutantCode = row.pollutant_code;
-  if (
-    typeof pollutantCode !== "string" ||
-    !CANONICAL_POLLUTANT_CODE.test(pollutantCode) ||
-    pollutantCode !== pollutantCode.toLowerCase()
-  ) {
-    throw new TypeError(
-      "pollutant_code must be a validated canonical lower-case code",
-    );
-  }
-  const observedAtUtc = row.observed_at_utc;
-  if (
-    typeof observedAtUtc !== "string" ||
-    !EXACT_UTC_MILLISECOND_TIMESTAMP.test(observedAtUtc) ||
-    Number.isNaN(Date.parse(observedAtUtc)) ||
-    new Date(observedAtUtc).toISOString() !== observedAtUtc
-  ) {
-    throw new TypeError(
-      "observed_at_utc must be an exact UTC ISO timestamp with millisecond precision",
-    );
-  }
-  const numericValue = row.value;
-  if (typeof numericValue !== "number" || !Number.isFinite(numericValue)) {
-    throw new TypeError("value must be a finite IEEE-754 binary64 number");
-  }
-  return Object.freeze({
-    connector_id: positiveInteger(row.connector_id, "connector_id"),
-    station_id: canonicalStationId(row.station_id),
-    timeseries_id: positiveInteger(row.timeseries_id, "timeseries_id"),
-    pollutant_code: pollutantCode,
-    observed_at_utc: observedAtUtc,
-    value: Object.is(numericValue, -0) ? 0 : numericValue,
-  });
-}
-
-export function encodeCanonicalObservationMeasurementRow(row) {
-  const canonical = normalizeCanonicalObservationMeasurementRow(row);
-  return JSON.stringify([
-    canonical.connector_id,
-    canonical.station_id,
-    canonical.timeseries_id,
-    canonical.pollutant_code,
-    canonical.observed_at_utc,
-    float64BigEndianHex(canonical.value),
-  ]);
-}
-
 
 export function preservePersistedRatifiedStatus(
   replacementRows,
@@ -270,43 +208,6 @@ export function computeObservationContentHash(rows) {
   };
 }
 
-export function computeObservationMeasurementContentHash(rows) {
-  if (!Array.isArray(rows) || rows.length === 0) {
-    throw new TypeError(
-      "observation measurement content hash requires a non-empty canonical partition",
-    );
-  }
-  const canonicalRows = rows.map(normalizeCanonicalObservationMeasurementRow);
-  const encodedRows = canonicalRows
-    .map(encodeCanonicalObservationMeasurementRow)
-    .sort();
-  const hash = createHash("sha256");
-  hash.update(OBSERVATION_MEASUREMENT_CONTENT_HASH_PREFIX, "utf8");
-  for (const encoded of encodedRows) {
-    hash.update(encoded, "utf8");
-    hash.update("\n", "utf8");
-  }
-  return {
-    observation_content_hash: hash.digest("hex"),
-    observation_content_hash_algorithm: OBSERVATION_CONTENT_HASH_ALGORITHM,
-    observation_content_hash_contract_version:
-      OBSERVATION_MEASUREMENT_CONTENT_HASH_CONTRACT_VERSION,
-    observation_content_hash_row_count: canonicalRows.length,
-    observation_content_hash_columns: [
-      ...OBSERVATION_MEASUREMENT_CONTENT_HASH_COLUMNS,
-    ],
-    canonical_rows: canonicalRows,
-  };
-}
-
-// Explicit legacy bridge for callers comparing measurement content across
-// status-inclusive schema-v3 objects and future schema-v4 objects. It decodes
-// only the six canonical measurement fields and computes contract v2 rather
-// than comparing incompatible v1/v2 digest strings.
-export function computeMeasurementIdentityFromLegacyObservationRows(rows) {
-  return computeObservationMeasurementContentHash(rows);
-}
-
 export function computeEmptyObservationContentHash() {
   const hash = createHash("sha256");
   hash.update(OBSERVATION_CONTENT_HASH_PREFIX, "utf8");
@@ -318,22 +219,6 @@ export function computeEmptyObservationContentHash() {
     observation_content_hash_row_count: 0,
     observation_content_hash_columns: [...OBSERVATION_CONTENT_HASH_COLUMNS],
     verification_status_counts: { P: 0, R: 0, null: 0 },
-    canonical_rows: [],
-  };
-}
-
-export function computeEmptyObservationMeasurementContentHash() {
-  const hash = createHash("sha256");
-  hash.update(OBSERVATION_MEASUREMENT_CONTENT_HASH_PREFIX, "utf8");
-  return {
-    observation_content_hash: hash.digest("hex"),
-    observation_content_hash_algorithm: OBSERVATION_CONTENT_HASH_ALGORITHM,
-    observation_content_hash_contract_version:
-      OBSERVATION_MEASUREMENT_CONTENT_HASH_CONTRACT_VERSION,
-    observation_content_hash_row_count: 0,
-    observation_content_hash_columns: [
-      ...OBSERVATION_MEASUREMENT_CONTENT_HASH_COLUMNS,
-    ],
     canonical_rows: [],
   };
 }
@@ -357,11 +242,10 @@ export function validateObservationContentHashMetadata(
   ) {
     throw new TypeError("unsupported observation content hash algorithm");
   }
-  const contractVersion = metadata.observation_content_hash_contract_version;
-  if (![OBSERVATION_CONTENT_HASH_CONTRACT_VERSION,
-    OBSERVATION_MEASUREMENT_CONTENT_HASH_CONTRACT_VERSION].includes(
-    contractVersion,
-  )) {
+  if (
+    metadata.observation_content_hash_contract_version !==
+      OBSERVATION_CONTENT_HASH_CONTRACT_VERSION
+  ) {
     throw new TypeError("unsupported observation content hash contract version");
   }
   if (
@@ -374,27 +258,15 @@ export function validateObservationContentHashMetadata(
   ) {
     throw new TypeError("observation content hash row count is invalid");
   }
-  const expectedColumns = contractVersion ===
-      OBSERVATION_MEASUREMENT_CONTENT_HASH_CONTRACT_VERSION
-    ? OBSERVATION_MEASUREMENT_CONTENT_HASH_COLUMNS
-    : OBSERVATION_CONTENT_HASH_COLUMNS;
   if (
     !Array.isArray(metadata.observation_content_hash_columns) ||
     metadata.observation_content_hash_columns.length !==
-      expectedColumns.length ||
+      OBSERVATION_CONTENT_HASH_COLUMNS.length ||
     metadata.observation_content_hash_columns.some(
-      (column, index) => column !== expectedColumns[index],
+      (column, index) => column !== OBSERVATION_CONTENT_HASH_COLUMNS[index],
     )
   ) {
     throw new TypeError("observation content hash columns are invalid");
-  }
-  if (contractVersion === OBSERVATION_MEASUREMENT_CONTENT_HASH_CONTRACT_VERSION) {
-    if (Object.hasOwn(metadata, "verification_status_counts")) {
-      throw new TypeError(
-        "measurement content hash metadata must not contain verification status counts",
-      );
-    }
-    return metadata;
   }
   const counts = metadata.verification_status_counts;
   if (
@@ -422,23 +294,6 @@ export function validateObservationContentHashMetadata(
   return metadata;
 }
 
-export function compareObservationContentHashMetadata(left, right) {
-  const leftMetadata = validateObservationContentHashMetadata(left);
-  const rightMetadata = validateObservationContentHashMetadata(right);
-  if (
-    leftMetadata.observation_content_hash_contract_version !==
-      rightMetadata.observation_content_hash_contract_version
-  ) {
-    throw new TypeError(
-      "observation content hashes use different contract versions; decode rows and compute measurement identity explicitly",
-    );
-  }
-  return leftMetadata.observation_content_hash ===
-      rightMetadata.observation_content_hash &&
-    leftMetadata.observation_content_hash_row_count ===
-      rightMetadata.observation_content_hash_row_count;
-}
-
 const isMain = typeof process !== "undefined" && process.argv?.[1] &&
   import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
@@ -453,15 +308,9 @@ if (isMain) {
         }),
       }))
       : inputRows;
-    const measurementOnly = input?.observation_content_hash_contract_version ===
-      OBSERVATION_MEASUREMENT_CONTENT_HASH_CONTRACT_VERSION;
     const result = Array.isArray(rows) && rows.length === 0 && input?.allow_empty
-      ? measurementOnly
-        ? computeEmptyObservationMeasurementContentHash()
-        : computeEmptyObservationContentHash()
-      : measurementOnly
-        ? computeObservationMeasurementContentHash(rows)
-        : computeObservationContentHash(rows);
+      ? computeEmptyObservationContentHash()
+      : computeObservationContentHash(rows);
     const { canonical_rows: _canonicalRows, ...output } = result;
     process.stdout.write(`${JSON.stringify(output)}\n`);
   } catch (error) {

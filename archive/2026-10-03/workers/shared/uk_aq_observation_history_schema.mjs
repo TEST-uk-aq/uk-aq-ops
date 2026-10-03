@@ -1,9 +1,7 @@
 export const OBSERVATION_HISTORY_SCHEMA_VERSION_V2 = 2;
 export const OBSERVATION_HISTORY_SCHEMA_VERSION_V3 = 3;
-export const OBSERVATION_HISTORY_SCHEMA_VERSION_V4 = 4;
 export const OBSERVATION_HISTORY_WRITER_VERSION_V2 = "parquet-wasm-zstd-v2";
 export const OBSERVATION_HISTORY_WRITER_VERSION_V3 = "parquet-wasm-zstd-v3";
-export const OBSERVATION_HISTORY_WRITER_VERSION_V4 = "parquet-wasm-zstd-v4";
 
 export const OBSERVATION_HISTORY_COLUMNS_V2 = Object.freeze([
   "connector_id",
@@ -22,14 +20,6 @@ export const OBSERVATION_HISTORY_COLUMNS_V2_STATUS = Object.freeze([
 export const OBSERVATION_HISTORY_COLUMNS_V3 = Object.freeze([
   ...OBSERVATION_HISTORY_COLUMNS_V2,
   "verification_status",
-]);
-
-// Schema v4 deliberately has the same six physical column names as the old
-// schema-v2 form. The explicit schema/writer identity is therefore required
-// whenever a descriptor is validated; column names alone cannot distinguish
-// those two historical meanings.
-export const OBSERVATION_HISTORY_COLUMNS_V4 = Object.freeze([
-  ...OBSERVATION_HISTORY_COLUMNS_V2,
 ]);
 
 export function selectObservationVerificationStatusColumn(schemaColumns) {
@@ -57,20 +47,7 @@ function cloneDescriptor(descriptor) {
   };
 }
 
-export function observationHistoryPhysicalSchemaForColumns(
-  columns,
-  { historySchemaVersion = null } = {},
-) {
-  if (
-    historySchemaVersion === OBSERVATION_HISTORY_SCHEMA_VERSION_V4 &&
-    sameColumns(columns, OBSERVATION_HISTORY_COLUMNS_V4)
-  ) {
-    return cloneDescriptor({
-      history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V4,
-      columns,
-      writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V4,
-    });
-  }
+export function observationHistoryPhysicalSchemaForColumns(columns) {
   if (sameColumns(columns, OBSERVATION_HISTORY_COLUMNS_V3)) {
     return cloneDescriptor({
       history_schema_version: OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
@@ -99,10 +76,7 @@ export function validateObservationHistoryPhysicalSchema(descriptor) {
   if (!descriptor || typeof descriptor !== "object" || Array.isArray(descriptor)) {
     throw new Error("Observation physical schema must be an object");
   }
-  const expected = observationHistoryPhysicalSchemaForColumns(
-    descriptor.columns,
-    { historySchemaVersion: descriptor.history_schema_version },
-  );
+  const expected = observationHistoryPhysicalSchemaForColumns(descriptor.columns);
   if (descriptor.history_schema_version !== expected.history_schema_version) {
     throw new Error("Observation physical history_schema_version does not match columns");
   }

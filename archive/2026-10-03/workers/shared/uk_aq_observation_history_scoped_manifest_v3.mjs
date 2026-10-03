@@ -1,9 +1,7 @@
 // @ts-nocheck -- pure scoped-manifest semantics shared by Node builders and Workers.
 import {
   OBSERVATION_HISTORY_SCHEMA_VERSION_V3,
-  OBSERVATION_HISTORY_SCHEMA_VERSION_V4,
   OBSERVATION_HISTORY_WRITER_VERSION_V3,
-  OBSERVATION_HISTORY_WRITER_VERSION_V4,
 } from "./uk_aq_observation_history_schema.mjs";
 import { normalizeObservationPropertyCode } from "./uk_aq_observation_property_code.mjs";
 
@@ -62,15 +60,9 @@ function normalizePhysicalIdentity(raw = DEFAULT_PHYSICAL_IDENTITY) {
     writer_version: String(raw?.writer_version || ""),
     physical_layout_version: String(raw?.physical_layout_version || ""),
   };
-  const supportedSchemaWriter = (
-    identity.history_schema_version === OBSERVATION_HISTORY_SCHEMA_VERSION_V3 &&
-    identity.writer_version === OBSERVATION_HISTORY_WRITER_VERSION_V3
-  ) || (
-    identity.history_schema_version === OBSERVATION_HISTORY_SCHEMA_VERSION_V4 &&
-    identity.writer_version === OBSERVATION_HISTORY_WRITER_VERSION_V4
-  );
   if (
-    !supportedSchemaWriter ||
+    identity.history_schema_version !== OBSERVATION_HISTORY_SCHEMA_VERSION_V3 ||
+    !identity.writer_version ||
     !identity.physical_layout_version
   ) {
     throw new Error("Scoped v3 manifest physical identity is invalid");

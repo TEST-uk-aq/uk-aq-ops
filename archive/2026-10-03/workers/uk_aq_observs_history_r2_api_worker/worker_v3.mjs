@@ -10,10 +10,6 @@ import {
 import {
   readObservationHistoryExactV3,
 } from "../shared/uk_aq_observation_history_reader_v3.mjs";
-import {
-  loadObservationVerificationAuthority,
-  resolveEffectiveObservationVerificationStatus,
-} from "../shared/uk_aq_observation_verification_overlay.mjs";
 
 const LOGICAL_HISTORY_VERSION = "v2";
 const INDEX_GENERATION = "v3";
@@ -224,20 +220,10 @@ async function handleDailyProvenance(params, env) {
   if (result.response_complete !== true || result.has_gap === true) {
     return jsonResponse({ ok: false, error: "observation provenance is incomplete" }, { status: 502, noStore: true });
   }
-  const verificationAuthority = await loadObservationVerificationAuthority({
-    bucket: env.UK_AQ_HISTORY_BUCKET,
-    connectorId: params.connectorId,
-  });
   const daily = new Map();
   for (const row of result.rows) {
     const dayUtc = row.observed_at_utc.slice(0, 10);
-    const effective = resolveEffectiveObservationVerificationStatus({
-      authority: verificationAuthority,
-      timeseriesId: params.timeseriesId,
-      observedAtUtc: row.observed_at_utc,
-      legacyStatus: row.verification_status,
-    });
-    const status = effective === "R" ? "R" : "P";
+    const status = row.verification_status === "R" ? "R" : "P";
     if (status === "P" || !daily.has(dayUtc)) daily.set(dayUtc, status);
   }
   return jsonResponse({
@@ -300,13 +286,10 @@ function cachePolicy(endIso) {
   return { scope: immutable ? "immutable" : "recent", seconds: immutable ? DEFAULT_IMMUTABLE_CACHE_SECONDS : DEFAULT_MUTABLE_CACHE_SECONDS };
 }
 
-function cacheKey(requestUrl, generation, verificationIdentity = null) {
+function cacheKey(requestUrl, generation) {
   const url = new URL(requestUrl);
   url.searchParams.set("__ukaq_observs_history_read_v", generation);
   url.searchParams.set("__ukaq_observs_history_cache_gen", generation === INDEX_GENERATION ? RESPONSE_CACHE_GENERATION : TIMESERIES_BINDING_CACHE_GENERATION);
-  if (verificationIdentity) {
-    url.searchParams.set("__ukaq_verification_identity", verificationIdentity);
-  }
   url.searchParams.sort();
   return new Request(url.toString(), { method: "GET" });
 }
@@ -384,12 +367,7 @@ function compactErrorSummary(diagnostics) {
   });
 }
 
-async function handleObservations(
-  params,
-  env,
-  diagnosticContext,
-  verificationAuthority,
-) {
+async function handleObservations(params, env, diagnosticContext) {
   const indexRoot = assertGenerationConfiguration(env);
   const result = await readObservationHistoryExactLeafPageV3({
     source: createR2ObservationHistoryV3Source({ bucket: env.UK_AQ_HISTORY_BUCKET }),
@@ -404,12 +382,7 @@ async function handleObservations(
   const rows = result.rows.map((row) => ({
     observed_at: row.observed_at_utc,
     value: row.value,
-    verification_status: resolveEffectiveObservationVerificationStatus({
-      authority: verificationAuthority,
-      timeseriesId: params.timeseriesId,
-      observedAtUtc: row.observed_at_utc,
-      legacyStatus: row.verification_status,
-    }),
+    verification_status: row.verification_status ?? null,
   }));
   const partialReasons = result.partial_reasons;
   const complete = result.response_complete === true;
@@ -518,40 +491,12 @@ export default {
             physical_cursor_supplied: Boolean(params.physicalCursor),
           }));
         }
-        const verificationAuthority = await loadObservationVerificationAuthority({
-          bucket: env.UK_AQ_HISTORY_BUCKET,
-          connectorId: params.connectorId,
-        });
-        return withCacheHeaders(
-          await handleObservations(
-            params,
-            env,
-            context,
-            verificationAuthority,
-          ),
-          "BYPASS",
-          RESPONSE_CACHE_GENERATION,
-        );
+        return withCacheHeaders(await handleObservations(params, env, context), "BYPASS", RESPONSE_CACHE_GENERATION);
       }
-      const verificationAuthority = await loadObservationVerificationAuthority({
-        bucket: env.UK_AQ_HISTORY_BUCKET,
-        connectorId: params.connectorId,
-      });
-      const key = cacheKey(
-        request.url,
-        INDEX_GENERATION,
-        verificationAuthority.overlay_authoritative
-          ? verificationAuthority.cache_identity
-          : null,
-      );
+      const key = cacheKey(request.url, INDEX_GENERATION);
       const cached = await caches.default.match(key);
       if (cached) return withCacheHeaders(cached, "HIT", RESPONSE_CACHE_GENERATION);
-      const response = await handleObservations(
-        params,
-        env,
-        null,
-        verificationAuthority,
-      );
+      const response = await handleObservations(params, env, null);
       const payload = await response.clone().json().catch(() => null);
       if (response.ok && payload?.response_complete === true && payload?.has_gap !== true) {
         ctx?.waitUntil?.(caches.default.put(key, response.clone()));
