@@ -14,6 +14,8 @@ The packed `timeseries_binding` transport is separately defined by [`r2_history_
 
 The Phase B observations backup is mandatory. Optimisation MUST preserve complete required observation backup coverage and MUST NOT disable, skip or reduce canonical observation history data.
 
+The future [verification-overlay backup amendment](r2_history_verification_overlay_backup_amendment.md) adds a separate mandatory verification domain after the observation verification overlay is activated. It does not change current runtime before that TEST-accepted cut-over. Once active, verification connector manifests and `history/_index_v3/verification/latest.json` are canonical backup payload with a separate verification processed-source-root identity; they are not covered by the derived-index exclusions below.
+
 ## Active backup scope
 
 The logical backup remains the v2 history backup. Its required domains are:
