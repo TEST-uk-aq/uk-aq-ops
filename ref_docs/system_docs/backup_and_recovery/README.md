@@ -118,7 +118,7 @@ When the future R2 verification overlay is in scope, also read:
 
 - [`r2_history_verification_overlay_backup_amendment.md`](r2_history_verification_overlay_backup_amendment.md)
 
-That future amendment makes `history/v3/verification/**` plus `history/_index_v3/verification/latest.json` mandatory backup payload, gives verification its own processed-source-root identity, and defines connector-manifest-first/latest-last restore ordering. It is not current backup runtime until the overlay is deployed and accepted on TEST.
+That future amendment makes the immutable SHA-addressed connector manifests referenced by `history/_index_v3/verification/latest.json`, plus that latest object, mandatory current backup payload; gives verification its own processed-source-root identity; and defines crash-safe manifest-first/latest-last copy and restore ordering. It is not current backup runtime until the overlay is deployed and accepted on TEST.
 
 ### Restore or recovery
 
