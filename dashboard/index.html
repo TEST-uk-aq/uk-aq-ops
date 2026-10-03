@@ -1918,7 +1918,6 @@
       const modeIngestBottomBtn = document.getElementById("mode-ingest-bottom");
       const modeOperationsBottomBtn = document.getElementById("mode-operations-bottom");
       const modeMediaBottomBtn = document.getElementById("mode-media-bottom");
-      const DASHBOARD_MODE_STORAGE_KEY = "uk_aq_dashboard_mode";
       const DASHBOARD_REFRESH_INGEST_STORAGE_KEY = "uk_aq_dashboard_refresh_ingest_seconds";
       const DASHBOARD_REFRESH_OPERATIONS_STORAGE_KEY = "uk_aq_dashboard_refresh_operations_seconds";
       const DAILY_TASK_RUNS_MODE_STORAGE_KEY = "ukAqDashboard.operations.dailyTaskRuns.mode";
@@ -1931,7 +1930,44 @@
         "duration",
       ]);
       const DASHBOARD_MODES = new Set(["ingest", "operations", "media"]);
-      let activeMode = "ingest";
+      const DASHBOARD_MODE_PATHS = Object.freeze({
+        ingest: "/ingest",
+        operations: "/ops",
+        media: "/media",
+      });
+      const DASHBOARD_PATH_MODES = new Map(
+        Object.entries(DASHBOARD_MODE_PATHS).map(([mode, path]) => [path, mode])
+      );
+
+      function resolveDashboardLocation(pathname = window.location.pathname) {
+        if (pathname === "/" || pathname === "/index.html") {
+          return { mode: "ingest", canonicalPath: DASHBOARD_MODE_PATHS.ingest };
+        }
+        const canonicalPath = pathname.length > 1 && pathname.endsWith("/")
+          ? pathname.slice(0, -1)
+          : pathname;
+        const mode = DASHBOARD_PATH_MODES.get(canonicalPath);
+        return mode ? { mode, canonicalPath: DASHBOARD_MODE_PATHS[mode] } : null;
+      }
+
+      function setDashboardPath(mode, { replace = false } = {}) {
+        const path = DASHBOARD_MODE_PATHS[mode];
+        if (!path) {
+          return;
+        }
+        const nextUrl = `${path}${window.location.search}${window.location.hash}`;
+        const method = replace ? "replaceState" : "pushState";
+        window.history[method]({ dashboardMode: mode }, "", nextUrl);
+      }
+
+      const initialDashboardLocation = resolveDashboardLocation();
+      let activeMode = initialDashboardLocation ? initialDashboardLocation.mode : "ingest";
+      if (
+        initialDashboardLocation &&
+        window.location.pathname !== initialDashboardLocation.canonicalPath
+      ) {
+        setDashboardPath(activeMode, { replace: true });
+      }
       let statusEl = null;
       let dataMetaEl = null;
       let errorEl = null;
@@ -2085,10 +2121,6 @@
       ];
 
       try {
-        const storedMode = localStorage.getItem(DASHBOARD_MODE_STORAGE_KEY);
-        if (storedMode && DASHBOARD_MODES.has(storedMode)) {
-          activeMode = storedMode;
-        }
         const storedIngestRefresh = Number(localStorage.getItem(DASHBOARD_REFRESH_INGEST_STORAGE_KEY));
         if (REFRESH_OPTIONS_SECONDS.includes(storedIngestRefresh)) {
           refreshSecondsByMode.ingest = storedIngestRefresh;
@@ -6768,19 +6800,27 @@
       document.addEventListener("visibilitychange", handleActivityChange);
       window.addEventListener("focus", handleActivityChange);
       window.addEventListener("blur", handleActivityChange);
-      function activateMode(mode) {
-        if (!DASHBOARD_MODES.has(mode) || activeMode === mode) {
+      function activateMode(mode, { updateHistory = true } = {}) {
+        if (!DASHBOARD_MODES.has(mode)) {
+          return;
+        }
+        if (updateHistory && window.location.pathname !== DASHBOARD_MODE_PATHS[mode]) {
+          setDashboardPath(mode);
+        }
+        if (activeMode === mode) {
           return;
         }
         activeMode = mode;
-        try {
-          localStorage.setItem(DASHBOARD_MODE_STORAGE_KEY, activeMode);
-        } catch (_err) {
-          // Ignore storage write failures.
-        }
         startRefreshTimer();
         void loadCurrentMode({ forceRefresh: false, modeSwitch: true });
       }
+
+      window.addEventListener("popstate", () => {
+        const locationState = resolveDashboardLocation();
+        if (locationState) {
+          activateMode(locationState.mode, { updateHistory: false });
+        }
+      });
 
       if (modeIngestBtn) {
         modeIngestBtn.addEventListener("click", () => activateMode("ingest"));

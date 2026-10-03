@@ -1,0 +1,6 @@
+/ingest/ /ingest 301
+/ops/ /ops 301
+/media/ /media 301
+/ingest /index.html 200
+/ops /index.html 200
+/media /index.html 200

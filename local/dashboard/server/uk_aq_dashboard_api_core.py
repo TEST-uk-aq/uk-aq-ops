@@ -4519,7 +4519,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     return
             if serve_cached_request(self, parsed):
                 return
-            if parsed.path in ("/", "/index.html"):
+            dashboard_redirects = {
+                "/ingest/": "/ingest",
+                "/ops/": "/ops",
+                "/media/": "/media",
+            }
+            if parsed.path in dashboard_redirects:
+                location = dashboard_redirects[parsed.path]
+                if parsed.query:
+                    location = f"{location}?{parsed.query}"
+                self.send_response(HTTPStatus.PERMANENT_REDIRECT)
+                self.send_header("Location", location)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+            if parsed.path in ("/", "/index.html", "/ingest", "/ops", "/media"):
                 self._serve_html()
                 return
             if parsed.path == "/favicon.ico":
