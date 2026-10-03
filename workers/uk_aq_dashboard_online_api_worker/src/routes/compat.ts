@@ -107,7 +107,9 @@ export async function handleCompatRoute(
       }
     }
     if (pathname === "/api/storage_coverage" || pathname === "/api/dashboard") {
-      response = await enrichStorageCoverageResponse(response, request, env);
+      if (useUpstream) {
+        response = await enrichStorageCoverageResponse(response, request, env);
+      }
       response = await enrichStorageCoverageFromMetrics(response, request, env);
     }
     return historyRoute ? withHistoryDiagnostics(response, env) : response;
