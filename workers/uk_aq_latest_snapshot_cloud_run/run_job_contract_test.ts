@@ -21,9 +21,20 @@ function fixtureMetadata() {
       id: 20,
       connector_id: 10,
       network_id: 30,
+      match_id: 70,
       station_ref: "BL-001",
       label: "BL Node 001",
       station_name: "BL Node 001",
+      pcon_code: "E14000001",
+      la_code: null,
+    }, {
+      id: 21,
+      connector_id: 1,
+      network_id: 31,
+      match_id: 70,
+      station_ref: "AURN-001",
+      label: "AURN Node 001",
+      station_name: "AURN Node 001",
       pcon_code: "E14000001",
       la_code: null,
     }],
@@ -33,6 +44,17 @@ function fixtureMetadata() {
       display_name: "Breathe London Nodes",
       network_type: "community",
       public_display_enabled: true,
+    }, {
+      id: 31,
+      network_code: "gov_uk_aurn",
+      display_name: "GOV.UK AURN",
+      network_type: "official",
+      public_display_enabled: true,
+    }],
+    station_matches: [{
+      id: 70,
+      uk_air_ref: "UKA01234",
+      match_name: "Canonical Site",
     }],
     timeseries: [{
       id: 40,
@@ -70,7 +92,7 @@ function fixtureState() {
   }]]);
 }
 
-Deno.test("v2 latest rows expose scalar public network fields and no membership fields", () => {
+Deno.test("v2 latest rows expose additive canonical site fields and scalar source provenance", () => {
   const result = buildSourceRows(fixtureState(), fixtureMetadata(), "v2");
   assert.equal(result.missingMetadata, 0);
   assert.equal(result.rows.length, 1);
@@ -82,11 +104,65 @@ Deno.test("v2 latest rows expose scalar public network fields and no membership 
   assert.equal(item.connector_id, 10);
   assert.equal(item.connector_code, "bl");
   assert.equal(item.connector_label, "Breathe London");
+  assert.equal(item.match_id, 70);
+  assert.equal(item.uk_air_ref, "UKA01234");
+  assert.equal(item.canonical_station_label, "Canonical Site");
+  assert.deepEqual(item.site_networks, [{
+    network_id: 30,
+    network_code: "breathelondon",
+    network_label: "Breathe London Nodes",
+  }, {
+    network_id: 31,
+    network_code: "gov_uk_aurn",
+    network_label: "GOV.UK AURN",
+  }]);
 
   assert.equal(Object.hasOwn(item, "station_network_memberships"), false);
   assert.equal(Object.hasOwn(item, "network_memberships"), false);
   assert.equal(Object.hasOwn(item, "network_name"), false);
   assert.equal(Object.hasOwn(item, "network_type"), false);
+});
+
+Deno.test("matched latest rows retain match identity when UK-AIR identity is unavailable", () => {
+  const metadata = fixtureMetadata();
+  metadata.stationMatchesById.set(70, {
+    id: 70,
+    uk_air_ref: null,
+    match_name: "Legacy non-canonical match",
+  });
+  const result = buildSourceRows(fixtureState(), metadata, "v2");
+  const item = result.rows[0].item as Record<string, unknown>;
+
+  assert.equal(item.match_id, 70);
+  assert.equal(item.uk_air_ref, null);
+  assert.equal(item.canonical_station_label, "Legacy non-canonical match");
+  assert.deepEqual(item.site_networks, [{
+    network_id: 30,
+    network_code: "breathelondon",
+    network_label: "Breathe London Nodes",
+  }, {
+    network_id: 31,
+    network_code: "gov_uk_aurn",
+    network_label: "GOV.UK AURN",
+  }]);
+});
+
+Deno.test("unmatched latest rows expose null canonical fields and one scalar site network", () => {
+  const metadata = fixtureMetadata();
+  const station = metadata.stationsById.get(20);
+  if (!station) throw new Error("fixture station missing");
+  station.match_id = null;
+  const result = buildSourceRows(fixtureState(), metadata, "v2");
+  const item = result.rows[0].item as Record<string, unknown>;
+
+  assert.equal(item.match_id, null);
+  assert.equal(item.uk_air_ref, null);
+  assert.equal(item.canonical_station_label, null);
+  assert.deepEqual(item.site_networks, [{
+    network_id: 30,
+    network_code: "breathelondon",
+    network_label: "Breathe London Nodes",
+  }]);
 });
 
 Deno.test("missing station network metadata is counted and skipped", () => {

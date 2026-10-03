@@ -38,10 +38,6 @@ type LatestItem = {
   network_id?: number | null;
   network_code?: string | null;
   network_label?: string | null;
-  match_id: number | null;
-  uk_air_ref: string | null;
-  canonical_station_label: string | null;
-  site_networks: SiteNetwork[];
   phenomenon_label: string | null;
   pollutant_label: string | null;
   observed_property_code: string | null;
@@ -240,24 +236,11 @@ type MetadataStation = {
   id: number;
   connector_id: number | null;
   network_id: number | null;
-  match_id: number | null;
   station_ref: string | null;
   label: string | null;
   station_name: string | null;
   pcon_code: string | null;
   la_code: string | null;
-};
-
-type MetadataStationMatch = {
-  id: number;
-  uk_air_ref: string | null;
-  match_name: string | null;
-};
-
-type SiteNetwork = {
-  network_id: number;
-  network_code: string;
-  network_label: string;
 };
 
 type MetadataNetwork = {
@@ -299,7 +282,6 @@ type CoreMetadataCacheFile = {
   source_day_utc: string | null;
   connectors: MetadataConnector[];
   stations: MetadataStation[];
-  station_matches: MetadataStationMatch[];
   networks: MetadataNetwork[];
   timeseries: MetadataTimeseries[];
   phenomena: MetadataPhenomenon[];
@@ -310,8 +292,6 @@ type MetadataIndex = {
   source_day_utc: string | null;
   connectorsById: Map<number, MetadataConnector>;
   stationsById: Map<number, MetadataStation>;
-  stationMatchesById: Map<number, MetadataStationMatch>;
-  siteNetworksByMatchId: Map<number, SiteNetwork[]>;
   networksById: Map<number, MetadataNetwork>;
   timeseriesById: Map<number, MetadataTimeseries>;
   phenomenaById: Map<number, MetadataPhenomenon>;
@@ -1079,7 +1059,6 @@ function tableKeyFromManifest(manifest: CoreSnapshotManifest, tableName: string)
 function buildMetadataIndex(cache: CoreMetadataCacheFile): MetadataIndex {
   const connectorsById = new Map<number, MetadataConnector>();
   const stationsById = new Map<number, MetadataStation>();
-  const stationMatchesById = new Map<number, MetadataStationMatch>();
   const networksById = new Map<number, MetadataNetwork>();
   const timeseriesById = new Map<number, MetadataTimeseries>();
   const phenomenaById = new Map<number, MetadataPhenomenon>();
@@ -1087,40 +1066,16 @@ function buildMetadataIndex(cache: CoreMetadataCacheFile): MetadataIndex {
 
   for (const row of cache.connectors) connectorsById.set(row.id, row);
   for (const row of cache.stations) stationsById.set(row.id, row);
-  for (const row of cache.station_matches) stationMatchesById.set(row.id, row);
   for (const row of cache.networks || []) networksById.set(row.id, row);
   for (const row of cache.timeseries) timeseriesById.set(row.id, row);
   for (const row of cache.phenomena) phenomenaById.set(row.id, row);
   for (const row of cache.observed_properties) observedPropertyById.set(row.id, row);
-
-  const siteNetworkMaps = new Map<number, Map<number, SiteNetwork>>();
-  for (const station of cache.stations) {
-    if (!station.match_id || !station.network_id) continue;
-    const network = networksById.get(station.network_id);
-    if (!network?.public_display_enabled || !network.network_code || !network.display_name) continue;
-    const byNetworkId = siteNetworkMaps.get(station.match_id) || new Map<number, SiteNetwork>();
-    byNetworkId.set(network.id, {
-      network_id: network.id,
-      network_code: network.network_code,
-      network_label: network.display_name,
-    });
-    siteNetworkMaps.set(station.match_id, byNetworkId);
-  }
-  const siteNetworksByMatchId = new Map<number, SiteNetwork[]>();
-  for (const [matchId, byNetworkId] of siteNetworkMaps) {
-    siteNetworksByMatchId.set(
-      matchId,
-      [...byNetworkId.values()].sort((a, b) => a.network_id - b.network_id),
-    );
-  }
 
 
   return {
     source_day_utc: cache.source_day_utc,
     connectorsById,
     stationsById,
-    stationMatchesById,
-    siteNetworksByMatchId,
     networksById,
     timeseriesById,
     phenomenaById,
@@ -1143,7 +1098,6 @@ function isCoreMetadataCacheFile(value: unknown): value is CoreMetadataCacheFile
     (cache.source_day_utc === null || typeof cache.source_day_utc === "string") &&
     Array.isArray(cache.connectors) &&
     Array.isArray(cache.stations) &&
-    Array.isArray(cache.station_matches) &&
     Array.isArray(cache.networks) &&
     Array.isArray(cache.timeseries) &&
     Array.isArray(cache.phenomena) &&
@@ -1208,29 +1162,11 @@ function mapStationRows(rows: Array<Record<string, unknown>>): MetadataStation[]
         const networkId = Number(row.network_id);
         return Number.isInteger(networkId) && networkId > 0 ? Math.trunc(networkId) : null;
       })(),
-      match_id: (() => {
-        const matchId = Number(row.match_id);
-        return Number.isInteger(matchId) && matchId > 0 ? Math.trunc(matchId) : null;
-      })(),
       station_ref: normalizeNonEmptyText(String(row.station_ref ?? "")),
       label: normalizeNonEmptyText(String(row.label ?? "")),
       station_name: normalizeNonEmptyText(String(row.station_name ?? "")),
       pcon_code: normalizeNonEmptyText(String(row.pcon_code ?? "")),
       la_code: normalizeNonEmptyText(String(row.la_code ?? "")),
-    });
-  }
-  return output;
-}
-
-function mapStationMatchRows(rows: Array<Record<string, unknown>>): MetadataStationMatch[] {
-  const output: MetadataStationMatch[] = [];
-  for (const row of rows) {
-    const id = Number(row.id);
-    if (!Number.isInteger(id) || id <= 0) continue;
-    output.push({
-      id: Math.trunc(id),
-      uk_air_ref: normalizeNonEmptyText(String(row.uk_air_ref ?? "")),
-      match_name: normalizeNonEmptyText(String(row.match_name ?? "")),
     });
   }
   return output;
@@ -1353,7 +1289,6 @@ async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: Me
     "connectors",
     "networks",
     "stations",
-    "station_matches",
     "timeseries",
     "phenomena",
     "observed_properties",
@@ -1379,7 +1314,6 @@ async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: Me
     source_day_utc: manifest.day_utc || latestManifestInfo.day_utc,
     connectors: mapConnectorRows(tableRows.get("connectors") || []),
     stations: mapStationRows(tableRows.get("stations") || []),
-    station_matches: mapStationMatchRows(tableRows.get("station_matches") || []),
     networks: mapNetworkRows(tableRows.get("networks") || []),
     timeseries: mapTimeseriesRows(tableRows.get("timeseries") || []),
     phenomena: mapPhenomenonRows(tableRows.get("phenomena") || []),
@@ -1640,23 +1574,6 @@ function buildSourceRows(
       network_code: network.network_code,
       network_label: network.display_name,
     };
-    const stationMatch = station?.match_id
-      ? metadata.stationMatchesById.get(station.match_id) || null
-      : null;
-    const canonicalSiteFields = stationMatch
-      ? {
-        match_id: stationMatch.id,
-        uk_air_ref: stationMatch.uk_air_ref,
-        canonical_station_label: stationMatch.match_name,
-        site_networks: (metadata.siteNetworksByMatchId.get(stationMatch.id) || [stationNetworkFields])
-          .map((entry) => ({ ...entry })),
-      }
-      : {
-        match_id: null,
-        uk_air_ref: null,
-        canonical_station_label: null,
-        site_networks: [{ ...stationNetworkFields }],
-      };
 
     const phenomenonLabel = resolvePhenomenonLabel(
       observedProperty?.display_name,
@@ -1685,7 +1602,6 @@ function buildSourceRows(
       pcon_code: station?.pcon_code ?? null,
       la_code: station?.la_code ?? null,
       ...stationNetworkFields,
-      ...canonicalSiteFields,
       phenomenon_label: phenomenonLabel,
       pollutant_label: phenomenonLabel,
       observed_property_code: pollutantNormalized,
