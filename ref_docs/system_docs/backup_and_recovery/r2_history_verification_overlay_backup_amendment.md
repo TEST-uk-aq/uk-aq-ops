@@ -16,23 +16,32 @@ only for the new verification domain.
 
 ## Mandatory backup scope
 
-Once verification-overlay authority is enabled, the normal R2 history Dropbox backup MUST include all authoritative verification connector manifests under:
+Once verification-overlay authority is enabled, the normal R2 history Dropbox backup MUST include:
 
-```text
-history/v3/verification/
-```
-
-and the compact verification discovery authority:
+1. the exact immutable connector manifests referenced by the current validated:
 
 ```text
 history/_index_v3/verification/latest.json
 ```
 
-These objects are mandatory backup payload.
+2. that exact `latest.json` object itself.
 
-Unlike the rebuildable bulk observation-timeseries exact index, connector verification manifests are canonical verification authority and MUST NOT be excluded as derived index data merely because they are JSON or live next to an index namespace.
+Connector manifests use the canonical content-addressed layout:
 
-The verification latest object is small and is also mandatory.
+```text
+history/v3/verification/
+  connector_id=<id>/
+    manifests/
+      <manifest_sha256>.json
+```
+
+The SHA encoded in each manifest key MUST agree with the exact canonical manifest bytes and with the identity pinned by latest.
+
+These referenced connector manifests are canonical verification authority and MUST NOT be excluded as rebuildable derived-index data.
+
+Unreferenced immutable connector manifests are not current verification authority. They MAY be retained in R2 or Dropbox for bounded recovery/history according to retention policy, but they are not required members of the **current** verification source-root identity merely because they exist under the verification prefix.
+
+A failed or unreadable latest object MUST fail backup closed. It MUST NOT be interpreted as an empty connector set or overlay deactivation.
 
 ## Separate root identity
 
@@ -60,11 +69,17 @@ Therefore a status-only P/R update can advance the verification backup generatio
 
 The hierarchical inventory remains the one active backup implementation.
 
-The inventory must enumerate verification connector manifests and verification latest using deterministic source identities including key, byte size and SHA-256.
+The current verification inventory MUST be derived from the validated latest object and MUST enumerate exactly:
+
+- latest key, byte size and SHA-256;
+- each connector ID referenced by latest;
+- each referenced immutable manifest key, byte size and SHA-256.
+
+The verification source-root identity MUST be computed from this authenticated current-authority set. Merely listing every object under `history/v3/verification/**` is not sufficient and MUST NOT let stale/orphaned immutable manifests alter current authority.
 
 Dropbox hierarchical checkpoint state must record successful copied/verified verification units and the completed verification source-root identity.
 
-A verification unit is complete only when the exact source identity has been copied and verified at the Dropbox destination.
+A verification unit is complete only when the exact source identity selected by latest has been copied and verified at the Dropbox destination.
 
 The existing backup-format generation paths remain unchanged. Adding a verification domain does not rename `backup_inventory_v2` or the Dropbox checkpoint generation.
 
@@ -72,30 +87,50 @@ The existing backup-format generation paths remain unchanged. Adding a verificat
 
 Verification JSON is expected to be small. No Parquet-reuse optimisation is required for this domain.
 
-Unchanged verification objects MAY be skipped when exact authenticated source/destination identity proves they already match.
+Unchanged immutable connector manifests MAY be reused when exact authenticated destination identity proves they already match.
 
-A changed verification connector manifest MUST be copied even when no observation Parquet changed.
+When a connector's current manifest changes:
 
-The verification latest object MUST be published to Dropbox only after every connector manifest identity it references is present and verified in the destination generation.
+```text
+copy/verify new immutable manifest first
+        -> keep previous Dropbox latest valid
+        -> copy/verify new latest last
+```
+
+The Dropbox latest object MUST NOT be advanced until every immutable connector manifest identity it references is present and verified at the destination.
+
+If copy stops before latest advances, the prior Dropbox latest remains valid and continues to reference the prior immutable manifest set. A newly copied but unreferenced immutable manifest is non-authoritative orphan/recovery material, not a partial current backup generation.
+
+A verification-only change MUST be copied even when no observation Parquet changed.
 
 ## Dropbox layout
 
-The Dropbox payload mirrors the R2 canonical verification paths beneath the normal history backup root:
+The Dropbox payload mirrors the canonical R2 verification identities beneath the normal history backup root:
 
 ```text
-history/v3/verification/connector_id=<id>/manifest.json
+history/v3/verification/connector_id=<id>/manifests/<manifest_sha256>.json
 history/_index_v3/verification/latest.json
 ```
+
+No mutable per-connector `manifest.json` key is part of the accepted design.
 
 No separate ad-hoc verification backup directory is introduced.
 
 ## Pruning
 
-Destination pruning for verification authority must be manifest/latest guided and fail closed.
+Destination pruning for verification authority must be latest-guided and fail closed.
 
-A connector verification manifest may be removed from current backup authority only when the current authenticated R2 verification latest authority no longer references it and the normal backup retention/recovery rules permit deletion.
+A referenced immutable connector manifest MUST never be pruned.
 
-A transport/read failure MUST NOT be interpreted as authority removal.
+An unreferenced immutable manifest MAY be pruned only when:
+
+- the current validated latest does not reference it;
+- no retained backup/recovery generation requires it;
+- the normal retention/recovery rules permit deletion.
+
+A transport/read failure, invalid latest or identity mismatch MUST NOT be interpreted as authority removal.
+
+Pruning MUST NOT overwrite or repurpose a content-addressed manifest key.
 
 ## Local materialisation
 
@@ -126,13 +161,19 @@ Restore support must include the verification domain.
 
 For verification restoration:
 
-1. restore and verify referenced connector manifests first;
-2. restore the compact verification latest object last;
-3. do not expose a latest object that references connector manifests not yet restored and verified.
+1. read and validate the source `latest.json`;
+2. restore each exact immutable connector manifest referenced by it to its SHA-addressed key;
+3. verify exact byte size, SHA-256 and key/hash agreement;
+4. restore the compact verification latest object last;
+5. verify latest exactly after publication.
+
+A restore MUST NOT expose a latest object that references connector manifests not yet restored and verified.
+
+If restoration fails before latest publication, any newly restored immutable manifests remain non-authoritative and the destination's prior valid latest MUST remain untouched where the restore mode preserves an existing destination authority.
 
 Restoring verification authority does not require rewriting observation Parquet.
 
-The generic R2 restore workflow is not considered complete for this new domain until this ordering and exact-byte verification are implemented and accepted through TEST.
+The generic R2 restore workflow is not considered complete for this new domain until this ordering, prior-latest safety and exact-byte verification are implemented and accepted through TEST.
 
 ## Backup completion evidence
 
@@ -153,11 +194,14 @@ A run that copied observations successfully but failed required verification bac
 After implementation, real TEST backup acceptance must demonstrate:
 
 - a verification-only R2 change with unchanged observation Parquet;
-- the next backup copies the changed verification authority;
+- the new connector manifest is written at an immutable SHA-addressed key;
+- the next backup copies/verifies that immutable manifest before advancing Dropbox latest;
+- an interrupted pre-latest copy leaves the previous Dropbox latest usable;
 - the observation processed-source-root remains unchanged;
-- the verification processed-source-root changes;
-- Dropbox payload identities match R2;
-- local materialisation can authenticate the changed verification files;
-- restore into an isolated TEST target publishes connector manifests before verification latest and reproduces exact identities.
+- the verification processed-source-root changes only when current verification authority changes;
+- adding an unreferenced orphan manifest alone does not change the current verification source-root;
+- Dropbox payload identities match R2 latest and referenced manifests exactly;
+- local materialisation can authenticate the changed latest and referenced immutable manifests;
+- restore into an isolated TEST target publishes referenced manifests before latest and reproduces exact identities.
 
 No broad speculative pre-deployment test suite is required.
