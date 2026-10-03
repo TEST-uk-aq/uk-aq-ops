@@ -22,6 +22,8 @@ Any canonical observation/Parquet output from SOS-light uses
 `vstatus` is permitted only as temporary read compatibility for already-written
 erroneous TEST objects, never as current output.
 
+The future [observation verification overlay contract](observation_verification_overlay_contract.md) changes that persistence boundary after connector `1` overlay cut-over. UK-AIR CSV P/R remains authoritative source evidence, but new Parquet becomes measurement-only and SOS P/R is collapsed into verification periods. A P/R-only change must update the overlay rather than force a complete-day observation rewrite. Until that transition is deployed and accepted, the current persisted-field rule above remains runtime authority.
+
 ## Operator entrypoint
 
 The operator continues to use:
