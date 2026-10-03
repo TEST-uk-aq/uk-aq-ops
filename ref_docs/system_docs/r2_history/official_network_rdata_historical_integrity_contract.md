@@ -125,9 +125,11 @@ A missing, duplicate or ambiguous authoritative binding for a non-empty selected
 
 OpenAir hourly RData uses a date-beginning convention, while the public network portal convention may be hour-ending.
 
-The historical adapter MUST explicitly normalise the source timestamp to the canonical `observed_at_utc` semantic already used by UK AQ for connector `9` and connector `10`.
+The current WAQN/SAQN live site adapter interprets Ricardo graph timestamp calendar/time components as `Europe/London` wall-clock time and converts them to UTC before persistence. That live-source rule is authoritative under [`../ingest/waqn_saqn_ni_connector_contract.md`](../ingest/waqn_saqn_ni_connector_contract.md).
 
-It MUST NOT assume that the raw RData timestamp is already the correct persisted UK AQ timestamp.
+The historical adapter MUST explicitly normalise the RData source timestamp to the same canonical `observed_at_utc` semantic used by UK AQ for connector `9` and connector `10`.
+
+It MUST NOT assume that the raw RData timestamp is already the correct persisted UK AQ timestamp. The live graph's `Europe/London` interpretation does not, by itself, resolve the separate RData date-beginning/hour-ending alignment question.
 
 Before implementation of the timestamp normaliser is finalised, one narrow targeted alignment check is genuinely required:
 
@@ -140,13 +142,7 @@ This is a structural source-boundary check, not a broad pre-implementation test 
 
 ## Verification status
 
-Canonical persisted naming remains owned by [`observation_history_schema_contract.md`](observation_history_schema_contract.md). The only persisted field name is:
-
-```text
-verification_status
-```
-
-WAQN and SAQN verification status is derived from the network metadata row for the same:
+WAQN and SAQN verification source semantics are derived from the network metadata row for the same:
 
 ```text
 site_id + parameter
@@ -161,21 +157,21 @@ ratified_to
 For a valid non-null observation with an unambiguous metadata row:
 
 ```text
-observation calendar date <= ratified_to -> verification_status = R
-observation calendar date >  ratified_to -> verification_status = P
+observation calendar date <= ratified_to -> R
+observation calendar date >  ratified_to -> P
 ```
 
 The comparison is by UTC calendar date. A valid `ratified_to` date covers the whole stated day.
 
-If the selected mapped pollutant has an explicit non-date status such as `Never`, or a missing `ratified_to`, the observation MUST NOT be claimed as ratified. It is provisional (`P`) and the condition is recorded in source audit evidence.
+Under the future [observation verification overlay contract](observation_verification_overlay_contract.md), these statuses are not persisted on each WAQN/SAQN Parquet row. The RData adapter retains `ratified_to` as pinned source provenance and publishes the equivalent canonical verification periods into the connector verification manifest. A change that only advances `ratified_to` updates that verification authority and MUST NOT rewrite otherwise unchanged observation Parquet or observation exact indexes.
 
-A missing or ambiguous metadata row for a selected mapped pollutant is a source-mapping defect and fails that selected group closed.
+If the selected mapped pollutant has an explicit non-date status such as `Never`, or a missing `ratified_to`, the mapped timeseries is provisional (`P`) for verification-overlay purposes and the condition is recorded in source audit evidence. A missing or ambiguous metadata row for a selected mapped pollutant remains a source-mapping defect and fails that selected group closed.
 
 Meteorological fields such as wind direction, wind speed and temperature are not made UK AQ pollutant history merely because they are present in the RData workspace.
 
-Every new Integrity run MUST re-read the pinned current metadata file for its source view so later source ratification can upgrade otherwise unchanged observations from `P` to `R`.
+Every new verification refresh MUST re-read and pin the current metadata file so later source ratification can advance effective status from `P` to `R` without observation-data mutation.
 
-An identical observation already established as `R` MUST NOT be silently downgraded to `P` because a later metadata file unexpectedly regresses or loses its previous ratification boundary. Such a regression is contradictory source evidence and MUST be surfaced rather than silently weakening verified history.
+An accepted effective `R` state MUST NOT be silently downgraded to `P` because a later metadata file unexpectedly regresses or loses its previous ratification boundary. A backwards `ratified_to` movement is contradictory source evidence and fails closed pending explicit review/repair authority.
 
 ## Integrity integration
 
