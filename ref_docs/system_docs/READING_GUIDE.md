@@ -31,6 +31,18 @@ When the administrative egress panel is also in scope, add:
 
 Monitoring owns measurement and attribution semantics. Dashboards own dashboard delivery and integration. Do not load monitoring interfaces, data flow, operations and validation unless the selected monitoring route actually requires them.
 
+## Canonical physical station identity, Latest Snapshot and Hex Map
+
+For the future cross-connector physical-site identity layer, start with [`station_identity/README.md`](station_identity/README.md).
+
+When the task assigns WAQN, SAQN or Northern Ireland source stations to a canonical UK-AIR site, also read [`ingest/waqn_saqn_ni_connector_contract.md`](ingest/waqn_saqn_ni_connector_contract.md). The connector contract owns source station identity and acquisition. The station-identity area owns the separate physical-site relationship.
+
+When the task exposes that relationship in current public rows, add [`latest_snapshot/canonical-site-projection-contract.md`](latest_snapshot/canonical-site-projection-contract.md). Latest Snapshot keeps source rows and provenance separate while projecting canonical identity and site-network membership additively.
+
+When the task changes Hex Map deduplication, network filtering, sensor counts, averages or the visible multi-network sensor identity, add [`website_ui/hex-map-canonical-site-contract.md`](website_ui/hex-map-canonical-site-contract.md).
+
+For schema changes, also follow the shared-schema route below. Do not infer physical-site identity in the browser from station names or coordinates.
+
 ## Shared schema and database promotion
 
 For Supabase/PostgreSQL database objects, RPC signatures, canonical schema files, existing-database migrations or runtime code that depends on a changed database contract, start with:
