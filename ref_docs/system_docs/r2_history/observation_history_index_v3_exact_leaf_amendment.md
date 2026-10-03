@@ -157,6 +157,37 @@ The selected decode profile remains `hyparquet-direct-column-v1` only where that
 
 If the low-level API exposes physical schema/writer diagnostics, a mixed request MUST report the actual unique selected physical identities deterministically. It MUST NOT label a mixed response globally as only v3 or only v4.
 
+### Mixed-schema physical cursor identity
+
+The current pre-overlay exact reader uses physical cursor schema version `2`, whose request identity includes one request-wide writer identity.
+
+That representation is not sufficient once one logical request may traverse schema-3 and schema-4 scopes.
+
+When mixed-schema support is activated, the exact reader MUST advance the private physical cursor to schema version:
+
+```text
+3
+```
+
+Cursor v3 keeps request-wide logical/index/layout identity at request level, but physical schema/writer identity moves into the pinned per-scope discovery state.
+
+Each validated scope carried by the cursor MUST pin at least:
+
+```text
+history_schema_version
+writer_version
+physical_layout_version
+decode_profile_id
+```
+
+and any additional exact physical identity needed by the selected reader.
+
+The next-segment identity MUST be validated against the physical identity pinned for its own scope. A cursor MUST NOT carry one schema/writer identity and apply it to another scope.
+
+Because physical cursors are private, short-lived low-level plumbing rather than durable public API state, deployment of the mixed-schema reader MAY invalidate outstanding cursor-v2 continuations. It MUST fail such stale cursors closed rather than reinterpret them.
+
+Before mixed-schema reader cut-over, cursor v2 remains current runtime authority.
+
 ## Parquet physical identity gate
 
 Before any indexed Parquet byte range is read, the runtime MUST establish that the object is the exact physical object pinned by the leaf/index evidence.
@@ -216,7 +247,7 @@ It MUST:
 - fail closed for malformed, cross-request, stale-index, stale-leaf, stale-coordinate or out-of-root state;
 - never permit cursor-supplied object keys to bypass deterministic configured roots and leaf-key rules.
 
-The selected cursor schema is version 2.
+The selected current pre-overlay cursor schema is version 2. The future mixed-schema verification-overlay transition explicitly advances this private cursor to version 3 under the mixed-schema amendment above.
 
 A separate cryptographic signature is not required while the low-level route remains protected by the established upstream-auth boundary and all routing/identity fields are independently validated. Authentication does not make cursor content trusted.
 
