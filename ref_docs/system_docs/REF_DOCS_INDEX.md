@@ -26,6 +26,7 @@ Base snapshot date:
 
 Task-specific refresh:
 
+- `ref_docs/system_docs/SYSTEM_OVERVIEW.md`, `READING_GUIDE.md`, the new `station_identity/` area, the WAQN/SAQN/NI connector route, the Latest Snapshot canonical-site projection route and the Hex Map canonical-site route were refreshed/added from authoritative source commit `8b79537cacd65934bc9ca722206e7455f61732e1` on `03/10/2026`. This defines the future TEST-first UK-AIR physical-site identity model using `station_matches` / `stations.match_id`, preserves source connector/network provenance, adds canonical Latest Snapshot projection fields and requires Hex Map physical-site deduplication without double-weighting overlapping AURN/devolved feeds.
 - `ref_docs/system_docs/dashboards/media_dashboard_contract.md` was refreshed from authoritative source commit `cc52669d6dabea44f851f8dc7d404e4c074682b8` on `02/10/2026` to make Article Status the first article-detail section, move Image policy below Display title, and use source-wide permission evidence plus an article confirmation checkbox without a duplicate article-level basis note.
 - `ref_docs/system_docs/dashboards/README.md` and `ref_docs/system_docs/dashboards/daily_task_warning_status_contract.md` were refreshed from authoritative source commit `bc14d60ddee0996a2765d3f84ba69ed9025fa94f` on `23/09/2026`.
 - `ref_docs/system_docs/SYSTEM_OVERVIEW.md`, `ref_docs/system_docs/observs_operations/README.md` and `ref_docs/system_docs/observs_operations/partition_maintenance.md` were refreshed from authoritative source commit `223a129526d6ffeba734d013b52a806c2d7c1de6` on `23/09/2026`.
@@ -71,6 +72,7 @@ This snapshot intentionally contains the contracts needed for current TEST ops w
 - GCP Cloud Logging analysis archive source/archive/redaction identity, quota-safe retrieval, publication, checkpoint and recovery behaviour;
 - Observs partition maintenance, including selected-generation R2 day-manifest deletion authority, fail-closed retention behaviour and TEST acceptance;
 - operator-execution progress, persistent run-log and structured-run-report behaviour for qualifying local scripts.
+- future canonical physical-site identity across AURN and WAQN/SAQN/NI, including Latest Snapshot projection and Hex Map deduplication/presentation.
 
 It is intentionally not a complete copy of all UK AQ system documentation.
 

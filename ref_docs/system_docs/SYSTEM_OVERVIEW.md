@@ -29,6 +29,7 @@ A normal coding task should enter through the relevant area below rather than re
 | Task or subsystem | Start here | Status |
 |---|---|---|
 | Connector ingest, Daily Stations discovery, Breathe London reference discovery, UK-AIR SOS polling/fallback | [`ingest/README.md`](ingest/README.md) | Active current runtime; also routes explicitly labelled future Breathe London Communities discovery and shared reference recovery, high-frequency and UK-AIR Black Carbon contracts |
+| Canonical physical monitoring-site identity across connector/network representations | [`station_identity/README.md`](station_identity/README.md) | Future implementation authority; TEST-first, not current runtime |
 | Latest snapshot builder and current snapshot/API boundary | [`latest_snapshot/README.md`](latest_snapshot/README.md) | Active |
 | Canonical observation history, timeseries continuity, history indexes and current History Integrity repair | [`r2_history/README.md`](r2_history/README.md) | Active; also routes explicitly labelled future WAQN/SAQN RData historical Integrity authority, future SOS-light stable-fallback authority, future Black Carbon direct-R2 history authority, future fixed-v2 SOS-light coordinator hardening authority and future fixed-v2 pre-mutation lock-recovery authority |
 | Future dedicated Integrity Factory architecture | [`integrity_factory/README.md`](integrity_factory/README.md) | Future implementation authority; not current Integrity runtime |
@@ -66,6 +67,7 @@ Start with the primary area, then use [`READING_GUIDE.md`](READING_GUIDE.md) whe
 - R2 history plus station charts;
 - website deployment plus website UI;
 - database/schema promotion plus runtime code;
+- canonical station identity plus ingest, Latest Snapshot and Hex Map presentation;
 - WHO calculation plus cache proxy;
 - monitoring plus dashboards;
 - R2 history plus backup/recovery;
