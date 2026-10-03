@@ -8,6 +8,8 @@ Until that future model is deployed and accepted through real TEST operation, th
 
 After connector-scoped overlay cut-over, the overlay contract is authoritative for the new six-column physical schema, measurement-only content hash and reader derivation of effective `verification_status`. Existing seven-column schema-version-3 Parquet remains readable legacy measurement history and does not require a whole-archive rewrite solely to remove the embedded status field.
 
+Because cut-over is connector-scoped and old Parquet is retained, a normal logical history read may span both schema-version-3 and schema-version-4 physical objects. Readers MUST validate the physical identity selected by each authoritative scope/file rather than impose one request-wide schema/writer identity. The exact-v3 mixed-scope rules are owned by the verification-overlay and exact-leaf contracts.
+
 ## Purpose
 
 This contract is the authoritative UK AQ definition of
