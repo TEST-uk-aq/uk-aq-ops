@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Build a local canonical v2 or v3 proposal from already pinned/decoded RData rows.
+// Build a local canonical v2 proposal from already pinned/decoded RData rows.
 // This helper has no R2 client and cannot publish; the Integrity coordinator
 // retains ownership of APPLY and final verification.
 
@@ -13,13 +13,6 @@ import {
 import {
   ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
 } from "../../../../workers/shared/uk_aq_observation_history_writer_limits_v3.mjs";
-import {
-  getObservationHistoryGeneration,
-} from "../../../../workers/shared/uk_aq_observation_history_generation.mjs";
-import {
-  buildObservationHistoryV3SteadyStatePartition,
-  OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES,
-} from "../../../../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
 import {
   buildHistoryV2ConnectorManifest,
   buildHistoryV2ConnectorManifestKey,
@@ -88,21 +81,11 @@ function contentHashMetadata(metadata) {
 }
 
 function main() {
-  const [inputPath, stageRoot, observationsPrefix, writerGitSha, generationArg] = process.argv.slice(2);
+  const [inputPath, stageRoot, observationsPrefix, writerGitSha] = process.argv.slice(2);
   if (!inputPath || !stageRoot || !observationsPrefix || !/^[0-9a-f]{40}$/.test(writerGitSha || "")) {
-    throw new Error("usage: official_network_rdata_proposal.mjs INPUT STAGE_ROOT PREFIX WRITER_GIT_SHA GENERATION");
+    throw new Error("usage: official_network_rdata_proposal.mjs INPUT STAGE_ROOT PREFIX WRITER_GIT_SHA");
   }
   const input = JSON.parse(fs.readFileSync(inputPath, "utf8"));
-  const historyGeneration = String(generationArg || input.history_generation || "").trim();
-  if (historyGeneration !== String(input.history_generation || "").trim()) {
-    throw new Error("proposal generation argument disagrees with the pinned input");
-  }
-  const generation = getObservationHistoryGeneration(historyGeneration);
-  if (observationsPrefix !== generation.observations_prefix) {
-    throw new Error(
-      `proposal observations prefix does not belong to ${historyGeneration}: ${observationsPrefix}`,
-    );
-  }
   const dayUtc = String(input.day_utc || "");
   const connectorId = Number(input.connector_id);
   const sourceAdapter = String(input.source_adapter || "");
@@ -134,61 +117,38 @@ function main() {
   for (const pollutantCode of requestedPollutants) {
     const pollutantRows = rows.filter((row) => row.pollutant_code === pollutantCode);
     if (pollutantRows.length === 0) continue;
-    let targetMetadata;
-    let manifest;
-    let manifestKey;
-    if (historyGeneration === "v3") {
-      const prepared = buildObservationHistoryV3SteadyStatePartition({
-        source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.integrity,
-        rows: pollutantRows,
-        scope: { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode },
-        targetWriterGitSha: writerGitSha,
-        backedUpAtUtc,
-        observationsPrefix,
-      });
-      for (const intent of prepared.file_intents) {
-        writeObject(stageRoot, intent.key, intent.body);
-      }
-      targetMetadata = prepared.target_metadata;
-      manifestKey = prepared.canonical_pollutant_manifest.key;
-      manifest = prepared.canonical_pollutant_manifest.payload;
-      writeObject(stageRoot, manifestKey, prepared.canonical_pollutant_manifest.body);
-    } else {
-      const target = buildCanonicalObservationTimeseriesAlignedFiles(pollutantRows, {
-        limits: ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
-        partition: { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode },
-        fileKeyForOrdinal: (ordinal) => buildHistoryV2PartKey(
-          observationsPrefix, dayUtc, connectorId, pollutantCode, ordinal,
-        ),
-      });
-      targetMetadata = target.metadata;
-      for (const file of target.file_bodies) writeObject(stageRoot, file.key, file.body);
-      manifestKey = buildHistoryV2PollutantManifestKey(
-        observationsPrefix, dayUtc, connectorId, pollutantCode,
-      );
-      const v2HashMetadata = contentHashMetadata(targetMetadata);
-      manifest = buildHistoryV2PollutantManifest({
-        domain: "observations",
-        dayUtc,
-        connectorId,
-        pollutantCode,
-        runId: null,
-        manifestKey,
-        sourceRowCount: targetMetadata.row_count,
-        fileEntries: targetMetadata.files.map((file) => fileEntry(file, pollutantCode)),
-        writerGitSha,
-        backedUpAtUtc,
-        observationContentHash: v2HashMetadata,
-        physicalSchema: {
-          history_schema_version: targetMetadata.history_schema_version,
-          columns: [...targetMetadata.columns],
-          writer_version: targetMetadata.writer_version,
-        },
-      });
-      writeObject(stageRoot, manifestKey, Buffer.from(JSON.stringify(manifest, null, 2), "utf8"));
-    }
-    const hashMetadata = contentHashMetadata(targetMetadata);
+    const target = buildCanonicalObservationTimeseriesAlignedFiles(pollutantRows, {
+      limits: ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
+      partition: { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode },
+      fileKeyForOrdinal: (ordinal) => buildHistoryV2PartKey(
+        observationsPrefix, dayUtc, connectorId, pollutantCode, ordinal,
+      ),
+    });
+    for (const file of target.file_bodies) writeObject(stageRoot, file.key, file.body);
+    const manifestKey = buildHistoryV2PollutantManifestKey(
+      observationsPrefix, dayUtc, connectorId, pollutantCode,
+    );
+    const hashMetadata = contentHashMetadata(target.metadata);
     observationContentHashes[pollutantCode] = hashMetadata;
+    const manifest = buildHistoryV2PollutantManifest({
+      domain: "observations",
+      dayUtc,
+      connectorId,
+      pollutantCode,
+      runId: null,
+      manifestKey,
+      sourceRowCount: target.metadata.row_count,
+      fileEntries: target.metadata.files.map((file) => fileEntry(file, pollutantCode)),
+      writerGitSha,
+      backedUpAtUtc,
+      observationContentHash: hashMetadata,
+      physicalSchema: {
+        history_schema_version: target.metadata.history_schema_version,
+        columns: [...target.metadata.columns],
+        writer_version: target.metadata.writer_version,
+      },
+    });
+    writeObject(stageRoot, manifestKey, Buffer.from(JSON.stringify(manifest, null, 2), "utf8"));
     pollutantManifests.push(manifest);
   }
   if (pollutantManifests.length === 0) throw new Error("canonical proposal contains no rows");
@@ -266,7 +226,6 @@ function main() {
   const evidence = {
     schema_version: 1,
     ...evidenceInput,
-    history_generation: historyGeneration,
     source_evidence_input_sha256: sha256(Buffer.from(canonicalJson(evidenceInput), "utf8")),
     enumeration_complete: true,
     files_enumerated: requiredSourceFiles,
