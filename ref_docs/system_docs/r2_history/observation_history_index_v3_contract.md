@@ -82,17 +82,10 @@ Rollback is operational, not hybrid. A rollback restores the archived/recoverabl
 
 A physical rewrite MUST preserve the canonical logical observation contract.
 
-At minimum, canonical logical identity continues to include the fields already governed by the active v2 contracts, including:
-
-```text
-connector_id
-station_id
-timeseries_id
-pollutant_code
-observed_at_utc
-value
-verification_status
-```
+The canonical logical row and exact field names are governed by the
+[observation-history schema contract](observation_history_schema_contract.md).
+Exact-v3 code MUST use those logical fields and MUST NOT introduce `vstatus` as
+a competing current field.
 
 The deterministic `observation_content_hash` remains independent of physical representation.
 
@@ -146,6 +139,20 @@ observation-timeseries index generation = v3
 ```
 
 A later packing-only change MAY advance `physical_layout_version` without implying a new logical history version or observation-timeseries index generation, provided the active reader/index contract explicitly supports that layout.
+
+## Future verification-overlay physical-schema transition
+
+The future [observation verification overlay contract](observation_verification_overlay_contract.md) adds physical schema version `4` / writer `parquet-wasm-zstd-v4` while preserving existing schema-version-3 objects.
+
+That transition does not create a new observation-history generation or exact-index generation.
+
+After schema-4 writer cut-over begins, the v3 exact index and reader MUST permit supported physical schema identities to differ by authoritative day/connector/pollutant scope and physical file.
+
+A logical read spanning multiple scopes MUST NOT require all selected scopes to share one schema/writer identity. Each scoped manifest and exact child/leaf remains responsible for pinning the physical identity of the files it references.
+
+The more specific mixed-scope reader rules live in [`observation_history_index_v3_exact_leaf_amendment.md`](observation_history_index_v3_exact_leaf_amendment.md).
+
+Existing wording in this contract that describes schema version 3 as the current physical identity remains current-runtime authority until overlay cut-over. It MUST NOT be interpreted as prohibiting the explicitly contracted future schema-3/schema-4 coexistence.
 
 ## Deterministic physical ordering and timeseries contiguity
 
