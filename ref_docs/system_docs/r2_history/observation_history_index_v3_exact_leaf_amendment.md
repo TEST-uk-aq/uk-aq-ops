@@ -27,6 +27,10 @@ For the selected v3 design, this amendment specifically supersedes older wording
 
 The logical observation-history version remains v2. This amendment does not change canonical row meaning or multiplicity, `observation_content_hash`, verification status semantics, timeseries-binding/continuity authority, AQI algorithms, Integrity source authority, backup/rollback ownership or Prune Daily deletion gates.
 
+The [observation-history schema contract](observation_history_schema_contract.md)
+owns observation field names; this amendment owns exact-leaf physical and index
+fields such as `byte_size`, `sha256` and `row_count`.
+
 ## Selected physical layout
 
 The selected v3 observation physical layout is:
@@ -123,6 +127,35 @@ hyparquet-direct-column-v1
 ```
 
 A request MUST fail closed for an unsupported writer/layout/decode-profile combination rather than falling back to broad whole-object decoding, runtime footer discovery, `_index_v2`, or a different physical layout.
+
+## Future schema-4 mixed-scope read amendment
+
+The future verification-overlay transition introduces observation physical schema version `4` / writer `parquet-wasm-zstd-v4` without rewriting all existing schema-version-3 history.
+
+Therefore the exact-v3 reader MUST support mixed physical schema identities across the UTC scopes selected by one logical request.
+
+The authoritative physical identity is carried by each selected scoped manifest / exact leaf / file. It is not one request-global constant.
+
+A request that spans two UTC-day scopes may validly select:
+
+```text
+scope A -> schema 3 / parquet-wasm-zstd-v3
+scope B -> schema 4 / parquet-wasm-zstd-v4
+```
+
+provided both identities are individually supported and all exact-leaf/file evidence is internally consistent.
+
+The reader MUST:
+
+- derive the physical schema/writer identity independently for each selected scope;
+- validate child/leaf/file/footer-or-byte-range evidence against that scope's identity;
+- decode only the projected `observed_at_utc` and `value` columns required by this contract;
+- preserve physical-cursor continuation across a schema boundary by pinning the next scope's own identity rather than a request-wide schema constant;
+- fail closed on unsupported, contradictory or cross-scope-substituted physical identity.
+
+The selected decode profile remains `hyparquet-direct-column-v1` only where that profile is explicitly valid for the selected schema/writer identity. Supporting schema 4 does not authorise fallback to footer discovery, broad whole-file reads, `_index_v2`, or another decode profile.
+
+If the low-level API exposes physical schema/writer diagnostics, a mixed request MUST report the actual unique selected physical identities deterministically. It MUST NOT label a mixed response globally as only v3 or only v4.
 
 ## Parquet physical identity gate
 
