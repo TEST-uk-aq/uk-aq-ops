@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
+import * as arrow from "apache-arrow";
+import * as parquetWasm from "parquet-wasm/esm";
 
 import {
   buildObservationHistoryIndexV3ScopedHierarchy,
@@ -23,6 +25,9 @@ import {
 import {
   buildCanonicalObservationTimeseriesBoundedFiles,
 } from "../workers/shared/uk_aq_observation_history_target_writer.mjs";
+import {
+  resolveEffectiveObservationVerificationStatus,
+} from "../workers/shared/uk_aq_observation_verification_overlay.mjs";
 
 const WRITER_LIMITS = Object.freeze({
   target_row_group_rows: 2,
@@ -34,6 +39,7 @@ const WRITER_LIMITS = Object.freeze({
   max_row_groups_per_file: 2,
 });
 const LEGACY_LAYOUT = "timeseries-bounded-v1";
+const SCHEMA_V4_WRITER = "parquet-wasm-zstd-v4";
 
 function asLegacyReaderFixtureMetadata(metadata, replacementShaByKey) {
   const segment = (value) => ({
@@ -59,6 +65,31 @@ function asLegacyReaderFixtureMetadata(metadata, replacementShaByKey) {
 
 function sha256(body) {
   return createHash("sha256").update(body).digest("hex");
+}
+
+function serializeSchema4Rows(rows, rowGroupRows) {
+  const table = arrow.tableFromArrays({
+    connector_id: arrow.vectorFromArray(rows.map((row) => row.connector_id), new arrow.Int32()),
+    station_id: arrow.vectorFromArray(rows.map((row) => row.station_id), new arrow.Int32()),
+    timeseries_id: arrow.vectorFromArray(rows.map((row) => row.timeseries_id), new arrow.Int32()),
+    pollutant_code: arrow.vectorFromArray(rows.map((row) => row.pollutant_code), new arrow.Utf8()),
+    observed_at_utc: arrow.vectorFromArray(
+      rows.map((row) => new Date(row.observed_at_utc)),
+      new arrow.TimestampMillisecond(),
+    ),
+    value: arrow.vectorFromArray(rows.map((row) => row.value), new arrow.Float64()),
+  });
+  const properties = new parquetWasm.WriterPropertiesBuilder()
+    .setCompression(parquetWasm.Compression.ZSTD)
+    .setMaxRowGroupSize(rowGroupRows)
+    .setCreatedBy([
+      `writer_version=${SCHEMA_V4_WRITER}`,
+      "history_schema_version=4",
+      `physical_layout_version=${LEGACY_LAYOUT}`,
+    ].join(";"))
+    .build();
+  const wasmTable = parquetWasm.Table.fromIPCStream(arrow.tableToIPC(table, "stream"));
+  return Buffer.from(parquetWasm.writeParquet(wasmTable, properties));
 }
 
 function hexBytes(value) {
@@ -165,9 +196,104 @@ function buildDay(dayUtc, valueOffset = 0) {
   return built;
 }
 
-function buildFixture() {
-  const days = [buildDay("2026-08-18", 0), buildDay("2026-08-19", 10)];
-  const unusedDay = buildDay("2026-08-20", 20);
+function buildSchema4Day(dayUtc, valueOffset = 0) {
+  const rows = dayRows(dayUtc, valueOffset);
+  const built = buildScopedDay(dayUtc, rows);
+  const orderedRows = [...rows].sort((left, right) =>
+    left.timeseries_id - right.timeseries_id ||
+    left.observed_at_utc.localeCompare(right.observed_at_utc)
+  );
+  const replacements = new Map();
+  let rowOffset = 0;
+  const files = built.phase1.metadata.files.map((file) => {
+    const fileRows = orderedRows.slice(rowOffset, rowOffset + file.row_count);
+    rowOffset += file.row_count;
+    const body = serializeSchema4Rows(fileRows, file.row_groups[0].row_count);
+    const replacement = {
+      ...file,
+      byte_size: body.byteLength,
+      sha256: sha256(body),
+      history_schema_version: 4,
+      writer_version: SCHEMA_V4_WRITER,
+    };
+    replacements.set(file.key, { body, metadata: replacement });
+    return replacement;
+  });
+  built.phase1.file_bodies = built.phase1.file_bodies.map(({ key }) => ({
+    key,
+    body: replacements.get(key).body,
+  }));
+  built.phase1.metadata = {
+    ...built.phase1.metadata,
+    history_schema_version: 4,
+    writer_version: SCHEMA_V4_WRITER,
+    columns: [
+      "connector_id",
+      "station_id",
+      "timeseries_id",
+      "pollutant_code",
+      "observed_at_utc",
+      "value",
+    ],
+    files,
+  };
+
+  const childPayload = structuredClone(built.child.payload);
+  childPayload.history_schema_version = 4;
+  childPayload.writer_version = SCHEMA_V4_WRITER;
+  childPayload.files = childPayload.files.map((file) => {
+    const replacement = replacements.get(file.key).metadata;
+    return {
+      ...file,
+      byte_size: replacement.byte_size,
+      sha256: replacement.sha256,
+      history_schema_version: 4,
+      writer_version: SCHEMA_V4_WRITER,
+    };
+  });
+  const childBody = encodeObservationHistoryIndexV3Json(childPayload);
+  const child = {
+    ...built.child,
+    payload: childPayload,
+    body: childBody,
+    byte_size: Buffer.byteLength(childBody),
+    sha256: sha256(childBody),
+  };
+
+  const scopedPayload = structuredClone(built.hierarchy.scoped_manifest.payload);
+  scopedPayload.history_schema_version = 4;
+  scopedPayload.writer_version = SCHEMA_V4_WRITER;
+  const descriptor = scopedPayload.children.find((entry) => entry.key === child.key);
+  Object.assign(descriptor, {
+    byte_size: child.byte_size,
+    sha256: child.sha256,
+    files: childPayload.files.map(({ key, byte_size, sha256: fileSha256 }) => ({
+      key,
+      byte_size,
+      sha256: fileSha256,
+    })),
+  });
+  const scopedBody = encodeObservationHistoryIndexV3Json(scopedPayload);
+  const scopedManifest = {
+    ...built.hierarchy.scoped_manifest,
+    payload: scopedPayload,
+    body: scopedBody,
+    byte_size: Buffer.byteLength(scopedBody),
+    sha256: sha256(scopedBody),
+  };
+  built.child = child;
+  built.hierarchy = {
+    ...built.hierarchy,
+    child_shards: [child],
+    scoped_manifest: scopedManifest,
+  };
+  return built;
+}
+
+function buildFixture({
+  days = [buildDay("2026-08-18", 0), buildDay("2026-08-19", 10)],
+  unusedDay = buildDay("2026-08-20", 20),
+} = {}) {
   const indexObjects = new Map();
   const files = new Map();
   for (const fixtureDay of [...days, unusedDay]) {
@@ -294,6 +420,8 @@ test("v3 exact reader follows Phase 1 segments across row groups, files, and day
   assert.equal(result.response_complete, true);
   assert.equal("workload" in result.diagnostics, false);
   assert.equal(result.has_gap, false);
+  assert.equal(result.physical_schema.history_schema_version, 3);
+  assert.deepEqual(result.physical_schemas.map((schema) => schema.history_schema_version), [3]);
   assert.equal(result.rows.length, 10);
   assert.deepEqual(
     result.rows.map((row) => row.timeseries_id),
@@ -358,6 +486,80 @@ test("v3 exact reader follows Phase 1 segments across row groups, files, and day
       "2026-08-19T00:02:00.000Z",
     ],
   );
+});
+
+test("long-range v3 reader validates and decodes mixed schema-3/schema-4 UTC scopes", async () => {
+  const older = buildDay("2026-08-18", 0);
+  const newer = buildSchema4Day("2026-08-19", 10);
+  const fixture = buildFixture({ days: [older, newer] });
+  const footerCache = createObservationHistoryV3FooterCache();
+  const result = await query(fixture.source, { footerCache });
+
+  assert.equal(result.response_complete, true);
+  assert.equal(result.has_gap, false);
+  assert.equal(result.physical_schema, null);
+  assert.deepEqual(result.physical_schemas.map((schema) => [
+    schema.history_schema_version,
+    schema.writer_version,
+    schema.columns.length,
+  ]), [
+    [3, "parquet-wasm-zstd-v3", 7],
+    [4, SCHEMA_V4_WRITER, 6],
+  ]);
+  assert.deepEqual(
+    result.rows.slice(0, 5).map((row) => row.verification_status),
+    [null, "P", null, "P", null],
+  );
+  assert.deepEqual(
+    result.rows.slice(5).map((row) => row.verification_status),
+    [null, null, null, null, null],
+  );
+
+  const authority = {
+    overlay_authoritative: true,
+    manifest: {
+      timeseries: [{ timeseries_id: 100, default_status: "R", periods: [] }],
+    },
+  };
+  assert.deepEqual(result.rows.map((row) =>
+    resolveEffectiveObservationVerificationStatus({
+      authority,
+      timeseriesId: 100,
+      observedAtUtc: row.observed_at_utc,
+      legacyStatus: row.verification_status,
+    })), Array(10).fill("R"));
+
+  const schema3File = older.child.payload.files[0];
+  const schema3CacheKey = observationHistoryV3FooterCacheKey(schema3File);
+  const schema4CacheKey = observationHistoryV3FooterCacheKey({
+    ...schema3File,
+    history_schema_version: 4,
+    writer_version: SCHEMA_V4_WRITER,
+  });
+  assert.notEqual(
+    schema3CacheKey,
+    schema4CacheKey,
+    "the same bytes/size cannot share a footer-cache identity across schema/writer pairs",
+  );
+  const isolatedFooterCache = createObservationHistoryV3FooterCache();
+  isolatedFooterCache.set(schema3CacheKey, { schema: 3 });
+  assert.equal(isolatedFooterCache.get(schema4CacheKey), null);
+
+  const contradictory = buildFixture({ days: [older, buildSchema4Day("2026-08-19", 10)] });
+  const scopedKey = contradictory.days[1].hierarchy.scoped_manifest.key;
+  const scopedPayload = structuredClone(
+    contradictory.days[1].hierarchy.scoped_manifest.payload,
+  );
+  scopedPayload.writer_version = "parquet-wasm-zstd-v3";
+  contradictory.indexObjects.set(
+    scopedKey,
+    encodeObservationHistoryIndexV3Json(scopedPayload),
+  );
+  await assert.rejects(
+    query(contradictory.source),
+    /physical identity is invalid/,
+  );
+  assert.equal(contradictory.observations.opened.length, 0);
 });
 
 test("v3 exact reader reports debug-gated workload shape without extra reads", async () => {
@@ -440,8 +642,7 @@ test("v3 footer cache is content-identity scoped and still re-verifies file iden
     history_schema_version: file.history_schema_version,
     writer_version: file.writer_version,
     physical_layout_version: file.physical_layout_version,
-    parquet_footer_identity: "created_by",
-    parquet_created_by: "different-created-by-policy",
+    parquet_footer_identity: "uk_aq_schema_metadata",
   };
   assert.notEqual(
     observationHistoryV3FooterCacheKey(file),

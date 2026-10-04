@@ -152,52 +152,6 @@ function normalizePhysicalIdentity(raw = DEFAULT_PHYSICAL_IDENTITY) {
   return Object.freeze(identity);
 }
 
-function normalizePhysicalIdentityCompatibility(raw = DEFAULT_PHYSICAL_IDENTITY) {
-  const legacyDefault = normalizePhysicalIdentity(raw);
-  return Object.freeze({
-    physical_layout_version: legacyDefault.physical_layout_version,
-    parquet_footer_identity: legacyDefault.parquet_footer_identity,
-  });
-}
-
-function parquetCreatedByForIdentity(identity) {
-  return [
-    `writer_version=${identity.writer_version}`,
-    `history_schema_version=${identity.history_schema_version}`,
-    `physical_layout_version=${identity.physical_layout_version}`,
-  ].join(";");
-}
-
-function physicalIdentityForScope(raw, compatibility) {
-  const authority = {
-    history_schema_version: Number(raw?.history_schema_version),
-    writer_version: String(raw?.writer_version || ""),
-    physical_layout_version: String(raw?.physical_layout_version || ""),
-  };
-  if (authority.physical_layout_version !== compatibility.physical_layout_version) {
-    throw new Error("V3 scope physical layout is incompatible with the configured reader");
-  }
-  return normalizePhysicalIdentity({
-    ...authority,
-    parquet_footer_identity: compatibility.parquet_footer_identity,
-    ...(compatibility.parquet_footer_identity.includes("created_by")
-      ? { parquet_created_by: parquetCreatedByForIdentity(authority) }
-      : {}),
-  });
-}
-
-function physicalSchemaForIdentity(identity) {
-  return Object.freeze({
-    history_schema_version: identity.history_schema_version,
-    writer_version: identity.writer_version,
-    columns: Object.freeze([
-      ...(identity.history_schema_version === OBSERVATION_HISTORY_SCHEMA_VERSION_V4
-        ? OBSERVATION_HISTORY_COLUMNS_V4
-        : OBSERVATION_HISTORY_COLUMNS_V3),
-    ]),
-  });
-}
-
 function positiveSafeInteger(value, fieldName) {
   const number = Number(value);
   if (!Number.isSafeInteger(number) || number <= 0) {
@@ -777,10 +731,7 @@ export function observationHistoryV3FooterCacheKey(
   file,
   physicalIdentity = DEFAULT_PHYSICAL_IDENTITY,
 ) {
-  const identity = physicalIdentityForScope(
-    file,
-    normalizePhysicalIdentityCompatibility(physicalIdentity),
-  );
+  const identity = normalizePhysicalIdentity(physicalIdentity);
   return [
     OBSERVATION_HISTORY_V3_FOOTER_CACHE_GENERATION,
     normalizeSha256(file?.sha256, "file.sha256"),
@@ -1021,25 +972,13 @@ function validateSegmentsAgainstFooter(segments, file, footer) {
   }
 }
 
-function selectedColumnRanges({
-  file,
-  footer,
-  rowGroupOrdinals,
-  diagnostics,
-  physicalIdentity,
-}) {
+function selectedColumnRanges({ file, footer, rowGroupOrdinals, diagnostics }) {
   const ranges = [];
   let allPageIndexesAvailable = true;
-  const selectedColumns = [
-    ...OBSERVATION_HISTORY_V3_PROJECTED_COLUMNS,
-    ...(physicalIdentity.history_schema_version === OBSERVATION_HISTORY_SCHEMA_VERSION_V3
-      ? ["verification_status"]
-      : []),
-  ];
   for (const ordinal of rowGroupOrdinals) {
     const rowGroup = footer.metadata.row_groups[ordinal];
     if (!rowGroup) throw new Error(`V3 selected row group is missing: ${file.key}`);
-    for (const columnName of selectedColumns) {
+    for (const columnName of OBSERVATION_HISTORY_V3_PROJECTED_COLUMNS) {
       const column = columnChunk(rowGroup, columnName);
       if (!column) {
         throw new Error(`V3 projected column is missing: ${file.key}:${columnName}`);
@@ -1054,7 +993,6 @@ function selectedColumnRanges({
         ...range,
       });
       if (diagnostics.workload) {
-        diagnostics.workload.projected_compressed_bytes_by_column[columnName] ??= 0;
         const compressedBytes = range.end - range.start;
         diagnostics.workload.projected_compressed_bytes_by_column[columnName] +=
           compressedBytes;
@@ -1196,11 +1134,7 @@ export async function readObservationHistoryExactV3({
   collectWorkloadDiagnostics = false,
   physicalIdentity = DEFAULT_PHYSICAL_IDENTITY,
 }) {
-  // Compatibility input only: it selects the supported layout/footer-validation
-  // policy. Schema/writer identity is authoritative per scoped manifest and file.
-  const physicalIdentityCompatibility = normalizePhysicalIdentityCompatibility(
-    physicalIdentity,
-  );
+  const identity = normalizePhysicalIdentity(physicalIdentity);
   const totalStartedAt = collectWorkloadDiagnostics ? elapsedNow() : 0;
   const diagnostics = createDiagnostics({ collectWorkloadDiagnostics });
   const workload = diagnostics.workload || null;
@@ -1290,14 +1224,11 @@ export async function readObservationHistoryExactV3({
             key: scopedKey,
             body: scopedObject.body,
             indexRoot,
+            physicalIdentity: identity,
           }),
         );
         scopedManifestCache.set(scopedKey, scoped);
       }
-      const scopePhysicalIdentity = physicalIdentityForScope(
-        scoped.physical_identity,
-        physicalIdentityCompatibility,
-      );
 
       const requestedRange = observationHistoryV3RangeForTimeseriesId(
         normalizedTimeseriesId,
@@ -1367,7 +1298,7 @@ export async function readObservationHistoryExactV3({
             pollutantCode: scopeBase.pollutant_code,
             timeseriesId: normalizedTimeseriesId,
             indexRoot,
-            physicalIdentity: scopePhysicalIdentity,
+            physicalIdentity: identity,
           });
           if (
             !sameJson(
@@ -1400,34 +1331,16 @@ export async function readObservationHistoryExactV3({
         }
         const file = child.files_by_key.get(segment.file_key);
         const previous = filesByKey.get(file.key);
-        const selectedFile = Object.freeze({
-          file,
-          physical_identity: scopePhysicalIdentity,
-        });
-        if (previous && !sameJson(previous, selectedFile)) {
+        if (previous && !sameJson(previous, file)) {
           throw new Error(`V3 child files contradict one physical identity: ${file.key}`);
         }
-        filesByKey.set(file.key, selectedFile);
+        filesByKey.set(file.key, file);
         selectedSegments.push(Object.freeze({ day_utc: dayUtc, ...segment }));
       }
     }
 
     diagnostics.parquet_files_selected = filesByKey.size;
     diagnostics.selected_segments = selectedSegments.length;
-    const physicalSchemasByIdentity = new Map();
-    for (const { physical_identity: selectedIdentity } of filesByKey.values()) {
-      const schema = physicalSchemaForIdentity(selectedIdentity);
-      physicalSchemasByIdentity.set(
-        `${schema.history_schema_version}:${schema.writer_version}`,
-        schema,
-      );
-    }
-    const physicalSchemas = Object.freeze(
-      [...physicalSchemasByIdentity.values()].sort((left, right) =>
-        left.history_schema_version - right.history_schema_version ||
-        left.writer_version.localeCompare(right.writer_version)
-      ),
-    );
     if (workload) {
       workload.requested_timeseries_segment_rows = sum(
         selectedSegments.map((segment) => segment.row_count),
@@ -1464,8 +1377,7 @@ export async function readObservationHistoryExactV3({
     });
     const contexts = new Map();
     let plannedDecodedRows = 0;
-    for (const selectedFile of filesByKey.values()) {
-      const { file, physical_identity: filePhysicalIdentity } = selectedFile;
+    for (const file of filesByKey.values()) {
       const randomAccessFile = await measureAsync(
         workload,
         "parquet_file_identity_elapsed_ms",
@@ -1491,7 +1403,7 @@ export async function readObservationHistoryExactV3({
           footerCache,
           limits,
           diagnostics,
-          physicalIdentity: filePhysicalIdentity,
+          physicalIdentity: identity,
         }),
       );
       const plan = measureSync(
@@ -1510,7 +1422,6 @@ export async function readObservationHistoryExactV3({
             footer,
             rowGroupOrdinals,
             diagnostics,
-            physicalIdentity: filePhysicalIdentity,
           });
           const coalesced = coalesceObservationHistoryV3ByteRanges(ranges, {
             maxGapBytes: limits.coalesce_max_gap_bytes,
@@ -1528,7 +1439,6 @@ export async function readObservationHistoryExactV3({
         file,
         randomAccessFile,
         footer,
-        physicalIdentity: filePhysicalIdentity,
         fileSegments: plan.fileSegments,
         ranges: plan.ranges,
         coalesced: plan.coalesced,
@@ -1554,25 +1464,9 @@ export async function readObservationHistoryExactV3({
         blocks,
       });
       for (const segment of context.fileSegments) {
-        const detectedStatusColumn = selectObservationVerificationStatusColumn(
+        const physicalStatusColumn = selectObservationVerificationStatusColumn(
           context.footer.columns,
         );
-        const physicalStatusColumn = context.physicalIdentity.history_schema_version ===
-            OBSERVATION_HISTORY_SCHEMA_VERSION_V3
-          ? detectedStatusColumn
-          : null;
-        if (
-          (context.physicalIdentity.history_schema_version ===
-              OBSERVATION_HISTORY_SCHEMA_VERSION_V3 &&
-            physicalStatusColumn !== "verification_status") ||
-          (context.physicalIdentity.history_schema_version ===
-              OBSERVATION_HISTORY_SCHEMA_VERSION_V4 &&
-            detectedStatusColumn !== null)
-        ) {
-          throw new Error(
-            `V3 Parquet verification-status shape contradicts physical schema: ${context.file.key}`,
-          );
-        }
         const rows = await measureAsync(
           workload,
           "parquet_decode_elapsed_ms",
@@ -1650,8 +1544,6 @@ export async function readObservationHistoryExactV3({
       response_complete: complete,
       has_gap: !complete,
       partial_reasons: Object.freeze(partialReasons),
-      physical_schema: physicalSchemas.length === 1 ? physicalSchemas[0] : null,
-      physical_schemas: physicalSchemas,
       rows: Object.freeze(rows),
       diagnostics: Object.freeze({ ...diagnostics }),
     });

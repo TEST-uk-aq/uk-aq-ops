@@ -8,6 +8,9 @@ import observsHistoryWorker, {
   resolveCachePolicy,
 } from "../workers/uk_aq_observs_history_r2_api_worker/worker.mjs";
 import {
+  parseDailyProvenanceRequest as parseDailyProvenanceRequestV3,
+} from "../workers/uk_aq_observs_history_r2_api_worker/worker_v3.mjs";
+import {
   buildObservationVerificationLatest,
   observationVerificationConnectorManifestKey,
 } from "../workers/shared/uk_aq_observation_verification_overlay.mjs";
@@ -113,6 +116,32 @@ test("observation APIs emit canonical and presentation status names", () => {
   assert.match(workerSource, /source_validation_status/);
   assert.match(v3WorkerSource, /verification_status:/);
   assert.match(v3WorkerSource, /source_validation_status/);
+  const handlerStart = v3WorkerSource.indexOf("async function handleDailyProvenance");
+  const handlerEnd = v3WorkerSource.indexOf("function diagnosticRequestContext", handlerStart);
+  const provenanceHandler = v3WorkerSource.slice(handlerStart, handlerEnd);
+  assert.match(provenanceHandler, /readObservationHistoryExactV3\(/);
+  assert.match(provenanceHandler, /for \(const row of result\.rows\)/);
+  assert.match(provenanceHandler, /resolveEffectiveObservationVerificationStatus\(/);
+  assert.match(provenanceHandler, /legacyStatus: row\.verification_status/);
+  assert.doesNotMatch(provenanceHandler, /readObservationHistoryExactLeafPageV3\(/);
+
+  const provenanceUrl = (startUtc) => new URL(
+    "https://example.test/v1/daily-validation-provenance" +
+      `?timeseries_id=1001&connector_id=1&pollutant=pm25&start_utc=${startUtc}` +
+      "&end_utc=2026-01-01T00:00:00.000Z",
+  );
+  assert.equal(
+    parseDailyProvenanceRequestV3(provenanceUrl("2025-01-01T00:00:00.000Z")).ok,
+    true,
+  );
+  assert.equal(
+    parseDailyProvenanceRequestV3(provenanceUrl("2024-12-31T00:00:00.000Z")).ok,
+    true,
+  );
+  assert.equal(
+    parseDailyProvenanceRequestV3(provenanceUrl("2024-12-30T00:00:00.000Z")).ok,
+    false,
+  );
 });
 
 test("observations Cache API eligibility requires complete, gap-free coverage", () => {
