@@ -7,60 +7,36 @@ exec </dev/null
 
 usage() {
   cat <<USAGE
-Usage: $(basename "$0") --source sos|waqn|saqn|ni
+Usage: $(basename "$0")
 
-Run the LIVE monthly Integrity and backup sequence for exactly one source.
+Stable SOS-light monthly fallback for TEST.
+Source: sos only. This script accepts no source option.
 USAGE
 }
 
-argument_error() {
-  echo "ERROR: $*" >&2
-  usage >&2
-  exit 2
-}
-
-SOURCE=""
-SOURCE_SEEN=0
-while [ "$#" -gt 0 ]; do
+if [ "$#" -gt 0 ]; then
   case "$1" in
     -h|--help)
       usage
       exit 0
       ;;
-    --source)
-      [ "$SOURCE_SEEN" -eq 0 ] || argument_error "--source supplied more than once"
-      [ "$#" -ge 2 ] && [ -n "$2" ] && [[ "$2" != -* ]] || argument_error "--source requires a value"
-      SOURCE="$2"
-      SOURCE_SEEN=1
-      shift 2
-      ;;
-    --source=*)
-      [ "$SOURCE_SEEN" -eq 0 ] || argument_error "--source supplied more than once"
-      SOURCE="${1#--source=}"
-      [ -n "$SOURCE" ] || argument_error "--source requires a value"
-      SOURCE_SEEN=1
-      shift
-      ;;
     *)
-      argument_error "unknown argument: $1"
+      echo "ERROR: this stable fallback accepts no arguments; source is fixed to sos" >&2
+      usage >&2
+      exit 2
       ;;
   esac
-done
+fi
 
-[ "$SOURCE_SEEN" -eq 1 ] || argument_error "--source is required"
-case "$SOURCE" in
-  sos|waqn|saqn|ni) ;;
-  *) argument_error "unsupported source: $SOURCE" ;;
-esac
-
-INTEGRITY="/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-local-wrapper-v3.sh"
-INTEGRITY_ENV="LIVE"
-BACKUP_REPOSITORY="UK-AQ/uk-aq-ops"
+SOURCE="sos"
+INTEGRITY="/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-stable-local-wrapper-v3.sh"
+INTEGRITY_ENV="TEST"
+BACKUP_REPOSITORY="TEST-uk-aq/uk-aq-ops"
 BACKUP_WORKFLOW="uk_aq_r2_history_dropbox_backup.yml"
 BACKUP_ARTIFACT="uk-aq-r2-history-dropbox-backup-report"
 BACKUP_REPORT="r2_history_dropbox_backup_report.json"
 OBSERVATION_PARQUET_COPY_MODE="reuse_matching"
-LOG_ROOT="/Users/mikehinford/uk-aq-history-integrity/state/LIVE/logs/integrity-run-monthly/$SOURCE"
+LOG_ROOT="/Users/mikehinford/uk-aq-history-integrity/state/TEST/logs/integrity-run-monthly-stable-sos-light"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 DISCOVERY_TIMEOUT_SECONDS="${DISCOVERY_TIMEOUT_SECONDS:-300}"
 DISCOVERY_POLL_SECONDS="${DISCOVERY_POLL_SECONDS:-10}"
@@ -642,7 +618,7 @@ run_batch() {
     if nice -n 10 "$INTEGRITY" \
       --env "$INTEGRITY_ENV" \
       --profile manual \
-      --source "$SOURCE" \
+      --source sos \
       --from-day "$from_day" \
       --to-day "$to_day" \
       --run-backfill \
@@ -677,7 +653,7 @@ run_batch() {
       caller_run_id="$(json_field "$dispatch_receipt" caller_run_id)"
       log "BACKUP DISCOVERY RESUME label=${label} caller_run_id=${caller_run_id}"
     else
-      caller_run_id="integrity-monthly-${INTEGRITY_ENV}-${SOURCE}-${BATCH_ID}-after-${label}"
+      caller_run_id="integrity-monthly-stable-sos-light-${INTEGRITY_ENV}-${BATCH_ID}-after-${label}"
       rm -f "$backup_receipt" "$sync_receipt"
       rm -rf "$artifact_dir"
       write_receipt "$dispatch_receipt" "phase=backup_dispatch_requested" "label=$label" \
@@ -756,14 +732,8 @@ run_batch() {
 }
 
 preflight
-run_batch 2025-05-01 2025-05-31 2025-05
-run_batch 2025-06-01 2025-06-30 2025-06
-run_batch 2025-07-01 2025-07-31 2025-07
-run_batch 2025-08-01 2025-08-31 2025-08
-run_batch 2025-09-01 2025-09-30 2025-09
-run_batch 2025-10-01 2025-10-31 2025-10
-run_batch 2025-11-01 2025-11-30 2025-11
-run_batch 2025-12-01 2025-12-31 2025-12
-run_batch 2026-01-01 2026-01-31 2026-01
+run_batch 2025-01-01 2025-01-31 2025-01
+run_batch 2025-02-01 2025-02-28 2025-02
+
 log "ALL BATCHES COMPLETED"
 echo "Summary: $SUMMARY"

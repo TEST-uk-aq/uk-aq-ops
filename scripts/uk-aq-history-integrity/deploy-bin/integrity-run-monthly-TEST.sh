@@ -5,6 +5,54 @@ set -euo pipefail
 # Always provide a valid detached stdin to Python and child processes.
 exec </dev/null
 
+usage() {
+  cat <<USAGE
+Usage: $(basename "$0") --source sos|waqn|saqn|ni
+
+Run the TEST monthly Integrity and backup sequence for exactly one source.
+USAGE
+}
+
+argument_error() {
+  echo "ERROR: $*" >&2
+  usage >&2
+  exit 2
+}
+
+SOURCE=""
+SOURCE_SEEN=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --source)
+      [ "$SOURCE_SEEN" -eq 0 ] || argument_error "--source supplied more than once"
+      [ "$#" -ge 2 ] && [ -n "$2" ] && [[ "$2" != -* ]] || argument_error "--source requires a value"
+      SOURCE="$2"
+      SOURCE_SEEN=1
+      shift 2
+      ;;
+    --source=*)
+      [ "$SOURCE_SEEN" -eq 0 ] || argument_error "--source supplied more than once"
+      SOURCE="${1#--source=}"
+      [ -n "$SOURCE" ] || argument_error "--source requires a value"
+      SOURCE_SEEN=1
+      shift
+      ;;
+    *)
+      argument_error "unknown argument: $1"
+      ;;
+  esac
+done
+
+[ "$SOURCE_SEEN" -eq 1 ] || argument_error "--source is required"
+case "$SOURCE" in
+  sos|waqn|saqn|ni) ;;
+  *) argument_error "unsupported source: $SOURCE" ;;
+esac
+
 INTEGRITY="/Users/mikehinford/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-local-wrapper-v3.sh"
 INTEGRITY_ENV="TEST"
 BACKUP_REPOSITORY="TEST-uk-aq/uk-aq-ops"
@@ -12,7 +60,7 @@ BACKUP_WORKFLOW="uk_aq_r2_history_dropbox_backup.yml"
 BACKUP_ARTIFACT="uk-aq-r2-history-dropbox-backup-report"
 BACKUP_REPORT="r2_history_dropbox_backup_report.json"
 OBSERVATION_PARQUET_COPY_MODE="reuse_matching"
-LOG_ROOT="/Users/mikehinford/uk-aq-history-integrity/state/TEST/logs/integrity-run-monthly"
+LOG_ROOT="/Users/mikehinford/uk-aq-history-integrity/state/TEST/logs/integrity-run-monthly/$SOURCE"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 DISCOVERY_TIMEOUT_SECONDS="${DISCOVERY_TIMEOUT_SECONDS:-300}"
 DISCOVERY_POLL_SECONDS="${DISCOVERY_POLL_SECONDS:-10}"
@@ -63,7 +111,7 @@ PY
 receipt_valid() {
   local path="$1"
   shift
-  "$PYTHON_BIN" - "$path" "$@" <<'PY'
+  "$PYTHON_BIN" - "$path" "source=$SOURCE" "$@" <<'PY'
 import json
 import sys
 try:
@@ -123,7 +171,7 @@ month_state_valid() {
 write_receipt() {
   local path="$1"
   shift
-  "$PYTHON_BIN" - "$path" "$@" <<'PY'
+  "$PYTHON_BIN" - "$path" "source=$SOURCE" "$@" <<'PY'
 import json
 import os
 import sys
@@ -594,7 +642,7 @@ run_batch() {
     if nice -n 10 "$INTEGRITY" \
       --env "$INTEGRITY_ENV" \
       --profile manual \
-      --source sos \
+      --source "$SOURCE" \
       --from-day "$from_day" \
       --to-day "$to_day" \
       --run-backfill \
@@ -629,7 +677,7 @@ run_batch() {
       caller_run_id="$(json_field "$dispatch_receipt" caller_run_id)"
       log "BACKUP DISCOVERY RESUME label=${label} caller_run_id=${caller_run_id}"
     else
-      caller_run_id="integrity-monthly-${INTEGRITY_ENV}-${BATCH_ID}-after-${label}"
+      caller_run_id="integrity-monthly-${INTEGRITY_ENV}-${SOURCE}-${BATCH_ID}-after-${label}"
       rm -f "$backup_receipt" "$sync_receipt"
       rm -rf "$artifact_dir"
       write_receipt "$dispatch_receipt" "phase=backup_dispatch_requested" "label=$label" \
