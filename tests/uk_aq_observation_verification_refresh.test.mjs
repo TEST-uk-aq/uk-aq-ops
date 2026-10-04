@@ -10,11 +10,11 @@ import {
   buildObservationVerificationConnectorPublication,
 } from "../workers/shared/uk_aq_observation_verification_publication.mjs";
 import {
-  assertPublishEnvironment,
+  assertApplyEnvironment,
   assertSosAcquisitionBindingsComplete,
   buildVerificationPublicationPlan,
   compareObservationVerificationCandidates,
-  executeVerificationPublication,
+  executeVerificationApply,
   normalizeAurnVerificationStatus,
 } from "../scripts/backup_r2/lib/observation_verification_refresh.mjs";
 
@@ -218,11 +218,11 @@ test("latest is composed after durable connector verification and preserves refr
   });
   const events = [];
   let latestPublication = null;
-  await executeVerificationPublication({
-    publish: true,
+  const result = await executeVerificationApply({
+    apply: true,
     environment: "TEST",
     plan,
-    withPublicationLock: async (callback) => {
+    withApplyLock: async (callback) => {
       events.push("lock");
       return callback({ assertHeld: () => {} });
     },
@@ -245,6 +245,7 @@ test("latest is composed after durable connector verification and preserves refr
       return { ...value.artifact, verified: true };
     },
   });
+  assert.equal(result.status, "applied");
   assert.deepEqual(events, ["lock", "connector", "refresh", "latest"]);
   assert.deepEqual(
     latestPublication.payload.connectors.filter((item) => item.connector_id !== 9),
@@ -261,7 +262,7 @@ test("latest is composed after durable connector verification and preserves refr
   );
 });
 
-test("locked publication aborts if target authority changed after comparison", async () => {
+test("locked apply aborts if target authority changed after comparison", async () => {
   const old9 = await publication(9, [entry()]);
   const new9 = await publication(9, [entry({ ratifiedTo: "2026-07-31" })]);
   const other9 = await publication(9, [entry({ ratifiedTo: "2026-08-31" })]);
@@ -280,11 +281,11 @@ test("locked publication aborts if target authority changed after comparison", a
     authenticatedCurrentConnectorIdentities: [old9.latest_identity],
   });
   let latestCalls = 0;
-  await assert.rejects(executeVerificationPublication({
-    publish: true,
+  await assert.rejects(executeVerificationApply({
+    apply: true,
     environment: "TEST",
     plan,
-    withPublicationLock: async (callback) => callback({ assertHeld: () => {} }),
+    withApplyLock: async (callback) => callback({ assertHeld: () => {} }),
     publishConnector: async () => ({ ...new9.latest_identity, verified: true }),
     refreshCurrentAuthority: async () => ({
       status: "authenticated",
@@ -318,12 +319,12 @@ test("unproven first-publication coverage and SOS missing bindings fail closed",
   }), /without an unambiguous authoritative binding/i);
 });
 
-test("build-only and LIVE publication both fail before any PUT", async () => {
+test("build-only and LIVE apply both fail before any PUT", async () => {
   let calls = 0;
   const putConnector = async () => { calls += 1; };
   const putLatest = async () => { calls += 1; };
-  const buildOnly = await executeVerificationPublication({
-    publish: false,
+  const buildOnly = await executeVerificationApply({
+    apply: false,
     environment: "TEST",
     plan: { publication_intent: true },
     publishConnector: putConnector,
@@ -331,10 +332,10 @@ test("build-only and LIVE publication both fail before any PUT", async () => {
   });
   assert.equal(buildOnly.status, "build_only");
   assert.equal(calls, 0);
-  assert.throws(() => assertPublishEnvironment({ environment: "LIVE", publish: true }), /LIVE/i);
+  assert.throws(() => assertApplyEnvironment({ environment: "LIVE", apply: true }), /LIVE/i);
   await assert.rejects(
-    executeVerificationPublication({
-      publish: true,
+    executeVerificationApply({
+      apply: true,
       environment: "LIVE",
       plan: { publication_intent: true },
       publishConnector: putConnector,
@@ -343,8 +344,8 @@ test("build-only and LIVE publication both fail before any PUT", async () => {
     /LIVE/i,
   );
   assert.equal(calls, 0);
-  await assert.rejects(executeVerificationPublication({
-    publish: true,
+  await assert.rejects(executeVerificationApply({
+    apply: true,
     environment: "TEST",
     plan: { publication_intent: true },
     refreshCurrentAuthority: async () => ({ status: "pre_overlay" }),

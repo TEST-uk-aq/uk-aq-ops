@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// @ts-nocheck -- operator CLI; build-only unless --apply is explicit.
+// @ts-nocheck -- operator CLI; build-only unless --publish is explicit.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -28,20 +28,20 @@ import {
   withObservationsGlobalOperationLock,
 } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
 import {
-  assertApplyEnvironment,
+  assertPublishEnvironment,
   buildVerificationPublicationPlan,
   compareObservationVerificationCandidates,
-  executeVerificationApply,
+  executeVerificationPublication,
   sourceConnectorId,
 } from "./lib/observation_verification_refresh.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 function parseArgs(argv) {
-  const options = { environment: "TEST", apply: false, source: "", fromDay: "", toDay: "", stateDir: "" };
+  const options = { environment: "TEST", publish: false, source: "", fromDay: "", toDay: "", stateDir: "" };
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
-    if (token === "--apply") options.apply = true;
+    if (token === "--publish") options.publish = true;
     else if (["--source", "--env", "--from-day", "--to-day", "--state-dir"].includes(token)) {
       const value = argv[index + 1];
       if (!value || value.startsWith("--")) throw new Error(`${token} requires a value`);
@@ -52,12 +52,12 @@ function parseArgs(argv) {
       if (token === "--to-day") options.toDay = value;
       if (token === "--state-dir") options.stateDir = value;
     } else if (token === "--help") {
-      console.log("Usage: uk_aq_refresh_observation_verification.mjs --source sos|waqn|saqn --env TEST|LIVE [--from-day YYYY-MM-DD --to-day YYYY-MM-DD] [--apply]");
+      console.log("Usage: uk_aq_refresh_observation_verification.mjs --source sos|waqn|saqn --env TEST|LIVE [--from-day YYYY-MM-DD --to-day YYYY-MM-DD] [--publish]");
       process.exit(0);
     } else throw new Error(`unknown argument: ${token}`);
   }
   sourceConnectorId(options.source);
-  assertApplyEnvironment({ environment: options.environment, apply: options.apply });
+  assertPublishEnvironment({ environment: options.environment, publish: options.publish });
   if (options.source === "sos" && (!options.fromDay || !options.toDay)) {
     throw new Error("--source sos requires --from-day and --to-day for its diagnostic retained-range build");
   }
@@ -263,11 +263,11 @@ async function main() {
     });
 
     const r2 = r2Config();
-    if (options.apply && options.environment === "TEST" && r2.bucket !== "uk-aq-history-cic-test") {
-      throw new Error(`refusing TEST apply for unexpected bucket: ${r2.bucket || "(empty)"}`);
+    if (options.publish && options.environment === "TEST" && r2.bucket !== "uk-aq-history-cic-test") {
+      throw new Error(`refusing TEST publication for unexpected bucket: ${r2.bucket || "(empty)"}`);
     }
     const current = await readCurrentAuthority(r2, source.connector_id);
-    if (options.apply && current.status === "unavailable") {
+    if (options.publish && current.status === "unavailable") {
       throw new Error(`current verification authority is unavailable: ${current.reason}`);
     }
     const publicationReadiness = current.status === "unavailable"
@@ -297,24 +297,24 @@ async function main() {
         currentLatest: current.latest,
         authenticatedCurrentConnectorIdentities: current.authenticated,
       });
-    } else if (options.apply && comparison.semantic_change) {
+    } else if (options.publish && comparison.semantic_change) {
       throw new Error(`verification candidate is not publishable: ${comparison.blockers.join("; ")}`);
     }
     const lockDiagnostics = [];
-    const applyLockRunId = randomUUID();
-    const withApplyLock = async (callback) => {
+    const publicationLockRunId = randomUUID();
+    const withPublicationLock = async (callback) => {
       const databaseUrl = String(
         process.env.SUPABASE_DB_URL || process.env.UK_AQ_INGEST_DATABASE_URL ||
         process.env.DATABASE_URL || "",
       ).trim();
       if (!databaseUrl) {
-        throw new Error("TEST apply requires the existing observations global operation lock database URL");
+        throw new Error("TEST publication requires the existing observations global operation lock database URL");
       }
       return withHistoryWriterClient(databaseUrl, async (client) =>
         withObservationsGlobalOperationLock({
           client,
-          owner: "observation_verification_apply",
-          runId: applyLockRunId,
+          owner: "observation_verification_publication",
+          runId: publicationLockRunId,
           diagnostics: lockDiagnostics,
           diagnosticEnvironment: options.environment,
         }, async (_identity, lock) => callback({
@@ -322,12 +322,12 @@ async function main() {
         }))
       );
     };
-    const apply = await executeVerificationApply({
-      apply: options.apply,
+    const publication = await executeVerificationPublication({
+      publish: options.publish,
       environment: options.environment,
       plan,
       r2,
-      withApplyLock,
+      withPublicationLock,
       refreshCurrentAuthority: () => readCurrentAuthority(r2, source.connector_id),
     });
     const report = {
@@ -336,9 +336,9 @@ async function main() {
       environment: options.environment,
       source: options.source,
       connector_id: source.connector_id,
-      apply_requested: options.apply,
-      apply,
-      apply_lock_diagnostics: lockDiagnostics,
+      publish_requested: options.publish,
+      publication,
+      publication_lock_diagnostics: lockDiagnostics,
       pinned_core_identity: source.core_identity,
       timeseries_count: refresh.canonical_manifest.timeseries.length,
       semantic_manifest_sha256: candidatePublication.latest_identity.sha256,
@@ -368,7 +368,7 @@ async function main() {
       environment: options.environment,
       source: options.source,
       connector_id: sourceConnectorId(options.source),
-      apply_requested: options.apply,
+      publish_requested: options.publish,
       error: error instanceof Error ? error.message : String(error),
       run_report_path: reportPath,
     });

@@ -77,13 +77,13 @@ export function normalizeAurnVerificationStatus(value) {
   throw new Error(`Unsupported AURN source verification status: ${JSON.stringify(String(value))}`);
 }
 
-export function assertApplyEnvironment({ environment, apply }) {
+export function assertPublishEnvironment({ environment, publish }) {
   const normalized = String(environment || "").trim().toUpperCase();
   if (normalized !== "TEST" && normalized !== "LIVE") {
     throw new Error("environment must be TEST or LIVE");
   }
-  if (apply && normalized === "LIVE") {
-    throw new Error("LIVE observation-verification apply is disabled pending TEST acceptance");
+  if (publish && normalized === "LIVE") {
+    throw new Error("LIVE observation-verification publication is disabled pending TEST acceptance");
   }
   return normalized;
 }
@@ -226,28 +226,28 @@ export async function buildVerificationPublicationPlan({
   });
 }
 
-export async function executeVerificationApply({
-  apply,
+export async function executeVerificationPublication({
+  publish,
   environment,
   plan,
   r2 = null,
-  withApplyLock = null,
+  withPublicationLock = null,
   refreshCurrentAuthority = null,
   publishConnector = publishObservationVerificationConnectorManifest,
   publishLatest = publishObservationVerificationLatest,
 }) {
-  const normalizedEnvironment = assertApplyEnvironment({ environment, apply });
-  if (!apply) return Object.freeze({ status: "build_only", environment: normalizedEnvironment, objects_written: 0 });
+  const normalizedEnvironment = assertPublishEnvironment({ environment, publish });
+  if (!publish) return Object.freeze({ status: "build_only", environment: normalizedEnvironment, objects_written: 0 });
   if (!plan?.publication_intent) {
     return Object.freeze({ status: "unchanged", environment: normalizedEnvironment, objects_written: 0 });
   }
   if (typeof refreshCurrentAuthority !== "function") {
-    throw new Error("apply requires a locked current-authority refresh callback");
+    throw new Error("publication requires a locked current-authority refresh callback");
   }
-  if (typeof withApplyLock !== "function") {
-    throw new Error("apply requires the observations global operation lock");
+  if (typeof withPublicationLock !== "function") {
+    throw new Error("publication requires the observations global operation lock");
   }
-  return withApplyLock(async ({ assertHeld = () => {} } = {}) => {
+  return withPublicationLock(async ({ assertHeld = () => {} } = {}) => {
     assertHeld();
     const durableCandidate = await publishConnector({ r2, publication: plan.connector });
     assertHeld();
@@ -287,7 +287,7 @@ export async function executeVerificationApply({
     });
     assertHeld();
     return Object.freeze({
-      status: "applied",
+      status: "published",
       environment: normalizedEnvironment,
       objects_written: 2,
       durable_connector: durableCandidate,
