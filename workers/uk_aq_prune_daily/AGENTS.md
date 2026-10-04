@@ -4,18 +4,17 @@ These instructions apply to files under `workers/uk_aq_prune_daily/` and supplem
 
 ## Required contracts
 
-Before analysing, planning or changing Prune Daily Phase B history behaviour, read:
+Before analysing, planning or changing Prune Daily Phase B history behaviour, read this repository's `/AGENTS.md`, then use the `TEST-uk-aq/uk-aq-system-docs` repository in the current multi-repository workspace and read:
 
-1. `/AGENTS.md`;
-2. `/system_docs/README.md`;
-3. `/system_docs/r2_history/README.md`;
-4. `/system_docs/r2_history/aqi_history_write_pipeline.md`;
-5. `/system_docs/r2_history/prune_connector_day_gate.md`;
-6. `/system_docs/r2_history/implementation_safety_contract.md`;
-7. `/system_docs/r2_history/prune_daily_observation_only_phase_b_contract.md`;
-8. any other R2-history contract linked by those files that is directly affected by the task.
+1. `system_docs/SYSTEM_OVERVIEW.md`;
+2. `system_docs/r2_history/README.md`;
+3. `system_docs/r2_history/aqi_history_write_pipeline.md`;
+4. `system_docs/r2_history/prune_connector_day_gate.md`;
+5. `system_docs/r2_history/implementation_safety_contract.md`;
+6. `system_docs/r2_history/prune_daily_observation_only_phase_b_contract.md`;
+7. any other R2-history contract linked by those files that is directly affected by the task.
 
-`system_docs/` is read-only to Codex and other coding agents. Do not create, edit, move, rename or delete files under it. Report any required documentation follow-up to ChatGPT in Chat mode.
+The authoritative `system_docs/` repository is read-only to Codex and other coding agents. Do not create, edit, move, rename or delete files under it, and do not create local `ref_docs/` mirrors. If the system-docs repository is unavailable in the current workspace, report the missing prerequisite. Report any required documentation follow-up to ChatGPT in Chat mode.
 
 ## Regression-sensitive control-flow mode
 
