@@ -28,6 +28,10 @@ const MAX_RANGE_BYTES = 8 * 1024 * 1024;
 const MAX_MERGED_RANGE_BYTES = 8 * 1024 * 1024;
 const MAX_RANGE_CONCURRENCY = 2;
 const MAX_CURSOR_LENGTH = 12_288;
+const MAX_PROVENANCE_RANGE_MS = 366 * DAY_MS;
+const MAX_PROVENANCE_UTC_SCOPES = 367;
+const MAX_PROVENANCE_INDEX_OBJECTS = MAX_PROVENANCE_UTC_SCOPES * 2;
+const MAX_PROVENANCE_INDEX_BYTES = 64 * 1024 * 1024;
 const SHA256 = /^[0-9a-f]{64}$/;
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const COLUMN_NAMES = Object.freeze(["observed_at_utc", "value"]);
@@ -964,6 +968,121 @@ async function readIndex(source, key, diagnostics, { leaf = false, manifest = fa
     diagnostics.timeseries_leaf_bytes_read += object.byte_size;
   }
   return object;
+}
+
+async function readProvenanceIndexObject(source, key, budget) {
+  if (budget.objects_read >= MAX_PROVENANCE_INDEX_OBJECTS) {
+    throw new Error("exact-leaf provenance index object-count budget exceeded");
+  }
+  const remainingBytes = MAX_PROVENANCE_INDEX_BYTES - budget.bytes_read;
+  if (remainingBytes <= 0) {
+    throw new Error("exact-leaf provenance index byte budget exceeded");
+  }
+  budget.objects_read += 1;
+  const object = await source.getIndexObject({
+    key,
+    maxBytes: Math.min(MAX_INDEX_BYTES, remainingBytes),
+    diagnostics: budget,
+  });
+  if (!object) return null;
+  const body = exactBody(object.body);
+  const byteSize = positiveInteger(object.byte_size, "provenance index object byte_size");
+  if (body.byteLength !== byteSize || byteSize > remainingBytes) {
+    throw new Error(`exact-leaf provenance index byte budget or size mismatch: ${key}`);
+  }
+  budget.bytes_read += byteSize;
+  return Object.freeze({ key, body, byte_size: byteSize });
+}
+
+/**
+ * Reads only current exact-leaf JSON authority. It deliberately has no
+ * openParquetFile dependency and is bounded for the longest accepted request.
+ */
+export async function readObservationHistoryExactLeafDailyMetadataV3({
+  source,
+  timeseriesId,
+  connectorId,
+  pollutantCode,
+  startUtc,
+  endUtc,
+  index,
+}) {
+  if (!source || typeof source.getIndexObject !== "function") {
+    throw new Error("source must provide exact index access");
+  }
+  const normalizedIndex = normalizeIndex(index);
+  const request = Object.freeze({
+    timeseriesId: positiveInteger(timeseriesId, "timeseriesId"),
+    connectorId: positiveInteger(connectorId, "connectorId"),
+    pollutantCode: required(pollutantCode, "pollutantCode"),
+    startIso: iso(startUtc, "startUtc"),
+    endIso: iso(endUtc, "endUtc"),
+  });
+  const startMs = Date.parse(request.startIso);
+  const endMs = Date.parse(request.endIso);
+  if (endMs <= startMs) throw new Error("endUtc must be after startUtc");
+  if (endMs - startMs > MAX_PROVENANCE_RANGE_MS) {
+    throw new Error("exact-leaf provenance range exceeds 366 days");
+  }
+  const days = dayList(startMs, endMs);
+  if (days.length > MAX_PROVENANCE_UTC_SCOPES) {
+    throw new Error("exact-leaf provenance UTC-scope budget exceeded");
+  }
+
+  const budget = { objects_read: 0, bytes_read: 0 };
+  const rows = [];
+  for (const dayUtc of days) {
+    const expected = { ...request, dayUtc };
+    const scope = scopePath(expected);
+    const manifestKey = `${normalizedIndex.root}/${scope}/manifest.json`;
+    const manifestObject = await readProvenanceIndexObject(source, manifestKey, budget);
+    if (!manifestObject) continue;
+    const manifest = validateManifest(
+      parseJson(manifestObject.body, manifestKey),
+      expected,
+      manifestKey,
+      scope,
+      normalizedIndex,
+    );
+    if (!manifest.descriptor) continue;
+
+    const leafObject = await readProvenanceIndexObject(
+      source,
+      manifest.descriptor.key,
+      budget,
+    );
+    if (!leafObject) {
+      throw new Error(`required exact physical leaf is missing: ${manifest.descriptor.key}`);
+    }
+    const leafBody = await assertBodyIdentity(
+      leafObject,
+      manifest.descriptor,
+      "exact physical leaf",
+    );
+    const segments = validateLeaf(
+      parseJson(leafBody, manifest.descriptor.key),
+      expected,
+      manifest.descriptor,
+      manifest.profile,
+      manifest.physicalIdentity,
+      normalizedIndex,
+    );
+    rows.push(Object.freeze({
+      day_utc: dayUtc,
+      row_count: segments.reduce((sum, segment) => sum + segment.row_count, 0),
+      min_observed_at_utc: segments[0].min_observed_at_utc,
+      max_observed_at_utc: segments.at(-1).max_observed_at_utc,
+    }));
+  }
+  return Object.freeze({
+    rows: Object.freeze(rows),
+    diagnostics: Object.freeze({
+      utc_scopes_considered: days.length,
+      index_objects_read: budget.objects_read,
+      index_bytes_read: budget.bytes_read,
+      parquet_objects_opened: 0,
+    }),
+  });
 }
 
 function segmentIntersects(segment, startMs, endMs) {

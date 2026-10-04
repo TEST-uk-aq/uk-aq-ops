@@ -119,11 +119,10 @@ test("observation APIs emit canonical and presentation status names", () => {
   const handlerStart = v3WorkerSource.indexOf("async function handleDailyProvenance");
   const handlerEnd = v3WorkerSource.indexOf("function diagnosticRequestContext", handlerStart);
   const provenanceHandler = v3WorkerSource.slice(handlerStart, handlerEnd);
-  assert.match(provenanceHandler, /readObservationHistoryExactV3\(/);
-  assert.match(provenanceHandler, /for \(const row of result\.rows\)/);
-  assert.match(provenanceHandler, /resolveEffectiveObservationVerificationStatus\(/);
-  assert.match(provenanceHandler, /legacyStatus: row\.verification_status/);
-  assert.doesNotMatch(provenanceHandler, /readObservationHistoryExactLeafPageV3\(/);
+  assert.match(provenanceHandler, /readObservationHistoryExactLeafDailyMetadataV3\(/);
+  assert.match(provenanceHandler, /deriveAurnDailyValidationStatus\(/);
+  assert.match(provenanceHandler, /verification_overlay_not_authoritative/);
+  assert.doesNotMatch(provenanceHandler, /readObservationHistoryExactV3\(/);
 
   const provenanceUrl = (startUtc) => new URL(
     "https://example.test/v1/daily-validation-provenance" +

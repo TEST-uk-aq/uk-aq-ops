@@ -395,7 +395,7 @@ export function validateObservationHistoryIndexV3ScopedManifestBody({
   key,
   body,
   indexRoot = DEFAULT_INDEX_ROOT,
-  physicalIdentity = null,
+  physicalIdentity = DEFAULT_PHYSICAL_IDENTITY,
 }) {
   const bodyBuffer = exactArrayBuffer(body);
   let bodyText;
@@ -408,17 +408,6 @@ export function validateObservationHistoryIndexV3ScopedManifestBody({
   }
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw new Error("Scoped v3 manifest payload must be an object");
-  }
-  const authoritativePhysicalIdentity = normalizePhysicalIdentity({
-    history_schema_version: payload.history_schema_version,
-    writer_version: payload.writer_version,
-    physical_layout_version: payload.physical_layout_version,
-  });
-  const expectedPhysicalIdentity = physicalIdentity === null
-    ? authoritativePhysicalIdentity
-    : normalizePhysicalIdentity(physicalIdentity);
-  if (!sameJson(authoritativePhysicalIdentity, expectedPhysicalIdentity)) {
-    throw new Error("Scoped v3 manifest physical identity is contradictory");
   }
   const scope = normalizeScope(payload);
   const source = canonicalSourceDescriptor(
@@ -437,7 +426,7 @@ export function validateObservationHistoryIndexV3ScopedManifestBody({
     scope,
     canonicalSource: source,
     childDescriptors: descriptors,
-    physicalIdentity: authoritativePhysicalIdentity,
+    physicalIdentity,
   });
   if (!sameJson(payload, expectedPayload)) {
     throw new Error(
@@ -455,7 +444,6 @@ export function validateObservationHistoryIndexV3ScopedManifestBody({
     key: expectedKey,
     scope,
     payload,
-    physical_identity: authoritativePhysicalIdentity,
     source: Object.freeze(source),
     descriptors: Object.freeze(descriptors),
     coverage: Object.freeze(expectedPayload.coverage),
