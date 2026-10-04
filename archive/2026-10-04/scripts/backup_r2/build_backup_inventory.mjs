@@ -19,7 +19,6 @@ import {
   assertSelectedBackupInventory,
   buildObservationMonthInventoryShard,
   buildObservationRunManifestInventoryShard,
-  computeVerificationSourceRootHash,
   observationMonthInventoryShardKey,
   resolveObservationsTimeseriesLatestPath,
   sha256Hex,
@@ -281,10 +280,10 @@ function buildVerificationInventory(args, previousRoot) {
     return actual;
   });
   const inventory = validateVerificationInventory({
-    source_root_hash: computeVerificationSourceRootHash({
+    source_root_hash: sha256Hex(stableJson({
       latest: latestIdentity,
-      connectorManifests,
-    }),
+      connector_manifests: connectorManifests,
+    })),
     latest: latestIdentity,
     connector_manifests: connectorManifests,
   });

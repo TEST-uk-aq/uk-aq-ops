@@ -7,6 +7,10 @@ import observsHistoryWorker, {
   isCompleteGapFreeObservationsResponse,
   resolveCachePolicy,
 } from "../workers/uk_aq_observs_history_r2_api_worker/worker.mjs";
+import {
+  buildObservationVerificationLatest,
+  observationVerificationConnectorManifestKey,
+} from "../workers/shared/uk_aq_observation_verification_overlay.mjs";
 
 const workerSource = readFileSync(
   "workers/uk_aq_observs_history_r2_api_worker/worker.mjs",
@@ -30,7 +34,7 @@ function makeJsonR2Object(payload) {
   };
 }
 
-function installHarness(objectsByKey = {}) {
+function installHarness(objectsByKey = {}, { cacheMatch = null } = {}) {
   const getKeys = [];
   const cachePutCalls = [];
   const waitUntilPromises = [];
@@ -38,8 +42,8 @@ function installHarness(objectsByKey = {}) {
 
   globalThis.caches = {
     default: {
-      async match() {
-        return null;
+      async match(request) {
+        return cacheMatch ? cacheMatch(request) : null;
       },
       async put(request, response) {
         cachePutCalls.push({ url: request.url, status: response.status });
@@ -189,7 +193,7 @@ test("observations Cache API keys use the corrected cache generation and retain 
   });
 });
 
-test("partial and invalid observation responses are no-store and never seed Cache API", async () => {
+test("partial and invalid observation responses are no-store and never seed the response cache", async () => {
   const harness = installHarness({});
   try {
     const response = await observsHistoryWorker.fetch(observationRequest(), harness.env, harness.ctx);
@@ -214,7 +218,46 @@ test("partial and invalid observation responses are no-store and never seed Cach
   } finally {
     await harness.restore();
   }
-  assert.equal(harness.cachePutCalls.length, 0);
+  assert.equal(harness.cachePutCalls.filter(({ url }) =>
+    new URL(url).pathname === "/v1/observations").length, 0);
+  assert.equal(harness.cachePutCalls.filter(({ url }) =>
+    new URL(url).pathname.includes("/_cache/observation-verification/latest-v1")).length, 1);
+});
+
+test("a verification-aware response-cache hit does not read the immutable connector manifest", async () => {
+  const manifestSha256 = "a".repeat(64);
+  const manifestKey = observationVerificationConnectorManifestKey(396, manifestSha256);
+  const latest = buildObservationVerificationLatest({
+    connectorManifests: [{
+      connector_id: 396,
+      key: manifestKey,
+      byte_size: 123,
+      sha256: manifestSha256,
+    }],
+  });
+  const cachedResponse = new Response(JSON.stringify({ ok: true, response_complete: true, has_gap: false }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+  const harness = installHarness({
+    [VERIFICATION_LATEST_KEY]: makeJsonR2Object(latest),
+  }, {
+    cacheMatch(request) {
+      const url = new URL(request.url);
+      return url.searchParams.get("__ukaq_verification_identity") === manifestSha256
+        ? cachedResponse.clone()
+        : null;
+    },
+  });
+  try {
+    const response = await observsHistoryWorker.fetch(observationRequest(), harness.env, harness.ctx);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-ukaq-cache"), "HIT");
+    assert.deepEqual(harness.getKeys, [VERIFICATION_LATEST_KEY]);
+    assert.equal(harness.getKeys.includes(manifestKey), false);
+  } finally {
+    await harness.restore();
+  }
 });
 
 test("observations Worker v2 uses the fixed generation prefixes", async () => {

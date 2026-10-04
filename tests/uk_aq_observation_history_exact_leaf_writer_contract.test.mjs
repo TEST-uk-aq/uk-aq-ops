@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
@@ -41,15 +42,16 @@ function rows() {
   }));
 }
 
-function readerSource(prepared) {
+function readerSource(...preparedPartitions) {
   const indexBodies = new Map(
-    prepared.v3_hierarchy.publication_objects.map((entry) => [
+    preparedPartitions.flatMap((prepared) => prepared.v3_hierarchy.publication_objects).map((entry) => [
       entry.key,
       Buffer.from(entry.body, "utf8"),
     ]),
   );
   const parquetBodies = new Map(
-    prepared.file_intents.map((entry) => [entry.key, Buffer.from(entry.body)]),
+    preparedPartitions.flatMap((prepared) => prepared.file_intents)
+      .map((entry) => [entry.key, Buffer.from(entry.body)]),
   );
   return {
     async getIndexObject({ key }) {
@@ -76,6 +78,60 @@ function readerSource(prepared) {
   };
 }
 
+function schema4CompatibleFixture(prepared) {
+  const publications = prepared.v3_hierarchy.publication_objects.map((entry) => ({ ...entry }));
+  const leaf = publications.find((entry) => entry.payload.kind === OBSERVATION_HISTORY_EXACT_LEAF_KIND_V3);
+  const manifest = publications.find((entry) => entry.payload.kind === OBSERVATION_HISTORY_EXACT_LEAF_MANIFEST_KIND_V3);
+  const leafPayload = {
+    ...leaf.payload,
+    history_schema_version: 4,
+    writer_version: "parquet-wasm-zstd-v4",
+  };
+  const leafBody = `${JSON.stringify(leafPayload, null, 2)}\n`;
+  const leafSha256 = createHash("sha256").update(leafBody).digest("hex");
+  Object.assign(leaf, {
+    payload: leafPayload,
+    body: leafBody,
+    byte_size: Buffer.byteLength(leafBody),
+    sha256: leafSha256,
+  });
+  const descriptor = manifest.payload.leaves_by_timeseries_id[String(TIMESERIES_ID)];
+  const manifestPayload = {
+    ...manifest.payload,
+    history_schema_version: 4,
+    writer_version: "parquet-wasm-zstd-v4",
+    decode_profile: {
+      ...manifest.payload.decode_profile,
+      root_schema_element: {
+        ...manifest.payload.decode_profile.root_schema_element,
+        num_children: 6,
+      },
+    },
+    leaves_by_timeseries_id: {
+      ...manifest.payload.leaves_by_timeseries_id,
+      [String(TIMESERIES_ID)]: [descriptor[0], Buffer.byteLength(leafBody), leafSha256],
+    },
+  };
+  const manifestBody = `${JSON.stringify(manifestPayload, null, 2)}\n`;
+  Object.assign(manifest, {
+    payload: manifestPayload,
+    body: manifestBody,
+    byte_size: Buffer.byteLength(manifestBody),
+    sha256: createHash("sha256").update(manifestBody).digest("hex"),
+  });
+  return {
+    ...prepared,
+    v3_hierarchy: {
+      ...prepared.v3_hierarchy,
+      publication_objects: publications,
+    },
+  };
+}
+
+function decodeCursor(cursor) {
+  return JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+}
+
 const EXACT_READER_INDEX = Object.freeze({
   root: DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT,
   alignedIndexRoot:
@@ -83,8 +139,6 @@ const EXACT_READER_INDEX = Object.freeze({
   alignedDataRoot: "history/v3/observations",
   indexGeneration: "v3",
   historyVersion: "v2",
-  historySchemaVersion: 3,
-  writerVersion: "parquet-wasm-zstd-v3",
   physicalLayoutVersion: OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
   alignedRowCap: OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
   decodeProfileId: OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE_ID,
@@ -95,7 +149,7 @@ const EXACT_READER_INDEX = Object.freeze({
   },
 });
 
-test("production aligned writer output is directly consumable by the unchanged exact reader", async () => {
+test("production aligned writer output remains directly consumable by the exact reader", async () => {
   const logicalRows = rows();
   const prepared = buildObservationHistoryV3SteadyStatePartition({
     source: "integrity",
@@ -121,6 +175,9 @@ test("production aligned writer output is directly consumable by the unchanged e
 
   assert.equal(first.rows.length, 1024);
   assert.equal(second.rows.length, 1);
+  assert.equal(first.physical_schemas.length, 1);
+  assert.equal(first.physical_schema.history_schema_version, 3);
+  assert.equal(first.physical_schema.writer_version, "parquet-wasm-zstd-v3");
   assert.equal(first.response_complete, false);
   assert.equal(second.response_complete, true);
   assert.deepEqual(
@@ -222,4 +279,77 @@ test("exact scoped coverage uses temporal bounds across all timeseries", async (
     })),
   );
   assert.equal(result.response_complete, true);
+});
+
+test("exact reader cursor v3 pins mixed schema-3 and schema-4 scope identities", async () => {
+  const partition = (dayUtc, observedAtUtc, value) => buildObservationHistoryV3SteadyStatePartition({
+    source: "integrity",
+    rows: [{
+      connector_id: 1,
+      station_id: 7001,
+      timeseries_id: TIMESERIES_ID,
+      pollutant_code: "pm25",
+      observed_at_utc: observedAtUtc,
+      value,
+      verification_status: null,
+    }],
+    targetWriterGitSha: "1".repeat(40),
+    backedUpAtUtc: `${dayUtc}T23:59:59.000Z`,
+  });
+  const older = partition("2026-01-02", "2026-01-02T23:30:00.000Z", 1);
+  const newer = schema4CompatibleFixture(
+    partition("2026-01-03", "2026-01-03T00:30:00.000Z", 2),
+  );
+  const request = {
+    source: readerSource(older, newer),
+    timeseriesId: TIMESERIES_ID,
+    connectorId: 1,
+    pollutantCode: "pm25",
+    startUtc: "2026-01-02T23:00:00.000Z",
+    endUtc: "2026-01-03T23:00:00.000Z",
+    index: EXACT_READER_INDEX,
+  };
+
+  const first = await readObservationHistoryExactLeafPageV3(request);
+  assert.deepEqual(first.physical_schemas.map((identity) => [
+    identity.history_schema_version,
+    identity.writer_version,
+  ]), [
+    [3, "parquet-wasm-zstd-v3"],
+    [4, "parquet-wasm-zstd-v4"],
+  ]);
+  assert.equal(first.physical_schema, null);
+  const cursor = decodeCursor(first.physical_page.next_cursor);
+  assert.equal(cursor.schema_version, 3);
+  assert.equal(cursor.request.writer_version, undefined);
+  assert.deepEqual(cursor.discovery.scopes.map((scope) =>
+    scope.physical_identity.history_schema_version), [3, 4]);
+  assert.equal(cursor.next.physical_identity.history_schema_version, 4);
+
+  const second = await readObservationHistoryExactLeafPageV3({
+    ...request,
+    physicalCursor: first.physical_page.next_cursor,
+  });
+  assert.deepEqual([...first.rows, ...second.rows].map((row) => row.value), [1, 2]);
+  assert.equal(second.response_complete, true);
+
+  const stale = { ...cursor, schema_version: 2 };
+  await assert.rejects(
+    readObservationHistoryExactLeafPageV3({
+      ...request,
+      physicalCursor: Buffer.from(JSON.stringify(stale)).toString("base64url"),
+    }),
+    (error) => error.code === "physical_cursor_invalid",
+  );
+
+  const contradictory = structuredClone(cursor);
+  contradictory.discovery.scopes[1].physical_identity.writer_version =
+    "parquet-wasm-zstd-v3";
+  await assert.rejects(
+    readObservationHistoryExactLeafPageV3({
+      ...request,
+      physicalCursor: Buffer.from(JSON.stringify(contradictory)).toString("base64url"),
+    }),
+    (error) => error.code === "physical_cursor_invalid",
+  );
 });

@@ -5,8 +5,8 @@ import { putAndVerifyR2ObjectWithSha256 } from "./uk_aq_r2_checksum_publication.
 import {
   OBSERVATION_VERIFICATION_LATEST_KEY,
   buildObservationVerificationArtifact,
-  buildObservationVerificationConnectorArtifact,
   buildObservationVerificationLatest,
+  observationVerificationConnectorManifestKey,
   validateObservationVerificationConnectorManifest,
 } from "./uk_aq_observation_verification_overlay.mjs";
 
@@ -19,9 +19,10 @@ function publicationIntent(artifact) {
 
 export async function buildObservationVerificationConnectorPublication({ manifest }) {
   const canonicalManifest = validateObservationVerificationConnectorManifest(manifest);
-  const artifact = await buildObservationVerificationConnectorArtifact(
-    canonicalManifest,
-  );
+  const artifact = await buildObservationVerificationArtifact({
+    key: observationVerificationConnectorManifestKey(canonicalManifest.connector_id),
+    payload: canonicalManifest,
+  });
   return Object.freeze({
     artifact: publicationIntent(artifact),
     latest_identity: Object.freeze({
@@ -49,14 +50,7 @@ export async function buildObservationVerificationLatestPublication({
 }
 
 export async function publishObservationVerificationConnectorManifest({ r2, publication }) {
-  const durable = await putAndVerifyR2ObjectWithSha256({
-    r2,
-    intent: publication.artifact,
-  });
-  return Object.freeze({
-    connector_id: publication.latest_identity.connector_id,
-    ...durable,
-  });
+  return putAndVerifyR2ObjectWithSha256({ r2, intent: publication.artifact });
 }
 
 export async function publishObservationVerificationLatest({
@@ -70,8 +64,7 @@ export async function publishObservationVerificationLatest({
   for (const expected of publication.payload.connectors) {
     const durable = durableByKey.get(expected.key);
     if (
-      !durable || Number(durable.connector_id) !== expected.connector_id ||
-      Number(durable.byte_size) !== expected.byte_size ||
+      !durable || Number(durable.byte_size) !== expected.byte_size ||
       durable.sha256 !== expected.sha256
     ) {
       throw new Error(

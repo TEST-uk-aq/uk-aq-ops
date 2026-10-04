@@ -4,8 +4,6 @@ import { observationHistoryPhysicalSchemaForColumns, selectObservationVerificati
 import {
   applyObservationVerificationOverlay,
   loadObservationVerificationAuthority,
-  loadObservationVerificationDiscovery,
-  observationVerificationManifestIdentityForConnector,
 } from "../shared/uk_aq_observation_verification_overlay.mjs";
 import { parquetMetadataAsync, parquetRead, parquetSchema } from "hyparquet";
 import { compressors } from "hyparquet-compressors";
@@ -751,7 +749,6 @@ async function handleDailyProvenanceV2(params, env) {
   const verificationAuthority = await loadObservationVerificationAuthority({
     bucket: env.UK_AQ_HISTORY_BUCKET,
     connectorId: params.connectorId,
-    cache: caches.default,
   });
   const observations = await handleRequest(params, env, verificationAuthority);
   const payload = await observations.json();
@@ -1420,7 +1417,6 @@ async function handleRequest(requestParams, env, verificationAuthority = null) {
     await loadObservationVerificationAuthority({
       bucket: env.UK_AQ_HISTORY_BUCKET,
       connectorId,
-      cache: caches.default,
     });
   const effectiveRows = applyObservationVerificationOverlay({
     rows: historyRead.rows,
@@ -1616,31 +1612,22 @@ export default {
     }
 
     const readVersion = resolveR2HistoryVersion(env, { context: "R2 observations history API reads" });
-    const verificationDiscovery = await loadObservationVerificationDiscovery({
+    const verificationAuthority = await loadObservationVerificationAuthority({
       bucket: env.UK_AQ_HISTORY_BUCKET,
-      cache: caches.default,
-    });
-    const verificationManifestIdentity = observationVerificationManifestIdentityForConnector({
-      discovery: verificationDiscovery,
       connectorId: requestParams.connectorId,
     });
     const cacheKey = buildCanonicalCacheKey(
       request.url,
       requestParams,
       readVersion,
-      verificationManifestIdentity?.sha256 || null,
+      verificationAuthority.overlay_authoritative
+        ? verificationAuthority.cache_identity
+        : null,
     );
     const cached = await caches.default.match(cacheKey);
     if (cached) {
       return withCacheMarker(cached, "HIT");
     }
-
-    const verificationAuthority = await loadObservationVerificationAuthority({
-      bucket: env.UK_AQ_HISTORY_BUCKET,
-      connectorId: requestParams.connectorId,
-      discovery: verificationDiscovery,
-      cache: caches.default,
-    });
 
     const _fetchStart = Date.now();
     let response;

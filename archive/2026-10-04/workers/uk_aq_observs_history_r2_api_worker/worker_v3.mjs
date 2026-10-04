@@ -12,19 +12,18 @@ import {
 } from "../shared/uk_aq_observation_history_reader_v3.mjs";
 import {
   loadObservationVerificationAuthority,
-  loadObservationVerificationDiscovery,
-  observationVerificationManifestIdentityForConnector,
   resolveEffectiveObservationVerificationStatus,
 } from "../shared/uk_aq_observation_verification_overlay.mjs";
 
 const LOGICAL_HISTORY_VERSION = "v2";
 const INDEX_GENERATION = "v3";
 const PHYSICAL_LAYOUT_VERSION = "timeseries-aligned-v2";
+const WRITER_VERSION = "parquet-wasm-zstd-v3";
 const ALIGNED_ROW_CAP = 1024;
 const V3 = getObservationHistoryGeneration("v3");
 const ALIGNED_INDEX_PREFIX = `${V3.observations_timeseries_index_prefix}/_aligned`;
 const ALIGNED_DATA_PREFIX = V3.observations_prefix;
-const RESPONSE_CACHE_GENERATION = "side-by-side-v3-exact-leaf-3";
+const RESPONSE_CACHE_GENERATION = "side-by-side-v3-exact-leaf-2";
 const TIMESERIES_BINDING_CACHE_GENERATION = "3";
 const DEFAULT_MUTABLE_CACHE_SECONDS = 300;
 const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
@@ -120,6 +119,8 @@ export function observationHistoryV3ReaderIndex(indexRoot) {
     alignedDataRoot: ALIGNED_DATA_PREFIX,
     indexGeneration: INDEX_GENERATION,
     historyVersion: LOGICAL_HISTORY_VERSION,
+    historySchemaVersion: 3,
+    writerVersion: WRITER_VERSION,
     physicalLayoutVersion: PHYSICAL_LAYOUT_VERSION,
     alignedRowCap: ALIGNED_ROW_CAP,
     decodeProfileId: "hyparquet-direct-column-v1",
@@ -226,7 +227,6 @@ async function handleDailyProvenance(params, env) {
   const verificationAuthority = await loadObservationVerificationAuthority({
     bucket: env.UK_AQ_HISTORY_BUCKET,
     connectorId: params.connectorId,
-    cache: caches.default,
   });
   const daily = new Map();
   for (const row of result.rows) {
@@ -352,7 +352,6 @@ function compactReaderSummary({ result, outcome, returnedRows }) {
     identity_head_reads: diagnostics.identity_head_reads,
     r2_range_reads: diagnostics.r2_range_reads,
     r2_bytes_requested: diagnostics.r2_bytes_requested,
-    physical_schemas: result.physical_schemas,
     parquet_footer_fetched: diagnostics.parquet_footer_fetched,
     parquet_footer_parsed: diagnostics.parquet_footer_parsed,
     timeseries_id_decoded: diagnostics.timeseries_id_decoded,
@@ -445,12 +444,8 @@ async function handleObservations(
     index_version: INDEX_GENERATION,
     pollutant: params.pollutantCode,
     physical_layout_version: PHYSICAL_LAYOUT_VERSION,
+    writer_version: WRITER_VERSION,
     aligned_row_cap: ALIGNED_ROW_CAP,
-    physical_schemas: result.physical_schemas,
-    ...(result.physical_schema ? {
-      history_schema_version: result.physical_schema.history_schema_version,
-      writer_version: result.physical_schema.writer_version,
-    } : {}),
     timeseries_id: params.timeseriesId,
     connector_id: params.connectorId,
     start_utc: params.startIso,
@@ -526,7 +521,6 @@ export default {
         const verificationAuthority = await loadObservationVerificationAuthority({
           bucket: env.UK_AQ_HISTORY_BUCKET,
           connectorId: params.connectorId,
-          cache: caches.default,
         });
         return withCacheHeaders(
           await handleObservations(
@@ -539,27 +533,19 @@ export default {
           RESPONSE_CACHE_GENERATION,
         );
       }
-      const verificationDiscovery = await loadObservationVerificationDiscovery({
+      const verificationAuthority = await loadObservationVerificationAuthority({
         bucket: env.UK_AQ_HISTORY_BUCKET,
-        cache: caches.default,
-      });
-      const verificationManifestIdentity = observationVerificationManifestIdentityForConnector({
-        discovery: verificationDiscovery,
         connectorId: params.connectorId,
       });
       const key = cacheKey(
         request.url,
         INDEX_GENERATION,
-        verificationManifestIdentity?.sha256 || null,
+        verificationAuthority.overlay_authoritative
+          ? verificationAuthority.cache_identity
+          : null,
       );
       const cached = await caches.default.match(key);
       if (cached) return withCacheHeaders(cached, "HIT", RESPONSE_CACHE_GENERATION);
-      const verificationAuthority = await loadObservationVerificationAuthority({
-        bucket: env.UK_AQ_HISTORY_BUCKET,
-        connectorId: params.connectorId,
-        discovery: verificationDiscovery,
-        cache: caches.default,
-      });
       const response = await handleObservations(
         params,
         env,

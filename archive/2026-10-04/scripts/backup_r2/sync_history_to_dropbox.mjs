@@ -19,7 +19,6 @@ import {
 import {
   buildObservationRunManifestStateShard,
   completeObservationMonthState,
-  computeVerificationSourceRootHash,
   emptyHierarchicalStateRoot,
   markLatestTimeseriesProcessed,
   markObservationDayCopied,
@@ -528,10 +527,10 @@ function syncVerificationDomain({ args, inventoryRoot, stateRoot }) {
     inventory.latest.relative_path,
   );
   const latest = validateObservationVerificationLatest(latestSource.parsed);
-  const expectedVerificationRoot = computeVerificationSourceRootHash({
+  const expectedVerificationRoot = sha256Hex(stableJson({
     latest: inventory.latest,
-    connectorManifests: inventory.connector_manifests,
-  });
+    connector_manifests: inventory.connector_manifests,
+  }));
   if (
     expectedVerificationRoot !== inventory.source_root_hash ||
     sha256Hex(latestSource.text) !== inventory.latest.sha256 ||

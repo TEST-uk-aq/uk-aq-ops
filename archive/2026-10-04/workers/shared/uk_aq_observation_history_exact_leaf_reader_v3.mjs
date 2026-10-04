@@ -32,7 +32,7 @@ const SHA256 = /^[0-9a-f]{64}$/;
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const COLUMN_NAMES = Object.freeze(["observed_at_utc", "value"]);
 const CURSOR_KIND = "uk_aq_observation_history_exact_leaf_physical_cursor";
-const CURSOR_SCHEMA_VERSION = 3;
+const CURSOR_SCHEMA_VERSION = 2;
 const PAGINATION_PARTIAL_REASON = "physical_pagination_incomplete";
 const SUPPORTED_DECODE_PROFILE_ID = "hyparquet-direct-column-v1";
 const SUPPORTED_DECODE_PROFILE = Object.freeze({
@@ -159,6 +159,8 @@ function normalizeIndex(index) {
     alignedDataRoot: required(index.alignedDataRoot, "index.alignedDataRoot").replace(/^\/+|\/+$/g, ""),
     indexGeneration: required(index.indexGeneration, "index.indexGeneration"),
     historyVersion: required(index.historyVersion, "index.historyVersion"),
+    historySchemaVersion: positiveInteger(index.historySchemaVersion, "index.historySchemaVersion"),
+    writerVersion: required(index.writerVersion, "index.writerVersion"),
     physicalLayoutVersion: required(index.physicalLayoutVersion, "index.physicalLayoutVersion"),
     alignedRowCap: positiveInteger(index.alignedRowCap, "index.alignedRowCap"),
     decodeProfileId: required(index.decodeProfileId, "index.decodeProfileId"),
@@ -166,8 +168,16 @@ function normalizeIndex(index) {
     leafKind: required(index.leafKind, "index.leafKind"),
     additionalCommonFields: Object.freeze({ ...additionalCommonFields }),
   });
+  const supportedPhysicalIdentity = (
+    normalized.historySchemaVersion === OBSERVATION_HISTORY_SCHEMA_VERSION_V3 &&
+    normalized.writerVersion === OBSERVATION_HISTORY_WRITER_VERSION_V3
+  ) || (
+    normalized.historySchemaVersion === OBSERVATION_HISTORY_SCHEMA_VERSION_V4 &&
+    normalized.writerVersion === OBSERVATION_HISTORY_WRITER_VERSION_V4
+  );
   if (
     normalized.historyVersion !== "v2" ||
+    !supportedPhysicalIdentity ||
     normalized.physicalLayoutVersion !== "timeseries-aligned-v2" ||
     normalized.alignedRowCap !== MAX_PHYSICAL_SEGMENT_ROWS ||
     normalized.decodeProfileId !== SUPPORTED_DECODE_PROFILE_ID
@@ -191,69 +201,22 @@ async function assertBodyIdentity(object, descriptor, label) {
   return body;
 }
 
-function normalizeScopePhysicalIdentity(payload, index, label) {
-  const historySchemaVersion = positiveInteger(
-    payload?.history_schema_version,
-    `${label}.history_schema_version`,
-  );
-  const writerVersion = required(
-    payload?.writer_version,
-    `${label}.writer_version`,
-  );
-  const supportedPair = (
-    historySchemaVersion === OBSERVATION_HISTORY_SCHEMA_VERSION_V3 &&
-    writerVersion === OBSERVATION_HISTORY_WRITER_VERSION_V3
-  ) || (
-    historySchemaVersion === OBSERVATION_HISTORY_SCHEMA_VERSION_V4 &&
-    writerVersion === OBSERVATION_HISTORY_WRITER_VERSION_V4
-  );
-  const physicalLayoutVersion = required(
-    payload?.physical_layout_version,
-    `${label}.physical_layout_version`,
-  );
-  const alignedRowCap = positiveInteger(
-    payload?.aligned_row_cap,
-    `${label}.aligned_row_cap`,
-  );
-  if (
-    !supportedPair ||
-    physicalLayoutVersion !== index.physicalLayoutVersion ||
-    alignedRowCap !== index.alignedRowCap
-  ) throw new Error(`unsupported or contradictory ${label} physical identity`);
-  return Object.freeze({
-    history_schema_version: historySchemaVersion,
-    writer_version: writerVersion,
-    physical_layout_version: physicalLayoutVersion,
-    aligned_row_cap: alignedRowCap,
-    decode_profile_id: index.decodeProfileId,
-  });
-}
-
-function assertCommonIndex(
-  payload,
-  expected,
-  kind,
-  index,
-  expectedPhysicalIdentity = null,
-) {
-  const physicalIdentity = normalizeScopePhysicalIdentity(payload, index, kind);
+function assertCommonIndex(payload, expected, kind, index) {
   if (
     payload?.schema_version !== 1 ||
     payload?.kind !== kind ||
     payload?.index_generation !== index.indexGeneration ||
     payload?.history_version !== index.historyVersion ||
     payload?.domain !== "observations" ||
+    payload?.history_schema_version !== index.historySchemaVersion ||
+    payload?.writer_version !== index.writerVersion ||
+    payload?.physical_layout_version !== index.physicalLayoutVersion ||
+    payload?.aligned_row_cap !== index.alignedRowCap ||
     payload?.day_utc !== expected.dayUtc ||
     payload?.connector_id !== expected.connectorId ||
     payload?.pollutant_code !== expected.pollutantCode ||
     Object.entries(index.additionalCommonFields).some(([field, value]) => payload?.[field] !== value)
   ) throw new Error(`unsupported or contradictory ${kind}`);
-  if (
-    expectedPhysicalIdentity &&
-    Object.entries(expectedPhysicalIdentity).some(([field, value]) =>
-      physicalIdentity[field] !== value)
-  ) throw new Error(`${kind} physical identity contradicts its scoped manifest`);
-  return physicalIdentity;
 }
 
 function expectedLeafKey(root, scope, timeseriesId) {
@@ -268,8 +231,8 @@ function validateIdentity(raw, label) {
   return Object.freeze({ key, byte_size: byteSize, sha256 });
 }
 
-function validateProfile(profile, physicalIdentity) {
-  const expectedRootChildren = physicalIdentity.history_schema_version ===
+function validateProfile(profile, index) {
+  const expectedRootChildren = index.historySchemaVersion ===
       OBSERVATION_HISTORY_SCHEMA_VERSION_V4
     ? 6
     : 7;
@@ -281,9 +244,6 @@ function validateProfile(profile, physicalIdentity) {
     profile.root_schema_element.repetition_type !== SUPPORTED_DECODE_PROFILE.root_schema_element.repetition_type ||
     profile.root_schema_element.num_children !== expectedRootChildren
   ) throw new Error("unsupported physical decode profile");
-  if (profile.version !== physicalIdentity.decode_profile_id) {
-    throw new Error("decode profile identity contradicts its scoped manifest");
-  }
   const expected = {
     observed_at_utc: { physical: "INT64", converted: "TIMESTAMP_MILLIS" },
     value: { physical: "DOUBLE", converted: undefined },
@@ -308,8 +268,8 @@ function validateProfile(profile, physicalIdentity) {
   return profile;
 }
 
-function decodeProfileForPhysicalIdentity(physicalIdentity) {
-  const expectedRootChildren = physicalIdentity.history_schema_version ===
+function decodeProfileForIndex(index) {
+  const expectedRootChildren = index.historySchemaVersion ===
       OBSERVATION_HISTORY_SCHEMA_VERSION_V4
     ? 6
     : 7;
@@ -368,12 +328,7 @@ function validateRange(raw, file, rowCount, label) {
 }
 
 function validateManifest(payload, expected, key, scope, index) {
-  const physicalIdentity = assertCommonIndex(
-    payload,
-    expected,
-    index.manifestKind,
-    index,
-  );
+  assertCommonIndex(payload, expected, index.manifestKind, index);
   if (
     payload.key !== key ||
     JSON.stringify(payload.leaf_descriptor_fields) !== JSON.stringify(["key", "byte_size", "sha256"]) ||
@@ -381,7 +336,7 @@ function validateManifest(payload, expected, key, scope, index) {
     typeof payload.leaves_by_timeseries_id !== "object" ||
     Array.isArray(payload.leaves_by_timeseries_id)
   ) throw new Error("exact-leaf scoped manifest key or lookup is contradictory");
-  const profile = validateProfile(payload.decode_profile, physicalIdentity);
+  const profile = validateProfile(payload.decode_profile, index);
   const lookupKeys = Object.keys(payload.leaves_by_timeseries_id);
   if (
     positiveInteger(payload.coverage?.timeseries_count, "coverage.timeseries_count") !== lookupKeys.length ||
@@ -399,7 +354,7 @@ function validateManifest(payload, expected, key, scope, index) {
     throw new Error("exact-leaf source aligned scoped-manifest key is contradictory");
   }
   const raw = payload.leaves_by_timeseries_id[String(expected.timeseriesId)];
-  if (raw === undefined) return { profile, physicalIdentity, descriptor: null };
+  if (raw === undefined) return { profile, descriptor: null };
   if (!Array.isArray(raw) || raw.length !== 3) throw new Error("exact-leaf descriptor tuple is contradictory");
   const descriptor = validateIdentity(
     { key: raw[0], byte_size: raw[1], sha256: raw[2] },
@@ -408,24 +363,11 @@ function validateManifest(payload, expected, key, scope, index) {
   if (descriptor.key !== expectedLeafKey(index.root, scope, expected.timeseriesId)) {
     throw new Error("exact-leaf descriptor key is contradictory");
   }
-  return { profile, physicalIdentity, descriptor };
+  return { profile, descriptor };
 }
 
-function validateLeaf(
-  payload,
-  expected,
-  descriptor,
-  profile,
-  physicalIdentity,
-  index,
-) {
-  assertCommonIndex(
-    payload,
-    expected,
-    index.leafKind,
-    index,
-    physicalIdentity,
-  );
+function validateLeaf(payload, expected, descriptor, profile, index) {
+  assertCommonIndex(payload, expected, index.leafKind, index);
   if (
     payload.key !== descriptor.key ||
     payload.timeseries_id !== expected.timeseriesId ||
@@ -504,7 +446,6 @@ function validateLeaf(
       min_observed_at_utc: min,
       max_observed_at_utc: max,
       profile,
-      physical_identity: physicalIdentity,
       column_ranges: Object.fromEntries(COLUMN_NAMES.map((name) => [
         name,
         validateRange(raw.column_ranges?.[name], file, rowCount, `segments[${segmentIndex}].${name}`),
@@ -582,6 +523,7 @@ function cursorRequestIdentity(request, index) {
     history_version: index.historyVersion,
     index_generation: index.indexGeneration,
     physical_layout_version: index.physicalLayoutVersion,
+    writer_version: index.writerVersion,
     aligned_row_cap: index.alignedRowCap,
     decode_profile_id: index.decodeProfileId,
     index_root: index.root,
@@ -609,27 +551,8 @@ function cursorSegmentIdentity(segment, pageNumber, scopeSegmentNumber) {
     leaf_key: segment.leaf_key,
     leaf_byte_size: segment.leaf_byte_size,
     leaf_sha256: segment.leaf_sha256,
-    physical_identity: segment.physical_identity,
     ...segmentCoordinateIdentity(segment),
   });
-}
-
-function validateCursorPhysicalIdentity(raw, index, label) {
-  exactKeys(raw, [
-    "history_schema_version",
-    "writer_version",
-    "physical_layout_version",
-    "aligned_row_cap",
-    "decode_profile_id",
-  ], label);
-  const identity = normalizeScopePhysicalIdentity(raw, index, label);
-  if (raw.decode_profile_id !== index.decodeProfileId) {
-    throw codedError(
-      "physical_cursor_invalid",
-      `${label}.decode_profile_id is unsupported`,
-    );
-  }
-  return identity;
 }
 
 function encodeNextCursor(request, index, discovery, segment, pageNumber, scopeSegmentNumber) {
@@ -706,13 +629,7 @@ function validateCursorCoordinate(raw, request, index, dayUtc, label) {
 }
 
 function sameFields(left, right) {
-  return Object.entries(left).every(([field, value]) => {
-    const candidate = right?.[field];
-    if (value && typeof value === "object") {
-      return JSON.stringify(candidate) === JSON.stringify(value);
-    }
-    return candidate === value;
-  });
+  return Object.entries(left).every(([field, value]) => right?.[field] === value);
 }
 
 function validateCursorDiscovery(raw, request, index, startMs, endMs) {
@@ -734,7 +651,6 @@ function validateCursorDiscovery(raw, request, index, startMs, endMs) {
     exactKeys(scope, [
       "day_utc",
       "state",
-      "physical_identity",
       "leaf_descriptor",
       "intersecting_segment_count",
       "first_intersecting_segment",
@@ -752,13 +668,6 @@ function validateCursorDiscovery(raw, request, index, startMs, endMs) {
       `${label}.intersecting_segment_count`,
       { zero: true },
     );
-    const physicalIdentity = scope.physical_identity === null
-      ? null
-      : validateCursorPhysicalIdentity(
-        scope.physical_identity,
-        index,
-        `${label}.physical_identity`,
-      );
     const descriptor = scope.leaf_descriptor === null
       ? null
       : validateCursorLeafDescriptor(scope.leaf_descriptor, request, index, dayUtc, `${label}.leaf_descriptor`);
@@ -766,19 +675,15 @@ function validateCursorDiscovery(raw, request, index, startMs, endMs) {
       ? null
       : validateCursorCoordinate(scope.first_intersecting_segment, request, index, dayUtc, `${label}.first_intersecting_segment`);
     if (
-      (state === "validated_leaf" && (!descriptor || !physicalIdentity)) ||
-      (state === "authoritative_absence" &&
-        (!physicalIdentity || descriptor || count !== 0 || first)) ||
-      (state === "missing_scope" &&
-        (physicalIdentity || descriptor || count !== 0 || first)) ||
-      (state === "missing_leaf" &&
-        (!physicalIdentity || !descriptor || count !== 0 || first)) ||
+      (state === "validated_leaf" && !descriptor) ||
+      (state === "authoritative_absence" && (descriptor || count !== 0 || first)) ||
+      (state === "missing_scope" && (descriptor || count !== 0 || first)) ||
+      (state === "missing_leaf" && (!descriptor || count !== 0 || first)) ||
       (state === "validated_leaf" && ((count === 0) !== (first === null)))
     ) throw codedError("physical_cursor_invalid", `${label} state and pinned discovery fields contradict`);
     return Object.freeze({
       day_utc: dayUtc,
       state,
-      physical_identity: physicalIdentity,
       leaf_descriptor: descriptor,
       intersecting_segment_count: count,
       first_intersecting_segment: first,
@@ -827,7 +732,6 @@ function decodeAndValidateCursorRequest(physicalCursor, request, index, startMs,
     "leaf_key",
     "leaf_byte_size",
     "leaf_sha256",
-    "physical_identity",
     "file_key",
     "file_byte_size",
     "file_sha256",
@@ -860,17 +764,6 @@ function decodeAndValidateCursorRequest(physicalCursor, request, index, startMs,
   if (!sameFields(nextDescriptor, scope.leaf_descriptor)) {
     throw codedError("physical_cursor_invalid", "physical cursor next leaf descriptor contradicts discovery");
   }
-  const nextPhysicalIdentity = validateCursorPhysicalIdentity(
-    payload.next.physical_identity,
-    index,
-    "physical cursor next physical identity",
-  );
-  if (!sameFields(nextPhysicalIdentity, scope.physical_identity)) {
-    throw codedError(
-      "physical_cursor_invalid",
-      "physical cursor next segment physical identity contradicts its scope",
-    );
-  }
   const nextCoordinate = validateCursorCoordinate({
     file_key: payload.next.file_key,
     file_byte_size: payload.next.file_byte_size,
@@ -902,7 +795,6 @@ function decodeAndValidateCursorRequest(physicalCursor, request, index, startMs,
       leaf_key: nextDescriptor.key,
       leaf_byte_size: nextDescriptor.byte_size,
       leaf_sha256: nextDescriptor.sha256,
-      physical_identity: nextPhysicalIdentity,
       ...nextCoordinate,
     }),
     scope_index: scopeIndex,
@@ -944,8 +836,6 @@ function diagnosticsTemplate() {
     timeseries_leaf_objects_read: 0,
     timeseries_leaf_bytes_read: 0,
     coarse_child_shards_read: 0,
-    physical_schemas: [],
-    physical_schema: null,
     selected_coordinates: [],
   };
 }
@@ -996,7 +886,6 @@ function createDiscoverySnapshot(scopes) {
   const snapshots = scopes.map((scope) => Object.freeze({
     day_utc: scope.day_utc,
     state: scope.state,
-    physical_identity: scope.physical_identity,
     leaf_descriptor: leafDescriptorSnapshot(scope.leaf_descriptor),
     intersecting_segment_count: scope.intersecting_segments.length,
     first_intersecting_segment: scope.intersecting_segments.length
@@ -1014,17 +903,6 @@ function createDiscoverySnapshot(scopes) {
   });
 }
 
-function physicalSchemasFromDiscovery(discovery) {
-  const seen = new Set();
-  return Object.freeze(discovery.scopes.flatMap((scope) => {
-    if (!scope.physical_identity) return [];
-    const key = JSON.stringify(scope.physical_identity);
-    if (seen.has(key)) return [];
-    seen.add(key);
-    return [scope.physical_identity];
-  }));
-}
-
 function segmentFromDiscoveryScope(scope) {
   const coordinate = scope.first_intersecting_segment;
   const descriptor = scope.leaf_descriptor;
@@ -1034,7 +912,6 @@ function segmentFromDiscoveryScope(scope) {
     leaf_key: descriptor.key,
     leaf_byte_size: descriptor.byte_size,
     leaf_sha256: descriptor.sha256,
-    physical_identity: scope.physical_identity,
     file_key: coordinate.file_key,
     file: Object.freeze({
       key: coordinate.file_key,
@@ -1131,7 +1008,6 @@ export async function readObservationHistoryExactLeafPageV3({
           scopeRecords.push({
             day_utc: dayUtc,
             state: "missing_scope",
-            physical_identity: null,
             leaf_descriptor: null,
             intersecting_segments: [],
           });
@@ -1148,7 +1024,6 @@ export async function readObservationHistoryExactLeafPageV3({
           scopeRecords.push({
             day_utc: dayUtc,
             state: "authoritative_absence",
-            physical_identity: manifest.physicalIdentity,
             leaf_descriptor: null,
             intersecting_segments: [],
           });
@@ -1159,7 +1034,6 @@ export async function readObservationHistoryExactLeafPageV3({
           scopeRecords.push({
             day_utc: dayUtc,
             state: "missing_leaf",
-            physical_identity: manifest.physicalIdentity,
             leaf_descriptor: manifest.descriptor,
             intersecting_segments: [],
           });
@@ -1171,7 +1045,6 @@ export async function readObservationHistoryExactLeafPageV3({
           expected,
           manifest.descriptor,
           manifest.profile,
-          manifest.physicalIdentity,
           normalizedIndex,
         );
         const scopedSegments = segments
@@ -1181,7 +1054,6 @@ export async function readObservationHistoryExactLeafPageV3({
         scopeRecords.push({
           day_utc: dayUtc,
           state: "validated_leaf",
-          physical_identity: manifest.physicalIdentity,
           leaf_descriptor: manifest.descriptor,
           intersecting_segments: scopedSegments,
         });
@@ -1220,8 +1092,7 @@ export async function readObservationHistoryExactLeafPageV3({
         parseJson(leafBody, descriptor.key),
         expected,
         descriptor,
-        decodeProfileForPhysicalIdentity(currentScope.physical_identity),
-        currentScope.physical_identity,
+        decodeProfileForIndex(normalizedIndex),
         normalizedIndex,
       );
       const scopedSegments = segments
@@ -1255,9 +1126,6 @@ export async function readObservationHistoryExactLeafPageV3({
 
     diagnostics.candidate_intersecting_segments = discovery.total_intersecting_segments;
     diagnostics.physical_page_number = pageNumber;
-    const physicalSchemas = physicalSchemasFromDiscovery(discovery);
-    diagnostics.physical_schemas = physicalSchemas;
-    diagnostics.physical_schema = physicalSchemas.length === 1 ? physicalSchemas[0] : null;
 
     const decoded = [];
     if (selectedSegment) {
@@ -1274,7 +1142,6 @@ export async function readObservationHistoryExactLeafPageV3({
       diagnostics.physical_rows_decoded = selectedSegment.row_count;
       diagnostics.selected_coordinates.push({
         day_utc: selectedSegment.day_utc,
-        physical_identity: selectedSegment.physical_identity,
         file_key: selectedSegment.file_key,
         row_group_ordinal: selectedSegment.row_group_ordinal,
         row_start: selectedSegment.row_start,
@@ -1380,8 +1247,6 @@ export async function readObservationHistoryExactLeafPageV3({
       coverage_complete: coverageComplete,
       coverage_partial_reasons: Object.freeze(coverageReasons),
       partial_reasons: Object.freeze(partialReasons),
-      physical_schemas: physicalSchemas,
-      physical_schema: physicalSchemas.length === 1 ? physicalSchemas[0] : null,
       physical_page: Object.freeze({
         schema_version: 2,
         page_number: pageNumber,

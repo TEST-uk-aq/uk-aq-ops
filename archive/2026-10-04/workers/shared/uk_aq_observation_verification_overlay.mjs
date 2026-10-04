@@ -12,29 +12,10 @@ export const OBSERVATION_VERIFICATION_RATIFICATION_BOUNDARY_MODEL =
   "ratification-boundary-v1";
 export const OBSERVATION_VERIFICATION_PER_OBSERVATION_MODEL =
   "per-observation-status-v1";
-export const OBSERVATION_VERIFICATION_LATEST_CACHE_MAX_AGE_SECONDS = 60;
-export const OBSERVATION_VERIFICATION_MANIFEST_CACHE_MAX_AGE_SECONDS = 31_536_000;
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const POLLUTANT = /^[a-z0-9_]+$/;
 const UTC_DAY = /^\d{4}-\d{2}-\d{2}$/;
-const VOLATILE_ACQUISITION_FIELDS = new Set([
-  "retrieved_at_utc",
-  "downloaded_at_utc",
-  "download_timestamp",
-  "source_file_sha256",
-  "downloaded_file_sha256",
-  "source_sha256",
-  "source_byte_size",
-  "response_byte_size",
-  "http_etag",
-  "transient_etag",
-  "etag",
-  "http_response_identity",
-  "decoder_execution_metadata",
-  "decoder_run_id",
-]);
-const VERIFICATION_CACHE_ORIGIN = "https://uk-aq.internal";
 const encoder = new TextEncoder();
 
 function bytewiseCompare(left, right) {
@@ -117,34 +98,11 @@ function canonicalSha256(value, label) {
   return sha256;
 }
 
-function canonicalObject(value, label) {
+function canonicalProvenance(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new TypeError(`${label} must be an object`);
   }
   return canonicalize(value);
-}
-
-function rejectVolatileAcquisitionEvidence(value, label, path = label) {
-  if (Array.isArray(value)) {
-    value.forEach((entry, index) =>
-      rejectVolatileAcquisitionEvidence(entry, label, `${path}[${index}]`));
-    return;
-  }
-  if (!value || typeof value !== "object") return;
-  for (const [key, entry] of Object.entries(value)) {
-    if (VOLATILE_ACQUISITION_FIELDS.has(key)) {
-      throw new TypeError(
-        `${path}.${key} is acquisition audit evidence and must not enter canonical semantic manifest identity`,
-      );
-    }
-    rejectVolatileAcquisitionEvidence(entry, label, `${path}.${key}`);
-  }
-}
-
-function canonicalSemanticProvenance(value, label) {
-  const canonical = canonicalObject(value, label);
-  rejectVolatileAcquisitionEvidence(canonical, label);
-  return canonical;
 }
 
 export function normalizeObservationVerificationPeriods(periods = []) {
@@ -216,24 +174,14 @@ export function normalizeObservationVerificationPeriods(periods = []) {
   return collapsed.map((period) => Object.freeze({ ...period }));
 }
 
-export function verificationPeriodsFromRatifiedTo(
-  ratifiedTo,
-  { semanticSourceProvenance = {} } = {},
-) {
-  const stableProvenance = canonicalSemanticProvenance(
-    semanticSourceProvenance,
-    "semanticSourceProvenance",
-  );
+export function verificationPeriodsFromRatifiedTo(ratifiedTo) {
   const sourceValue = ratifiedTo === null || ratifiedTo === undefined
     ? null
     : String(ratifiedTo).trim();
   if (sourceValue === null || sourceValue === "" || sourceValue.toLowerCase() === "never") {
     return Object.freeze({
       source_verification_model: OBSERVATION_VERIFICATION_RATIFICATION_BOUNDARY_MODEL,
-      semantic_source_provenance: Object.freeze({
-        ...stableProvenance,
-        ratified_to: sourceValue || null,
-      }),
+      source_provenance: Object.freeze({ ratified_to: sourceValue || null }),
       default_status: "P",
       periods: Object.freeze([]),
     });
@@ -248,10 +196,7 @@ export function verificationPeriodsFromRatifiedTo(
   const nextMidnight = new Date(parsed.getTime() + 86_400_000).toISOString();
   return Object.freeze({
     source_verification_model: OBSERVATION_VERIFICATION_RATIFICATION_BOUNDARY_MODEL,
-    semantic_source_provenance: Object.freeze({
-      ...stableProvenance,
-      ratified_to: sourceValue,
-    }),
+    source_provenance: Object.freeze({ ratified_to: sourceValue }),
     default_status: "P",
     periods: Object.freeze(normalizeObservationVerificationPeriods([{
       from_observed_at_utc: null,
@@ -261,10 +206,7 @@ export function verificationPeriodsFromRatifiedTo(
   });
 }
 
-export function verificationPeriodsFromObservationEvidence(
-  evidence = [],
-  { semanticSourceProvenance = {} } = {},
-) {
+export function verificationPeriodsFromObservationEvidence(evidence = []) {
   if (!Array.isArray(evidence)) {
     throw new TypeError("source observation verification evidence must be an array");
   }
@@ -298,16 +240,12 @@ export function verificationPeriodsFromObservationEvidence(
   }));
   return Object.freeze({
     source_verification_model: OBSERVATION_VERIFICATION_PER_OBSERVATION_MODEL,
-    semantic_source_provenance: Object.freeze(canonicalSemanticProvenance(
-      semanticSourceProvenance,
-      "semanticSourceProvenance",
-    )),
     default_status: "P",
     periods: Object.freeze(normalizeObservationVerificationPeriods(periods)),
   });
 }
 
-function normalizeTimeseriesEntry(raw, connectorId, { canonical = false } = {}) {
+function normalizeTimeseriesEntry(raw, connectorId) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new TypeError("verification timeseries entry must be an object");
   }
@@ -320,25 +258,15 @@ function normalizeTimeseriesEntry(raw, connectorId, { canonical = false } = {}) 
     OBSERVATION_VERIFICATION_PER_OBSERVATION_MODEL].includes(sourceModel)) {
     throw new TypeError("timeseries.source_verification_model is unsupported");
   }
-  const semanticProvenance = canonical
-    ? raw.source_provenance
-    : raw.semantic_source_provenance;
-  if (!canonical && Object.hasOwn(raw, "source_provenance")) {
-    throw new TypeError(
-      "timeseries builder input must use semantic_source_provenance; acquisition evidence is separate",
-    );
-  }
   return {
     connector_id: entryConnectorId,
     timeseries_id: positiveInteger(raw.timeseries_id, "timeseries.timeseries_id"),
     station_id: nullablePositiveInteger(raw.station_id, "timeseries.station_id"),
     pollutant_code: canonicalPollutant(raw.pollutant_code, "timeseries.pollutant_code"),
     source_verification_model: sourceModel,
-    source_provenance: canonicalSemanticProvenance(
-      semanticProvenance,
-      canonical
-        ? "timeseries.source_provenance"
-        : "timeseries.semantic_source_provenance",
+    source_provenance: canonicalProvenance(
+      raw.source_provenance,
+      "timeseries.source_provenance",
     ),
     default_status: canonicalStatus(
       raw.default_status,
@@ -351,7 +279,7 @@ function normalizeTimeseriesEntry(raw, connectorId, { canonical = false } = {}) 
 
 export function buildObservationVerificationConnectorManifest({
   connectorId,
-  semanticSourceIdentity,
+  sourceIdentity,
   timeseries,
 }) {
   const connector = positiveInteger(connectorId, "connectorId");
@@ -369,30 +297,8 @@ export function buildObservationVerificationConnectorManifest({
     verification_format_version: OBSERVATION_VERIFICATION_FORMAT_VERSION,
     history_generation: "v3",
     connector_id: connector,
-    source_identity: canonicalSemanticProvenance(
-      semanticSourceIdentity,
-      "semanticSourceIdentity",
-    ),
+    source_identity: canonicalProvenance(sourceIdentity, "sourceIdentity"),
     timeseries: Object.freeze(normalizedTimeseries.map((entry) => Object.freeze(entry))),
-  });
-}
-
-export function buildObservationVerificationRefreshInputs({
-  connectorId,
-  semanticSourceIdentity,
-  timeseries,
-  acquisitionEvidence,
-}) {
-  return Object.freeze({
-    canonical_manifest: buildObservationVerificationConnectorManifest({
-      connectorId,
-      semanticSourceIdentity,
-      timeseries,
-    }),
-    acquisition_audit_evidence: Object.freeze(canonicalObject(
-      acquisitionEvidence,
-      "acquisitionEvidence",
-    )),
   });
 }
 
@@ -403,26 +309,10 @@ export function validateObservationVerificationConnectorManifest(raw) {
     raw?.verification_format_version !== OBSERVATION_VERIFICATION_FORMAT_VERSION ||
     raw?.history_generation !== "v3"
   ) throw new Error("verification connector manifest identity is invalid");
-  const connector = positiveInteger(raw.connector_id, "connector_id");
-  const normalizedTimeseries = (Array.isArray(raw.timeseries) ? raw.timeseries : [])
-    .map((entry) => normalizeTimeseriesEntry(entry, connector, { canonical: true }))
-    .sort((left, right) => left.timeseries_id - right.timeseries_id);
-  for (let index = 1; index < normalizedTimeseries.length; index += 1) {
-    if (normalizedTimeseries[index - 1].timeseries_id === normalizedTimeseries[index].timeseries_id) {
-      throw new Error("verification connector manifest contains duplicate timeseries_id");
-    }
-  }
-  const normalized = Object.freeze({
-    schema_version: OBSERVATION_VERIFICATION_FORMAT_VERSION,
-    kind: OBSERVATION_VERIFICATION_CONNECTOR_MANIFEST_KIND,
-    verification_format_version: OBSERVATION_VERIFICATION_FORMAT_VERSION,
-    history_generation: "v3",
-    connector_id: connector,
-    source_identity: canonicalSemanticProvenance(
-      raw.source_identity,
-      "source_identity",
-    ),
-    timeseries: Object.freeze(normalizedTimeseries.map((entry) => Object.freeze(entry))),
+  const normalized = buildObservationVerificationConnectorManifest({
+    connectorId: raw.connector_id,
+    sourceIdentity: raw.source_identity,
+    timeseries: raw.timeseries,
   });
   if (encodeObservationVerificationJson(raw) !== encodeObservationVerificationJson(normalized)) {
     throw new Error("verification connector manifest is not canonical");
@@ -430,17 +320,11 @@ export function validateObservationVerificationConnectorManifest(raw) {
   return normalized;
 }
 
-export function observationVerificationConnectorManifestKey(
-  connectorId,
-  manifestSha256,
-) {
+export function observationVerificationConnectorManifestKey(connectorId) {
   return `${OBSERVATION_VERIFICATION_ROOT}/connector_id=${positiveInteger(
     connectorId,
     "connectorId",
-  )}/manifests/${canonicalSha256(
-    manifestSha256,
-    "manifestSha256",
-  )}.json`;
+  )}/manifest.json`;
 }
 
 function normalizeManifestIdentity(raw) {
@@ -451,15 +335,8 @@ function normalizeManifestIdentity(raw) {
     byte_size: positiveInteger(raw?.byte_size, "connector identity.byte_size"),
     sha256: canonicalSha256(raw?.sha256, "connector identity.sha256"),
   };
-  if (
-    identity.key !== observationVerificationConnectorManifestKey(
-      connectorId,
-      identity.sha256,
-    )
-  ) {
-    throw new Error(
-      "verification connector identity key is not canonical for its connector and SHA-256",
-    );
+  if (identity.key !== observationVerificationConnectorManifestKey(connectorId)) {
+    throw new Error("verification connector identity key is not canonical");
   }
   return identity;
 }
@@ -517,22 +394,6 @@ export async function buildObservationVerificationArtifact({ key, payload }) {
   });
 }
 
-export async function buildObservationVerificationConnectorArtifact(payload) {
-  const canonicalManifest = validateObservationVerificationConnectorManifest(payload);
-  const body = encoder.encode(encodeObservationVerificationJson(canonicalManifest));
-  const sha256 = await sha256ObservationVerificationBytes(body);
-  return Object.freeze({
-    key: observationVerificationConnectorManifestKey(
-      canonicalManifest.connector_id,
-      sha256,
-    ),
-    body,
-    byte_size: body.byteLength,
-    sha256,
-    content_type: "application/json; charset=utf-8",
-  });
-}
-
 async function r2ObjectBytes(object) {
   if (typeof object?.arrayBuffer === "function") {
     return new Uint8Array(await object.arrayBuffer());
@@ -550,156 +411,10 @@ function parseVerificationJson(bytes, label) {
   }
 }
 
-function cacheTimestamp(response) {
-  const value = Number(response?.headers?.get("x-uk-aq-cached-at-ms"));
-  return Number.isFinite(value) && value >= 0 ? value : null;
-}
-
-function latestCacheRequest() {
-  return new Request(
-    `${VERIFICATION_CACHE_ORIGIN}/_cache/observation-verification/latest-v1`,
-  );
-}
-
-function manifestCacheRequest(identity) {
-  const url = new URL(
-    `${VERIFICATION_CACHE_ORIGIN}/_cache/observation-verification/manifest-v1`,
-  );
-  url.searchParams.set("connector_id", String(identity.connector_id));
-  url.searchParams.set("key", identity.key);
-  url.searchParams.set("byte_size", String(identity.byte_size));
-  url.searchParams.set("sha256", identity.sha256);
-  return new Request(url.toString());
-}
-
-async function cachePut(cache, request, bytes, {
-  nowMs,
-  maxAgeSeconds,
-  absent = false,
-}) {
-  if (!cache || typeof cache.put !== "function") return;
-  const response = new Response(absent ? new Uint8Array() : bytes, {
-    headers: {
-      "Cache-Control": `public, max-age=${maxAgeSeconds}`,
-      "Content-Type": "application/octet-stream",
-      "x-uk-aq-cached-at-ms": String(nowMs),
-      "x-uk-aq-cache-absent": absent ? "1" : "0",
-    },
-  });
-  await cache.put(request, response);
-}
-
-function buildVerificationDiscovery(latestBytes, { cacheStatus }) {
-  if (latestBytes === null) {
-    return Object.freeze({
-      latest_present: false,
-      latest: null,
-      latest_identity: null,
-      cache_status: cacheStatus,
-    });
-  }
-  const latest = validateObservationVerificationLatest(
-    parseVerificationJson(latestBytes, "verification latest"),
-  );
-  return sha256ObservationVerificationBytes(latestBytes).then((sha256) =>
-    Object.freeze({
-      latest_present: true,
-      latest,
-      latest_identity: Object.freeze({
-        key: OBSERVATION_VERIFICATION_LATEST_KEY,
-        byte_size: latestBytes.byteLength,
-        sha256,
-      }),
-      cache_status: cacheStatus,
-    }));
-}
-
-export async function loadObservationVerificationDiscovery({
-  bucket,
-  cache = null,
-  nowMs = Date.now(),
-}) {
-  if (!bucket || typeof bucket.get !== "function") {
-    throw new TypeError("verification discovery requires an R2 bucket");
-  }
-  const currentTime = Number(nowMs);
-  if (!Number.isFinite(currentTime) || currentTime < 0) {
-    throw new TypeError("nowMs must be a non-negative finite number");
-  }
-  const request = latestCacheRequest();
-  if (cache && typeof cache.match === "function") {
-    const cached = await cache.match(request);
-    const cachedAt = cacheTimestamp(cached);
-    if (
-      cached && cachedAt !== null && currentTime >= cachedAt &&
-      currentTime - cachedAt <=
-        OBSERVATION_VERIFICATION_LATEST_CACHE_MAX_AGE_SECONDS * 1000
-    ) {
-      if (cached.headers.get("x-uk-aq-cache-absent") === "1") {
-        return buildVerificationDiscovery(null, { cacheStatus: "hit_absent" });
-      }
-      const bytes = new Uint8Array(await cached.arrayBuffer());
-      return buildVerificationDiscovery(bytes, { cacheStatus: "hit" });
-    }
-  }
-
+export async function loadObservationVerificationAuthority({ bucket, connectorId }) {
+  const connector = positiveInteger(connectorId, "connectorId");
   const latestObject = await bucket.get(OBSERVATION_VERIFICATION_LATEST_KEY);
   if (!latestObject) {
-    await cachePut(cache, request, new Uint8Array(), {
-      nowMs: currentTime,
-      maxAgeSeconds: OBSERVATION_VERIFICATION_LATEST_CACHE_MAX_AGE_SECONDS,
-      absent: true,
-    });
-    return buildVerificationDiscovery(null, { cacheStatus: "miss_absent" });
-  }
-  const latestBytes = await r2ObjectBytes(latestObject);
-  const discovery = await buildVerificationDiscovery(latestBytes, {
-    cacheStatus: "miss",
-  });
-  await cachePut(cache, request, latestBytes, {
-    nowMs: currentTime,
-    maxAgeSeconds: OBSERVATION_VERIFICATION_LATEST_CACHE_MAX_AGE_SECONDS,
-  });
-  return discovery;
-}
-
-export function observationVerificationManifestIdentityForConnector({
-  discovery,
-  connectorId,
-}) {
-  const connector = positiveInteger(connectorId, "connectorId");
-  if (!discovery?.latest_present) return null;
-  return discovery.latest.connectors.find((entry) =>
-    entry.connector_id === connector) || null;
-}
-
-async function readCachedManifest(cache, identity) {
-  if (!cache || typeof cache.match !== "function") return null;
-  const cached = await cache.match(manifestCacheRequest(identity));
-  if (!cached) return null;
-  const bytes = new Uint8Array(await cached.arrayBuffer());
-  if (
-    bytes.byteLength !== identity.byte_size ||
-    await sha256ObservationVerificationBytes(bytes) !== identity.sha256
-  ) return null;
-  const manifest = validateObservationVerificationConnectorManifest(
-    parseVerificationJson(bytes, "cached verification connector manifest"),
-  );
-  if (manifest.connector_id !== identity.connector_id) return null;
-  return Object.freeze({ bytes, manifest });
-}
-
-export async function loadObservationVerificationAuthority({
-  bucket,
-  connectorId,
-  discovery = null,
-  cache = null,
-  nowMs = Date.now(),
-}) {
-  const connector = positiveInteger(connectorId, "connectorId");
-  const resolvedDiscovery = discovery ||
-    await loadObservationVerificationDiscovery({ bucket, cache, nowMs });
-  if (!resolvedDiscovery.latest_present) {
     return Object.freeze({
       latest_present: false,
       overlay_authoritative: false,
@@ -707,40 +422,28 @@ export async function loadObservationVerificationAuthority({
       manifest: null,
       manifest_identity: null,
       cache_identity: "legacy-embedded-status",
-      discovery_cache_status: resolvedDiscovery.cache_status,
-      manifest_cache_status: "not_applicable",
     });
   }
-  const manifestIdentity = observationVerificationManifestIdentityForConnector({
-    discovery: resolvedDiscovery,
-    connectorId: connector,
+  const latestBytes = await r2ObjectBytes(latestObject);
+  const latest = validateObservationVerificationLatest(
+    parseVerificationJson(latestBytes, "verification latest"),
+  );
+  const latestIdentity = Object.freeze({
+    key: OBSERVATION_VERIFICATION_LATEST_KEY,
+    byte_size: latestBytes.byteLength,
+    sha256: await sha256ObservationVerificationBytes(latestBytes),
   });
+  const manifestIdentity = latest.connectors.find((entry) =>
+    entry.connector_id === connector) || null;
   if (!manifestIdentity) {
     return Object.freeze({
       latest_present: true,
       overlay_authoritative: false,
       connector_id: connector,
-      latest_identity: resolvedDiscovery.latest_identity,
+      latest_identity: latestIdentity,
       manifest: null,
       manifest_identity: null,
       cache_identity: "legacy-embedded-status",
-      discovery_cache_status: resolvedDiscovery.cache_status,
-      manifest_cache_status: "not_applicable",
-    });
-  }
-
-  const cachedManifest = await readCachedManifest(cache, manifestIdentity);
-  if (cachedManifest) {
-    return Object.freeze({
-      latest_present: true,
-      overlay_authoritative: true,
-      connector_id: connector,
-      latest_identity: resolvedDiscovery.latest_identity,
-      manifest: cachedManifest.manifest,
-      manifest_identity: manifestIdentity,
-      cache_identity: manifestIdentity.sha256,
-      discovery_cache_status: resolvedDiscovery.cache_status,
-      manifest_cache_status: "hit",
     });
   }
   const manifestObject = await bucket.get(manifestIdentity.key);
@@ -760,20 +463,14 @@ export async function loadObservationVerificationAuthority({
   if (manifest.connector_id !== connector) {
     throw new Error("verification connector manifest connector_id mismatch");
   }
-  await cachePut(cache, manifestCacheRequest(manifestIdentity), manifestBytes, {
-    nowMs: Number(nowMs),
-    maxAgeSeconds: OBSERVATION_VERIFICATION_MANIFEST_CACHE_MAX_AGE_SECONDS,
-  });
   return Object.freeze({
     latest_present: true,
     overlay_authoritative: true,
     connector_id: connector,
-    latest_identity: resolvedDiscovery.latest_identity,
+    latest_identity: latestIdentity,
     manifest,
     manifest_identity: manifestIdentity,
     cache_identity: manifestIdentity.sha256,
-    discovery_cache_status: resolvedDiscovery.cache_status,
-    manifest_cache_status: "miss",
   });
 }
 

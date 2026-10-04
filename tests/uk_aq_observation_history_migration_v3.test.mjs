@@ -404,8 +404,6 @@ const EXACT_READER_INDEX = Object.freeze({
   alignedDataRoot: PREFIX,
   indexGeneration: "v3",
   historyVersion: "v2",
-  historySchemaVersion: 3,
-  writerVersion: "parquet-wasm-zstd-v3",
   physicalLayoutVersion: OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
   alignedRowCap: OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
   decodeProfileId: OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE_ID,
