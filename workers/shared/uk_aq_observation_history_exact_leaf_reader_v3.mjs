@@ -995,8 +995,8 @@ async function readProvenanceIndexObject(source, key, budget) {
 }
 
 /**
- * Reads only current exact-leaf JSON authority. It deliberately has no
- * openParquetFile dependency and is bounded for the longest accepted request.
+ * Reads only complete UTC-day current exact-leaf JSON authority. It deliberately
+ * has no openParquetFile dependency and is bounded for the longest accepted request.
  */
 export async function readObservationHistoryExactLeafDailyMetadataV3({
   source,
@@ -1021,6 +1021,9 @@ export async function readObservationHistoryExactLeafDailyMetadataV3({
   const startMs = Date.parse(request.startIso);
   const endMs = Date.parse(request.endIso);
   if (endMs <= startMs) throw new Error("endUtc must be after startUtc");
+  if (startMs % DAY_MS !== 0 || endMs % DAY_MS !== 0) {
+    throw new Error("exact-leaf provenance metadata requires complete UTC days");
+  }
   if (endMs - startMs > MAX_PROVENANCE_RANGE_MS) {
     throw new Error("exact-leaf provenance range exceeds 366 days");
   }
@@ -1031,12 +1034,16 @@ export async function readObservationHistoryExactLeafDailyMetadataV3({
 
   const budget = { objects_read: 0, bytes_read: 0 };
   const rows = [];
+  const coveragePartialReasons = [];
   for (const dayUtc of days) {
     const expected = { ...request, dayUtc };
     const scope = scopePath(expected);
     const manifestKey = `${normalizedIndex.root}/${scope}/manifest.json`;
     const manifestObject = await readProvenanceIndexObject(source, manifestKey, budget);
-    if (!manifestObject) continue;
+    if (!manifestObject) {
+      coveragePartialReasons.push("required_physical_leaf_scope_missing");
+      continue;
+    }
     const manifest = validateManifest(
       parseJson(manifestObject.body, manifestKey),
       expected,
@@ -1052,7 +1059,8 @@ export async function readObservationHistoryExactLeafDailyMetadataV3({
       budget,
     );
     if (!leafObject) {
-      throw new Error(`required exact physical leaf is missing: ${manifest.descriptor.key}`);
+      coveragePartialReasons.push("required_physical_timeseries_leaf_missing");
+      continue;
     }
     const leafBody = await assertBodyIdentity(
       leafObject,
@@ -1074,8 +1082,15 @@ export async function readObservationHistoryExactLeafDailyMetadataV3({
       max_observed_at_utc: segments.at(-1).max_observed_at_utc,
     }));
   }
+  const partialReasons = Object.freeze([...new Set(coveragePartialReasons)]);
+  const coverageComplete = partialReasons.length === 0;
   return Object.freeze({
     rows: Object.freeze(rows),
+    response_complete: coverageComplete,
+    has_gap: !coverageComplete,
+    coverage_complete: coverageComplete,
+    coverage_partial_reasons: partialReasons,
+    partial_reasons: partialReasons,
     diagnostics: Object.freeze({
       utc_scopes_considered: days.length,
       index_objects_read: budget.objects_read,
@@ -1535,6 +1550,14 @@ export const OBSERVATION_HISTORY_EXACT_LEAF_LIMITS = Object.freeze({
   max_physical_segment_rows: MAX_PHYSICAL_SEGMENT_ROWS,
   physical_cursor_schema_version: CURSOR_SCHEMA_VERSION,
   max_physical_cursor_characters: MAX_CURSOR_LENGTH,
+});
+
+export const OBSERVATION_HISTORY_EXACT_LEAF_PROVENANCE_LIMITS = Object.freeze({
+  max_range_ms: MAX_PROVENANCE_RANGE_MS,
+  max_utc_scopes: MAX_PROVENANCE_UTC_SCOPES,
+  max_index_objects: MAX_PROVENANCE_INDEX_OBJECTS,
+  max_index_bytes: MAX_PROVENANCE_INDEX_BYTES,
+  max_index_object_bytes: MAX_INDEX_BYTES,
 });
 
 export const OBSERVATION_HISTORY_EXACT_LEAF_PAGINATION_REASON = PAGINATION_PARTIAL_REASON;

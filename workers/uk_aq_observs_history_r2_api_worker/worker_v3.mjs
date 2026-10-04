@@ -32,7 +32,12 @@ const UPSTREAM_AUTH_HEADER = "x-uk-aq-upstream-auth";
 const DEFAULT_BINDING_PREFIX = V3.timeseries_binding_index_prefix;
 const DAILY_PROVENANCE_PATH = "/v1/daily-validation-provenance";
 const VALID_OBSERVATION_PATHS = new Set(["/", "/v1/observations"]);
-const MAX_PROVENANCE_RANGE_MS = 366 * 24 * 60 * 60 * 1000;
+const UTC_DAY_MS = 24 * 60 * 60 * 1000;
+const MAX_PROVENANCE_RANGE_MS = 366 * UTC_DAY_MS;
+const MAX_PROVENANCE_PARTIAL_BOUNDARY_DAYS = 2;
+const MAX_PROVENANCE_PARTIAL_PHYSICAL_PAGES = 16;
+const PROVENANCE_PAGE_BUDGET_REASON =
+  "observation_history_physical_page_budget_exceeded";
 export const EXACT_HISTORY_WORKLOAD_DIAGNOSTIC_MODE = "workload_v1";
 export const EXACT_HISTORY_CPU_DIAGNOSTIC_MODE = "cpu_v1";
 const EXACT_HISTORY_DIAGNOSTIC_MODES = new Set([
@@ -194,6 +199,155 @@ export function parseDailyProvenanceRequest(url) {
   return { ok: true, timeseriesId, connectorId, pollutantCode, startIso, endIso };
 }
 
+export function dailyProvenanceUtcDayIntersections({ startUtc, endUtc }) {
+  const startIso = isoOrNull(startUtc);
+  const endIso = isoOrNull(endUtc);
+  if (!startIso || !endIso || startIso >= endIso) {
+    throw new Error("daily provenance interval is invalid");
+  }
+  const startMs = Date.parse(startIso);
+  const endMs = Date.parse(endIso);
+  const intersections = [];
+  for (
+    let dayStartMs = Math.floor(startMs / UTC_DAY_MS) * UTC_DAY_MS;
+    dayStartMs < endMs;
+    dayStartMs += UTC_DAY_MS
+  ) {
+    const dayEndMs = dayStartMs + UTC_DAY_MS;
+    const effectiveStartMs = Math.max(startMs, dayStartMs);
+    const effectiveEndMs = Math.min(endMs, dayEndMs);
+    intersections.push(Object.freeze({
+      day_utc: new Date(dayStartMs).toISOString().slice(0, 10),
+      effective_start_utc: new Date(effectiveStartMs).toISOString(),
+      effective_end_utc: new Date(effectiveEndMs).toISOString(),
+      is_complete_utc_day:
+        effectiveStartMs === dayStartMs && effectiveEndMs === dayEndMs,
+    }));
+  }
+  const partialCount = intersections.filter((day) => !day.is_complete_utc_day).length;
+  if (partialCount > MAX_PROVENANCE_PARTIAL_BOUNDARY_DAYS) {
+    throw new Error("daily provenance interval has too many partial UTC boundary days");
+  }
+  return Object.freeze(intersections);
+}
+
+function incompleteDailyProvenanceResponse(partialReasons, { hasGap = true } = {}) {
+  return jsonResponse({
+    ok: false,
+    error_code: "observation_provenance_incomplete",
+    error: "observation provenance is incomplete",
+    response_complete: false,
+    has_gap: hasGap,
+    partial_reasons: [...new Set(partialReasons)],
+  }, { status: 502, noStore: true });
+}
+
+function aurnVerificationTimeseries(authority, timeseriesId) {
+  if (!authority?.overlay_authoritative || authority.connector_id !== 1) {
+    throw new Error("authoritative connector-1 verification overlay is required");
+  }
+  const timeseries = authority.manifest?.timeseries?.find((entry) =>
+    entry.timeseries_id === timeseriesId);
+  if (!timeseries) throw new Error("verification overlay does not contain the requested timeseries");
+  if (timeseries.source_verification_model !== OBSERVATION_VERIFICATION_PER_OBSERVATION_MODEL) {
+    throw new Error("AURN daily provenance requires per-observation verification authority");
+  }
+  return timeseries;
+}
+
+export function deriveAurnPartialDayValidationStatus({ authority, timeseriesId, rows }) {
+  aurnVerificationTimeseries(authority, timeseriesId);
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  let sawRatified = false;
+  for (const row of rows) {
+    const status = resolveEffectiveObservationVerificationStatus({
+      authority,
+      timeseriesId,
+      observedAtUtc: row?.observed_at_utc,
+      legacyStatus: null,
+    });
+    if (status === "P") return "P";
+    if (status !== "R") {
+      throw new Error("verification overlay cannot classify a boundary-day observation");
+    }
+    sawRatified = true;
+  }
+  return sawRatified ? "R" : null;
+}
+
+async function readPartialDailyProvenance({
+  source,
+  index,
+  params,
+  intersection,
+  verificationAuthority,
+  pageBudget,
+}) {
+  const rows = [];
+  let physicalCursor = null;
+  while (true) {
+    if (pageBudget.pages >= MAX_PROVENANCE_PARTIAL_PHYSICAL_PAGES) {
+      return {
+        complete: false,
+        has_gap: false,
+        partial_reasons: [PROVENANCE_PAGE_BUDGET_REASON],
+      };
+    }
+    let result;
+    try {
+      result = await readObservationHistoryExactLeafPageV3({
+        source,
+        timeseriesId: params.timeseriesId,
+        connectorId: params.connectorId,
+        pollutantCode: params.pollutantCode,
+        startUtc: intersection.effective_start_utc,
+        endUtc: intersection.effective_end_utc,
+        physicalCursor,
+        index,
+      });
+    } catch (error) {
+      if (physicalCursor && error instanceof ObservationHistoryExactLeafReadError) {
+        return {
+          complete: false,
+          has_gap: true,
+          partial_reasons: ["required_physical_leaf_continuation_invalid"],
+        };
+      }
+      throw error;
+    }
+    pageBudget.pages += 1;
+    if (result.has_gap === true || result.coverage_complete !== true) {
+      return {
+        complete: false,
+        has_gap: true,
+        partial_reasons: result.coverage_partial_reasons?.length
+          ? result.coverage_partial_reasons
+          : ["required_physical_leaf_coverage_incomplete"],
+      };
+    }
+    rows.push(...result.rows);
+    if (result.response_complete === true) break;
+    const nextCursor = result.physical_page?.next_cursor;
+    if (
+      result.physical_page?.pagination_complete !== false ||
+      typeof nextCursor !== "string" ||
+      !nextCursor ||
+      nextCursor === physicalCursor
+    ) {
+      throw new Error("partial-day exact-leaf cursor progression is contradictory");
+    }
+    physicalCursor = nextCursor;
+  }
+  return {
+    complete: true,
+    status: deriveAurnPartialDayValidationStatus({
+      authority: verificationAuthority,
+      timeseriesId: params.timeseriesId,
+      rows,
+    }),
+  };
+}
+
 async function handleDailyProvenance(params, env) {
   const verificationAuthority = await loadObservationVerificationAuthority({
     bucket: env.UK_AQ_HISTORY_BUCKET,
@@ -207,28 +361,63 @@ async function handleDailyProvenance(params, env) {
       error: "verification_overlay_not_authoritative",
     }, { status: 503, noStore: true });
   }
-  const result = await readObservationHistoryExactLeafDailyMetadataV3({
-    source: createR2ObservationHistoryV3Source({ bucket: env.UK_AQ_HISTORY_BUCKET }),
-    timeseriesId: params.timeseriesId,
-    connectorId: params.connectorId,
-    pollutantCode: params.pollutantCode,
+  const source = createR2ObservationHistoryV3Source({ bucket: env.UK_AQ_HISTORY_BUCKET });
+  const index = observationHistoryV3ReaderIndex(V3.observations_timeseries_index_prefix);
+  const intersections = dailyProvenanceUtcDayIntersections({
     startUtc: params.startIso,
     endUtc: params.endIso,
-    index: observationHistoryV3ReaderIndex(V3.observations_timeseries_index_prefix),
   });
-  return jsonResponse({
-    ok: true, timeseries_id: params.timeseriesId, connector_id: 1,
-    pollutant: params.pollutantCode, start_utc: params.startIso, end_utc: params.endIso,
-    response_complete: true, has_gap: false,
-    rows: result.rows.map((row) => ({
-      day_utc: row.day_utc,
-      source_validation_status: deriveAurnDailyValidationStatus({
+  const daily = new Map();
+  const completeDays = intersections.filter((day) => day.is_complete_utc_day);
+  if (completeDays.length > 0) {
+    const result = await readObservationHistoryExactLeafDailyMetadataV3({
+      source,
+      timeseriesId: params.timeseriesId,
+      connectorId: params.connectorId,
+      pollutantCode: params.pollutantCode,
+      startUtc: completeDays[0].effective_start_utc,
+      endUtc: completeDays.at(-1).effective_end_utc,
+      index,
+    });
+    if (result.response_complete !== true || result.has_gap === true) {
+      return incompleteDailyProvenanceResponse(result.partial_reasons);
+    }
+    for (const row of result.rows) {
+      daily.set(row.day_utc, deriveAurnDailyValidationStatus({
         authority: verificationAuthority,
         timeseriesId: params.timeseriesId,
         minObservedAtUtc: row.min_observed_at_utc,
         maxObservedAtUtc: row.max_observed_at_utc,
-      }),
-    })),
+      }));
+    }
+  }
+
+  const pageBudget = { pages: 0 };
+  for (const intersection of intersections.filter((day) => !day.is_complete_utc_day)) {
+    const result = await readPartialDailyProvenance({
+      source,
+      index,
+      params,
+      intersection,
+      verificationAuthority,
+      pageBudget,
+    });
+    if (!result.complete) {
+      return incompleteDailyProvenanceResponse(result.partial_reasons, {
+        hasGap: result.has_gap,
+      });
+    }
+    if (result.status !== null) daily.set(intersection.day_utc, result.status);
+  }
+  return jsonResponse({
+    ok: true, timeseries_id: params.timeseriesId, connector_id: 1,
+    pollutant: params.pollutantCode, start_utc: params.startIso, end_utc: params.endIso,
+    response_complete: true, has_gap: false,
+    rows: [...daily].sort(([left], [right]) => left.localeCompare(right))
+      .map(([day_utc, source_validation_status]) => ({
+        day_utc,
+        source_validation_status,
+      })),
   }, { noStore: true });
 }
 
@@ -238,15 +427,7 @@ export function deriveAurnDailyValidationStatus({
   minObservedAtUtc,
   maxObservedAtUtc,
 }) {
-  if (!authority?.overlay_authoritative || authority.connector_id !== 1) {
-    throw new Error("authoritative connector-1 verification overlay is required");
-  }
-  const timeseries = authority.manifest?.timeseries?.find((entry) =>
-    entry.timeseries_id === timeseriesId);
-  if (!timeseries) throw new Error("verification overlay does not contain the requested timeseries");
-  if (timeseries.source_verification_model !== OBSERVATION_VERIFICATION_PER_OBSERVATION_MODEL) {
-    throw new Error("AURN daily provenance requires per-observation verification authority");
-  }
+  const timeseries = aurnVerificationTimeseries(authority, timeseriesId);
   const minObserved = isoOrNull(minObservedAtUtc);
   const maxObserved = isoOrNull(maxObservedAtUtc);
   if (!minObserved || !maxObserved || minObserved > maxObserved) {
