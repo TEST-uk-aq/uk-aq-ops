@@ -245,11 +245,11 @@ CROSS_CHECK_BACKFILL_CONNECTOR_CODES_BY_FILTER: dict[str, tuple[str, ...]] = {
 OFFICIAL_RDATA_RUN_CONTEXTS: dict[str, dict[str, Any]] = {}
 
 # Subset of core tables that the integrity DB needs. Other tables in the
-# manifest (categories, observed_properties, offerings, features, procedures,
-# networks, sos_*, station_metadata)
+# manifest (categories, offerings, features, procedures, networks, sos_*,
+# station_metadata)
 # are accepted in the manifest but not imported in this phase.
 CORE_TABLES_TO_IMPORT = (
-    "connectors", "stations", "timeseries", "phenomena",
+    "connectors", "stations", "timeseries", "phenomena", "observed_properties",
     "observed_property_mappings", "sos_station_timeseries_site_refs",
 )
 
@@ -267,6 +267,7 @@ CREATE TABLE IF NOT EXISTS core_snapshot_imports (
   rows_stations INTEGER DEFAULT 0,
   rows_timeseries INTEGER DEFAULT 0,
   rows_pollutants INTEGER DEFAULT 0,
+  rows_observed_properties INTEGER DEFAULT 0,
   rows_lookup INTEGER DEFAULT 0,
   rows_sos_site_ref_bridge INTEGER DEFAULT 0,
   sos_site_ref_bridge_sha256 TEXT,
@@ -328,6 +329,15 @@ CREATE TABLE IF NOT EXISTS core_phenomena_snapshot (
   observed_property_id INTEGER,
   connector_id INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS core_observed_properties_snapshot (
+  id INTEGER PRIMARY KEY,
+  code TEXT,
+  display_name TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_core_observed_properties_snapshot_code
+  ON core_observed_properties_snapshot(code);
 
 CREATE TABLE IF NOT EXISTS core_observed_property_mappings_snapshot (
   id INTEGER PRIMARY KEY,
@@ -838,17 +848,14 @@ def _core_snapshot_identity_relationship_warnings(
                OR s.id IS NULL OR c.id IS NULL OR p.id IS NULL
                OR s.connector_id != t.connector_id
         """,
-        "phenomenon_observed_property_mapping": """
+        "phenomenon_observed_property": """
             SELECT COUNT(*)
             FROM core_phenomena_snapshot p
+            LEFT JOIN core_observed_properties_snapshot o
+              ON o.id = p.observed_property_id
             WHERE p.id IS NULL OR p.connector_id IS NULL
                OR p.observed_property_id IS NULL
-               OR NOT EXISTS (
-                   SELECT 1
-                   FROM core_observed_property_mappings_snapshot m
-                   WHERE m.connector_id = p.connector_id
-                     AND m.observed_property_id = p.observed_property_id
-               )
+               OR o.id IS NULL OR TRIM(COALESCE(o.code, '')) = ''
         """,
     }
     warnings: list[dict[str, Any]] = []
@@ -1490,7 +1497,14 @@ def snapshot_tables_have_rows(
     mappings = conn.execute(
         "SELECT COUNT(*) FROM core_observed_property_mappings_snapshot"
     ).fetchone()
-    if not bool(stations and stations[0] > 0 and mappings and mappings[0] > 0):
+    observed_properties = conn.execute(
+        "SELECT COUNT(*) FROM core_observed_properties_snapshot"
+    ).fetchone()
+    if not bool(
+        stations and stations[0] > 0
+        and mappings and mappings[0] > 0
+        and observed_properties and observed_properties[0] > 0
+    ):
         return False
     if manifest is None:
         return _table_exists(conn, "sos_station_timeseries_site_refs_snapshot")
@@ -1627,6 +1641,23 @@ def _phenomena_insert_spec() -> tuple[str, Any]:
     return sql, to_tuple
 
 
+def _observed_properties_insert_spec() -> tuple[str, Any]:
+    sql = (
+        "INSERT INTO core_observed_properties_snapshot "
+        "(id, code, display_name) VALUES (?, ?, ?)"
+    )
+    def to_tuple(r: dict[str, Any]) -> tuple:
+        observed_property_id = _row_get_int(r, "id")
+        if observed_property_id is None or observed_property_id <= 0:
+            raise ValueError("observed_properties row has invalid id")
+        return (
+            observed_property_id,
+            _row_get_str(r, "code"),
+            _row_get_str(r, "display_name"),
+        )
+    return sql, to_tuple
+
+
 def _observed_property_mappings_insert_spec() -> tuple[str, Any]:
     sql = (
         "INSERT INTO core_observed_property_mappings_snapshot "
@@ -1689,6 +1720,7 @@ _INSERT_SPECS = {
     "stations":   _stations_insert_spec,
     "timeseries": _timeseries_insert_spec,
     "phenomena":  _phenomena_insert_spec,
+    "observed_properties": _observed_properties_insert_spec,
     "observed_property_mappings": _observed_property_mappings_insert_spec,
     "sos_station_timeseries_site_refs": _sos_site_ref_bridge_insert_spec,
 }
@@ -1698,6 +1730,7 @@ _TARGET_TABLES = {
     "stations":   "core_stations_snapshot",
     "timeseries": "core_timeseries_snapshot",
     "phenomena":  "core_phenomena_snapshot",
+    "observed_properties": "core_observed_properties_snapshot",
     "observed_property_mappings": "core_observed_property_mappings_snapshot",
     "sos_station_timeseries_site_refs":
         "sos_station_timeseries_site_refs_snapshot",
@@ -2111,6 +2144,7 @@ def import_core_snapshot(
               rows_stations = ?,
               rows_timeseries = ?,
               rows_pollutants = ?,
+              rows_observed_properties = ?,
               rows_lookup = ?,
               rows_sos_site_ref_bridge = ?,
               sos_site_ref_bridge_sha256 = ?,
@@ -2124,6 +2158,7 @@ def import_core_snapshot(
                 rows_by_table.get("stations", 0),
                 rows_by_table.get("timeseries", 0),
                 rows_by_table.get("phenomena", 0),
+                rows_by_table.get("observed_properties", 0),
                 rows_lookup,
                 rows_by_table.get("sos_station_timeseries_site_refs", 0),
                 str(bridge_entry["sha256"]),
@@ -14653,34 +14688,30 @@ def _official_rdata_bindings(
     dict[str, list[dict[str, Any]]],
 ]:
     """Resolve one authoritative active timeseries per site/pollutant."""
+    config = OFFICIAL_RDATA_NETWORKS.get(source_key)
+    if config is None:
+        raise ValueError(f"unsupported official RData source: {source_key}")
     rows = conn.execute(
         """
         SELECT
           UPPER(TRIM(l.source_location_id)),
           l.station_id,
+          l.connector_id,
           l.timeseries_id,
-          LOWER(TRIM(m.observed_property_code)),
-          m.observed_property_code_count,
-          m.observed_property_codes,
+          t.station_id,
+          t.connector_id,
+          p.connector_id,
+          p.observed_property_id,
+          o.id,
+          LOWER(TRIM(o.code)),
           p.label,
           p.source_label,
           p.pollutant_label
         FROM source_station_timeseries_lookup l
         JOIN core_timeseries_snapshot t ON t.id = l.timeseries_id
         JOIN core_phenomena_snapshot p ON p.id = t.phenomenon_id
-        LEFT JOIN (
-          SELECT connector_id, observed_property_id,
-                 MIN(LOWER(TRIM(observed_property_code))) AS observed_property_code,
-                 COUNT(DISTINCT LOWER(TRIM(observed_property_code))) AS observed_property_code_count,
-                 GROUP_CONCAT(DISTINCT LOWER(TRIM(observed_property_code))) AS observed_property_codes
-          FROM core_observed_property_mappings_snapshot
-          WHERE is_active = 1
-            AND observed_property_id IS NOT NULL
-            AND TRIM(observed_property_code) != ''
-          GROUP BY connector_id, observed_property_id
-        ) m
-          ON m.connector_id = t.connector_id
-         AND m.observed_property_id = p.observed_property_id
+        LEFT JOIN core_observed_properties_snapshot o
+          ON o.id = p.observed_property_id
         WHERE l.source_key = ?
           AND l.is_active = 1
           AND l.source_location_id IS NOT NULL
@@ -14702,16 +14733,12 @@ def _official_rdata_bindings(
     excluded_rows: list[dict[str, Any]] = []
     mapping_defects: list[dict[str, Any]] = []
     for (
-        site_code, station_id, timeseries_id, pollutant_code, code_count,
-        observed_property_codes, phenomenon_label, phenomenon_source_label,
-        phenomenon_pollutant_label,
+        site_code, lookup_station_id, lookup_connector_id, timeseries_id,
+        timeseries_station_id, timeseries_connector_id, phenomenon_connector_id,
+        observed_property_id, canonical_observed_property_id, pollutant_code,
+        phenomenon_label, phenomenon_source_label, phenomenon_pollutant_label,
     ) in rows:
         code = str(pollutant_code or "").strip().lower()
-        mapped_codes = sorted({
-            value.strip().lower()
-            for value in str(observed_property_codes or "").split(",")
-            if value.strip()
-        })
         label_codes = sorted({
             normalized
             for normalized in (
@@ -14723,47 +14750,65 @@ def _official_rdata_bindings(
         })
         identity = {
             "site_code": str(site_code),
-            "station_id": int(station_id),
+            "station_id": int(lookup_station_id),
             "timeseries_id": int(timeseries_id),
-            "observed_property_code": code,
-            "observed_property_code_count": int(code_count or 0),
-            "observed_property_codes": mapped_codes,
+            "observed_property_id": (
+                int(observed_property_id)
+                if observed_property_id is not None else None
+            ),
+            "canonical_observed_property_code": code,
+        }
+        diagnostic_identity = {
+            **identity,
+            "phenomenon_label": phenomenon_label,
+            "phenomenon_source_label": phenomenon_source_label,
+            "phenomenon_pollutant_label": phenomenon_pollutant_label,
             "phenomenon_pollutant_codes": label_codes,
         }
-        if int(code_count or 0) != 1:
-            audit_row = {
-                **identity,
-                "reason": (
-                    "ambiguous_active_observed_property_mapping"
-                    if int(code_count or 0) > 1
-                    else "missing_active_observed_property_mapping"
-                ),
-            }
-            if selected.intersection(set(mapped_codes) | set(label_codes)):
-                observed_property_rows.append(identity)
-                mapping_defects.append(audit_row)
-            else:
-                excluded_rows.append({
-                    **audit_row,
-                    "reason": f"unselected_{audit_row['reason']}",
-                })
+        identity_contradictions = []
+        if int(lookup_connector_id) != config.connector_id:
+            identity_contradictions.append("lookup_connector_id")
+        if int(timeseries_connector_id) != config.connector_id:
+            identity_contradictions.append("timeseries_connector_id")
+        if int(phenomenon_connector_id) != config.connector_id:
+            identity_contradictions.append("phenomenon_connector_id")
+        if int(timeseries_station_id) != int(lookup_station_id):
+            identity_contradictions.append("timeseries_station_id")
+        defect_reason = None
+        if identity_contradictions:
+            defect_reason = "contradictory_station_timeseries_identity"
+        elif observed_property_id is None:
+            defect_reason = "missing_observed_property_id"
+        elif canonical_observed_property_id is None:
+            defect_reason = "missing_canonical_observed_property"
+        elif int(canonical_observed_property_id) != int(observed_property_id):
+            defect_reason = "contradictory_canonical_observed_property"
+        elif not code:
+            defect_reason = "blank_canonical_observed_property_code"
+        if defect_reason is not None:
+            mapping_defects.append({
+                **diagnostic_identity,
+                "identity_contradictions": identity_contradictions,
+                "reason": defect_reason,
+            })
             continue
         if code not in supported:
             excluded_rows.append({
-                **identity,
+                **diagnostic_identity,
                 "reason": "unsupported_integrity_pollutant",
             })
             continue
         if code not in selected:
             excluded_rows.append({
-                **identity,
+                **diagnostic_identity,
                 "reason": "not_selected_pollutant",
             })
             continue
         observed_property_rows.append(identity)
         binding = {
-            "station_id": int(station_id),
+            "station_id": int(lookup_station_id),
             "timeseries_id": int(timeseries_id),
+            "observed_property_id": int(observed_property_id),
         }
         grouped.setdefault((str(site_code), code), []).append(binding)
     if mapping_defects:
@@ -14773,7 +14818,7 @@ def _official_rdata_bindings(
             for row in mapping_defects[:10]
         )
         raise RuntimeError(
-            f"{source_key} authoritative observed-property mapping is defective: "
+            f"{source_key} authoritative observed-property identity is defective: "
             f"{sample}"
         )
     ambiguous = {
@@ -14789,11 +14834,17 @@ def _official_rdata_bindings(
         )
     bindings: dict[str, dict[str, dict[str, int]]] = {}
     for (site_code, pollutant_code), values in sorted(grouped.items()):
-        bindings.setdefault(site_code, {})[pollutant_code] = values[0]
+        selected_binding = values[0]
+        bindings.setdefault(site_code, {})[pollutant_code] = {
+            "station_id": selected_binding["station_id"],
+            "timeseries_id": selected_binding["timeseries_id"],
+        }
         mapping_rows.append({
             "site_code": site_code,
             "pollutant_code": pollutant_code,
-            **values[0],
+            "station_id": selected_binding["station_id"],
+            "timeseries_id": selected_binding["timeseries_id"],
+            "observed_property_id": selected_binding["observed_property_id"],
         })
     if not bindings:
         raise RuntimeError(
@@ -28160,6 +28211,7 @@ def open_db(db_path: str) -> sqlite3.Connection:
     ensure_columns(conn, "core_snapshot_imports", {
         "snapshot_day_utc": "TEXT",
         "bytes_read": "INTEGER DEFAULT 0",
+        "rows_observed_properties": "INTEGER DEFAULT 0",
         "rows_sos_site_ref_bridge": "INTEGER DEFAULT 0",
         "sos_site_ref_bridge_sha256": "TEXT",
     })
