@@ -101,12 +101,16 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
 
         self.assertEqual(manifest["config_version"], 1)
         self.assertEqual(manifest["scheduler_name"], "uk-aq-cron-scheduler-ops")
-        self.assertEqual(manifest["job_count"], 9)
+        self.assertEqual(manifest["job_count"], 13)
         self.assertEqual(
             [job["job_key"] for job in manifest["jobs"]],
             [
+                "uk_aq_blog_refresh",
                 "uk_aq_chart_metrics",
                 "uk_aq_dropbox_prune_raw",
+                "uk_aq_media_discovery",
+                "uk_aq_media_gdelt",
+                "uk_aq_media_news_email",
                 "uk_aq_observs_partition_maintenance",
                 "uk_aq_prune_daily",
                 "uk_aq_r2_core_snapshot",
@@ -125,10 +129,16 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
             job for job in manifest["jobs"] if job["job_key"] == "uk_aq_r2_history_dropbox_backup"
         )
         self.assertEqual(daily_backup["github_inputs_json"], "{}")
-        self.assertTrue(all(job["target_type"] == "github_workflow" for job in manifest["jobs"]))
-        self.assertTrue(all(job["worker_http_url"] is None for job in manifest["jobs"]))
-        self.assertTrue(all(job["worker_http_secret_binding"] is None for job in manifest["jobs"]))
-        self.assertTrue(all(job["worker_http_body_json"] is None for job in manifest["jobs"]))
+        # HTTP jobs already existed; retain the null-target checks for GitHub jobs.
+        github_jobs = [job for job in manifest["jobs"] if job["target_type"] == "github_workflow"]
+        news = next(job for job in manifest["jobs"] if job["job_key"] == "uk_aq_media_news_email")
+        self.assertEqual(news["enabled"], 0)
+        self.assertEqual(news["cron_expr"], "*/5 * * * *")
+        self.assertEqual(news["target_type"], "worker_http")
+        self.assertEqual(news["worker_http_secret_binding"], "UK_AQ_MEDIA_EMAIL_WORKER_HTTP_SECRET")
+        self.assertTrue(all(job["worker_http_url"] is None for job in github_jobs))
+        self.assertTrue(all(job["worker_http_secret_binding"] is None for job in github_jobs))
+        self.assertTrue(all(job["worker_http_body_json"] is None for job in github_jobs))
 
     def test_github_workflow_jobs_default_cloud_run_method_to_post(self) -> None:
         job = sync_jobs.validate_job(
@@ -187,8 +197,8 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
             self.assertTrue(json_path.exists())
 
             manifest = json.loads(json_path.read_text(encoding="utf-8"))
-            self.assertEqual(manifest["job_count"], 9)
-            self.assertEqual(len(manifest["jobs"]), 9)
+            self.assertEqual(manifest["job_count"], 13)
+            self.assertEqual(len(manifest["jobs"]), 13)
             self.assertEqual(
                 set(manifest["scheduler_jobs_required_columns"]),
                 set(sync_jobs.SQL_COLUMNS + ["updated_at"]),
