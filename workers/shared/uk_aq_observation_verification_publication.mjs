@@ -52,6 +52,7 @@ export async function publishObservationVerificationConnectorManifest({ r2, publ
   const durable = await putAndVerifyR2ObjectWithSha256({
     r2,
     intent: publication.artifact,
+    verifyStoredBodyWithGetWhenHeadSizeUnavailable: true,
   });
   return Object.freeze({
     connector_id: publication.latest_identity.connector_id,
@@ -79,5 +80,9 @@ export async function publishObservationVerificationLatest({
       );
     }
   }
-  return putAndVerifyR2ObjectWithSha256({ r2, intent: publication.artifact });
+  return putAndVerifyR2ObjectWithSha256({
+    r2,
+    intent: publication.artifact,
+    verifyStoredBodyWithGetWhenHeadSizeUnavailable: true,
+  });
 }

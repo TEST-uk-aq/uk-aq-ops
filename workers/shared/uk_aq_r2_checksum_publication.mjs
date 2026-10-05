@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 
 import {
   normalizeR2Sha256Checksum,
+  r2GetObject,
   r2HeadObject,
   r2PutObject,
   sha256Hex,
@@ -72,12 +73,85 @@ export function verifyR2StoredSha256Head({
   });
 }
 
+function storedBodyBytes(stored, key) {
+  const body = stored?.body;
+  if (Buffer.isBuffer(body)) return Buffer.from(body);
+  if (body instanceof ArrayBuffer) return Buffer.from(body);
+  if (ArrayBuffer.isView(body)) {
+    return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+  }
+  throw new Error(`Checksum-aware R2 stored body verification unavailable: ${key}`);
+}
+
+function verifyR2StoredBodyGet({ head, stored, intent }) {
+  if (!head || head.exists === false) {
+    throw new Error(`Checksum-aware R2 object is missing: ${intent.key}`);
+  }
+  const rawHeadSha256 = head.sha256 ?? head.checksums?.sha256;
+  let headSha256Verified = false;
+  if (rawHeadSha256 !== null && rawHeadSha256 !== undefined && rawHeadSha256 !== "") {
+    const headSha256 = requireSha256(
+      rawHeadSha256,
+      `stored R2 SHA-256 for ${intent.key}`,
+    );
+    if (headSha256 !== intent.sha256) {
+      throw new Error(`Checksum-aware R2 SHA-256 verification failed: ${intent.key}`);
+    }
+    headSha256Verified = true;
+  }
+  if (stored?.key !== undefined && stored.key !== intent.key) {
+    throw new Error(`Checksum-aware R2 GET key verification failed: ${intent.key}`);
+  }
+  const body = storedBodyBytes(stored, intent.key);
+  const rawGetByteSize = stored?.bytes ?? stored?.size;
+  if (
+    rawGetByteSize !== null && rawGetByteSize !== undefined && rawGetByteSize !== "" &&
+    Number(rawGetByteSize) !== body.byteLength
+  ) {
+    throw new Error(
+      `Checksum-aware R2 GET byte-size evidence is contradictory: ${intent.key}`,
+    );
+  }
+  if (body.byteLength !== intent.byte_size) {
+    throw new Error(`Checksum-aware R2 GET byte-size verification failed: ${intent.key}`);
+  }
+  const calculatedSha256 = sha256Hex(body);
+  const rawGetSha256 = stored?.sha256 ?? stored?.checksums?.sha256;
+  if (rawGetSha256 !== null && rawGetSha256 !== undefined && rawGetSha256 !== "") {
+    const getSha256 = requireSha256(
+      rawGetSha256,
+      `GET R2 SHA-256 for ${intent.key}`,
+    );
+    if (getSha256 !== calculatedSha256) {
+      throw new Error(
+        `Checksum-aware R2 GET SHA-256 evidence is contradictory: ${intent.key}`,
+      );
+    }
+  }
+  if (calculatedSha256 !== intent.sha256) {
+    throw new Error(`Checksum-aware R2 GET SHA-256 verification failed: ${intent.key}`);
+  }
+  return Object.freeze({
+    key: intent.key,
+    byte_size: intent.byte_size,
+    sha256: intent.sha256,
+    etag: String(stored?.etag || head.etag || head.httpEtag || "").trim() || null,
+    verified: true,
+    stored_sha256_verified: true,
+    stored_byte_size_verified: true,
+    stored_body_get_verified: true,
+    head_sha256_verified: headSha256Verified,
+  });
+}
+
 export async function putAndVerifyR2ObjectWithSha256({
   r2,
   intent,
   putObject = r2PutObject,
   headObject = r2HeadObject,
+  getObject = r2GetObject,
   requireStoredByteSize = true,
+  verifyStoredBodyWithGetWhenHeadSizeUnavailable = false,
 }) {
   const normalizedIntent = buildR2ChecksumAwarePutIntent({
     key: intent?.key,
@@ -104,6 +178,42 @@ export async function putAndVerifyR2ObjectWithSha256({
     sha256: normalizedIntent.sha256,
   });
   const head = await headObject({ r2, key: normalizedIntent.key });
+  if (!head || head.exists === false) {
+    throw new Error(`Checksum-aware R2 object is missing: ${normalizedIntent.key}`);
+  }
+  const rawStoredByteSize = head.bytes ?? head.size;
+  const storedByteSizeAvailable = (
+    rawStoredByteSize !== null &&
+    rawStoredByteSize !== undefined &&
+    rawStoredByteSize !== ""
+  );
+  if (
+    !storedByteSizeAvailable &&
+    verifyStoredBodyWithGetWhenHeadSizeUnavailable
+  ) {
+    const rawHeadSha256 = head.sha256 ?? head.checksums?.sha256;
+    if (
+      rawHeadSha256 !== null &&
+      rawHeadSha256 !== undefined &&
+      rawHeadSha256 !== ""
+    ) {
+      const headSha256 = requireSha256(
+        rawHeadSha256,
+        `stored R2 SHA-256 for ${normalizedIntent.key}`,
+      );
+      if (headSha256 !== normalizedIntent.sha256) {
+        throw new Error(
+          `Checksum-aware R2 SHA-256 verification failed: ${normalizedIntent.key}`,
+        );
+      }
+    }
+    const stored = await getObject({ r2, key: normalizedIntent.key });
+    return verifyR2StoredBodyGet({
+      head,
+      stored,
+      intent: normalizedIntent,
+    });
+  }
   return verifyR2StoredSha256Head({
     head,
     intent: normalizedIntent,
