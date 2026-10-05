@@ -22,12 +22,12 @@ on:
         default: ""
         type: string
       force_prune_recheck:
-        description: "Audit a bounded rolling batch of eligible observation days"
+        description: "Force prune recheck"
         required: false
         default: false
         type: boolean
       force_prune_max_days_per_run:
-        description: "Override positive forced-prune audit day limit (default 50)"
+        description: "Override positive forced-prune-recheck audit day limit (default 50)"
         required: false
         default: ""
         type: string
