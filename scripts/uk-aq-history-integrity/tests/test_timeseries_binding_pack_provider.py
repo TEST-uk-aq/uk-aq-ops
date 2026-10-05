@@ -356,6 +356,18 @@ class TimeseriesBindingPackProviderTests(unittest.TestCase):
                     "individual",
                 )
 
+    def test_cli_live_defaults_remain_individual(self) -> None:
+        for source in ("waqn", "saqn", "all", "openaq", "sensorcommunity"):
+            with self.subTest(source=source):
+                parsed = V3_MODULE.parse_args([
+                    "--env", "LIVE", "--source", source, "--check-only",
+                    "--from-day", "2026-06-01", "--to-day", "2026-06-01",
+                ])
+                self.assertEqual(
+                    parsed.timeseries_binding_backup_mode,
+                    "individual",
+                )
+
     def test_cli_accepts_explicit_test_pack_for_supported_sources(self) -> None:
         for source in ("sos", "waqn", "saqn", "all"):
             with self.subTest(source=source):

@@ -26586,11 +26586,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if parsed.env == "LIVE" and parsed.enable_historical_identity_repair:
         p.error("historical identity repair must remain disabled in LIVE")
     if parsed.timeseries_binding_backup_mode is None:
-        parsed.timeseries_binding_backup_mode = (
-            "pack"
-            if parsed.source in {"sos", "waqn", "saqn", "all"}
-            else "individual"
-        )
+        if parsed.source == "sos":
+            parsed.timeseries_binding_backup_mode = "pack"
+        elif parsed.env == "TEST" and parsed.source in {"waqn", "saqn", "all"}:
+            parsed.timeseries_binding_backup_mode = "pack"
+        else:
+            parsed.timeseries_binding_backup_mode = "individual"
     if parsed.source == "sos" and parsed.timeseries_binding_backup_mode != "pack":
         p.error("fixed-v3 SOS-light source=sos requires packed Timeseries Binding backup state")
     if parsed.timeseries_binding_pack_root:
