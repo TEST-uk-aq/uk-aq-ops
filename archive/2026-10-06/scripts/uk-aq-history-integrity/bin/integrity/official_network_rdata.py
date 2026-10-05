@@ -63,10 +63,6 @@ POLLUTANT_TO_METADATA_PARAMETER = {
     "o3": "O3",
 }
 
-COVERAGE_REQUIRED = "required"
-COVERAGE_AUTHORITATIVE_NO_COVERAGE = "authoritative_no_coverage"
-COVERAGE_INDETERMINATE = "indeterminate"
-
 
 _R_EXTRACT_SCRIPT = r'''
 args <- commandArgs(trailingOnly=TRUE)
@@ -88,13 +84,11 @@ if (identical(mode, "site_year")) {
   if (any(is.na(parsed))) stop("site-year object has an invalid date value")
   value$date <- format(parsed, "%Y-%m-%dT%H:%M:%SZ", tz="UTC", usetz=FALSE)
 } else if (identical(mode, "metadata")) {
-  required <- c("site_id", "parameter", "start_date", "end_date", "ratified_to")
+  required <- c("site_id", "parameter", "ratified_to")
   if (!all(required %in% names(value))) stop("metadata object lacks required columns")
   value <- value[, required, drop=FALSE]
   value$site_id <- as.character(value$site_id)
   value$parameter <- as.character(value$parameter)
-  value$start_date <- as.character(value$start_date)
-  value$end_date <- as.character(value$end_date)
   value$ratified_to <- as.character(value$ratified_to)
 } else {
   stop(paste("unsupported extraction mode:", mode))
@@ -204,219 +198,6 @@ def required_site_years(days: Iterable[dt.date]) -> list[int]:
         years.add((start - dt.timedelta(hours=1)).year)
         years.add((end - dt.timedelta(hours=1)).year)
     return sorted(years)
-
-
-def source_time_windows_for_year(
-    days: Iterable[dt.date],
-    source_year: int,
-) -> list[dict[str, str]]:
-    """Return raw hour-beginning windows needed for canonical UTC days."""
-    year_start = dt.datetime(
-        int(source_year), 1, 1, tzinfo=dt.timezone.utc,
-    )
-    year_end = dt.datetime(
-        int(source_year) + 1, 1, 1, tzinfo=dt.timezone.utc,
-    )
-    windows: list[dict[str, str]] = []
-    for day in sorted(set(days)):
-        canonical_start = dt.datetime.combine(
-            day, dt.time.min, tzinfo=dt.timezone.utc,
-        )
-        raw_start = canonical_start - dt.timedelta(hours=1)
-        raw_end = canonical_start + dt.timedelta(days=1, hours=-1)
-        clipped_start = max(raw_start, year_start)
-        clipped_end = min(raw_end, year_end)
-        if clipped_start >= clipped_end:
-            continue
-        windows.append({
-            "canonical_day_utc": day.isoformat(),
-            "raw_start_utc": clipped_start.isoformat().replace("+00:00", "Z"),
-            "raw_end_exclusive_utc": clipped_end.isoformat().replace(
-                "+00:00", "Z",
-            ),
-        })
-    return windows
-
-
-def _parse_lifecycle_date(raw_value: Any) -> dt.date | None:
-    raw = str(raw_value or "").strip()
-    if not raw:
-        return None
-    try:
-        parsed = dt.date.fromisoformat(raw)
-    except ValueError:
-        return None
-    return parsed if parsed.isoformat() == raw else None
-
-
-def classify_site_year_coverage(
-    metadata_rows: Iterable[Mapping[str, Any]],
-    *,
-    site_code: str,
-    bindings_by_pollutant: Mapping[str, Mapping[str, Any]],
-    selected_days: Iterable[dt.date],
-    source_year: int,
-) -> dict[str, Any]:
-    """Classify whether selected bindings can overlap one raw site-year file.
-
-    Only a unique metadata row with valid ISO lifecycle dates (or the verified
-    ``ongoing`` end marker) can prove no coverage.  Missing, malformed or
-    contradictory lifecycle evidence remains indeterminate and therefore must
-    retain the existing fail-closed acquisition behaviour.
-    """
-    days = sorted(set(selected_days))
-    windows = source_time_windows_for_year(days, source_year)
-    if not windows:
-        return {
-            "classification": COVERAGE_INDETERMINATE,
-            "reason": "no_selected_source_window_for_year",
-            "site_code": site_code.upper(),
-            "source_year": int(source_year),
-            "selected_canonical_days": [day.isoformat() for day in days],
-            "raw_source_windows": [],
-            "selected_bindings": [],
-        }
-
-    parsed_windows = [
-        (
-            dt.datetime.fromisoformat(window["raw_start_utc"].replace("Z", "+00:00")),
-            dt.datetime.fromisoformat(
-                window["raw_end_exclusive_utc"].replace("Z", "+00:00")
-            ),
-        )
-        for window in windows
-    ]
-    rows = list(metadata_rows)
-    binding_evidence: list[dict[str, Any]] = []
-    for pollutant_code, binding in sorted(bindings_by_pollutant.items()):
-        parameter = POLLUTANT_TO_METADATA_PARAMETER[pollutant_code]
-        matches = [
-            row for row in rows
-            if str(row.get("site_id") or "").strip().upper() == site_code.upper()
-            and str(row.get("parameter") or "").strip().upper() == parameter.upper()
-        ]
-        evidence: dict[str, Any] = {
-            "pollutant_code": pollutant_code,
-            "station_id": int(binding["station_id"]),
-            "timeseries_id": int(binding["timeseries_id"]),
-            "metadata_row_identity": {
-                "site_id": site_code.upper(),
-                "parameter": parameter,
-            },
-        }
-        if len(matches) != 1:
-            evidence.update({
-                "start_date": None,
-                "end_date": None,
-                "normalised_start_date": None,
-                "normalised_end_date": None,
-                "end_open": None,
-                "classification": COVERAGE_INDETERMINATE,
-                "reason": (
-                    "metadata_lifecycle_row_missing"
-                    if not matches else "metadata_lifecycle_row_ambiguous"
-                ),
-                "metadata_match_count": len(matches),
-            })
-            binding_evidence.append(evidence)
-            continue
-
-        row = matches[0]
-        raw_start = str(row.get("start_date") or "").strip()
-        raw_end = str(row.get("end_date") or "").strip()
-        start_date = _parse_lifecycle_date(raw_start)
-        end_open = raw_end.lower() == "ongoing"
-        end_date = None if end_open else _parse_lifecycle_date(raw_end)
-        evidence.update({
-            "start_date": raw_start or "missing",
-            "end_date": raw_end or "missing",
-            "normalised_start_date": (
-                start_date.isoformat() if start_date is not None else None
-            ),
-            "normalised_end_date": (
-                end_date.isoformat() if end_date is not None else None
-            ),
-            "end_open": end_open,
-            "metadata_match_count": 1,
-        })
-        lifecycle_reason = None
-        if start_date is None:
-            lifecycle_reason = (
-                "start_date_missing" if not raw_start else "start_date_malformed"
-            )
-        elif not end_open and end_date is None:
-            lifecycle_reason = (
-                "end_date_missing" if not raw_end else "end_date_malformed"
-            )
-        elif end_date is not None and end_date < start_date:
-            lifecycle_reason = "lifecycle_dates_contradictory"
-        if lifecycle_reason is not None:
-            evidence.update({
-                "classification": COVERAGE_INDETERMINATE,
-                "reason": lifecycle_reason,
-            })
-            binding_evidence.append(evidence)
-            continue
-
-        coverage_start = dt.datetime.combine(
-            start_date, dt.time.min, tzinfo=dt.timezone.utc,
-        )
-        coverage_end = (
-            None
-            if end_open else dt.datetime.combine(
-                end_date + dt.timedelta(days=1),
-                dt.time.min,
-                tzinfo=dt.timezone.utc,
-            )
-        )
-        overlaps = any(
-            coverage_start < raw_end_exclusive
-            and (coverage_end is None or coverage_end > raw_start)
-            for raw_start, raw_end_exclusive in parsed_windows
-        )
-        if overlaps:
-            evidence.update({
-                "classification": COVERAGE_REQUIRED,
-                "reason": "lifecycle_overlaps_selected_source_window",
-            })
-        else:
-            earliest_start = min(raw_start for raw_start, _end in parsed_windows)
-            latest_end = max(raw_end for _start, raw_end in parsed_windows)
-            reason = "lifecycle_does_not_overlap_selected_source_window"
-            if coverage_start >= latest_end:
-                reason = "coverage_starts_after_selected_source_window"
-            elif coverage_end is not None and coverage_end <= earliest_start:
-                reason = "coverage_ends_before_selected_source_window"
-            evidence.update({
-                "classification": COVERAGE_AUTHORITATIVE_NO_COVERAGE,
-                "reason": reason,
-            })
-        binding_evidence.append(evidence)
-
-    classifications = {
-        str(item["classification"]) for item in binding_evidence
-    }
-    if not binding_evidence:
-        classification = COVERAGE_INDETERMINATE
-        reason = "selected_binding_scope_empty"
-    elif COVERAGE_REQUIRED in classifications:
-        classification = COVERAGE_REQUIRED
-        reason = "selected_binding_overlaps_source_window"
-    elif COVERAGE_INDETERMINATE in classifications:
-        classification = COVERAGE_INDETERMINATE
-        reason = "selected_binding_coverage_indeterminate"
-    else:
-        classification = COVERAGE_AUTHORITATIVE_NO_COVERAGE
-        reason = "all_selected_bindings_outside_source_window"
-    return {
-        "classification": classification,
-        "reason": reason,
-        "site_code": site_code.upper(),
-        "source_year": int(source_year),
-        "selected_canonical_days": [day.isoformat() for day in days],
-        "raw_source_windows": windows,
-        "selected_bindings": binding_evidence,
-    }
 
 
 def download_pinned(url: str, destination: Path, *, timeout: int = 180) -> dict[str, Any]:

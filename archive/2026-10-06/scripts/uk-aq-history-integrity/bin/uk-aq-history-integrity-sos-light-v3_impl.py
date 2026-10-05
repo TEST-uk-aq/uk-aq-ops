@@ -84,13 +84,9 @@ from integrity.timeseries_binding_provider import (
     binding_backup_view,
 )
 from integrity.official_network_rdata import (
-    COVERAGE_AUTHORITATIVE_NO_COVERAGE,
-    COVERAGE_INDETERMINATE,
-    COVERAGE_REQUIRED,
     NETWORKS as OFFICIAL_RDATA_NETWORKS,
     RDATA_COLUMN_TO_POLLUTANT,
     canonical_rows_for_site_year,
-    classify_site_year_coverage,
     download_pinned as download_official_rdata_pinned,
     extract_metadata as extract_official_rdata_metadata,
     extract_site_year as extract_official_rdata_site_year,
@@ -15096,95 +15092,20 @@ def check_official_network_rdata(
     required_by_day: dict[str, set[str]] = {
         day.isoformat(): {metadata_key} for day in days
     }
-    coverage_audit: list[dict[str, Any]] = []
-    site_year_files_authoritative_no_coverage = 0
     decoded_files = 0
     for site_code, site_bindings in sorted(bindings.items()):
         for year in official_rdata_required_site_years(days):
             source_file_key = _official_rdata_source_file_key(
                 source_key, site_code, year,
             )
-            filename = f"{site_code}_{year}.RData"
-            source_url = config.base_url + filename
-            relevant_days = [
-                day for day in days
-                if year in official_rdata_required_site_years((day,))
-            ]
-            day_coverage: list[dict[str, Any]] = []
-            for day in relevant_days:
-                coverage = classify_site_year_coverage(
-                    metadata_rows,
-                    site_code=site_code,
-                    bindings_by_pollutant=site_bindings,
-                    selected_days=(day,),
-                    source_year=year,
-                )
-                evidence = {
-                    "schema_version": 1,
-                    "source_adapter": source_key,
-                    "connector_id": config.connector_id,
-                    "source_file": source_file_key,
-                    "url": source_url,
-                    "metadata_source_identity": dict(
-                        identities_by_key[metadata_key]
-                    ),
-                    **coverage,
-                }
-                day_coverage.append(evidence)
-                audits_by_day[day.isoformat()].append({
-                    "audit_kind": "site_year_source_coverage",
-                    **evidence,
-                })
-                if coverage["classification"] != COVERAGE_AUTHORITATIVE_NO_COVERAGE:
+            for day in days:
+                if year in official_rdata_required_site_years((day,)):
                     required_by_day[day.isoformat()].add(source_file_key)
-
-            classifications = {
-                str(evidence["classification"]) for evidence in day_coverage
-            }
-            if COVERAGE_REQUIRED in classifications:
-                classification = COVERAGE_REQUIRED
-                reason = "selected_day_requires_site_year"
-            elif COVERAGE_INDETERMINATE in classifications:
-                classification = COVERAGE_INDETERMINATE
-                reason = "selected_day_coverage_indeterminate"
-            else:
-                classification = COVERAGE_AUTHORITATIVE_NO_COVERAGE
-                reason = "all_selected_days_authoritative_no_coverage"
-            coverage_record = {
-                "schema_version": 1,
-                "source_adapter": source_key,
-                "connector_id": config.connector_id,
-                "site_code": site_code,
-                "source_year": year,
-                "source_file": source_file_key,
-                "url": source_url,
-                "selected_pollutants": sorted(site_bindings),
-                "selected_canonical_days": [
-                    day.isoformat() for day in relevant_days
-                ],
-                "metadata_source_identity": dict(
-                    identities_by_key[metadata_key]
-                ),
-                "classification": classification,
-                "reason": reason,
-                "day_classifications": day_coverage,
-                "acquisition_action": (
-                    "not_fetched_authoritative_no_coverage"
-                    if classification == COVERAGE_AUTHORITATIVE_NO_COVERAGE
-                    else "fetched_fail_closed_indeterminate"
-                    if classification == COVERAGE_INDETERMINATE
-                    else "fetched_required"
-                ),
-            }
-            coverage_audit.append(coverage_record)
-            if classification == COVERAGE_AUTHORITATIVE_NO_COVERAGE:
-                site_year_files_authoritative_no_coverage += 1
-                continue
-
+            filename = f"{site_code}_{year}.RData"
             destination = run_root / f"site={site_code}" / filename
             identity = acquire(
                 source_file_key=source_file_key,
-                url=source_url,
+                url=config.base_url + filename,
                 destination=destination,
                 site_code=site_code,
                 year=year,
@@ -15196,7 +15117,7 @@ def check_official_network_rdata(
             except Exception as exc:
                 failure_path = record_acquisition_failure(
                     source_file_key=source_file_key,
-                    url=source_url,
+                    url=config.base_url + filename,
                     site_code=site_code,
                     year=year,
                     stage="decode",
@@ -15218,7 +15139,7 @@ def check_official_network_rdata(
             except Exception as exc:
                 failure_path = record_acquisition_failure(
                     source_file_key=source_file_key,
-                    url=source_url,
+                    url=config.base_url + filename,
                     site_code=site_code,
                     year=year,
                     stage="canonicalize",
@@ -15275,7 +15196,6 @@ def check_official_network_rdata(
         "authoritative_mapping_sha256": mapping_hash,
         "observed_property_mapping_sha256": observed_property_hash,
         "mapping_audit": mapping_audit,
-        "site_year_coverage_audit": coverage_audit,
         "rscript_identity": official_rdata_rscript_identity(),
         "run_root": str(run_root),
     }
@@ -15293,9 +15213,6 @@ def check_official_network_rdata(
         "metadata_files_fetched": 1,
         "site_year_files_fetched": len(identities_by_key) - 1,
         "site_year_files_decoded": decoded_files,
-        "site_year_files_authoritative_no_coverage": (
-            site_year_files_authoritative_no_coverage
-        ),
         "source_files_authoritatively_absent": 0,
         "downloaded_bytes": downloaded_bytes,
         "canonical_rows": sum(len(rows) for rows in rows_by_day.values()),
