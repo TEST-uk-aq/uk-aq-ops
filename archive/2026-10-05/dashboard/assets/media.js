@@ -930,27 +930,11 @@
   }
 
   function blueskyState(data, article) {
-    const social = { ...(article || {}), ...(article?.bluesky || {}), ...(data?.bluesky || {}) };
-    if ((social.publications || []).some(item => item.publication_reason === "auto_approved"
-      && item.status === "blocked" && item.last_error_code === "thumbnail_pending")) {
-      social.direct_publish_available = false;
-      social.direct_publish_unavailable_reason = "publication_in_progress";
-      social.manual_post_available = false;
-      social.manual_post_unavailable_reason = "publication_in_progress";
-    }
-    return social;
+    return { ...(article || {}), ...(article?.bluesky || {}), ...(data?.bluesky || {}) };
   }
 
   function blueskyReasonLabel(reason) {
     return BLUESKY_REASON_LABELS[reason] || reason || "—";
-  }
-
-  function blueskyStatusLabel(item) {
-    const error = item.last_error_code || item.error_code;
-    if (item.status === "blocked" && error === "thumbnail_pending") return "Waiting for thumbnail";
-    if (item.status === "blocked" && error === "operator_cancelled") return "Cancelled";
-    return item.status_label || ({ queued: "Queued", posting: "Posting", posted: "Posted",
-      failed: "Failed", blocked: "Blocked" })[item.status] || item.status || "—";
   }
 
   function blueskyHistoryHtml(data, article) {
@@ -959,14 +943,9 @@
       const href = item.post_url || (String(item.post_uri || "").startsWith("https://") ? item.post_uri : "");
       const post = href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">Open post ↗</a>` : esc(item.post_uri || "—");
       const reason = blueskyReasonLabel(item.publication_reason);
-      const error = item.last_error_code || item.error_code;
-      const detail = error === "thumbnail_pending" ? "Awaiting an eligible thumbnail"
-        : error === "operator_cancelled" ? "Cancelled by operator" : error || "—";
-      return `<tr><td>${esc(blueskyStatusLabel(item))}</td><td>${esc(reason)}</td><td>${esc(formatUtcDateTime(item.posted_at || item.updated_at || item.created_at))}</td><td>${esc(detail)}</td><td>${post}</td></tr>`;
+      return `<tr><td>${esc(item.status || "—")}</td><td>${esc(reason)}</td><td>${esc(formatUtcDateTime(item.posted_at || item.updated_at || item.created_at))}</td><td>${esc(item.last_error_code || item.error_code || "—")}</td><td>${post}</td></tr>`;
     }).join("");
-    const latestStatus = bluesky.latest_status_label || blueskyStatusLabel(publications[0] || {
-      status: bluesky.latest_status, last_error_code: bluesky.latest_error_code });
-    return `<section><h4>Bluesky publication</h4><div class="media-stats"><div class="media-stat"><strong>${esc(bluesky.post_count ?? 0)}</strong><span>Successful posts</span></div><div class="media-stat"><strong>${esc(bluesky.publication_count ?? publications.length)}</strong><span>Publication requests</span></div><div class="media-stat"><strong>${esc(latestStatus)}</strong><span>Latest status</span></div></div>${rows ? `<div class="media-table-wrap"><table class="media-table media-table--bluesky"><thead><tr><th>Status</th><th>Reason</th><th>Relevant time</th><th>Details</th><th>Post</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="media-subtext">No Bluesky publication history.</p>`}</section>`;
+    return `<section><h4>Bluesky publication</h4><div class="media-stats"><div class="media-stat"><strong>${esc(bluesky.post_count ?? 0)}</strong><span>Successful posts</span></div><div class="media-stat"><strong>${esc(bluesky.publication_count ?? publications.length)}</strong><span>Publication requests</span></div><div class="media-stat"><strong>${esc(bluesky.latest_status || "—")}</strong><span>Latest status</span></div></div>${rows ? `<div class="media-table-wrap"><table class="media-table media-table--bluesky"><thead><tr><th>Status</th><th>Reason</th><th>Relevant time</th><th>Error code</th><th>Post</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="media-subtext">No Bluesky publication history.</p>`}</section>`;
   }
 
   function facebookState(data, article) {
@@ -978,9 +957,7 @@
   function directPublishUnavailableMessage(platform, reason) {
     const messages = {
       thumbnail_missing: "Bluesky posting unavailable because no eligible thumbnail is available.",
-      publication_in_progress: platform === "Bluesky"
-        ? "A Bluesky publication is already waiting for a thumbnail, queued or in progress."
-        : "A publication is already queued or in progress.",
+      publication_in_progress: "A publication is already queued or in progress.",
       unknown_remote_state: "Facebook publication state is unknown and is being held to prevent a possible duplicate post.",
       facebook_publishing_disabled: "Facebook publishing is disabled.",
       article_not_approved: "Direct publishing is only available for Approved articles.",
@@ -1031,7 +1008,7 @@
     if (article.status === "approved") return "";
     if (bluesky.manual_post_available === true) return `<label class="media-toggle" data-manual-bluesky><input type="checkbox"> <span>Post to Bluesky @ukaq.co.uk</span></label>${bluesky.manual_post_reason ? `<p class="media-subtext">Reason: ${esc(blueskyReasonLabel(bluesky.manual_post_reason))}</p>` : ""}`;
     const reason = bluesky.manual_post_unavailable_reason || bluesky.manual_post_reason;
-    return reason ? `<p class="media-message">${esc(directPublishUnavailableMessage("Bluesky", reason))}</p>` : "";
+    return reason ? `<p class="media-message">Bluesky posting unavailable: ${esc(blueskyReasonLabel(reason))}</p>` : "";
   }
 
   function manualFacebookHtml(article) {
