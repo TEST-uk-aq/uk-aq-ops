@@ -192,6 +192,26 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
         ):
             self.resolve(("no2",))
 
+    def test_contradictory_active_lookup_connector_identity_fails_closed(self) -> None:
+        self.add_binding(
+            site_code="CONNECTOR",
+            station_id=410,
+            timeseries_id=7101,
+            phenomenon_id=8101,
+            observed_property_id=12,
+            canonical_code="no2",
+            label="NO2",
+        )
+        self.conn.execute(
+            "UPDATE source_station_timeseries_lookup "
+            "SET connector_id = 10 WHERE timeseries_id = 7101"
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "contradictory_station_timeseries_identity",
+        ):
+            self.resolve(("no2",))
+
     def test_authenticated_core_table_loader_imports_observed_properties(self) -> None:
         self.assertIn("observed_properties", INTEGRITY.CORE_TABLES_TO_IMPORT)
         with tempfile.TemporaryDirectory() as temporary_directory:

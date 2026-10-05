@@ -35,6 +35,13 @@ PACK_RANGE_STATE_KIND = (
     "uk_aq_r2_history_backup_state_timeseries_binding_pack_range"
 )
 
+# Stable binding-body identity published by
+# workers/shared/uk_aq_r2_history_index.mjs. The observation-generation pack
+# namespace does not change these body-contract values.
+STABLE_BINDING_INDEX_KIND = "timeseries_binding"
+STABLE_BINDING_HISTORY_VERSION = "v2"
+STABLE_BINDING_SCHEMA_VERSIONS = frozenset((1, 2))
+
 _SHA256_RE = re.compile(r"[a-f0-9]{64}")
 _BINDING_PATH_RE = re.compile(
     rf"{re.escape(BINDING_PREFIX)}/timeseries_id=([1-9]\d*)\.json"

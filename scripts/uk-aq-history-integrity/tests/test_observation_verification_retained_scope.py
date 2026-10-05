@@ -78,7 +78,7 @@ class OfficialRetainedVerificationScopeTests(unittest.TestCase):
             905: binding_bytes(905, 9, "no", 92),
             1001: binding_bytes(1001, 10, "no2", 101),
         }
-        self.active_timeseries_ids = {901, 903, 905}
+        self.active_timeseries_ids = [901, 903]
         self.metadata = [
             {"site_id": "ABC", "parameter": "NO2", "ratified_to": "2026-06-30"},
             {"site_id": "ABC", "parameter": "O3", "ratified_to": "Never"},
@@ -96,7 +96,7 @@ class OfficialRetainedVerificationScopeTests(unittest.TestCase):
             connector_id=9,
             authenticated_members=self.members,
             provider_audit=provider_audit(),
-            active_timeseries_ids=self.active_timeseries_ids,
+            active_selected_timeseries_ids=self.active_timeseries_ids,
             metadata_rows=self.metadata,
         )
 
@@ -120,12 +120,20 @@ class OfficialRetainedVerificationScopeTests(unittest.TestCase):
         self.assertEqual(readiness["retained_selected_timeseries_count"], 4)
         self.assertEqual(readiness["active_selected_timeseries_count"], 2)
         self.assertEqual(
+            readiness["active_selected_retained_intersection_count"], 2
+        )
+        self.assertEqual(
+            readiness["active_selected_missing_from_retained_count"], 0
+        )
+        self.assertEqual(
+            readiness["active_selected_missing_from_retained_timeseries_ids"], []
+        )
+        self.assertEqual(
             readiness["inactive_retained_selected_timeseries_count"], 2
         )
         self.assertEqual(readiness["candidate_timeseries_count"], 4)
         self.assertEqual(len(boundaries), 4)
         self.assertEqual(audit["retained_unselected_timeseries_count"], 1)
-        self.assertEqual(audit["active_core_lookup_timeseries_count"], 3)
         self.assertEqual(candidate[0]["site_id"], "ABC")
         self.assertEqual(candidate[1]["ratified_to"], None)
 
@@ -140,7 +148,7 @@ class OfficialRetainedVerificationScopeTests(unittest.TestCase):
                 connector_id=10,
                 authenticated_members={1001: self.members[1001]},
                 provider_audit=provider_audit(),
-                active_timeseries_ids={1001},
+                active_selected_timeseries_ids=[1001],
                 metadata_rows=[{
                     "site_id": "SAQ",
                     "parameter": "NO2",
@@ -189,7 +197,7 @@ class OfficialRetainedVerificationScopeTests(unittest.TestCase):
         ):
             with self.subTest(matches=len(metadata)):
                 self.members = {901: self.members[901]}
-                self.active_timeseries_ids = {901}
+                self.active_timeseries_ids = [901]
                 self.metadata = metadata
                 with self.assertRaisesRegex(ValueError, "metadata identity failed"):
                     self.build()
@@ -206,10 +214,77 @@ class OfficialRetainedVerificationScopeTests(unittest.TestCase):
             station_identity_timeseries_ids=[901, 902],
             metadata_identity_timeseries_ids=[901, 902],
             candidate_timeseries_ids=[901],
-            active_selected_timeseries_count=1,
+            active_selected_timeseries_ids=[901],
         )
         self.assertFalse(readiness["publishable"])
         self.assertIn("exactly equal", readiness["reason"])
+
+    def test_active_selected_core_missing_from_retained_is_auditable_blocker(self) -> None:
+        self.active_timeseries_ids = [999, 901, 998]
+        candidate, _boundaries, readiness, audit = self.build()
+        self.assertFalse(readiness["publishable"])
+        self.assertIn(
+            "active core timeseries are missing from retained binding authority",
+            readiness["reason"],
+        )
+        self.assertEqual(readiness["active_selected_timeseries_count"], 3)
+        self.assertEqual(
+            readiness["active_selected_retained_intersection_count"], 1
+        )
+        self.assertEqual(
+            readiness["active_selected_missing_from_retained_count"], 2
+        )
+        self.assertEqual(
+            readiness["active_selected_missing_from_retained_timeseries_ids"],
+            [998, 999],
+        )
+        self.assertEqual(len(candidate), 4)
+        self.assertEqual(audit["candidate_timeseries_count"], 4)
+
+    def test_active_selected_core_duplicate_timeseries_fails_closed(self) -> None:
+        with self.assertRaisesRegex(ValueError, "duplicate active selected core"):
+            SOURCE.active_selected_core_timeseries_ids({
+                "ABC": {
+                    "no2": {"station_id": 91, "timeseries_id": 901},
+                    "o3": {"station_id": 91, "timeseries_id": 901},
+                }
+            })
+
+    def test_supported_stable_binding_schemas_include_continuity_schema(self) -> None:
+        for schema_version, continuity in (
+            (1, None),
+            (2, {"schema_version": 1, "members": []}),
+        ):
+            with self.subTest(schema_version=schema_version):
+                body = binding_bytes(
+                    901,
+                    9,
+                    "no2",
+                    91,
+                    schema_version=schema_version,
+                    **({"continuity": continuity} if continuity is not None else {}),
+                )
+                retained, _counts = SOURCE.retained_official_binding_members(
+                    {901: body}, connector_id=9
+                )
+                self.assertEqual(retained[0]["timeseries_id"], 901)
+
+    def test_unsupported_or_missing_stable_binding_contract_identity_fails(self) -> None:
+        cases = (
+            ({"schema_version": 3}, "schema_version"),
+            ({"schema_version": None}, "schema_version"),
+            ({"history_version": "v3"}, "history_version"),
+            ({"history_version": None}, "history_version"),
+            ({"index_kind": "timeseries"}, "index_kind"),
+            ({"index_kind": None}, "index_kind"),
+        )
+        for override, expected in cases:
+            with self.subTest(override=override):
+                body = binding_bytes(901, 9, "no2", 91, **override)
+                with self.assertRaisesRegex(ValueError, expected):
+                    SOURCE.retained_official_binding_members(
+                        {901: body}, connector_id=9
+                    )
 
 
 if __name__ == "__main__":
