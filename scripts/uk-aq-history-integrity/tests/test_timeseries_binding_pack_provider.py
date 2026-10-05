@@ -653,6 +653,124 @@ class TimeseriesBindingPackProviderTests(unittest.TestCase):
         self.assertIsNone(result["provider"]["temporary_path"])
         self.assertEqual(result["provider"]["cleanup_outcome"], "not_applicable")
 
+    def test_legacy_v2_final_verification_scopes_live_waqn_and_saqn(self) -> None:
+        cases = (
+            ("waqn", 9),
+            ("saqn", 10),
+        )
+        conn = sqlite3.connect(":memory:")
+        try:
+            for source, connector_id in cases:
+                with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    final_view = root / "final-view"
+                    config = MODULE.resolve_history_path_config("v2", {})
+                    with mock.patch.object(
+                        MODULE,
+                        "validate_run_state_core_snapshot_identity",
+                    ), mock.patch.object(
+                        MODULE,
+                        "_create_final_verification_view",
+                        return_value=final_view,
+                    ), mock.patch.object(
+                        MODULE,
+                        "run_v2_post_repair_integrity_rechecks",
+                        return_value={"observations": {"gaps": []}},
+                    ), mock.patch.object(
+                        MODULE,
+                        "verify_apply_persistence_artifacts",
+                        return_value={"status": "verified"},
+                    ), mock.patch.object(
+                        MODULE,
+                        "_validate_v2_timeseries_bindings",
+                        return_value=[],
+                    ) as validator:
+                        result = MODULE.run_v2_final_verification(
+                            run_state={
+                                "overlay_root": str(root / "overlay"),
+                                "base_dropbox_root": str(root / "dropbox"),
+                            },
+                            conn=conn,
+                            env_name="LIVE",
+                            config=config,
+                            from_day="2026-09-29",
+                            to_day="2026-09-29",
+                            allowed_connector_ids={connector_id},
+                            source_scope={
+                                "source": source,
+                                "connector_ids": [connector_id],
+                            },
+                            log=mock.Mock(),
+                            require_remote_state=False,
+                        )
+
+                    validator.assert_called_once_with(
+                        conn=conn,
+                        view_root=final_view,
+                        config=config,
+                        allowed_connector_ids={connector_id},
+                    )
+                    self.assertEqual(result["status"], "planned")
+        finally:
+            conn.close()
+
+    def test_legacy_v2_final_verification_uses_source_all_connector_scope(self) -> None:
+        connector_ids = [1, 2, 9, 10]
+        conn = sqlite3.connect(":memory:")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                final_view = root / "final-view"
+                config = MODULE.resolve_history_path_config("v2", {})
+                with mock.patch.object(
+                    MODULE,
+                    "validate_run_state_core_snapshot_identity",
+                ), mock.patch.object(
+                    MODULE,
+                    "_create_final_verification_view",
+                    return_value=final_view,
+                ), mock.patch.object(
+                    MODULE,
+                    "run_v2_post_repair_integrity_rechecks",
+                    return_value={"observations": {"gaps": []}},
+                ), mock.patch.object(
+                    MODULE,
+                    "verify_apply_persistence_artifacts",
+                    return_value={"status": "verified"},
+                ), mock.patch.object(
+                    MODULE,
+                    "_validate_v2_timeseries_bindings",
+                    return_value=[],
+                ) as validator:
+                    result = MODULE.run_v2_final_verification(
+                        run_state={
+                            "overlay_root": str(root / "overlay"),
+                            "base_dropbox_root": str(root / "dropbox"),
+                        },
+                        conn=conn,
+                        env_name="LIVE",
+                        config=config,
+                        from_day="2026-09-29",
+                        to_day="2026-09-29",
+                        allowed_connector_ids=None,
+                        source_scope={
+                            "source": "all",
+                            "connector_ids": connector_ids,
+                        },
+                        log=mock.Mock(),
+                        require_remote_state=False,
+                    )
+
+                validator.assert_called_once_with(
+                    conn=conn,
+                    view_root=final_view,
+                    config=config,
+                    allowed_connector_ids=set(connector_ids),
+                )
+                self.assertEqual(result["status"], "planned")
+        finally:
+            conn.close()
+
     def test_v3_final_verification_routes_effective_binding_scope_and_mode(self) -> None:
         cases = (
             ("waqn", {9}, [9], "pack", {9}),

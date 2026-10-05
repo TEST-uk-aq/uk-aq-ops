@@ -21451,8 +21451,20 @@ def run_v2_final_verification(
             "gap_type": "apply_persistence_artifact_verification_failed",
             "evidence": apply_persistence_artifacts,
         })
+    binding_connector_ids = allowed_connector_ids
+    if binding_connector_ids is None and isinstance(source_scope, Mapping):
+        raw_connector_ids = source_scope.get("connector_ids")
+        if isinstance(raw_connector_ids, (list, tuple, set, frozenset)):
+            binding_connector_ids = {
+                int(value)
+                for value in raw_connector_ids
+                if str(value).strip().isdigit() and int(value) > 0
+            }
     remaining_scopes.extend(_validate_v2_timeseries_bindings(
-        conn=conn, view_root=view_root, config=config,
+        conn=conn,
+        view_root=view_root,
+        config=config,
+        allowed_connector_ids=binding_connector_ids,
     ))
     for gap in list((recheck.get("observations") or {}).get("gaps") or []):
         if isinstance(gap, Mapping) and str(gap.get("severity") or "error") == "error":
