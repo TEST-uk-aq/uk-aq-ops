@@ -28,6 +28,13 @@ function requireValue(argv, index, flag) {
   return value;
 }
 
+function validateForcePruneMaxDays(value) {
+  if (!/^[1-9]\d*$/.test(String(value)) || !Number.isSafeInteger(Number(value))) {
+    throw new Error("--force-prune-max-days-per-run / UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN must be a positive integer within the safe integer range");
+  }
+  return String(value);
+}
+
 export function parseLockedHistoryBackupArgs(argv) {
   const args = {
     sourceRoot: null,
@@ -46,7 +53,7 @@ export function parseLockedHistoryBackupArgs(argv) {
     maxDaysPerRun: "0",
     checkpointBatchUnits: "10",
     checkpointFlushSeconds: "60",
-    forcePruneMaxDaysPerRun: "50",
+    forcePruneMaxDaysPerRun: null,
     inventoryReportOut: null,
     backupReportOut: null,
     dryRun: false,
@@ -113,11 +120,8 @@ export function parseLockedHistoryBackupArgs(argv) {
   ]) {
     if (!/^\d+$/.test(String(value))) throw new Error(`${flag} must be a non-negative integer`);
   }
-  if (
-    !/^[1-9]\d*$/.test(String(args.forcePruneMaxDaysPerRun))
-    || !Number.isSafeInteger(Number(args.forcePruneMaxDaysPerRun))
-  ) {
-    throw new Error("--force-prune-max-days-per-run must be a positive integer");
+  if (args.forcePruneMaxDaysPerRun !== null) {
+    validateForcePruneMaxDays(args.forcePruneMaxDaysPerRun);
   }
   if (args.historyIndexVersion !== null) resolveObservationsTimeseriesLatestPath(args.historyIndexVersion);
   assertExperimentalPackOnlyDestination({
@@ -185,6 +189,10 @@ export function runLockedHistoryBackup({
   const generation = resolveObservationHistoryGeneration(env);
   args = {
     ...args,
+    forcePruneMaxDaysPerRun: validateForcePruneMaxDays(
+      args.forcePruneMaxDaysPerRun
+        ?? (String(env.UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN ?? "").trim() || "50"),
+    ),
     observationsPrefix: args.observationsPrefix ?? (env.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || generation.observations_prefix),
     runsPrefix: args.runsPrefix ?? (env.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || generation.observations_runs_prefix),
     timeseriesBindingPrefix: args.timeseriesBindingPrefix ?? (env.UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX || generation.timeseries_binding_index_prefix),

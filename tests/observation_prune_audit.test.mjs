@@ -213,7 +213,7 @@ test("locked wrapper defaults and forwards a positive independent forced-prune l
   ];
   assert.equal(
     parseLockedHistoryBackupArgs(required).forcePruneMaxDaysPerRun,
-    "50",
+    null,
   );
   assert.throws(
     () => parseLockedHistoryBackupArgs([
@@ -223,11 +223,6 @@ test("locked wrapper defaults and forwards a positive independent forced-prune l
     /positive integer/,
   );
 
-  const args = parseLockedHistoryBackupArgs([
-    ...required,
-    "--force-prune-recheck",
-    "--force-prune-max-days-per-run", "7",
-  ]);
   const identity = observationsGlobalOperationLockIdentity();
   const env = {
     UK_AQ_R2_HISTORY_VERSION: "v2",
@@ -242,17 +237,40 @@ test("locked wrapper defaults and forwards a positive independent forced-prune l
     [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.waitMs]: "0",
     [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.outcome]: "held",
   };
-  const calls = [];
-  runLockedHistoryBackup({
-    args,
-    env,
+  const invoke = (cli, configured, calls) => runLockedHistoryBackup({
+    args: parseLockedHistoryBackupArgs([
+      ...required,
+      ...(cli === undefined ? [] : ["--force-prune-max-days-per-run", cli]),
+    ]),
+    env: { ...env, UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN: configured },
     log: () => {},
     run: (_command, commandArgs) => {
       calls.push(commandArgs);
       return { status: 0, signal: null, error: null };
     },
   });
-  const sync = calls.find((call) => /sync_history_to_dropbox\.mjs$/.test(call[0]));
-  const limitIndex = sync.indexOf("--force-prune-max-days-per-run");
-  assert.equal(sync[limitIndex + 1], "7");
+  for (const [cli, configured, expected] of [
+    [undefined, undefined, "50"],
+    [undefined, "   ", "50"],
+    [undefined, "20", "20"],
+    ["7", "20", "7"],
+    ["7", "invalid", "7"],
+  ]) {
+    const calls = [];
+    invoke(cli, configured, calls);
+    const sync = calls.find((call) => /sync_history_to_dropbox\.mjs$/.test(call[0]));
+    assert.ok(sync);
+    const limitIndex = sync.indexOf("--force-prune-max-days-per-run");
+    assert.ok(limitIndex > 0);
+    assert.equal(sync[limitIndex + 1], expected);
+    assert.equal(sync[sync.indexOf("--max-days-per-run") + 1], "0");
+  }
+  for (const invalid of ["0", "-1", "1.5", "invalid", "9007199254740992"]) {
+    const calls = [];
+    assert.throws(() => invoke(undefined, invalid, calls), /positive integer/);
+    assert.deepEqual(calls, []);
+    assert.throws(() => parseLockedHistoryBackupArgs([
+      ...required, "--force-prune-max-days-per-run", invalid,
+    ]), /positive integer/);
+  }
 });
