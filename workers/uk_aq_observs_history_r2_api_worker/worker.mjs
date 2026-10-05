@@ -116,6 +116,12 @@ function normalizePollutant(raw) {
   if (compact === "no2" || compact === "nitrogendioxide") {
     return "no2";
   }
+  if (compact === "bc" || compact === "blackcarbon") {
+    return "bc";
+  }
+  if (compact === "uv370" || compact === "uv370nm" || compact === "uvparticulatematter370nm") {
+    return "uv370";
+  }
   return null;
 }
 
@@ -656,7 +662,7 @@ function parseObservationsRequest(url) {
     return {
       ok: false,
       status: 400,
-      error: "pollutant must be one of pm25, pm10, or no2 when provided.",
+      error: "pollutant must be one of pm25, pm10, no2, bc, or uv370 when provided.",
     };
   }
 
