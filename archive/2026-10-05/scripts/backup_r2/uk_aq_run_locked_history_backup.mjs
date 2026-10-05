@@ -46,7 +46,6 @@ export function parseLockedHistoryBackupArgs(argv) {
     maxDaysPerRun: "0",
     checkpointBatchUnits: "10",
     checkpointFlushSeconds: "60",
-    forcePruneMaxDaysPerRun: "50",
     inventoryReportOut: null,
     backupReportOut: null,
     dryRun: false,
@@ -87,9 +86,6 @@ export function parseLockedHistoryBackupArgs(argv) {
       else if (flag === "--max-days-per-run") args.maxDaysPerRun = value;
       else if (flag === "--checkpoint-batch-units") args.checkpointBatchUnits = value;
       else if (flag === "--checkpoint-flush-seconds") args.checkpointFlushSeconds = value;
-      else if (flag === "--force-prune-max-days-per-run") {
-        args.forcePruneMaxDaysPerRun = value;
-      }
       else if (flag === "--inventory-report-out") args.inventoryReportOut = value;
       else if (flag === "--backup-report-out") args.backupReportOut = value;
       else if (flag === "--pack-publisher-report-out") {
@@ -112,12 +108,6 @@ export function parseLockedHistoryBackupArgs(argv) {
     ["--checkpoint-flush-seconds", args.checkpointFlushSeconds],
   ]) {
     if (!/^\d+$/.test(String(value))) throw new Error(`${flag} must be a non-negative integer`);
-  }
-  if (
-    !/^[1-9]\d*$/.test(String(args.forcePruneMaxDaysPerRun))
-    || !Number.isSafeInteger(Number(args.forcePruneMaxDaysPerRun))
-  ) {
-    throw new Error("--force-prune-max-days-per-run must be a positive integer");
   }
   if (args.historyIndexVersion !== null) resolveObservationsTimeseriesLatestPath(args.historyIndexVersion);
   assertExperimentalPackOnlyDestination({
@@ -255,7 +245,6 @@ export function runLockedHistoryBackup({
     "--max-days-per-run", args.maxDaysPerRun,
     "--checkpoint-batch-units", args.checkpointBatchUnits,
     "--checkpoint-flush-seconds", args.checkpointFlushSeconds,
-    "--force-prune-max-days-per-run", args.forcePruneMaxDaysPerRun,
     "--report-out", args.backupReportOut,
     ...(args.dryRun ? ["--dry-run"] : []),
     ...(args.forcePruneRecheck ? ["--force-prune-recheck"] : []),

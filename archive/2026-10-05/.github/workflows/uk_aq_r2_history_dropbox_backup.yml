@@ -22,15 +22,10 @@ on:
         default: ""
         type: string
       force_prune_recheck:
-        description: "Audit a bounded rolling batch of eligible observation days"
+        description: "Audit all current observation days for stale Dropbox Parquet"
         required: false
         default: false
         type: boolean
-      force_prune_max_days_per_run:
-        description: "Override positive forced-prune audit day limit (default 50)"
-        required: false
-        default: ""
-        type: string
       observation_parquet_copy_mode:
         description: "Observation Parquet transfer mode"
         required: false
@@ -74,7 +69,6 @@ jobs:
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
 
       UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN || '0' }}
-      UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN || '50' }}
       UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS: ${{ vars.UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS || '10' }}
       UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS: ${{ vars.UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS || '60' }}
       UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || 'TEST' }}
@@ -83,7 +77,6 @@ jobs:
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
       INPUT_MAX_DAYS_PER_RUN: ${{ github.event.inputs.max_days_per_run || '' }}
       INPUT_FORCE_PRUNE_RECHECK: ${{ github.event.inputs.force_prune_recheck || 'false' }}
-      INPUT_FORCE_PRUNE_MAX_DAYS_PER_RUN: ${{ github.event.inputs.force_prune_max_days_per_run || '' }}
       INPUT_OBSERVATION_PARQUET_COPY_MODE: ${{ github.event.inputs.observation_parquet_copy_mode || 'full' }}
       INPUT_TIMESERIES_BINDING_BACKUP_MODE: ${{ github.event.inputs.timeseries_binding_backup_mode || 'pack' }}
 
@@ -145,13 +138,6 @@ jobs:
           case "${UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN}" in
             ''|*[!0-9]*)
               echo "UK_AQ_R2_HISTORY_BACKUP_MAX_DAYS_PER_RUN must be a non-negative integer." >&2
-              exit 1
-              ;;
-          esac
-
-          case "${UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN}" in
-            ''|*[!0-9]*|0*)
-              echo "UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN must be a positive integer." >&2
               exit 1
               ;;
           esac
@@ -239,17 +225,6 @@ jobs:
               ;;
           esac
 
-          force_prune_max_days="${INPUT_FORCE_PRUNE_MAX_DAYS_PER_RUN:-}"
-          if [ -z "${force_prune_max_days}" ]; then
-            force_prune_max_days="${UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN}"
-          fi
-          case "${force_prune_max_days}" in
-            ''|*[!0-9]*|0*)
-              echo "force_prune_max_days_per_run must be a positive integer" >&2
-              exit 1
-              ;;
-          esac
-
           selected_mode="${INPUT_TIMESERIES_BINDING_BACKUP_MODE:-pack}"
           case "${selected_mode}" in
             individual|pack) ;;
@@ -294,7 +269,6 @@ jobs:
             --timeseries-binding-backup-mode "${selected_mode}"
             --observation-parquet-copy-mode "${observation_parquet_copy_mode}"
             --max-days-per-run "${max_days}"
-            --force-prune-max-days-per-run "${force_prune_max_days}"
             --checkpoint-batch-units "${UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS}"
             --checkpoint-flush-seconds "${UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS}"
             --inventory-report-out "tmp/r2_backup_inventory_report.json"

@@ -533,6 +533,196 @@ class TimeseriesBindingPackProviderTests(unittest.TestCase):
         self.assertEqual(result["provider"]["non_sos_bindings_materialised"], 0)
         self.assertEqual(result["provider"]["cleanup_outcome"], "removed")
 
+    def test_v3_generic_binding_verification_uses_only_scoped_core_ids(self) -> None:
+        manager = mock.MagicMock()
+        materialized_root = self.root / "materialized"
+        manager.__enter__.return_value = (
+            materialized_root,
+            {"mode": "pack", "cleanup_outcome": "removed"},
+        )
+        manager.__exit__.return_value = False
+        expected = {
+            9101: {
+                "timeseries_id": 9101,
+                "connector_id": 9,
+                "pollutant_code": "no2",
+            },
+        }
+        conn = sqlite3.connect(":memory:")
+        try:
+            with mock.patch.object(
+                V3_MODULE,
+                "_expected_v2_core_timeseries_bindings",
+                return_value=expected,
+            ) as expected_bindings, mock.patch.object(
+                V3_MODULE,
+                "binding_backup_view",
+                return_value=manager,
+            ) as binding_view, mock.patch.object(
+                V3_MODULE,
+                "_validate_v2_timeseries_bindings",
+                return_value=[],
+            ) as validator:
+                result = V3_MODULE.run_timeseries_binding_verification(
+                    conn=conn,
+                    config=V3_MODULE.resolve_history_path_config("v3", {}),
+                    individual_root=self.root / "individual",
+                    backup_mode="pack",
+                    pack_root=self.root,
+                    connector_ids={9},
+                    stage="final_verification",
+                )
+        finally:
+            conn.close()
+
+        expected_bindings.assert_called_once_with(
+            mock.ANY,
+            allowed_connector_ids={9},
+        )
+        self.assertEqual(
+            binding_view.call_args.kwargs["required_timeseries_ids"],
+            {9101},
+        )
+        self.assertEqual(
+            binding_view.call_args.kwargs["observation_generation"],
+            "v3",
+        )
+        validator.assert_called_once_with(
+            conn=mock.ANY,
+            view_root=materialized_root,
+            config=mock.ANY,
+            allowed_connector_ids={9},
+        )
+        self.assertEqual(result["connector_ids"], [9])
+        self.assertEqual(result["required_binding_count"], 1)
+
+    def test_v3_final_verification_routes_effective_binding_scope_and_mode(self) -> None:
+        cases = (
+            ("waqn", {9}, [9], "pack", {9}),
+            ("saqn", {10}, [10], "pack", {10}),
+            ("all", None, [1, 2, 9, 10], "pack", {1, 2, 9, 10}),
+            ("openaq", {2}, [2], "individual", {2}),
+            ("sensorcommunity", {4}, [4], "individual", {4}),
+        )
+        conn = sqlite3.connect(":memory:")
+        try:
+            for source, allowed, scoped, mode, expected_scope in cases:
+                with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    verification_result = {
+                        "stage": "final_verification",
+                        "status": "ok",
+                        "connector_ids": sorted(expected_scope),
+                        "required_binding_count": 1,
+                        "semantic_binding_count_checked": 1,
+                        "gap_count": 0,
+                        "gaps": [],
+                        "provider": {"mode": mode},
+                    }
+                    with mock.patch.object(
+                        V3_MODULE,
+                        "validate_run_state_core_snapshot_identity",
+                    ), mock.patch.object(
+                        V3_MODULE,
+                        "_create_final_verification_view",
+                        return_value=root / "final-view",
+                    ), mock.patch.object(
+                        V3_MODULE,
+                        "run_v2_post_repair_integrity_rechecks",
+                        return_value={"observations": {"gaps": []}},
+                    ), mock.patch.object(
+                        V3_MODULE,
+                        "verify_apply_persistence_artifacts",
+                        return_value={"status": "verified"},
+                    ), mock.patch.object(
+                        V3_MODULE,
+                        "run_timeseries_binding_verification",
+                        return_value=verification_result,
+                    ) as binding_verification:
+                        result = V3_MODULE.run_v2_final_verification(
+                            run_state={
+                                "overlay_root": str(root / "overlay"),
+                                "base_dropbox_root": str(root / "dropbox"),
+                            },
+                            conn=conn,
+                            env_name="TEST",
+                            config=V3_MODULE.resolve_history_path_config("v3", {}),
+                            from_day="2026-09-29",
+                            to_day="2026-09-29",
+                            allowed_connector_ids=allowed,
+                            source_scope={
+                                "source": source,
+                                "connector_ids": scoped,
+                            },
+                            log=mock.Mock(),
+                            require_remote_state=False,
+                            timeseries_binding_backup_mode=mode,
+                            timeseries_binding_pack_root=(
+                                root if mode == "pack" else None
+                            ),
+                        )
+
+                    call = binding_verification.call_args.kwargs
+                    self.assertEqual(call["backup_mode"], mode)
+                    self.assertEqual(call["connector_ids"], expected_scope)
+                    self.assertEqual(result["status"], "planned")
+        finally:
+            conn.close()
+
+    def test_v3_final_verification_fails_closed_on_pack_view_error(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                with mock.patch.object(
+                    V3_MODULE,
+                    "validate_run_state_core_snapshot_identity",
+                ), mock.patch.object(
+                    V3_MODULE,
+                    "_create_final_verification_view",
+                    return_value=root / "final-view",
+                ), mock.patch.object(
+                    V3_MODULE,
+                    "run_v2_post_repair_integrity_rechecks",
+                    return_value={"observations": {"gaps": []}},
+                ), mock.patch.object(
+                    V3_MODULE,
+                    "verify_apply_persistence_artifacts",
+                    return_value={"status": "verified"},
+                ), mock.patch.object(
+                    V3_MODULE,
+                    "run_timeseries_binding_verification",
+                    side_effect=V3_MODULE.PackedBindingError(
+                        "fixture pack authentication failed"
+                    ),
+                ):
+                    result = V3_MODULE.run_v2_final_verification(
+                        run_state={
+                            "overlay_root": str(root / "overlay"),
+                            "base_dropbox_root": str(root / "dropbox"),
+                        },
+                        conn=conn,
+                        env_name="TEST",
+                        config=V3_MODULE.resolve_history_path_config("v3", {}),
+                        from_day="2026-09-29",
+                        to_day="2026-09-29",
+                        allowed_connector_ids={9},
+                        source_scope={"source": "waqn", "connector_ids": [9]},
+                        log=mock.Mock(),
+                        require_remote_state=False,
+                        timeseries_binding_backup_mode="pack",
+                        timeseries_binding_pack_root=root,
+                    )
+        finally:
+            conn.close()
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["remaining_gap_count"], 1)
+        self.assertEqual(
+            result["remaining_scopes"][0]["gap_type"],
+            "timeseries_binding_backup_view_failed",
+        )
+
     def test_individual_mode_skips_operational_verifier(self) -> None:
         conn = sqlite3.connect(":memory:")
         try:

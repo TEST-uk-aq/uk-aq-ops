@@ -79,7 +79,10 @@ from integrity.current_state.audit import (
     start_target_attempt,
 )
 from integrity.runtime import CANONICAL_REPAIR_STAGE_ORDER
-from integrity.timeseries_binding_provider import binding_backup_view
+from integrity.timeseries_binding_provider import (
+    PackedBindingError,
+    binding_backup_view,
+)
 from integrity.official_network_rdata import (
     NETWORKS as OFFICIAL_RDATA_NETWORKS,
     RDATA_COLUMN_TO_POLLUTANT,
@@ -21778,18 +21781,17 @@ def _validate_v2_timeseries_bindings(
     return gaps
 
 
-def run_sos_timeseries_binding_verification(
+def run_timeseries_binding_verification(
     *,
     conn: sqlite3.Connection,
     config: HistoryPathConfig,
     individual_root: Path,
     backup_mode: str,
     pack_root: Path | None,
+    connector_ids: set[int] | None,
     stage: str,
-    log: logging.Logger | None = None,
 ) -> dict[str, Any]:
-    """Run established connector-1 semantics through one physical provider."""
-    connector_ids = {1}
+    """Validate connector-scoped core bindings through one physical provider."""
     expected = _expected_v2_core_timeseries_bindings(
         conn,
         allowed_connector_ids=connector_ids,
@@ -21813,14 +21815,44 @@ def run_sos_timeseries_binding_verification(
     result = {
         "stage": stage,
         "status": "ok" if not gaps else "fail",
-        "connector_ids": [1],
+        "connector_ids": (
+            sorted(connector_ids)
+            if connector_ids is not None else sorted({
+                int(value["connector_id"])
+                for value in expected.values()
+            })
+        ),
         "required_binding_count": len(required_ids),
         "semantic_binding_count_checked": len(required_ids),
         "gap_count": len(gaps),
         "gaps": gaps,
         "provider": dict(provider_audit),
     }
+    return result
+
+
+def run_sos_timeseries_binding_verification(
+    *,
+    conn: sqlite3.Connection,
+    config: HistoryPathConfig,
+    individual_root: Path,
+    backup_mode: str,
+    pack_root: Path | None,
+    stage: str,
+    log: logging.Logger | None = None,
+) -> dict[str, Any]:
+    """Run established connector-1 semantics through one physical provider."""
+    result = run_timeseries_binding_verification(
+        conn=conn,
+        config=config,
+        individual_root=individual_root,
+        backup_mode=backup_mode,
+        pack_root=pack_root,
+        connector_ids={1},
+        stage=stage,
+    )
     if log is not None:
+        provider_audit = result["provider"]
         log.info(
             "SOS timeseries binding verification stage=%s mode=%s status=%s "
             "required=%s gaps=%s ranges_verified=%s members_verified=%s "
@@ -22532,6 +22564,8 @@ def run_v2_final_verification(
     selected_days: Iterable[str] | None = None,
     require_remote_state: bool = True,
     repair_pollutants: Iterable[str] | None = None,
+    timeseries_binding_backup_mode: str = "individual",
+    timeseries_binding_pack_root: Path | None = None,
 ) -> dict[str, Any]:
     """One read-only final pass over source cache and final local objects."""
     validate_run_state_core_snapshot_identity(
@@ -22578,9 +22612,48 @@ def run_v2_final_verification(
             "gap_type": "apply_persistence_artifact_verification_failed",
             "evidence": apply_persistence_artifacts,
         })
-    remaining_scopes.extend(_validate_v2_timeseries_bindings(
-        conn=conn, view_root=view_root, config=config,
-    ))
+    binding_connector_ids = allowed_connector_ids
+    if binding_connector_ids is None and isinstance(source_scope, Mapping):
+        raw_connector_ids = source_scope.get("connector_ids")
+        if isinstance(raw_connector_ids, (list, tuple, set, frozenset)):
+            binding_connector_ids = {
+                int(value)
+                for value in raw_connector_ids
+                if str(value).strip().isdigit() and int(value) > 0
+            }
+    try:
+        timeseries_binding_verification = run_timeseries_binding_verification(
+            conn=conn,
+            config=config,
+            individual_root=view_root,
+            backup_mode=timeseries_binding_backup_mode,
+            pack_root=timeseries_binding_pack_root,
+            connector_ids=binding_connector_ids,
+            stage="final_verification",
+        )
+    except PackedBindingError as exc:
+        timeseries_binding_verification = {
+            "stage": "final_verification",
+            "status": "fail",
+            "connector_ids": (
+                sorted(binding_connector_ids)
+                if binding_connector_ids is not None else None
+            ),
+            "required_binding_count": None,
+            "semantic_binding_count_checked": 0,
+            "gap_count": 1,
+            "gaps": [{
+                "stage": "timeseries_binding",
+                "gap_type": "timeseries_binding_backup_view_failed",
+                "error": str(exc),
+            }],
+            "provider": {
+                "mode": timeseries_binding_backup_mode,
+                "status": "failed",
+                "error": str(exc),
+            },
+        }
+    remaining_scopes.extend(timeseries_binding_verification["gaps"])
     for domain, gaps in (
         ("observations", list((recheck.get("observations") or {}).get("gaps") or [])),
     ):
@@ -22712,6 +22785,7 @@ def run_v2_final_verification(
         "r2_delete_verification_evidence": r2_delete_verification_evidence,
         "apply_persistence_artifacts": apply_persistence_artifacts,
         "application_failures": application_failures,
+        "timeseries_binding_verification": timeseries_binding_verification,
         "r2_objects_written": len(r2_written_keys),
         "r2_objects_deleted": sum(
             int(evidence.get("deleted_object_count") or 1)
@@ -26098,6 +26172,8 @@ def run_v2_integrity_repair_flow(
             log=log,
             require_remote_state=not dry_run,
             repair_pollutants=repair_pollutants,
+            timeseries_binding_backup_mode=timeseries_binding_backup_mode,
+            timeseries_binding_pack_root=timeseries_binding_pack_root,
         )
     all_observation_repair_entries = [
         entry
