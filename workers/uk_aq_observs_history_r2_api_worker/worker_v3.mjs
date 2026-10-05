@@ -70,6 +70,8 @@ function normalizePollutant(value) {
   if (compact === "pm25" || compact === "particulatematter25") return "pm25";
   if (compact === "pm10" || compact === "particulatematter10") return "pm10";
   if (compact === "no2" || compact === "nitrogendioxide") return "no2";
+  if (compact === "bc" || compact === "blackcarbon") return "bc";
+  if (compact === "uv370" || compact === "uv370nm" || compact === "uvparticulatematter370nm") return "uv370";
   return null;
 }
 
@@ -142,7 +144,7 @@ export function parseObservationRequest(url) {
   const endIso = isoOrNull(url.searchParams.get("end_utc"));
   if (!timeseriesId) return { ok: false, status: 400, error: "timeseries_id must be a positive integer." };
   if (!connectorId) return { ok: false, status: 400, error: "connector_id must be a positive integer." };
-  if (!pollutantCode) return { ok: false, status: 400, error: "pollutant must be one of pm25, pm10, or no2." };
+  if (!pollutantCode) return { ok: false, status: 400, error: "pollutant must be one of pm25, pm10, no2, bc, or uv370." };
   if (!startIso || !endIso) return { ok: false, status: 400, error: "start_utc and end_utc must be valid ISO timestamps." };
   const startMs = Date.parse(startIso);
   const endMs = Date.parse(endIso);
