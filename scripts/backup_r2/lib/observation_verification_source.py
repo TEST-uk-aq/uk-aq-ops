@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Any
+from typing import Any, Mapping
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -24,6 +24,17 @@ INTEGRITY_IMPL = (
     REPO_ROOT
     / "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v3_impl.py"
 )
+INTEGRITY_BIN_DIR = INTEGRITY_IMPL.parent
+if str(INTEGRITY_BIN_DIR) not in sys.path:
+    sys.path.insert(0, str(INTEGRITY_BIN_DIR))
+
+from integrity import official_network_rdata
+from integrity.timeseries_binding_provider import (
+    authenticated_packed_binding_generation,
+)
+
+
+OFFICIAL_VERIFICATION_POLLUTANTS = frozenset(("no2", "o3", "pm10", "pm25"))
 
 
 def load_integrity() -> Any:
@@ -39,6 +50,314 @@ def load_integrity() -> Any:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _reject_duplicate_object_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate binding JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _positive_integer(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+def retained_official_binding_members(
+    authenticated_members: Mapping[int, bytes],
+    *,
+    connector_id: int,
+    selected_pollutants: frozenset[str] = OFFICIAL_VERIFICATION_POLLUTANTS,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Validate and select retained physical bindings from authenticated bytes."""
+    retained: list[dict[str, Any]] = []
+    connector_member_count = 0
+    excluded_pollutant_count = 0
+    seen_selected_ids: set[int] = set()
+    for packed_timeseries_id, body in sorted(authenticated_members.items()):
+        try:
+            raw = json.loads(
+                body.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_object_keys,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(
+                f"authenticated binding member {packed_timeseries_id} is invalid JSON"
+            ) from exc
+        if not isinstance(raw, Mapping):
+            raise ValueError(
+                f"authenticated binding member {packed_timeseries_id} must be an object"
+            )
+        member_connector_id = _positive_integer(
+            raw.get("connector_id"),
+            f"binding {packed_timeseries_id} connector_id",
+        )
+        if member_connector_id != connector_id:
+            continue
+        connector_member_count += 1
+        if raw.get("index_kind") != "timeseries_binding":
+            raise ValueError(
+                f"binding {packed_timeseries_id} index_kind is contradictory"
+            )
+        pollutant_code = str(raw.get("pollutant_code") or "").strip().lower()
+        if not pollutant_code:
+            raise ValueError(
+                f"binding {packed_timeseries_id} pollutant_code must be non-empty"
+            )
+        if pollutant_code not in selected_pollutants:
+            excluded_pollutant_count += 1
+            continue
+        timeseries_id = _positive_integer(
+            raw.get("timeseries_id"),
+            f"binding {packed_timeseries_id} timeseries_id",
+        )
+        if timeseries_id != int(packed_timeseries_id):
+            raise ValueError(
+                f"binding {packed_timeseries_id} timeseries identity is contradictory"
+            )
+        if timeseries_id in seen_selected_ids:
+            raise ValueError(
+                f"duplicate retained selected timeseries identity: {timeseries_id}"
+            )
+        seen_selected_ids.add(timeseries_id)
+        identity = {
+            "connector_id": member_connector_id,
+            "timeseries_id": timeseries_id,
+            "station_id": _positive_integer(
+                raw.get("station_id"),
+                f"binding {timeseries_id} station_id",
+            ),
+            "pollutant_code": pollutant_code,
+        }
+        for field in ("phenomenon_id", "observed_property_id"):
+            if raw.get(field) is not None:
+                identity[field] = _positive_integer(
+                    raw.get(field), f"binding {timeseries_id} {field}"
+                )
+        retained.append(identity)
+    retained.sort(key=lambda item: item["timeseries_id"])
+    return retained, {
+        "retained_connector_timeseries_count": connector_member_count,
+        "retained_selected_timeseries_count": len(retained),
+        "retained_unselected_timeseries_count": excluded_pollutant_count,
+    }
+
+
+def resolve_retained_station_identities(
+    conn: Any,
+    retained_bindings: list[dict[str, Any]],
+    *,
+    connector_id: int,
+) -> list[dict[str, Any]]:
+    """Resolve every retained station through the already pinned core snapshot."""
+    resolved: list[dict[str, Any]] = []
+    for binding in retained_bindings:
+        rows = conn.execute(
+            "SELECT id, connector_id, station_ref "
+            "FROM core_stations_snapshot WHERE id = ?",
+            (binding["station_id"],),
+        ).fetchall()
+        if len(rows) != 1:
+            raise ValueError(
+                "retained binding station identity is missing or ambiguous: "
+                f"timeseries_id={binding['timeseries_id']} "
+                f"station_id={binding['station_id']} matches={len(rows)}"
+            )
+        station_id, station_connector_id, station_ref = rows[0]
+        resolved_station_id = _positive_integer(
+            station_id, f"retained binding {binding['timeseries_id']} core station id"
+        )
+        resolved_connector_id = _positive_integer(
+            station_connector_id,
+            f"retained binding {binding['timeseries_id']} core station connector_id",
+        )
+        if resolved_station_id != binding["station_id"]:
+            raise ValueError(
+                f"retained binding {binding['timeseries_id']} station identity is contradictory"
+            )
+        if resolved_connector_id != connector_id:
+            raise ValueError(
+                f"retained binding {binding['timeseries_id']} station connector is contradictory"
+            )
+        site_code = str(station_ref or "").strip().upper()
+        if not site_code:
+            raise ValueError(
+                f"retained binding {binding['timeseries_id']} station_ref is blank"
+            )
+        resolved.append({**binding, "site_code": site_code})
+    return resolved
+
+
+def retained_scope_coverage_readiness(
+    *,
+    provider_audit: Mapping[str, Any],
+    connector_id: int,
+    scope_counts: Mapping[str, int],
+    retained_timeseries_ids: list[int],
+    station_identity_timeseries_ids: list[int],
+    metadata_identity_timeseries_ids: list[int],
+    candidate_timeseries_ids: list[int],
+    active_selected_timeseries_count: int,
+) -> dict[str, Any]:
+    retained_set = set(retained_timeseries_ids)
+    station_set = set(station_identity_timeseries_ids)
+    metadata_set = set(metadata_identity_timeseries_ids)
+    candidate_set = set(candidate_timeseries_ids)
+    reasons: list[str] = []
+    if provider_audit.get("authenticated_generation_complete") is not True:
+        reasons.append("complete packed binding generation was not authenticated")
+    if provider_audit.get("observation_generation") != "v3":
+        reasons.append("authenticated binding generation is not v3")
+    if len(retained_timeseries_ids) != len(retained_set):
+        reasons.append("retained selected scope contains duplicate timeseries IDs")
+    if station_set != retained_set:
+        reasons.append("pinned-core station identity does not cover retained selected scope")
+    if metadata_set != retained_set:
+        reasons.append("official metadata identity does not cover retained selected scope")
+    if len(candidate_timeseries_ids) != len(candidate_set) or candidate_set != retained_set:
+        reasons.append("candidate scope does not exactly equal retained selected scope")
+    retained_count = len(retained_set)
+    if int(scope_counts.get("retained_selected_timeseries_count", -1)) != retained_count:
+        reasons.append("retained selected scope count is contradictory")
+    evidence = {
+        "binding_scope": "authenticated_retained_v3_binding_pack",
+        "observation_generation": "v3",
+        "binding_source_root_hash": provider_audit.get("source_root_hash"),
+        "pack_root_relative_path": provider_audit.get("pack_root_relative_path"),
+        "pack_root_sha256": provider_audit.get("pack_root_sha256"),
+        "ranges_verified": provider_audit.get("ranges_verified"),
+        "total_pack_members_verified": provider_audit.get(
+            "total_pack_members_verified"
+        ),
+        "connector_id": connector_id,
+        "retained_connector_timeseries_count": int(
+            scope_counts.get("retained_connector_timeseries_count", 0)
+        ),
+        "retained_selected_timeseries_count": retained_count,
+        "active_selected_timeseries_count": active_selected_timeseries_count,
+        "inactive_retained_selected_timeseries_count": (
+            retained_count - active_selected_timeseries_count
+        ),
+        "station_identity_resolved_count": len(station_set),
+        "metadata_identity_resolved_count": len(metadata_set),
+        "candidate_timeseries_count": len(candidate_timeseries_ids),
+    }
+    return {
+        "publishable": not reasons,
+        "reason": "; ".join(reasons) if reasons else None,
+        **evidence,
+    }
+
+
+def build_official_retained_verification_scope(
+    *,
+    conn: Any,
+    source_key: str,
+    connector_id: int,
+    authenticated_members: Mapping[int, bytes],
+    provider_audit: Mapping[str, Any],
+    active_timeseries_ids: set[int],
+    metadata_rows: list[Mapping[str, Any]],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+    dict[str, Any],
+]:
+    retained, scope_counts = retained_official_binding_members(
+        authenticated_members,
+        connector_id=connector_id,
+    )
+    if not retained:
+        raise ValueError(
+            f"{source_key} authenticated binding generation has no retained selected scope"
+        )
+    resolved = resolve_retained_station_identities(
+        conn, retained, connector_id=connector_id
+    )
+    retained_selected_ids = {item["timeseries_id"] for item in resolved}
+    active_selected_ids = retained_selected_ids.intersection(active_timeseries_ids)
+
+    candidate_rows: list[dict[str, Any]] = []
+    boundaries: list[dict[str, Any]] = []
+    metadata_resolved_ids: list[int] = []
+    for binding in resolved:
+        pollutant_code = binding["pollutant_code"]
+        try:
+            boundary, raw = official_network_rdata.metadata_boundary(
+                metadata_rows,
+                site_code=binding["site_code"],
+                pollutant_code=pollutant_code,
+            )
+        except (KeyError, ValueError) as exc:
+            raise ValueError(
+                f"{source_key} retained binding metadata identity failed: "
+                f"timeseries_id={binding['timeseries_id']} "
+                f"site_id={binding['site_code']} pollutant={pollutant_code}: {exc}"
+            ) from exc
+        canonical_boundary = boundary.isoformat() if boundary else None
+        candidate_rows.append({
+            "connector_id": connector_id,
+            "station_id": binding["station_id"],
+            "timeseries_id": binding["timeseries_id"],
+            "pollutant_code": pollutant_code,
+            "site_id": binding["site_code"],
+            "parameter": official_network_rdata.POLLUTANT_TO_METADATA_PARAMETER[
+                pollutant_code
+            ],
+            "ratified_to": canonical_boundary,
+        })
+        boundary_audit = {
+            "site_id": binding["site_code"],
+            "parameter": official_network_rdata.POLLUTANT_TO_METADATA_PARAMETER[
+                pollutant_code
+            ],
+            "station_id": binding["station_id"],
+            "timeseries_id": binding["timeseries_id"],
+            "pollutant_code": pollutant_code,
+            "raw_ratified_to": raw,
+            "canonical_ratified_to": canonical_boundary,
+        }
+        for field in ("phenomenon_id", "observed_property_id"):
+            if field in binding:
+                boundary_audit[field] = binding[field]
+        boundaries.append(boundary_audit)
+        metadata_resolved_ids.append(binding["timeseries_id"])
+
+    candidate_rows.sort(key=lambda item: item["timeseries_id"])
+    boundaries.sort(key=lambda item: item["timeseries_id"])
+    retained_ids = [item["timeseries_id"] for item in retained]
+    resolved_ids = [item["timeseries_id"] for item in resolved]
+    candidate_ids = [item["timeseries_id"] for item in candidate_rows]
+    readiness = retained_scope_coverage_readiness(
+        provider_audit=provider_audit,
+        connector_id=connector_id,
+        scope_counts=scope_counts,
+        retained_timeseries_ids=retained_ids,
+        station_identity_timeseries_ids=resolved_ids,
+        metadata_identity_timeseries_ids=metadata_resolved_ids,
+        candidate_timeseries_ids=candidate_ids,
+        active_selected_timeseries_count=len(active_selected_ids),
+    )
+    retained_scope_audit = {
+        **{
+            key: value
+            for key, value in readiness.items()
+            if key not in {"publishable", "reason"}
+        },
+        "active_core_lookup_timeseries_count": len(active_timeseries_ids),
+        "retained_unselected_timeseries_count": scope_counts[
+            "retained_unselected_timeseries_count"
+        ],
+        "retained_selected_bindings": boundaries,
+    }
+    return candidate_rows, boundaries, readiness, retained_scope_audit
 
 
 def iso_days(first: str, last: str) -> list[str]:
@@ -91,7 +410,6 @@ def main() -> int:
     log = logging.getLogger("observation-verification-source")
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(levelname)s %(message)s")
     integrity = load_integrity()
-    from integrity import official_network_rdata as official_rdata
     environment = dict(os.environ)
     environment.setdefault(
         "UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR", str(run_dir / "source-cache")
@@ -125,28 +443,28 @@ def main() -> int:
 
         if args.source in {"waqn", "saqn"}:
             config = integrity.OFFICIAL_RDATA_NETWORKS[args.source]
-            bindings, mapping_hash, observed_property_hash, mapping_audit = (
-                integrity._official_rdata_bindings(
-                    conn,
-                    source_key=args.source,
-                    selected_pollutants=sorted(
-                        set(integrity.RDATA_COLUMN_TO_POLLUTANT.values())
-                    ),
-                )
-            )
-            connector_ids = {
+            active_timeseries_ids = {
                 int(row[0])
                 for row in conn.execute(
-                    "SELECT DISTINCT connector_id FROM source_station_timeseries_lookup "
-                    "WHERE source_key = ?",
+                    "SELECT DISTINCT timeseries_id "
+                    "FROM source_station_timeseries_lookup "
+                    "WHERE source_key = ? AND is_active = 1",
                     (args.source,),
                 ).fetchall()
+                if row[0] is not None
             }
-            if connector_ids != {config.connector_id}:
+            pack_root = str(
+                environment.get("UK_AQ_R2_HISTORY_DROPBOX_ROOT") or ""
+            ).strip()
+            if not pack_root:
                 raise RuntimeError(
-                    f"{args.source} connector mismatch: expected={config.connector_id} "
-                    f"resolved={sorted(connector_ids)}"
+                    "R2 history Dropbox root is unavailable for retained binding authentication"
                 )
+            authenticated_members, binding_provider_audit = (
+                authenticated_packed_binding_generation(
+                    Path(pack_root), observation_generation="v3"
+                )
+            )
             metadata_url = config.base_url.rstrip("/") + "/" + config.metadata_filename
             metadata_path = run_dir / "source" / config.metadata_filename
             pinned = integrity.download_official_rdata_pinned(
@@ -156,40 +474,20 @@ def main() -> int:
                 metadata_path, config=config
             )
             decoder = integrity.official_rdata_rscript_identity()
-            candidate_rows: list[dict[str, Any]] = []
-            boundaries: list[dict[str, Any]] = []
-            for site_code, pollutant_bindings in sorted(bindings.items()):
-                for pollutant_code, binding in sorted(pollutant_bindings.items()):
-                    boundary, raw = official_rdata.metadata_boundary(
-                        metadata_rows,
-                        site_code=site_code,
-                        pollutant_code=pollutant_code,
-                    )
-                    canonical_boundary = boundary.isoformat() if boundary else None
-                    candidate_rows.append(
-                        {
-                            "connector_id": config.connector_id,
-                            "station_id": int(binding["station_id"]),
-                            "timeseries_id": int(binding["timeseries_id"]),
-                            "pollutant_code": pollutant_code,
-                            "site_id": site_code,
-                            "parameter": official_rdata.POLLUTANT_TO_METADATA_PARAMETER[
-                                pollutant_code
-                            ],
-                            "ratified_to": canonical_boundary,
-                        }
-                    )
-                    boundaries.append(
-                        {
-                            "site_id": site_code,
-                            "parameter": official_rdata.POLLUTANT_TO_METADATA_PARAMETER[
-                                pollutant_code
-                            ],
-                            "timeseries_id": int(binding["timeseries_id"]),
-                            "raw_ratified_to": raw,
-                            "canonical_ratified_to": canonical_boundary,
-                        }
-                    )
+            (
+                candidate_rows,
+                boundaries,
+                coverage_readiness,
+                retained_scope_audit,
+            ) = build_official_retained_verification_scope(
+                conn=conn,
+                source_key=args.source,
+                connector_id=config.connector_id,
+                authenticated_members=authenticated_members,
+                provider_audit=binding_provider_audit,
+                active_timeseries_ids=active_timeseries_ids,
+                metadata_rows=metadata_rows,
+            )
             result = {
                 "schema_version": 1,
                 "source": args.source,
@@ -204,15 +502,7 @@ def main() -> int:
                     "verification_model": "ratification-boundary-v1",
                 },
                 "timeseries": candidate_rows,
-                "coverage_readiness": {
-                    "publishable": False,
-                    "reason": (
-                        f"{args.source} active core bindings do not prove the complete "
-                        "retained canonical connector timeseries scope; first publication "
-                        "requires an authenticated retained-scope inventory"
-                    ),
-                    "binding_scope": "active_generation_aware_core",
-                },
+                "coverage_readiness": coverage_readiness,
                 "acquisition_audit": {
                     "connector_id": config.connector_id,
                     "network": args.source,
@@ -226,10 +516,9 @@ def main() -> int:
                     "decoder_execution_identity": decoder,
                     "metadata_object": config.metadata_object,
                     "mapped_timeseries_count": len(candidate_rows),
-                    "binding_mapping_sha256": mapping_hash,
-                    "observed_property_mapping_sha256": observed_property_hash,
-                    "mapping_diagnostics": mapping_audit,
                     "ratified_to_values": boundaries,
+                    "retained_binding_provider": binding_provider_audit,
+                    "retained_scope": retained_scope_audit,
                     "pinned_core_identity": core_identity,
                 },
             }

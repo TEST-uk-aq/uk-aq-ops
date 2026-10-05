@@ -39,20 +39,43 @@ def sha256(body: bytes) -> str:
     return hashlib.sha256(body).hexdigest()
 
 
-def binding_bytes(timeseries_id: int, connector_id: int, pollutant: str) -> bytes:
-    return stable_bytes({
+def binding_bytes(
+    timeseries_id: int,
+    connector_id: int,
+    pollutant: str,
+    *,
+    station_id: int | None = None,
+) -> bytes:
+    payload = {
         "schema_version": 1,
         "history_version": "v2",
         "index_kind": "timeseries_binding",
         "timeseries_id": timeseries_id,
         "connector_id": connector_id,
         "pollutant_code": pollutant,
-    })
+    }
+    if station_id is not None:
+        payload["station_id"] = station_id
+    return stable_bytes(payload)
 
 
 class PackedBindingFixture:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, observation_generation: str = "v2") -> None:
         self.root = root
+        self.observation_generation = observation_generation
+        self.binding_prefix = (
+            f"history/_index_{observation_generation}/timeseries_binding"
+        )
+        suffix = "/generation=v3" if observation_generation == "v3" else ""
+        self.pack_prefix = (
+            f"history/_backup_packs_v1/timeseries_binding{suffix}"
+        )
+        self.pack_root_path = f"{self.pack_prefix}/root.json"
+        self.state_root_prefix = (
+            "_ops/checkpoints/r2_history_backup_state_v2/"
+            f"observation_generation={observation_generation}"
+        )
+        self.state_root_path = f"{self.state_root_prefix}/root.json"
         self.source_root_hash = sha256(b"source-root")
 
     def write(
@@ -79,7 +102,7 @@ class PackedBindingFixture:
                     "timeseries_id": timeseries_id,
                     "relative_path": raw.get(
                         "relative_path",
-                        f"{PROVIDER.BINDING_PREFIX}/timeseries_id={timeseries_id}.json",
+                        f"{self.binding_prefix}/timeseries_id={timeseries_id}.json",
                     ),
                     "size": raw.get("size", len(body)),
                     "sha256": raw.get("sha256", sha256(body)),
@@ -94,14 +117,14 @@ class PackedBindingFixture:
                 "range_size": 1000,
                 "range_start": start,
                 "range_end": end,
-                "source_prefix": PROVIDER.BINDING_PREFIX,
+                "source_prefix": self.binding_prefix,
                 "source_range_hash": source_range_hash,
                 "member_count": len(packed_members),
                 "members": packed_members,
             }
             pack_body = stable_bytes(pack)
             relative_path = (
-                f"{PROVIDER.PACK_PREFIX}/range={start:06d}-{end:06d}/"
+                f"{self.pack_prefix}/range={start:06d}-{end:06d}/"
                 f"{source_range_hash}.pack.json"
             )
             target = self.root / relative_path
@@ -124,15 +147,15 @@ class PackedBindingFixture:
             "kind": PROVIDER.PACK_ROOT_KIND,
             "backup_pack_version": "v1",
             "range_size": 1000,
-            "source_prefix": PROVIDER.BINDING_PREFIX,
-            "source_root_key": f"{PROVIDER.BINDING_PREFIX}/_manifests/root.json",
+            "source_prefix": self.binding_prefix,
+            "source_root_key": f"{self.binding_prefix}/_manifests/root.json",
             "source_root_hash": self.source_root_hash,
             "range_count": len(references),
             "member_count": sum(int(item["member_count"]) for item in references),
             "ranges": references,
         }
         pack_root_body = stable_bytes(pack_root)
-        pack_root_path = self.root / PROVIDER.PACK_ROOT_PATH
+        pack_root_path = self.root / self.pack_root_path
         pack_root_path.parent.mkdir(parents=True, exist_ok=True)
         pack_root_path.write_bytes(pack_root_body)
 
@@ -141,7 +164,7 @@ class PackedBindingFixture:
             start = int(reference["range_start"])
             end = int(reference["range_end"])
             shard_key = (
-                f"{PROVIDER.STATE_ROOT_PREFIX}/timeseries_binding_packs/"
+                f"{self.state_root_prefix}/timeseries_binding_packs/"
                 f"range={start:06d}-{end:06d}.json"
             )
             shard = {
@@ -178,6 +201,7 @@ class PackedBindingFixture:
             "schema_version": 1,
             "kind": PROVIDER.STATE_ROOT_KIND,
             "backup_version": "v2",
+            "observation_generation": self.observation_generation,
             "observations": {"processed_source_root_hash": None, "years": []},
             "global_units": {},
             "timeseries_binding_packs": {
@@ -188,14 +212,14 @@ class PackedBindingFixture:
                     checkpoint_source_root_hash or self.source_root_hash
                 ),
                 "processed_pack_root_sha256": sha256(pack_root_body),
-                "pack_root_relative_path": PROVIDER.PACK_ROOT_PATH,
+                "pack_root_relative_path": self.pack_root_path,
                 "pack_root_size": len(pack_root_body),
                 "copied_at": "2026-09-04T12:00:01.000Z",
                 "verified": True,
                 "ranges": state_ranges,
             },
         }
-        state_path = self.root / PROVIDER.STATE_ROOT_PATH
+        state_path = self.root / self.state_root_path
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_bytes(stable_bytes(state_root))
 
@@ -224,6 +248,56 @@ class TimeseriesBindingPackProviderTests(unittest.TestCase):
         self.assertEqual(audit["ranges_verified"], 2)
         self.assertEqual(audit["total_pack_members_verified"], 2)
         self.assertGreater(audit["total_pack_bytes_verified"], 0)
+        self.assertNotIn("authenticated_generation_complete", audit)
+        self.assertNotIn("authenticated_members_returned", audit)
+
+    def test_v3_authenticated_member_api_returns_complete_verified_generation_once(self) -> None:
+        v3_members = [
+            {
+                "timeseries_id": 101,
+                "body": binding_bytes(101, 1, "pm25", station_id=11),
+            },
+            {
+                "timeseries_id": 9101,
+                "body": binding_bytes(9101, 9, "no2", station_id=91),
+            },
+        ]
+        fixture = PackedBindingFixture(self.root, observation_generation="v3")
+        fixture.write(v3_members)
+        original_reader = PROVIDER._read_json_bytes
+        with mock.patch.object(
+            PROVIDER,
+            "_read_json_bytes",
+            wraps=original_reader,
+        ) as reader:
+            authenticated, audit = (
+                PROVIDER.authenticated_packed_binding_generation(
+                    self.root, observation_generation="v3"
+                )
+            )
+
+        self.assertEqual(set(authenticated), {101, 9101})
+        self.assertEqual(audit["observation_generation"], "v3")
+        self.assertTrue(audit["authenticated_generation_complete"])
+        self.assertEqual(audit["authenticated_members_returned"], 2)
+        pack_reads = [
+            call
+            for call in reader.call_args_list
+            if str(call.args[0]).endswith(".pack.json")
+        ]
+        self.assertEqual(len(pack_reads), audit["ranges_verified"])
+
+    def test_v3_authenticated_member_api_rejects_duplicate_retained_identity(self) -> None:
+        body = binding_bytes(9101, 9, "no2", station_id=91)
+        fixture = PackedBindingFixture(self.root, observation_generation="v3")
+        fixture.write([
+            {"timeseries_id": 9101, "body": body},
+            {"timeseries_id": 9101, "body": body},
+        ])
+        with self.assertRaisesRegex(PROVIDER.PackedBindingError, "duplicate"):
+            PROVIDER.authenticated_packed_binding_generation(
+                self.root, observation_generation="v3"
+            )
 
     def test_exact_sos_bytes_materialise_without_non_sos(self) -> None:
         with PROVIDER.binding_backup_view(

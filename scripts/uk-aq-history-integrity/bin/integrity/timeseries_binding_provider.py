@@ -334,12 +334,14 @@ def _validate_checkpoint_state(
                 )
 
 
-def verify_packed_binding_generation(
+def _verify_packed_binding_generation(
     pack_root: Path,
-    required_timeseries_ids: set[int],
+    required_timeseries_ids: set[int] | None,
     observation_generation: str = "v2",
+    *,
+    retain_all_members: bool = False,
 ) -> tuple[dict[int, bytes], dict[str, Any]]:
-    """Verify every packed range and retain only required member bytes."""
+    """Verify every packed range and retain authenticated member bytes."""
     if observation_generation not in {"v2", "v3"}:
         raise PackedBindingError("observation generation must be v2 or v3")
     binding_prefix = f"history/_index_{observation_generation}/timeseries_binding"
@@ -360,7 +362,9 @@ def verify_packed_binding_generation(
         raise PackedBindingError(f"packed binding root is unavailable: {pack_root}") from exc
     if not resolved_root.is_dir():
         raise PackedBindingError(f"packed binding root is not a directory: {pack_root}")
-    required = {int(value) for value in required_timeseries_ids}
+    required = {
+        int(value) for value in (required_timeseries_ids or set())
+    }
     if any(value <= 0 for value in required):
         raise PackedBindingError("required timeseries IDs must be positive integers")
 
@@ -469,7 +473,7 @@ def verify_packed_binding_generation(
                 raise PackedBindingError(f"member {timeseries_id} decoded size mismatch")
             if _sha256(decoded) != member_sha256:
                 raise PackedBindingError(f"member {timeseries_id} decoded SHA-256 mismatch")
-            if timeseries_id in required:
+            if retain_all_members or timeseries_id in required:
                 selected[timeseries_id] = decoded
             total_members += 1
         total_pack_bytes += len(pack_body)
@@ -481,6 +485,8 @@ def verify_packed_binding_generation(
         raise PackedBindingError(f"required SOS binding members are missing: {sample}")
     audit = {
         "mode": "pack",
+        "observation_generation": observation_generation,
+        "authenticated_generation_complete": True,
         "pack_root": str(resolved_root),
         "pack_root_relative_path": pack_root_path,
         "pack_root_sha256": _sha256(root_body),
@@ -490,13 +496,49 @@ def verify_packed_binding_generation(
         "ranges_verified": root_info["range_count"],
         "total_pack_bytes_verified": total_pack_bytes,
         "total_pack_members_verified": total_members,
-        "sos_bindings_selected": len(required),
-        "sos_bindings_materialised": 0,
-        "non_sos_bindings_materialised": 0,
+        "authenticated_members_returned": len(selected),
         "temporary_path": None,
         "cleanup_outcome": "not_started",
     }
     return selected, audit
+
+
+def verify_packed_binding_generation(
+    pack_root: Path,
+    required_timeseries_ids: set[int],
+    observation_generation: str = "v2",
+) -> tuple[dict[int, bytes], dict[str, Any]]:
+    """Verify every packed range and retain only required member bytes."""
+    selected, audit = _verify_packed_binding_generation(
+        pack_root,
+        required_timeseries_ids,
+        observation_generation,
+    )
+    for additive_key in (
+        "observation_generation",
+        "authenticated_generation_complete",
+        "authenticated_members_returned",
+    ):
+        audit.pop(additive_key, None)
+    audit.update({
+        "sos_bindings_selected": len(required_timeseries_ids),
+        "sos_bindings_materialised": 0,
+        "non_sos_bindings_materialised": 0,
+    })
+    return selected, audit
+
+
+def authenticated_packed_binding_generation(
+    pack_root: Path,
+    observation_generation: str = "v3",
+) -> tuple[dict[int, bytes], dict[str, Any]]:
+    """Return every member authenticated by one complete generation pass."""
+    return _verify_packed_binding_generation(
+        pack_root,
+        None,
+        observation_generation,
+        retain_all_members=True,
+    )
 
 
 @contextmanager
