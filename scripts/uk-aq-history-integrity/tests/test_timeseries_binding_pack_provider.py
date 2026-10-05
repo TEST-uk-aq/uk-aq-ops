@@ -596,6 +596,63 @@ class TimeseriesBindingPackProviderTests(unittest.TestCase):
         self.assertEqual(result["connector_ids"], [9])
         self.assertEqual(result["required_binding_count"], 1)
 
+    def test_v3_generic_individual_verification_uses_v2_waqn_root(self) -> None:
+        individual_root = self.root / "individual-v2"
+        individual_root.mkdir()
+        config = MODULE.resolve_history_path_config("v2", {})
+        expected = {
+            9101: {
+                "timeseries_id": 9101,
+                "connector_id": 9,
+                "pollutant_code": "no2",
+            },
+        }
+        conn = sqlite3.connect(":memory:")
+        try:
+            with mock.patch.object(
+                V3_MODULE,
+                "_expected_v2_core_timeseries_bindings",
+                return_value=expected,
+            ) as expected_bindings, mock.patch.object(
+                V3_MODULE,
+                "_validate_v2_timeseries_bindings",
+                return_value=[],
+            ) as validator, mock.patch.object(
+                PROVIDER,
+                "verify_packed_binding_generation",
+            ) as packed_verifier:
+                result = V3_MODULE.run_timeseries_binding_verification(
+                    conn=conn,
+                    config=config,
+                    individual_root=individual_root,
+                    backup_mode="individual",
+                    pack_root=None,
+                    connector_ids={9},
+                    stage="final_verification",
+                )
+        finally:
+            conn.close()
+
+        expected_bindings.assert_called_once_with(
+            mock.ANY,
+            allowed_connector_ids={9},
+        )
+        validator.assert_called_once_with(
+            conn=mock.ANY,
+            view_root=individual_root,
+            config=config,
+            allowed_connector_ids={9},
+        )
+        packed_verifier.assert_not_called()
+        self.assertEqual(result["connector_ids"], [9])
+        self.assertEqual(result["provider"]["mode"], "individual")
+        self.assertEqual(
+            result["provider"]["individual_root"],
+            str(individual_root),
+        )
+        self.assertIsNone(result["provider"]["temporary_path"])
+        self.assertEqual(result["provider"]["cleanup_outcome"], "not_applicable")
+
     def test_v3_final_verification_routes_effective_binding_scope_and_mode(self) -> None:
         cases = (
             ("waqn", {9}, [9], "pack", {9}),
@@ -665,6 +722,79 @@ class TimeseriesBindingPackProviderTests(unittest.TestCase):
                     call = binding_verification.call_args.kwargs
                     self.assertEqual(call["backup_mode"], mode)
                     self.assertEqual(call["connector_ids"], expected_scope)
+                    self.assertEqual(result["status"], "planned")
+        finally:
+            conn.close()
+
+    def test_v3_live_v2_final_verification_routes_individual_waqn_and_saqn(self) -> None:
+        cases = (
+            ("waqn", 9),
+            ("saqn", 10),
+        )
+        conn = sqlite3.connect(":memory:")
+        try:
+            for source, connector_id in cases:
+                with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    final_view = root / "final-view"
+                    config = MODULE.resolve_history_path_config("v2", {})
+                    verification_result = {
+                        "stage": "final_verification",
+                        "status": "ok",
+                        "connector_ids": [connector_id],
+                        "required_binding_count": 1,
+                        "semantic_binding_count_checked": 1,
+                        "gap_count": 0,
+                        "gaps": [],
+                        "provider": {"mode": "individual"},
+                    }
+                    with mock.patch.object(
+                        V3_MODULE,
+                        "validate_run_state_core_snapshot_identity",
+                    ), mock.patch.object(
+                        V3_MODULE,
+                        "_create_final_verification_view",
+                        return_value=final_view,
+                    ), mock.patch.object(
+                        V3_MODULE,
+                        "run_v2_post_repair_integrity_rechecks",
+                        return_value={"observations": {"gaps": []}},
+                    ), mock.patch.object(
+                        V3_MODULE,
+                        "verify_apply_persistence_artifacts",
+                        return_value={"status": "verified"},
+                    ), mock.patch.object(
+                        V3_MODULE,
+                        "run_timeseries_binding_verification",
+                        return_value=verification_result,
+                    ) as binding_verification:
+                        result = V3_MODULE.run_v2_final_verification(
+                            run_state={
+                                "overlay_root": str(root / "overlay"),
+                                "base_dropbox_root": str(root / "dropbox"),
+                            },
+                            conn=conn,
+                            env_name="LIVE",
+                            config=config,
+                            from_day="2026-09-29",
+                            to_day="2026-09-29",
+                            allowed_connector_ids={connector_id},
+                            source_scope={
+                                "source": source,
+                                "connector_ids": [connector_id],
+                            },
+                            log=mock.Mock(),
+                            require_remote_state=False,
+                            timeseries_binding_backup_mode="individual",
+                            timeseries_binding_pack_root=None,
+                        )
+
+                    call = binding_verification.call_args.kwargs
+                    self.assertIs(call["config"], config)
+                    self.assertEqual(call["individual_root"], final_view)
+                    self.assertEqual(call["backup_mode"], "individual")
+                    self.assertIsNone(call["pack_root"])
+                    self.assertEqual(call["connector_ids"], {connector_id})
                     self.assertEqual(result["status"], "planned")
         finally:
             conn.close()
