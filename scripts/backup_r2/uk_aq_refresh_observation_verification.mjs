@@ -34,8 +34,13 @@ import {
   executeVerificationApply,
   sourceConnectorId,
 } from "./lib/observation_verification_refresh.mjs";
+import {
+  bootstrapObservationVerificationIntegrityV3,
+  ensureObservationVerificationRuntimeDirectories,
+} from "./lib/observation_verification_bootstrap.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const REPOSITORY_ROOT = path.resolve(SCRIPT_DIR, "../..");
 
 function parseArgs(argv) {
   const options = { environment: "TEST", apply: false, source: "", fromDay: "", toDay: "", stateDir: "" };
@@ -52,7 +57,7 @@ function parseArgs(argv) {
       if (token === "--to-day") options.toDay = value;
       if (token === "--state-dir") options.stateDir = value;
     } else if (token === "--help") {
-      console.log("Usage: uk_aq_refresh_observation_verification.mjs --source sos|waqn|saqn --env TEST|LIVE [--from-day YYYY-MM-DD --to-day YYYY-MM-DD] [--apply]");
+      console.log("Usage: uk_aq_refresh_observation_verification.mjs --source sos|waqn|saqn --env TEST|LIVE [--from-day YYYY-MM-DD --to-day YYYY-MM-DD] [--state-dir PATH] [--apply]");
       process.exit(0);
     } else throw new Error(`unknown argument: ${token}`);
   }
@@ -216,21 +221,14 @@ async function readCurrentAuthority(r2, connectorId) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  const configuredEnvironment = String(
-    process.env.UKAQ_ENV_NAME || process.env.UK_AQ_ENV_NAME || "",
-  ).trim().toUpperCase();
-  if (!configuredEnvironment) {
-    throw new Error("UKAQ_ENV_NAME or UK_AQ_ENV_NAME is required to bind source/configuration resolution to --env");
-  }
-  if (configuredEnvironment !== options.environment) {
-    throw new Error(
-      `configured environment ${configuredEnvironment} does not match --env ${options.environment}`,
-    );
-  }
-  const stateRoot = path.resolve(options.stateDir || process.env.UK_AQ_HISTORY_INTEGRITY_STATE_DIR || "");
-  if (!options.stateDir && !process.env.UK_AQ_HISTORY_INTEGRITY_STATE_DIR) {
-    throw new Error("UK_AQ_HISTORY_INTEGRITY_STATE_DIR or --state-dir is required");
-  }
+  const bootstrap = bootstrapObservationVerificationIntegrityV3({
+    environment: options.environment,
+    repositoryRoot: REPOSITORY_ROOT,
+    stateDirOverride: options.stateDir,
+    env: process.env,
+  });
+  ensureObservationVerificationRuntimeDirectories(bootstrap);
+  const stateRoot = bootstrap.stateDir;
   const runsRoot = path.join(stateRoot, "verification-refresh", "runs");
   fs.mkdirSync(runsRoot, { recursive: true });
   const runDir = path.join(runsRoot, utcRunId(options.source));
