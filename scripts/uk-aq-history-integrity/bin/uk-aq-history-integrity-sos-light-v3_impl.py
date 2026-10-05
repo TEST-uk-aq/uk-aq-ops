@@ -26547,8 +26547,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         choices=["individual", "pack"],
         default=None,
         help=(
-            "Physical Dropbox binding representation; fixed-v3 source=sos "
-            "owns pack mode and rejects individual mode."
+            "Physical Dropbox binding representation; defaults to pack for "
+            "sos, waqn, saqn and all in TEST, while other sources default to "
+            "individual. Fixed-v3 source=sos rejects individual mode."
         ),
     )
     p.add_argument(
@@ -26586,7 +26587,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         p.error("historical identity repair must remain disabled in LIVE")
     if parsed.timeseries_binding_backup_mode is None:
         parsed.timeseries_binding_backup_mode = (
-            "pack" if parsed.source == "sos" else "individual"
+            "pack"
+            if parsed.source in {"sos", "waqn", "saqn", "all"}
+            else "individual"
         )
     if parsed.source == "sos" and parsed.timeseries_binding_backup_mode != "pack":
         p.error("fixed-v3 SOS-light source=sos requires packed Timeseries Binding backup state")
@@ -26604,8 +26607,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                 "--timeseries-binding-pack-root points at the other environment"
             )
     if parsed.timeseries_binding_backup_mode == "pack":
-        if parsed.source != "sos":
-            p.error("pack binding mode is currently supported only with --source sos")
+        if parsed.source not in {"sos", "waqn", "saqn", "all"}:
+            p.error(
+                "pack binding mode is supported only with --source sos, "
+                "waqn, saqn, or all"
+            )
         if parsed.env != "TEST":
             p.error("pack binding mode is currently TEST-only")
     return parsed

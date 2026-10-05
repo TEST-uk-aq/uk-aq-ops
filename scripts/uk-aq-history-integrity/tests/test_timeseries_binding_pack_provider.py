@@ -30,6 +30,16 @@ MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
+V3_MODULE_PATH = BIN_DIR / "uk-aq-history-integrity-sos-light-v3.py"
+V3_SPEC = importlib.util.spec_from_file_location(
+    "uk_aq_history_integrity_binding_pack_v3_test", V3_MODULE_PATH
+)
+if V3_SPEC is None or V3_SPEC.loader is None:
+    raise RuntimeError(f"Unable to load module at {V3_MODULE_PATH}")
+V3_MODULE = importlib.util.module_from_spec(V3_SPEC)
+sys.modules[V3_SPEC.name] = V3_MODULE
+V3_SPEC.loader.exec_module(V3_MODULE)
+
 
 def stable_bytes(value: object) -> bytes:
     return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -325,20 +335,58 @@ class TimeseriesBindingPackProviderTests(unittest.TestCase):
             self.assertEqual(view, individual)
             self.assertEqual(audit["cleanup_outcome"], "not_applicable")
 
-    def test_cli_defaults_to_individual_and_accepts_explicit_test_pack(self) -> None:
-        common = [
-            "--env", "TEST", "--source", "sos", "--check-only",
-            "--from-day", "2026-06-01", "--to-day", "2026-06-01",
-        ]
-        individual = MODULE.parse_args(common)
-        self.assertEqual(individual.timeseries_binding_backup_mode, "individual")
-        packed = MODULE.parse_args([
-            *common,
-            "--timeseries-binding-backup-mode", "pack",
-            "--timeseries-binding-pack-root", str(self.root),
-        ])
-        self.assertEqual(packed.timeseries_binding_backup_mode, "pack")
-        self.assertEqual(packed.timeseries_binding_pack_root, str(self.root))
+    def test_cli_defaults_pack_for_sos_official_networks_and_all(self) -> None:
+        for source in ("sos", "waqn", "saqn", "all"):
+            with self.subTest(source=source):
+                parsed = V3_MODULE.parse_args([
+                    "--env", "TEST", "--source", source, "--check-only",
+                    "--from-day", "2026-06-01", "--to-day", "2026-06-01",
+                ])
+                self.assertEqual(parsed.timeseries_binding_backup_mode, "pack")
+
+    def test_cli_preserves_individual_default_for_other_sources(self) -> None:
+        for source in ("openaq", "sensorcommunity"):
+            with self.subTest(source=source):
+                parsed = V3_MODULE.parse_args([
+                    "--env", "TEST", "--source", source, "--check-only",
+                    "--from-day", "2026-06-01", "--to-day", "2026-06-01",
+                ])
+                self.assertEqual(
+                    parsed.timeseries_binding_backup_mode,
+                    "individual",
+                )
+
+    def test_cli_accepts_explicit_test_pack_for_supported_sources(self) -> None:
+        for source in ("sos", "waqn", "saqn", "all"):
+            with self.subTest(source=source):
+                parsed = V3_MODULE.parse_args([
+                    "--env", "TEST", "--source", source, "--check-only",
+                    "--from-day", "2026-06-01", "--to-day", "2026-06-01",
+                    "--timeseries-binding-backup-mode", "pack",
+                    "--timeseries-binding-pack-root", str(self.root),
+                ])
+                self.assertEqual(parsed.timeseries_binding_backup_mode, "pack")
+                self.assertEqual(
+                    parsed.timeseries_binding_pack_root,
+                    str(self.root),
+                )
+
+    def test_cli_rejects_pack_for_sources_without_pack_routing(self) -> None:
+        for source in ("openaq", "sensorcommunity"):
+            with self.subTest(source=source), self.assertRaises(SystemExit):
+                V3_MODULE.parse_args([
+                    "--env", "TEST", "--source", source, "--check-only",
+                    "--from-day", "2026-06-01", "--to-day", "2026-06-01",
+                    "--timeseries-binding-backup-mode", "pack",
+                ])
+
+    def test_cli_pack_mode_remains_test_only(self) -> None:
+        with self.assertRaises(SystemExit):
+            V3_MODULE.parse_args([
+                "--env", "LIVE", "--source", "waqn", "--check-only",
+                "--from-day", "2026-06-01", "--to-day", "2026-06-01",
+                "--timeseries-binding-backup-mode", "pack",
+            ])
 
     def test_root_checkpoint_source_identity_mismatch_fails(self) -> None:
         self.fixture.write(
@@ -525,26 +573,32 @@ class TimeseriesBindingPackProviderTests(unittest.TestCase):
         self.assertEqual(verifier.call_args.kwargs["stage"], "check_only")
         self.assertEqual(verifier.call_args.kwargs["backup_mode"], "pack")
 
-    def test_currentness_gate_wrapper_propagates_pack_mode(self) -> None:
+    def test_currentness_gate_wrapper_propagates_waqn_default_pack_mode(self) -> None:
+        parsed = V3_MODULE.parse_args([
+            "--env", "TEST", "--source", "waqn", "--check-only",
+            "--from-day", "2026-06-01", "--to-day", "2026-06-01",
+        ])
         completed = mock.Mock(
             returncode=0,
             stdout='{"allowed": true}\n',
             stderr="",
         )
         with mock.patch.object(
-            MODULE,
+            V3_MODULE,
             "_repo_root_for_integrity_script",
             return_value=self.root,
         ), mock.patch.object(
-            MODULE.subprocess,
+            V3_MODULE.subprocess,
             "run",
             return_value=completed,
         ) as runner:
-            result = MODULE.run_integrity_dropbox_currentness_gate(
+            result = V3_MODULE.run_integrity_dropbox_currentness_gate(
                 env={"UK_AQ_BACKFILL_NODE_BIN": "node"},
                 dropbox_root=self.root,
                 observations_prefix="history/v2/observations",
-                timeseries_binding_backup_mode="pack",
+                timeseries_binding_backup_mode=(
+                    parsed.timeseries_binding_backup_mode
+                ),
             )
         command = runner.call_args.args[0]
         mode_index = command.index("--timeseries-binding-backup-mode")
