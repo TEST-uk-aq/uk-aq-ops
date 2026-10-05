@@ -57,7 +57,10 @@ function normalizeIsoOrNull(value) {
 
 function normalizeTimeseriesPollutantKey(value) {
   const normalized = String(value ?? "").trim().toLowerCase().replace(/[\s._-]+/g, "");
-  return normalized === "pm25" || normalized === "pm10" || normalized === "no2" ? normalized : null;
+  if (normalized === "pm25" || normalized === "pm10" || normalized === "no2") return normalized;
+  if (normalized === "bc" || normalized === "blackcarbon") return "bc";
+  if (normalized === "uv370" || normalized === "uv370nm" || normalized === "uvparticulatematter370nm") return "uv370";
+  return null;
 }
 
 function normalizeResponsePartFlag(searchParams, name) {
