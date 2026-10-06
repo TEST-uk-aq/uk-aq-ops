@@ -108,6 +108,82 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             "station_id": station_id,
         }
 
+    @staticmethod
+    def stage_official_proposal(
+        root: Path,
+        *,
+        requested_pollutants: list[str],
+        rows: list[dict[str, object]],
+        source_available_pollutants: list[str],
+        source_unavailable_scopes: list[dict[str, object]] | None = None,
+        preserved_baseline_identity: dict[str, object] | None = None,
+    ) -> tuple[Path, dict[str, object]]:
+        root.mkdir(parents=True, exist_ok=True)
+        repo_root = Path(__file__).resolve().parents[3]
+        helper = (
+            repo_root / "scripts/uk-aq-history-integrity/bin/integrity/"
+            "official_network_rdata_proposal.mjs"
+        )
+        writer_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo_root, check=True,
+            text=True, stdout=subprocess.PIPE,
+        ).stdout.strip()
+        unavailable_scopes = list(source_unavailable_scopes or [])
+        payload = {
+            "history_generation": "v3",
+            "day_utc": "2026-09-28",
+            "connector_id": 9,
+            "source_adapter": "waqn",
+            "requested_pollutant_set": requested_pollutants,
+            "backed_up_at_utc": "2026-10-06T00:00:00Z",
+            "rows": rows,
+            "preserved_baseline_rows": [],
+            "preserved_baseline_identity": preserved_baseline_identity or {
+                "source": "dropbox", "partition_identities": [],
+            },
+            "source_available_timeseries_ids": [
+                1001 + index for index, _ in enumerate(source_available_pollutants)
+            ],
+            "source_available_pollutant_codes": source_available_pollutants,
+            "source_unavailable_timeseries_ids": [
+                int(scope["timeseries_id"]) for scope in unavailable_scopes
+            ],
+            "source_unavailable_scopes": unavailable_scopes,
+            "source_file_identities": [{
+                "source_file": "waqn:metadata", "sha256": "a" * 64,
+                "bytes": 100,
+            }],
+            "required_source_files": ["waqn:metadata"],
+            "authoritatively_absent_source_files": [],
+            "authoritative_mapping_sha256": "b" * 64,
+            "observed_property_mapping_sha256": "c" * 64,
+            "ratification_audit": [],
+            "mapping_audit": {
+                "mapped_source_groups": [], "excluded_source_groups": [],
+            },
+            "rscript_identity": {
+                "executable": "/usr/bin/Rscript", "version": "test",
+            },
+        }
+        input_path = root / "input.json"
+        input_path.write_text(json.dumps(payload), encoding="utf-8")
+        stage_root = root / "stage"
+        completed = subprocess.run(
+            [
+                "node", str(helper), str(input_path), str(stage_root),
+                "history/v3/observations", writer_sha, "v3",
+            ],
+            cwd=repo_root, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, check=False,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stderr)
+        evidence_path = (
+            stage_root / "day_utc=2026-09-28/connector_id=9/"
+            "source-evidence.json"
+        )
+        return stage_root, json.loads(evidence_path.read_text(encoding="utf-8"))
+
     def classify_coverage(
         self,
         metadata_rows: list[dict[str, str]],
@@ -1785,6 +1861,311 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
                 partition_identity["object_identities"][1]["sha256"],
                 hashlib.sha256(parquet_body).hexdigest(),
             )
+
+    def test_mixed_multi_pollutant_proposal_retains_empty_target_scope(self) -> None:
+        source_row = {
+            "connector_id": 9,
+            "station_id": 101,
+            "timeseries_id": 1001,
+            "pollutant_code": "no2",
+            "observed_at_utc": "2026-09-28T01:00:00.000Z",
+            "value": 10.0,
+            "verification_status": "P",
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            stage_root, evidence = self.stage_official_proposal(
+                root,
+                requested_pollutants=["no2", "pm10"],
+                rows=[source_row],
+                source_available_pollutants=["no2", "pm10"],
+            )
+            generated = stage_root / "generated-objects"
+            self.assertTrue(list(
+                generated.rglob("pollutant_code=no2/part-*.parquet")
+            ))
+            self.assertTrue(list(
+                generated.rglob("pollutant_code=no2/manifest.json")
+            ))
+            self.assertFalse(list(
+                generated.rglob("pollutant_code=pm10/part-*.parquet")
+            ))
+            self.assertFalse(list(
+                generated.rglob("pollutant_code=pm10/manifest.json")
+            ))
+            self.assertEqual(evidence["evidence_contract_version"], 6)
+            self.assertEqual(
+                evidence["source_evidence_input_sha256"],
+                INTEGRITY._source_evidence_input_sha256(evidence),
+            )
+            self.assertEqual(
+                evidence["preserved_baseline_dependency_sha256"],
+                INTEGRITY._official_rdata_preserved_baseline_dependency_sha256(
+                    evidence
+                ),
+            )
+            run_state = {
+                "overlay_root": str(stage_root),
+                "base_dropbox_root": str(root / "baseline"),
+                "run_state_path": str(root / "run-state.json"),
+                "objects": {},
+                "tombstone_prefixes": [],
+            }
+            with mock.patch.object(
+                INTEGRITY,
+                "_observation_rows_from_local_parquet_for_shared_hash",
+                return_value=[source_row],
+            ):
+                captured = INTEGRITY._capture_local_v2_observation_scope(
+                    run_state=run_state,
+                    day_utc="2026-09-28",
+                    connector_id=9,
+                    repair_pollutants=["no2", "pm10"],
+                )
+            self.assertTrue(captured)
+            self.assertTrue(all("pollutant_code=no2" in key for key in captured))
+            self.assertEqual(
+                [entry["prefix"].rsplit("=", 1)[-1]
+                 for entry in run_state["tombstone_prefixes"]],
+                ["no2", "pm10"],
+            )
+            changed, empty = INTEGRITY._observation_changed_scope_pollutants(
+                validated_overlay_keys=captured,
+                source_evidence=evidence,
+                requested_repair_pollutants=["no2", "pm10"],
+            )
+            self.assertEqual(changed, ["no2", "pm10"])
+            self.assertEqual(empty, ["pm10"])
+            outcomes = INTEGRITY._official_rdata_selected_partition_outcomes(
+                day_utc="2026-09-28",
+                connector_id=9,
+                pollutant_codes=changed,
+                empty_pollutant_codes=empty,
+                validated_overlay_keys=captured,
+                created_tombstones=[
+                    entry["prefix"]
+                    for entry in run_state["tombstone_prefixes"]
+                ],
+            )
+            self.assertEqual(
+                [(item["pollutant_code"], item["outcome"])
+                 for item in outcomes],
+                [
+                    ("no2", "complete_replacement"),
+                    ("pm10", "authoritative_no_data_replacement"),
+                ],
+            )
+            self.assertTrue(all(item["tombstone_created"] for item in outcomes))
+            self.assertTrue(outcomes[0]["replacement_object_keys"])
+            self.assertEqual(outcomes[1]["replacement_object_keys"], [])
+
+    def test_all_empty_multi_pollutant_proposal_has_no_synthetic_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            stage_root, evidence = self.stage_official_proposal(
+                root,
+                requested_pollutants=["no2", "pm10"],
+                rows=[],
+                source_available_pollutants=["no2", "pm10"],
+            )
+            generated = stage_root / "generated-objects"
+            self.assertFalse(list(generated.rglob("*.parquet")))
+            self.assertFalse(list(generated.rglob("manifest.json")))
+            run_state = {
+                "overlay_root": str(stage_root),
+                "run_state_path": str(root / "run-state.json"),
+                "objects": {},
+                "tombstone_prefixes": [],
+            }
+            captured = INTEGRITY._capture_local_v2_observation_scope(
+                run_state=run_state,
+                day_utc="2026-09-28",
+                connector_id=9,
+                repair_pollutants=["no2", "pm10"],
+            )
+            self.assertEqual(captured, [])
+            changed, empty = INTEGRITY._observation_changed_scope_pollutants(
+                validated_overlay_keys=captured,
+                source_evidence=evidence,
+                requested_repair_pollutants=["no2", "pm10"],
+            )
+            self.assertEqual(changed, ["no2", "pm10"])
+            self.assertEqual(empty, ["no2", "pm10"])
+            actions = INTEGRITY._merge_changed_observation_metadata_actions(
+                [],
+                [{
+                    "day_utc": "2026-09-28",
+                    "connector_id": 9,
+                    "timeseries_ids": [],
+                    "pollutant_codes": changed,
+                    "empty_pollutant_codes": empty,
+                }],
+            )
+            leaf_actions = {
+                (action["kind"], action.get("pollutant_code"))
+                for action in actions
+            }
+            self.assertNotIn(
+                ("observation_pollutant_manifest_repair", "no2"), leaf_actions
+            )
+            self.assertNotIn(
+                ("observation_pollutant_manifest_repair", "pm10"), leaf_actions
+            )
+            self.assertIn(("observation_index_repair", "no2"), leaf_actions)
+            self.assertIn(("observation_index_repair", "pm10"), leaf_actions)
+            self.assertIn(
+                ("observation_connector_manifest_repair", None), leaf_actions
+            )
+            self.assertIn(("observation_day_manifest_repair", None), leaf_actions)
+
+    def test_mixed_metadata_actions_skip_only_empty_pollutant_manifest(self) -> None:
+        actions = INTEGRITY._merge_changed_observation_metadata_actions(
+            [],
+            [{
+                "day_utc": "2026-09-28",
+                "connector_id": 9,
+                "timeseries_ids": [1001],
+                "pollutant_codes": ["no2", "pm10"],
+                "empty_pollutant_codes": ["pm10"],
+            }],
+        )
+        leaf_actions = {
+            (action["kind"], action.get("pollutant_code")) for action in actions
+        }
+        self.assertIn(
+            ("observation_pollutant_manifest_repair", "no2"), leaf_actions
+        )
+        self.assertNotIn(
+            ("observation_pollutant_manifest_repair", "pm10"), leaf_actions
+        )
+        self.assertIn(("observation_index_repair", "no2"), leaf_actions)
+        self.assertIn(("observation_index_repair", "pm10"), leaf_actions)
+        self.assertIn(
+            ("observation_connector_manifest_repair", None), leaf_actions
+        )
+        self.assertIn(("observation_day_manifest_repair", None), leaf_actions)
+
+    def test_wholly_unavailable_pollutant_is_excluded_before_empty_replacement(self) -> None:
+        unavailable_scope = {
+            "day_utc": "2026-09-28",
+            "site_code": "SITE2",
+            "source_year": 2026,
+            "source_file_key": "waqn:site_ref=SITE2:year=2026",
+            "pollutant_code": "pm10",
+            "station_id": 102,
+            "timeseries_id": 1002,
+            "reason": "source_artifact_unavailable",
+            "canonical_url": "https://example.test/SITE2_2026.RData",
+            "final_url": "https://example.test/SITE2_2026.RData",
+            "http_status": 404,
+            "raw_source_windows": [],
+            "canonical_unavailable_windows": [{
+                "canonical_day_utc": "2026-09-28",
+                "canonical_start_utc": "2026-09-28T00:00:00Z",
+                "canonical_end_exclusive_utc": "2026-09-29T00:00:00Z",
+            }],
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            stage_root, evidence = self.stage_official_proposal(
+                root,
+                requested_pollutants=["no2"],
+                rows=[],
+                source_available_pollutants=["no2"],
+                source_unavailable_scopes=[unavailable_scope],
+            )
+            run_state = {
+                "overlay_root": str(stage_root),
+                "run_state_path": str(root / "run-state.json"),
+                "objects": {},
+                "tombstone_prefixes": [],
+            }
+            captured = INTEGRITY._capture_local_v2_observation_scope(
+                run_state=run_state,
+                day_utc="2026-09-28",
+                connector_id=9,
+                repair_pollutants=["no2"],
+            )
+            self.assertEqual(captured, [])
+            self.assertEqual(evidence["empty_final_target_pollutant_codes"], ["no2"])
+            self.assertEqual(len(run_state["tombstone_prefixes"]), 1)
+            self.assertTrue(
+                run_state["tombstone_prefixes"][0]["prefix"].endswith(
+                    "pollutant_code=no2"
+                )
+            )
+
+    def test_preservation_dependency_is_deterministic_and_changes_with_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            _, evidence_a = self.stage_official_proposal(
+                root / "a",
+                requested_pollutants=["no2"], rows=[],
+                source_available_pollutants=["no2"],
+            )
+            _, evidence_a_repeat = self.stage_official_proposal(
+                root / "a-repeat",
+                requested_pollutants=["no2"], rows=[],
+                source_available_pollutants=["no2"],
+            )
+            _, evidence_b = self.stage_official_proposal(
+                root / "b",
+                requested_pollutants=["no2"], rows=[],
+                source_available_pollutants=["no2"],
+                preserved_baseline_identity={
+                    "source": "dropbox",
+                    "partition_identities": [{
+                        "pollutant_code": "no2",
+                        "baseline_state": "partition_absent",
+                        "object_identities": [],
+                    }],
+                },
+            )
+            self.assertEqual(
+                evidence_a["preserved_baseline_dependency_sha256"],
+                evidence_a_repeat["preserved_baseline_dependency_sha256"],
+            )
+            self.assertEqual(
+                evidence_a["source_evidence_input_sha256"],
+                evidence_a_repeat["source_evidence_input_sha256"],
+            )
+            self.assertNotEqual(
+                evidence_a["preserved_baseline_dependency_sha256"],
+                evidence_b["preserved_baseline_dependency_sha256"],
+            )
+            self.assertNotEqual(
+                evidence_a["source_evidence_input_sha256"],
+                evidence_b["source_evidence_input_sha256"],
+            )
+            first = INTEGRITY._persist_complete_connector_day_source_evidence(
+                conn=self.conn, env_name="TEST", evidence=evidence_a,
+                canonical_rows=[],
+            )
+            second = INTEGRITY._persist_complete_connector_day_source_evidence(
+                conn=self.conn, env_name="TEST", evidence=evidence_b,
+                canonical_rows=[],
+            )
+            self.assertNotEqual(first["evidence_id"], second["evidence_id"])
+
+    def test_official_rdata_v6_does_not_advance_sos_contract(self) -> None:
+        self.assertEqual(INTEGRITY.OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION, 6)
+        self.assertEqual(INTEGRITY.SOURCE_EVIDENCE_CONTRACT_VERSION, 4)
+        v5_payload = INTEGRITY._source_evidence_input_payload({
+            "evidence_contract_version": 5,
+            "source_artifact_availability_sha256": "a" * 64,
+            "preserved_baseline_dependency_sha256": "b" * 64,
+        })
+        self.assertEqual(
+            v5_payload["source_artifact_availability_sha256"], "a" * 64
+        )
+        self.assertNotIn(
+            "preserved_baseline_dependency_sha256", v5_payload
+        )
+        v4_payload = INTEGRITY._source_evidence_input_payload({
+            "evidence_contract_version": 4,
+            "source_artifact_availability_sha256": "a" * 64,
+        })
+        self.assertNotIn("source_artifact_availability_sha256", v4_payload)
 
     def test_january_first_retains_both_raw_source_year_windows(self) -> None:
         day = dt.date(2026, 1, 1)

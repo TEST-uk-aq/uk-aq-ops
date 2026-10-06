@@ -360,19 +360,28 @@ function main() {
     .map((scope) => ({
       day_utc: String(scope.day_utc || ""),
       site_code: String(scope.site_code || ""),
-      source_year: Number(scope.source_year),
+      source_year: Number(scope.source_year || 0),
       source_file_key: String(scope.source_file_key || ""),
       pollutant_code: String(scope.pollutant_code || ""),
-      station_id: Number(scope.station_id),
-      timeseries_id: Number(scope.timeseries_id),
+      station_id: Number(scope.station_id || 0),
+      timeseries_id: Number(scope.timeseries_id || 0),
       reason: String(scope.reason || ""),
       canonical_url: String(scope.canonical_url || ""),
       final_url: String(scope.final_url || ""),
-      http_status: Number(scope.http_status),
+      http_status: Number(scope.http_status || 0),
       raw_source_windows: scope.raw_source_windows || [],
       canonical_unavailable_windows: scope.canonical_unavailable_windows || [],
     }))
     .sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
+  const preservedBaselineIdentity = input.preserved_baseline_identity || {
+    source: "dropbox",
+    partition_identities: [],
+  };
+  const preservedBaselineDependencySha256 = sha256(Buffer.from(canonicalJson({
+    preserved_baseline_identity: preservedBaselineIdentity,
+    preserved_baseline_rows_sha256: sha256(preservedRowsBody),
+    source_unavailable_scopes: sourceArtifactAvailabilityIdentity,
+  }), "utf8"));
   const evidenceInput = {
     source_adapter: sourceAdapter,
     day_utc: dayUtc,
@@ -380,7 +389,7 @@ function main() {
     source_file_identities_sha256: sha256(identityBody),
     requested_pollutant_set: requestedPollutants,
     contract,
-    evidence_contract_version: 5,
+    evidence_contract_version: 6,
     source_label_registry_snapshot_content_sha256: null,
     authoritative_station_timeseries_mapping_sha256: input.authoritative_mapping_sha256 || null,
     sos_site_ref_bridge_mapping_identity: null,
@@ -389,6 +398,7 @@ function main() {
     source_artifact_availability_sha256: sha256(Buffer.from(
       canonicalJson(sourceArtifactAvailabilityIdentity), "utf8",
     )),
+    preserved_baseline_dependency_sha256: preservedBaselineDependencySha256,
   };
   const evidence = {
     schema_version: 1,
@@ -424,7 +434,7 @@ function main() {
     preserved_baseline_rows_sha256: sha256(preservedRowsBody),
     preserved_baseline_rows_bytes: preservedRowsBody.byteLength,
     preserved_baseline_row_count: preservedEvidenceRows.length,
-    preserved_baseline_identity: input.preserved_baseline_identity || null,
+    preserved_baseline_identity: preservedBaselineIdentity,
     final_target_row_count: targetRows.length,
     final_target_timeseries_row_counts: Object.fromEntries(Object.entries(finalTargetPerTimeseries).sort(([a], [b]) => Number(a) - Number(b))),
     final_target_pollutant_counts: Object.fromEntries(Object.entries(finalTargetPerPollutant).sort(([a], [b]) => a.localeCompare(b))),
