@@ -138,7 +138,8 @@ notes = "Refresh UK AQ Blog from Substack and deploy Pages"
 [jobs.uk_aq_blog_refresh.github_inputs]
 refresh_blog_feed = "true"
 
-# Future TEST activation only: enable after schema, Queue, Worker and Pro acceptance.
+# Future TEST activation only: enable after schema, Queue, Worker and OAuth SMTP readiness.
+# Pro is an optional fallback, not a scheduler dependency.
 [jobs.uk_aq_media_news_email]
 enabled = false
 cron_expr = "*/5 * * * *"
