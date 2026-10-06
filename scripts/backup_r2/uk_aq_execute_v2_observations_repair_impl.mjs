@@ -2121,7 +2121,7 @@ export async function runV2ObservationsRepair({
       const child = await readChildren({ store: staged.stagedR2.adapter, prefix: `${base}/connector_id=${scope.connectorId}/pollutant_code=`, dayUtc, connectorId: scope.connectorId, kind: "pollutant", domain, allowEmpty: true });
       const key = `${base}/connector_id=${scope.connectorId}/manifest.json`;
       if (!child.children.length) {
-        const existing = staged.stagedR2.adapter.getObjectIfExists(key);
+        const existing = localStore.getObjectIfExists(key);
         if (!existing) {
           blockedScopes.push({ ...scope, status: "blocked_dependency", reason: "empty_connector_manifest_unavailable" });
           blockedConnectorScopes.add(`${dayUtc}|${scope.connectorId}`);
@@ -2129,9 +2129,56 @@ export async function runV2ObservationsRepair({
         }
         const existingPayload = jsonObject(existing, key);
         assertV2ObservationsChildManifest(existingPayload, { key, kind: "connector", dayUtc, connectorId: scope.connectorId });
-        if ((existingPayload.child_manifests || []).length || (existingPayload.files || []).length) {
+        const authoritativeEmptyCodes = new Set(
+          (scope.index_pollutant_codes || []).filter(
+            (code) => !(scope.pollutant_codes || []).includes(code),
+          ),
+        );
+        const declaredChildren = [
+          ...(existingPayload.child_manifests || []),
+          ...(existingPayload.pollutant_manifests || []),
+        ];
+        const childCodes = declaredChildren.map((entry) =>
+          String(entry?.pollutant_code || "").trim().toLowerCase());
+        const fileCodes = (existingPayload.files || []).map((entry) =>
+          String(entry?.pollutant_code || "").trim().toLowerCase());
+        const hiddenChildCodes = new Set(childCodes.filter(Boolean));
+        const hiddenFileCodes = new Set(fileCodes.filter(Boolean));
+        const hiddenCodes = new Set([...hiddenChildCodes, ...hiddenFileCodes]);
+        if (!authoritativeEmptyCodes.size
+          || childCodes.some((code) => !code)
+          || fileCodes.some((code) => !code)
+          || [...hiddenCodes].some((code) => !authoritativeEmptyCodes.has(code))) {
           throw new Error(`Connector manifest has children hidden by the proposed final state: ${key}`);
         }
+        const payload = buildHistoryV2ConnectorManifest({
+          domain,
+          grain: null,
+          profile: null,
+          dayUtc,
+          connectorId: scope.connectorId,
+          runId: existingPayload.run_id || null,
+          manifestKey: key,
+          pollutantManifests: [],
+          writerGitSha: existingPayload.writer_git_sha || null,
+          backedUpAtUtc: existingPayload.backed_up_at_utc,
+        });
+        await staged.stage({
+          key,
+          body: JSON.stringify(payload, null, 2),
+          kind: "connector_manifest",
+          dayUtc,
+          dependencies: [],
+          localDependencySnapshot: localDependencySnapshot({
+            child,
+            proposals: staged.proposals,
+            prefix: `${base}/connector_id=${scope.connectorId}/pollutant_code=`,
+            dayUtc,
+            connectorId: scope.connectorId,
+            kind: "pollutant",
+            domain,
+          }),
+        });
         proposalKeys.push(key);
         continue;
       }

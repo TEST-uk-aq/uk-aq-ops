@@ -37,7 +37,9 @@ This repo runs UK AQ operational Cloud Run services (prune, outbox, partition ma
 - Schema DDL canonical location is schema repo under `schemas/`.
 
 ## Permissions (REQUIRED)
-- The agent may edit any files without asking for permission, except files under any `/archive` directory.
+- The agent may edit normal TEST working-tree files required by the bounded task without asking for permission.
+- When `AGENTS.md` requires a pre-change archive copy, creating that required copy is also authorised without a separate confirmation.
+- Existing archived content remains read-only reference/rollback material and must not be modified or used as active runtime code.
 
 ## Links
 - Existing README: `README.md`

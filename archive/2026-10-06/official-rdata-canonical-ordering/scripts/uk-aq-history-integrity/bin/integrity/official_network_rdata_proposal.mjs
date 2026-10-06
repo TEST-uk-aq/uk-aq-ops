@@ -36,35 +36,13 @@ function sha256(body) {
   return crypto.createHash("sha256").update(body).digest("hex");
 }
 
-function canonicalUtf8Bytes(value) {
-  const text = String(value);
-  for (let index = 0; index < text.length; index += 1) {
-    const codeUnit = text.charCodeAt(index);
-    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
-      const nextCodeUnit = text.charCodeAt(index + 1);
-      if (!(nextCodeUnit >= 0xdc00 && nextCodeUnit <= 0xdfff)) {
-        throw new Error("canonical evidence string contains an unpaired UTF-16 surrogate");
-      }
-      index += 1;
-    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
-      throw new Error("canonical evidence string contains an unpaired UTF-16 surrogate");
-    }
-  }
-  return Buffer.from(text, "utf8");
-}
-
-function compareCanonicalUtf8(left, right) {
-  return Buffer.compare(canonicalUtf8Bytes(left), canonicalUtf8Bytes(right));
-}
-
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value && typeof value === "object") {
-    return `{${Object.keys(value).sort(compareCanonicalUtf8).map((key) =>
+    return `{${Object.keys(value).sort().map((key) =>
       `${JSON.stringify(key)}:${canonicalJson(value[key])}`
     ).join(",")}}`;
   }
-  if (typeof value === "string") canonicalUtf8Bytes(value);
   return JSON.stringify(value);
 }
 
@@ -155,8 +133,7 @@ function main() {
   const dayUtc = String(input.day_utc || "");
   const connectorId = Number(input.connector_id);
   const sourceAdapter = String(input.source_adapter || "");
-  const requestedPollutants = [...new Set(input.requested_pollutant_set || [])]
-    .sort(compareCanonicalUtf8);
+  const requestedPollutants = [...new Set(input.requested_pollutant_set || [])].sort();
   const backedUpAtUtc = String(input.backed_up_at_utc || "");
   const rows = (input.rows || []).map((row) => ({
     connector_id: Number(row.connector_id),
@@ -341,14 +318,14 @@ function main() {
     source_file: String(identity.source_file || ""),
     sha256: String(identity.sha256 || ""),
     bytes: Number(identity.bytes),
-  })).sort((left, right) => compareCanonicalUtf8(left.source_file, right.source_file));
+  })).sort((left, right) => left.source_file.localeCompare(right.source_file));
   const requiredSourceFiles = [...new Set(
     (input.required_source_files || identities.map((identity) => identity.source_file))
       .map((value) => String(value)),
-  )].sort(compareCanonicalUtf8);
+  )].sort();
   const absentSourceFiles = [...new Set(
     (input.authoritatively_absent_source_files || []).map((value) => String(value)),
-  )].sort(compareCanonicalUtf8);
+  )].sort();
   const readSourceFiles = identities.map((identity) => identity.source_file);
   if (requiredSourceFiles.some((value) =>
       !readSourceFiles.includes(value) && !absentSourceFiles.includes(value)) ||
@@ -395,7 +372,7 @@ function main() {
       raw_source_windows: scope.raw_source_windows || [],
       canonical_unavailable_windows: scope.canonical_unavailable_windows || [],
     }))
-    .sort((left, right) => compareCanonicalUtf8(canonicalJson(left), canonicalJson(right)));
+    .sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
   const preservedBaselineIdentity = input.preserved_baseline_identity || {
     source: "dropbox",
     partition_identities: [],
@@ -444,15 +421,15 @@ function main() {
     canonical_rows_bytes: rowsBody.byteLength,
     total_rows: evidenceRows.length,
     per_timeseries_counts: Object.fromEntries(Object.entries(perTimeseries).sort(([a], [b]) => Number(a) - Number(b))),
-    per_pollutant_counts: Object.fromEntries(Object.entries(perPollutant).sort(([a], [b]) => compareCanonicalUtf8(a, b))),
-    observation_content_hashes: Object.fromEntries(Object.entries(sourceObservationContentHashes).sort(([a], [b]) => compareCanonicalUtf8(a, b))),
-    pollutant_set: Object.keys(perPollutant).sort(compareCanonicalUtf8),
+    per_pollutant_counts: Object.fromEntries(Object.entries(perPollutant).sort(([a], [b]) => a.localeCompare(b))),
+    observation_content_hashes: Object.fromEntries(Object.entries(sourceObservationContentHashes).sort(([a], [b]) => a.localeCompare(b))),
+    pollutant_set: Object.keys(perPollutant).sort(),
     source_available_timeseries_ids: [...new Set(
       (input.source_available_timeseries_ids || []).map((value) => Number(value)),
     )].sort((a, b) => a - b),
-    source_available_pollutant_codes: [...sourceAvailablePollutantCodes].sort(compareCanonicalUtf8),
+    source_available_pollutant_codes: [...sourceAvailablePollutantCodes].sort(),
     source_unavailable_timeseries_ids: [...unavailableTimeseriesIds].sort((a, b) => a - b),
-    source_unavailable_scopes: sourceArtifactAvailabilityIdentity,
+    source_unavailable_scopes: input.source_unavailable_scopes || [],
     preserved_baseline_rows_file: "preserved_baseline_rows.json",
     preserved_baseline_rows_sha256: sha256(preservedRowsBody),
     preserved_baseline_rows_bytes: preservedRowsBody.byteLength,
@@ -460,9 +437,9 @@ function main() {
     preserved_baseline_identity: preservedBaselineIdentity,
     final_target_row_count: targetRows.length,
     final_target_timeseries_row_counts: Object.fromEntries(Object.entries(finalTargetPerTimeseries).sort(([a], [b]) => Number(a) - Number(b))),
-    final_target_pollutant_counts: Object.fromEntries(Object.entries(finalTargetPerPollutant).sort(([a], [b]) => compareCanonicalUtf8(a, b))),
-    empty_final_target_pollutant_codes: [...emptyFinalTargetPollutantCodes].sort(compareCanonicalUtf8),
-    final_target_observation_content_hashes: Object.fromEntries(Object.entries(finalTargetObservationContentHashes).sort(([a], [b]) => compareCanonicalUtf8(a, b))),
+    final_target_pollutant_counts: Object.fromEntries(Object.entries(finalTargetPerPollutant).sort(([a], [b]) => a.localeCompare(b))),
+    empty_final_target_pollutant_codes: [...emptyFinalTargetPollutantCodes].sort(),
+    final_target_observation_content_hashes: Object.fromEntries(Object.entries(finalTargetObservationContentHashes).sort(([a], [b]) => a.localeCompare(b))),
     source_rows_before_canonical_dedupe: evidenceRows.length,
     duplicate_rows_removed_by_canonical_normalisation: 0,
     duplicate_canonical_row_count: 0,

@@ -696,6 +696,88 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
                 self.run_state
             )
 
+    def test_generic_file_backed_proposal_finalises_before_apply(self) -> None:
+        executor = self._bulk_executor(1)
+        MODULE._record_metadata_executor_overlay(
+            run_state=self.run_state,
+            executor_result=executor,
+            dry_run=False,
+            require_file_backed_bodies=True,
+        )
+        logger = mock.Mock(spec=logging.Logger)
+        succeeded = {
+            "status": "succeeded",
+            "manifest_status": "succeeded",
+            "index_status": "succeeded",
+        }
+        with mock.patch.object(
+            MODULE,
+            "_finalise_staged_write_set_provenance",
+            wraps=MODULE._finalise_staged_write_set_provenance,
+        ) as finalise:
+            self.assertFalse(
+                MODULE._finalise_generic_file_backed_proposal_if_ready(
+                    self.run_state,
+                    dedicated_sos_historical_replacement=True,
+                    observation_failed=False,
+                    metadata=succeeded,
+                    log=logger,
+                )
+            )
+            self.assertFalse(
+                MODULE._finalise_generic_file_backed_proposal_if_ready(
+                    self.run_state,
+                    dedicated_sos_historical_replacement=False,
+                    observation_failed=False,
+                    metadata={"status": "failed"},
+                    log=logger,
+                )
+            )
+            self.run_state["blocked_scopes"] = [{
+                "stage": "observs_indexes",
+                "reason": "test_blocked_proposal",
+            }]
+            self.assertFalse(
+                MODULE._finalise_generic_file_backed_proposal_if_ready(
+                    self.run_state,
+                    dedicated_sos_historical_replacement=False,
+                    observation_failed=False,
+                    metadata=succeeded,
+                    log=logger,
+                )
+            )
+            self.run_state["blocked_scopes"] = []
+            finalise.assert_not_called()
+            self.assertNotIn(
+                "final_staged_write_set_provenance", self.run_state
+            )
+
+            self.assertTrue(
+                MODULE._finalise_generic_file_backed_proposal_if_ready(
+                    self.run_state,
+                    dedicated_sos_historical_replacement=False,
+                    observation_failed=False,
+                    metadata=succeeded,
+                    log=logger,
+                )
+            )
+            finalise.assert_called_once_with(self.run_state, log=logger)
+
+        self.assertEqual(
+            self.run_state["final_staged_write_set_provenance"]["status"],
+            "finalised",
+        )
+        persisted = json.loads(
+            Path(self.run_state["run_state_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            persisted["final_staged_write_set_provenance"]["status"],
+            "finalised",
+        )
+        MODULE._require_complete_persisted_file_backed_proposal(
+            self.run_state
+        )
+
     def test_apply_launch_requires_and_persists_final_validation(self) -> None:
         executor = self._bulk_executor(1)
         MODULE._record_metadata_executor_overlay(

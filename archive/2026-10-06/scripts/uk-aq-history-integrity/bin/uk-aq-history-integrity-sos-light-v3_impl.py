@@ -84,17 +84,9 @@ from integrity.timeseries_binding_provider import (
     binding_backup_view,
 )
 from integrity.official_network_rdata import (
-    AuthoritativeSourceArtifactAbsent,
-    COVERAGE_AUTHORITATIVE_NO_COVERAGE,
-    COVERAGE_INDETERMINATE,
-    COVERAGE_REQUIRED,
     NETWORKS as OFFICIAL_RDATA_NETWORKS,
     RDATA_COLUMN_TO_POLLUTANT,
-    canonical_day_has_available_window as official_rdata_day_has_available_window,
     canonical_rows_for_site_year,
-    canonical_timestamp_is_in_windows as official_rdata_timestamp_is_in_windows,
-    canonical_unavailable_windows as official_rdata_canonical_unavailable_windows,
-    classify_site_year_coverage,
     download_pinned as download_official_rdata_pinned,
     extract_metadata as extract_official_rdata_metadata,
     extract_site_year as extract_official_rdata_site_year,
@@ -11876,14 +11868,6 @@ def _current_source_counts_for_v2_partition(
             pollutant_code=pollutant_code,
         )
 
-    official_rdata_source = _official_rdata_source_for_connector(connector_id)
-    if official_rdata_source and official_rdata_source in source_keys:
-        return _official_rdata_source_counts_for_partition(
-            source_key=official_rdata_source,
-            day_utc=day_utc,
-            pollutant_code=pollutant_code,
-        )
-
     day = dt.date.fromisoformat(day_utc)
     lookup_rows = conn.execute(
         f"""
@@ -12634,7 +12618,6 @@ def run_v2_observations_integrity_checks(
     gaps: list[dict[str, Any]] = []
     hash_check_candidates: list[dict[str, Any]] = []
     source_resolution_by_pollutant: dict[str, dict[str, Any]] = {}
-    source_unavailable_scopes: list[dict[str, Any]] = []
     all_unmapped_partitions_left_unchanged: list[dict[str, Any]] = []
     connector_day_source_evidence: dict[
         tuple[str, int], dict[str, dict[str, Any]]
@@ -13145,16 +13128,6 @@ def run_v2_observations_integrity_checks(
                     )
                     or ""
                 )
-                if source_partition_evidence is not None:
-                    source_unavailable_scopes.extend(
-                        dict(scope)
-                        for scope in list(
-                            source_partition_evidence.get(
-                                "source_unavailable_scopes"
-                            )
-                            or []
-                        )
-                    )
                 if (
                     parquet_stats is not None
                     and connector_id_for_source is not None
@@ -13163,75 +13136,13 @@ def run_v2_observations_integrity_checks(
                         "successful_empty",
                     }
                 ):
-                    available_timeseries_ids = {
-                        int(value)
-                        for value in list(
-                            (source_partition_evidence or {}).get(
-                                "source_available_timeseries_ids"
-                            )
-                            or []
-                        )
-                    }
-                    comparison_r2_counts = _normalize_timeseries_row_counts(
-                        parquet_stats["timeseries_row_counts"]
-                    )
-                    unavailable_scopes_for_comparison = [
-                        dict(scope)
-                        for scope in list(
-                            (source_partition_evidence or {}).get(
-                                "source_unavailable_scopes"
-                            )
-                            or []
-                        )
-                        if str(scope.get("pollutant_code") or "") == pollutant
-                    ]
-                    if unavailable_scopes_for_comparison:
-                        try:
-                            baseline_rows_for_comparison = (
-                                _observation_rows_from_local_parquet_for_shared_hash(
-                                    parquet_paths=[
-                                        str(path) for path in sorted(local_parquets)
-                                    ],
-                                )
-                            )
-                            comparable_rows = _official_rdata_source_available_rows(
-                                baseline_rows_for_comparison,
-                                unavailable_scopes_for_comparison,
-                            )
-                        except (OSError, RuntimeError, ValueError) as exc:
-                            gaps.append(_v2_obs_gap(
-                                "parquet_unreadable",
-                                day_utc=day_utc,
-                                connector_id=connector_raw,
-                                pollutant_code=pollutant,
-                                expected_path=manifest_rel,
-                                related_paths=[
-                                    "source_available_subset_read_failed:"
-                                    + _truncate_text(str(exc), 500)
-                                ],
-                            ))
-                            continue
-                        comparison_r2_counts = {}
-                        for row in comparable_rows:
-                            timeseries_id = int(row["timeseries_id"])
-                            comparison_r2_counts[timeseries_id] = (
-                                comparison_r2_counts.get(timeseries_id, 0) + 1
-                            )
-                    elif "source_available_timeseries_ids" in (
-                        source_partition_evidence or {}
-                    ):
-                        comparison_r2_counts = {
-                            timeseries_id: count
-                            for timeseries_id, count in comparison_r2_counts.items()
-                            if timeseries_id in available_timeseries_ids
-                        }
                     stale_gap = _build_v2_source_r2_mismatch_gap_if_complete(
                         day_utc=day_utc,
                         connector_id=connector_raw,
                         pollutant_code=pollutant,
                         expected_path=manifest_rel,
                         source_counts=source_counts,
-                        r2_counts=comparison_r2_counts,
+                        r2_counts=parquet_stats["timeseries_row_counts"],
                         source_partition_evidence=source_partition_evidence,
                     )
                     if stale_gap is not None:
@@ -13245,9 +13156,12 @@ def run_v2_observations_integrity_checks(
                             )
                             or ""
                         )
-                        in {"successful_non_empty", "successful_empty"}
+                        == "successful_non_empty"
+                        and source_counts
                         and _normalize_timeseries_row_counts(source_counts)
-                        == comparison_r2_counts
+                        == _normalize_timeseries_row_counts(
+                            parquet_stats["timeseries_row_counts"]
+                        )
                     ):
                         hash_check_candidates.append({
                             "day_utc": day_utc,
@@ -13278,11 +13192,6 @@ def run_v2_observations_integrity_checks(
                                     "historical_identity_rollover_groups",
                                     "historical_identity_rollovers",
                                     "identity_classification",
-                                    "source_available_timeseries_ids",
-                                    "source_available_pollutant_codes",
-                                    "source_unavailable_timeseries_ids",
-                                    "source_unavailable_scopes",
-                                    "comparison_scope",
                                 )
                                 if field in source_partition_evidence
                             },
@@ -13377,22 +13286,6 @@ def run_v2_observations_integrity_checks(
             for pollutant in sorted(V2_OBSERVATION_INTEGRITY_POLLUTANTS)
         },
         "source_resolution_by_pollutant": source_resolution_by_pollutant,
-        "source_unavailable_scopes": sorted(
-            {
-                (
-                    str(entry.get("day_utc") or ""),
-                    str(entry.get("site_code") or ""),
-                    int(entry.get("source_year") or 0),
-                    str(entry.get("pollutant_code") or ""),
-                    int(entry.get("timeseries_id") or 0),
-                ): entry
-                for entry in source_unavailable_scopes
-            }.values(),
-            key=lambda entry: (
-                entry.get("day_utc"), entry.get("pollutant_code"),
-                entry.get("timeseries_id"), entry.get("source_year"),
-            ),
-        ),
         "all_unmapped_partitions_left_unchanged": sorted(
             {
                 (
@@ -13648,69 +13541,6 @@ def run_r2_cross_checks(
         per_ts = grouped.setdefault(key, {})
         per_ts[int(timeseries_id)] = int(source_row_count or 0)
 
-    official_comparison_by_scope: dict[
-        tuple[str, int], dict[str, Any]
-    ] = {}
-    for official_source, context in OFFICIAL_RDATA_RUN_CONTEXTS.items():
-        if official_source not in source_keys:
-            continue
-        connector_id = int(context["connector_id"])
-        for day_utc in sorted((context.get("rows_by_day") or {})):
-            scope = (str(day_utc), connector_id)
-            selected_binding_ids = {
-                int(binding["timeseries_id"])
-                for site_bindings in dict(context.get("bindings") or {}).values()
-                for binding in dict(site_bindings).values()
-            }
-            unavailable_scopes = [
-                dict(item)
-                for item in list(
-                    (context.get("source_unavailable_by_day") or {}).get(
-                        day_utc
-                    )
-                    or []
-                )
-            ]
-            windows_by_timeseries: dict[int, list[dict[str, Any]]] = {}
-            for unavailable_scope in unavailable_scopes:
-                windows_by_timeseries.setdefault(
-                    int(unavailable_scope["timeseries_id"]), []
-                ).extend(
-                    dict(window) for window in list(
-                        unavailable_scope.get("canonical_unavailable_windows")
-                        or []
-                    )
-                )
-            comparable_ids = {
-                timeseries_id for timeseries_id in selected_binding_ids
-                if official_rdata_day_has_available_window(
-                    str(day_utc),
-                    windows_by_timeseries.get(timeseries_id, []),
-                )
-            }
-            partial_window_ids = comparable_ids & set(windows_by_timeseries)
-            official_comparison_by_scope[scope] = {
-                "timeseries_ids": comparable_ids,
-                "unavailable_scopes": unavailable_scopes,
-                "requires_exact_baseline_rows": bool(partial_window_ids),
-            }
-            if not comparable_ids:
-                grouped.pop(scope, None)
-                continue
-            current_counts: dict[int, int] = {}
-            for row in list((context.get("rows_by_day") or {}).get(day_utc) or []):
-                timeseries_id = int(row["timeseries_id"])
-                if (
-                    timeseries_id in comparable_ids
-                    and not _official_rdata_row_is_source_unavailable(
-                        row, unavailable_scopes,
-                    )
-                ):
-                    current_counts[timeseries_id] = (
-                        current_counts.get(timeseries_id, 0) + 1
-                    )
-            grouped[scope] = current_counts
-
     status_counts = {
         "ok": 0,
         "mismatch": 0,
@@ -13782,50 +13612,6 @@ def run_r2_cross_checks(
                     notes,
                 ))
             continue
-
-        official_comparison = official_comparison_by_scope.get(
-            (day_utc, connector_id)
-        )
-        if official_comparison is not None:
-            available_timeseries_ids = set(
-                official_comparison["timeseries_ids"]
-            )
-            if official_comparison["requires_exact_baseline_rows"]:
-                connector_root = (
-                    root / R2_HISTORY_V2_OBSERVATIONS_PREFIX
-                    / f"day_utc={day_utc}"
-                    / f"connector_id={int(connector_id)}"
-                )
-                parquet_paths = sorted(
-                    str(path) for path in connector_root.glob(
-                        "pollutant_code=*/part-*.parquet"
-                    )
-                )
-                baseline_rows = (
-                    _observation_rows_from_local_parquet_for_shared_hash(
-                        parquet_paths=parquet_paths,
-                    )
-                )
-                exact_counts: dict[int, int] = {}
-                for row in baseline_rows:
-                    timeseries_id = int(row.get("timeseries_id") or 0)
-                    if (
-                        timeseries_id in available_timeseries_ids
-                        and not _official_rdata_row_is_source_unavailable(
-                            row,
-                            official_comparison["unavailable_scopes"],
-                        )
-                    ):
-                        exact_counts[timeseries_id] = (
-                            exact_counts.get(timeseries_id, 0) + 1
-                        )
-                r2_counts = exact_counts
-            else:
-                r2_counts = {
-                    timeseries_id: count
-                    for timeseries_id, count in r2_counts.items()
-                    if timeseries_id in available_timeseries_ids
-                }
 
         for timeseries_id in sorted(set(source_counts) | set(r2_counts)):
             source_row_count = source_counts.get(timeseries_id)
@@ -14893,94 +14679,6 @@ def _official_rdata_source_file_key(
     return f"{source_key}:site_ref={site_code.upper()}:year={int(year)}"
 
 
-def _official_rdata_row_is_source_unavailable(
-    row: Mapping[str, Any],
-    unavailable_scopes: Iterable[Mapping[str, Any]],
-) -> bool:
-    timeseries_id = int(row.get("timeseries_id") or 0)
-    pollutant_code = str(row.get("pollutant_code") or "")
-    observed_at_utc = str(
-        row.get("observed_at_utc") or row.get("observed_at") or ""
-    )
-    for scope in unavailable_scopes:
-        scope_windows = list(
-            scope.get("canonical_unavailable_windows") or []
-        )
-        if not scope_windows:
-            raise ValueError(
-                "official RData unavailable scope has no canonical windows"
-            )
-        if (
-            int(scope.get("timeseries_id") or 0) != timeseries_id
-            or str(scope.get("pollutant_code") or "") != pollutant_code
-        ):
-            continue
-        if official_rdata_timestamp_is_in_windows(
-            observed_at_utc,
-            scope_windows,
-        ):
-            return True
-    return False
-
-
-def _official_rdata_source_available_rows(
-    rows: Iterable[Mapping[str, Any]],
-    unavailable_scopes: Iterable[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    scopes = [dict(scope) for scope in unavailable_scopes]
-    return [
-        dict(row) for row in rows
-        if not _official_rdata_row_is_source_unavailable(row, scopes)
-    ]
-
-
-def _official_rdata_partition_availability(
-    *,
-    context: Mapping[str, Any],
-    day_utc: str,
-    pollutant_code: str,
-) -> tuple[set[int], set[int], list[dict[str, Any]]]:
-    binding_ids = {
-        int(binding["timeseries_id"])
-        for site_bindings in dict(context.get("bindings") or {}).values()
-        for code, binding in dict(site_bindings).items()
-        if str(code) == pollutant_code
-    }
-    unavailable_scopes = [
-        dict(scope)
-        for scope in list(
-            (context.get("source_unavailable_by_day") or {}).get(day_utc) or []
-        )
-        if str(scope.get("pollutant_code") or "") == pollutant_code
-    ]
-    unavailable_ids = {
-        int(scope["timeseries_id"]) for scope in unavailable_scopes
-    }
-    windows_by_timeseries: dict[int, list[dict[str, Any]]] = {}
-    for scope in unavailable_scopes:
-        scope_windows = list(
-            scope.get("canonical_unavailable_windows") or []
-        )
-        if not scope_windows:
-            raise ValueError(
-                "official RData unavailable scope has no canonical windows"
-            )
-        windows_by_timeseries.setdefault(
-            int(scope["timeseries_id"]), []
-        ).extend(
-            dict(window)
-            for window in scope_windows
-        )
-    available_ids = {
-        timeseries_id for timeseries_id in binding_ids
-        if official_rdata_day_has_available_window(
-            day_utc,
-            windows_by_timeseries.get(timeseries_id, []),
-        )
-    }
-    return available_ids, unavailable_ids, unavailable_scopes
-
-
 def _official_rdata_bindings(
     conn: sqlite3.Connection,
     *,
@@ -15225,7 +14923,6 @@ def check_official_network_rdata(
     run_root.mkdir(parents=True, exist_ok=True)
     now_iso = utc_now().isoformat()
     identities_by_key: dict[str, dict[str, Any]] = {}
-    acquisition_records: list[dict[str, Any]] = []
     downloaded_bytes = 0
 
     def record_acquisition_failure(
@@ -15238,11 +14935,7 @@ def check_official_network_rdata(
         exc: Exception,
     ) -> Path:
         http_status = (
-            int(exc.code)
-            if isinstance(exc, urllib.error.HTTPError)
-            else int(exc.http_status)
-            if isinstance(exc, AuthoritativeSourceArtifactAbsent)
-            else None
+            int(exc.code) if isinstance(exc, urllib.error.HTTPError) else None
         )
         reason = (
             "unexpected_required_source_http_404"
@@ -15280,18 +14973,8 @@ def check_official_network_rdata(
     def acquire(
         *, source_file_key: str, url: str, destination: Path,
         site_code: str | None, year: int | None,
-        allow_authoritative_absence: bool = False,
     ) -> dict[str, Any]:
         nonlocal downloaded_bytes
-        if allow_authoritative_absence and (
-            not site_code
-            or year is None
-            or Path(urllib.parse.urlsplit(url).path).name
-            != f"{site_code}_{int(year)}.RData"
-        ):
-            raise ValueError(
-                "authoritative absence is limited to canonical site-year RData objects"
-            )
         if limits.should_stop():
             raise RuntimeError(
                 f"{source_key} RData acquisition stopped by {limits.stopped_for}"
@@ -15299,64 +14982,7 @@ def check_official_network_rdata(
         prior = _fetch_prior_state(conn, source_file_key)
         started = time.monotonic()
         try:
-            pinned = download_official_rdata_pinned(
-                url,
-                destination,
-                config=config,
-            )
-        except AuthoritativeSourceArtifactAbsent as exc:
-            if not allow_authoritative_absence:
-                failure_path = record_acquisition_failure(
-                    source_file_key=source_file_key,
-                    url=url,
-                    site_code=site_code,
-                    year=year,
-                    stage="fetch",
-                    exc=exc,
-                )
-                raise RuntimeError(
-                    f"{source_key} required metadata RData fetch failed closed: "
-                    f"status=404 url={url}; audit={failure_path}"
-                ) from exc
-            record = {
-                "source_adapter": source_key,
-                "connector_id": config.connector_id,
-                "source_file": source_file_key,
-                "site_code": site_code,
-                "source_year": year,
-                "canonical_url": exc.canonical_url,
-                "final_url": exc.final_url,
-                "availability": "authoritatively_absent",
-                "http_status": exc.http_status,
-                "requested_at_utc": exc.requested_at_utc,
-                "reason": "source_artifact_unavailable",
-                "authoritative_no_data": False,
-            }
-            _upsert_source_state(
-                conn=conn, source_key=source_key,
-                remote_scheme="openair_rdata",
-                source_file_key=source_file_key, env_name=env_name,
-                remote_url_or_key=url, station_ref=site_code,
-                source_location_id=site_code, day=days[0],
-                exists_remote=False, content_length=None, etag=None,
-                last_modified_utc=None, sha256_downloaded=None,
-                sha256_uncompressed=None, local_cached_path=None,
-                now_iso=now_iso, last_changed_at=now_iso,
-                last_status="authoritatively_absent",
-                notes=(
-                    "canonical provider site-year artifact unavailable; "
-                    f"HTTP 404; year={year}; final_url={exc.final_url}"
-                ),
-                source_count_mapping_identity="official_network_rdata_v1",
-                source_count_mapping_hash=mapping_hash,
-            )
-            acquisition_records.append(record)
-            log.warning(
-                "%s source artifact unavailable: site=%s year=%s status=404 "
-                "action=preserve_pinned_baseline_scope",
-                source_key.upper(), site_code, year,
-            )
-            return record
+            pinned = download_official_rdata_pinned(url, destination)
         except Exception as exc:
             failure_path = record_acquisition_failure(
                 source_file_key=source_file_key,
@@ -15426,22 +15052,10 @@ def check_official_network_rdata(
         identity = {
             "source_file": source_file_key,
             "url": url,
-            "canonical_url": str(pinned.get("canonical_url") or url),
-            "final_url": str(pinned.get("final_url") or url),
-            "availability": "present",
-            "http_status": int(pinned.get("http_status") or 200),
-            "requested_at_utc": str(pinned.get("requested_at_utc") or now_iso),
             "bytes": int(pinned["bytes"]),
             "sha256": str(pinned["sha256"]),
         }
         identities_by_key[source_file_key] = identity
-        acquisition_records.append({
-            "source_adapter": source_key,
-            "connector_id": config.connector_id,
-            "site_code": site_code,
-            "source_year": year,
-            **identity,
-        })
         return identity
 
     metadata_key = f"{source_key}:metadata"
@@ -15478,169 +15092,24 @@ def check_official_network_rdata(
     required_by_day: dict[str, set[str]] = {
         day.isoformat(): {metadata_key} for day in days
     }
-    coverage_audit: list[dict[str, Any]] = []
-    unavailable_scopes: list[dict[str, Any]] = []
-    unavailable_by_day: dict[str, list[dict[str, Any]]] = {
-        day.isoformat(): [] for day in days
-    }
-    site_year_files_authoritative_no_coverage = 0
     decoded_files = 0
     for site_code, site_bindings in sorted(bindings.items()):
         for year in official_rdata_required_site_years(days):
             source_file_key = _official_rdata_source_file_key(
                 source_key, site_code, year,
             )
-            filename = f"{site_code}_{year}.RData"
-            source_url = config.base_url + filename
-            relevant_days = [
-                day for day in days
-                if year in official_rdata_required_site_years((day,))
-            ]
-            day_coverage: list[dict[str, Any]] = []
-            for day in relevant_days:
-                coverage = classify_site_year_coverage(
-                    metadata_rows,
-                    site_code=site_code,
-                    bindings_by_pollutant=site_bindings,
-                    selected_days=(day,),
-                    source_year=year,
-                )
-                evidence = {
-                    "schema_version": 1,
-                    "source_adapter": source_key,
-                    "connector_id": config.connector_id,
-                    "source_file": source_file_key,
-                    "url": source_url,
-                    "metadata_source_identity": dict(
-                        identities_by_key[metadata_key]
-                    ),
-                    **coverage,
-                }
-                day_coverage.append(evidence)
-                audits_by_day[day.isoformat()].append({
-                    "audit_kind": "site_year_source_coverage",
-                    **evidence,
-                })
-                if coverage["classification"] != COVERAGE_AUTHORITATIVE_NO_COVERAGE:
+            for day in days:
+                if year in official_rdata_required_site_years((day,)):
                     required_by_day[day.isoformat()].add(source_file_key)
-
-            classifications = {
-                str(evidence["classification"]) for evidence in day_coverage
-            }
-            if COVERAGE_REQUIRED in classifications:
-                classification = COVERAGE_REQUIRED
-                reason = "selected_day_requires_site_year"
-            elif COVERAGE_INDETERMINATE in classifications:
-                classification = COVERAGE_INDETERMINATE
-                reason = "selected_day_coverage_indeterminate"
-            else:
-                classification = COVERAGE_AUTHORITATIVE_NO_COVERAGE
-                reason = "all_selected_days_authoritative_no_coverage"
-            coverage_record = {
-                "schema_version": 1,
-                "source_adapter": source_key,
-                "connector_id": config.connector_id,
-                "site_code": site_code,
-                "source_year": year,
-                "source_file": source_file_key,
-                "url": source_url,
-                "selected_pollutants": sorted(site_bindings),
-                "selected_canonical_days": [
-                    day.isoformat() for day in relevant_days
-                ],
-                "metadata_source_identity": dict(
-                    identities_by_key[metadata_key]
-                ),
-                "classification": classification,
-                "reason": reason,
-                "day_classifications": day_coverage,
-                "acquisition_action": (
-                    "not_fetched_authoritative_no_coverage"
-                    if classification == COVERAGE_AUTHORITATIVE_NO_COVERAGE
-                    else "fetched_fail_closed_indeterminate"
-                    if classification == COVERAGE_INDETERMINATE
-                    else "fetched_required"
-                ),
-            }
-            coverage_audit.append(coverage_record)
-            if classification == COVERAGE_AUTHORITATIVE_NO_COVERAGE:
-                site_year_files_authoritative_no_coverage += 1
-                coverage_record["source_artifact_availability"] = (
-                    "not_requested_authoritative_no_coverage"
-                )
-                continue
-
+            filename = f"{site_code}_{year}.RData"
             destination = run_root / f"site={site_code}" / filename
             identity = acquire(
                 source_file_key=source_file_key,
-                url=source_url,
+                url=config.base_url + filename,
                 destination=destination,
                 site_code=site_code,
                 year=year,
-                allow_authoritative_absence=True,
             )
-            availability = str(identity.get("availability") or "present")
-            coverage_record["source_artifact_availability"] = availability
-            coverage_record["canonical_url"] = str(
-                identity.get("canonical_url") or source_url
-            )
-            coverage_record["final_url"] = str(
-                identity.get("final_url") or source_url
-            )
-            coverage_record["http_status"] = int(
-                identity.get("http_status") or 200
-            )
-            coverage_record["request_audit_timestamp"] = str(
-                identity.get("requested_at_utc") or now_iso
-            )
-            if availability == "authoritatively_absent":
-                for day_evidence in day_coverage:
-                    day_utc = str(
-                        (day_evidence.get("selected_canonical_days") or [""])[0]
-                    )
-                    required_by_day[day_utc].discard(source_file_key)
-                    for binding_evidence in list(
-                        day_evidence.get("selected_bindings") or []
-                    ):
-                        if (
-                            binding_evidence.get("classification")
-                            == COVERAGE_AUTHORITATIVE_NO_COVERAGE
-                        ):
-                            continue
-                        scope = {
-                            "day_utc": day_utc,
-                            "site_code": site_code,
-                            "source_year": int(year),
-                            "source_file_key": source_file_key,
-                            "pollutant_code": str(
-                                binding_evidence["pollutant_code"]
-                            ),
-                            "station_id": int(binding_evidence["station_id"]),
-                            "timeseries_id": int(
-                                binding_evidence["timeseries_id"]
-                            ),
-                            "reason": "source_artifact_unavailable",
-                            "canonical_url": str(identity["canonical_url"]),
-                            "final_url": str(identity["final_url"]),
-                            "http_status": 404,
-                            "request_audit_timestamp": str(
-                                identity["requested_at_utc"]
-                            ),
-                            "raw_source_windows": list(
-                                day_evidence.get("raw_source_windows") or []
-                            ),
-                            "canonical_unavailable_windows": (
-                                official_rdata_canonical_unavailable_windows(
-                                    list(
-                                        day_evidence.get("raw_source_windows")
-                                        or []
-                                    )
-                                )
-                            ),
-                        }
-                        unavailable_scopes.append(scope)
-                        unavailable_by_day[day_utc].append(scope)
-                continue
             try:
                 decoded = extract_official_rdata_site_year(
                     destination, site_code=site_code, year=year,
@@ -15648,7 +15117,7 @@ def check_official_network_rdata(
             except Exception as exc:
                 failure_path = record_acquisition_failure(
                     source_file_key=source_file_key,
-                    url=source_url,
+                    url=config.base_url + filename,
                     site_code=site_code,
                     year=year,
                     stage="decode",
@@ -15670,7 +15139,7 @@ def check_official_network_rdata(
             except Exception as exc:
                 failure_path = record_acquisition_failure(
                     source_file_key=source_file_key,
-                    url=source_url,
+                    url=config.base_url + filename,
                     site_code=site_code,
                     year=year,
                     stage="canonicalize",
@@ -15695,10 +15164,6 @@ def check_official_network_rdata(
             decoded_files += 1
 
     for day_utc, rows in rows_by_day.items():
-        rows[:] = _official_rdata_source_available_rows(
-            rows,
-            unavailable_by_day[day_utc],
-        )
         rows.sort(key=lambda row: (
             row["observed_at_utc"], row["timeseries_id"], row["pollutant_code"],
         ))
@@ -15720,37 +15185,17 @@ def check_official_network_rdata(
     context = {
         "source_key": source_key,
         "connector_id": config.connector_id,
-        "bindings": bindings,
         "rows_by_day": rows_by_day,
         "audits_by_day": audits_by_day,
         "required_by_day": {
             key: sorted(value) for key, value in required_by_day.items()
         },
-        "source_unavailable_by_day": {
-            key: sorted(
-                value,
-                key=lambda item: (
-                    item["pollutant_code"], item["timeseries_id"],
-                    item["source_year"],
-                ),
-            )
-            for key, value in unavailable_by_day.items()
-        },
-        "source_unavailable_scopes": sorted(
-            unavailable_scopes,
-            key=lambda item: (
-                item["day_utc"], item["pollutant_code"],
-                item["timeseries_id"], item["source_year"],
-            ),
-        ),
-        "acquisition_records": acquisition_records,
         "identities_by_key": identities_by_key,
         "absent_keys": [],
         "selected_pollutants": selected,
         "authoritative_mapping_sha256": mapping_hash,
         "observed_property_mapping_sha256": observed_property_hash,
         "mapping_audit": mapping_audit,
-        "site_year_coverage_audit": coverage_audit,
         "rscript_identity": official_rdata_rscript_identity(),
         "run_root": str(run_root),
     }
@@ -15768,18 +15213,7 @@ def check_official_network_rdata(
         "metadata_files_fetched": 1,
         "site_year_files_fetched": len(identities_by_key) - 1,
         "site_year_files_decoded": decoded_files,
-        "site_year_files_authoritative_no_coverage": (
-            site_year_files_authoritative_no_coverage
-        ),
-        "site_year_files_source_unavailable": sum(
-            1 for record in acquisition_records
-            if record.get("source_year") is not None
-            and record.get("availability") == "authoritatively_absent"
-        ),
-        "site_year_files_indeterminate": 0,
         "source_files_authoritatively_absent": 0,
-        "source_unavailable_scope_count": len(unavailable_scopes),
-        "source_unavailable_scopes": context["source_unavailable_scopes"],
         "downloaded_bytes": downloaded_bytes,
         "canonical_rows": sum(len(rows) for rows in rows_by_day.values()),
         "selected_day_count": len(days),
@@ -15814,161 +15248,6 @@ def _prepare_official_rdata_proposal(
         dict(row) for row in context["rows_by_day"].get(day_utc, [])
         if str(row.get("pollutant_code") or "") in pollutants
     ]
-    unavailable_scopes = [
-        {
-            key: value
-            for key, value in dict(scope).items()
-            if key != "request_audit_timestamp"
-        }
-        for scope in list(
-            (context.get("source_unavailable_by_day") or {}).get(day_utc) or []
-        )
-        if str(scope.get("pollutant_code") or "") in pollutants
-    ]
-    unavailable_timeseries_ids = {
-        int(scope["timeseries_id"]) for scope in unavailable_scopes
-    }
-    source_available_timeseries_ids: set[int] = set()
-    source_available_pollutant_codes: list[str] = []
-    for pollutant_code in pollutants:
-        pollutant_available_ids, _unavailable_ids, _scopes = (
-            _official_rdata_partition_availability(
-                context=context,
-                day_utc=day_utc,
-                pollutant_code=pollutant_code,
-            )
-        )
-        source_available_timeseries_ids.update(pollutant_available_ids)
-        if pollutant_available_ids:
-            source_available_pollutant_codes.append(pollutant_code)
-    preserved_rows: list[dict[str, Any]] = []
-    preserved_baseline_identity: dict[str, Any] = {
-        "source": "dropbox",
-        "partition_identities": [],
-    }
-    if unavailable_timeseries_ids:
-        baseline_root = Path(resolve_r2_history_root({**os.environ, **env}))
-        for pollutant_code in pollutants:
-            pollutant_unavailable_scopes = [
-                dict(scope) for scope in unavailable_scopes
-                if scope["pollutant_code"] == pollutant_code
-            ]
-            pollutant_unavailable_ids = {
-                int(scope["timeseries_id"])
-                for scope in pollutant_unavailable_scopes
-            }
-            if not pollutant_unavailable_scopes:
-                continue
-            partition_prefix = (
-                f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
-                f"connector_id={int(connector_id)}/"
-                f"pollutant_code={pollutant_code}"
-            )
-            manifest_path = baseline_root / partition_prefix / "manifest.json"
-            partition_identity: dict[str, Any] = {
-                "day_utc": day_utc,
-                "connector_id": int(connector_id),
-                "pollutant_code": pollutant_code,
-                "source_unavailable_timeseries_ids": sorted(
-                    pollutant_unavailable_ids
-                ),
-                "source_unavailable_scopes": pollutant_unavailable_scopes,
-                "manifest_key": f"{partition_prefix}/manifest.json",
-            }
-            if not manifest_path.is_file():
-                partition_identity.update({
-                    "baseline_state": "partition_absent",
-                    "preserved_row_count": 0,
-                    "object_identities": [],
-                })
-                preserved_baseline_identity["partition_identities"].append(
-                    partition_identity
-                )
-                continue
-            manifest_body = manifest_path.read_bytes()
-            manifest = json.loads(manifest_body)
-            files = list(manifest.get("files") or []) if isinstance(
-                manifest, Mapping
-            ) else []
-            parquet_paths: list[str] = []
-            object_identities = [{
-                "object_key": f"{partition_prefix}/manifest.json",
-                "bytes": len(manifest_body),
-                "sha256": hashlib.sha256(manifest_body).hexdigest(),
-            }]
-            for entry in files:
-                object_key = str(
-                    entry.get("key") if isinstance(entry, Mapping) else ""
-                ).strip().lstrip("/")
-                expected_prefix = partition_prefix.rstrip("/") + "/"
-                if not object_key.startswith(expected_prefix):
-                    raise ValueError(
-                        "pinned baseline pollutant manifest escaped its partition"
-                    )
-                object_path = baseline_root / object_key
-                if not object_path.is_file():
-                    raise FileNotFoundError(
-                        f"pinned baseline object is unavailable: {object_key}"
-                    )
-                body = object_path.read_bytes()
-                body_sha256 = hashlib.sha256(body).hexdigest()
-                try:
-                    recorded_bytes = int(entry.get("bytes"))
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(
-                        "pinned baseline pollutant manifest has invalid file bytes"
-                    ) from exc
-                recorded_sha256 = str(
-                    entry.get("etag_or_hash") or ""
-                ).strip().lower()
-                if (
-                    recorded_bytes != len(body)
-                    or recorded_sha256 != body_sha256
-                ):
-                    raise ValueError(
-                        "pinned baseline pollutant file identity changed: "
-                        f"{object_key}"
-                    )
-                parquet_paths.append(str(object_path))
-                object_identities.append({
-                    "object_key": object_key,
-                    "bytes": len(body),
-                    "sha256": body_sha256,
-                })
-            baseline_rows = (
-                _observation_rows_from_local_parquet_for_shared_hash(
-                    parquet_paths=parquet_paths,
-                )
-                if parquet_paths else []
-            )
-            selected_baseline_rows = []
-            for row in baseline_rows:
-                if not _official_rdata_row_is_source_unavailable(
-                    row,
-                    pollutant_unavailable_scopes,
-                ):
-                    continue
-                timeseries_id = int(row.get("timeseries_id") or 0)
-                selected_baseline_rows.append({
-                    "connector_id": int(row["connector_id"]),
-                    "station_id": int(row["station_id"]),
-                    "timeseries_id": timeseries_id,
-                    "pollutant_code": str(row["pollutant_code"]),
-                    "observed_at_utc": str(row["observed_at_utc"]),
-                    "value": float(row["value"]),
-                    "verification_status": row.get(
-                        "verification_status", row.get("status")
-                    ),
-                })
-            preserved_rows.extend(selected_baseline_rows)
-            partition_identity.update({
-                "baseline_state": "partition_present",
-                "preserved_row_count": len(selected_baseline_rows),
-                "object_identities": object_identities,
-            })
-            preserved_baseline_identity["partition_identities"].append(
-                partition_identity
-            )
     required = list(context["required_by_day"].get(day_utc, []))
     identities = [
         context["identities_by_key"][key]
@@ -15994,18 +15273,6 @@ def _prepare_official_rdata_proposal(
         "requested_pollutant_set": pollutants,
         "backed_up_at_utc": utc_now().isoformat().replace("+00:00", "Z"),
         "rows": rows,
-        "preserved_baseline_rows": preserved_rows,
-        "preserved_baseline_identity": preserved_baseline_identity,
-        "source_unavailable_scopes": unavailable_scopes,
-        "source_available_timeseries_ids": sorted(
-            source_available_timeseries_ids
-        ),
-        "source_available_pollutant_codes": sorted(
-            source_available_pollutant_codes
-        ),
-        "source_unavailable_timeseries_ids": sorted(
-            unavailable_timeseries_ids
-        ),
         "source_file_identities": identities,
         "required_source_files": required,
         "authoritatively_absent_source_files": absent,
@@ -16053,10 +15320,9 @@ def _prepare_official_rdata_proposal(
         "backfill_run_status": "ok",
         "integrity_proposal_chunk_staged_events": 1,
         "integrity_proposal_staged_rows": len(rows),
-        "max_integrity_proposal_staged_rows": len(rows) + len(preserved_rows),
-        "preserved_baseline_rows": len(preserved_rows),
+        "max_integrity_proposal_staged_rows": len(rows),
         "repaired_timeseries_row_counts": result.get(
-            "final_target_timeseries_row_counts", {}
+            "source_timeseries_row_counts", {}
         ),
     })
     return result
@@ -16072,100 +15338,6 @@ def _official_rdata_source_for_connector(connector_id: int) -> str | None:
             f"official RData connector maps to multiple run contexts: {connector_id}"
         )
     return matches[0] if matches else None
-
-
-def _official_rdata_source_counts_for_partition(
-    *,
-    source_key: str,
-    day_utc: str,
-    pollutant_code: str,
-) -> tuple[dict[int, int], dict[str, Any]]:
-    """Return current-run counts for exact source-available timestamp windows."""
-    context = OFFICIAL_RDATA_RUN_CONTEXTS[source_key]
-    all_bindings = {
-        int(binding["timeseries_id"])
-        for site_bindings in dict(context.get("bindings") or {}).values()
-        for code, binding in dict(site_bindings).items()
-        if str(code) == pollutant_code
-    }
-    available_ids, unavailable_ids, unavailable_scopes = (
-        _official_rdata_partition_availability(
-            context=context,
-            day_utc=day_utc,
-            pollutant_code=pollutant_code,
-        )
-    )
-    counts: dict[int, int] = {}
-    for row in list((context.get("rows_by_day") or {}).get(day_utc) or []):
-        timeseries_id = int(row["timeseries_id"])
-        if (
-            str(row.get("pollutant_code") or "") == pollutant_code
-            and timeseries_id in available_ids
-            and not _official_rdata_row_is_source_unavailable(
-                row,
-                unavailable_scopes,
-            )
-        ):
-            counts[timeseries_id] = counts.get(timeseries_id, 0) + 1
-    if not all_bindings:
-        state = "counts_unavailable"
-        skip_reason = "official_rdata_selected_binding_scope_empty"
-        available = False
-    elif not available_ids:
-        state = "source_artifact_unavailable"
-        skip_reason = "all_timeseries_source_artifacts_unavailable"
-        available = False
-    else:
-        state = "successful_non_empty" if counts else "successful_empty"
-        skip_reason = None
-        available = True
-    required_files = sorted(
-        (context.get("required_by_day") or {}).get(day_utc) or []
-    )
-    unavailable_files = sorted({
-        str(scope["source_file_key"]) for scope in unavailable_scopes
-    })
-    evidence: dict[str, Any] = {
-        "source_partition_state": state,
-        "source_counts_present": bool(counts),
-        "source_counts_available": available,
-        "source_rows": sum(counts.values()),
-        "source_timeseries_row_counts": {
-            str(key): value for key, value in sorted(counts.items())
-        },
-        "source_available_timeseries_ids": sorted(available_ids),
-        "source_unavailable_timeseries_ids": sorted(unavailable_ids),
-        "source_unavailable_scopes": unavailable_scopes,
-        "source_file_count": len(required_files),
-        "source_file_keys": required_files,
-        "required_source_file_count": len(required_files),
-        "successful_source_file_count": len(required_files),
-        "source_unavailable_file_keys": unavailable_files,
-        "source_skip_reason": skip_reason,
-        "source_available_pollutant_codes": (
-            [pollutant_code] if available_ids else []
-        ),
-        "comparison_scope": "source_available_timestamp_windows",
-    }
-    evidence["partition"] = {
-        "state": state,
-        "source_counts_present": bool(counts),
-        "source_counts_available": available,
-        "source_rows": sum(counts.values()),
-        "source_timeseries_row_counts": dict(
-            evidence["source_timeseries_row_counts"]
-        ),
-        "source_available_timeseries_ids": sorted(available_ids),
-        "source_unavailable_timeseries_ids": sorted(unavailable_ids),
-        "source_skip_reason": skip_reason,
-        "required_source_file_count": len(required_files),
-        "successful_source_file_count": len(required_files),
-        "source_available_pollutant_codes": (
-            [pollutant_code] if available_ids else []
-        ),
-        "comparison_scope": "source_available_timestamp_windows",
-    }
-    return counts, evidence
 
 
 def _source_cache_status_for_connector_day(
@@ -16439,8 +15611,6 @@ def _v2_observations_index_rebuild_command(
 
 
 SOURCE_EVIDENCE_CONTRACT_VERSION = 4
-OFFICIAL_RDATA_SOURCE_AVAILABILITY_CONTRACT_VERSION = 5
-OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION = 6
 OBSERVATION_CONTENT_HASH_COLUMNS = [
     "connector_id",
     "station_id",
@@ -16495,26 +15665,8 @@ def _require_nonnegative_evidence_int(
     return value
 
 
-def _canonical_utf8_sort_key(value: Any) -> bytes:
-    """Return the locale-independent UTF-8 byte-lexical ordering key."""
-    return str(value).encode("utf-8")
-
-
-def _canonical_json_utf8_bytes(value: Any) -> bytes:
-    """Encode canonical JSON using the same UTF-8 bytes as the Node producer."""
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
-
-
 def _source_evidence_input_payload(evidence: Mapping[str, Any]) -> dict[str, Any]:
-    evidence_contract_version = _require_nonnegative_evidence_int(
-        evidence, "evidence_contract_version"
-    )
-    payload = {
+    return {
         "source_adapter": str(evidence.get("source_adapter") or ""),
         "day_utc": str(evidence.get("day_utc") or ""),
         "connector_id": int(evidence.get("connector_id") or 0),
@@ -16522,14 +15674,13 @@ def _source_evidence_input_payload(evidence: Mapping[str, Any]) -> dict[str, Any
             evidence.get("source_file_identities_sha256") or ""
         ),
         "requested_pollutant_set": sorted(
-            (
-                str(value)
-                for value in list(evidence.get("requested_pollutant_set") or [])
-            ),
-            key=_canonical_utf8_sort_key,
+            str(value)
+            for value in list(evidence.get("requested_pollutant_set") or [])
         ),
         "contract": str(evidence.get("contract") or ""),
-        "evidence_contract_version": evidence_contract_version,
+        "evidence_contract_version": _require_nonnegative_evidence_int(
+            evidence, "evidence_contract_version"
+        ),
         "source_label_registry_snapshot_content_sha256": evidence.get(
             "source_label_registry_snapshot_content_sha256"
         ),
@@ -16546,78 +15697,16 @@ def _source_evidence_input_payload(evidence: Mapping[str, Any]) -> dict[str, Any
             "observed_property_mapping_sha256"
         ),
     }
-    if evidence_contract_version >= OFFICIAL_RDATA_SOURCE_AVAILABILITY_CONTRACT_VERSION:
-        payload["source_artifact_availability_sha256"] = evidence.get(
-            "source_artifact_availability_sha256"
-        )
-    if evidence_contract_version >= OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION:
-        payload["preserved_baseline_dependency_sha256"] = evidence.get(
-            "preserved_baseline_dependency_sha256"
-        )
-    return payload
 
 
 def _source_evidence_input_sha256(evidence: Mapping[str, Any]) -> str:
     return hashlib.sha256(
-        _canonical_json_utf8_bytes(_source_evidence_input_payload(evidence))
-    ).hexdigest()
-
-
-def _official_rdata_source_artifact_availability_identity(
-    evidence: Mapping[str, Any],
-) -> list[dict[str, Any]]:
-    """Canonicalise unavailable scopes exactly as the proposal writer does."""
-    normalized = [
-        {
-            "day_utc": str(scope.get("day_utc") or ""),
-            "site_code": str(scope.get("site_code") or ""),
-            "source_year": int(scope.get("source_year") or 0),
-            "source_file_key": str(scope.get("source_file_key") or ""),
-            "pollutant_code": str(scope.get("pollutant_code") or ""),
-            "station_id": int(scope.get("station_id") or 0),
-            "timeseries_id": int(scope.get("timeseries_id") or 0),
-            "reason": str(scope.get("reason") or ""),
-            "canonical_url": str(scope.get("canonical_url") or ""),
-            "final_url": str(scope.get("final_url") or ""),
-            "http_status": int(scope.get("http_status") or 0),
-            "raw_source_windows": list(scope.get("raw_source_windows") or []),
-            "canonical_unavailable_windows": list(
-                scope.get("canonical_unavailable_windows") or []
-            ),
-        }
-        for scope in list(evidence.get("source_unavailable_scopes") or [])
-        if isinstance(scope, Mapping)
-    ]
-    normalized.sort(key=_canonical_json_utf8_bytes)
-    return normalized
-
-
-def _official_rdata_source_artifact_availability_sha256(
-    evidence: Mapping[str, Any],
-) -> str:
-    return hashlib.sha256(
-        _canonical_json_utf8_bytes(
-            _official_rdata_source_artifact_availability_identity(evidence)
-        )
-    ).hexdigest()
-
-
-def _official_rdata_preserved_baseline_dependency_sha256(
-    evidence: Mapping[str, Any],
-) -> str:
-    payload = {
-        "preserved_baseline_identity": evidence.get(
-            "preserved_baseline_identity"
-        ) or {"source": "dropbox", "partition_identities": []},
-        "preserved_baseline_rows_sha256": str(
-            evidence.get("preserved_baseline_rows_sha256") or ""
-        ),
-        "source_unavailable_scopes": (
-            _official_rdata_source_artifact_availability_identity(evidence)
-        ),
-    }
-    return hashlib.sha256(
-        _canonical_json_utf8_bytes(payload)
+        json.dumps(
+            _source_evidence_input_payload(evidence),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
     ).hexdigest()
 
 
@@ -16625,7 +15714,14 @@ def _immutable_source_evidence_sha256(evidence: Mapping[str, Any]) -> str:
     payload = dict(evidence)
     payload.pop("source_label_registry_snapshot_file", None)
     payload.pop("source_label_registry_snapshot_file_sha256", None)
-    return hashlib.sha256(_canonical_json_utf8_bytes(payload)).hexdigest()
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _dedicated_sos_source_evidence_identity(
@@ -16753,16 +15849,10 @@ def _load_complete_connector_day_source_evidence(
     source_evidence_input_sha256 = str(
         evidence.get("source_evidence_input_sha256") or ""
     )
-    source_adapter = str(evidence.get("source_adapter") or "")
-    expected_evidence_version = (
-        OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION
-        if source_adapter in OFFICIAL_RDATA_NETWORKS
-        else SOURCE_EVIDENCE_CONTRACT_VERSION
-    )
     if (
         evidence.get("schema_version") != 1
         or evidence.get("evidence_contract_version")
-        != expected_evidence_version
+        != SOURCE_EVIDENCE_CONTRACT_VERSION
         or evidence.get("contract") != expected_contract
         or requested_pollutant_set != selected_pollutants
         or evidence.get("enumeration_complete") is not True
@@ -16806,9 +15896,7 @@ def _load_complete_connector_day_source_evidence(
             "sha256": sha256,
             "bytes": byte_count,
         })
-    normalized_identities.sort(
-        key=lambda value: _canonical_utf8_sort_key(value["source_file"])
-    )
+    normalized_identities.sort(key=lambda value: str(value["source_file"]))
     if len({str(value["source_file"]) for value in normalized_identities}) != len(normalized_identities):
         raise ValueError("complete connector-day detector source file identity is duplicated")
     if {str(value["source_file"]) for value in normalized_identities} != files_read:
@@ -16885,23 +15973,13 @@ def _load_complete_connector_day_source_evidence(
     ):
         raise ValueError("complete connector-day detector source evidence counts are invalid")
     hash_evidence = evidence.get("observation_content_hashes")
-    expected_hash_pollutants = set(per_pollutant)
-    if source_adapter in OFFICIAL_RDATA_NETWORKS:
-        expected_hash_pollutants.update(
-            str(value)
-            for value in list(
-                evidence.get("source_available_pollutant_codes") or []
-            )
-        )
-    if (
-        not isinstance(hash_evidence, dict)
-        or sorted(hash_evidence) != sorted(expected_hash_pollutants)
+    if not isinstance(hash_evidence, dict) or sorted(hash_evidence) != sorted(
+        per_pollutant
     ):
         raise ValueError(
             "complete connector-day observation content hash evidence is incomplete"
         )
-    for pollutant_code in sorted(expected_hash_pollutants):
-        row_count = int(per_pollutant.get(pollutant_code, 0))
+    for pollutant_code, row_count in per_pollutant.items():
         metadata = hash_evidence.get(pollutant_code)
         if not isinstance(metadata, Mapping):
             raise ValueError(
@@ -16911,88 +15989,6 @@ def _load_complete_connector_day_source_evidence(
             metadata,
             row_count=row_count,
         )
-    if source_adapter in OFFICIAL_RDATA_NETWORKS:
-        source_artifact_availability_sha256 = str(
-            evidence.get("source_artifact_availability_sha256") or ""
-        )
-        if (
-            not re.fullmatch(
-                r"[0-9a-f]{64}", source_artifact_availability_sha256
-            )
-            or source_artifact_availability_sha256
-            != _official_rdata_source_artifact_availability_sha256(evidence)
-        ):
-            raise ValueError(
-                "official RData source artifact availability identity is invalid"
-            )
-        preserved_path = source_dir / "preserved_baseline_rows.json"
-        if not preserved_path.is_file():
-            raise FileNotFoundError(
-                "official RData preserved baseline row evidence is unavailable"
-            )
-        preserved_bytes = preserved_path.read_bytes()
-        preserved_rows = json.loads(preserved_bytes)
-        preserved_count = _require_nonnegative_evidence_int(
-            evidence, "preserved_baseline_row_count"
-        )
-        final_target_count = _require_nonnegative_evidence_int(
-            evidence, "final_target_row_count"
-        )
-        preservation_dependency = str(
-            evidence.get("preserved_baseline_dependency_sha256") or ""
-        )
-        if (
-            not isinstance(preserved_rows, list)
-            or not isinstance(evidence.get("preserved_baseline_identity"), Mapping)
-            or hashlib.sha256(preserved_bytes).hexdigest()
-            != str(evidence.get("preserved_baseline_rows_sha256") or "")
-            or len(preserved_bytes)
-            != _require_nonnegative_evidence_int(
-                evidence, "preserved_baseline_rows_bytes"
-            )
-            or len(preserved_rows) != preserved_count
-            or final_target_count != len(rows) + preserved_count
-            or not re.fullmatch(r"[0-9a-f]{64}", preservation_dependency)
-            or preservation_dependency
-            != _official_rdata_preserved_baseline_dependency_sha256(evidence)
-        ):
-            raise ValueError(
-                "official RData preserved baseline evidence identity is invalid"
-            )
-        final_hashes = evidence.get(
-            "final_target_observation_content_hashes"
-        )
-        final_pollutant_counts = dict(
-            evidence.get("final_target_pollutant_counts") or {}
-        )
-        empty_final_target_pollutants = sorted(
-            str(value) for value in list(
-                evidence.get("empty_final_target_pollutant_codes") or []
-            )
-        )
-        if not isinstance(final_hashes, Mapping) or sorted(final_hashes) != sorted(
-            final_pollutant_counts
-        ):
-            raise ValueError(
-                "official RData final target hash evidence is incomplete"
-            )
-        if (
-            len(empty_final_target_pollutants)
-            != len(set(empty_final_target_pollutants))
-            or empty_final_target_pollutants
-            != sorted(
-                code for code, count in final_pollutant_counts.items()
-                if int(count) == 0
-            )
-        ):
-            raise ValueError(
-                "official RData empty final target evidence is invalid"
-            )
-        for pollutant_code, row_count in final_pollutant_counts.items():
-            _validate_observation_content_hash_metadata(
-                final_hashes[pollutant_code],
-                row_count=int(row_count),
-            )
     classification_counts = dict(
         evidence.get("source_label_classification_counts") or {}
     )
@@ -17046,9 +16042,6 @@ def _persist_complete_connector_day_source_evidence(
         evidence.get("authoritative_station_timeseries_mapping_sha256"),
         evidence.get("observed_property_mapping_sha256"),
     )
-    official_preservation_dependency = str(
-        evidence.get("preserved_baseline_dependency_sha256") or ""
-    )
     if (
         not day_utc
         or connector_id <= 0
@@ -17057,26 +16050,7 @@ def _persist_complete_connector_day_source_evidence(
         or not re.fullmatch(r"[0-9a-f]{64}", source_evidence_input_hash)
         or source_evidence_input_hash != _source_evidence_input_sha256(evidence)
         or evidence.get("evidence_contract_version")
-        != (
-            OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION
-            if source_adapter in OFFICIAL_RDATA_NETWORKS
-            else SOURCE_EVIDENCE_CONTRACT_VERSION
-        )
-        or (
-            source_adapter in OFFICIAL_RDATA_NETWORKS
-            and (
-                not isinstance(
-                    evidence.get("preserved_baseline_identity"), Mapping
-                )
-                or not re.fullmatch(
-                    r"[0-9a-f]{64}", official_preservation_dependency
-                )
-                or official_preservation_dependency
-                != _official_rdata_preserved_baseline_dependency_sha256(
-                    evidence
-                )
-            )
-        )
+        != SOURCE_EVIDENCE_CONTRACT_VERSION
         or (
             source_adapter == "sos"
             and not all(
@@ -17135,76 +16109,6 @@ def _normalise_repair_pollutants(values: Iterable[Any] | None) -> list[str]:
     if invalid:
         raise ValueError(f"unsupported repair pollutant(s): {','.join(invalid)}")
     return normalized
-
-
-def _observation_changed_scope_pollutants(
-    *,
-    validated_overlay_keys: Iterable[str],
-    source_evidence: Mapping[str, Any],
-    requested_repair_pollutants: Iterable[str] | None,
-) -> tuple[list[str], list[str]]:
-    staged_pollutants = {
-        match.group(1)
-        for key in validated_overlay_keys
-        if (match := re.search(r"/pollutant_code=([a-z0-9_]+)/", str(key)))
-    }
-    empty_pollutants = (
-        {
-            str(value).strip().lower()
-            for value in list(
-                source_evidence.get("empty_final_target_pollutant_codes") or []
-            )
-            if str(value or "").strip()
-        }
-        if str(source_evidence.get("source_adapter") or "")
-        in OFFICIAL_RDATA_NETWORKS
-        else set()
-    )
-    changed_pollutants = staged_pollutants | empty_pollutants
-    requested = set(_normalise_repair_pollutants(requested_repair_pollutants))
-    if requested and not changed_pollutants.issubset(requested):
-        raise ValueError(
-            "OBSERVS_CHANGED pollutant scope escaped requested repair scope"
-        )
-    return sorted(changed_pollutants), sorted(empty_pollutants)
-
-
-def _official_rdata_selected_partition_outcomes(
-    *,
-    day_utc: str,
-    connector_id: int,
-    pollutant_codes: Iterable[str],
-    empty_pollutant_codes: Iterable[str],
-    validated_overlay_keys: Iterable[str],
-    created_tombstones: Iterable[str],
-) -> list[dict[str, Any]]:
-    empty = set(empty_pollutant_codes)
-    object_keys = list(validated_overlay_keys)
-    tombstones = set(created_tombstones)
-    outcomes: list[dict[str, Any]] = []
-    for pollutant_code in sorted(set(pollutant_codes)):
-        authoritative_no_data = pollutant_code in empty
-        tombstone_prefix = (
-            f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
-            f"connector_id={int(connector_id)}/"
-            f"pollutant_code={pollutant_code}"
-        )
-        outcomes.append({
-            "day_utc": day_utc,
-            "connector_id": int(connector_id),
-            "pollutant_code": pollutant_code,
-            "outcome": (
-                "authoritative_no_data_replacement"
-                if authoritative_no_data else "complete_replacement"
-            ),
-            "tombstone_created": tombstone_prefix in tombstones,
-            "exact_tombstone_count": int(tombstone_prefix in tombstones),
-            "replacement_object_keys": [
-                key for key in object_keys
-                if f"/pollutant_code={pollutant_code}/" in key
-            ],
-        })
-    return outcomes
 
 
 def _scoped_observation_partition_rows(
@@ -17598,28 +16502,7 @@ def _derive_observation_hash_check_pollutants(
             source_row_count = int(candidate.get("source_row_count") or 0)
         except (TypeError, ValueError):
             source_row_count = 0
-        source_state = str(
-            (
-                candidate.get("source_evidence")
-                if isinstance(candidate.get("source_evidence"), Mapping)
-                else {}
-            ).get("source_partition_state")
-            or ""
-        )
-        valid_non_empty = (
-            source_state == "successful_non_empty"
-            and source_row_count > 0
-            and isinstance(source_counts, Mapping)
-            and bool(source_counts)
-        )
-        valid_empty = (
-            _official_rdata_source_for_connector(connector_id) is not None
-            and source_state == "successful_empty"
-            and source_row_count == 0
-            and isinstance(source_counts, Mapping)
-            and not source_counts
-        )
-        if not (valid_non_empty or valid_empty):
+        if source_row_count <= 0 or not isinstance(source_counts, Mapping) or not source_counts:
             skipped[key] = "no_executable_source_rows"
             continue
         suitable, reason = _observation_repair_source_evidence_is_complete(
@@ -17874,22 +16757,7 @@ def _assert_detector_and_proposal_source_evidence_agree(
         "source_label_registry_snapshot_content_sha256",
         "authoritative_station_timeseries_mapping_sha256",
         "observed_property_mapping_sha256",
-        "source_artifact_availability_sha256",
         "source_csv_records_scanned",
-        "source_available_timeseries_ids",
-        "source_available_pollutant_codes",
-        "source_unavailable_timeseries_ids",
-        "source_unavailable_scopes",
-        "preserved_baseline_rows_sha256",
-        "preserved_baseline_rows_bytes",
-        "preserved_baseline_row_count",
-        "preserved_baseline_identity",
-        "preserved_baseline_dependency_sha256",
-        "final_target_row_count",
-        "final_target_timeseries_row_counts",
-        "final_target_pollutant_counts",
-        "empty_final_target_pollutant_codes",
-        "final_target_observation_content_hashes",
     )
     mismatched = [field for field in fields if detector.get(field) != proposal.get(field)]
     if mismatched:
@@ -18503,96 +17371,6 @@ def run_v2_observation_content_hash_checks(
             new_gaps.append(gap)
             metrics["invalid_contract"] += 1
             continue
-        unavailable_timeseries_ids = {
-            int(value)
-            for value in list(
-                (candidate.get("source_evidence") or {}).get(
-                    "source_unavailable_timeseries_ids"
-                )
-                or []
-            )
-        }
-        unavailable_scopes = [
-            dict(scope)
-            for scope in list(
-                (candidate.get("source_evidence") or {}).get(
-                    "source_unavailable_scopes"
-                )
-                or []
-            )
-            if str(scope.get("pollutant_code") or "") == pollutant_code
-        ]
-        if unavailable_scopes:
-            try:
-                baseline_rows = _observation_rows_from_local_parquet_for_shared_hash(
-                    parquet_paths=candidate.get("parquet_paths") or [],
-                )
-                baseline_available_rows = _official_rdata_source_available_rows(
-                    baseline_rows,
-                    unavailable_scopes,
-                )
-                baseline_available_hash = (
-                    _compute_observation_hash_with_shared_javascript(
-                        rows=baseline_available_rows,
-                        is_sos=False,
-                        env=env,
-                        allow_empty=True,
-                    )
-                )
-            except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
-                gap = _v2_obs_gap(
-                    "observation_content_hash_invalid_contract",
-                    day_utc=day_utc,
-                    connector_id=connector_id,
-                    pollutant_code=pollutant_code,
-                    expected_path=str(candidate.get("manifest_rel") or ""),
-                    related_paths=[f"available_subset_hash_failed:{exc}"],
-                )
-                new_gaps.append(gap)
-                metrics["invalid_contract"] += 1
-                continue
-            subset_matches = (
-                baseline_available_hash["observation_content_hash"]
-                == source_hash["observation_content_hash"]
-                and baseline_available_hash["verification_status_counts"]
-                == source_hash["verification_status_counts"]
-            )
-            if not subset_matches:
-                gap = _v2_obs_gap(
-                    "observation_content_hash_mismatch",
-                    day_utc=day_utc,
-                    connector_id=connector_id,
-                    pollutant_code=pollutant_code,
-                    expected_path=str(candidate.get("manifest_rel") or ""),
-                    related_paths=[
-                        "source_available_subset_differs_from_source",
-                        f"source_hash={source_hash['observation_content_hash']}",
-                        "baseline_available_hash="
-                        + baseline_available_hash["observation_content_hash"],
-                    ],
-                )
-                gap["source_evidence"] = dict(
-                    candidate.get("source_evidence") or {}
-                )
-                new_gaps.append(gap)
-                metrics["mismatch"] += 1
-            else:
-                verified_partitions.append({
-                    "day_utc": day_utc,
-                    "connector_id": connector_id,
-                    "pollutant_code": pollutant_code,
-                    "status": (
-                        "source_available_subset_observation_content_hash_verified"
-                    ),
-                    "observation_content_hash": source_hash[
-                        "observation_content_hash"
-                    ],
-                    "source_unavailable_timeseries_ids": sorted(
-                        unavailable_timeseries_ids
-                    ),
-                })
-                metrics["verified"] += 1
-            continue
         manifest = json.loads(
             Path(str(candidate["manifest_path"])).read_text(encoding="utf-8")
         )
@@ -19164,43 +17942,6 @@ def run_v2_gap_backfills(
                 "reason": "no_executable_observation_repair_pollutants",
             })
             continue
-        scoped_official_source = _official_rdata_source_for_connector(
-            connector_id
-        )
-        if scoped_official_source:
-            repairable_pollutants: list[str] = []
-            unavailable_only_pollutants: list[str] = []
-            for pollutant_code in selected_repair_pollutants:
-                _counts, partition_evidence = (
-                    _official_rdata_source_counts_for_partition(
-                        source_key=scoped_official_source,
-                        day_utc=day_iso,
-                        pollutant_code=pollutant_code,
-                    )
-                )
-                if partition_evidence.get("source_partition_state") == (
-                    "source_artifact_unavailable"
-                ):
-                    unavailable_only_pollutants.append(pollutant_code)
-                else:
-                    repairable_pollutants.append(pollutant_code)
-            if unavailable_only_pollutants:
-                outcome = {
-                    "day_utc": day_iso,
-                    "connector_id": connector_id,
-                    "pollutant_codes": unavailable_only_pollutants,
-                    "outcome": "source_artifact_unavailable_preserved",
-                    "selected_partition_left_unchanged": True,
-                    "tombstone_created": False,
-                }
-                metrics["selected_partition_outcomes"].append(outcome)
-                metrics["skipped_v2_observation_repairs"].append({
-                    **outcome,
-                    "reason": "all_timeseries_source_artifacts_unavailable",
-                })
-            selected_repair_pollutants = repairable_pollutants
-            if not selected_repair_pollutants:
-                continue
         day_obj = dt.date.fromisoformat(day_iso)
         partition_pollutant = (
             selected_repair_pollutants[0]
@@ -19670,31 +18411,13 @@ def run_v2_gap_backfills(
                     connector_id=connector_id,
                     repair_pollutants=selected_repair_pollutants,
                 )
-                proposal_is_official_rdata = str(
-                    source_evidence.get("source_adapter") or ""
-                ) in OFFICIAL_RDATA_NETWORKS
                 expected_timeseries_row_counts = _normalize_timeseries_row_counts(
-                    source_evidence.get(
-                        "final_target_timeseries_row_counts"
-                        if proposal_is_official_rdata
-                        else "per_timeseries_counts"
-                    )
+                    source_evidence.get("per_timeseries_counts")
                 )
-                expected_pollutant_codes = (
-                    sorted(dict(source_evidence.get(
-                        "final_target_pollutant_counts"
-                    ) or {}))
-                    if proposal_is_official_rdata
-                    else [
-                        str(value) for value in list(
-                            source_evidence.get("pollutant_set") or []
-                        )
-                    ]
-                )
-                expected_min_manifest_rows = int(source_evidence.get(
-                    "final_target_row_count"
-                    if proposal_is_official_rdata else "total_rows"
-                ) or 0)
+                expected_pollutant_codes = [
+                    str(value) for value in list(source_evidence.get("pollutant_set") or [])
+                ]
+                expected_min_manifest_rows = int(source_evidence.get("total_rows") or 0)
                 evidence_path = Path(str(
                     partition_source_evidence.get("evidence_path")
                     or (
@@ -19851,22 +18574,20 @@ def run_v2_gap_backfills(
             metrics["v2_observation_repairs_ok"] += 1
             metrics["observation_backfills_ok"] += 1
             if run_state is not None:
+                proposal_pollutants = sorted({
+                    match.group(1)
+                    for key in validated_overlay_keys
+                    if (match := re.search(r"/pollutant_code=([a-z0-9_]+)/", key))
+                })
                 requested_repair_pollutants = selected_repair_pollutants
-                proposal_pollutants, empty_pollutants = (
-                    _observation_changed_scope_pollutants(
-                        validated_overlay_keys=validated_overlay_keys,
-                        source_evidence=source_evidence,
-                        requested_repair_pollutants=(
-                            requested_repair_pollutants
-                        ),
-                    )
-                )
+                if requested_repair_pollutants and not set(proposal_pollutants).issubset(set(requested_repair_pollutants)):
+                    raise ValueError("OBSERVS_CHANGED pollutant scope escaped requested repair scope")
                 affected_pollutants = sorted({
                     str(gap.get("pollutant_code") or "").strip().lower()
                     for gap in gaps_by_key.get((day_iso, connector_id), [])
                     if str(gap.get("pollutant_code") or "").strip()
                 } | set(proposal_pollutants))
-                changed_scope = {
+                record_changed_scope(run_state, "OBSERVS_CHANGED", {
                     "day_utc": day_iso,
                     "connector_id": connector_id,
                     "timeseries_ids": sorted(expected_timeseries_row_counts),
@@ -19885,15 +18606,7 @@ def run_v2_gap_backfills(
                     ),
                     "object_keys": validated_overlay_keys,
                     "stage": "observs",
-                }
-                proposal_is_official_rdata = str(
-                    source_evidence.get("source_adapter") or ""
-                ) in OFFICIAL_RDATA_NETWORKS
-                if proposal_is_official_rdata:
-                    changed_scope["empty_pollutant_codes"] = empty_pollutants
-                record_changed_scope(
-                    run_state, "OBSERVS_CHANGED", changed_scope
-                )
+                })
                 tombstones_after = {
                     str(entry.get("prefix") or "")
                     for entry in list(
@@ -19907,49 +18620,26 @@ def run_v2_gap_backfills(
                 metrics["exact_tombstones_created"] += (
                     exact_tombstones_created
                 )
-                created_tombstones = tombstones_after - tombstones_before
-                if proposal_is_official_rdata:
-                    outcomes = _official_rdata_selected_partition_outcomes(
-                        day_utc=day_iso,
-                        connector_id=connector_id,
-                        pollutant_codes=proposal_pollutants,
-                        empty_pollutant_codes=empty_pollutants,
-                        validated_overlay_keys=validated_overlay_keys,
-                        created_tombstones=created_tombstones,
-                    )
-                    metrics["selected_partition_outcomes"].extend(outcomes)
-                    metrics["authoritative_no_data_replacements"] += sum(
-                        outcome["outcome"]
-                        == "authoritative_no_data_replacement"
-                        for outcome in outcomes
-                    )
-                    metrics["complete_replacements"] += sum(
-                        outcome["outcome"] == "complete_replacement"
-                        for outcome in outcomes
-                    )
+                authoritative_no_data = (
+                    int(source_evidence.get("total_rows") or 0) == 0
+                )
+                outcome_name = (
+                    "authoritative_no_data_replacement"
+                    if authoritative_no_data else "complete_replacement"
+                )
+                metrics["selected_partition_outcomes"].append({
+                    "day_utc": day_iso,
+                    "connector_id": connector_id,
+                    "pollutant_code": partition_pollutant,
+                    "outcome": outcome_name,
+                    "tombstone_created": exact_tombstones_created == 1,
+                    "exact_tombstone_count": exact_tombstones_created,
+                    "replacement_object_keys": list(validated_overlay_keys),
+                })
+                if authoritative_no_data:
+                    metrics["authoritative_no_data_replacements"] += 1
                 else:
-                    authoritative_no_data = (
-                        int(source_evidence.get("total_rows") or 0) == 0
-                    )
-                    outcome_name = (
-                        "authoritative_no_data_replacement"
-                        if authoritative_no_data else "complete_replacement"
-                    )
-                    metrics["selected_partition_outcomes"].append({
-                        "day_utc": day_iso,
-                        "connector_id": connector_id,
-                        "pollutant_code": partition_pollutant,
-                        "outcome": outcome_name,
-                        "tombstone_created": exact_tombstones_created == 1,
-                        "exact_tombstone_count": exact_tombstones_created,
-                        "replacement_object_keys": list(
-                            validated_overlay_keys
-                        ),
-                    })
-                    if authoritative_no_data:
-                        metrics["authoritative_no_data_replacements"] += 1
-                    else:
-                        metrics["complete_replacements"] += 1
+                    metrics["complete_replacements"] += 1
         elif no_observation_rows:
             metrics["v2_observation_repairs_no_rows"] += 1
             log.warning(
@@ -21084,99 +19774,6 @@ def _v2_observation_metadata_actions(v2_observations: Mapping[str, Any]) -> list
     return _dedupe_v2_repair_actions(actions)
 
 
-def _merge_changed_observation_metadata_actions(
-    metadata_actions: Iterable[Mapping[str, Any]],
-    changed_scopes: Iterable[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Add exact leaf and parent finalisation for successfully changed scopes."""
-    scopes = [dict(scope) for scope in changed_scopes if isinstance(scope, Mapping)]
-    empty_partitions = {
-        (
-            str(scope.get("day_utc") or ""),
-            int(scope.get("connector_id") or 0),
-            str(pollutant_code).strip().lower(),
-        )
-        for scope in scopes
-        for pollutant_code in list(scope.get("empty_pollutant_codes") or [])
-        if str(pollutant_code or "").strip()
-    }
-    legacy_empty_connector_days = {
-        (
-            str(scope.get("day_utc") or ""),
-            int(scope.get("connector_id") or 0),
-        )
-        for scope in scopes
-        if not list(scope.get("pollutant_codes") or [])
-    }
-    merged_actions = [
-        dict(action)
-        for action in metadata_actions
-        if isinstance(action, Mapping)
-        and not (
-            str(action.get("kind") or "")
-            == "observation_pollutant_manifest_repair"
-            and (
-                (
-                    str(action.get("day_utc") or ""),
-                    int(action.get("connector_id") or 0),
-                    str(action.get("pollutant_code") or "").strip().lower(),
-                ) in empty_partitions
-                or (
-                    str(action.get("day_utc") or ""),
-                    int(action.get("connector_id") or 0),
-                ) in legacy_empty_connector_days
-            )
-        )
-    ]
-    for scope in scopes:
-        day_utc = str(scope.get("day_utc") or "").strip()
-        connector_id = scope.get("connector_id")
-        empty_pollutants = {
-            str(value).strip().lower()
-            for value in list(scope.get("empty_pollutant_codes") or [])
-            if str(value or "").strip()
-        }
-        base = {
-            "status": "planned",
-            "executes": False,
-            "data_changes_required": False,
-            "operator_action_required": False,
-            "history_version": "v2",
-            "domain": "observations",
-            "day_utc": day_utc,
-            "connector_id": connector_id,
-            "targeted_replacement_timeseries_ids": sorted({
-                int(timeseries_id)
-                for timeseries_id in list(scope.get("timeseries_ids") or [])
-                if str(timeseries_id).strip().isdigit()
-                and int(timeseries_id) > 0
-            }),
-            "requires_index_rebuild": True,
-            "gap_types": ["observation_repaired"],
-        }
-        for pollutant_code in list(scope.get("pollutant_codes") or []):
-            if pollutant_code not in empty_pollutants:
-                merged_actions.append({
-                    **base,
-                    "kind": "observation_pollutant_manifest_repair",
-                    "pollutant_code": pollutant_code,
-                })
-            merged_actions.append({
-                **base,
-                "kind": "observation_index_repair",
-                "pollutant_code": pollutant_code,
-            })
-        day_base = {
-            key: value for key, value in base.items()
-            if key not in {"connector_id", "pollutant_code"}
-        }
-        merged_actions.extend([
-            {**base, "kind": "observation_connector_manifest_repair"},
-            {**day_base, "kind": "observation_day_manifest_repair"},
-        ])
-    return _dedupe_v2_repair_actions(merged_actions)
-
-
 def _authoritative_v2_core_timeseries_bindings(
     conn: sqlite3.Connection | None,
 ) -> list[dict[str, Any]]:
@@ -22251,47 +20848,6 @@ def _finalise_staged_write_set_provenance(
     return audit
 
 
-def _finalise_generic_file_backed_proposal_if_ready(
-    run_state: dict[str, Any],
-    *,
-    dedicated_sos_historical_replacement: bool,
-    observation_failed: bool,
-    metadata: Mapping[str, Any],
-    log: logging.Logger | None = None,
-) -> bool:
-    """Persist the generic fixed-v3 final ownership freeze when it is valid."""
-    if dedicated_sos_historical_replacement or observation_failed:
-        return False
-    manifest_status = str(
-        metadata.get("manifest_status") or metadata.get("status") or "not_run"
-    )
-    index_status = str(
-        metadata.get("index_status") or metadata.get("status") or "not_run"
-    )
-    if (
-        manifest_status in {"failed", "blocked_dependency"}
-        or index_status in {"failed", "blocked_dependency"}
-        or bool(run_state.get("blocked_scopes"))
-    ):
-        return False
-    transport = run_state.get("proposal_transport")
-    ingestion = run_state.get("proposal_ingestion")
-    if (
-        not isinstance(transport, Mapping)
-        or transport.get("transport_mode")
-        != "file_backed_compact_proposal"
-        or not isinstance(ingestion, Mapping)
-        or ingestion.get("status") != "complete"
-        or ingestion.get("node_apply_launch_permitted") is not False
-        or ingestion.get("completed_object_count")
-        != ingestion.get("total_object_count")
-    ):
-        return False
-    _finalise_staged_write_set_provenance(run_state, log=log)
-    write_run_state(run_state)
-    return True
-
-
 def _validated_observation_pollutant_manifest_row_count(
     payload: Any,
     *,
@@ -22787,10 +21343,17 @@ def _capture_local_v2_observation_scope(
     selected_pollutants = _normalise_repair_pollutants(repair_pollutants)
     source_root = generated_root / connector_prefix
     manifest_source = source_root / "manifest.json"
-    manifest = (
-        json.loads(manifest_source.read_text(encoding="utf-8"))
-        if manifest_source.is_file() else None
-    )
+    if not manifest_source.is_file():
+        raise FileNotFoundError(f"canonical connector manifest is unavailable: {connector_prefix}")
+    manifest = json.loads(manifest_source.read_text(encoding="utf-8"))
+    if (
+        not isinstance(manifest, Mapping)
+        or manifest.get("history_version") != "v2"
+        or manifest.get("domain") != "observations"
+        or str(manifest.get("day_utc") or "") != day_utc
+        or int(manifest.get("connector_id") or 0) != int(connector_id)
+    ):
+        raise ValueError("canonical connector manifest identity is invalid")
     evidence_path = (
         stage_root / f"day_utc={day_utc}" /
         f"connector_id={int(connector_id)}" / "source-evidence.json"
@@ -22845,66 +21408,25 @@ def _capture_local_v2_observation_scope(
     if not isinstance(source_hashes, Mapping):
         raise ValueError("source observation content hash evidence is unavailable")
     is_sos = str(evidence.get("source_adapter") or "") == "sos"
-    is_official_rdata = str(evidence.get("source_adapter") or "") in (
-        OFFICIAL_RDATA_NETWORKS
-    )
-    empty_final_target_pollutants = sorted(
-        str(value) for value in list(
-            evidence.get("empty_final_target_pollutant_codes") or []
-        )
-    )
-    empty_only_proposal = (
-        is_official_rdata
-        and bool(selected_pollutants)
-        and empty_final_target_pollutants == selected_pollutants
-    )
-    if manifest is None:
-        if not empty_only_proposal:
-            raise FileNotFoundError(
-                f"canonical connector manifest is unavailable: {connector_prefix}"
-            )
-    elif (
-        not isinstance(manifest, Mapping)
-        or manifest.get("history_version") != "v2"
-        or manifest.get("domain") != "observations"
-        or str(manifest.get("day_utc") or "") != day_utc
-        or int(manifest.get("connector_id") or 0) != int(connector_id)
-    ):
-        raise ValueError("canonical connector manifest identity is invalid")
-    target_hashes = (
-        evidence.get("final_target_observation_content_hashes")
-        if is_official_rdata else source_hashes
-    )
-    if not isinstance(target_hashes, Mapping):
-        raise ValueError("final target observation content hash evidence is unavailable")
     selected_hash_pollutants = (
         selected_pollutants
         if selected_pollutants
-        else sorted(str(value) for value in target_hashes)
+        else sorted(str(value) for value in source_hashes)
     )
     for pollutant_code in selected_hash_pollutants:
-        source_hash = target_hashes.get(pollutant_code)
+        source_hash = source_hashes.get(pollutant_code)
         pollutant_paths = [
             str(path)
             for path in parquet_paths
             if path.parent.name == f"pollutant_code={pollutant_code}"
         ]
-        if is_official_rdata:
-            authoritative_no_data = (
-                pollutant_code in empty_final_target_pollutants
-                and int(dict(
-                    evidence.get("final_target_pollutant_counts") or {}
-                ).get(pollutant_code, -1)) == 0
-                and int(evidence.get("missing_binding_rows") or 0) == 0
-            )
-        else:
-            authoritative_no_data = (
-                run_state.get("execution_path")
-                == SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH
-                and len(selected_pollutants) == 1
-                and int(evidence.get("total_rows") or 0) == 0
-                and int(evidence.get("missing_binding_rows") or 0) == 0
-            )
+        authoritative_no_data = (
+            run_state.get("execution_path")
+            == SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH
+            and len(selected_pollutants) == 1
+            and int(evidence.get("total_rows") or 0) == 0
+            and int(evidence.get("missing_binding_rows") or 0) == 0
+        )
         if not isinstance(source_hash, Mapping) and not authoritative_no_data:
             raise ValueError(
                 f"source observation content hash is missing: {pollutant_code}"
@@ -22936,8 +21458,6 @@ def _capture_local_v2_observation_scope(
         pollutant_manifest_path = (
             source_root / f"pollutant_code={pollutant_code}" / "manifest.json"
         )
-        if authoritative_no_data and not pollutant_manifest_path.is_file():
-            continue
         pollutant_manifest = json.loads(
             pollutant_manifest_path.read_text(encoding="utf-8")
         )
@@ -22957,60 +21477,41 @@ def _capture_local_v2_observation_scope(
             )
 
     expected_counts = _normalize_timeseries_row_counts(
-        evidence.get(
-            "final_target_timeseries_row_counts"
-            if is_official_rdata else "per_timeseries_counts"
-        )
+        evidence.get("per_timeseries_counts")
     )
     expected_pollutant_counts = {
         str(code): int(count)
-        for code, count in dict(evidence.get(
-            "final_target_pollutant_counts"
-            if is_official_rdata else "per_pollutant_counts"
-        ) or {}).items()
+        for code, count in dict(evidence.get("per_pollutant_counts") or {}).items()
     }
     if selected_pollutants and (
         sorted(expected_pollutant_counts) != sorted(set(expected_pollutant_counts) & set(selected_pollutants))
         or not set(expected_pollutant_counts).issubset(set(selected_pollutants))
     ):
         raise ValueError("canonical proposal pollutant set escaped requested repair scope")
-    evidence_pollutants = (
-        sorted(expected_pollutant_counts)
-        if is_official_rdata
-        else list(evidence.get("pollutant_set") or [])
+    evidence_pollutants = list(evidence.get("pollutant_set") or [])
+    manifest_summary, mismatches = _v2_observation_manifest_evidence_mismatches(
+        manifest,
+        expected_source_row_count=len(source_rows),
+        expected_timeseries_row_counts=expected_counts,
+        expected_pollutant_counts=expected_pollutant_counts,
+        source_evidence_pollutant_set=evidence_pollutants,
     )
-    expected_target_row_count = int(
-        evidence.get("final_target_row_count")
-        if is_official_rdata else len(source_rows)
-    )
-    if manifest is not None:
-        manifest_pollutant_counts = {
-            code: count for code, count in expected_pollutant_counts.items()
-            if count > 0
-        }
-        manifest_summary, mismatches = _v2_observation_manifest_evidence_mismatches(
-            manifest,
-            expected_source_row_count=sum(manifest_pollutant_counts.values()),
-            expected_timeseries_row_counts=expected_counts,
-            expected_pollutant_counts=manifest_pollutant_counts,
-            source_evidence_pollutant_set=sorted(manifest_pollutant_counts),
+    if mismatches:
+        first_field = str(mismatches[0].get("field") or "manifest")
+        raise CanonicalConnectorManifestValidationError(
+            f"source_evidence_{first_field}_mismatch",
+            {
+                "expected_source_row_count": len(source_rows),
+                "expected_timeseries_count": len(expected_counts),
+                "expected_pollutant_counts": dict(sorted(expected_pollutant_counts.items())),
+                "source_evidence_pollutant_set": sorted(
+                    str(value).strip() for value in evidence_pollutants
+                    if str(value or "").strip()
+                ),
+                "manifest": manifest_summary,
+                "mismatches": mismatches[:25],
+            },
         )
-        if mismatches:
-            first_field = str(mismatches[0].get("field") or "manifest")
-            raise CanonicalConnectorManifestValidationError(
-                f"source_evidence_{first_field}_mismatch",
-                {
-                    "expected_source_row_count": expected_target_row_count,
-                    "expected_timeseries_count": len(expected_counts),
-                    "expected_pollutant_counts": dict(sorted(expected_pollutant_counts.items())),
-                    "source_evidence_pollutant_set": sorted(
-                        str(value).strip() for value in evidence_pollutants
-                        if str(value or "").strip()
-                    ),
-                    "manifest": manifest_summary,
-                    "mismatches": mismatches[:25],
-                },
-            )
     object_paths = sorted(
         path for path in source_root.rglob("*") if path.is_file() and (
             not selected_pollutants
@@ -23020,7 +21521,7 @@ def _capture_local_v2_observation_scope(
             )
         )
     )
-    if not object_paths and not empty_only_proposal:
+    if not object_paths:
         raise ValueError("canonical connector proposal has no objects")
     captured: list[str] = []
     parquet_pattern = re.compile(
@@ -27389,14 +25890,56 @@ def run_v2_integrity_repair_flow(
             action for action in metadata_actions
             if not suppress_all_unmapped_action(action)
         ]
-    metadata_actions = _merge_changed_observation_metadata_actions(
-        metadata_actions,
-        list(
-            (run_state.get("changed_scopes") or {}).get(
-                "OBSERVS_CHANGED"
-            ) or []
-        ),
-    )
+    empty_replacement_scopes = {
+        (str(scope.get("day_utc") or ""), int(scope.get("connector_id") or 0))
+        for scope in list((run_state.get("changed_scopes") or {}).get("OBSERVS_CHANGED") or [])
+        if isinstance(scope, Mapping) and not list(scope.get("pollutant_codes") or [])
+    }
+    metadata_actions = [
+        action for action in metadata_actions
+        if not (
+            str(action.get("kind") or "") == "observation_pollutant_manifest_repair"
+            and (str(action.get("day_utc") or ""), int(action.get("connector_id") or 0))
+            in empty_replacement_scopes
+        )
+    ]
+    # A repaired leaf always makes its pollutant/connector/day metadata and
+    # targeted index eligible.  Keep one action set per day+connector so the
+    # executor writes each parent only after the full child set is final.
+    for scope in list((run_state.get("changed_scopes") or {}).get("OBSERVS_CHANGED") or []):
+        if not isinstance(scope, Mapping):
+            continue
+        day_utc = str(scope.get("day_utc") or "").strip()
+        connector_id = scope.get("connector_id")
+        base = {
+            "status": "planned",
+            "executes": False,
+            "data_changes_required": False,
+            "operator_action_required": False,
+            "history_version": "v2",
+            "domain": "observations",
+            "day_utc": day_utc,
+            "connector_id": connector_id,
+            "targeted_replacement_timeseries_ids": sorted({
+                int(timeseries_id)
+                for timeseries_id in list(scope.get("timeseries_ids") or [])
+                if str(timeseries_id).strip().isdigit() and int(timeseries_id) > 0
+            }),
+            "requires_index_rebuild": True,
+            "gap_types": ["observation_repaired"],
+        }
+        for pollutant_code in list(scope.get("pollutant_codes") or []):
+            metadata_actions.append({**base, "kind": "observation_pollutant_manifest_repair", "pollutant_code": pollutant_code})
+            metadata_actions.append({**base, "kind": "observation_index_repair", "pollutant_code": pollutant_code})
+        day_base = {
+            key: value for key, value in base.items()
+            if key not in {"connector_id", "pollutant_code"}
+        }
+        metadata_actions.extend([
+            {**base, "kind": "observation_connector_manifest_repair"},
+            {**day_base, "kind": "observation_day_manifest_repair"},
+        ])
+    metadata_actions = _dedupe_v2_repair_actions(metadata_actions)
     metadata = (
         {"status": "blocked_dependency", "reason": "observation_repair_failed", "results": []}
         if observation_failed else
@@ -27412,15 +25955,6 @@ def run_v2_integrity_repair_flow(
         executor_result=metadata,
         dry_run=dry_run,
         require_file_backed_bodies=True,
-        log=log,
-    )
-    _finalise_generic_file_backed_proposal_if_ready(
-        run_state,
-        dedicated_sos_historical_replacement=(
-            dedicated_sos_historical_replacement
-        ),
-        observation_failed=observation_failed,
-        metadata=metadata,
         log=log,
     )
     if dedicated_sos_historical_replacement and not observation_failed and str(
@@ -30698,37 +29232,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
             )
         lines.append("")
 
-    for official_source in ("waqn", "saqn"):
-        official = s.get(official_source) or {}
-        if not (official.get("ran") or official.get("skipped_reason")):
-            continue
-        lines.extend([
-            f"## {official_source.upper()} official RData",
-            "",
-            f"- Ran: {bool(official.get('ran'))}",
-            f"- Site-year files fetched: {int(official.get('site_year_files_fetched') or 0)}",
-            "- Site-year lifecycle no-coverage: "
-            f"{int(official.get('site_year_files_authoritative_no_coverage') or 0)}",
-            "- Site-year source artifacts unavailable: "
-            f"{int(official.get('site_year_files_source_unavailable') or 0)}",
-            f"- Indeterminate acquisitions: {int(official.get('site_year_files_indeterminate') or 0)}",
-            "- Unavailable binding scopes preserved/unverifiable: "
-            f"{int(official.get('source_unavailable_scope_count') or 0)}",
-        ])
-        for scope in list(official.get("source_unavailable_scopes") or [])[:50]:
-            lines.append(
-                "  - source artifact unavailable: "
-                f"site={scope.get('site_code')} year={scope.get('source_year')} "
-                f"day={scope.get('day_utc')} pollutant={scope.get('pollutant_code')} "
-                f"timeseries_id={scope.get('timeseries_id')} status=404 "
-                "canonical_windows="
-                f"{json.dumps(scope.get('canonical_unavailable_windows') or [], separators=(',', ':'))} "
-                "action=preserve_pinned_baseline_scope"
-            )
-        if official.get("skipped_reason"):
-            lines.append(f"- Skipped reason: {official['skipped_reason']}")
-        lines.append("")
-
     sc = s.get("sensor_community") or {}
     if sc.get("ran") or sc.get("skipped_reason"):
         lines.extend([
@@ -32610,12 +31113,6 @@ def main(argv: list[str]) -> int:
             sos_metrics.get(
                 "no_authoritative_timeseries_binding_groups"
             ) or 0
-        )
-        warnings_count_total += int(
-            waqn_metrics.get("source_unavailable_scope_count") or 0
-        )
-        warnings_count_total += int(
-            saqn_metrics.get("source_unavailable_scope_count") or 0
         )
         warnings_count_total += int(
             ((repair_flow.get("sos_light") or {}).get("warning_count")) or 0

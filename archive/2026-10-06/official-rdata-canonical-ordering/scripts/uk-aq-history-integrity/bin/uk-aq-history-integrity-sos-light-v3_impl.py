@@ -16495,21 +16495,6 @@ def _require_nonnegative_evidence_int(
     return value
 
 
-def _canonical_utf8_sort_key(value: Any) -> bytes:
-    """Return the locale-independent UTF-8 byte-lexical ordering key."""
-    return str(value).encode("utf-8")
-
-
-def _canonical_json_utf8_bytes(value: Any) -> bytes:
-    """Encode canonical JSON using the same UTF-8 bytes as the Node producer."""
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
-
-
 def _source_evidence_input_payload(evidence: Mapping[str, Any]) -> dict[str, Any]:
     evidence_contract_version = _require_nonnegative_evidence_int(
         evidence, "evidence_contract_version"
@@ -16522,11 +16507,8 @@ def _source_evidence_input_payload(evidence: Mapping[str, Any]) -> dict[str, Any
             evidence.get("source_file_identities_sha256") or ""
         ),
         "requested_pollutant_set": sorted(
-            (
-                str(value)
-                for value in list(evidence.get("requested_pollutant_set") or [])
-            ),
-            key=_canonical_utf8_sort_key,
+            str(value)
+            for value in list(evidence.get("requested_pollutant_set") or [])
         ),
         "contract": str(evidence.get("contract") or ""),
         "evidence_contract_version": evidence_contract_version,
@@ -16559,7 +16541,12 @@ def _source_evidence_input_payload(evidence: Mapping[str, Any]) -> dict[str, Any
 
 def _source_evidence_input_sha256(evidence: Mapping[str, Any]) -> str:
     return hashlib.sha256(
-        _canonical_json_utf8_bytes(_source_evidence_input_payload(evidence))
+        json.dumps(
+            _source_evidence_input_payload(evidence),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
     ).hexdigest()
 
 
@@ -16588,18 +16575,12 @@ def _official_rdata_source_artifact_availability_identity(
         for scope in list(evidence.get("source_unavailable_scopes") or [])
         if isinstance(scope, Mapping)
     ]
-    normalized.sort(key=_canonical_json_utf8_bytes)
-    return normalized
-
-
-def _official_rdata_source_artifact_availability_sha256(
-    evidence: Mapping[str, Any],
-) -> str:
-    return hashlib.sha256(
-        _canonical_json_utf8_bytes(
-            _official_rdata_source_artifact_availability_identity(evidence)
+    normalized.sort(
+        key=lambda value: json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         )
-    ).hexdigest()
+    )
+    return normalized
 
 
 def _official_rdata_preserved_baseline_dependency_sha256(
@@ -16617,7 +16598,9 @@ def _official_rdata_preserved_baseline_dependency_sha256(
         ),
     }
     return hashlib.sha256(
-        _canonical_json_utf8_bytes(payload)
+        json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
     ).hexdigest()
 
 
@@ -16625,7 +16608,14 @@ def _immutable_source_evidence_sha256(evidence: Mapping[str, Any]) -> str:
     payload = dict(evidence)
     payload.pop("source_label_registry_snapshot_file", None)
     payload.pop("source_label_registry_snapshot_file_sha256", None)
-    return hashlib.sha256(_canonical_json_utf8_bytes(payload)).hexdigest()
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _dedicated_sos_source_evidence_identity(
@@ -16806,9 +16796,7 @@ def _load_complete_connector_day_source_evidence(
             "sha256": sha256,
             "bytes": byte_count,
         })
-    normalized_identities.sort(
-        key=lambda value: _canonical_utf8_sort_key(value["source_file"])
-    )
+    normalized_identities.sort(key=lambda value: str(value["source_file"]))
     if len({str(value["source_file"]) for value in normalized_identities}) != len(normalized_identities):
         raise ValueError("complete connector-day detector source file identity is duplicated")
     if {str(value["source_file"]) for value in normalized_identities} != files_read:
@@ -16912,19 +16900,6 @@ def _load_complete_connector_day_source_evidence(
             row_count=row_count,
         )
     if source_adapter in OFFICIAL_RDATA_NETWORKS:
-        source_artifact_availability_sha256 = str(
-            evidence.get("source_artifact_availability_sha256") or ""
-        )
-        if (
-            not re.fullmatch(
-                r"[0-9a-f]{64}", source_artifact_availability_sha256
-            )
-            or source_artifact_availability_sha256
-            != _official_rdata_source_artifact_availability_sha256(evidence)
-        ):
-            raise ValueError(
-                "official RData source artifact availability identity is invalid"
-            )
         preserved_path = source_dir / "preserved_baseline_rows.json"
         if not preserved_path.is_file():
             raise FileNotFoundError(
@@ -22251,47 +22226,6 @@ def _finalise_staged_write_set_provenance(
     return audit
 
 
-def _finalise_generic_file_backed_proposal_if_ready(
-    run_state: dict[str, Any],
-    *,
-    dedicated_sos_historical_replacement: bool,
-    observation_failed: bool,
-    metadata: Mapping[str, Any],
-    log: logging.Logger | None = None,
-) -> bool:
-    """Persist the generic fixed-v3 final ownership freeze when it is valid."""
-    if dedicated_sos_historical_replacement or observation_failed:
-        return False
-    manifest_status = str(
-        metadata.get("manifest_status") or metadata.get("status") or "not_run"
-    )
-    index_status = str(
-        metadata.get("index_status") or metadata.get("status") or "not_run"
-    )
-    if (
-        manifest_status in {"failed", "blocked_dependency"}
-        or index_status in {"failed", "blocked_dependency"}
-        or bool(run_state.get("blocked_scopes"))
-    ):
-        return False
-    transport = run_state.get("proposal_transport")
-    ingestion = run_state.get("proposal_ingestion")
-    if (
-        not isinstance(transport, Mapping)
-        or transport.get("transport_mode")
-        != "file_backed_compact_proposal"
-        or not isinstance(ingestion, Mapping)
-        or ingestion.get("status") != "complete"
-        or ingestion.get("node_apply_launch_permitted") is not False
-        or ingestion.get("completed_object_count")
-        != ingestion.get("total_object_count")
-    ):
-        return False
-    _finalise_staged_write_set_provenance(run_state, log=log)
-    write_run_state(run_state)
-    return True
-
-
 def _validated_observation_pollutant_manifest_row_count(
     payload: Any,
     *,
@@ -27412,15 +27346,6 @@ def run_v2_integrity_repair_flow(
         executor_result=metadata,
         dry_run=dry_run,
         require_file_backed_bodies=True,
-        log=log,
-    )
-    _finalise_generic_file_backed_proposal_if_ready(
-        run_state,
-        dedicated_sos_historical_replacement=(
-            dedicated_sos_historical_replacement
-        ),
-        observation_failed=observation_failed,
-        metadata=metadata,
         log=log,
     )
     if dedicated_sos_historical_replacement and not observation_failed and str(

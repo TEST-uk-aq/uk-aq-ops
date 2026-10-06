@@ -15,7 +15,11 @@ import {
   validateFinalPlannerProposalGraph,
 } from "../uk_aq_execute_v2_observations_repair.mjs";
 import {
+  runV2ObservationsRepair as runGenerationNeutralObservationMetadataRepair,
+} from "../uk_aq_execute_v2_observations_repair_impl.mjs";
+import {
   buildHistoryV2ConnectorManifest,
+  buildHistoryV2DayManifest,
   buildHistoryV2PollutantManifest,
 } from "../../../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 import {
@@ -48,6 +52,169 @@ function localObject(key, body, source = "dropbox") {
     content_sha256: sha256Hex(buffer),
   };
 }
+
+test("all-empty authoritative repair rebuilds zero-child connector and day parents", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-all-empty-parents-"));
+  try {
+    const dayUtc = "2026-09-28";
+    const connectorId = 9;
+    const dataPrefix = "history/v3/observations";
+    const dayPrefix = `${dataPrefix}/day_utc=${dayUtc}`;
+    const dropboxRoot = path.join(root, "dropbox");
+    const overlayRoot = path.join(root, "overlay");
+    fs.mkdirSync(overlayRoot, { recursive: true });
+    const pollutantManifests = ["no2", "pm10"].map((pollutantCode, index) => {
+      const manifestKey = `${dayPrefix}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/manifest.json`;
+      const partKey = manifestKey.replace("manifest.json", "part-00000.parquet");
+      const { canonical_rows: _canonicalRows, ...observationContentHash } =
+        computeObservationContentHash([{
+          connector_id: connectorId,
+          station_id: 101 + index,
+          timeseries_id: 1001 + index,
+          pollutant_code: pollutantCode,
+          observed_at_utc: `${dayUtc}T01:00:00.000Z`,
+          value: 10 + index,
+          verification_status: "P",
+        }]);
+      return buildHistoryV2PollutantManifest({
+        domain: "observations",
+        dayUtc,
+        connectorId,
+        pollutantCode,
+        manifestKey,
+        sourceRowCount: 1,
+        fileEntries: [{
+          key: partKey,
+          row_count: 1,
+          bytes: 10,
+          etag_or_hash: "a".repeat(64),
+          min_timeseries_id: 1001 + index,
+          max_timeseries_id: 1001 + index,
+          min_observed_at_utc: `${dayUtc}T01:00:00.000Z`,
+          max_observed_at_utc: `${dayUtc}T01:00:00.000Z`,
+          timeseries_row_counts: { [String(1001 + index)]: 1 },
+        }],
+        writerGitSha: "b".repeat(40),
+        backedUpAtUtc: `${dayUtc}T02:00:00.000Z`,
+        observationContentHash,
+      });
+    });
+    const connectorKey = `${dayPrefix}/connector_id=${connectorId}/manifest.json`;
+    const connectorManifest = buildHistoryV2ConnectorManifest({
+      domain: "observations",
+      dayUtc,
+      connectorId,
+      manifestKey: connectorKey,
+      pollutantManifests,
+      writerGitSha: "b".repeat(40),
+      backedUpAtUtc: `${dayUtc}T02:00:00.000Z`,
+    });
+    const dayKey = `${dayPrefix}/manifest.json`;
+    const dayManifest = buildHistoryV2DayManifest({
+      domain: "observations",
+      dayUtc,
+      manifestKey: dayKey,
+      connectorManifests: [connectorManifest],
+      writerGitSha: "b".repeat(40),
+      backedUpAtUtc: `${dayUtc}T02:00:00.000Z`,
+    });
+    for (const payload of [...pollutantManifests, connectorManifest, dayManifest]) {
+      const filePath = path.join(dropboxRoot, ...payload.manifest_key.split("/"));
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, JSON.stringify(payload, null, 2));
+    }
+    const runStatePath = path.join(root, "run-state.json");
+    fs.writeFileSync(runStatePath, JSON.stringify({
+      objects: {},
+      tombstones: {},
+      tombstone_prefixes: ["no2", "pm10"].map((pollutantCode) => ({
+        prefix: `${dayPrefix}/connector_id=${connectorId}/pollutant_code=${pollutantCode}`,
+        proposed: true,
+      })),
+    }));
+    const baseAction = {
+      status: "planned",
+      executes: false,
+      data_changes_required: false,
+      operator_action_required: false,
+      history_version: "v2",
+      domain: "observations",
+      day_utc: dayUtc,
+      requires_index_rebuild: true,
+      gap_types: ["observation_repaired"],
+    };
+    const repairPlan = {
+      history_version: "v2",
+      domain: "observations",
+      repair_plan: [
+        ...["no2", "pm10"].map((pollutantCode) => ({
+          ...baseAction,
+          kind: "observation_index_repair",
+          connector_id: connectorId,
+          pollutant_code: pollutantCode,
+        })),
+        {
+          ...baseAction,
+          kind: "observation_connector_manifest_repair",
+          connector_id: connectorId,
+        },
+        { ...baseAction, kind: "observation_day_manifest_repair" },
+      ],
+    };
+    const output = await runGenerationNeutralObservationMetadataRepair({
+      repairPlan,
+      storageGeneration: "v3",
+      planIndexes: false,
+      env: {
+        UK_AQ_HISTORY_INTEGRITY_OVERLAY_ROOT: overlayRoot,
+        UK_AQ_R2_HISTORY_DROPBOX_ROOT: dropboxRoot,
+        UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON: runStatePath,
+        CFLARE_R2_ENDPOINT: "https://example.invalid",
+        CFLARE_R2_BUCKET: "test-fixture",
+        CFLARE_R2_ACCESS_KEY_ID: "test-fixture",
+        CFLARE_R2_SECRET_ACCESS_KEY: "test-fixture",
+      },
+    });
+    assert.equal(output.status, "planned");
+    const proposals = new Map(output.planning.proposals.map((item) => [item.key, item]));
+    const rebuiltConnector = JSON.parse(proposals.get(connectorKey).proposed_body);
+    const rebuiltDay = JSON.parse(proposals.get(dayKey).proposed_body);
+    assert.deepEqual(rebuiltConnector.pollutant_manifests, []);
+    assert.deepEqual(rebuiltConnector.child_manifests, []);
+    assert.equal(rebuiltConnector.source_row_count, 0);
+    assert.deepEqual(
+      rebuiltDay.connector_manifests.map((item) => item.manifest_key),
+      [connectorKey],
+    );
+    assert.equal(
+      [...proposals.keys()].some((key) => key.includes("/pollutant_code=")),
+      false,
+    );
+    const incompleteAuthorityPlan = structuredClone(repairPlan);
+    incompleteAuthorityPlan.repair_plan = incompleteAuthorityPlan.repair_plan.filter(
+      (action) => action.pollutant_code !== "pm10",
+    );
+    await assert.rejects(
+      runGenerationNeutralObservationMetadataRepair({
+        repairPlan: incompleteAuthorityPlan,
+        storageGeneration: "v3",
+        planIndexes: false,
+        env: {
+          UK_AQ_HISTORY_INTEGRITY_OVERLAY_ROOT: overlayRoot,
+          UK_AQ_R2_HISTORY_DROPBOX_ROOT: dropboxRoot,
+          UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON: runStatePath,
+          CFLARE_R2_ENDPOINT: "https://example.invalid",
+          CFLARE_R2_BUCKET: "test-fixture",
+          CFLARE_R2_ACCESS_KEY_ID: "test-fixture",
+          CFLARE_R2_SECRET_ACCESS_KEY: "test-fixture",
+        },
+      }),
+      /Connector manifest has children hidden by the proposed final state/,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("metadata planning progress reports by count, time, and final completion", () => {
   const events = [];
