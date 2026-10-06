@@ -263,6 +263,120 @@ def source_time_windows_for_year(
     return windows
 
 
+def canonical_unavailable_windows(
+    raw_source_windows: Iterable[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    """Convert raw hour-beginning windows to canonical hour-ending windows."""
+    windows: list[dict[str, str]] = []
+    for raw_window in raw_source_windows:
+        day_utc = str(raw_window.get("canonical_day_utc") or "").strip()
+        try:
+            start = dt.datetime.fromisoformat(
+                str(raw_window.get("raw_start_utc") or "").replace(
+                    "Z", "+00:00"
+                )
+            )
+            end = dt.datetime.fromisoformat(
+                str(raw_window.get("raw_end_exclusive_utc") or "").replace(
+                    "Z", "+00:00"
+                )
+            )
+        except ValueError as exc:
+            raise ValueError("invalid raw RData source window") from exc
+        if start.tzinfo is None or end.tzinfo is None or start >= end:
+            raise ValueError("invalid raw RData source window")
+        canonical_start = start.astimezone(dt.timezone.utc) + dt.timedelta(hours=1)
+        canonical_end = end.astimezone(dt.timezone.utc) + dt.timedelta(hours=1)
+        if not day_utc or canonical_start.date().isoformat() != day_utc:
+            raise ValueError("raw RData source window escaped its canonical day")
+        windows.append({
+            "canonical_day_utc": day_utc,
+            "canonical_start_utc": canonical_start.isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "canonical_end_exclusive_utc": canonical_end.isoformat().replace(
+                "+00:00", "Z"
+            ),
+        })
+    return windows
+
+
+def canonical_timestamp_is_in_windows(
+    observed_at_utc: str,
+    windows: Iterable[Mapping[str, Any]],
+) -> bool:
+    """Return whether a canonical observation timestamp is in any half-open window."""
+    try:
+        observed = dt.datetime.fromisoformat(
+            str(observed_at_utc).replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise ValueError("invalid canonical RData observation timestamp") from exc
+    if observed.tzinfo is None:
+        raise ValueError("canonical RData observation timestamp is not UTC-aware")
+    observed = observed.astimezone(dt.timezone.utc)
+    for window in windows:
+        try:
+            start = dt.datetime.fromisoformat(
+                str(window.get("canonical_start_utc") or "").replace(
+                    "Z", "+00:00"
+                )
+            )
+            end = dt.datetime.fromisoformat(
+                str(window.get("canonical_end_exclusive_utc") or "").replace(
+                    "Z", "+00:00"
+                )
+            )
+        except ValueError as exc:
+            raise ValueError("invalid canonical RData unavailable window") from exc
+        if start.tzinfo is None or end.tzinfo is None or start >= end:
+            raise ValueError("invalid canonical RData unavailable window")
+        start = start.astimezone(dt.timezone.utc)
+        end = end.astimezone(dt.timezone.utc)
+        if start <= observed < end:
+            return True
+    return False
+
+
+def canonical_day_has_available_window(
+    day_utc: str,
+    unavailable_windows: Iterable[Mapping[str, Any]],
+) -> bool:
+    """Return whether any part of a canonical UTC day remains source-authoritative."""
+    day = dt.date.fromisoformat(day_utc)
+    day_start = dt.datetime.combine(day, dt.time.min, tzinfo=dt.timezone.utc)
+    day_end = day_start + dt.timedelta(days=1)
+    intervals: list[tuple[dt.datetime, dt.datetime]] = []
+    for window in unavailable_windows:
+        start = dt.datetime.fromisoformat(
+            str(window.get("canonical_start_utc") or "").replace(
+                "Z", "+00:00"
+            )
+        )
+        end = dt.datetime.fromisoformat(
+            str(window.get("canonical_end_exclusive_utc") or "").replace(
+                "Z", "+00:00"
+            )
+        )
+        if start.tzinfo is None or end.tzinfo is None or start >= end:
+            raise ValueError("invalid canonical RData unavailable window")
+        start = start.astimezone(dt.timezone.utc)
+        end = end.astimezone(dt.timezone.utc)
+        start = max(start, day_start)
+        end = min(end, day_end)
+        if start < end:
+            intervals.append((start, end))
+    covered_until = day_start
+    for start, end in sorted(intervals):
+        if start > covered_until:
+            return True
+        if end > covered_until:
+            covered_until = end
+        if covered_until >= day_end:
+            return False
+    return covered_until < day_end
+
+
 def _parse_lifecycle_date(raw_value: Any) -> dt.date | None:
     raw = str(raw_value or "").strip()
     if not raw:

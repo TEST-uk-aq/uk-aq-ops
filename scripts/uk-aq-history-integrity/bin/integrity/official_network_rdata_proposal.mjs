@@ -17,6 +17,7 @@ import {
   getObservationHistoryGeneration,
 } from "../../../../workers/shared/uk_aq_observation_history_generation.mjs";
 import {
+  computeEmptyObservationContentHash,
   computeObservationContentHash,
 } from "../../../../workers/shared/uk_aq_observation_content_hash.mjs";
 import {
@@ -90,6 +91,29 @@ function contentHashMetadata(metadata) {
   };
 }
 
+function canonicalIdentity(row) {
+  return `${row.timeseries_id}|${row.observed_at_utc}|${row.pollutant_code}`;
+}
+
+function rowIsSourceUnavailable(row, scopes) {
+  return scopes.some((scope) => {
+    if (Number(scope.timeseries_id) !== row.timeseries_id ||
+        String(scope.pollutant_code || "") !== row.pollutant_code) {
+      return false;
+    }
+    const observedAt = Date.parse(row.observed_at_utc);
+    if (!Number.isFinite(observedAt)) throw new Error("invalid canonical observation timestamp");
+    return (scope.canonical_unavailable_windows || []).some((window) => {
+      const start = Date.parse(String(window.canonical_start_utc || ""));
+      const end = Date.parse(String(window.canonical_end_exclusive_utc || ""));
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) {
+        throw new Error("invalid canonical source-unavailable window");
+      }
+      return start <= observedAt && observedAt < end;
+    });
+  });
+}
+
 function main() {
   const [inputPath, stageRoot, observationsPrefix, writerGitSha, generationArg] = process.argv.slice(2);
   if (!inputPath || !stageRoot || !observationsPrefix || !/^[0-9a-f]{40}$/.test(writerGitSha || "")) {
@@ -149,16 +173,49 @@ function main() {
   const unavailableTimeseriesIds = new Set(
     (input.source_unavailable_timeseries_ids || []).map((value) => Number(value)),
   );
-  if (preservedBaselineRows.some((row) => !unavailableTimeseriesIds.has(row.timeseries_id)) ||
-      rows.some((row) => unavailableTimeseriesIds.has(row.timeseries_id))) {
-    throw new Error("source and preserved baseline row provenance overlaps");
+  const unavailableScopes = (input.source_unavailable_scopes || []).map((scope) => ({
+    ...scope,
+    canonical_unavailable_windows: scope.canonical_unavailable_windows || [],
+  }));
+  if (unavailableScopes.some((scope) => scope.canonical_unavailable_windows.length === 0)) {
+    throw new Error("source-unavailable scope has no canonical timestamp window");
   }
+  const sourceIdentities = new Set(rows.map(canonicalIdentity));
+  if (preservedBaselineRows.some((row) => sourceIdentities.has(canonicalIdentity(row)))) {
+    throw new Error("source and preserved baseline rows contain a duplicate canonical identity");
+  }
+  if (preservedBaselineRows.some((row) => !rowIsSourceUnavailable(row, unavailableScopes)) ||
+      rows.some((row) => rowIsSourceUnavailable(row, unavailableScopes))) {
+    throw new Error("source or preserved baseline row escaped its availability window");
+  }
+  const sourceAvailablePollutantCodes = new Set(
+    (input.source_available_pollutant_codes || []).map((value) => String(value)),
+  );
   const pollutantManifests = [];
   const sourceObservationContentHashes = {};
   const finalTargetObservationContentHashes = {};
+  const emptyFinalTargetPollutantCodes = [];
   for (const pollutantCode of requestedPollutants) {
     const pollutantRows = targetRows.filter((row) => row.pollutant_code === pollutantCode);
-    if (pollutantRows.length === 0) continue;
+    const sourcePollutantRows = rows.filter((row) => row.pollutant_code === pollutantCode);
+    if (sourcePollutantRows.length > 0) {
+      sourceObservationContentHashes[pollutantCode] = contentHashMetadata(
+        computeObservationContentHash(sourcePollutantRows),
+      );
+    } else if (sourceAvailablePollutantCodes.has(pollutantCode)) {
+      sourceObservationContentHashes[pollutantCode] = contentHashMetadata(
+        computeEmptyObservationContentHash(),
+      );
+    }
+    if (pollutantRows.length === 0) {
+      if (sourceAvailablePollutantCodes.has(pollutantCode)) {
+        finalTargetObservationContentHashes[pollutantCode] = contentHashMetadata(
+          computeEmptyObservationContentHash(),
+        );
+        emptyFinalTargetPollutantCodes.push(pollutantCode);
+      }
+      continue;
+    }
     let targetMetadata;
     let manifest;
     let manifestKey;
@@ -214,30 +271,28 @@ function main() {
     }
     const hashMetadata = contentHashMetadata(targetMetadata);
     finalTargetObservationContentHashes[pollutantCode] = hashMetadata;
-    const sourcePollutantRows = rows.filter((row) => row.pollutant_code === pollutantCode);
-    if (sourcePollutantRows.length > 0) {
-      sourceObservationContentHashes[pollutantCode] = contentHashMetadata(
-        computeObservationContentHash(sourcePollutantRows),
-      );
-    }
     pollutantManifests.push(manifest);
   }
-  if (pollutantManifests.length === 0) throw new Error("canonical proposal contains no rows");
+  if (pollutantManifests.length === 0 && emptyFinalTargetPollutantCodes.length === 0) {
+    throw new Error("canonical proposal contains neither rows nor a source-available empty target");
+  }
 
-  const connectorManifestKey = buildHistoryV2ConnectorManifestKey(
-    observationsPrefix, dayUtc, connectorId,
-  );
-  const connectorManifest = buildHistoryV2ConnectorManifest({
-    domain: "observations",
-    dayUtc,
-    connectorId,
-    runId: null,
-    manifestKey: connectorManifestKey,
-    pollutantManifests,
-    writerGitSha,
-    backedUpAtUtc,
-  });
-  writeObject(stageRoot, connectorManifestKey, Buffer.from(JSON.stringify(connectorManifest, null, 2), "utf8"));
+  if (pollutantManifests.length > 0) {
+    const connectorManifestKey = buildHistoryV2ConnectorManifestKey(
+      observationsPrefix, dayUtc, connectorId,
+    );
+    const connectorManifest = buildHistoryV2ConnectorManifest({
+      domain: "observations",
+      dayUtc,
+      connectorId,
+      runId: null,
+      manifestKey: connectorManifestKey,
+      pollutantManifests,
+      writerGitSha,
+      backedUpAtUtc,
+    });
+    writeObject(stageRoot, connectorManifestKey, Buffer.from(JSON.stringify(connectorManifest, null, 2), "utf8"));
+  }
 
   const evidenceRows = rows.map((row) => ({
     connector_id: row.connector_id,
@@ -297,6 +352,9 @@ function main() {
     finalTargetPerPollutant[row.pollutant_code] =
       (finalTargetPerPollutant[row.pollutant_code] || 0) + 1;
   }
+  for (const pollutantCode of emptyFinalTargetPollutantCodes) {
+    finalTargetPerPollutant[pollutantCode] = 0;
+  }
   const contract = "pollutant_scoped_authoritative_connector_day_source_rows";
   const sourceArtifactAvailabilityIdentity = (input.source_unavailable_scopes || [])
     .map((scope) => ({
@@ -312,6 +370,7 @@ function main() {
       final_url: String(scope.final_url || ""),
       http_status: Number(scope.http_status),
       raw_source_windows: scope.raw_source_windows || [],
+      canonical_unavailable_windows: scope.canonical_unavailable_windows || [],
     }))
     .sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
   const evidenceInput = {
@@ -358,6 +417,7 @@ function main() {
     source_available_timeseries_ids: [...new Set(
       (input.source_available_timeseries_ids || []).map((value) => Number(value)),
     )].sort((a, b) => a - b),
+    source_available_pollutant_codes: [...sourceAvailablePollutantCodes].sort(),
     source_unavailable_timeseries_ids: [...unavailableTimeseriesIds].sort((a, b) => a - b),
     source_unavailable_scopes: input.source_unavailable_scopes || [],
     preserved_baseline_rows_file: "preserved_baseline_rows.json",
@@ -368,6 +428,7 @@ function main() {
     final_target_row_count: targetRows.length,
     final_target_timeseries_row_counts: Object.fromEntries(Object.entries(finalTargetPerTimeseries).sort(([a], [b]) => Number(a) - Number(b))),
     final_target_pollutant_counts: Object.fromEntries(Object.entries(finalTargetPerPollutant).sort(([a], [b]) => a.localeCompare(b))),
+    empty_final_target_pollutant_codes: [...emptyFinalTargetPollutantCodes].sort(),
     final_target_observation_content_hashes: Object.fromEntries(Object.entries(finalTargetObservationContentHashes).sort(([a], [b]) => a.localeCompare(b))),
     source_rows_before_canonical_dedupe: evidenceRows.length,
     duplicate_rows_removed_by_canonical_normalisation: 0,
@@ -413,7 +474,10 @@ function main() {
     source_timeseries_row_counts: evidence.per_timeseries_counts,
     final_target_timeseries_row_counts: evidence.final_target_timeseries_row_counts,
     source_pollutant_codes: evidence.pollutant_set,
-    objects_staged_local: pollutantManifests.reduce((count, manifest) => count + manifest.file_count + 1, 1),
+    objects_staged_local: pollutantManifests.reduce(
+      (count, manifest) => count + manifest.file_count + 1,
+      pollutantManifests.length > 0 ? 1 : 0,
+    ),
   }));
 }
 

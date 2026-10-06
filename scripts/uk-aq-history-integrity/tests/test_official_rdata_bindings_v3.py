@@ -184,6 +184,226 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             )
         return {"metrics": metrics, "downloader": downloader}
 
+    def run_partial_january_proposal(
+        self,
+        *,
+        temporary_directory: str,
+        baseline_rows: list[dict[str, object]],
+    ) -> tuple[dict[str, object], dict[str, object], list[dict[str, object]]]:
+        repo_root = Path(__file__).resolve().parents[3]
+        day_utc = "2026-01-01"
+        partition_prefix = (
+            "history/v3/observations/day_utc=2026-01-01/connector_id=9/"
+            "pollutant_code=no2"
+        )
+        source_rows = [{
+            "connector_id": 9,
+            "station_id": 101,
+            "timeseries_id": 1001,
+            "pollutant_code": "no2",
+            "observed_at_utc": f"2026-01-01T{hour:02}:00:00.000Z",
+            "value": float(hour),
+            "verification_status": "R",
+        } for hour in range(1, 24)]
+        unavailable_scope = {
+            "day_utc": day_utc,
+            "site_code": "SITE1",
+            "source_year": 2025,
+            "source_file_key": "waqn:site_ref=SITE1:year=2025",
+            "pollutant_code": "no2",
+            "station_id": 101,
+            "timeseries_id": 1001,
+            "reason": "source_artifact_unavailable",
+            "canonical_url": "https://airquality.gov.wales/sites/default/files/"
+            "openair/R_data/SITE1_2025.RData",
+            "final_url": "https://www.airquality.gov.wales/sites/default/files/"
+            "openair/R_data/SITE1_2025.RData",
+            "http_status": 404,
+            "raw_source_windows": [{
+                "canonical_day_utc": day_utc,
+                "raw_start_utc": "2025-12-31T23:00:00Z",
+                "raw_end_exclusive_utc": "2026-01-01T00:00:00Z",
+            }],
+            "canonical_unavailable_windows": [{
+                "canonical_day_utc": day_utc,
+                "canonical_start_utc": "2026-01-01T00:00:00Z",
+                "canonical_end_exclusive_utc": "2026-01-01T01:00:00Z",
+            }],
+        }
+        root = Path(temporary_directory)
+        baseline_root = root / "baseline"
+        parquet_key = f"{partition_prefix}/part-00000.parquet"
+        parquet_path = baseline_root / parquet_key
+        parquet_path.parent.mkdir(parents=True)
+        parquet_body = b"pinned-january-baseline-parquet"
+        parquet_path.write_bytes(parquet_body)
+        manifest_path = baseline_root / partition_prefix / "manifest.json"
+        manifest_path.write_text(json.dumps({
+            "files": [{
+                "key": parquet_key,
+                "bytes": len(parquet_body),
+                "etag_or_hash": hashlib.sha256(parquet_body).hexdigest(),
+            }],
+        }), encoding="utf-8")
+        INTEGRITY.OFFICIAL_RDATA_RUN_CONTEXTS["waqn"] = {
+            "source_key": "waqn",
+            "connector_id": 9,
+            "bindings": {
+                "SITE1": {
+                    "no2": {"station_id": 101, "timeseries_id": 1001},
+                },
+            },
+            "rows_by_day": {day_utc: source_rows},
+            "source_unavailable_by_day": {day_utc: [unavailable_scope]},
+            "required_by_day": {
+                day_utc: ["waqn:metadata", "waqn:site_ref=SITE1:year=2026"],
+            },
+            "identities_by_key": {
+                "waqn:metadata": {
+                    "source_file": "waqn:metadata", "bytes": 1,
+                    "sha256": "a" * 64,
+                },
+                "waqn:site_ref=SITE1:year=2026": {
+                    "source_file": "waqn:site_ref=SITE1:year=2026", "bytes": 1,
+                    "sha256": "b" * 64,
+                },
+            },
+            "absent_keys": [],
+            "authoritative_mapping_sha256": "c" * 64,
+            "observed_property_mapping_sha256": "d" * 64,
+            "audits_by_day": {day_utc: []},
+            "mapping_audit": {
+                "mapped_source_groups": [], "excluded_source_groups": [],
+            },
+            "rscript_identity": {
+                "executable": "/usr/bin/Rscript", "version": "test",
+            },
+        }
+        stage_root = root / "stage"
+        with mock.patch.object(
+            INTEGRITY,
+            "resolve_r2_history_root",
+            return_value=baseline_root,
+        ), mock.patch.object(
+            INTEGRITY,
+            "_observation_rows_from_local_parquet_for_shared_hash",
+            return_value=baseline_rows,
+        ):
+            result = INTEGRITY._prepare_official_rdata_proposal(
+                source_key="waqn",
+                day_utc=day_utc,
+                connector_id=9,
+                selected_pollutants=["no2"],
+                stage_root=stage_root,
+                env={"UK_AQ_OPS_REPO_ROOT": str(repo_root)},
+                history_generation="v3",
+            )
+        evidence = json.loads((
+            stage_root / f"day_utc={day_utc}/connector_id=9/source-evidence.json"
+        ).read_text(encoding="utf-8"))
+        preserved = json.loads((
+            stage_root /
+            f"day_utc={day_utc}/connector_id=9/preserved_baseline_rows.json"
+        ).read_text(encoding="utf-8"))
+        return result, evidence, preserved
+
+    def run_empty_baseline_subset_hash_check(
+        self,
+        *,
+        temporary_directory: str,
+        source_rows: list[dict[str, object]],
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        repo_root = Path(__file__).resolve().parents[3]
+        day_utc = "2026-09-28"
+        source_hash = INTEGRITY._compute_observation_hash_with_shared_javascript(
+            rows=source_rows,
+            is_sos=False,
+            env={"UK_AQ_OPS_REPO_ROOT": str(repo_root)},
+            allow_empty=not source_rows,
+        )
+        source_state = "successful_non_empty" if source_rows else "successful_empty"
+        unavailable_scope = {
+            "day_utc": day_utc,
+            "site_code": "SITE2",
+            "source_year": 2026,
+            "source_file_key": "waqn:site_ref=SITE2:year=2026",
+            "pollutant_code": "no2",
+            "station_id": 102,
+            "timeseries_id": 1002,
+            "reason": "source_artifact_unavailable",
+            "canonical_unavailable_windows": [{
+                "canonical_day_utc": day_utc,
+                "canonical_start_utc": "2026-09-28T00:00:00Z",
+                "canonical_end_exclusive_utc": "2026-09-29T00:00:00Z",
+            }],
+        }
+        candidate = {
+            "day_utc": day_utc,
+            "connector_id": 9,
+            "pollutant_code": "no2",
+            "manifest_path": str(Path(temporary_directory) / "manifest.json"),
+            "manifest_rel": "manifest.json",
+            "parquet_paths": [str(Path(temporary_directory) / "part.parquet")],
+            "source_row_count": len(source_rows),
+            "source_timeseries_row_counts": (
+                {"1001": len(source_rows)} if source_rows else {}
+            ),
+            "source_evidence": {
+                "source_partition_state": source_state,
+                "source_counts_available": True,
+                "source_skip_reason": None,
+                "required_source_file_count": 1,
+                "successful_source_file_count": 1,
+                "source_available_timeseries_ids": [1001],
+                "source_unavailable_timeseries_ids": [1002],
+                "source_unavailable_scopes": [unavailable_scope],
+                "comparison_scope": "source_available_timestamp_windows",
+            },
+        }
+        evidence = {
+            "observation_content_hashes": {"no2": source_hash},
+        }
+        INTEGRITY.OFFICIAL_RDATA_RUN_CONTEXTS["waqn"] = {
+            "connector_id": 9,
+        }
+        v2_observations = {
+            "hash_check_candidates": [candidate],
+            "hash_candidates_by_pollutant": {"no2": 1},
+            "gaps": [],
+        }
+        env = {
+            "UK_AQ_HISTORY_INTEGRITY_LOG_DIR": temporary_directory,
+            "UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR": temporary_directory,
+            "UK_AQ_OPS_REPO_ROOT": str(repo_root),
+        }
+        with mock.patch.object(
+            INTEGRITY,
+            "_prepare_official_rdata_proposal",
+            return_value={"status": "ok"},
+        ), mock.patch.object(
+            INTEGRITY,
+            "_load_complete_connector_day_source_evidence",
+            return_value=(evidence, source_rows),
+        ), mock.patch.object(
+            INTEGRITY,
+            "_persist_complete_connector_day_source_evidence",
+        ), mock.patch.object(
+            INTEGRITY,
+            "_observation_rows_from_local_parquet_for_shared_hash",
+            return_value=[],
+        ):
+            metrics = INTEGRITY.run_v2_observation_content_hash_checks(
+                conn=self.conn,
+                env_name="TEST",
+                run_compact="2026-10-06T000000Z",
+                env=env,
+                v2_observations=v2_observations,
+                source_scope={"source": "waqn"},
+                log=logging.getLogger("official-rdata-empty-subset-test"),
+                repair_pollutants=["no2"],
+            )
+        return metrics, v2_observations
+
     def test_canonical_observed_properties_resolve_all_selected_pollutants_without_mapping_rows(self) -> None:
         expected = {3: "pm10", 9: "pm25", 12: "no2", 14: "o3"}
         for offset, (observed_property_id, code) in enumerate(expected.items(), start=1):
@@ -913,6 +1133,334 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             }],
         )
 
+    def test_january_missing_prior_year_keeps_present_year_source_rows(self) -> None:
+        def download(url: str, _destination: Path, **_kwargs):
+            if url.endswith("SITE1_2025.RData"):
+                raise RDATA.AuthoritativeSourceArtifactAbsent(
+                    canonical_url=url,
+                    final_url=url,
+                    requested_at_utc="2026-10-06T00:00:00+00:00",
+                )
+            return {
+                "bytes": 100,
+                "sha256": "2" * 64,
+                "etag": None,
+                "last_modified": None,
+            }
+
+        present_year_rows = [{
+            "date": f"2026-01-01T{hour:02}:00:00Z",
+            "NO2": str(10 + hour),
+        } for hour in range(23)]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            self.run_acquisition(
+                metadata_rows=[self.metadata_row()],
+                download_side_effect=download,
+                temporary_directory=temporary_directory,
+                from_day="2026-01-01",
+                to_day="2026-01-01",
+                decoded_rows=present_year_rows,
+            )
+
+        context = INTEGRITY.OFFICIAL_RDATA_RUN_CONTEXTS["waqn"]
+        rows = context["rows_by_day"]["2026-01-01"]
+        self.assertEqual(len(rows), 23)
+        self.assertEqual(rows[0]["observed_at_utc"], "2026-01-01T01:00:00.000Z")
+        self.assertEqual(rows[-1]["observed_at_utc"], "2026-01-01T23:00:00.000Z")
+        [scope] = context["source_unavailable_by_day"]["2026-01-01"]
+        self.assertEqual(scope["canonical_unavailable_windows"], [{
+            "canonical_day_utc": "2026-01-01",
+            "canonical_start_utc": "2026-01-01T00:00:00Z",
+            "canonical_end_exclusive_utc": "2026-01-01T01:00:00Z",
+        }])
+        counts, evidence = INTEGRITY._official_rdata_source_counts_for_partition(
+            source_key="waqn",
+            day_utc="2026-01-01",
+            pollutant_code="no2",
+        )
+        self.assertEqual(counts, {1001: 23})
+        self.assertEqual(evidence["source_available_timeseries_ids"], [1001])
+        self.assertEqual(evidence["source_unavailable_timeseries_ids"], [1001])
+        self.assertEqual(evidence["comparison_scope"], "source_available_timestamp_windows")
+
+    def test_january_proposal_preserves_only_missing_midnight_window(self) -> None:
+        midnight = {
+            "connector_id": 9,
+            "station_id": 101,
+            "timeseries_id": 1001,
+            "pollutant_code": "no2",
+            "observed_at_utc": "2026-01-01T00:00:00.000Z",
+            "value": 5.0,
+            "verification_status": "R",
+        }
+        baseline_present_window = {
+            **midnight,
+            "observed_at_utc": "2026-01-01T01:00:00.000Z",
+            "value": 99.0,
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result, evidence, preserved = self.run_partial_january_proposal(
+                temporary_directory=temporary_directory,
+                baseline_rows=[midnight, baseline_present_window],
+            )
+
+        self.assertEqual(result["source_timeseries_row_counts"], {"1001": 23})
+        self.assertEqual(result["final_target_timeseries_row_counts"], {"1001": 24})
+        self.assertEqual(preserved, [{
+            "connector_id": 9,
+            "station_id": 101,
+            "timeseries_id": 1001,
+            "pollutant_code": "no2",
+            "observed_at": "2026-01-01T00:00:00.000Z",
+            "value": 5.0,
+            "verification_status": "R",
+        }])
+        self.assertEqual(evidence["total_rows"], 23)
+        self.assertEqual(evidence["preserved_baseline_row_count"], 1)
+        self.assertEqual(evidence["final_target_row_count"], 24)
+        self.assertEqual(evidence["source_available_timeseries_ids"], [1001])
+        self.assertEqual(evidence["source_unavailable_timeseries_ids"], [1001])
+
+    def test_january_proposal_does_not_manufacture_missing_baseline_row(self) -> None:
+        baseline_present_window = {
+            "connector_id": 9,
+            "station_id": 101,
+            "timeseries_id": 1001,
+            "pollutant_code": "no2",
+            "observed_at_utc": "2026-01-01T01:00:00.000Z",
+            "value": 99.0,
+            "verification_status": "R",
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result, evidence, preserved = self.run_partial_january_proposal(
+                temporary_directory=temporary_directory,
+                baseline_rows=[baseline_present_window],
+            )
+
+        self.assertEqual(preserved, [])
+        self.assertEqual(result["final_target_timeseries_row_counts"], {"1001": 23})
+        self.assertEqual(evidence["preserved_baseline_row_count"], 0)
+        self.assertEqual(evidence["final_target_row_count"], 23)
+
+    def test_empty_baseline_comparable_subset_yields_normal_mismatch(self) -> None:
+        source_rows = [{
+            "connector_id": 9,
+            "station_id": 101,
+            "timeseries_id": 1001,
+            "pollutant_code": "no2",
+            "observed_at_utc": "2026-09-28T01:00:00.000Z",
+            "value": 10.0,
+            "verification_status": "P",
+        }]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            metrics, observations = self.run_empty_baseline_subset_hash_check(
+                temporary_directory=temporary_directory,
+                source_rows=source_rows,
+            )
+
+        self.assertEqual(metrics["mismatch"], 1)
+        self.assertEqual(metrics["invalid_contract"], 0)
+        self.assertEqual(
+            observations["gaps"][-1]["gap_type"],
+            "observation_content_hash_mismatch",
+        )
+
+    def test_empty_source_and_baseline_comparable_subsets_verify(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            metrics, observations = self.run_empty_baseline_subset_hash_check(
+                temporary_directory=temporary_directory,
+                source_rows=[],
+            )
+
+        self.assertEqual(metrics["verified"], 1)
+        self.assertEqual(metrics["invalid_contract"], 0)
+        self.assertEqual(metrics["mismatch"], 0)
+        self.assertFalse(observations["gaps"])
+
+    def test_cross_check_filters_baseline_by_exact_unavailable_window(self) -> None:
+        day_utc = "2026-01-01"
+        self.conn.execute(
+            "INSERT INTO core_connectors_snapshot (id, connector_code) "
+            "VALUES (9, 'waqn')"
+        )
+        self.conn.execute(
+            "INSERT INTO core_phenomena_snapshot "
+            "(id, label, source_label, pollutant_label, observed_property_id, connector_id) "
+            "VALUES (2001, 'NO2', 'NO2', 'NO2', NULL, 9)"
+        )
+        self.conn.execute(
+            "INSERT INTO core_timeseries_snapshot "
+            "(id, station_id, connector_id, phenomenon_id) VALUES (1001, 101, 9, 2001)"
+        )
+        self.conn.execute(
+            "INSERT INTO source_file_state "
+            "(source_file_key, env_name, source_key, remote_scheme, remote_url_or_key, "
+            " exists_remote, first_seen_at_utc, last_checked_at_utc, last_status) "
+            "VALUES ('waqn:test', 'TEST', 'waqn', 'https', 'https://example.test', "
+            " 1, '2026-10-06T00:00:00Z', '2026-10-06T00:00:00Z', 'unchanged')"
+        )
+        self.conn.execute(
+            "INSERT INTO source_file_timeseries_counts "
+            "(source_file_key, day_utc, timeseries_id, row_count, counted_at_utc) "
+            "VALUES ('waqn:test', ?, 1001, 23, '2026-10-06T00:00:00Z')",
+            (day_utc,),
+        )
+        unavailable_scope = {
+            "day_utc": day_utc,
+            "pollutant_code": "no2",
+            "timeseries_id": 1001,
+            "canonical_unavailable_windows": [{
+                "canonical_day_utc": day_utc,
+                "canonical_start_utc": "2026-01-01T00:00:00Z",
+                "canonical_end_exclusive_utc": "2026-01-01T01:00:00Z",
+            }],
+        }
+        source_rows = [{
+            "timeseries_id": 1001,
+            "pollutant_code": "no2",
+            "observed_at_utc": f"2026-01-01T{hour:02}:00:00.000Z",
+        } for hour in range(1, 24)]
+        baseline_rows = [{
+            "timeseries_id": 1001,
+            "pollutant_code": "no2",
+            "observed_at_utc": f"2026-01-01T{hour:02}:00:00.000Z",
+        } for hour in range(24)]
+        INTEGRITY.OFFICIAL_RDATA_RUN_CONTEXTS["waqn"] = {
+            "connector_id": 9,
+            "bindings": {
+                "SITE1": {
+                    "no2": {"station_id": 101, "timeseries_id": 1001},
+                },
+            },
+            "rows_by_day": {day_utc: source_rows},
+            "source_unavailable_by_day": {day_utc: [unavailable_scope]},
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory, mock.patch.object(
+            INTEGRITY,
+            "_read_r2_timeseries_manifest_counts",
+            return_value=({1001: 24}, None, None),
+        ), mock.patch.object(
+            INTEGRITY,
+            "_observation_rows_from_local_parquet_for_shared_hash",
+            return_value=baseline_rows,
+        ) as parquet_reader:
+            metrics = INTEGRITY.run_r2_cross_checks(
+                self.conn,
+                run_id=1,
+                env_name="TEST",
+                source_filter="waqn",
+                from_day=day_utc,
+                to_day=day_utc,
+                r2_history_root=temporary_directory,
+                r2_manifest_prefix="history/v3/observations_timeseries",
+                checked_at_utc="2026-10-06T00:00:00Z",
+                log=logging.getLogger("official-rdata-cross-check-test"),
+            )
+
+        parquet_reader.assert_called_once()
+        self.assertEqual(metrics["cross_checks_ok"], 1)
+        self.assertEqual(metrics["discrepancy_total"], 0)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT source_row_count, r2_row_count, status FROM cross_checks"
+            ).fetchall(),
+            [(23, 23, "ok")],
+        )
+
+    def test_proposal_represents_source_available_empty_final_target(self) -> None:
+        repo_root = Path(__file__).resolve().parents[3]
+        helper = (
+            repo_root / "scripts/uk-aq-history-integrity/bin/integrity/"
+            "official_network_rdata_proposal.mjs"
+        )
+        writer_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo_root, check=True,
+            text=True, stdout=subprocess.PIPE,
+        ).stdout.strip()
+        payload = {
+            "history_generation": "v3",
+            "day_utc": "2026-09-28",
+            "connector_id": 9,
+            "source_adapter": "waqn",
+            "requested_pollutant_set": ["no2"],
+            "backed_up_at_utc": "2026-10-06T00:00:00Z",
+            "rows": [],
+            "preserved_baseline_rows": [],
+            "preserved_baseline_identity": {
+                "source": "dropbox", "partition_identities": [],
+            },
+            "source_available_timeseries_ids": [1001],
+            "source_available_pollutant_codes": ["no2"],
+            "source_unavailable_timeseries_ids": [],
+            "source_unavailable_scopes": [],
+            "source_file_identities": [{
+                "source_file": "waqn:metadata", "sha256": "a" * 64, "bytes": 100,
+            }],
+            "required_source_files": ["waqn:metadata"],
+            "authoritatively_absent_source_files": [],
+            "authoritative_mapping_sha256": "b" * 64,
+            "observed_property_mapping_sha256": "c" * 64,
+            "ratification_audit": [],
+            "mapping_audit": {"mapped_source_groups": [], "excluded_source_groups": []},
+            "rscript_identity": {"executable": "/usr/bin/Rscript", "version": "test"},
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            input_path = root / "input.json"
+            input_path.write_text(json.dumps(payload), encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    "node", str(helper), str(input_path), str(root / "stage"),
+                    "history/v3/observations", writer_sha, "v3",
+                ],
+                cwd=repo_root, text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = json.loads((
+                root / "stage/day_utc=2026-09-28/connector_id=9/source-evidence.json"
+            ).read_text(encoding="utf-8"))
+            generated = root / "stage/generated-objects"
+            self.assertFalse(list(generated.rglob("*.parquet")))
+            self.assertFalse(list(generated.rglob("manifest.json")))
+            run_state = {
+                "overlay_root": str(root / "stage"),
+                "run_state_path": str(root / "run-state.json"),
+                "objects": {},
+                "tombstone_prefixes": [],
+            }
+            captured = INTEGRITY._capture_local_v2_observation_scope(
+                run_state=run_state,
+                day_utc="2026-09-28",
+                connector_id=9,
+                repair_pollutants=["no2"],
+            )
+            self.assertEqual(captured, [])
+            self.assertEqual(run_state["objects"], {})
+            self.assertEqual(run_state["tombstone_prefixes"], [{
+                "prefix": (
+                    "history/v3/observations/day_utc=2026-09-28/"
+                    "connector_id=9/pollutant_code=no2"
+                ),
+                "proposed": True,
+                "deleted": False,
+                "deletion_verified": False,
+                "stage": "observations_data",
+                "repair_pollutants": ["no2"],
+            }])
+
+        empty_hash = "ba11f8ae1a68f90774b65d0e7cee54d827699dcade0af06e15a4262f4fa489c7"
+        self.assertEqual(evidence["empty_final_target_pollutant_codes"], ["no2"])
+        self.assertEqual(evidence["final_target_pollutant_counts"], {"no2": 0})
+        self.assertEqual(
+            evidence["observation_content_hashes"]["no2"]["observation_content_hash"],
+            empty_hash,
+        )
+        self.assertEqual(
+            evidence["final_target_observation_content_hashes"]["no2"]["observation_content_hash"],
+            empty_hash,
+        )
+
     def test_proposal_keeps_source_and_preserved_baseline_rows_separate(self) -> None:
         repo_root = Path(__file__).resolve().parents[3]
         helper = (
@@ -944,9 +1492,10 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             "value": 20.0,
             "verification_status": "R",
         }
-        for label, source_rows in (
-            ("mixed", [source_row]),
-            ("unavailable_only", []),
+        for label, source_rows, available_ids, available_pollutants in (
+            ("mixed", [source_row], [1001], ["no2"]),
+            ("available_empty_with_preserved", [], [1001], ["no2"]),
+            ("unavailable_only", [], [], []),
         ):
             with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -966,9 +1515,8 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
                             "preserved_row_count": 1,
                         }],
                     },
-                    "source_available_timeseries_ids": (
-                        [1001] if source_rows else []
-                    ),
+                    "source_available_timeseries_ids": available_ids,
+                    "source_available_pollutant_codes": available_pollutants,
                     "source_unavailable_timeseries_ids": [1002],
                     "source_unavailable_scopes": [{
                         "day_utc": "2026-09-28",
@@ -979,6 +1527,11 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
                         "station_id": 102,
                         "timeseries_id": 1002,
                         "reason": "source_artifact_unavailable",
+                        "canonical_unavailable_windows": [{
+                            "canonical_day_utc": "2026-09-28",
+                            "canonical_start_utc": "2026-09-28T00:00:00Z",
+                            "canonical_end_exclusive_utc": "2026-09-29T00:00:00Z",
+                        }],
                     }],
                     "source_file_identities": [{
                         "source_file": "waqn:metadata",
@@ -1034,6 +1587,32 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
                 self.assertEqual(
                     evidence["source_unavailable_timeseries_ids"], [1002]
                 )
+                if label == "available_empty_with_preserved":
+                    empty_hash = evidence["observation_content_hashes"]["no2"]
+                    self.assertEqual(
+                        empty_hash["observation_content_hash"],
+                        "ba11f8ae1a68f90774b65d0e7cee54d827699dcade0af06e15a4262f4fa489c7",
+                    )
+                    self.assertEqual(
+                        empty_hash["observation_content_hash_row_count"], 0
+                    )
+                    validated_evidence, validated_rows = (
+                        INTEGRITY._load_complete_connector_day_source_evidence(
+                            stage_root=root / "stage",
+                            day_utc="2026-09-28",
+                            connector_id=9,
+                            repair_pollutants=["no2"],
+                        )
+                    )
+                    self.assertEqual(validated_rows, [])
+                    self.assertEqual(
+                        validated_evidence["observation_content_hashes"][
+                            "no2"
+                        ]["observation_content_hash_row_count"],
+                        0,
+                    )
+                elif label == "unavailable_only":
+                    self.assertNotIn("no2", evidence["observation_content_hashes"])
                 self.assertNotEqual(
                     evidence["canonical_rows_sha256"],
                     evidence["preserved_baseline_rows_sha256"],
@@ -1116,6 +1695,11 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
                 "openair/R_data/SITE2_2026.RData",
                 "http_status": 404,
                 "raw_source_windows": [],
+                "canonical_unavailable_windows": [{
+                    "canonical_day_utc": day_utc,
+                    "canonical_start_utc": "2026-09-28T00:00:00Z",
+                    "canonical_end_exclusive_utc": "2026-09-29T00:00:00Z",
+                }],
             }
             INTEGRITY.OFFICIAL_RDATA_RUN_CONTEXTS["waqn"] = {
                 "source_key": "waqn",

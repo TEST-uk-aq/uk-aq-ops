@@ -90,7 +90,10 @@ from integrity.official_network_rdata import (
     COVERAGE_REQUIRED,
     NETWORKS as OFFICIAL_RDATA_NETWORKS,
     RDATA_COLUMN_TO_POLLUTANT,
+    canonical_day_has_available_window as official_rdata_day_has_available_window,
     canonical_rows_for_site_year,
+    canonical_timestamp_is_in_windows as official_rdata_timestamp_is_in_windows,
+    canonical_unavailable_windows as official_rdata_canonical_unavailable_windows,
     classify_site_year_coverage,
     download_pinned as download_official_rdata_pinned,
     extract_metadata as extract_official_rdata_metadata,
@@ -13172,7 +13175,49 @@ def run_v2_observations_integrity_checks(
                     comparison_r2_counts = _normalize_timeseries_row_counts(
                         parquet_stats["timeseries_row_counts"]
                     )
-                    if "source_available_timeseries_ids" in (
+                    unavailable_scopes_for_comparison = [
+                        dict(scope)
+                        for scope in list(
+                            (source_partition_evidence or {}).get(
+                                "source_unavailable_scopes"
+                            )
+                            or []
+                        )
+                        if str(scope.get("pollutant_code") or "") == pollutant
+                    ]
+                    if unavailable_scopes_for_comparison:
+                        try:
+                            baseline_rows_for_comparison = (
+                                _observation_rows_from_local_parquet_for_shared_hash(
+                                    parquet_paths=[
+                                        str(path) for path in sorted(local_parquets)
+                                    ],
+                                )
+                            )
+                            comparable_rows = _official_rdata_source_available_rows(
+                                baseline_rows_for_comparison,
+                                unavailable_scopes_for_comparison,
+                            )
+                        except (OSError, RuntimeError, ValueError) as exc:
+                            gaps.append(_v2_obs_gap(
+                                "parquet_unreadable",
+                                day_utc=day_utc,
+                                connector_id=connector_raw,
+                                pollutant_code=pollutant,
+                                expected_path=manifest_rel,
+                                related_paths=[
+                                    "source_available_subset_read_failed:"
+                                    + _truncate_text(str(exc), 500)
+                                ],
+                            ))
+                            continue
+                        comparison_r2_counts = {}
+                        for row in comparable_rows:
+                            timeseries_id = int(row["timeseries_id"])
+                            comparison_r2_counts[timeseries_id] = (
+                                comparison_r2_counts.get(timeseries_id, 0) + 1
+                            )
+                    elif "source_available_timeseries_ids" in (
                         source_partition_evidence or {}
                     ):
                         comparison_r2_counts = {
@@ -13200,8 +13245,7 @@ def run_v2_observations_integrity_checks(
                             )
                             or ""
                         )
-                        == "successful_non_empty"
-                        and source_counts
+                        in {"successful_non_empty", "successful_empty"}
                         and _normalize_timeseries_row_counts(source_counts)
                         == comparison_r2_counts
                     ):
@@ -13235,6 +13279,7 @@ def run_v2_observations_integrity_checks(
                                     "historical_identity_rollovers",
                                     "identity_classification",
                                     "source_available_timeseries_ids",
+                                    "source_available_pollutant_codes",
                                     "source_unavailable_timeseries_ids",
                                     "source_unavailable_scopes",
                                     "comparison_scope",
@@ -13603,8 +13648,8 @@ def run_r2_cross_checks(
         per_ts = grouped.setdefault(key, {})
         per_ts[int(timeseries_id)] = int(source_row_count or 0)
 
-    official_available_timeseries_by_scope: dict[
-        tuple[str, int], set[int]
+    official_comparison_by_scope: dict[
+        tuple[str, int], dict[str, Any]
     ] = {}
     for official_source, context in OFFICIAL_RDATA_RUN_CONTEXTS.items():
         if official_source not in source_keys:
@@ -13612,29 +13657,55 @@ def run_r2_cross_checks(
         connector_id = int(context["connector_id"])
         for day_utc in sorted((context.get("rows_by_day") or {})):
             scope = (str(day_utc), connector_id)
-            unavailable_ids = {
-                int(item["timeseries_id"])
+            selected_binding_ids = {
+                int(binding["timeseries_id"])
+                for site_bindings in dict(context.get("bindings") or {}).values()
+                for binding in dict(site_bindings).values()
+            }
+            unavailable_scopes = [
+                dict(item)
                 for item in list(
                     (context.get("source_unavailable_by_day") or {}).get(
                         day_utc
                     )
                     or []
                 )
+            ]
+            windows_by_timeseries: dict[int, list[dict[str, Any]]] = {}
+            for unavailable_scope in unavailable_scopes:
+                windows_by_timeseries.setdefault(
+                    int(unavailable_scope["timeseries_id"]), []
+                ).extend(
+                    dict(window) for window in list(
+                        unavailable_scope.get("canonical_unavailable_windows")
+                        or []
+                    )
+                )
+            comparable_ids = {
+                timeseries_id for timeseries_id in selected_binding_ids
+                if official_rdata_day_has_available_window(
+                    str(day_utc),
+                    windows_by_timeseries.get(timeseries_id, []),
+                )
             }
-            selected_binding_ids = {
-                int(binding["timeseries_id"])
-                for site_bindings in dict(context.get("bindings") or {}).values()
-                for binding in dict(site_bindings).values()
+            partial_window_ids = comparable_ids & set(windows_by_timeseries)
+            official_comparison_by_scope[scope] = {
+                "timeseries_ids": comparable_ids,
+                "unavailable_scopes": unavailable_scopes,
+                "requires_exact_baseline_rows": bool(partial_window_ids),
             }
-            available_ids = selected_binding_ids - unavailable_ids
-            official_available_timeseries_by_scope[scope] = available_ids
-            if not available_ids:
+            if not comparable_ids:
                 grouped.pop(scope, None)
                 continue
             current_counts: dict[int, int] = {}
             for row in list((context.get("rows_by_day") or {}).get(day_utc) or []):
                 timeseries_id = int(row["timeseries_id"])
-                if timeseries_id in available_ids:
+                if (
+                    timeseries_id in comparable_ids
+                    and not _official_rdata_row_is_source_unavailable(
+                        row, unavailable_scopes,
+                    )
+                ):
                     current_counts[timeseries_id] = (
                         current_counts.get(timeseries_id, 0) + 1
                     )
@@ -13712,15 +13783,49 @@ def run_r2_cross_checks(
                 ))
             continue
 
-        available_timeseries_ids = official_available_timeseries_by_scope.get(
+        official_comparison = official_comparison_by_scope.get(
             (day_utc, connector_id)
         )
-        if available_timeseries_ids is not None:
-            r2_counts = {
-                timeseries_id: count
-                for timeseries_id, count in r2_counts.items()
-                if timeseries_id in available_timeseries_ids
-            }
+        if official_comparison is not None:
+            available_timeseries_ids = set(
+                official_comparison["timeseries_ids"]
+            )
+            if official_comparison["requires_exact_baseline_rows"]:
+                connector_root = (
+                    root / R2_HISTORY_V2_OBSERVATIONS_PREFIX
+                    / f"day_utc={day_utc}"
+                    / f"connector_id={int(connector_id)}"
+                )
+                parquet_paths = sorted(
+                    str(path) for path in connector_root.glob(
+                        "pollutant_code=*/part-*.parquet"
+                    )
+                )
+                baseline_rows = (
+                    _observation_rows_from_local_parquet_for_shared_hash(
+                        parquet_paths=parquet_paths,
+                    )
+                )
+                exact_counts: dict[int, int] = {}
+                for row in baseline_rows:
+                    timeseries_id = int(row.get("timeseries_id") or 0)
+                    if (
+                        timeseries_id in available_timeseries_ids
+                        and not _official_rdata_row_is_source_unavailable(
+                            row,
+                            official_comparison["unavailable_scopes"],
+                        )
+                    ):
+                        exact_counts[timeseries_id] = (
+                            exact_counts.get(timeseries_id, 0) + 1
+                        )
+                r2_counts = exact_counts
+            else:
+                r2_counts = {
+                    timeseries_id: count
+                    for timeseries_id, count in r2_counts.items()
+                    if timeseries_id in available_timeseries_ids
+                }
 
         for timeseries_id in sorted(set(source_counts) | set(r2_counts)):
             source_row_count = source_counts.get(timeseries_id)
@@ -14788,6 +14893,94 @@ def _official_rdata_source_file_key(
     return f"{source_key}:site_ref={site_code.upper()}:year={int(year)}"
 
 
+def _official_rdata_row_is_source_unavailable(
+    row: Mapping[str, Any],
+    unavailable_scopes: Iterable[Mapping[str, Any]],
+) -> bool:
+    timeseries_id = int(row.get("timeseries_id") or 0)
+    pollutant_code = str(row.get("pollutant_code") or "")
+    observed_at_utc = str(
+        row.get("observed_at_utc") or row.get("observed_at") or ""
+    )
+    for scope in unavailable_scopes:
+        scope_windows = list(
+            scope.get("canonical_unavailable_windows") or []
+        )
+        if not scope_windows:
+            raise ValueError(
+                "official RData unavailable scope has no canonical windows"
+            )
+        if (
+            int(scope.get("timeseries_id") or 0) != timeseries_id
+            or str(scope.get("pollutant_code") or "") != pollutant_code
+        ):
+            continue
+        if official_rdata_timestamp_is_in_windows(
+            observed_at_utc,
+            scope_windows,
+        ):
+            return True
+    return False
+
+
+def _official_rdata_source_available_rows(
+    rows: Iterable[Mapping[str, Any]],
+    unavailable_scopes: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    scopes = [dict(scope) for scope in unavailable_scopes]
+    return [
+        dict(row) for row in rows
+        if not _official_rdata_row_is_source_unavailable(row, scopes)
+    ]
+
+
+def _official_rdata_partition_availability(
+    *,
+    context: Mapping[str, Any],
+    day_utc: str,
+    pollutant_code: str,
+) -> tuple[set[int], set[int], list[dict[str, Any]]]:
+    binding_ids = {
+        int(binding["timeseries_id"])
+        for site_bindings in dict(context.get("bindings") or {}).values()
+        for code, binding in dict(site_bindings).items()
+        if str(code) == pollutant_code
+    }
+    unavailable_scopes = [
+        dict(scope)
+        for scope in list(
+            (context.get("source_unavailable_by_day") or {}).get(day_utc) or []
+        )
+        if str(scope.get("pollutant_code") or "") == pollutant_code
+    ]
+    unavailable_ids = {
+        int(scope["timeseries_id"]) for scope in unavailable_scopes
+    }
+    windows_by_timeseries: dict[int, list[dict[str, Any]]] = {}
+    for scope in unavailable_scopes:
+        scope_windows = list(
+            scope.get("canonical_unavailable_windows") or []
+        )
+        if not scope_windows:
+            raise ValueError(
+                "official RData unavailable scope has no canonical windows"
+            )
+        windows_by_timeseries.setdefault(
+            int(scope["timeseries_id"]), []
+        ).extend(
+            dict(window)
+            for window in scope_windows
+        )
+    available_ids = {
+        timeseries_id for timeseries_id in binding_ids
+        if official_rdata_day_has_available_window(
+            day_utc,
+            windows_by_timeseries.get(timeseries_id, []),
+        )
+    }
+    return available_ids, unavailable_ids, unavailable_scopes
+
+
 def _official_rdata_bindings(
     conn: sqlite3.Connection,
     *,
@@ -15436,6 +15629,14 @@ def check_official_network_rdata(
                             "raw_source_windows": list(
                                 day_evidence.get("raw_source_windows") or []
                             ),
+                            "canonical_unavailable_windows": (
+                                official_rdata_canonical_unavailable_windows(
+                                    list(
+                                        day_evidence.get("raw_source_windows")
+                                        or []
+                                    )
+                                )
+                            ),
                         }
                         unavailable_scopes.append(scope)
                         unavailable_by_day[day_utc].append(scope)
@@ -15494,15 +15695,10 @@ def check_official_network_rdata(
             decoded_files += 1
 
     for day_utc, rows in rows_by_day.items():
-        unavailable_timeseries_ids = {
-            int(scope["timeseries_id"])
-            for scope in unavailable_by_day[day_utc]
-        }
-        if unavailable_timeseries_ids:
-            rows[:] = [
-                row for row in rows
-                if int(row["timeseries_id"]) not in unavailable_timeseries_ids
-            ]
+        rows[:] = _official_rdata_source_available_rows(
+            rows,
+            unavailable_by_day[day_utc],
+        )
         rows.sort(key=lambda row: (
             row["observed_at_utc"], row["timeseries_id"], row["pollutant_code"],
         ))
@@ -15632,15 +15828,19 @@ def _prepare_official_rdata_proposal(
     unavailable_timeseries_ids = {
         int(scope["timeseries_id"]) for scope in unavailable_scopes
     }
-    selected_binding_timeseries_ids = {
-        int(binding["timeseries_id"])
-        for site_bindings in dict(context.get("bindings") or {}).values()
-        for code, binding in dict(site_bindings).items()
-        if str(code) in pollutants
-    }
-    source_available_timeseries_ids = (
-        selected_binding_timeseries_ids - unavailable_timeseries_ids
-    )
+    source_available_timeseries_ids: set[int] = set()
+    source_available_pollutant_codes: list[str] = []
+    for pollutant_code in pollutants:
+        pollutant_available_ids, _unavailable_ids, _scopes = (
+            _official_rdata_partition_availability(
+                context=context,
+                day_utc=day_utc,
+                pollutant_code=pollutant_code,
+            )
+        )
+        source_available_timeseries_ids.update(pollutant_available_ids)
+        if pollutant_available_ids:
+            source_available_pollutant_codes.append(pollutant_code)
     preserved_rows: list[dict[str, Any]] = []
     preserved_baseline_identity: dict[str, Any] = {
         "source": "dropbox",
@@ -15649,12 +15849,15 @@ def _prepare_official_rdata_proposal(
     if unavailable_timeseries_ids:
         baseline_root = Path(resolve_r2_history_root({**os.environ, **env}))
         for pollutant_code in pollutants:
+            pollutant_unavailable_scopes = [
+                dict(scope) for scope in unavailable_scopes
+                if scope["pollutant_code"] == pollutant_code
+            ]
             pollutant_unavailable_ids = {
                 int(scope["timeseries_id"])
-                for scope in unavailable_scopes
-                if scope["pollutant_code"] == pollutant_code
+                for scope in pollutant_unavailable_scopes
             }
-            if not pollutant_unavailable_ids:
+            if not pollutant_unavailable_scopes:
                 continue
             partition_prefix = (
                 f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
@@ -15669,6 +15872,7 @@ def _prepare_official_rdata_proposal(
                 "source_unavailable_timeseries_ids": sorted(
                     pollutant_unavailable_ids
                 ),
+                "source_unavailable_scopes": pollutant_unavailable_scopes,
                 "manifest_key": f"{partition_prefix}/manifest.json",
             }
             if not manifest_path.is_file():
@@ -15739,9 +15943,12 @@ def _prepare_official_rdata_proposal(
             )
             selected_baseline_rows = []
             for row in baseline_rows:
-                timeseries_id = int(row.get("timeseries_id") or 0)
-                if timeseries_id not in pollutant_unavailable_ids:
+                if not _official_rdata_row_is_source_unavailable(
+                    row,
+                    pollutant_unavailable_scopes,
+                ):
                     continue
+                timeseries_id = int(row.get("timeseries_id") or 0)
                 selected_baseline_rows.append({
                     "connector_id": int(row["connector_id"]),
                     "station_id": int(row["station_id"]),
@@ -15792,6 +15999,9 @@ def _prepare_official_rdata_proposal(
         "source_unavailable_scopes": unavailable_scopes,
         "source_available_timeseries_ids": sorted(
             source_available_timeseries_ids
+        ),
+        "source_available_pollutant_codes": sorted(
+            source_available_pollutant_codes
         ),
         "source_unavailable_timeseries_ids": sorted(
             unavailable_timeseries_ids
@@ -15870,7 +16080,7 @@ def _official_rdata_source_counts_for_partition(
     day_utc: str,
     pollutant_code: str,
 ) -> tuple[dict[int, int], dict[str, Any]]:
-    """Return current-run counts only for source-available official bindings."""
+    """Return current-run counts for exact source-available timestamp windows."""
     context = OFFICIAL_RDATA_RUN_CONTEXTS[source_key]
     all_bindings = {
         int(binding["timeseries_id"])
@@ -15878,23 +16088,23 @@ def _official_rdata_source_counts_for_partition(
         for code, binding in dict(site_bindings).items()
         if str(code) == pollutant_code
     }
-    unavailable_scopes = [
-        dict(scope)
-        for scope in list(
-            (context.get("source_unavailable_by_day") or {}).get(day_utc) or []
+    available_ids, unavailable_ids, unavailable_scopes = (
+        _official_rdata_partition_availability(
+            context=context,
+            day_utc=day_utc,
+            pollutant_code=pollutant_code,
         )
-        if str(scope.get("pollutant_code") or "") == pollutant_code
-    ]
-    unavailable_ids = {
-        int(scope["timeseries_id"]) for scope in unavailable_scopes
-    }
-    available_ids = all_bindings - unavailable_ids
+    )
     counts: dict[int, int] = {}
     for row in list((context.get("rows_by_day") or {}).get(day_utc) or []):
         timeseries_id = int(row["timeseries_id"])
         if (
             str(row.get("pollutant_code") or "") == pollutant_code
             and timeseries_id in available_ids
+            and not _official_rdata_row_is_source_unavailable(
+                row,
+                unavailable_scopes,
+            )
         ):
             counts[timeseries_id] = counts.get(timeseries_id, 0) + 1
     if not all_bindings:
@@ -15928,9 +16138,14 @@ def _official_rdata_source_counts_for_partition(
         "source_unavailable_scopes": unavailable_scopes,
         "source_file_count": len(required_files),
         "source_file_keys": required_files,
+        "required_source_file_count": len(required_files),
+        "successful_source_file_count": len(required_files),
         "source_unavailable_file_keys": unavailable_files,
         "source_skip_reason": skip_reason,
-        "comparison_scope": "source_available_timeseries_only",
+        "source_available_pollutant_codes": (
+            [pollutant_code] if available_ids else []
+        ),
+        "comparison_scope": "source_available_timestamp_windows",
     }
     evidence["partition"] = {
         "state": state,
@@ -15943,7 +16158,12 @@ def _official_rdata_source_counts_for_partition(
         "source_available_timeseries_ids": sorted(available_ids),
         "source_unavailable_timeseries_ids": sorted(unavailable_ids),
         "source_skip_reason": skip_reason,
-        "comparison_scope": "source_available_timeseries_only",
+        "required_source_file_count": len(required_files),
+        "successful_source_file_count": len(required_files),
+        "source_available_pollutant_codes": (
+            [pollutant_code] if available_ids else []
+        ),
+        "comparison_scope": "source_available_timestamp_windows",
     }
     return counts, evidence
 
@@ -16594,13 +16814,23 @@ def _load_complete_connector_day_source_evidence(
     ):
         raise ValueError("complete connector-day detector source evidence counts are invalid")
     hash_evidence = evidence.get("observation_content_hashes")
-    if not isinstance(hash_evidence, dict) or sorted(hash_evidence) != sorted(
-        per_pollutant
+    expected_hash_pollutants = set(per_pollutant)
+    if source_adapter in OFFICIAL_RDATA_NETWORKS:
+        expected_hash_pollutants.update(
+            str(value)
+            for value in list(
+                evidence.get("source_available_pollutant_codes") or []
+            )
+        )
+    if (
+        not isinstance(hash_evidence, dict)
+        or sorted(hash_evidence) != sorted(expected_hash_pollutants)
     ):
         raise ValueError(
             "complete connector-day observation content hash evidence is incomplete"
         )
-    for pollutant_code, row_count in per_pollutant.items():
+    for pollutant_code in sorted(expected_hash_pollutants):
+        row_count = int(per_pollutant.get(pollutant_code, 0))
         metadata = hash_evidence.get(pollutant_code)
         if not isinstance(metadata, Mapping):
             raise ValueError(
@@ -16644,11 +16874,28 @@ def _load_complete_connector_day_source_evidence(
         final_pollutant_counts = dict(
             evidence.get("final_target_pollutant_counts") or {}
         )
+        empty_final_target_pollutants = sorted(
+            str(value) for value in list(
+                evidence.get("empty_final_target_pollutant_codes") or []
+            )
+        )
         if not isinstance(final_hashes, Mapping) or sorted(final_hashes) != sorted(
             final_pollutant_counts
         ):
             raise ValueError(
                 "official RData final target hash evidence is incomplete"
+            )
+        if (
+            len(empty_final_target_pollutants)
+            != len(set(empty_final_target_pollutants))
+            or empty_final_target_pollutants
+            != sorted(
+                code for code, count in final_pollutant_counts.items()
+                if int(count) == 0
+            )
+        ):
+            raise ValueError(
+                "official RData empty final target evidence is invalid"
             )
         for pollutant_code, row_count in final_pollutant_counts.items():
             _validate_observation_content_hash_metadata(
@@ -17172,7 +17419,28 @@ def _derive_observation_hash_check_pollutants(
             source_row_count = int(candidate.get("source_row_count") or 0)
         except (TypeError, ValueError):
             source_row_count = 0
-        if source_row_count <= 0 or not isinstance(source_counts, Mapping) or not source_counts:
+        source_state = str(
+            (
+                candidate.get("source_evidence")
+                if isinstance(candidate.get("source_evidence"), Mapping)
+                else {}
+            ).get("source_partition_state")
+            or ""
+        )
+        valid_non_empty = (
+            source_state == "successful_non_empty"
+            and source_row_count > 0
+            and isinstance(source_counts, Mapping)
+            and bool(source_counts)
+        )
+        valid_empty = (
+            _official_rdata_source_for_connector(connector_id) is not None
+            and source_state == "successful_empty"
+            and source_row_count == 0
+            and isinstance(source_counts, Mapping)
+            and not source_counts
+        )
+        if not (valid_non_empty or valid_empty):
             skipped[key] = "no_executable_source_rows"
             continue
         suitable, reason = _observation_repair_source_evidence_is_complete(
@@ -17430,6 +17698,7 @@ def _assert_detector_and_proposal_source_evidence_agree(
         "source_artifact_availability_sha256",
         "source_csv_records_scanned",
         "source_available_timeseries_ids",
+        "source_available_pollutant_codes",
         "source_unavailable_timeseries_ids",
         "source_unavailable_scopes",
         "preserved_baseline_rows_sha256",
@@ -17439,6 +17708,7 @@ def _assert_detector_and_proposal_source_evidence_agree(
         "final_target_row_count",
         "final_target_timeseries_row_counts",
         "final_target_pollutant_counts",
+        "empty_final_target_pollutant_codes",
         "final_target_observation_content_hashes",
     )
     mismatched = [field for field in fields if detector.get(field) != proposal.get(field)]
@@ -18062,30 +18332,31 @@ def run_v2_observation_content_hash_checks(
                 or []
             )
         }
-        if unavailable_timeseries_ids:
-            available_timeseries_ids = {
-                int(value)
-                for value in list(
-                    (candidate.get("source_evidence") or {}).get(
-                        "source_available_timeseries_ids"
-                    )
-                    or []
+        unavailable_scopes = [
+            dict(scope)
+            for scope in list(
+                (candidate.get("source_evidence") or {}).get(
+                    "source_unavailable_scopes"
                 )
-            }
+                or []
+            )
+            if str(scope.get("pollutant_code") or "") == pollutant_code
+        ]
+        if unavailable_scopes:
             try:
                 baseline_rows = _observation_rows_from_local_parquet_for_shared_hash(
                     parquet_paths=candidate.get("parquet_paths") or [],
                 )
-                baseline_available_rows = [
-                    row for row in baseline_rows
-                    if int(row.get("timeseries_id") or 0)
-                    in available_timeseries_ids
-                ]
+                baseline_available_rows = _official_rdata_source_available_rows(
+                    baseline_rows,
+                    unavailable_scopes,
+                )
                 baseline_available_hash = (
                     _compute_observation_hash_with_shared_javascript(
                         rows=baseline_available_rows,
                         is_sos=False,
                         env=env,
+                        allow_empty=True,
                     )
                 )
             except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
@@ -22174,17 +22445,10 @@ def _capture_local_v2_observation_scope(
     selected_pollutants = _normalise_repair_pollutants(repair_pollutants)
     source_root = generated_root / connector_prefix
     manifest_source = source_root / "manifest.json"
-    if not manifest_source.is_file():
-        raise FileNotFoundError(f"canonical connector manifest is unavailable: {connector_prefix}")
-    manifest = json.loads(manifest_source.read_text(encoding="utf-8"))
-    if (
-        not isinstance(manifest, Mapping)
-        or manifest.get("history_version") != "v2"
-        or manifest.get("domain") != "observations"
-        or str(manifest.get("day_utc") or "") != day_utc
-        or int(manifest.get("connector_id") or 0) != int(connector_id)
-    ):
-        raise ValueError("canonical connector manifest identity is invalid")
+    manifest = (
+        json.loads(manifest_source.read_text(encoding="utf-8"))
+        if manifest_source.is_file() else None
+    )
     evidence_path = (
         stage_root / f"day_utc={day_utc}" /
         f"connector_id={int(connector_id)}" / "source-evidence.json"
@@ -22242,6 +22506,29 @@ def _capture_local_v2_observation_scope(
     is_official_rdata = str(evidence.get("source_adapter") or "") in (
         OFFICIAL_RDATA_NETWORKS
     )
+    empty_final_target_pollutants = sorted(
+        str(value) for value in list(
+            evidence.get("empty_final_target_pollutant_codes") or []
+        )
+    )
+    empty_only_proposal = (
+        is_official_rdata
+        and bool(selected_pollutants)
+        and empty_final_target_pollutants == selected_pollutants
+    )
+    if manifest is None:
+        if not empty_only_proposal:
+            raise FileNotFoundError(
+                f"canonical connector manifest is unavailable: {connector_prefix}"
+            )
+    elif (
+        not isinstance(manifest, Mapping)
+        or manifest.get("history_version") != "v2"
+        or manifest.get("domain") != "observations"
+        or str(manifest.get("day_utc") or "") != day_utc
+        or int(manifest.get("connector_id") or 0) != int(connector_id)
+    ):
+        raise ValueError("canonical connector manifest identity is invalid")
     target_hashes = (
         evidence.get("final_target_observation_content_hashes")
         if is_official_rdata else source_hashes
@@ -22261,8 +22548,14 @@ def _capture_local_v2_observation_scope(
             if path.parent.name == f"pollutant_code={pollutant_code}"
         ]
         authoritative_no_data = (
-            run_state.get("execution_path")
-            == SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH
+            (
+                run_state.get("execution_path")
+                == SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH
+                or (
+                    is_official_rdata
+                    and pollutant_code in empty_final_target_pollutants
+                )
+            )
             and len(selected_pollutants) == 1
             and int(
                 evidence.get(
@@ -22303,6 +22596,8 @@ def _capture_local_v2_observation_scope(
         pollutant_manifest_path = (
             source_root / f"pollutant_code={pollutant_code}" / "manifest.json"
         )
+        if authoritative_no_data and not pollutant_manifest_path.is_file():
+            continue
         pollutant_manifest = json.loads(
             pollutant_manifest_path.read_text(encoding="utf-8")
         )
@@ -22348,29 +22643,34 @@ def _capture_local_v2_observation_scope(
         evidence.get("final_target_row_count")
         if is_official_rdata else len(source_rows)
     )
-    manifest_summary, mismatches = _v2_observation_manifest_evidence_mismatches(
-        manifest,
-        expected_source_row_count=expected_target_row_count,
-        expected_timeseries_row_counts=expected_counts,
-        expected_pollutant_counts=expected_pollutant_counts,
-        source_evidence_pollutant_set=evidence_pollutants,
-    )
-    if mismatches:
-        first_field = str(mismatches[0].get("field") or "manifest")
-        raise CanonicalConnectorManifestValidationError(
-            f"source_evidence_{first_field}_mismatch",
-            {
-                "expected_source_row_count": expected_target_row_count,
-                "expected_timeseries_count": len(expected_counts),
-                "expected_pollutant_counts": dict(sorted(expected_pollutant_counts.items())),
-                "source_evidence_pollutant_set": sorted(
-                    str(value).strip() for value in evidence_pollutants
-                    if str(value or "").strip()
-                ),
-                "manifest": manifest_summary,
-                "mismatches": mismatches[:25],
-            },
+    if manifest is not None:
+        manifest_pollutant_counts = {
+            code: count for code, count in expected_pollutant_counts.items()
+            if count > 0
+        }
+        manifest_summary, mismatches = _v2_observation_manifest_evidence_mismatches(
+            manifest,
+            expected_source_row_count=sum(manifest_pollutant_counts.values()),
+            expected_timeseries_row_counts=expected_counts,
+            expected_pollutant_counts=manifest_pollutant_counts,
+            source_evidence_pollutant_set=sorted(manifest_pollutant_counts),
         )
+        if mismatches:
+            first_field = str(mismatches[0].get("field") or "manifest")
+            raise CanonicalConnectorManifestValidationError(
+                f"source_evidence_{first_field}_mismatch",
+                {
+                    "expected_source_row_count": expected_target_row_count,
+                    "expected_timeseries_count": len(expected_counts),
+                    "expected_pollutant_counts": dict(sorted(expected_pollutant_counts.items())),
+                    "source_evidence_pollutant_set": sorted(
+                        str(value).strip() for value in evidence_pollutants
+                        if str(value or "").strip()
+                    ),
+                    "manifest": manifest_summary,
+                    "mismatches": mismatches[:25],
+                },
+            )
     object_paths = sorted(
         path for path in source_root.rglob("*") if path.is_file() and (
             not selected_pollutants
@@ -22380,7 +22680,7 @@ def _capture_local_v2_observation_scope(
             )
         )
     )
-    if not object_paths:
+    if not object_paths and not empty_only_proposal:
         raise ValueError("canonical connector proposal has no objects")
     captured: list[str] = []
     parquet_pattern = re.compile(
@@ -30114,6 +30414,8 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 f"site={scope.get('site_code')} year={scope.get('source_year')} "
                 f"day={scope.get('day_utc')} pollutant={scope.get('pollutant_code')} "
                 f"timeseries_id={scope.get('timeseries_id')} status=404 "
+                "canonical_windows="
+                f"{json.dumps(scope.get('canonical_unavailable_windows') or [], separators=(',', ':'))} "
                 "action=preserve_pinned_baseline_scope"
             )
         if official.get("skipped_reason"):
