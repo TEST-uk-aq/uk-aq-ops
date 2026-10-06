@@ -22251,6 +22251,47 @@ def _finalise_staged_write_set_provenance(
     return audit
 
 
+def _finalise_generic_file_backed_proposal_if_ready(
+    run_state: dict[str, Any],
+    *,
+    dedicated_sos_historical_replacement: bool,
+    observation_failed: bool,
+    metadata: Mapping[str, Any],
+    log: logging.Logger | None = None,
+) -> bool:
+    """Persist the generic fixed-v3 final ownership freeze when it is valid."""
+    if dedicated_sos_historical_replacement or observation_failed:
+        return False
+    manifest_status = str(
+        metadata.get("manifest_status") or metadata.get("status") or "not_run"
+    )
+    index_status = str(
+        metadata.get("index_status") or metadata.get("status") or "not_run"
+    )
+    if (
+        manifest_status in {"failed", "blocked_dependency"}
+        or index_status in {"failed", "blocked_dependency"}
+        or bool(run_state.get("blocked_scopes"))
+    ):
+        return False
+    transport = run_state.get("proposal_transport")
+    ingestion = run_state.get("proposal_ingestion")
+    if (
+        not isinstance(transport, Mapping)
+        or transport.get("transport_mode")
+        != "file_backed_compact_proposal"
+        or not isinstance(ingestion, Mapping)
+        or ingestion.get("status") != "complete"
+        or ingestion.get("node_apply_launch_permitted") is not False
+        or ingestion.get("completed_object_count")
+        != ingestion.get("total_object_count")
+    ):
+        return False
+    _finalise_staged_write_set_provenance(run_state, log=log)
+    write_run_state(run_state)
+    return True
+
+
 def _validated_observation_pollutant_manifest_row_count(
     payload: Any,
     *,
@@ -27371,6 +27412,15 @@ def run_v2_integrity_repair_flow(
         executor_result=metadata,
         dry_run=dry_run,
         require_file_backed_bodies=True,
+        log=log,
+    )
+    _finalise_generic_file_backed_proposal_if_ready(
+        run_state,
+        dedicated_sos_historical_replacement=(
+            dedicated_sos_historical_replacement
+        ),
+        observation_failed=observation_failed,
+        metadata=metadata,
         log=log,
     )
     if dedicated_sos_historical_replacement and not observation_failed and str(
