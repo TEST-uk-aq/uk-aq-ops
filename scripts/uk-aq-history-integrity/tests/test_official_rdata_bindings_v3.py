@@ -8,9 +8,11 @@ import gzip
 import hashlib
 import importlib.util
 import logging
+import json
 from pathlib import Path
 import sys
 import tempfile
+import subprocess
 import unittest
 from unittest import mock
 import urllib.error
@@ -32,6 +34,7 @@ RDATA = sys.modules["integrity.official_network_rdata"]
 class OfficialRDataBindingsV3Tests(unittest.TestCase):
     def setUp(self) -> None:
         self.conn = INTEGRITY.open_db(":memory:")
+        INTEGRITY.OFFICIAL_RDATA_RUN_CONTEXTS.clear()
 
     def tearDown(self) -> None:
         self.conn.close()
@@ -130,9 +133,12 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
         temporary_directory: str,
         from_day: str = "2026-09-28",
         to_day: str = "2026-09-28",
+        decode_side_effect=None,
+        decoded_rows: list[dict[str, str]] | None = None,
+        site_code: str = "SITE1",
     ) -> dict[str, object]:
         self.add_binding(
-            site_code="SITE1",
+            site_code=site_code,
             station_id=101,
             timeseries_id=1001,
             phenomenon_id=2001,
@@ -158,7 +164,8 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
         ), mock.patch.object(
             INTEGRITY,
             "extract_official_rdata_site_year",
-            return_value=[],
+            return_value=list(decoded_rows or []),
+            side_effect=decode_side_effect,
         ):
             metrics = INTEGRITY.check_official_network_rdata(
                 conn=self.conn,
@@ -496,7 +503,7 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
     def test_authoritative_no_coverage_site_year_is_not_fetched_or_required_by_day(self) -> None:
         calls: list[str] = []
 
-        def download(url: str, _destination: Path) -> dict[str, object]:
+        def download(url: str, _destination: Path, **_kwargs) -> dict[str, object]:
             calls.append(url)
             return {
                 "bytes": 100,
@@ -530,8 +537,8 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             "not_fetched_authoritative_no_coverage",
         )
 
-    def test_required_site_year_http_404_still_fails_closed(self) -> None:
-        def download(url: str, _destination: Path) -> dict[str, object]:
+    def test_car04_ongoing_2026_http_404_is_source_unavailable(self) -> None:
+        def download(url: str, _destination: Path, **_kwargs) -> dict[str, object]:
             if url.endswith("WAQ_metadata.RData"):
                 return {
                     "bytes": 100,
@@ -539,25 +546,53 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
                     "etag": None,
                     "last_modified": None,
                 }
-            error = urllib.error.HTTPError(url, 404, "Not Found", {}, None)
-            error.close()
-            raise error
+            raise RDATA.AuthoritativeSourceArtifactAbsent(
+                canonical_url=url,
+                final_url=url.replace(
+                    "https://airquality.gov.wales/",
+                    "https://www.airquality.gov.wales/",
+                ),
+                requested_at_utc="2026-10-06T00:00:00+00:00",
+            )
 
         with tempfile.TemporaryDirectory() as temporary_directory:
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "HTTP 404 is not authoritative no-coverage evidence",
-            ):
-                self.run_acquisition(
-                    metadata_rows=[self.metadata_row(end_date="ongoing")],
-                    download_side_effect=download,
-                    temporary_directory=temporary_directory,
-                )
+            result = self.run_acquisition(
+                metadata_rows=[self.metadata_row(
+                    site_code="CAR04", end_date="ongoing"
+                )],
+                download_side_effect=download,
+                temporary_directory=temporary_directory,
+                site_code="CAR04",
+            )
+        self.assertEqual(
+            result["metrics"]["site_year_files_source_unavailable"], 1
+        )
+        self.assertEqual(result["metrics"]["canonical_rows"], 0)
+        context = INTEGRITY.OFFICIAL_RDATA_RUN_CONTEXTS["waqn"]
+        self.assertEqual(
+            context["required_by_day"]["2026-09-28"], ["waqn:metadata"]
+        )
+        [scope] = context["source_unavailable_scopes"]
+        self.assertEqual(scope["site_code"], "CAR04")
+        self.assertEqual(scope["reason"], "source_artifact_unavailable")
+        self.assertEqual(scope["timeseries_id"], 1001)
+        self.assertEqual(scope["http_status"], 404)
+        counts, evidence = INTEGRITY._official_rdata_source_counts_for_partition(
+            source_key="waqn",
+            day_utc="2026-09-28",
+            pollutant_code="no2",
+        )
+        self.assertEqual(counts, {})
+        self.assertEqual(
+            evidence["source_partition_state"], "source_artifact_unavailable"
+        )
+        self.assertEqual(evidence["source_unavailable_timeseries_ids"], [1001])
+        self.assertFalse(evidence["source_counts_available"])
 
     def test_site_year_fetched_once_and_required_only_for_covered_day(self) -> None:
         calls: list[str] = []
 
-        def download(url: str, _destination: Path) -> dict[str, object]:
+        def download(url: str, _destination: Path, **_kwargs) -> dict[str, object]:
             calls.append(url)
             return {
                 "bytes": 100,
@@ -581,6 +616,591 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
         source_file = "waqn:site_ref=SITE1:year=2026"
         self.assertIn(source_file, context["required_by_day"]["2026-09-27"])
         self.assertNotIn(source_file, context["required_by_day"]["2026-09-28"])
+
+    def test_metadata_404_remains_fail_closed(self) -> None:
+        def download(url: str, _destination: Path, **_kwargs):
+            raise RDATA.AuthoritativeSourceArtifactAbsent(
+                canonical_url=url,
+                final_url=url,
+                requested_at_utc="2026-10-06T00:00:00+00:00",
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with self.assertRaisesRegex(
+                RuntimeError, "required metadata RData fetch failed closed"
+            ):
+                self.run_acquisition(
+                    metadata_rows=[self.metadata_row()],
+                    download_side_effect=download,
+                    temporary_directory=temporary_directory,
+                )
+
+    def test_site_year_non_404_and_transport_fail_closed(self) -> None:
+        for failure in (
+            urllib.error.HTTPError(
+                "https://airquality.gov.wales/sites/default/files/openair/R_data/"
+                "SITE1_2026.RData",
+                500,
+                "Server Error",
+                {},
+                None,
+            ),
+            TimeoutError("timed out"),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                original_conn = self.conn
+                self.conn = INTEGRITY.open_db(":memory:")
+                def download(url: str, _destination: Path, **_kwargs):
+                    if url.endswith("WAQ_metadata.RData"):
+                        return {
+                            "bytes": 100,
+                            "sha256": "d" * 64,
+                            "etag": None,
+                            "last_modified": None,
+                        }
+                    raise failure
+
+                try:
+                    with tempfile.TemporaryDirectory() as temporary_directory:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "required RData fetch failed closed"
+                        ):
+                            self.run_acquisition(
+                                metadata_rows=[self.metadata_row()],
+                                download_side_effect=download,
+                                temporary_directory=temporary_directory,
+                            )
+                finally:
+                    self.conn.close()
+                    self.conn = original_conn
+                    if isinstance(failure, urllib.error.HTTPError):
+                        failure.close()
+
+    def test_provider_host_validation_accepts_only_explicit_aliases(self) -> None:
+        waqn = RDATA.NETWORKS["waqn"]
+        path = "/sites/default/files/openair/R_data/CAR04_2026.RData"
+        for host in waqn.accepted_hosts:
+            self.assertEqual(
+                RDATA._validated_provider_url(
+                    f"https://{host}{path}", config=waqn, expected_path=path
+                ),
+                f"https://{host}{path}",
+            )
+        for url in (
+            f"https://airquality.gov.wales.evil.example{path}",
+            f"https://www.scottishairquality.scot{path}",
+            f"http://www.airquality.gov.wales{path}",
+            f"https://www.airquality.gov.wales/other/CAR04_2026.RData",
+        ):
+            with self.subTest(url=url), self.assertRaisesRegex(
+                RuntimeError, "unexpected waqn RData provider URL"
+            ):
+                RDATA._validated_provider_url(
+                    url, config=waqn, expected_path=path
+                )
+
+        saqn = RDATA.NETWORKS["saqn"]
+        saqn_path = "/openair/R_data/ABD_2026.RData"
+        for host in saqn.accepted_hosts:
+            RDATA._validated_provider_url(
+                f"https://{host}{saqn_path}",
+                config=saqn,
+                expected_path=saqn_path,
+            )
+
+    def test_download_classifies_only_authenticated_canonical_404_as_absent(self) -> None:
+        config = RDATA.NETWORKS["waqn"]
+        canonical_url = config.base_url + "CAR04_2026.RData"
+        accepted_final_url = canonical_url.replace(
+            "https://airquality.gov.wales/",
+            "https://www.airquality.gov.wales/",
+        )
+        accepted_404 = urllib.error.HTTPError(
+            accepted_final_url, 404, "Not Found", {}, None
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory, mock.patch.object(
+            RDATA.urllib.request,
+            "urlopen",
+            side_effect=accepted_404,
+        ):
+            with self.assertRaises(
+                RDATA.AuthoritativeSourceArtifactAbsent
+            ) as caught:
+                RDATA.download_pinned(
+                    canonical_url,
+                    Path(temporary_directory) / "CAR04_2026.RData",
+                    config=config,
+                )
+        accepted_404.close()
+        self.assertEqual(caught.exception.final_url, accepted_final_url)
+        self.assertEqual(caught.exception.http_status, 404)
+
+        unexpected_404 = urllib.error.HTTPError(
+            "https://airquality.gov.wales.evil.example/sites/default/files/"
+            "openair/R_data/CAR04_2026.RData",
+            404,
+            "Not Found",
+            {},
+            None,
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory, mock.patch.object(
+            RDATA.urllib.request,
+            "urlopen",
+            side_effect=unexpected_404,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "unexpected waqn RData provider URL"
+            ):
+                RDATA.download_pinned(
+                    canonical_url,
+                    Path(temporary_directory) / "CAR04_2026.RData",
+                    config=config,
+                )
+        unexpected_404.close()
+
+    def test_partial_successful_download_fails_closed(self) -> None:
+        class PartialResponse:
+            status = 200
+            headers = {"Content-Length": "10"}
+
+            def __init__(self, url: str) -> None:
+                self.url = url
+                self.read_count = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def geturl(self) -> str:
+                return self.url
+
+            def read(self, _size: int) -> bytes:
+                self.read_count += 1
+                return b"short" if self.read_count == 1 else b""
+
+        config = RDATA.NETWORKS["waqn"]
+        canonical_url = config.base_url + "CAR04_2026.RData"
+        with tempfile.TemporaryDirectory() as temporary_directory, mock.patch.object(
+            RDATA.urllib.request,
+            "urlopen",
+            return_value=PartialResponse(canonical_url),
+        ):
+            destination = Path(temporary_directory) / "CAR04_2026.RData"
+            with self.assertRaisesRegex(RuntimeError, "download was incomplete"):
+                RDATA.download_pinned(
+                    canonical_url,
+                    destination,
+                    config=config,
+                )
+            self.assertFalse(destination.exists())
+            self.assertFalse(destination.with_name(destination.name + ".part").exists())
+
+    def test_malformed_present_site_year_remains_fail_closed(self) -> None:
+        def download(url: str, _destination: Path, **_kwargs):
+            return {
+                "bytes": 100,
+                "sha256": "e" * 64,
+                "etag": None,
+                "last_modified": None,
+            }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with self.assertRaisesRegex(
+                RuntimeError, "site-year RData decode failed closed"
+            ):
+                self.run_acquisition(
+                    metadata_rows=[self.metadata_row()],
+                    download_side_effect=download,
+                    temporary_directory=temporary_directory,
+                    decode_side_effect=RuntimeError("malformed workspace"),
+                )
+
+    def test_absent_site_does_not_stop_other_available_site(self) -> None:
+        self.add_binding(
+            site_code="SITE2",
+            station_id=102,
+            timeseries_id=1002,
+            phenomenon_id=2002,
+            observed_property_id=12,
+            canonical_code="no2",
+            label="NO2",
+        )
+
+        def download(url: str, _destination: Path, **_kwargs):
+            if url.endswith("SITE1_2026.RData"):
+                raise RDATA.AuthoritativeSourceArtifactAbsent(
+                    canonical_url=url,
+                    final_url=url,
+                    requested_at_utc="2026-10-06T00:00:00+00:00",
+                )
+            return {
+                "bytes": 100,
+                "sha256": "f" * 64,
+                "etag": None,
+                "last_modified": None,
+            }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result = self.run_acquisition(
+                metadata_rows=[
+                    self.metadata_row(site_code="SITE1"),
+                    self.metadata_row(site_code="SITE2"),
+                ],
+                download_side_effect=download,
+                temporary_directory=temporary_directory,
+                decoded_rows=[{
+                    "date": "2026-09-28T00:00:00Z",
+                    "NO2": "17.5",
+                }],
+            )
+        self.assertEqual(result["metrics"]["site_year_files_fetched"], 1)
+        self.assertEqual(
+            result["metrics"]["site_year_files_source_unavailable"], 1
+        )
+        counts, evidence = INTEGRITY._official_rdata_source_counts_for_partition(
+            source_key="waqn",
+            day_utc="2026-09-28",
+            pollutant_code="no2",
+        )
+        self.assertEqual(counts, {1002: 1})
+        self.assertEqual(evidence["source_available_timeseries_ids"], [1002])
+        self.assertEqual(evidence["source_unavailable_timeseries_ids"], [1001])
+        gap = INTEGRITY._build_v2_source_r2_mismatch_gap_if_complete(
+            source_partition_evidence=evidence,
+            day_utc="2026-09-28",
+            connector_id=9,
+            pollutant_code="no2",
+            expected_path="manifest.json",
+            source_counts=counts,
+            r2_counts={1002: 1},
+        )
+        self.assertIsNone(gap)
+
+    def test_january_split_marks_only_missing_raw_year_artifact(self) -> None:
+        def download(url: str, _destination: Path, **_kwargs):
+            if url.endswith("SITE1_2025.RData"):
+                raise RDATA.AuthoritativeSourceArtifactAbsent(
+                    canonical_url=url,
+                    final_url=url,
+                    requested_at_utc="2026-10-06T00:00:00+00:00",
+                )
+            return {
+                "bytes": 100,
+                "sha256": "1" * 64,
+                "etag": None,
+                "last_modified": None,
+            }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            result = self.run_acquisition(
+                metadata_rows=[self.metadata_row()],
+                download_side_effect=download,
+                temporary_directory=temporary_directory,
+                from_day="2026-01-01",
+                to_day="2026-01-01",
+            )
+        self.assertEqual(result["metrics"]["site_year_files_fetched"], 1)
+        [scope] = result["metrics"]["source_unavailable_scopes"]
+        self.assertEqual(scope["source_year"], 2025)
+        self.assertEqual(
+            scope["raw_source_windows"],
+            [{
+                "canonical_day_utc": "2026-01-01",
+                "raw_start_utc": "2025-12-31T23:00:00Z",
+                "raw_end_exclusive_utc": "2026-01-01T00:00:00Z",
+            }],
+        )
+
+    def test_proposal_keeps_source_and_preserved_baseline_rows_separate(self) -> None:
+        repo_root = Path(__file__).resolve().parents[3]
+        helper = (
+            repo_root / "scripts/uk-aq-history-integrity/bin/integrity/"
+            "official_network_rdata_proposal.mjs"
+        )
+        writer_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        source_row = {
+            "connector_id": 9,
+            "station_id": 101,
+            "timeseries_id": 1001,
+            "pollutant_code": "no2",
+            "observed_at_utc": "2026-09-28T01:00:00.000Z",
+            "value": 10.0,
+            "verification_status": "P",
+        }
+        preserved_row = {
+            "connector_id": 9,
+            "station_id": 102,
+            "timeseries_id": 1002,
+            "pollutant_code": "no2",
+            "observed_at_utc": "2026-09-28T01:00:00.000Z",
+            "value": 20.0,
+            "verification_status": "R",
+        }
+        for label, source_rows in (
+            ("mixed", [source_row]),
+            ("unavailable_only", []),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                payload = {
+                    "history_generation": "v3",
+                    "day_utc": "2026-09-28",
+                    "connector_id": 9,
+                    "source_adapter": "waqn",
+                    "requested_pollutant_set": ["no2"],
+                    "backed_up_at_utc": "2026-10-06T00:00:00Z",
+                    "rows": source_rows,
+                    "preserved_baseline_rows": [preserved_row],
+                    "preserved_baseline_identity": {
+                        "source": "dropbox",
+                        "partition_identities": [{
+                            "pollutant_code": "no2",
+                            "preserved_row_count": 1,
+                        }],
+                    },
+                    "source_available_timeseries_ids": (
+                        [1001] if source_rows else []
+                    ),
+                    "source_unavailable_timeseries_ids": [1002],
+                    "source_unavailable_scopes": [{
+                        "day_utc": "2026-09-28",
+                        "site_code": "SITE2",
+                        "source_year": 2026,
+                        "source_file_key": "waqn:site_ref=SITE2:year=2026",
+                        "pollutant_code": "no2",
+                        "station_id": 102,
+                        "timeseries_id": 1002,
+                        "reason": "source_artifact_unavailable",
+                    }],
+                    "source_file_identities": [{
+                        "source_file": "waqn:metadata",
+                        "sha256": "a" * 64,
+                        "bytes": 100,
+                    }],
+                    "required_source_files": ["waqn:metadata"],
+                    "authoritatively_absent_source_files": [],
+                    "authoritative_mapping_sha256": "b" * 64,
+                    "observed_property_mapping_sha256": "c" * 64,
+                    "ratification_audit": [],
+                    "mapping_audit": {
+                        "mapped_source_groups": [],
+                        "excluded_source_groups": [],
+                    },
+                    "rscript_identity": {
+                        "executable": "/usr/bin/Rscript",
+                        "version": "test",
+                    },
+                }
+                input_path = root / "input.json"
+                input_path.write_text(json.dumps(payload), encoding="utf-8")
+                completed = subprocess.run(
+                    [
+                        "node", str(helper), str(input_path), str(root / "stage"),
+                        "history/v3/observations", writer_sha, "v3",
+                    ],
+                    cwd=repo_root,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                evidence_path = (
+                    root / "stage/day_utc=2026-09-28/connector_id=9/"
+                    "source-evidence.json"
+                )
+                evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+                self.assertEqual(evidence["total_rows"], len(source_rows))
+                self.assertEqual(evidence["preserved_baseline_row_count"], 1)
+                self.assertEqual(
+                    evidence["final_target_row_count"], len(source_rows) + 1
+                )
+                self.assertEqual(
+                    evidence["per_timeseries_counts"],
+                    {"1001": 1} if source_rows else {},
+                )
+                self.assertEqual(
+                    evidence["final_target_timeseries_row_counts"],
+                    ({"1001": 1, "1002": 1} if source_rows else {"1002": 1}),
+                )
+                self.assertEqual(
+                    evidence["source_unavailable_timeseries_ids"], [1002]
+                )
+                self.assertNotEqual(
+                    evidence["canonical_rows_sha256"],
+                    evidence["preserved_baseline_rows_sha256"],
+                )
+                generated_parquets = list(
+                    (root / "stage/generated-objects").rglob("*.parquet")
+                )
+                self.assertTrue(generated_parquets)
+                pollutant_manifest_path = next(
+                    path for path in (root / "stage/generated-objects").rglob(
+                        "manifest.json"
+                    )
+                    if "pollutant_code=no2" in path.as_posix()
+                )
+                pollutant_manifest = json.loads(
+                    pollutant_manifest_path.read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    int(pollutant_manifest["row_count"]), len(source_rows) + 1
+                )
+                self.assertEqual(
+                    set(evidence["final_target_timeseries_row_counts"]),
+                    ({"1001", "1002"} if source_rows else {"1002"}),
+                )
+                self.assertFalse(list((root / "stage").rglob("*tombstone*")))
+
+    def test_prepare_proposal_reads_unavailable_rows_only_from_pinned_baseline(self) -> None:
+        repo_root = Path(__file__).resolve().parents[3]
+        day_utc = "2026-09-28"
+        partition_prefix = (
+            "history/v3/observations/day_utc=2026-09-28/connector_id=9/"
+            "pollutant_code=no2"
+        )
+        preserved_row = {
+            "connector_id": 9,
+            "station_id": 102,
+            "timeseries_id": 1002,
+            "pollutant_code": "no2",
+            "observed_at_utc": "2026-09-28T01:00:00.000Z",
+            "value": 20.0,
+            "verification_status": "R",
+        }
+        source_row = {
+            "connector_id": 9,
+            "station_id": 101,
+            "timeseries_id": 1001,
+            "pollutant_code": "no2",
+            "observed_at_utc": "2026-09-28T01:00:00.000Z",
+            "value": 10.0,
+            "verification_status": "P",
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            baseline_root = root / "baseline"
+            parquet_key = f"{partition_prefix}/part-00000.parquet"
+            parquet_path = baseline_root / parquet_key
+            parquet_path.parent.mkdir(parents=True)
+            parquet_body = b"pinned-baseline-parquet"
+            parquet_path.write_bytes(parquet_body)
+            manifest_path = baseline_root / partition_prefix / "manifest.json"
+            manifest_path.write_text(json.dumps({
+                "files": [{
+                    "key": parquet_key,
+                    "bytes": len(parquet_body),
+                    "etag_or_hash": hashlib.sha256(parquet_body).hexdigest(),
+                }],
+            }), encoding="utf-8")
+            unavailable_scope = {
+                "day_utc": day_utc,
+                "site_code": "SITE2",
+                "source_year": 2026,
+                "source_file_key": "waqn:site_ref=SITE2:year=2026",
+                "pollutant_code": "no2",
+                "station_id": 102,
+                "timeseries_id": 1002,
+                "reason": "source_artifact_unavailable",
+                "canonical_url": "https://airquality.gov.wales/sites/default/files/"
+                "openair/R_data/SITE2_2026.RData",
+                "final_url": "https://www.airquality.gov.wales/sites/default/files/"
+                "openair/R_data/SITE2_2026.RData",
+                "http_status": 404,
+                "raw_source_windows": [],
+            }
+            INTEGRITY.OFFICIAL_RDATA_RUN_CONTEXTS["waqn"] = {
+                "source_key": "waqn",
+                "connector_id": 9,
+                "bindings": {
+                    "SITE1": {"no2": {"station_id": 101, "timeseries_id": 1001}},
+                    "SITE2": {"no2": {"station_id": 102, "timeseries_id": 1002}},
+                },
+                "rows_by_day": {day_utc: [source_row]},
+                "source_unavailable_by_day": {day_utc: [unavailable_scope]},
+                "required_by_day": {day_utc: ["waqn:metadata", "waqn:site_ref=SITE1:year=2026"]},
+                "identities_by_key": {
+                    "waqn:metadata": {
+                        "source_file": "waqn:metadata", "bytes": 1, "sha256": "a" * 64,
+                    },
+                    "waqn:site_ref=SITE1:year=2026": {
+                        "source_file": "waqn:site_ref=SITE1:year=2026",
+                        "bytes": 1,
+                        "sha256": "b" * 64,
+                    },
+                },
+                "absent_keys": [],
+                "authoritative_mapping_sha256": "c" * 64,
+                "observed_property_mapping_sha256": "d" * 64,
+                "audits_by_day": {day_utc: []},
+                "mapping_audit": {
+                    "mapped_source_groups": [], "excluded_source_groups": [],
+                },
+                "rscript_identity": {
+                    "executable": "/usr/bin/Rscript", "version": "test",
+                },
+            }
+            stage_root = root / "stage"
+            with mock.patch.object(
+                INTEGRITY,
+                "resolve_r2_history_root",
+                return_value=baseline_root,
+            ), mock.patch.object(
+                INTEGRITY,
+                "_observation_rows_from_local_parquet_for_shared_hash",
+                return_value=[preserved_row],
+            ) as baseline_reader:
+                result = INTEGRITY._prepare_official_rdata_proposal(
+                    source_key="waqn",
+                    day_utc=day_utc,
+                    connector_id=9,
+                    selected_pollutants=["no2"],
+                    stage_root=stage_root,
+                    env={"UK_AQ_OPS_REPO_ROOT": str(repo_root)},
+                    history_generation="v3",
+                )
+            self.assertEqual(baseline_reader.call_count, 1)
+            self.assertEqual(result["source_timeseries_row_counts"], {"1001": 1})
+            self.assertEqual(
+                result["final_target_timeseries_row_counts"],
+                {"1001": 1, "1002": 1},
+            )
+            self.assertEqual(result["preserved_baseline_rows"], 1)
+            evidence = json.loads((
+                stage_root / f"day_utc={day_utc}/connector_id=9/source-evidence.json"
+            ).read_text(encoding="utf-8"))
+            self.assertEqual(evidence["total_rows"], 1)
+            self.assertEqual(evidence["preserved_baseline_row_count"], 1)
+            self.assertEqual(evidence["final_target_row_count"], 2)
+            validated_evidence, validated_source_rows = (
+                INTEGRITY._load_complete_connector_day_source_evidence(
+                    stage_root=stage_root,
+                    day_utc=day_utc,
+                    connector_id=9,
+                    repair_pollutants=["no2"],
+                )
+            )
+            self.assertEqual(validated_source_rows[0]["timeseries_id"], 1001)
+            self.assertEqual(
+                validated_evidence["source_unavailable_timeseries_ids"],
+                [1002],
+            )
+            [partition_identity] = evidence[
+                "preserved_baseline_identity"
+            ]["partition_identities"]
+            self.assertEqual(partition_identity["baseline_state"], "partition_present")
+            self.assertEqual(
+                partition_identity["object_identities"][1]["sha256"],
+                hashlib.sha256(parquet_body).hexdigest(),
+            )
 
     def test_january_first_retains_both_raw_source_year_windows(self) -> None:
         day = dt.date(2026, 1, 1)

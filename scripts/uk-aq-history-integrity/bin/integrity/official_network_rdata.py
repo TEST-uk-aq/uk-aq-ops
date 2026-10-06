@@ -17,6 +17,8 @@ from pathlib import Path
 import shutil
 import subprocess
 from typing import Any, Iterable, Mapping
+import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -28,6 +30,24 @@ class OfficialNetworkRDataConfig:
     base_url: str
     metadata_filename: str
     metadata_object: str
+    accepted_hosts: tuple[str, ...]
+
+
+class AuthoritativeSourceArtifactAbsent(RuntimeError):
+    """A canonical provider object ended in an authenticated HTTP 404."""
+
+    def __init__(
+        self,
+        *,
+        canonical_url: str,
+        final_url: str,
+        requested_at_utc: str,
+    ) -> None:
+        super().__init__(f"canonical provider object returned HTTP 404: {final_url}")
+        self.canonical_url = canonical_url
+        self.final_url = final_url
+        self.http_status = 404
+        self.requested_at_utc = requested_at_utc
 
 
 NETWORKS: dict[str, OfficialNetworkRDataConfig] = {
@@ -38,6 +58,7 @@ NETWORKS: dict[str, OfficialNetworkRDataConfig] = {
         base_url="https://airquality.gov.wales/sites/default/files/openair/R_data/",
         metadata_filename="WAQ_metadata.RData",
         metadata_object="metadata",
+        accepted_hosts=("airquality.gov.wales", "www.airquality.gov.wales"),
     ),
     "saqn": OfficialNetworkRDataConfig(
         source_key="saqn",
@@ -46,6 +67,10 @@ NETWORKS: dict[str, OfficialNetworkRDataConfig] = {
         base_url="https://www.scottishairquality.scot/openair/R_data/",
         metadata_filename="SCOT_metadata.RData",
         metadata_object="meta",
+        accepted_hosts=(
+            "scottishairquality.scot",
+            "www.scottishairquality.scot",
+        ),
     ),
 }
 
@@ -419,8 +444,45 @@ def classify_site_year_coverage(
     }
 
 
-def download_pinned(url: str, destination: Path, *, timeout: int = 180) -> dict[str, Any]:
+def _validated_provider_url(
+    url: str,
+    *,
+    config: OfficialNetworkRDataConfig,
+    expected_path: str,
+) -> str:
+    parsed = urllib.parse.urlsplit(str(url))
+    host = str(parsed.hostname or "").lower()
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.port not in (None, 443)
+        or host not in set(config.accepted_hosts)
+        or parsed.path != expected_path
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError(
+            f"unexpected {config.source_key} RData provider URL: {url}"
+        )
+    return urllib.parse.urlunsplit(("https", parsed.netloc, parsed.path, "", ""))
+
+
+def download_pinned(
+    url: str,
+    destination: Path,
+    *,
+    config: OfficialNetworkRDataConfig,
+    timeout: int = 180,
+) -> dict[str, Any]:
     """GET one source object once and atomically retain its exact bytes."""
+    requested_at_utc = dt.datetime.now(dt.timezone.utc).isoformat()
+    expected_path = urllib.parse.urlsplit(url).path
+    canonical_url = _validated_provider_url(
+        url,
+        config=config,
+        expected_path=expected_path,
+    )
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.name + ".part")
     digest = hashlib.sha256()
@@ -428,6 +490,11 @@ def download_pinned(url: str, destination: Path, *, timeout: int = 180) -> dict[
     request = urllib.request.Request(url, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
+            final_url = _validated_provider_url(
+                response.geturl(),
+                config=config,
+                expected_path=expected_path,
+            )
             if int(getattr(response, "status", 200)) != 200:
                 raise RuntimeError(f"GET {url} returned {response.status}")
             with temporary.open("wb") as output:
@@ -439,12 +506,44 @@ def download_pinned(url: str, destination: Path, *, timeout: int = 180) -> dict[
                     digest.update(chunk)
                     byte_count += len(chunk)
             headers = response.headers
+            raw_content_length = headers.get("Content-Length")
+            if raw_content_length is not None:
+                try:
+                    expected_bytes = int(raw_content_length)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"GET {url} returned an invalid Content-Length"
+                    ) from exc
+                if expected_bytes < 0 or byte_count != expected_bytes:
+                    raise RuntimeError(
+                        f"GET {url} download was incomplete: "
+                        f"expected_bytes={expected_bytes} actual_bytes={byte_count}"
+                    )
         temporary.replace(destination)
+    except urllib.error.HTTPError as exc:
+        temporary.unlink(missing_ok=True)
+        final_url = _validated_provider_url(
+            exc.geturl(),
+            config=config,
+            expected_path=expected_path,
+        )
+        if int(exc.code) == 404:
+            raise AuthoritativeSourceArtifactAbsent(
+                canonical_url=canonical_url,
+                final_url=final_url,
+                requested_at_utc=requested_at_utc,
+            ) from exc
+        raise
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
     return {
-        "url": url,
+        "url": canonical_url,
+        "canonical_url": canonical_url,
+        "final_url": final_url,
+        "availability": "present",
+        "http_status": 200,
+        "requested_at_utc": requested_at_utc,
         "bytes": byte_count,
         "sha256": digest.hexdigest(),
         "etag": headers.get("ETag"),

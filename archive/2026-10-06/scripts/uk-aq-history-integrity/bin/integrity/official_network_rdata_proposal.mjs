@@ -17,9 +17,6 @@ import {
   getObservationHistoryGeneration,
 } from "../../../../workers/shared/uk_aq_observation_history_generation.mjs";
 import {
-  computeObservationContentHash,
-} from "../../../../workers/shared/uk_aq_observation_content_hash.mjs";
-import {
   buildObservationHistoryV3SteadyStatePartition,
   OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES,
 } from "../../../../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
@@ -120,16 +117,6 @@ function main() {
     value: Number(row.value),
     verification_status: row.verification_status,
   }));
-  const preservedBaselineRows = (input.preserved_baseline_rows || []).map((row) => ({
-    connector_id: Number(row.connector_id),
-    station_id: Number(row.station_id),
-    timeseries_id: Number(row.timeseries_id),
-    pollutant_code: String(row.pollutant_code),
-    observed_at_utc: String(row.observed_at_utc),
-    value: Number(row.value),
-    verification_status: row.verification_status ?? null,
-  }));
-  const targetRows = [...rows, ...preservedBaselineRows];
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dayUtc) || !Number.isSafeInteger(connectorId) || connectorId <= 0) {
     throw new Error("invalid proposal scope");
   }
@@ -141,23 +128,11 @@ function main() {
       !requestedPollutants.includes(row.pollutant_code))) {
     throw new Error("proposal row escaped selected connector/day/pollutant scope");
   }
-  if (preservedBaselineRows.some((row) => row.connector_id !== connectorId ||
-      row.observed_at_utc.slice(0, 10) !== dayUtc ||
-      !requestedPollutants.includes(row.pollutant_code))) {
-    throw new Error("preserved baseline row escaped selected connector/day/pollutant scope");
-  }
-  const unavailableTimeseriesIds = new Set(
-    (input.source_unavailable_timeseries_ids || []).map((value) => Number(value)),
-  );
-  if (preservedBaselineRows.some((row) => !unavailableTimeseriesIds.has(row.timeseries_id)) ||
-      rows.some((row) => unavailableTimeseriesIds.has(row.timeseries_id))) {
-    throw new Error("source and preserved baseline row provenance overlaps");
-  }
+
   const pollutantManifests = [];
-  const sourceObservationContentHashes = {};
-  const finalTargetObservationContentHashes = {};
+  const observationContentHashes = {};
   for (const pollutantCode of requestedPollutants) {
-    const pollutantRows = targetRows.filter((row) => row.pollutant_code === pollutantCode);
+    const pollutantRows = rows.filter((row) => row.pollutant_code === pollutantCode);
     if (pollutantRows.length === 0) continue;
     let targetMetadata;
     let manifest;
@@ -213,13 +188,7 @@ function main() {
       writeObject(stageRoot, manifestKey, Buffer.from(JSON.stringify(manifest, null, 2), "utf8"));
     }
     const hashMetadata = contentHashMetadata(targetMetadata);
-    finalTargetObservationContentHashes[pollutantCode] = hashMetadata;
-    const sourcePollutantRows = rows.filter((row) => row.pollutant_code === pollutantCode);
-    if (sourcePollutantRows.length > 0) {
-      sourceObservationContentHashes[pollutantCode] = contentHashMetadata(
-        computeObservationContentHash(sourcePollutantRows),
-      );
-    }
+    observationContentHashes[pollutantCode] = hashMetadata;
     pollutantManifests.push(manifest);
   }
   if (pollutantManifests.length === 0) throw new Error("canonical proposal contains no rows");
@@ -249,16 +218,6 @@ function main() {
     verification_status: row.verification_status,
   }));
   const rowsBody = Buffer.from(JSON.stringify(evidenceRows), "utf8");
-  const preservedEvidenceRows = preservedBaselineRows.map((row) => ({
-    connector_id: row.connector_id,
-    station_id: row.station_id,
-    timeseries_id: row.timeseries_id,
-    pollutant_code: row.pollutant_code,
-    observed_at: row.observed_at_utc,
-    value: row.value,
-    verification_status: row.verification_status,
-  }));
-  const preservedRowsBody = Buffer.from(JSON.stringify(preservedEvidenceRows), "utf8");
   const identities = [...(input.source_file_identities || [])].map((identity) => ({
     source_file: String(identity.source_file || ""),
     sha256: String(identity.sha256 || ""),
@@ -280,8 +239,6 @@ function main() {
   const identityBody = Buffer.from(JSON.stringify(identities), "utf8");
   const perTimeseries = {};
   const perPollutant = {};
-  const finalTargetPerTimeseries = {};
-  const finalTargetPerPollutant = {};
   const verificationStatusCounts = { P: 0, R: 0 };
   for (const row of evidenceRows) {
     perTimeseries[String(row.timeseries_id)] = (perTimeseries[String(row.timeseries_id)] || 0) + 1;
@@ -291,29 +248,7 @@ function main() {
     }
     verificationStatusCounts[row.verification_status] += 1;
   }
-  for (const row of targetRows) {
-    finalTargetPerTimeseries[String(row.timeseries_id)] =
-      (finalTargetPerTimeseries[String(row.timeseries_id)] || 0) + 1;
-    finalTargetPerPollutant[row.pollutant_code] =
-      (finalTargetPerPollutant[row.pollutant_code] || 0) + 1;
-  }
   const contract = "pollutant_scoped_authoritative_connector_day_source_rows";
-  const sourceArtifactAvailabilityIdentity = (input.source_unavailable_scopes || [])
-    .map((scope) => ({
-      day_utc: String(scope.day_utc || ""),
-      site_code: String(scope.site_code || ""),
-      source_year: Number(scope.source_year),
-      source_file_key: String(scope.source_file_key || ""),
-      pollutant_code: String(scope.pollutant_code || ""),
-      station_id: Number(scope.station_id),
-      timeseries_id: Number(scope.timeseries_id),
-      reason: String(scope.reason || ""),
-      canonical_url: String(scope.canonical_url || ""),
-      final_url: String(scope.final_url || ""),
-      http_status: Number(scope.http_status),
-      raw_source_windows: scope.raw_source_windows || [],
-    }))
-    .sort((left, right) => canonicalJson(left).localeCompare(canonicalJson(right)));
   const evidenceInput = {
     source_adapter: sourceAdapter,
     day_utc: dayUtc,
@@ -321,15 +256,12 @@ function main() {
     source_file_identities_sha256: sha256(identityBody),
     requested_pollutant_set: requestedPollutants,
     contract,
-    evidence_contract_version: 5,
+    evidence_contract_version: 4,
     source_label_registry_snapshot_content_sha256: null,
     authoritative_station_timeseries_mapping_sha256: input.authoritative_mapping_sha256 || null,
     sos_site_ref_bridge_mapping_identity: null,
     sos_site_ref_bridge_artifact_sha256: null,
     observed_property_mapping_sha256: input.observed_property_mapping_sha256 || null,
-    source_artifact_availability_sha256: sha256(Buffer.from(
-      canonicalJson(sourceArtifactAvailabilityIdentity), "utf8",
-    )),
   };
   const evidence = {
     schema_version: 1,
@@ -353,22 +285,8 @@ function main() {
     total_rows: evidenceRows.length,
     per_timeseries_counts: Object.fromEntries(Object.entries(perTimeseries).sort(([a], [b]) => Number(a) - Number(b))),
     per_pollutant_counts: Object.fromEntries(Object.entries(perPollutant).sort(([a], [b]) => a.localeCompare(b))),
-    observation_content_hashes: Object.fromEntries(Object.entries(sourceObservationContentHashes).sort(([a], [b]) => a.localeCompare(b))),
+    observation_content_hashes: Object.fromEntries(Object.entries(observationContentHashes).sort(([a], [b]) => a.localeCompare(b))),
     pollutant_set: Object.keys(perPollutant).sort(),
-    source_available_timeseries_ids: [...new Set(
-      (input.source_available_timeseries_ids || []).map((value) => Number(value)),
-    )].sort((a, b) => a - b),
-    source_unavailable_timeseries_ids: [...unavailableTimeseriesIds].sort((a, b) => a - b),
-    source_unavailable_scopes: input.source_unavailable_scopes || [],
-    preserved_baseline_rows_file: "preserved_baseline_rows.json",
-    preserved_baseline_rows_sha256: sha256(preservedRowsBody),
-    preserved_baseline_rows_bytes: preservedRowsBody.byteLength,
-    preserved_baseline_row_count: preservedEvidenceRows.length,
-    preserved_baseline_identity: input.preserved_baseline_identity || null,
-    final_target_row_count: targetRows.length,
-    final_target_timeseries_row_counts: Object.fromEntries(Object.entries(finalTargetPerTimeseries).sort(([a], [b]) => Number(a) - Number(b))),
-    final_target_pollutant_counts: Object.fromEntries(Object.entries(finalTargetPerPollutant).sort(([a], [b]) => a.localeCompare(b))),
-    final_target_observation_content_hashes: Object.fromEntries(Object.entries(finalTargetObservationContentHashes).sort(([a], [b]) => a.localeCompare(b))),
     source_rows_before_canonical_dedupe: evidenceRows.length,
     duplicate_rows_removed_by_canonical_normalisation: 0,
     duplicate_canonical_row_count: 0,
@@ -396,22 +314,18 @@ function main() {
   };
   const evidenceDir = path.join(stageRoot, `day_utc=${dayUtc}`, `connector_id=${connectorId}`);
   writeAtomic(path.join(evidenceDir, "obs_history_rows.json"), rowsBody);
-  writeAtomic(path.join(evidenceDir, "preserved_baseline_rows.json"), preservedRowsBody);
   writeAtomic(path.join(evidenceDir, "source-evidence.json"), Buffer.from(JSON.stringify(evidence), "utf8"));
   process.stdout.write(JSON.stringify({
     status: "ok",
     day_utc: dayUtc,
     connector_id: connectorId,
     rows_observations: evidenceRows.length,
-    final_target_rows_observations: targetRows.length,
-    preserved_baseline_rows: preservedEvidenceRows.length,
     source_connector_day_complete_events: 1,
     source_connector_day_failed_events: 0,
     source_connector_day_pending_events: 0,
     source_connector_day_skipped_events: 0,
     source_mapped_rows: evidenceRows.length,
     source_timeseries_row_counts: evidence.per_timeseries_counts,
-    final_target_timeseries_row_counts: evidence.final_target_timeseries_row_counts,
     source_pollutant_codes: evidence.pollutant_set,
     objects_staged_local: pollutantManifests.reduce((count, manifest) => count + manifest.file_count + 1, 1),
   }));
