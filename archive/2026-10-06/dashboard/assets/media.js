@@ -13,9 +13,6 @@
     ["updated_desc", "Recently Updated"],
   ];
   const STATUS_LABELS = { approved: "Approved", pending: "Pending", rejected: "Rejected", hidden: "Hidden" };
-  const POSSIBLE_DUPLICATE_REASON_LABELS = {
-    same_source_exact_title_same_published_at: "Same source, exact publisher title and publication time",
-  };
   const BLUESKY_REASON_LABELS = {
     auto_approved: "Automatically approved",
     pending_approved: "Approved from Pending",
@@ -186,10 +183,6 @@
 
   function message(text, kind = "") {
     return `<div class="media-message${kind ? ` media-message--${kind}` : ""}" role="status">${esc(text)}</div>`;
-  }
-
-  function possibleDuplicateReasonLabel(reason) {
-    return POSSIBLE_DUPLICATE_REASON_LABELS[reason] || "Strong same-article evidence";
   }
 
   function graphemeCount(value) {
@@ -433,11 +426,8 @@
       ? `<img class="media-thumb" loading="lazy" src="${esc(imageUrl)}" alt="" data-media-thumb>`
       : `<span class="media-thumb-fallback">No image</span>`;
     const imageState = articleImageState(article);
-    const possibleDuplicate = Number(article.possible_duplicate_active) === 1
-      ? `<span class="media-possible-duplicate">Possible duplicate</span><span class="media-subtext">${esc(possibleDuplicateReasonLabel(article.possible_duplicate_reason_code))}</span>`
-      : "";
     return `<tr data-article-id="${article.id}"><td class="media-select-cell"><input type="checkbox" data-select-article aria-label="Select ${esc(title)}"${state.selectedArticleIds.has(String(article.id)) ? " checked" : ""}></td><td>${thumb}<span class="media-image-state media-image-state--${esc(imageState[0])}">${esc(imageState[1])}</span></td>
-      <td class="media-title-cell"><button type="button" class="media-title-button" data-open-article>${esc(title)}</button>${article.display_title ? `<span class="media-subtext">Original: ${esc(article.title)}</span>` : ""}${possibleDuplicate}</td>
+      <td class="media-title-cell"><button type="button" class="media-title-button" data-open-article>${esc(title)}</button>${article.display_title ? `<span class="media-subtext">Original: ${esc(article.title)}</span>` : ""}</td>
       <td>${esc(article.publisher)}</td><td>${esc(article.author || "—")}</td>
       <td>${esc(formatPublishedDateTime(article.published_at, false))}</td><td>${esc(formatUtcDateTime(article.approved_at, false))}</td>
       <td><span class="media-title-status media-title-status--${esc(titleState)}">${esc(titleLabel)}</span><button type="button" class="media-ai-disclosure" data-toggle-ai aria-expanded="${isExpanded}">${isExpanded ? "▴ Title" : "▾ Title"}</button></td><td>${statusControl(article)}</td></tr>${isExpanded ? `<tr class="media-ai-expanded"><td colspan="9">${inlineAiReview(article)}</td></tr>` : ""}`;
@@ -1062,17 +1052,6 @@
     return `<section><h4>Image policy</h4><p>Article: <strong>${esc(article.image_policy)}</strong> · Source: <strong>${esc(article.source_image_policy)}</strong></p>${retainedWarning}<form class="media-inline-form" data-article-image-policy><label class="media-field"><span>Article image policy</span><select name="image_policy"><option value="blocked"${article.image_policy === "blocked" ? " selected" : ""}>blocked</option><option value="remote_preview"${article.image_policy === "remote_preview" ? " selected" : ""}>remote_preview</option><option value="local_copy_permitted"${article.image_policy === "local_copy_permitted" ? " selected" : ""}${sourceAllowsLocalCopy ? "" : " disabled"}>local_copy_permitted</option></select></label><label class="media-toggle"><input name="confirm_local_copy_permitted" type="checkbox"> <span>I explicitly confirm that the recorded permission, licence or other right permits this article’s image to be retained locally.</span></label><button type="submit" class="media-button media-button--primary">Save image policy</button></form><p class="media-subtext">A retained image can be uploaded only after both source and article policies are local_copy_permitted.</p><div data-article-image-policy-message></div></section>`;
   }
 
-  function possibleDuplicateDetailHtml(possibleDuplicate) {
-    if (!possibleDuplicate?.candidate) return "";
-    const candidate = possibleDuplicate.candidate;
-    const stateLabel = possibleDuplicate.active
-      ? `<span class="media-possible-duplicate">Active hold</span>`
-      : `<span class="media-possible-duplicate media-possible-duplicate--resolved">Resolved ${esc(possibleDuplicate.resolution || "")}</span>`;
-    const resolution = possibleDuplicate.active ? ""
-      : `<p class="media-subtext">Resolved ${esc(formatUtcDateTime(possibleDuplicate.resolved_at))}. Evidence is retained for audit.</p>`;
-    return `<section class="media-possible-duplicate-detail"><h4>Possible duplicate ${stateLabel}</h4><p>${esc(possibleDuplicateReasonLabel(possibleDuplicate.reason_code))}</p><dl><dt>Candidate title</dt><dd>${esc(candidate.title || "—")}</dd><dt>Candidate URL</dt><dd>${candidate.canonical_url ? `<a href="${esc(candidate.canonical_url)}" target="_blank" rel="noopener noreferrer">${esc(candidate.canonical_url)} ↗</a>` : "—"}</dd><dt>Candidate status</dt><dd>${esc(STATUS_LABELS[candidate.status] || candidate.status || "—")}</dd><dt>Candidate published</dt><dd>${esc(formatPublishedDateTime(candidate.published_at))}</dd><dt>Candidate author</dt><dd>${esc(candidate.author || "—")}</dd></dl>${possibleDuplicate.active ? `<p class="media-subtext">Automatic approval is held. Approve or reject only through the normal Article Status control after review; social posting remains an explicit manual choice.</p>` : resolution}</section>`;
-  }
-
   async function openArticle(id, notice = "", selectedStatus = "") {
     const dialog = detailDialog();
     dialog.innerHTML = `<div class="media-detail__inner"><div class="media-loading">Loading article…</div></div>`;
@@ -1094,7 +1073,6 @@
         <div class="media-detail__grid"><div>${article.admin_preview_image_path && imageUrl ? `<img class="media-detail__preview" src="${esc(imageUrl)}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}<span class="media-image-state media-image-state--${esc(imageState[0])}">${esc(imageState[1])}</span></div>
         <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title Status</dt><dd>${esc(titleStatus(article)[1])}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>${esc(aiSuggestionLabel(article))}</dt><dd>${esc(article.ai_title_suggestion || "—")}</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatPublishedDateTime(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatUtcDateTime(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatUtcDateTime(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatUtcDateTime(article.updated_at))}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
         <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div><div class="media-social-options" data-manual-social hidden><div>${manualBlueskyHtml(article, data)}</div><div>${manualFacebookHtml(article)}</div></div><div data-detail-status-message></div></section>
-        ${possibleDuplicateDetailHtml(data.possible_duplicate)}
         ${directPublishHtml(data, article)}
         ${blueskyHistoryHtml(data, article)}
         ${facebookHistoryHtml(data, article)}

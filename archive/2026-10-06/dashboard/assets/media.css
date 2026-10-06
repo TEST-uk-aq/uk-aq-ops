@@ -228,23 +228,6 @@
 .media-title-button:hover,
 .media-title-button:focus-visible { color: var(--accent); text-decoration: underline; }
 .media-subtext { display: block; margin-top: 3px; color: var(--muted); font-size: 13px; font-weight: 400; }
-.media-possible-duplicate {
-  display: inline-flex;
-  align-items: center;
-  width: fit-content;
-  margin-top: 6px;
-  padding: 3px 8px;
-  border: 1px solid #b86b17;
-  border-radius: 999px;
-  background: #fff1d9;
-  color: #7b4305;
-  font-size: 12px;
-  font-weight: 800;
-  line-height: 1.2;
-}
-.media-possible-duplicate--resolved { border-color: var(--border); background: #f0eee9; color: var(--muted); }
-.media-possible-duplicate-detail h4 { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.media-possible-duplicate-detail h4 .media-possible-duplicate { margin-top: 0; }
 
 .media-thumb,
 .media-thumb-fallback {
