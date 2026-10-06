@@ -117,6 +117,7 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
         source_available_pollutants: list[str],
         source_unavailable_scopes: list[dict[str, object]] | None = None,
         preserved_baseline_identity: dict[str, object] | None = None,
+        source_file_identities: list[dict[str, object]] | None = None,
     ) -> tuple[Path, dict[str, object]]:
         root.mkdir(parents=True, exist_ok=True)
         repo_root = Path(__file__).resolve().parents[3]
@@ -129,6 +130,10 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             text=True, stdout=subprocess.PIPE,
         ).stdout.strip()
         unavailable_scopes = list(source_unavailable_scopes or [])
+        identities = source_file_identities or [{
+            "source_file": "waqn:metadata", "sha256": "a" * 64,
+            "bytes": 100,
+        }]
         payload = {
             "history_generation": "v3",
             "day_utc": "2026-09-28",
@@ -149,11 +154,10 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
                 int(scope["timeseries_id"]) for scope in unavailable_scopes
             ],
             "source_unavailable_scopes": unavailable_scopes,
-            "source_file_identities": [{
-                "source_file": "waqn:metadata", "sha256": "a" * 64,
-                "bytes": 100,
-            }],
-            "required_source_files": ["waqn:metadata"],
+            "source_file_identities": identities,
+            "required_source_files": [
+                str(identity["source_file"]) for identity in identities
+            ],
             "authoritatively_absent_source_files": [],
             "authoritative_mapping_sha256": "b" * 64,
             "observed_property_mapping_sha256": "c" * 64,
@@ -2146,6 +2150,203 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
                 canonical_rows=[],
             )
             self.assertNotEqual(first["evidence_id"], second["evidence_id"])
+
+    def test_official_rdata_evidence_uses_cross_runtime_utf8_ordering(self) -> None:
+        identities = [
+            {
+                "source_file": "waqn:site_ref=SWA1:year=2026",
+                "sha256": "1" * 64,
+                "bytes": 101,
+            },
+            {
+                "source_file": "waqn:site_ref=SWA11:year=2026",
+                "sha256": "2" * 64,
+                "bytes": 111,
+            },
+            {
+                "source_file": "waqn:site_ref=SWA12:year=2026",
+                "sha256": "3" * 64,
+                "bytes": 112,
+            },
+        ]
+        unavailable_scopes = [
+            {
+                "day_utc": "2026-09-28",
+                "site_code": site_code,
+                "source_year": 2026,
+                "source_file_key": f"waqn:site_ref={site_code}:year=2026",
+                "pollutant_code": "pm10",
+                "station_id": station_id,
+                "timeseries_id": timeseries_id,
+                "reason": "source_artifact_unavailable",
+                "canonical_url": (
+                    f"https://example.test/{site_code}_2026.RData"
+                ),
+                "final_url": f"https://example.test/{site_code}_2026.RData",
+                "http_status": 404,
+                "raw_source_windows": [],
+                "canonical_unavailable_windows": [{
+                    "canonical_day_utc": "2026-09-28",
+                    "canonical_start_utc": "2026-09-28T00:00:00Z",
+                    "canonical_end_exclusive_utc": "2026-09-29T00:00:00Z",
+                }],
+            }
+            for site_code, station_id, timeseries_id in (
+                ("SWA1", 201, 2001),
+                ("SWA11", 211, 2011),
+            )
+        ]
+        expected_source_files = [
+            "waqn:site_ref=SWA11:year=2026",
+            "waqn:site_ref=SWA12:year=2026",
+            "waqn:site_ref=SWA1:year=2026",
+        ]
+        source_row = {
+            "connector_id": 9,
+            "station_id": 101,
+            "timeseries_id": 1001,
+            "pollutant_code": "no2",
+            "observed_at_utc": "2026-09-28T01:00:00.000Z",
+            "value": 10.0,
+            "verification_status": "P",
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            stage_a, evidence_a = self.stage_official_proposal(
+                root / "a",
+                requested_pollutants=["no2", "pm10"],
+                rows=[source_row],
+                source_available_pollutants=["no2"],
+                source_unavailable_scopes=unavailable_scopes,
+                source_file_identities=identities,
+            )
+            stage_b, evidence_b = self.stage_official_proposal(
+                root / "b",
+                requested_pollutants=["no2", "pm10"],
+                rows=[source_row],
+                source_available_pollutants=["no2"],
+                source_unavailable_scopes=list(reversed(unavailable_scopes)),
+                source_file_identities=list(reversed(identities)),
+            )
+            _, evidence_changed = self.stage_official_proposal(
+                root / "changed",
+                requested_pollutants=["no2", "pm10"],
+                rows=[source_row],
+                source_available_pollutants=["no2"],
+                source_unavailable_scopes=unavailable_scopes,
+                source_file_identities=[
+                    identities[0],
+                    {**identities[1], "sha256": "f" * 64},
+                    identities[2],
+                ],
+            )
+
+            validated, validated_rows = (
+                INTEGRITY._load_complete_connector_day_source_evidence(
+                    stage_root=stage_a,
+                    day_utc="2026-09-28",
+                    connector_id=9,
+                    repair_pollutants=["no2", "pm10"],
+                )
+            )
+            self.assertEqual(
+                [identity["source_file"] for identity in validated[
+                    "source_file_identities"
+                ]],
+                expected_source_files,
+            )
+            self.assertEqual(
+                evidence_a["source_file_identities_sha256"],
+                evidence_b["source_file_identities_sha256"],
+            )
+            self.assertEqual(
+                evidence_a["source_artifact_availability_sha256"],
+                evidence_b["source_artifact_availability_sha256"],
+            )
+            self.assertEqual(
+                evidence_a["source_artifact_availability_sha256"],
+                INTEGRITY._official_rdata_source_artifact_availability_sha256(
+                    evidence_a
+                ),
+            )
+            self.assertEqual(
+                evidence_a["preserved_baseline_dependency_sha256"],
+                evidence_b["preserved_baseline_dependency_sha256"],
+            )
+            self.assertEqual(
+                evidence_a["preserved_baseline_dependency_sha256"],
+                INTEGRITY._official_rdata_preserved_baseline_dependency_sha256(
+                    evidence_a
+                ),
+            )
+            persisted_a = INTEGRITY._persist_complete_connector_day_source_evidence(
+                conn=self.conn,
+                env_name="TEST",
+                evidence=evidence_a,
+                canonical_rows=validated_rows,
+            )
+            persisted_b = INTEGRITY._persist_complete_connector_day_source_evidence(
+                conn=self.conn,
+                env_name="TEST",
+                evidence=evidence_b,
+                canonical_rows=validated_rows,
+            )
+            self.assertEqual(
+                persisted_a["evidence_id"], persisted_b["evidence_id"]
+            )
+            self.assertNotEqual(
+                evidence_a["source_file_identities_sha256"],
+                evidence_changed["source_file_identities_sha256"],
+            )
+            self.assertNotEqual(
+                evidence_a["source_evidence_input_sha256"],
+                evidence_changed["source_evidence_input_sha256"],
+            )
+
+            evidence_b_path = (
+                stage_b / "day_utc=2026-09-28/connector_id=9/"
+                "source-evidence.json"
+            )
+            tampered_availability = json.loads(
+                evidence_b_path.read_text(encoding="utf-8")
+            )
+            tampered_availability[
+                "source_artifact_availability_sha256"
+            ] = "d" * 64
+            tampered_availability["source_evidence_input_sha256"] = (
+                INTEGRITY._source_evidence_input_sha256(tampered_availability)
+            )
+            evidence_b_path.write_text(
+                json.dumps(tampered_availability), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "source artifact availability identity is invalid",
+            ):
+                INTEGRITY._load_complete_connector_day_source_evidence(
+                    stage_root=stage_b,
+                    day_utc="2026-09-28",
+                    connector_id=9,
+                    repair_pollutants=["no2", "pm10"],
+                )
+
+            evidence_path = (
+                stage_a / "day_utc=2026-09-28/connector_id=9/"
+                "source-evidence.json"
+            )
+            tampered = json.loads(evidence_path.read_text(encoding="utf-8"))
+            tampered["source_file_identities"][0]["sha256"] = "e" * 64
+            evidence_path.write_text(json.dumps(tampered), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError,
+                "source file identities changed",
+            ):
+                INTEGRITY._load_complete_connector_day_source_evidence(
+                    stage_root=stage_a,
+                    day_utc="2026-09-28",
+                    connector_id=9,
+                    repair_pollutants=["no2", "pm10"],
+                )
 
     def test_official_rdata_v6_does_not_advance_sos_contract(self) -> None:
         self.assertEqual(INTEGRITY.OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION, 6)
