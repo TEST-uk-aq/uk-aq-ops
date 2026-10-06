@@ -28,6 +28,8 @@ Coding agents may read authoritative `system_docs/` in `TEST-uk-aq/uk-aq-system-
 
 Default is code-only implementation in TEST.
 
+A user request to implement, fix, change or update code authorises the bounded TEST working-tree edits needed for that task. After any required pre-change report, continue directly with implementation. Do not stop to ask the user to confirm a design, plan, approach or implementation unless a genuine blocking ambiguity, contract conflict, missing prerequisite or permission boundary remains.
+
 Unless the user explicitly asks for the operation, do **not**:
 
 - create/amend commits, push, create branches or create PRs;
