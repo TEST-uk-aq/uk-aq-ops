@@ -6,10 +6,12 @@ import {
   hasRequiredR2Config,
   r2DeleteObjects,
   r2GetObject,
+  r2HeadObject,
   r2ListAllObjects,
   r2PutObject,
   sha256Hex,
 } from "../../workers/shared/r2_sigv4.mjs";
+import { verifyR2StoredSha256Head } from "../../workers/shared/uk_aq_r2_checksum_publication.mjs";
 import {
   computeEmptyObservationContentHash,
   computeObservationContentHash,
@@ -1461,6 +1463,7 @@ export async function putAndVerifyObject({
   verifiedBodyCache = null,
 }) {
   const entry = object.entry;
+  const fixedV3Parquet = /^history\/v3\/observations\/.+\.parquet$/.test(object.key);
   const context = mutationContext(object.key, objectPublicationStage(object));
   const scheduleEvidence = {
     publication_schedule_sha256: runState?.apply?.publication_schedule?.schedule_sha256 || null,
@@ -1489,7 +1492,13 @@ export async function putAndVerifyObject({
     post_put_verification_count: 0,
   });
   try {
-    await adapters.putObject({ r2, key: object.key, body: object.body, content_type: contentTypeForKey(object.key) });
+    await adapters.putObject({
+      r2,
+      key: object.key,
+      body: object.body,
+      content_type: contentTypeForKey(object.key),
+      ...(fixedV3Parquet ? { sha256: entry.sha256 } : {}),
+    });
     Object.assign(entry, { uploaded: true, uploaded_at_utc: new Date().toISOString(), status: "uploaded" });
     persistence?.appendEvent({
       event_type: "put_completed",
@@ -1518,8 +1527,16 @@ export async function putAndVerifyObject({
       key: object.key,
       phase: `canonical_apply_post_put_readback_${objectPublicationStage(object)}`,
     });
-    if (Number(fresh.bytes) !== object.body.byteLength || sha256Hex(fresh.body) !== entry.sha256) {
+    if (Number(fresh.bytes) !== object.body.byteLength || sha256Hex(fresh.body) !== entry.sha256
+      || (fixedV3Parquet && !Buffer.from(fresh.body).equals(object.body))) {
       throw new Error(`R2 GET verification identity mismatch: ${object.key}`);
+    }
+    if (fixedV3Parquet) {
+      const head = await adapters.headObject({ r2, key: object.key });
+      verifyR2StoredSha256Head({
+        head,
+        intent: { key: object.key, byte_size: object.body.byteLength, sha256: entry.sha256 },
+      });
     }
     Object.assign(entry, {
       r2_verified: true,
@@ -1527,6 +1544,10 @@ export async function putAndVerifyObject({
       remote_completed: true,
       status: "get_verified",
       post_put_verification_get_count: 1,
+      ...(fixedV3Parquet ? {
+        stored_sha256_verified: true,
+        stored_byte_size_verified: true,
+      } : {}),
     });
     if (/^history\/v2\/observations\/.+\.parquet$/.test(object.key)
       && (runState.execution_path !== "sos_light" || entry.stage === "observations_data")) {
@@ -1557,6 +1578,11 @@ export async function putAndVerifyObject({
     Object.assign(entry, {
       status: "failed",
       error: message,
+      ...(fixedV3Parquet ? {
+        r2_verified: false,
+        stored_sha256_verified: false,
+        stored_byte_size_verified: false,
+      } : {}),
     });
     try {
       persistence?.appendEvent({
@@ -2746,6 +2772,7 @@ export async function applyValidatedProposal({
       phase: phase || "canonical_apply_r2_get",
       ...(retryLog ? { log: retryLog } : {}),
     }),
+    headObject: adapters.headObject || r2HeadObject,
     listAllObjects: adapters.listAllObjects || r2ListAllObjects,
     putObject: adapters.putObject || r2PutObject,
   };

@@ -2427,6 +2427,53 @@ test("changed-object apply records exactly one post-PUT verification GET", async
   assert.equal(getCount, 1);
 });
 
+test("fixed-v3 Parquet APPLY republishes identical bytes with stored SHA-256 verification", async () => {
+  const key = "history/v3/observations/day_utc=2026-09-28/connector_id=9/pollutant_code=pm25/part-00000.parquet";
+  const body = Buffer.from("canonical parquet bytes");
+  const sha256 = sha256Hex(body);
+  for (const storedSha256 of [sha256, null, "f".repeat(64)]) {
+    const entry = { bytes: body.byteLength, sha256 };
+    const object = { key, body, entry };
+    const runState = { objects: { [key]: entry } };
+    attachTestSchedule(runState, [object]);
+    let putCount = 0;
+    let headCount = 0;
+    let liveBody = Buffer.from(body); // Already present with identical bytes and no stored checksum.
+    let liveStoredSha256 = null;
+    const apply = putAndVerifyObject({
+      r2: {}, runState, object,
+      adapters: {
+        putObject: async (request) => {
+          putCount += 1;
+          assert.equal(request.sha256, sha256);
+          assert.deepEqual(request.body, body);
+          assert.deepEqual(liveBody, body);
+          assert.equal(liveStoredSha256, null);
+          liveBody = Buffer.from(request.body);
+          liveStoredSha256 = storedSha256;
+        },
+        getObject: async () => ({ body: liveBody, bytes: liveBody.byteLength }),
+        headObject: async () => {
+          headCount += 1;
+          return { exists: true, bytes: liveBody.byteLength, sha256: liveStoredSha256 };
+        },
+      },
+    });
+    if (storedSha256 === sha256) {
+      await apply;
+      assert.equal(entry.r2_verified, true);
+      assert.equal(entry.stored_sha256_verified, true);
+      assert.equal(entry.stored_byte_size_verified, true);
+    } else {
+      await assert.rejects(apply, /stored R2 SHA-256|Checksum-aware R2 SHA-256/);
+      assert.notEqual(entry.r2_verified, true);
+      assert.equal(entry.stored_sha256_verified, false);
+    }
+    assert.equal(putCount, 1);
+    assert.equal(headCount, 1);
+  }
+});
+
 test("multiple object transitions append detailed events without rewriting complete run state", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-apply-persistence-"));
   const runStatePath = path.join(root, "run-state.json");
