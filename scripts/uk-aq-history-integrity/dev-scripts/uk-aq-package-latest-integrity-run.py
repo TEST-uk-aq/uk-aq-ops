@@ -122,11 +122,59 @@ def find_tmp_run_roots(tmp_root: Path, count: int) -> list[Path]:
     return [tmp_root]
 
 
-def run_command(args: list[str]) -> str:
+def resolve_ops_repo_root(environment: str) -> tuple[Path | None, str | None]:
+    selector_path = PROJECT_ROOT / "env" / f"{environment}.env"
+    try:
+        selector_text = selector_path.read_text(encoding="utf-8")
+    except OSError as error:
+        return None, f"Unable to read repository selector {selector_path}: {error}"
+
+    values: list[str] = []
+    for raw_line in selector_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            return None, f"Invalid repository selector line in {selector_path}: {raw_line!r}"
+        key, raw_value = line.split("=", 1)
+        if key.strip() != "UK_AQ_OPS_REPO_ROOT":
+            return None, (
+                f"Repository selector {selector_path} contains unsupported key "
+                f"{key.strip()!r}"
+            )
+
+        value = raw_value.strip()
+        if " #" in value:
+            value = value.split(" #", 1)[0].rstrip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"\"", "'"}:
+            value = value[1:-1]
+        if not value:
+            return None, f"UK_AQ_OPS_REPO_ROOT is empty in {selector_path}"
+        values.append(value)
+
+    if len(values) != 1:
+        return None, (
+            f"Repository selector {selector_path} must contain exactly one "
+            "UK_AQ_OPS_REPO_ROOT assignment"
+        )
+
+    repo_root = Path(values[0])
+    if not repo_root.is_absolute():
+        return None, f"UK_AQ_OPS_REPO_ROOT must be absolute: {repo_root}"
+    try:
+        repo_root = repo_root.resolve(strict=True)
+    except OSError as error:
+        return None, f"Unable to resolve selected repository {repo_root}: {error}"
+    if not repo_root.is_dir():
+        return None, f"Selected repository is not a directory: {repo_root}"
+    return repo_root, None
+
+
+def run_command(args: list[str], *, cwd: Path) -> str:
     try:
         completed = subprocess.run(
             args,
-            cwd=PROJECT_ROOT,
+            cwd=cwd,
             check=False,
             text=True,
             stdout=subprocess.PIPE,
@@ -147,6 +195,7 @@ def main() -> int:
         raise SystemExit("--max-file-mb must be between 1 and 500")
 
     environment = args.env
+    ops_repo_root, ops_repo_root_error = resolve_ops_repo_root(environment)
     state_root = PROJECT_ROOT / "state" / environment
     tmp_root = state_root / "tmp"
     dropbox_root = (
@@ -292,21 +341,36 @@ def main() -> int:
 
         git_state_path = staging_root / "project" / "git-state.txt"
         git_state_path.parent.mkdir(parents=True, exist_ok=True)
-        git_state_path.write_text(
-            "git rev-parse HEAD\n"
-            "------------------\n"
-            f"{run_command(['git', 'rev-parse', 'HEAD'])}\n"
-            "git status --short\n"
-            "------------------\n"
-            f"{run_command(['git', 'status', '--short'])}\n",
-            encoding="utf-8",
-        )
+        if ops_repo_root is None:
+            git_state_text = (
+                "Selected ops repository\n"
+                "-----------------------\n"
+                f"{ops_repo_root_error or 'Unavailable'}\n"
+            )
+        else:
+            git_state_text = (
+                "Selected ops repository\n"
+                "-----------------------\n"
+                f"{ops_repo_root}\n\n"
+                "git rev-parse HEAD\n"
+                "------------------\n"
+                f"{run_command(['git', 'rev-parse', 'HEAD'], cwd=ops_repo_root)}\n"
+                "git branch --show-current\n"
+                "-------------------------\n"
+                f"{run_command(['git', 'branch', '--show-current'], cwd=ops_repo_root)}\n"
+                "git status --short\n"
+                "------------------\n"
+                f"{run_command(['git', 'status', '--short'], cwd=ops_repo_root)}\n"
+            )
+        git_state_path.write_text(git_state_text, encoding="utf-8")
 
         manifest = {
             "schema_version": 1,
             "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "environment": environment,
             "project_root": str(PROJECT_ROOT),
+            "ops_repo_root": str(ops_repo_root) if ops_repo_root is not None else None,
+            "ops_repo_root_error": ops_repo_root_error,
             "state_root": str(state_root),
             "dropbox_root": str(dropbox_root),
             "dropbox_logs_root": str(logs_root),
