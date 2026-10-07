@@ -2298,6 +2298,47 @@ write(latest.key, latest.body);
                     self._verify_fixture_index(root)["gap_type"],
                 )
 
+    def test_final_verification_rejects_noncanonical_repinned_leaf(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._write_final_verification_fixture(root)
+            self.assertIsNone(self._verify_fixture_index(root))
+            index = root / self._final_verification_index_key()
+            manifest = json.loads(index.read_bytes())
+            descriptor = manifest["leaves_by_timeseries_id"]["1001"]
+            leaf = root / descriptor[0]
+            original = leaf.read_bytes()
+            payload = json.loads(original)
+            altered = json.dumps(payload, indent=1).encode()
+            self.assertNotEqual(original, altered)
+            self.assertEqual(payload, json.loads(altered))
+            leaf.write_bytes(altered)
+            manifest["leaves_by_timeseries_id"]["1001"] = [
+                descriptor[0], len(altered), hashlib.sha256(altered).hexdigest(),
+            ]
+            index.write_text(json.dumps(manifest))
+            self.assertEqual(
+                "index_leaf_identity_mismatch",
+                self._verify_fixture_index(root)["gap_type"],
+            )
+
+    def test_final_verification_rejects_noncanonical_scoped_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._write_final_verification_fixture(root)
+            self.assertIsNone(self._verify_fixture_index(root))
+            index = root / self._final_verification_index_key()
+            original = index.read_bytes()
+            payload = json.loads(original)
+            altered = json.dumps(payload, indent=1).encode()
+            self.assertNotEqual(original, altered)
+            self.assertEqual(payload, json.loads(altered))
+            index.write_bytes(altered)
+            self.assertEqual(
+                "index_manifest_identity_mismatch",
+                self._verify_fixture_index(root)["gap_type"],
+            )
+
     def test_final_verification_authenticates_exact_v3_leaf_and_physical_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

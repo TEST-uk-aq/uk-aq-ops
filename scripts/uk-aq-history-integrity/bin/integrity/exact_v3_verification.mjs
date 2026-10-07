@@ -74,9 +74,8 @@ export async function verifyExactV3Scope({
       fail(gapType, key, error.message);
     }
   };
-  const actual = parseObject(
-    readObject(indexKey, "index_manifest_unreadable"), "index_manifest_invalid_json",
-  );
+  const scoped = readObject(indexKey, "index_manifest_unreadable");
+  const actual = parseObject(scoped, "index_manifest_invalid_json");
   if (actual.kind !== OBSERVATION_HISTORY_EXACT_LEAF_MANIFEST_KIND_V3) {
     fail("index_manifest_schema_mismatch", indexKey, "expected exact-v3 scoped manifest kind");
   }
@@ -126,6 +125,23 @@ export async function verifyExactV3Scope({
       fail("index_leaf_schema_mismatch", expected.key,
         "leaf scope, counts, files or physical segments disagree with canonical Parquet");
     }
+    if (leaf.key !== expected.key || leaf.body.byteLength !== expected.byte_size ||
+        sha256Hex(leaf.body) !== expected.sha256 ||
+        !leaf.body.equals(Buffer.from(expected.body, "utf8"))) {
+      fail("index_leaf_identity_mismatch", expected.key,
+        "leaf bytes differ from the canonical shared-builder artifact");
+    }
+  }
+  if (!isDeepStrictEqual(membership, expectedMembership)) {
+    fail("index_manifest_membership_mismatch", indexKey,
+      "exact-v3 descriptors disagree with the canonical shared-builder membership");
+  }
+  if (scoped.key !== hierarchy.scoped_manifest.key ||
+      scoped.body.byteLength !== hierarchy.scoped_manifest.byte_size ||
+      sha256Hex(scoped.body) !== hierarchy.scoped_manifest.sha256 ||
+      !scoped.body.equals(Buffer.from(hierarchy.scoped_manifest.body, "utf8"))) {
+    fail("index_manifest_identity_mismatch", indexKey,
+      "scoped manifest bytes differ from the canonical shared-builder artifact");
   }
   // Aligned JSON is derived and is not guaranteed to be in the backup/view.
   // Its descriptors are checked against reconstruction above; no dependency
