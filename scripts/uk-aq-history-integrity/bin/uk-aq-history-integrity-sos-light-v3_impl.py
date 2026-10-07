@@ -12627,6 +12627,68 @@ def _v2_observation_repair_source_evidence_summary(
     return summary
 
 
+def _verify_exact_v3_index_scope(
+    *,
+    root: Path,
+    config: HistoryPathConfig,
+    day_utc: str,
+    connector_id: str,
+    pollutant_code: str,
+    index_key: str,
+    allowed_real_roots: Iterable[Path],
+) -> dict[str, Any] | None:
+    """Authenticate local exact-v3 authority against the shared physical builder."""
+    helper = _INTEGRITY_BIN_DIR / "integrity" / "exact_v3_verification.mjs"
+    try:
+        completed = subprocess.run(
+            [
+                os.environ.get("UK_AQ_BACKFILL_NODE_BIN")
+                or shutil.which("node") or "node",
+                str(helper),
+            ],
+            input=json.dumps({
+                "root": str(root.resolve()),
+                "allowed_real_roots": [str(path.resolve()) for path in allowed_real_roots],
+                "scope": {
+                    "day_utc": day_utc,
+                    "connector_id": int(connector_id),
+                    "pollutant_code": pollutant_code,
+                },
+                "index_prefix": config.observations_timeseries_index_prefix.strip("/"),
+                "data_prefix": config.observations_data_prefix.strip("/"),
+                "index_key": index_key,
+            }),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        result = json.loads(completed.stdout)
+        if completed.returncode == 0 and result == {"status": "ok"}:
+            return None
+        if (
+            not isinstance(result, dict)
+            or result.get("status") != "fail"
+            or not str(result.get("gap_type") or "").startswith("index_")
+        ):
+            raise ValueError("exact-v3 verifier returned no valid failure evidence")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        result = {
+            "gap_type": "index_manifest_verification_failed",
+            "reason": str(exc),
+        }
+    return _v2_obs_gap(
+        result["gap_type"],
+        day_utc=day_utc,
+        connector_id=connector_id,
+        pollutant_code=pollutant_code,
+        expected_path=index_key,
+        related_paths=[
+            str(result.get("key") or index_key),
+            str(result.get("reason") or "exact-v3 verification failed"),
+        ],
+    )
+
+
 def run_v2_observations_integrity_checks(
     *,
     r2_history_root: str | Path | None,
@@ -13105,30 +13167,17 @@ def run_v2_observations_integrity_checks(
                 if not idx_path.is_file():
                     gaps.append(_v2_obs_gap("index_manifest_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
                 else:
-                    try:
-                        idx_payload = json.loads(idx_path.read_text(encoding="utf-8"))
-                        if idx_payload.get("kind") == (
-                            "observation_timeseries_physical_leaf_scoped_manifest"
-                        ):
-                            timeseries_membership = idx_payload.get(
-                                "leaves_by_timeseries_id"
-                            )
-                            membership_missing = not isinstance(
-                                timeseries_membership, Mapping
-                            )
-                        else:
-                            timeseries_membership = idx_payload.get(
-                                "timeseries_row_counts"
-                            )
-                            membership_missing = (
-                                "timeseries_row_counts" not in idx_payload
-                            )
-                        if membership_missing:
-                            gaps.append(_v2_obs_gap("index_manifest_missing_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
-                        elif not timeseries_membership:
-                            gaps.append(_v2_obs_gap("index_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
-                    except Exception:
-                        gaps.append(_v2_obs_gap("index_manifest_invalid_json", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                    index_gap = _verify_exact_v3_index_scope(
+                        root=root,
+                        config=config,
+                        day_utc=day_utc,
+                        connector_id=connector_raw,
+                        pollutant_code=pollutant,
+                        index_key=idx_rel,
+                        allowed_real_roots=allowed_real_roots,
+                    )
+                    if index_gap is not None:
+                        gaps.append(index_gap)
                 if source_partition_evidence is not None:
                     for partition_gap in gaps[partition_gap_start:]:
                         partition_gap.setdefault("source_evidence", {}).update(source_partition_evidence)

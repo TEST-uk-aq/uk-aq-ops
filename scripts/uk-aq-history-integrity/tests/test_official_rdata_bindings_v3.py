@@ -10,6 +10,7 @@ import importlib.util
 import logging
 import json
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import subprocess
@@ -2115,113 +2116,335 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             for action in actions
         ))
 
-    def test_final_verification_accepts_exact_v3_scoped_index_membership(
-        self,
-    ) -> None:
+    @staticmethod
+    def _write_final_verification_fixture(root: Path) -> None:
+        # Real shared writer output: 118 timeseries, 1,365 rows across the three
+        # WAQN pollutants. No source acquisition, R2 client or APPLY invocation.
+        subprocess.run(
+            ["node", "--input-type=module", "-e", r"""
+import fs from "node:fs";
+import path from "node:path";
+import { buildObservationHistoryV3SteadyStatePartition } from
+  "./workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
+import { buildObservationHistoryExactLeafIndexV3Latest } from
+  "./workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
+import { buildHistoryV2ConnectorManifest, buildHistoryV2DayManifest } from
+  "./workers/shared/uk_aq_r2_history_canonical.mjs";
+const root = process.argv[1];
+const dayUtc = "2026-09-28";
+const prefix = "history/v3/observations";
+const writerGitSha = "a".repeat(40);
+const write = (key, body) => {
+  const target = path.join(root, key);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, body);
+};
+const partitions = ["no2", "pm10", "pm25"].map((pollutant, pollutantIndex) => {
+  const rows = [];
+  for (let id = pollutantIndex; id < 118; id += 3) {
+    for (let hour = 0; hour < (id < 67 ? 12 : 11); hour += 1) {
+      rows.push({
+        connector_id: 9, station_id: 2000 + id, timeseries_id: 1001 + id,
+        pollutant_code: pollutant,
+        observed_at_utc: new Date(Date.UTC(2026, 8, 28, hour)).toISOString(),
+        value: id + hour / 10, verification_status: hour % 2 ? "P" : "R",
+      });
+    }
+  }
+  const built = buildObservationHistoryV3SteadyStatePartition({
+    source: "integrity", rows, targetWriterGitSha: writerGitSha,
+    backedUpAtUtc: "2026-10-07T00:00:00.000Z",
+  });
+  for (const artifact of [
+    ...built.file_intents, built.canonical_pollutant_manifest,
+    ...built.v3_hierarchy.publication_objects,
+  ]) write(artifact.key, artifact.body);
+  return built;
+});
+const connectorKey = prefix + "/day_utc=" + dayUtc + "/connector_id=9/manifest.json";
+const connector = buildHistoryV2ConnectorManifest({
+  domain: "observations", dayUtc, connectorId: 9, manifestKey: connectorKey,
+  pollutantManifests: partitions.map(p => p.canonical_pollutant_manifest.payload),
+  writerGitSha,
+});
+write(connectorKey, JSON.stringify(connector));
+const dayKey = prefix + "/day_utc=" + dayUtc + "/manifest.json";
+write(dayKey, JSON.stringify(buildHistoryV2DayManifest({
+  domain: "observations", dayUtc, manifestKey: dayKey,
+  connectorManifests: [connector], writerGitSha,
+})));
+const latest = buildObservationHistoryExactLeafIndexV3Latest({
+  scopedHierarchies: partitions.map(p => p.v3_hierarchy),
+});
+write(latest.key, latest.body);
+""", str(root)],
+            cwd=MODULE_PATH.parents[3],
+            text=True, capture_output=True, check=True,
+        )
+
+    @staticmethod
+    def _final_verification_index_key(pollutant: str = "no2") -> str:
+        return (
+            "history/_index_v3/observations_timeseries/"
+            "day_utc=2026-09-28/connector_id=9/"
+            f"pollutant_code={pollutant}/manifest.json"
+        )
+
+    def _verify_fixture_index(self, root: Path, **kwargs):
+        return INTEGRITY._verify_exact_v3_index_scope(
+            root=root,
+            config=INTEGRITY.resolve_history_path_config("v3", {}),
+            day_utc="2026-09-28", connector_id="9", pollutant_code="no2",
+            index_key=kwargs.get("index_key", self._final_verification_index_key()),
+            allowed_real_roots=kwargs.get("allowed_real_roots", ()),
+        )
+
+    def test_final_verification_accepts_exact_v3_scoped_index_membership(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            config = INTEGRITY.resolve_history_path_config("v3", {})
-            day_utc = "2026-09-28"
-            connector_id = 9
-            timeseries_id = 1001
-            data_prefix = config.observations_data_prefix.strip("/")
-            index_prefix = (
-                config.observations_timeseries_index_prefix.strip("/")
+            self._write_final_verification_fixture(root)
+            # Derived aligned JSON is not backup authority or a required local
+            # final-view dependency. Exact leaves and canonical bytes suffice.
+            shutil.rmtree(root / "history/_index_v3/observations_timeseries/_aligned")
+            totals = {"timeseries_count": 0, "row_count": 0}
+            for pollutant in ("no2", "pm10", "pm25"):
+                payload = json.loads((root / self._final_verification_index_key(pollutant)).read_text())
+                self.assertNotIn("timeseries_row_counts", payload)
+                for field in totals:
+                    totals[field] += payload["coverage"][field]
+            self.assertEqual({"timeseries_count": 118, "row_count": 1365}, totals)
+            result = INTEGRITY.run_v2_observations_integrity_checks(
+                r2_history_root=root,
+                config=INTEGRITY.resolve_history_path_config("v3", {}),
+                from_day="2026-09-28", to_day="2026-09-28",
+                allowed_connector_ids={9},
+                observation_total_connector_ids={9},
+                observation_total_pollutants=("no2", "pm10", "pm25"),
             )
-            for pollutant_code in ("no2", "pm10", "pm25"):
-                partition_key = (
-                    f"{data_prefix}/day_utc={day_utc}/"
-                    f"connector_id={connector_id}/"
-                    f"pollutant_code={pollutant_code}"
+            self.assertEqual([], result["gaps"])
+            self.assertEqual("ok", result["status"])
+            # The same final recheck must fail for a corrupt proposed index.
+            index = root / self._final_verification_index_key()
+            payload = json.loads(index.read_text())
+            payload["leaves_by_timeseries_id"] = {}
+            index.write_text(json.dumps(payload))
+            result = INTEGRITY.run_v2_post_repair_integrity_rechecks(
+                r2_history_root=root,
+                config=INTEGRITY.resolve_history_path_config("v3", {}),
+                from_day="2026-09-28", to_day="2026-09-28",
+                allowed_connector_ids={9}, source_scope=None,
+                log=mock.Mock(),
+            )
+            self.assertEqual("fail", result["status"])
+            self.assertEqual(1, result["remaining_observation_gap_count"])
+            self.assertEqual(
+                "index_manifest_membership_mismatch",
+                result["observations"]["gaps"][0]["gap_type"],
+            )
+
+    def test_final_verification_rejects_corrupt_exact_v3_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._write_final_verification_fixture(root)
+            index = root / self._final_verification_index_key()
+            original = index.read_bytes()
+            valid = json.loads(original)
+            cases = [
+                ("kind", None), ("kind", "unknown"),
+                ("schema_version", 2), ("schema_version", True),
+                ("index_generation", "v2"), ("history_version", "v3"),
+                ("domain", "aqilevels"), ("history_schema_version", 4),
+                ("writer_version", "unsupported"),
+                ("physical_layout_version", "timeseries-bounded-v1"),
+                ("aligned_row_cap", 2048), ("exact_leaf_index_version", None),
+                ("day_utc", "2026-09-29"), ("connector_id", 10),
+                ("pollutant_code", "pm25"), ("key", "/tmp/manifest.json"),
+                ("leaf_descriptor_fields", ["key", "sha256", "byte_size"]),
+                ("decode_profile", {}),
+                ("source_aligned_scoped_manifest", {}),
+                ("coverage", {**valid["coverage"], "row_count": 0}),
+                ("coverage", {**valid["coverage"], "timeseries_count": 1}),
+                ("coverage", {
+                    **valid["coverage"],
+                    "physical_file_count": valid["coverage"]["physical_file_count"] + 1,
+                }),
+                ("coverage", {**valid["coverage"], "min_observed_at_utc": None}),
+                ("leaves_by_timeseries_id", {}),
+                ("leaves_by_timeseries_id", []),
+                ("leaves_by_timeseries_id", {"bogus": ["anything", 1, "a" * 64]}),
+                ("leaves_by_timeseries_id", {
+                    key: value for key, value in valid["leaves_by_timeseries_id"].items()
+                    if key != "1001"
+                }),
+                ("leaves_by_timeseries_id", {
+                    **valid["leaves_by_timeseries_id"], "9999": ["anything", 1, "a" * 64],
+                }),
+            ]
+            for field, value in cases:
+                with self.subTest(field=field, value=value):
+                    payload = json.loads(original)
+                    payload[field] = value
+                    # Legacy-looking evidence cannot rescue an invalid exact-v3 object.
+                    if field == "kind":
+                        payload["timeseries_row_counts"] = {"1001": 12}
+                    index.write_text(json.dumps(payload))
+                    gap = self._verify_fixture_index(root)
+                    self.assertIsNotNone(gap)
+                    self.assertTrue(gap["gap_type"].startswith("index_"), gap)
+            for invalid_json in ("[]", "null", "{"):
+                index.write_text(invalid_json)
+                self.assertEqual(
+                    "index_manifest_invalid_json",
+                    self._verify_fixture_index(root)["gap_type"],
                 )
-                partition = root / partition_key
-                partition.mkdir(parents=True, exist_ok=True)
-                parquet_key = f"{partition_key}/part-00000.parquet"
-                (root / parquet_key).write_bytes(b"PAR1")
-                (partition / "manifest.json").write_text(json.dumps({
-                    "manifest_kind": "pollutant",
-                    "history_version": "v2",
-                    "domain": "observations",
-                    "grain": None,
-                    "profile": None,
-                    "day_utc": day_utc,
-                    "connector_id": connector_id,
-                    "pollutant_code": pollutant_code,
-                    "row_count": 1,
-                    "source_row_count": 1,
-                    "file_count": 1,
-                    "total_bytes": 4,
-                    "min_timeseries_id": timeseries_id,
-                    "max_timeseries_id": timeseries_id,
-                    "timeseries_row_counts": {str(timeseries_id): 1},
-                    "files": [{
-                        "key": parquet_key,
-                        "bytes": 4,
-                        "timeseries_row_counts": {str(timeseries_id): 1},
-                    }],
-                }), encoding="utf-8")
-                index_manifest = (
-                    root / index_prefix / f"day_utc={day_utc}"
-                    / f"connector_id={connector_id}"
-                    / f"pollutant_code={pollutant_code}" / "manifest.json"
-                )
-                index_manifest.parent.mkdir(parents=True, exist_ok=True)
-                index_manifest.write_text(json.dumps({
-                    "schema_version": 1,
-                    "kind": (
-                        "observation_timeseries_physical_leaf_scoped_manifest"
+
+    def test_final_verification_rejects_noncanonical_repinned_leaf(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._write_final_verification_fixture(root)
+            self.assertIsNone(self._verify_fixture_index(root))
+            index = root / self._final_verification_index_key()
+            manifest = json.loads(index.read_bytes())
+            descriptor = manifest["leaves_by_timeseries_id"]["1001"]
+            leaf = root / descriptor[0]
+            original = leaf.read_bytes()
+            payload = json.loads(original)
+            altered = json.dumps(payload, indent=1).encode()
+            self.assertNotEqual(original, altered)
+            self.assertEqual(payload, json.loads(altered))
+            leaf.write_bytes(altered)
+            manifest["leaves_by_timeseries_id"]["1001"] = [
+                descriptor[0], len(altered), hashlib.sha256(altered).hexdigest(),
+            ]
+            index.write_text(json.dumps(manifest))
+            self.assertEqual(
+                "index_leaf_identity_mismatch",
+                self._verify_fixture_index(root)["gap_type"],
+            )
+
+    def test_final_verification_rejects_noncanonical_scoped_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._write_final_verification_fixture(root)
+            self.assertIsNone(self._verify_fixture_index(root))
+            index = root / self._final_verification_index_key()
+            original = index.read_bytes()
+            payload = json.loads(original)
+            altered = json.dumps(payload, indent=1).encode()
+            self.assertNotEqual(original, altered)
+            self.assertEqual(payload, json.loads(altered))
+            index.write_bytes(altered)
+            self.assertEqual(
+                "index_manifest_identity_mismatch",
+                self._verify_fixture_index(root)["gap_type"],
+            )
+
+    def test_final_verification_authenticates_exact_v3_leaf_and_physical_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._write_final_verification_fixture(root)
+            index = root / self._final_verification_index_key()
+            original_index = index.read_bytes()
+            manifest = json.loads(original_index)
+            descriptor = manifest["leaves_by_timeseries_id"]["1001"]
+            leaf = root / descriptor[0]
+            original_leaf = leaf.read_bytes()
+            bad_descriptors = [
+                None, {}, [], descriptor[:2], [*descriptor, 1],
+                ["/tmp/leaf.json", *descriptor[1:]],
+                [descriptor[0].replace("000001001", "000001004"), *descriptor[1:]],
+                [descriptor[0].replace("pollutant_code=no2", "pollutant_code=pm10"), *descriptor[1:]],
+                [descriptor[0], True, descriptor[2]],
+                [descriptor[0], 0, descriptor[2]],
+                [descriptor[0], str(descriptor[1]), descriptor[2]],
+                [descriptor[0], descriptor[1], "not-a-sha"],
+                [descriptor[0], descriptor[1] + 1, descriptor[2]],
+                [descriptor[0], descriptor[1], "0" * 64],
+            ]
+            for bad in bad_descriptors:
+                with self.subTest(descriptor=bad):
+                    payload = json.loads(original_index)
+                    payload["leaves_by_timeseries_id"]["1001"] = bad
+                    index.write_text(json.dumps(payload))
+                    self.assertIsNotNone(self._verify_fixture_index(root))
+            index.write_bytes(original_index)
+            leaf.unlink()
+            self.assertEqual("index_leaf_unreadable", self._verify_fixture_index(root)["gap_type"])
+            leaf.write_bytes(original_leaf + b" ")
+            self.assertEqual("index_leaf_identity_mismatch", self._verify_fixture_index(root)["gap_type"])
+
+            def check_repinned(payload, expected_gap="index_leaf_schema_mismatch"):
+                body = json.dumps(payload).encode()
+                leaf.write_bytes(body)
+                parent = json.loads(original_index)
+                parent["leaves_by_timeseries_id"]["1001"] = [
+                    descriptor[0], len(body), hashlib.sha256(body).hexdigest(),
+                ]
+                index.write_text(json.dumps(parent))
+                self.assertEqual(expected_gap, self._verify_fixture_index(root)["gap_type"])
+
+            for field, value in [
+                ("kind", "unknown"), ("timeseries_id", 1004),
+                ("day_utc", "2026-09-29"), ("connector_id", 10),
+                ("pollutant_code", "pm25"), ("row_count", 999),
+                ("files", []), ("segments", []),
+            ]:
+                with self.subTest(leaf_field=field):
+                    payload = json.loads(original_leaf)
+                    payload[field] = value
+                    check_repinned(payload)
+            payload = json.loads(original_leaf)
+            payload["segments"][0]["column_ranges"]["value"]["start"] += 1
+            check_repinned(payload)
+            check_repinned(None, "index_leaf_invalid_json")
+
+            index.write_bytes(original_index)
+            leaf.write_bytes(original_leaf)
+            parquet = root / json.loads(original_leaf)["files"][0]["key"]
+            parquet.write_bytes(parquet.read_bytes() + b" ")
+            self.assertEqual(
+                "index_manifest_canonical_evidence_invalid",
+                self._verify_fixture_index(root)["gap_type"],
+            )
+
+    def test_final_verification_exact_v3_trusts_only_explicit_local_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "view"
+            backing = Path(temporary_directory) / "backing"
+            backing.mkdir()
+            self._write_final_verification_fixture(root)
+            manifest = json.loads((root / self._final_verification_index_key()).read_bytes())
+            leaf = root / manifest["leaves_by_timeseries_id"]["1001"][0]
+            target = backing / "leaf.json"
+            target.write_bytes(leaf.read_bytes())
+            leaf.unlink()
+            leaf.symlink_to(target)
+            self.assertEqual("index_leaf_unreadable", self._verify_fixture_index(root)["gap_type"])
+            self.assertIsNone(self._verify_fixture_index(root, allowed_real_roots=(backing,)))
+            self.assertEqual(
+                "index_manifest_schema_mismatch",
+                self._verify_fixture_index(
+                    root, allowed_real_roots=(backing,),
+                    index_key=self._final_verification_index_key().replace(
+                        "connector_id=9", "connector_id=09",
                     ),
-                    "index_generation": "v3",
-                    "history_version": "v2",
-                    "domain": "observations",
-                    "history_schema_version": 3,
-                    "day_utc": day_utc,
-                    "connector_id": connector_id,
-                    "pollutant_code": pollutant_code,
-                    "coverage": {
-                        "row_count": 1,
-                        "timeseries_count": 1,
-                    },
-                    "leaves_by_timeseries_id": {
-                        str(timeseries_id): [
-                            f"{index_manifest.parent}/timeseries_id={timeseries_id}.json",
-                            100,
-                            "a" * 64,
-                        ],
-                    },
-                }), encoding="utf-8")
-            latest_path = root / config.observations_latest_index_key.strip("/")
-            latest_path.parent.mkdir(parents=True, exist_ok=True)
-            latest_path.write_text(json.dumps({"status": "test"}), encoding="utf-8")
-            stats = {
-                "row_count": 1,
-                "timeseries_row_counts": {timeseries_id: 1},
-                "min_timeseries_id": timeseries_id,
-                "max_timeseries_id": timeseries_id,
-                "min_timestamp_utc": f"{day_utc}T00:00:00+00:00",
-                "max_timestamp_utc": f"{day_utc}T00:00:00+00:00",
-                "parquet_null_timeseries_id_rows": False,
-            }
-            with mock.patch.object(
-                INTEGRITY,
-                "_read_parquet_partition_stats",
-                return_value=(stats, None),
-            ):
-                result = INTEGRITY.run_v2_observations_integrity_checks(
-                    r2_history_root=root,
-                    config=config,
-                    from_day=day_utc,
-                    to_day=day_utc,
-                    allowed_connector_ids={connector_id},
-                )
-        false_gaps = [
-            gap for gap in result["gaps"]
-            if gap["gap_type"] in {
-                "index_manifest_missing_timeseries_counts",
-                "index_manifest_empty_timeseries_counts",
-            }
-        ]
-        self.assertEqual([], false_gaps)
+                )["gap_type"],
+            )
+
+    def test_final_verification_exact_v3_helper_failure_is_a_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            for result in [
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "null", ""),
+                subprocess.CompletedProcess([], 1, '{"status":"ok"}', ""),
+            ]:
+                with self.subTest(result=result), mock.patch.object(
+                    INTEGRITY.subprocess, "run", return_value=result,
+                ):
+                    self.assertEqual(
+                        "index_manifest_verification_failed",
+                        self._verify_fixture_index(Path(temporary_directory))["gap_type"],
+                    )
 
     def test_preservation_parent_actions_compose_with_repaired_sibling(self) -> None:
         repaired = INTEGRITY._merge_changed_observation_metadata_actions(
