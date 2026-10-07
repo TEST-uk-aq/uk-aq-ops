@@ -928,9 +928,11 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
                 "day_utc": "2026-09-28",
                 "connector_id": 8,
                 "pollutant_code": "o3",
+                "pollutant_prefix": prefix,
                 "outcome": "authoritative_no_data_replacement",
                 "authorised_tombstone_prefix": prefix,
                 "replacement_object_keys": [],
+                "preservation_evidence": None,
             }],
             "authorised_pollutant_tombstone_prefixes": [prefix],
         }
@@ -1064,9 +1066,11 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
                 "day_utc": "2026-09-28",
                 "connector_id": 8,
                 "pollutant_code": "no2",
+                "pollutant_prefix": prefix,
                 "outcome": "authoritative_no_data_replacement",
                 "authorised_tombstone_prefix": prefix,
                 "replacement_object_keys": [],
+                "preservation_evidence": None,
             }],
             "authorised_pollutant_tombstone_prefixes": [prefix],
         }
@@ -1139,6 +1143,178 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
                     "pollutant_codes": ["pm10"],
                     "outcome": "source_artifact_unavailable_preserved",
                 }],
+            )
+
+    def test_generic_preserved_scope_freezes_parent_chain_and_matches_node(
+        self,
+    ) -> None:
+        self.run_state.update({
+            "execution_path": "generic_integrity",
+            "dedicated_sos_historical_replacement": False,
+        })
+        self.run_state.pop("sos_light", None)
+        day_utc = "2026-09-28"
+        connector_id = 8
+        pollutant_code = "pm10"
+        day_prefix = f"history/v3/observations/day_utc={day_utc}"
+        connector_prefix = f"{day_prefix}/connector_id={connector_id}"
+        pollutant_prefix = (
+            f"{connector_prefix}/pollutant_code={pollutant_code}"
+        )
+        pollutant_key = f"{pollutant_prefix}/manifest.json"
+        connector_key = f"{connector_prefix}/manifest.json"
+        day_key = f"{day_prefix}/manifest.json"
+        pollutant_payload = {"manifest_hash": "a" * 64}
+        pollutant_body = json.dumps(
+            pollutant_payload, separators=(",", ":"),
+        ).encode()
+        pollutant_path = self.dropbox / pollutant_key
+        pollutant_path.parent.mkdir(parents=True, exist_ok=True)
+        pollutant_path.write_bytes(pollutant_body)
+        pollutant_identity = {
+            "sha256": hashlib.sha256(pollutant_body).hexdigest(),
+            "bytes": len(pollutant_body),
+            "source": "dropbox",
+        }
+
+        def add_staged(
+            object_key: str,
+            payload: dict[str, object],
+            dependencies: list[str],
+            identities: dict[str, dict[str, object]],
+        ) -> None:
+            body = json.dumps(payload, separators=(",", ":")).encode()
+            local_path = Path(self.run_state["overlay_root"]) / object_key
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_bytes(body)
+            self.run_state["objects"][object_key] = {
+                "object_key": object_key,
+                "local_path": str(local_path),
+                "sha256": hashlib.sha256(body).hexdigest(),
+                "bytes": len(body),
+                "stage": "observations_manifest",
+                "dependencies": dependencies,
+                "dependency_identities": identities,
+                "proposed": True,
+                "built": True,
+                "structurally_validated": True,
+                "changed": True,
+                "included_in_write_set": True,
+                "status": "planned",
+                "planner_changed": True,
+                "planner_status": "planned",
+                "planner_included_in_write_set": True,
+                "planner_dependencies": list(dependencies),
+                "planner_dependency_identities": dict(identities),
+            }
+
+        pollutant_reference = {
+            "manifest_key": pollutant_key,
+            "manifest_hash": pollutant_payload["manifest_hash"],
+        }
+        connector_payload = {
+            "manifest_hash": "b" * 64,
+            "pollutant_manifests": [pollutant_reference],
+            "child_manifests": [pollutant_reference],
+        }
+        add_staged(
+            connector_key,
+            connector_payload,
+            [pollutant_key],
+            {pollutant_key: pollutant_identity},
+        )
+        connector_entry = self.run_state["objects"][connector_key]
+        connector_identity = {
+            "sha256": connector_entry["sha256"],
+            "bytes": connector_entry["bytes"],
+            "source": "planned_overlay",
+        }
+        connector_reference = {
+            "manifest_key": connector_key,
+            "manifest_hash": connector_payload["manifest_hash"],
+        }
+        add_staged(
+            day_key,
+            {
+                "manifest_hash": "c" * 64,
+                "connector_manifests": [connector_reference],
+                "child_manifests": [connector_reference],
+            },
+            [connector_key],
+            {connector_key: connector_identity},
+        )
+        authority = MODULE._finalise_generic_integrity_selected_scope_authority(
+            self.run_state,
+            [{
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "pollutant_code": pollutant_code,
+                "outcome": "source_artifact_unavailable_preserved",
+            }],
+        )
+        scope = authority["selected_scopes"][0]
+        self.assertEqual(scope["pollutant_prefix"], pollutant_prefix)
+        self.assertEqual(
+            scope["preservation_evidence"]["pollutant_manifest"],
+            {"object_key": pollutant_key, **pollutant_identity},
+        )
+        self.assertEqual(
+            scope["preservation_evidence"]["connector_parent"]
+            ["object_key"],
+            connector_key,
+        )
+        self.assertEqual(
+            scope["preservation_evidence"]["day_parent"]["object_key"],
+            day_key,
+        )
+        self.run_state["proposal_transition_planner_unchanged_keys"] = []
+        self.run_state["final_staged_write_set_provenance"] = {
+            "status": "finalised",
+            "final_staged_object_count": 2,
+            "forced_republication_count": 0,
+            "forced_republication_keys": [],
+            "promotion_reason_counts": {},
+            "rebuilt_dependency_identity_count": 0,
+            "staged_dependency_edge_count": 1,
+            "external_dependency_edge_counts": {
+                "dropbox": 1,
+                "overlay": 0,
+            },
+        }
+        MODULE.write_run_state(self.run_state)
+        python_fingerprint = (
+            MODULE.proposal_transition_state_fingerprint_sha256(self.run_state)
+        )
+        validation_module = (
+            Path(__file__).resolve().parents[3]
+            / "scripts/backup_r2/lib/generic_v3_proposal_validation.mjs"
+        ).as_uri()
+        result = MODULE.subprocess.run(
+            [
+                "node",
+                "--input-type=module",
+                "--eval",
+                (
+                    "import fs from 'node:fs';"
+                    f"import {{computeGenericV3TransitionStateFingerprint}} from {json.dumps(validation_module)};"
+                    "const state=JSON.parse(fs.readFileSync("
+                    f"{json.dumps(self.run_state['run_state_path'])},'utf8'));"
+                    "process.stdout.write(computeGenericV3TransitionStateFingerprint(state));"
+                ),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, python_fingerprint)
+
+        pollutant_path.write_bytes(b'{"manifest_hash":"stale"}')
+        with self.assertRaisesRegex(
+            ValueError, "preserved pollutant manifest identity changed",
+        ):
+            MODULE._canonical_generic_integrity_selected_scope_authority(
+                self.run_state
             )
 
     def test_progress_throttles_by_count_and_elapsed_time(self) -> None:

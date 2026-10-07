@@ -17578,6 +17578,247 @@ def _official_rdata_selected_partition_outcomes(
     return outcomes
 
 
+def _generic_preserved_manifest_reference(
+    payload: Mapping[str, Any],
+    *,
+    parent_key: str,
+    child_key: str,
+    reference_fields: tuple[str, ...],
+) -> str:
+    references: dict[str, str] = {}
+    for field in reference_fields:
+        raw_references = payload.get(field) or []
+        if not isinstance(raw_references, list):
+            raise ValueError(
+                f"generic preserved parent references are invalid: {parent_key}"
+            )
+        for raw_reference in raw_references:
+            if not isinstance(raw_reference, Mapping):
+                raise ValueError(
+                    f"generic preserved parent reference is invalid: {parent_key}"
+                )
+            manifest_key = str(raw_reference.get("manifest_key") or "")
+            manifest_hash = str(raw_reference.get("manifest_hash") or "")
+            if not manifest_key:
+                continue
+            previous = references.get(manifest_key)
+            if previous is not None and previous != manifest_hash:
+                raise ValueError(
+                    "generic preserved parent has contradictory child identity: "
+                    f"{parent_key} -> {manifest_key}"
+                )
+            references[manifest_key] = manifest_hash
+    manifest_hash = references.get(child_key)
+    if not re.fullmatch(r"[a-f0-9]{64}", str(manifest_hash or "")):
+        raise ValueError(
+            "generic preserved parent lacks exact child reference: "
+            f"{parent_key} -> {child_key}"
+        )
+    return str(manifest_hash)
+
+
+def _read_generic_preserved_json(
+    path: Path,
+    *,
+    object_key: str,
+) -> tuple[bytes, Mapping[str, Any]]:
+    try:
+        body = path.read_bytes()
+        payload = json.loads(body)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"generic preserved manifest is unavailable or invalid: {object_key}"
+        ) from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError(
+            f"generic preserved manifest JSON is invalid: {object_key}"
+        )
+    return body, payload
+
+
+def _derive_generic_preserved_scope_evidence(
+    run_state: Mapping[str, Any],
+    *,
+    day_utc: str,
+    connector_id: int,
+    pollutant_code: str,
+) -> dict[str, Any]:
+    day_prefix = (
+        f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}"
+    )
+    connector_prefix = f"{day_prefix}/connector_id={connector_id}"
+    pollutant_prefix = f"{connector_prefix}/pollutant_code={pollutant_code}"
+    pollutant_manifest_key = f"{pollutant_prefix}/manifest.json"
+    connector_manifest_key = f"{connector_prefix}/manifest.json"
+    day_manifest_key = f"{day_prefix}/manifest.json"
+    objects = run_state.get("objects")
+    if not isinstance(objects, Mapping):
+        raise ValueError("generic preserved scope objects mapping is unavailable")
+    connector_entry = objects.get(connector_manifest_key)
+    day_entry = objects.get(day_manifest_key)
+    if not isinstance(connector_entry, Mapping) or not isinstance(day_entry, Mapping):
+        raise ValueError(
+            "generic preserved scope requires staged connector and day manifests: "
+            f"{pollutant_prefix}"
+        )
+
+    connector_identities = connector_entry.get("dependency_identities")
+    connector_dependencies = connector_entry.get("dependencies")
+    raw_pollutant_identity = (
+        connector_identities.get(pollutant_manifest_key)
+        if isinstance(connector_identities, Mapping) else None
+    )
+    if (
+        not isinstance(connector_dependencies, list)
+        or pollutant_manifest_key not in connector_dependencies
+        or not isinstance(raw_pollutant_identity, Mapping)
+    ):
+        raise ValueError(
+            "generic preserved connector lacks the exact pollutant dependency: "
+            f"{connector_manifest_key} -> {pollutant_manifest_key}"
+        )
+    pollutant_identity = _normalise_proposal_dependency_identity(
+        parent_key=connector_manifest_key,
+        dependency_key=pollutant_manifest_key,
+        identity=raw_pollutant_identity,
+    )
+    if pollutant_identity["source"] not in PROPOSAL_TRANSITION_EXTERNAL_SOURCES:
+        raise ValueError(
+            "generic preserved pollutant manifest is not externally pinned: "
+            f"{pollutant_manifest_key}"
+        )
+    external_root_name = (
+        "base_dropbox_root"
+        if pollutant_identity["source"] == "dropbox" else "overlay_root"
+    )
+    external_root_value = str(run_state.get(external_root_name) or "")
+    external_root = Path(external_root_value)
+    if not external_root_value or not external_root.is_dir():
+        raise ValueError(
+            "generic preserved external root is unavailable: "
+            f"{pollutant_identity['source']}"
+        )
+    external_body, pollutant_payload = _read_generic_preserved_json(
+        external_root / pollutant_manifest_key,
+        object_key=pollutant_manifest_key,
+    )
+    if (
+        len(external_body) != pollutant_identity["bytes"]
+        or hashlib.sha256(external_body).hexdigest()
+        != pollutant_identity["sha256"]
+    ):
+        raise ValueError(
+            "generic preserved pollutant manifest identity changed: "
+            f"{pollutant_manifest_key}"
+        )
+    pollutant_manifest_hash = str(
+        pollutant_payload.get("manifest_hash") or ""
+    )
+    if not re.fullmatch(r"[a-f0-9]{64}", pollutant_manifest_hash):
+        raise ValueError(
+            "generic preserved pollutant manifest hash is invalid: "
+            f"{pollutant_manifest_key}"
+        )
+
+    connector_body, connector_payload = _read_generic_preserved_json(
+        Path(str(connector_entry.get("local_path") or "")),
+        object_key=connector_manifest_key,
+    )
+    if (
+        len(connector_body) != connector_entry.get("bytes")
+        or hashlib.sha256(connector_body).hexdigest()
+        != str(connector_entry.get("sha256") or "")
+    ):
+        raise ValueError(
+            "generic preserved connector manifest identity changed: "
+            f"{connector_manifest_key}"
+        )
+    connector_child_hash = _generic_preserved_manifest_reference(
+        connector_payload,
+        parent_key=connector_manifest_key,
+        child_key=pollutant_manifest_key,
+        reference_fields=("pollutant_manifests", "child_manifests"),
+    )
+    if connector_child_hash != pollutant_manifest_hash:
+        raise ValueError(
+            "generic preserved connector references stale pollutant identity: "
+            f"{pollutant_manifest_key}"
+        )
+    connector_manifest_hash = str(
+        connector_payload.get("manifest_hash") or ""
+    )
+    if not re.fullmatch(r"[a-f0-9]{64}", connector_manifest_hash):
+        raise ValueError(
+            "generic preserved connector manifest hash is invalid: "
+            f"{connector_manifest_key}"
+        )
+
+    day_dependencies = day_entry.get("dependencies")
+    day_identities = day_entry.get("dependency_identities")
+    raw_connector_identity = (
+        day_identities.get(connector_manifest_key)
+        if isinstance(day_identities, Mapping) else None
+    )
+    expected_connector_identity = {
+        "sha256": str(connector_entry.get("sha256") or ""),
+        "bytes": connector_entry.get("bytes"),
+        "source": "planned_overlay",
+    }
+    if (
+        not isinstance(day_dependencies, list)
+        or connector_manifest_key not in day_dependencies
+        or not isinstance(raw_connector_identity, Mapping)
+        or _normalise_proposal_dependency_identity(
+            parent_key=day_manifest_key,
+            dependency_key=connector_manifest_key,
+            identity=raw_connector_identity,
+        ) != expected_connector_identity
+    ):
+        raise ValueError(
+            "generic preserved day parent lacks the staged connector identity: "
+            f"{day_manifest_key} -> {connector_manifest_key}"
+        )
+    day_body, day_payload = _read_generic_preserved_json(
+        Path(str(day_entry.get("local_path") or "")),
+        object_key=day_manifest_key,
+    )
+    if (
+        len(day_body) != day_entry.get("bytes")
+        or hashlib.sha256(day_body).hexdigest()
+        != str(day_entry.get("sha256") or "")
+    ):
+        raise ValueError(
+            f"generic preserved day manifest identity changed: {day_manifest_key}"
+        )
+    day_child_hash = _generic_preserved_manifest_reference(
+        day_payload,
+        parent_key=day_manifest_key,
+        child_key=connector_manifest_key,
+        reference_fields=("connector_manifests", "child_manifests"),
+    )
+    if day_child_hash != connector_manifest_hash:
+        raise ValueError(
+            "generic preserved day parent references stale connector identity: "
+            f"{connector_manifest_key}"
+        )
+    return {
+        "pollutant_manifest": {
+            "object_key": pollutant_manifest_key,
+            **pollutant_identity,
+        },
+        "connector_parent": {
+            "object_key": connector_manifest_key,
+            "pollutant_manifest_key": pollutant_manifest_key,
+            "pollutant_manifest_hash": pollutant_manifest_hash,
+        },
+        "day_parent": {
+            "object_key": day_manifest_key,
+            "connector_manifest_key": connector_manifest_key,
+            "connector_manifest_hash": connector_manifest_hash,
+        },
+    }
+
+
 def _finalise_generic_integrity_selected_scope_authority(
     run_state: dict[str, Any],
     selected_partition_outcomes: Iterable[Mapping[str, Any]],
@@ -17667,15 +17908,26 @@ def _finalise_generic_integrity_selected_scope_authority(
             raise ValueError(
                 f"generic selected partition outcome is not mutation-capable: {outcome}"
             )
+        preservation_evidence = (
+            _derive_generic_preserved_scope_evidence(
+                run_state,
+                day_utc=day_utc,
+                connector_id=connector_id,
+                pollutant_code=pollutant_code,
+            )
+            if outcome == "source_artifact_unavailable_preserved" else None
+        )
         scopes.append({
             "day_utc": day_utc,
             "connector_id": connector_id,
             "pollutant_code": pollutant_code,
+            "pollutant_prefix": prefix,
             "outcome": outcome,
             "authorised_tombstone_prefix": authorised_prefix,
             "replacement_object_keys": (
                 replacement_keys if outcome == "complete_replacement" else []
             ),
+            "preservation_evidence": preservation_evidence,
         })
     scopes.sort(key=lambda entry: (
         entry["day_utc"].encode("utf-8"),
@@ -20543,10 +20795,10 @@ SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
     "uk_aq_sos_light_v3_transition_state_fingerprint_v2"
 )
 GENERIC_INTEGRITY_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
-    "uk_aq_generic_integrity_v3_transition_state_fingerprint_v1"
+    "uk_aq_generic_integrity_v3_transition_state_fingerprint_v2"
 )
 GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT = (
-    "uk_aq_generic_integrity_v3_selected_scope_authority_v1"
+    "uk_aq_generic_integrity_v3_selected_scope_authority_v2"
 )
 COORDINATOR_PROGRESS_OBJECT_INTERVAL = 250
 COORDINATOR_PROGRESS_SECONDS = 15.0
@@ -21270,11 +21522,26 @@ def _canonical_generic_integrity_selected_scope_authority(
             f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
             f"connector_id={connector_id}/pollutant_code={pollutant_code}"
         )
+        if raw_scope.get("pollutant_prefix") != expected_prefix:
+            raise ValueError(
+                "generic fixed-v3 selected pollutant prefix is invalid"
+            )
         authorised_prefix = raw_scope.get("authorised_tombstone_prefix")
         if outcome == "source_artifact_unavailable_preserved":
             if authorised_prefix is not None:
                 raise ValueError(
                     "generic fixed-v3 preserved scope has deletion authority"
+                )
+            if any(
+                isinstance(entry, Mapping)
+                and entry.get("proposed")
+                and _normalise_overlay_object_key(
+                    str(entry.get("prefix") or "")
+                ).rstrip("/") == expected_prefix
+                for entry in list(run_state.get("tombstone_prefixes") or [])
+            ):
+                raise ValueError(
+                    "generic fixed-v3 source-unavailable scope has proposed deletion"
                 )
         elif authorised_prefix != expected_prefix:
             raise ValueError(
@@ -21319,13 +21586,34 @@ def _canonical_generic_integrity_selected_scope_authority(
             raise ValueError(
                 "generic fixed-v3 selected replacement closure changed"
             )
+        preservation_evidence = raw_scope.get("preservation_evidence")
+        if outcome == "source_artifact_unavailable_preserved":
+            expected_preservation_evidence = (
+                _derive_generic_preserved_scope_evidence(
+                    run_state,
+                    day_utc=day_utc,
+                    connector_id=connector_id,
+                    pollutant_code=pollutant_code,
+                )
+            )
+            if preservation_evidence != expected_preservation_evidence:
+                raise ValueError(
+                    "generic fixed-v3 preserved scope evidence changed"
+                )
+            preservation_evidence = expected_preservation_evidence
+        elif preservation_evidence is not None:
+            raise ValueError(
+                "generic fixed-v3 replacement scope has preservation evidence"
+            )
         scopes.append({
             "day_utc": day_utc,
             "connector_id": connector_id,
             "pollutant_code": pollutant_code,
+            "pollutant_prefix": expected_prefix,
             "outcome": outcome,
             "authorised_tombstone_prefix": authorised_prefix,
             "replacement_object_keys": replacement_keys,
+            "preservation_evidence": preservation_evidence,
         })
     scopes.sort(key=lambda entry: (
         entry["day_utc"].encode("utf-8"),

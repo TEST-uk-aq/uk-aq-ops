@@ -884,6 +884,23 @@ test("fixed-v3 apply rejects missing, unknown, and intermediate fingerprints", (
   );
 });
 
+function canonicalTestManifest(fields) {
+  const payload = {
+    history_version: "v2",
+    domain: "observations",
+    source_row_count: 0,
+    row_count: 0,
+    file_count: 0,
+    total_bytes: 0,
+    files: [],
+    ...fields,
+  };
+  return Buffer.from(JSON.stringify({
+    ...payload,
+    manifest_hash: sha256Hex(Buffer.from(JSON.stringify(payload))),
+  }));
+}
+
 function genericV3SelectedScopeState({ authoritativeEmpty = false } = {}) {
   const runRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-generic-v3-"));
   const overlayRoot = path.join(runRoot, "overlay");
@@ -896,18 +913,20 @@ function genericV3SelectedScopeState({ authoritativeEmpty = false } = {}) {
   const prefix = `history/v3/observations/day_utc=${dayUtc}`
     + `/connector_id=${connectorId}/pollutant_code=${pollutantCode}`;
   const objects = {};
-  const addObject = (key, body, dependencies = []) => {
+  const addObject = (key, body, dependencies = [], suppliedIdentities = null) => {
     const localPath = path.join(overlayRoot, ...key.split("/"));
     fs.mkdirSync(path.dirname(localPath), { recursive: true });
     fs.writeFileSync(localPath, body);
-    const dependencyIdentities = Object.fromEntries(dependencies.map((dependencyKey) => [
-      dependencyKey,
-      {
-        sha256: objects[dependencyKey].sha256,
-        bytes: objects[dependencyKey].bytes,
-        source: "planned_overlay",
-      },
-    ]));
+    const dependencyIdentities = suppliedIdentities || Object.fromEntries(
+      dependencies.map((dependencyKey) => [
+        dependencyKey,
+        {
+          sha256: objects[dependencyKey].sha256,
+          bytes: objects[dependencyKey].bytes,
+          source: "planned_overlay",
+        },
+      ]),
+    );
     objects[key] = {
       object_key: key,
       local_path: localPath,
@@ -968,10 +987,12 @@ function genericV3SelectedScopeState({ authoritativeEmpty = false } = {}) {
         day_utc: dayUtc,
         connector_id: connectorId,
         pollutant_code: pollutantCode,
+        pollutant_prefix: prefix,
         outcome: authoritativeEmpty
           ? "authoritative_no_data_replacement" : "complete_replacement",
         authorised_tombstone_prefix: prefix,
         replacement_object_keys: replacementObjectKeys,
+        preservation_evidence: null,
       }],
       authorised_pollutant_tombstone_prefixes: [prefix],
     },
@@ -1002,7 +1023,121 @@ function genericV3SelectedScopeState({ authoritativeEmpty = false } = {}) {
   };
   runState.proposal_transition_validation.state_fingerprint_sha256 =
     computeGenericV3TransitionStateFingerprint(runState);
-  return { runRoot, runState, prefix, env: { UK_AQ_ENV_NAME: "TEST" } };
+  return {
+    runRoot,
+    runState,
+    prefix,
+    addObject,
+    env: { UK_AQ_ENV_NAME: "TEST" },
+  };
+}
+
+function configurePreservedPm10Scope(fixture) {
+  const { runState, addObject } = fixture;
+  const dayUtc = "2026-09-28";
+  const connectorId = 8;
+  const pollutantCode = "pm10";
+  const dayPrefix = `history/v3/observations/day_utc=${dayUtc}`;
+  const connectorPrefix = `${dayPrefix}/connector_id=${connectorId}`;
+  const pollutantPrefix = `${connectorPrefix}/pollutant_code=${pollutantCode}`;
+  const pollutantManifestKey = `${pollutantPrefix}/manifest.json`;
+  const connectorManifestKey = `${connectorPrefix}/manifest.json`;
+  const dayManifestKey = `${dayPrefix}/manifest.json`;
+  const pollutantBody = canonicalTestManifest({
+    manifest_kind: "pollutant",
+    manifest_key: pollutantManifestKey,
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    pollutant_code: pollutantCode,
+  });
+  const pollutantPath = path.join(
+    runState.base_dropbox_root,
+    ...pollutantManifestKey.split("/"),
+  );
+  fs.mkdirSync(path.dirname(pollutantPath), { recursive: true });
+  fs.writeFileSync(pollutantPath, pollutantBody);
+  const pollutantPayload = JSON.parse(pollutantBody.toString("utf8"));
+  const pollutantIdentity = {
+    sha256: sha256Hex(pollutantBody),
+    bytes: pollutantBody.byteLength,
+    source: "dropbox",
+  };
+  const connectorReference = {
+    pollutant_code: pollutantCode,
+    manifest_key: pollutantManifestKey,
+    manifest_hash: pollutantPayload.manifest_hash,
+  };
+  const connectorBody = canonicalTestManifest({
+    manifest_kind: "connector",
+    manifest_key: connectorManifestKey,
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    pollutant_manifests: [connectorReference],
+    child_manifests: [connectorReference],
+  });
+  addObject(
+    connectorManifestKey,
+    connectorBody,
+    [pollutantManifestKey],
+    { [pollutantManifestKey]: pollutantIdentity },
+  );
+  const connectorPayload = JSON.parse(connectorBody.toString("utf8"));
+  const dayReference = {
+    connector_id: connectorId,
+    manifest_key: connectorManifestKey,
+    manifest_hash: connectorPayload.manifest_hash,
+  };
+  const dayBody = canonicalTestManifest({
+    manifest_kind: "day",
+    manifest_key: dayManifestKey,
+    day_utc: dayUtc,
+    connector_manifests: [dayReference],
+    child_manifests: [dayReference],
+  });
+  addObject(dayManifestKey, dayBody, [connectorManifestKey]);
+  runState.tombstone_prefixes = [];
+  runState.generic_integrity_selected_scope_authority.selected_scopes = [{
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    pollutant_code: pollutantCode,
+    pollutant_prefix: pollutantPrefix,
+    outcome: "source_artifact_unavailable_preserved",
+    authorised_tombstone_prefix: null,
+    replacement_object_keys: [],
+    preservation_evidence: {
+      pollutant_manifest: {
+        object_key: pollutantManifestKey,
+        ...pollutantIdentity,
+      },
+      connector_parent: {
+        object_key: connectorManifestKey,
+        pollutant_manifest_key: pollutantManifestKey,
+        pollutant_manifest_hash: pollutantPayload.manifest_hash,
+      },
+      day_parent: {
+        object_key: dayManifestKey,
+        connector_manifest_key: connectorManifestKey,
+        connector_manifest_hash: connectorPayload.manifest_hash,
+      },
+    },
+  }];
+  runState.generic_integrity_selected_scope_authority
+    .authorised_pollutant_tombstone_prefixes = [];
+  runState.proposal_ingestion.completed_object_count = Object.keys(runState.objects).length;
+  runState.proposal_ingestion.total_object_count = Object.keys(runState.objects).length;
+  Object.assign(runState.final_staged_write_set_provenance, {
+    final_staged_object_count: Object.keys(runState.objects).length,
+    staged_dependency_edge_count: 1,
+    external_dependency_edge_counts: { dropbox: 1, overlay: 0 },
+  });
+  runState.proposal_transition_validation.state_fingerprint_sha256 =
+    computeGenericV3TransitionStateFingerprint(runState);
+  return {
+    pollutantManifestKey,
+    pollutantPath,
+    connectorManifestKey,
+    dayManifestKey,
+  };
 }
 
 test("generic fixed-v3 accepts selected non-empty authority and remains isolated from SOS", () => {
@@ -1080,7 +1215,7 @@ test("generic fixed-v3 rejects source-unavailable deletion and stale fingerprint
       .authorised_pollutant_tombstone_prefixes = [];
     assert.throws(
       () => computeGenericV3TransitionStateFingerprint(unavailable),
-      /proposed tombstones exceed selected authority/,
+      /source-unavailable scope has proposed deletion/,
     );
 
     const stale = structuredClone(fixture.runState);
@@ -1140,7 +1275,7 @@ test("generic fixed-v3 bridge rejects the dedicated SOS execution path", async (
   }
 });
 
-test("generic fixed-v3 authenticates an unstaged preserved Dropbox dependency", () => {
+test("generic fixed-v3 rejects an unrelated cross-pollutant preserved dependency", () => {
   const fixture = genericV3SelectedScopeState();
   try {
     const dayUtc = "2026-09-28";
@@ -1166,19 +1301,74 @@ test("generic fixed-v3 authenticates an unstaged preserved Dropbox dependency", 
       day_utc: dayUtc,
       connector_id: 8,
       pollutant_code: "pm10",
+      pollutant_prefix: externalPrefix,
       outcome: "source_artifact_unavailable_preserved",
       authorised_tombstone_prefix: null,
       replacement_object_keys: [],
+      preservation_evidence: {
+        pollutant_manifest: { object_key: externalKey, ...externalIdentity },
+        connector_parent: {
+          object_key: `history/v3/observations/day_utc=${dayUtc}/connector_id=8/manifest.json`,
+          pollutant_manifest_key: externalKey,
+          pollutant_manifest_hash: "a".repeat(64),
+        },
+        day_parent: {
+          object_key: `history/v3/observations/day_utc=${dayUtc}/manifest.json`,
+          connector_manifest_key: `history/v3/observations/day_utc=${dayUtc}/connector_id=8/manifest.json`,
+          connector_manifest_hash: "b".repeat(64),
+        },
+      },
     });
     fixture.runState.final_staged_write_set_provenance.external_dependency_edge_counts.dropbox = 1;
-    fixture.runState.proposal_transition_validation.state_fingerprint_sha256 =
-      computeGenericV3TransitionStateFingerprint(fixture.runState);
-    assert.doesNotThrow(() => validateLocalGenericV3Proposal(fixture.runState, fixture.env));
+    assert.throws(
+      () => computeGenericV3TransitionStateFingerprint(fixture.runState),
+      /preserved parent is not staged/,
+    );
+  } finally {
+    fs.rmSync(fixture.runRoot, { recursive: true, force: true });
+  }
+});
 
-    fs.writeFileSync(externalPath, Buffer.from("changed-after-freeze\n"));
+test("generic fixed-v3 accepts the exact preserved manifest through connector/day parents", async () => {
+  const fixture = genericV3SelectedScopeState({ authoritativeEmpty: true });
+  try {
+    configurePreservedPm10Scope(fixture);
+    const proposal = validateLocalGenericV3Proposal(fixture.runState, fixture.env);
+    assert.equal(proposal.prefixes.length, 0);
+    assert.deepEqual(
+      proposal.objects.map((object) => object.key).sort(),
+      [
+        "history/v3/observations/day_utc=2026-09-28/connector_id=8/manifest.json",
+        "history/v3/observations/day_utc=2026-09-28/manifest.json",
+      ].sort(),
+    );
+    const validation = await validateFinalGenericV3ProposalGraph({
+      runState: fixture.runState,
+      proposal,
+    });
+    assert.equal(validation.status, "succeeded");
+    assert.equal(validation.parent_and_index_dependencies_validated, true);
+  } finally {
+    fs.rmSync(fixture.runRoot, { recursive: true, force: true });
+  }
+});
+
+test("generic fixed-v3 rejects stale preserved external bytes before mutation", () => {
+  const fixture = genericV3SelectedScopeState({ authoritativeEmpty: true });
+  try {
+    const preserved = configurePreservedPm10Scope(fixture);
+    const scope = fixture.runState.generic_integrity_selected_scope_authority.selected_scopes[0];
+    const frozenSha256 = scope.preservation_evidence.pollutant_manifest.sha256;
+    scope.preservation_evidence.pollutant_manifest.sha256 = "f".repeat(64);
+    assert.throws(
+      () => computeGenericV3TransitionStateFingerprint(fixture.runState),
+      /preserved scope evidence changed/,
+    );
+    scope.preservation_evidence.pollutant_manifest.sha256 = frozenSha256;
+    fs.writeFileSync(preserved.pollutantPath, Buffer.from("changed-after-freeze\n"));
     assert.throws(
       () => validateLocalGenericV3Proposal(fixture.runState, fixture.env),
-      /external dependency identity changed after planning/,
+      /preserved pollutant manifest identity changed/,
     );
   } finally {
     fs.rmSync(fixture.runRoot, { recursive: true, force: true });

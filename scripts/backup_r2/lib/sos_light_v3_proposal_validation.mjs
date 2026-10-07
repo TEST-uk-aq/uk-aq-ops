@@ -188,9 +188,7 @@ function requireUnicodeScalarText(value) {
 }
 
 function compareFingerprintObjectKeys(left, right) {
-  if (left.object_key < right.object_key) return -1;
-  if (left.object_key > right.object_key) return 1;
-  return 0;
+  return bytewiseTextCompare(left.object_key, right.object_key);
 }
 
 function canonicalConnectorIds(value, label) {

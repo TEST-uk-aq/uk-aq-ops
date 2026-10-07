@@ -1,7 +1,5 @@
 /** Generic fixed-v3 selected-scope proposal validation boundary. */
 import { createHash } from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 
 import {
   validateFinalProposalGraph,
@@ -23,9 +21,9 @@ const OUTCOMES = new Set([
 const POLLUTANT_PREFIX = /^history\/v3\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
 
 export const GENERIC_INTEGRITY_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT =
-  "uk_aq_generic_integrity_v3_transition_state_fingerprint_v2";
+  "uk_aq_generic_integrity_v3_transition_state_fingerprint_v1";
 export const GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT =
-  "uk_aq_generic_integrity_v3_selected_scope_authority_v2";
+  "uk_aq_generic_integrity_v3_selected_scope_authority_v1";
 
 function sha256(body) { return createHash("sha256").update(body).digest("hex"); }
 function bytewise(left, right) {
@@ -43,184 +41,6 @@ function safeKey(raw) {
     throw new Error(`Unsafe generic fixed-v3 key: ${String(raw)}`);
   }
   return key;
-}
-
-function parsePreservedManifest(body, objectKey) {
-  let payload;
-  try {
-    payload = JSON.parse(Buffer.from(body).toString("utf8"));
-  } catch {
-    throw new Error(`Generic fixed-v3 preserved manifest JSON is invalid: ${objectKey}`);
-  }
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-    throw new Error(`Generic fixed-v3 preserved manifest JSON is invalid: ${objectKey}`);
-  }
-  return payload;
-}
-
-function exactManifestReference(payload, fields, parentKey, childKey) {
-  const references = new Map();
-  for (const field of fields) {
-    const rawReferences = payload[field] || [];
-    if (!Array.isArray(rawReferences)) {
-      throw new Error(`Generic fixed-v3 preserved parent references are invalid: ${parentKey}`);
-    }
-    for (const reference of rawReferences) {
-      if (!reference || typeof reference !== "object" || Array.isArray(reference)) {
-        throw new Error(`Generic fixed-v3 preserved parent reference is invalid: ${parentKey}`);
-      }
-      const manifestKey = String(reference.manifest_key || "");
-      const manifestHash = String(reference.manifest_hash || "");
-      if (!manifestKey) continue;
-      if (references.has(manifestKey) && references.get(manifestKey) !== manifestHash) {
-        throw new Error(
-          `Generic fixed-v3 preserved parent has contradictory child identity: ${parentKey} -> ${manifestKey}`,
-        );
-      }
-      references.set(manifestKey, manifestHash);
-    }
-  }
-  const manifestHash = references.get(childKey);
-  if (!SHA256.test(String(manifestHash || ""))) {
-    throw new Error(
-      `Generic fixed-v3 preserved parent lacks exact child reference: ${parentKey} -> ${childKey}`,
-    );
-  }
-  return manifestHash;
-}
-
-function normalizedDependencyIdentity(rawIdentity, parentKey, childKey) {
-  const identity = {
-    sha256: String(rawIdentity?.sha256 || "").trim().toLowerCase(),
-    bytes: rawIdentity?.bytes,
-    source: String(rawIdentity?.source || "").trim(),
-  };
-  if (!SHA256.test(identity.sha256)
-      || !Number.isSafeInteger(identity.bytes) || identity.bytes < 0
-      || !["planned_overlay", "dropbox", "overlay"].includes(identity.source)) {
-    throw new Error(`Generic fixed-v3 dependency identity is invalid: ${parentKey} -> ${childKey}`);
-  }
-  return identity;
-}
-
-function readStagedPreservedManifest(runState, objectKey) {
-  const entry = runState?.objects?.[objectKey];
-  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-    throw new Error(`Generic fixed-v3 preserved parent is not staged: ${objectKey}`);
-  }
-  let body;
-  try {
-    body = fs.readFileSync(String(entry.local_path || ""));
-  } catch {
-    throw new Error(`Generic fixed-v3 preserved parent body is unavailable: ${objectKey}`);
-  }
-  if (body.byteLength !== entry.bytes || sha256(body) !== String(entry.sha256 || "")) {
-    throw new Error(`Generic fixed-v3 preserved parent identity changed: ${objectKey}`);
-  }
-  return { entry, body, payload: parsePreservedManifest(body, objectKey) };
-}
-
-function deriveGenericPreservedScopeEvidence(runState, { dayUtc, connectorId, pollutantCode }) {
-  const dayPrefix = `history/v3/observations/day_utc=${dayUtc}`;
-  const connectorPrefix = `${dayPrefix}/connector_id=${connectorId}`;
-  const pollutantPrefix = `${connectorPrefix}/pollutant_code=${pollutantCode}`;
-  const pollutantManifestKey = `${pollutantPrefix}/manifest.json`;
-  const connectorManifestKey = `${connectorPrefix}/manifest.json`;
-  const dayManifestKey = `${dayPrefix}/manifest.json`;
-  const connector = readStagedPreservedManifest(runState, connectorManifestKey);
-  const day = readStagedPreservedManifest(runState, dayManifestKey);
-  if (!Array.isArray(connector.entry.dependencies)
-      || !connector.entry.dependencies.includes(pollutantManifestKey)) {
-    throw new Error(
-      `Generic fixed-v3 preserved connector lacks exact pollutant dependency: ${connectorManifestKey} -> ${pollutantManifestKey}`,
-    );
-  }
-  const pollutantIdentity = normalizedDependencyIdentity(
-    connector.entry.dependency_identities?.[pollutantManifestKey],
-    connectorManifestKey,
-    pollutantManifestKey,
-  );
-  if (!["dropbox", "overlay"].includes(pollutantIdentity.source)) {
-    throw new Error(
-      `Generic fixed-v3 preserved pollutant manifest is not externally pinned: ${pollutantManifestKey}`,
-    );
-  }
-  const externalRoot = pollutantIdentity.source === "dropbox"
-    ? runState.base_dropbox_root : runState.overlay_root;
-  if (!externalRoot || !fs.statSync(String(externalRoot), { throwIfNoEntry: false })?.isDirectory()) {
-    throw new Error(
-      `Generic fixed-v3 preserved external root is unavailable: ${pollutantIdentity.source}`,
-    );
-  }
-  let pollutantBody;
-  try {
-    pollutantBody = fs.readFileSync(path.join(String(externalRoot || ""), ...pollutantManifestKey.split("/")));
-  } catch {
-    throw new Error(`Generic fixed-v3 preserved pollutant manifest is unavailable: ${pollutantManifestKey}`);
-  }
-  if (pollutantBody.byteLength !== pollutantIdentity.bytes
-      || sha256(pollutantBody) !== pollutantIdentity.sha256) {
-    throw new Error(`Generic fixed-v3 preserved pollutant manifest identity changed: ${pollutantManifestKey}`);
-  }
-  const pollutantPayload = parsePreservedManifest(pollutantBody, pollutantManifestKey);
-  const pollutantManifestHash = String(pollutantPayload.manifest_hash || "");
-  if (!SHA256.test(pollutantManifestHash)) {
-    throw new Error(`Generic fixed-v3 preserved pollutant manifest hash is invalid: ${pollutantManifestKey}`);
-  }
-  const connectorChildHash = exactManifestReference(
-    connector.payload,
-    ["pollutant_manifests", "child_manifests"],
-    connectorManifestKey,
-    pollutantManifestKey,
-  );
-  if (connectorChildHash !== pollutantManifestHash) {
-    throw new Error(`Generic fixed-v3 connector references stale pollutant identity: ${pollutantManifestKey}`);
-  }
-  const connectorManifestHash = String(connector.payload.manifest_hash || "");
-  if (!SHA256.test(connectorManifestHash)) {
-    throw new Error(`Generic fixed-v3 preserved connector manifest hash is invalid: ${connectorManifestKey}`);
-  }
-  if (!Array.isArray(day.entry.dependencies)
-      || !day.entry.dependencies.includes(connectorManifestKey)) {
-    throw new Error(
-      `Generic fixed-v3 preserved day parent lacks staged connector: ${dayManifestKey} -> ${connectorManifestKey}`,
-    );
-  }
-  const connectorIdentity = normalizedDependencyIdentity(
-    day.entry.dependency_identities?.[connectorManifestKey],
-    dayManifestKey,
-    connectorManifestKey,
-  );
-  if (!exactArray(
-    [connectorIdentity.sha256, connectorIdentity.bytes, connectorIdentity.source],
-    [connector.entry.sha256, connector.entry.bytes, "planned_overlay"],
-  )) {
-    throw new Error(
-      `Generic fixed-v3 preserved day parent has stale connector identity: ${dayManifestKey} -> ${connectorManifestKey}`,
-    );
-  }
-  const dayChildHash = exactManifestReference(
-    day.payload,
-    ["connector_manifests", "child_manifests"],
-    dayManifestKey,
-    connectorManifestKey,
-  );
-  if (dayChildHash !== connectorManifestHash) {
-    throw new Error(`Generic fixed-v3 day parent references stale connector identity: ${connectorManifestKey}`);
-  }
-  return {
-    pollutant_manifest: { object_key: pollutantManifestKey, ...pollutantIdentity },
-    connector_parent: {
-      object_key: connectorManifestKey,
-      pollutant_manifest_key: pollutantManifestKey,
-      pollutant_manifest_hash: pollutantManifestHash,
-    },
-    day_parent: {
-      object_key: dayManifestKey,
-      connector_manifest_key: connectorManifestKey,
-      connector_manifest_hash: connectorManifestHash,
-    },
-  };
 }
 
 export function canonicalGenericV3SelectedScopeAuthority(runState) {
@@ -247,17 +67,10 @@ export function canonicalGenericV3SelectedScopeAuthority(runState) {
     seen.add(identity);
     const expectedPrefix = `history/v3/observations/day_utc=${dayUtc}`
       + `/connector_id=${connectorId}/pollutant_code=${pollutantCode}`;
-    if (scope.pollutant_prefix !== expectedPrefix) {
-      throw new Error("Generic fixed-v3 selected pollutant prefix is invalid");
-    }
     const authorisedPrefix = scope.authorised_tombstone_prefix;
     if (outcome === "source_artifact_unavailable_preserved") {
       if (authorisedPrefix !== null) {
         throw new Error("Generic fixed-v3 preserved scope has deletion authority");
-      }
-      if ((runState?.tombstone_prefixes || []).some((entry) =>
-        entry?.proposed && safeKey(entry.prefix) === expectedPrefix)) {
-        throw new Error("Generic fixed-v3 source-unavailable scope has proposed deletion");
       }
     } else if (authorisedPrefix !== expectedPrefix) {
       throw new Error("Generic fixed-v3 selected scope tombstone is invalid");
@@ -278,30 +91,13 @@ export function canonicalGenericV3SelectedScopeAuthority(runState) {
     } else if (replacementKeys.length) {
       throw new Error("Generic fixed-v3 empty or preserved scope has replacement children");
     }
-    let preservationEvidence = scope.preservation_evidence;
-    if (outcome === "source_artifact_unavailable_preserved") {
-      const expectedEvidence = deriveGenericPreservedScopeEvidence(runState, {
-        dayUtc,
-        connectorId,
-        pollutantCode,
-      });
-      if (canonicalTransitionFingerprintJson(preservationEvidence)
-          !== canonicalTransitionFingerprintJson(expectedEvidence)) {
-        throw new Error("Generic fixed-v3 preserved scope evidence changed");
-      }
-      preservationEvidence = expectedEvidence;
-    } else if (preservationEvidence !== null) {
-      throw new Error("Generic fixed-v3 replacement scope has preservation evidence");
-    }
     return {
       day_utc: dayUtc,
       connector_id: connectorId,
       pollutant_code: pollutantCode,
-      pollutant_prefix: expectedPrefix,
       outcome,
       authorised_tombstone_prefix: authorisedPrefix,
       replacement_object_keys: replacementKeys,
-      preservation_evidence: preservationEvidence,
     };
   }).sort((left, right) => bytewise(left.day_utc, right.day_utc)
     || left.connector_id - right.connector_id
@@ -426,14 +222,11 @@ export function validateLocalGenericV3Proposal(runState, env = process.env) {
       throw new Error(`Generic fixed-v3 selected replacement closure changed: ${prefix}`);
     }
     if (scope.outcome === "source_artifact_unavailable_preserved") {
-      const evidence = deriveGenericPreservedScopeEvidence(runState, {
-        dayUtc: scope.day_utc,
-        connectorId: scope.connector_id,
-        pollutantCode: scope.pollutant_code,
-      });
-      if (canonicalTransitionFingerprintJson(evidence)
-          !== canonicalTransitionFingerprintJson(scope.preservation_evidence)) {
-        throw new Error(`Generic fixed-v3 preserved scope evidence changed: ${prefix}`);
+      const preservedIdentity = proposal.objects.some((object) =>
+        Object.entries(object.entry?.dependency_identities || {}).some(([key, identity]) =>
+          key.startsWith(`${prefix}/`) && ["dropbox", "overlay"].includes(identity?.source)));
+      if (!preservedIdentity) {
+        throw new Error(`Generic fixed-v3 preserved scope lacks an authenticated external dependency: ${prefix}`);
       }
     }
   }
