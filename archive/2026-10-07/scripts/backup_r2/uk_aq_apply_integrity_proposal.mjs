@@ -1020,12 +1020,12 @@ export function createVerifiedGetBodyCache({
 
 const OBSERVATION_INTEGRITY_POLLUTANTS = new Set(["pm25", "pm10", "no2", "o3"]);
 const CANONICAL_CONNECTOR_DAY_PREFIX_PATTERNS = Object.freeze([
-  /^history\/v(?:2|3)\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)$/,
+  /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)$/,
 ]);
 const CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN =
-  /^history\/v(?:2|3)\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
+  /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
 const CANONICAL_OBSERVATION_DAY_PREFIX_PATTERN =
-  /^history\/v(?:2|3)\/observations\/day_utc=(\d{4}-\d{2}-\d{2})$/;
+  /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})$/;
 const CANONICAL_OBSERVATION_POLLUTANT_MANIFEST_PATTERN =
   /^history\/v(?:2|3)\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/;
 
@@ -1206,7 +1206,7 @@ export function validateExternalDependencyRoot({
   return { key, local_path: localPath, ...identity };
 }
 
-export function validateLocalProposal(runState, { generation = "v2" } = {}) {
+export function validateLocalProposal(runState) {
   if (!runState || typeof runState !== "object") throw new Error("run state must be an object");
   const objects = Object.entries(runState.objects || {}).sort(([left], [right]) => bytewiseKeyCompare(left, right));
   const prefixes = Array.isArray(runState.tombstone_prefixes) ? runState.tombstone_prefixes : [];
@@ -1216,7 +1216,7 @@ export function validateLocalProposal(runState, { generation = "v2" } = {}) {
     const key = safeKey(rawKey);
     let classification;
     try {
-      classification = requireObservationHistoryIntegrityKey(key, { generation });
+      classification = requireObservationHistoryIntegrityKey(key, { generation: "v2" });
     } catch {
       throw new Error(`Non-observation history is outside the Integrity proposal contract: ${key}`);
     }
@@ -1263,7 +1263,6 @@ export function validateLocalProposal(runState, { generation = "v2" } = {}) {
   const normalizedPrefixes = prefixes.map((entry) => {
     const prefix = safeKey(entry?.prefix).replace(/\/+$/, "");
     if (!entry?.proposed) throw new Error(`Deletion prefix is not proposed: ${prefix}`);
-    requireObservationHistoryIntegrityKey(prefix, { generation });
     assertCanonicalDeletionPrefix(prefix, entry);
     return { entry, prefix, domain: objectDomain(prefix) };
   });
@@ -2068,12 +2067,7 @@ function validateFinalParentReferences({ proposal, runState }) {
   }
 }
 
-export async function validateFinalProposalGraph({
-  runState,
-  proposal,
-  runStatePath = null,
-  genericSelectedScopeAuthority = null,
-}) {
+export async function validateFinalProposalGraph({ runState, proposal, runStatePath = null }) {
   const audit = {
     status: "running",
     started_at_utc: new Date().toISOString(),
@@ -2085,16 +2079,12 @@ export async function validateFinalProposalGraph({
   if (runStatePath) atomicWriteJson(runStatePath, runState);
   try {
     const sosLight = runState.execution_path === "sos_light";
-    const authorityByPrefix = new Map((genericSelectedScopeAuthority?.selected_scopes || [])
-      .filter((scope) => scope?.authorised_tombstone_prefix)
-      .map((scope) => [String(scope.authorised_tombstone_prefix), scope]));
     const selectedPrefixes = sosLight
       ? Object.keys(runState.source_evidence_partitions || {}).map((identity) => ({
         prefix: `history/v2/observations/${identity}`,
       }))
       : proposal.prefixes.filter((item) =>
-        CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN.test(item.prefix))
-        .map((item) => ({ ...item, authority_scope: authorityByPrefix.get(item.prefix) || null }));
+        CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN.test(item.prefix));
     audit.selected_partition_count = selectedPrefixes.length;
     const objects = new Map(proposal.objects.map((object) => [object.key, object]));
     const tombstoneCounts = new Map();
@@ -2129,22 +2119,15 @@ export async function validateFinalProposalGraph({
       const manifestObject = objects.get(manifestKey);
       const stagedParts = proposal.objects.filter((object) =>
         object.key.startsWith(`${selected.prefix}/`) && object.key.endsWith(".parquet"));
-      const authoritativeEmpty = selected.authority_scope?.outcome
-        === "authoritative_no_data_replacement";
       const dedicatedEmptyAllowed = runState.execution_path === "sos_light";
-      if ((!manifestObject && !authoritativeEmpty)
-          || (!stagedParts.length && !dedicatedEmptyAllowed && !authoritativeEmpty)
-          || (authoritativeEmpty && (manifestObject || stagedParts.length))) {
+      if (!manifestObject || (!stagedParts.length && !dedicatedEmptyAllowed)) {
         throw finalProposalError({
           key: manifestKey,
           object: manifestObject,
           differingFields: [
-            ...(!manifestObject && !authoritativeEmpty ? ["matching_staged_pollutant_manifest"] : []),
+            ...(!manifestObject ? ["matching_staged_pollutant_manifest"] : []),
             ...(!stagedParts.length && !dedicatedEmptyAllowed
-              && !authoritativeEmpty
               ? ["matching_staged_parquet"] : []),
-            ...(authoritativeEmpty && (manifestObject || stagedParts.length)
-              ? ["authoritative_empty_has_synthetic_children"] : []),
           ],
         });
       }
@@ -2155,9 +2138,7 @@ export async function validateFinalProposalGraph({
       const connectorId = Number(connectorIdRaw);
       const manifestKey = `${selected.prefix}/manifest.json`;
       const manifestObject = objects.get(manifestKey);
-      const authoritativeEmpty = selected.authority_scope?.outcome
-        === "authoritative_no_data_replacement";
-      if (!manifestObject && !authoritativeEmpty) {
+      if (!manifestObject) {
         throw finalProposalError({ key: manifestKey, object: null, differingFields: ["missing_final_pollutant_manifest"] });
       }
       const partObjects = proposal.objects.filter((object) =>
@@ -2171,25 +2152,6 @@ export async function validateFinalProposalGraph({
           object: manifestObject,
           differingFields: [`immutable_source_evidence:${error instanceof Error ? error.message : String(error)}`],
         });
-      }
-      if (authoritativeEmpty) {
-        if (source.rows.length !== 0 || manifestObject || partObjects.length) {
-          throw finalProposalError({
-            key: manifestKey,
-            object: manifestObject,
-            differingFields: ["authoritative_empty_source_or_staged_children"],
-          });
-        }
-        audit.partitions.push({
-          manifest_key: null,
-          partition_prefix: selected.prefix,
-          proposal_owner: "source_derived_authoritative_empty_repair",
-          source_content_hash: source.metadata.observation_content_hash,
-          row_count: 0,
-          status: "validated_authoritative_empty",
-        });
-        audit.validated_partition_count += 1;
-        continue;
       }
       if (!partObjects.length && source.rows.length) {
         throw finalProposalError({
@@ -2718,20 +2680,8 @@ export async function applyValidatedProposal({
   r2,
   adapters = {},
   env = process.env,
-  generation = "v2",
-  expectedExecutionPath = null,
-  coordinatorFreezeValidator = null,
-  localProposalValidator = null,
-  finalProposalGraphValidator = null,
 }) {
-  if (generation === "v3") {
-    if (env.UK_AQ_R2_HISTORY_VERSION !== "v3"
-        || env.UK_AQ_R2_HISTORY_INDEX_VERSION !== "v3") {
-      throw new Error("Generic fixed-v3 APPLY requires fixed v3 history and index authority");
-    }
-  } else {
-    assertIntegrityApplyGenerationEligible(env);
-  }
+  assertIntegrityApplyGenerationEligible(env);
   const baseGetObject = adapters.getObject || r2GetObject;
   const retryLog = adapters.progressLog
     ? (event) => adapters.progressLog(
@@ -2751,14 +2701,9 @@ export async function applyValidatedProposal({
   };
   const indexConfig = resolveR2HistoryIndexConfig(env);
   const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
-  if (expectedExecutionPath && runState.execution_path !== expectedExecutionPath) {
-    throw new Error(`Canonical apply execution path mismatch: ${String(runState.execution_path)}`);
-  }
   let sosLightV2CoordinatorFreeze;
   try {
-    sosLightV2CoordinatorFreeze = coordinatorFreezeValidator
-      ? { dedicated: false, ...coordinatorFreezeValidator(runState) }
-      : requireSosLightV2CoordinatorFreeze(runState);
+    sosLightV2CoordinatorFreeze = requireSosLightV2CoordinatorFreeze(runState);
     if (sosLightV2CoordinatorFreeze.dedicated) {
       runState.sos_light_v2_node_transition_validation = {
         ...sosLightV2CoordinatorFreeze,
@@ -2770,9 +2715,7 @@ export async function applyValidatedProposal({
   } catch (error) {
     runState.apply = {
       status: "failed",
-      current_phase: coordinatorFreezeValidator
-        ? "generic_v3_coordinator_freeze_validation"
-        : "sos_light_v2_coordinator_freeze_validation",
+      current_phase: "sos_light_v2_coordinator_freeze_validation",
       r2_mutation_possible: false,
       error: error instanceof Error ? error.message : String(error),
       finished_at_utc: new Date().toISOString(),
@@ -2802,19 +2745,13 @@ export async function applyValidatedProposal({
     atomicWriteJson(runStatePath, runState);
     throw error;
   }
-  const proposal = localProposalValidator
-    ? localProposalValidator(runState)
-    : validateLocalProposal(runState, { generation });
+  const proposal = validateLocalProposal(runState);
   const dedicatedSosProposal = validateDedicatedSosHistoricalProposal({
     runState,
     proposal,
   });
   try {
-    if (finalProposalGraphValidator) {
-      await finalProposalGraphValidator({ runState, proposal });
-    } else {
-      await validateFinalProposalGraph({ runState, proposal });
-    }
+    await validateFinalProposalGraph({ runState, proposal });
   } catch (error) {
     runState.apply = {
       status: "failed",
@@ -3085,12 +3022,7 @@ export async function applyValidatedProposal({
     const connectorGroups = new Map();
     const dayGroups = new Map();
     const globalOperations = [];
-    const genericDeletionOperations = [];
     for (const operation of operations) {
-      if (!dedicatedSosProposal.dedicated && operation.kind === "delete") {
-        genericDeletionOperations.push(operation);
-        continue;
-      }
       if (isObservationHistoryIntegrityIndexKey(operation.key)) {
         globalOperations.push(operation);
         continue;
@@ -3256,9 +3188,7 @@ export async function applyValidatedProposal({
         diagnosticEnvironment: runState.environment,
         diagnostics: runState.writer_locks,
         r2,
-        observationsPrefix: generation === "v3"
-          ? "history/v3/observations"
-          : indexConfig.observations_prefix_v2,
+        observationsPrefix: indexConfig.observations_prefix_v2,
         affectedDaysUtc: affectedDays,
         maxKeys: indexConfig.max_keys || 1000,
         hierarchyFinalizerAdapter: adapters.observationsHierarchyFinalizer,
@@ -3287,12 +3217,6 @@ export async function applyValidatedProposal({
       await checkpoint("after_affected_index_publication");
       report({ message: progressMessage("index publication completed"), completedObjects: counts.completed_writes, force: true });
     };
-    if (!dedicatedSosProposal.dedicated) {
-      for (const operation of genericDeletionOperations.sort((left, right) =>
-        bytewiseKeyCompare(left.key, right.key))) {
-        await executeOperation(operation);
-      }
-    }
     if (dedicatedSosProposal.dedicated) {
       runState.apply.sos_light_day_publication = perDayStatus;
       await applySosLightPerDayUnits({

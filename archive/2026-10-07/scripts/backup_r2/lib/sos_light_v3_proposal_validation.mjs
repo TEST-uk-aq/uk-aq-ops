@@ -139,52 +139,26 @@ function canonicalCountMap(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error(`Fixed-v3 transition fingerprint ${label} is invalid`);
   }
-  return Object.fromEntries(Object.keys(value).sort(bytewiseTextCompare).map((key) => [
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [
     key,
     nonnegativeFingerprintInteger(value, key, label),
   ]));
 }
 
-export function canonicalTransitionFingerprintJson(value) {
-  if (typeof value === "string") {
-    requireUnicodeScalarText(value);
-    return JSON.stringify(value);
-  }
-  if (value === null || typeof value === "boolean") {
+function canonicalJson(value) {
+  if (value === null || typeof value === "boolean" || typeof value === "string") {
     return JSON.stringify(value);
   }
   if (typeof value === "number") {
     if (!Number.isSafeInteger(value)) throw new Error("Fixed-v3 transition fingerprint number is invalid");
     return String(value);
   }
-  if (Array.isArray(value)) return `[${value.map(canonicalTransitionFingerprintJson).join(",")}]`;
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value && typeof value === "object") {
-    return `{${Object.keys(value).sort(bytewiseTextCompare).map((key) =>
-      `${JSON.stringify(requireUnicodeScalarText(key))}:${canonicalTransitionFingerprintJson(value[key])}`).join(",")}}`;
+    return `{${Object.keys(value).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
   }
   throw new Error("Fixed-v3 transition fingerprint value is invalid");
-}
-
-function bytewiseTextCompare(left, right) {
-  const leftText = requireUnicodeScalarText(String(left));
-  const rightText = requireUnicodeScalarText(String(right));
-  return Buffer.compare(Buffer.from(leftText, "utf8"), Buffer.from(rightText, "utf8"));
-}
-
-function requireUnicodeScalarText(value) {
-  for (let index = 0; index < value.length; index += 1) {
-    const unit = value.charCodeAt(index);
-    if (unit >= 0xd800 && unit <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (!(next >= 0xdc00 && next <= 0xdfff)) {
-        throw new Error("Fixed-v3 transition fingerprint text contains an unpaired surrogate");
-      }
-      index += 1;
-    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
-      throw new Error("Fixed-v3 transition fingerprint text contains an unpaired surrogate");
-    }
-  }
-  return value;
 }
 
 function compareFingerprintObjectKeys(left, right) {
@@ -211,7 +185,7 @@ function canonicalObservationObjectKeys(value, dayUtc) {
   }
   const root = `${OBSERVATIONS_PREFIX}/day_utc=${dayUtc}`;
   const dayManifestKey = `${root}/manifest.json`;
-  const canonical = [...new Set(value.map(safeKey))].sort(bytewiseTextCompare);
+  const canonical = [...new Set(value.map(safeKey))].sort();
   const validObject = (key) => key === dayManifestKey
     || new RegExp(`^${root}/connector_id=[1-9]\\d*/manifest\\.json$`).test(key)
     || new RegExp(
@@ -304,10 +278,10 @@ function canonicalSosLightConnectorMembership(runState) {
       final_assembled_connector_ids: finalAssembledConnectorIds,
       authoritative_observation_object_keys: authoritativeObservationObjectKeys,
     };
-  }).sort((left, right) => bytewiseTextCompare(left.day_utc, right.day_utc));
+  }).sort((left, right) => left.day_utc.localeCompare(right.day_utc));
 }
 
-export function coordinatorTransitionStateCommonFingerprintPayload(runState) {
+export function coordinatorTransitionStateFingerprintPayload(runState) {
   const rawObjects = runState?.objects;
   if (!rawObjects || typeof rawObjects !== "object" || Array.isArray(rawObjects)) {
     throw new Error("Fixed-v3 transition fingerprint objects mapping is invalid");
@@ -328,7 +302,7 @@ export function coordinatorTransitionStateCommonFingerprintPayload(runState) {
     if (!Array.isArray(entry.dependencies)) {
       throw new Error(`Fixed-v3 transition fingerprint dependencies are invalid: ${objectKey}`);
     }
-    const dependencies = [...new Set(entry.dependencies.map(safeKey))].sort(bytewiseTextCompare);
+    const dependencies = [...new Set(entry.dependencies.map(safeKey))].sort();
     if (dependencies.length !== entry.dependencies.length) {
       throw new Error(`Fixed-v3 transition fingerprint dependencies are duplicated: ${objectKey}`);
     }
@@ -337,7 +311,7 @@ export function coordinatorTransitionStateCommonFingerprintPayload(runState) {
       if (!Array.isArray(entry.planner_dependencies)) {
         throw new Error(`Fixed-v3 transition fingerprint planner dependencies are invalid: ${objectKey}`);
       }
-      plannerDependencies = [...new Set(entry.planner_dependencies.map(safeKey))].sort(bytewiseTextCompare);
+      plannerDependencies = [...new Set(entry.planner_dependencies.map(safeKey))].sort();
       if (plannerDependencies.length !== entry.planner_dependencies.length) {
         throw new Error(`Fixed-v3 transition fingerprint planner dependencies are duplicated: ${objectKey}`);
       }
@@ -385,14 +359,14 @@ export function coordinatorTransitionStateCommonFingerprintPayload(runState) {
   if (!Array.isArray(rawUnchangedKeys)) {
     throw new Error("Fixed-v3 transition fingerprint unchanged-planner keys are invalid");
   }
-  const unchangedKeys = [...new Set(rawUnchangedKeys.map(safeKey))].sort(bytewiseTextCompare);
+  const unchangedKeys = [...new Set(rawUnchangedKeys.map(safeKey))].sort();
   const rawTombstones = runState?.tombstone_prefixes || [];
   if (!Array.isArray(rawTombstones)) {
     throw new Error("Fixed-v3 transition fingerprint tombstone prefixes are invalid");
   }
   const proposedPrefixes = [...new Set(rawTombstones
     .filter((entry) => entry && typeof entry === "object" && entry.proposed)
-    .map((entry) => safeKey(entry.prefix).replace(/\/+$/, "")))].sort(bytewiseTextCompare);
+    .map((entry) => safeKey(entry.prefix).replace(/\/+$/, "")))].sort();
   const provenance = runState?.final_staged_write_set_provenance;
   if (!provenance || typeof provenance !== "object" || Array.isArray(provenance)) {
     throw new Error("Fixed-v3 transition fingerprint final provenance is invalid");
@@ -401,6 +375,8 @@ export function coordinatorTransitionStateCommonFingerprintPayload(runState) {
     throw new Error("Fixed-v3 transition fingerprint forced-republication keys are invalid");
   }
   return {
+    contract_version: SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+    sos_light_connector_membership: canonicalSosLightConnectorMembership(runState),
     objects,
     proposal_transition_planner_unchanged_keys: unchangedKeys,
     proposed_tombstone_prefixes: proposedPrefixes,
@@ -416,7 +392,7 @@ export function coordinatorTransitionStateCommonFingerprintPayload(runState) {
       ),
       forced_republication_keys: [...new Set(
         provenance.forced_republication_keys.map(safeKey),
-      )].sort(bytewiseTextCompare),
+      )].sort(),
       promotion_reason_counts: canonicalCountMap(
         provenance.promotion_reason_counts, "promotion_reason_counts",
       ),
@@ -433,17 +409,9 @@ export function coordinatorTransitionStateCommonFingerprintPayload(runState) {
   };
 }
 
-export function coordinatorTransitionStateFingerprintPayload(runState) {
-  return {
-    contract_version: SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
-    sos_light_connector_membership: canonicalSosLightConnectorMembership(runState),
-    ...coordinatorTransitionStateCommonFingerprintPayload(runState),
-  };
-}
-
 export function computeCoordinatorTransitionStateFingerprint(runState) {
   const payload = coordinatorTransitionStateFingerprintPayload(runState);
-  return sha256(Buffer.from(canonicalTransitionFingerprintJson(payload), "utf8"));
+  return sha256(Buffer.from(canonicalJson(payload), "utf8"));
 }
 
 export function requireCoordinatorProposalFreeze(runState) {

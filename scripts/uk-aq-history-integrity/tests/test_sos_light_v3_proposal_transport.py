@@ -50,6 +50,7 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
             environment="TEST",
             base_dropbox_root=self.dropbox,
         )
+        self.run_state["execution_path"] = "sos_light"
         self.run_state["sos_light"] = {
             "mode": "sos-light",
             "days": [{
@@ -850,6 +851,11 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
             )
         self.assertEqual(applied["status"], "succeeded")
         popen.assert_called_once()
+        self.assertTrue(
+            popen.call_args.args[0][1].endswith(
+                "uk_aq_apply_sos_light_v3_proposal.mjs"
+            )
+        )
         persisted = json.loads(
             Path(self.run_state["run_state_path"]).read_text()
         )
@@ -884,6 +890,83 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
             MODULE._require_complete_persisted_file_backed_proposal(
                 self.run_state
             )
+
+    def test_generic_executor_routes_only_to_generic_v3_entrypoint(self) -> None:
+        MODULE._record_metadata_executor_overlay(
+            run_state=self.run_state,
+            executor_result=self._bulk_executor(1),
+            dry_run=False,
+            require_file_backed_bodies=True,
+        )
+        self.run_state.update({
+            "execution_path": "generic_integrity",
+            "dedicated_sos_historical_replacement": False,
+        })
+        self.run_state.pop("sos_light", None)
+        prefix = (
+            "history/v3/observations/day_utc=2026-09-28/"
+            "connector_id=8/pollutant_code=o3"
+        )
+        self.run_state["tombstone_prefixes"] = [{
+            "prefix": prefix,
+            "proposed": True,
+            "stage": "observations_data",
+            "repair_pollutants": ["o3"],
+            "authority_outcome": "authoritative_no_data_replacement",
+            "authority_scope": {
+                "day_utc": "2026-09-28",
+                "connector_id": 8,
+                "pollutant_code": "o3",
+            },
+        }]
+        self.run_state["generic_integrity_selected_scope_authority"] = {
+            "contract_version": (
+                MODULE.GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT
+            ),
+            "history_generation": "v3",
+            "selected_scopes": [{
+                "day_utc": "2026-09-28",
+                "connector_id": 8,
+                "pollutant_code": "o3",
+                "outcome": "authoritative_no_data_replacement",
+                "authorised_tombstone_prefix": prefix,
+                "replacement_object_keys": [],
+            }],
+            "authorised_pollutant_tombstone_prefixes": [prefix],
+        }
+        MODULE._finalise_staged_write_set_provenance(self.run_state)
+        MODULE.write_run_state(self.run_state)
+        logger = mock.Mock(spec=logging.Logger)
+        process = FakePlannerProcess(stdout='{"ok":true}\n')
+        with (
+            mock.patch.object(
+                MODULE, "validate_run_state_core_snapshot_identity",
+            ),
+            mock.patch.object(
+                MODULE, "_repo_root_for_integrity_script",
+                return_value=self.root,
+            ),
+            mock.patch.object(
+                MODULE.subprocess, "Popen", return_value=process,
+            ) as popen,
+        ):
+            applied = MODULE.run_canonical_apply_executor(
+                run_state=self.run_state,
+                env={"UK_AQ_BACKFILL_NODE_BIN": "node"},
+                log=logger,
+            )
+        self.assertEqual(applied["status"], "succeeded")
+        self.assertTrue(
+            popen.call_args.args[0][1].endswith(
+                "uk_aq_apply_generic_v3_proposal.mjs"
+            )
+        )
+        self.assertEqual(
+            self.run_state["proposal_transition_validation"][
+                "state_fingerprint_contract_version"
+            ],
+            MODULE.GENERIC_INTEGRITY_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+        )
 
     def test_python_and_node_transition_fingerprints_match(self) -> None:
         executor = self._bulk_executor(2)
@@ -936,11 +1019,127 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
                     "process.stdout.write(computeCoordinatorTransitionStateFingerprint(state));"
                 ),
             ],
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
         )
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, python_fingerprint)
+
+    def test_generic_v3_fingerprint_parity_uses_selected_scope_not_sos(self) -> None:
+        executor = self._bulk_executor(2)
+        MODULE._record_metadata_executor_overlay(
+            run_state=self.run_state,
+            executor_result=executor,
+            dry_run=False,
+            require_file_backed_bodies=True,
+        )
+        self.run_state.update({
+            "execution_path": "generic_integrity",
+            "dedicated_sos_historical_replacement": False,
+        })
+        self.run_state.pop("sos_light", None)
+        prefix = (
+            "history/v3/observations/day_utc=2026-09-28/"
+            "connector_id=8/pollutant_code=no2"
+        )
+        self.run_state["tombstone_prefixes"] = [{
+            "prefix": prefix,
+            "proposed": True,
+            "stage": "observations_data",
+            "repair_pollutants": ["no2"],
+            "authority_outcome": "authoritative_no_data_replacement",
+            "authority_scope": {
+                "day_utc": "2026-09-28",
+                "connector_id": 8,
+                "pollutant_code": "no2",
+            },
+        }]
+        self.run_state["generic_integrity_selected_scope_authority"] = {
+            "contract_version": (
+                MODULE.GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT
+            ),
+            "history_generation": "v3",
+            "selected_scopes": [{
+                "day_utc": "2026-09-28",
+                "connector_id": 8,
+                "pollutant_code": "no2",
+                "outcome": "authoritative_no_data_replacement",
+                "authorised_tombstone_prefix": prefix,
+                "replacement_object_keys": [],
+            }],
+            "authorised_pollutant_tombstone_prefixes": [prefix],
+        }
+        MODULE._finalise_staged_write_set_provenance(self.run_state)
+        MODULE.write_run_state(self.run_state)
+        transition = MODULE.validate_proposal_run_state_transition(
+            self.run_state
+        )
+        self.assertEqual(transition["status"], "succeeded")
+        python_fingerprint = (
+            MODULE.proposal_transition_state_fingerprint_sha256(self.run_state)
+        )
+        validation_module = (
+            Path(__file__).resolve().parents[3]
+            / "scripts/backup_r2/lib/generic_v3_proposal_validation.mjs"
+        ).as_uri()
+        result = MODULE.subprocess.run(
+            [
+                "node",
+                "--input-type=module",
+                "--eval",
+                (
+                    "import fs from 'node:fs';"
+                    f"import {{computeGenericV3TransitionStateFingerprint}} from {json.dumps(validation_module)};"
+                    "const state=JSON.parse(fs.readFileSync("
+                    f"{json.dumps(self.run_state['run_state_path'])},'utf8'));"
+                    "process.stdout.write(computeGenericV3TransitionStateFingerprint(state));"
+                ),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, python_fingerprint)
+        self.assertEqual(
+            MODULE._proposal_transition_state_fingerprint_payload(
+                self.run_state
+            )["contract_version"],
+            MODULE.GENERIC_INTEGRITY_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+        )
+        self.assertNotIn(
+            "sos_light_connector_membership",
+            MODULE._proposal_transition_state_fingerprint_payload(
+                self.run_state
+            ),
+        )
+
+    def test_generic_source_unavailable_scope_cannot_gain_deletion(self) -> None:
+        self.run_state.update({
+            "execution_path": "generic_integrity",
+            "dedicated_sos_historical_replacement": False,
+        })
+        prefix = (
+            "history/v3/observations/day_utc=2026-09-28/"
+            "connector_id=8/pollutant_code=pm10"
+        )
+        self.run_state["tombstone_prefixes"] = [{
+            "prefix": prefix,
+            "proposed": True,
+        }]
+        with self.assertRaisesRegex(
+            ValueError, "source-unavailable scope cannot be deleted",
+        ):
+            MODULE._finalise_generic_integrity_selected_scope_authority(
+                self.run_state,
+                [{
+                    "day_utc": "2026-09-28",
+                    "connector_id": 8,
+                    "pollutant_codes": ["pm10"],
+                    "outcome": "source_artifact_unavailable_preserved",
+                }],
+            )
 
     def test_progress_throttles_by_count_and_elapsed_time(self) -> None:
         logger = mock.Mock(spec=logging.Logger)

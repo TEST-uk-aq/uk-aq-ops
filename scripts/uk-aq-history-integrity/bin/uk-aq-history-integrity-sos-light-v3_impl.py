@@ -17578,6 +17578,129 @@ def _official_rdata_selected_partition_outcomes(
     return outcomes
 
 
+def _finalise_generic_integrity_selected_scope_authority(
+    run_state: dict[str, Any],
+    selected_partition_outcomes: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Freeze generic selected-scope mutation authority before APPLY."""
+    if run_state.get("execution_path") != "generic_integrity":
+        raise ValueError(
+            "generic selected-scope authority requires execution_path=generic_integrity"
+        )
+    expanded: list[dict[str, Any]] = []
+    for raw_outcome in selected_partition_outcomes:
+        if not isinstance(raw_outcome, Mapping):
+            raise ValueError("generic selected partition outcome is invalid")
+        pollutant_values = (
+            list(raw_outcome.get("pollutant_codes") or [])
+            if raw_outcome.get("pollutant_code") is None
+            else [raw_outcome.get("pollutant_code")]
+        )
+        if not pollutant_values:
+            raise ValueError("generic selected partition outcome has no pollutant")
+        for pollutant_value in pollutant_values:
+            expanded.append({
+                "day_utc": str(raw_outcome.get("day_utc") or ""),
+                "connector_id": raw_outcome.get("connector_id"),
+                "pollutant_code": str(pollutant_value or "").strip().lower(),
+                "outcome": str(raw_outcome.get("outcome") or ""),
+            })
+    if not expanded:
+        raise ValueError("generic selected-scope authority is empty")
+    objects = run_state.get("objects")
+    if not isinstance(objects, Mapping):
+        raise ValueError("generic selected-scope objects mapping is unavailable")
+    tombstones = [
+        entry for entry in list(run_state.get("tombstone_prefixes") or [])
+        if isinstance(entry, dict) and entry.get("proposed")
+    ]
+    scopes: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, str]] = set()
+    for raw_scope in expanded:
+        day_utc = raw_scope["day_utc"]
+        connector_id = raw_scope["connector_id"]
+        pollutant_code = raw_scope["pollutant_code"]
+        outcome = raw_scope["outcome"]
+        if not isinstance(connector_id, int) or isinstance(connector_id, bool):
+            raise ValueError("generic selected partition connector is invalid")
+        identity = (day_utc, connector_id, pollutant_code)
+        if identity in seen:
+            raise ValueError("generic selected partition outcome is duplicated")
+        seen.add(identity)
+        prefix = (
+            f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
+            f"connector_id={connector_id}/pollutant_code={pollutant_code}"
+        )
+        matching_tombstones = [
+            entry for entry in tombstones
+            if str(entry.get("prefix") or "").rstrip("/") == prefix
+        ]
+        replacement_keys = sorted(
+            (key for key in objects if str(key).startswith(f"{prefix}/")),
+            key=lambda value: str(value).encode("utf-8"),
+        )
+        if outcome in {
+            "complete_replacement", "authoritative_no_data_replacement",
+        }:
+            if len(matching_tombstones) != 1:
+                raise ValueError(
+                    "generic selected replacement requires one exact tombstone: "
+                    f"{prefix}"
+                )
+            matching_tombstones[0].update({
+                "authority_outcome": outcome,
+                "authority_scope": {
+                    "day_utc": day_utc,
+                    "connector_id": connector_id,
+                    "pollutant_code": pollutant_code,
+                },
+            })
+            authorised_prefix: str | None = prefix
+        elif outcome == "source_artifact_unavailable_preserved":
+            if matching_tombstones:
+                raise ValueError(
+                    "generic source-unavailable scope cannot be deleted: "
+                    f"{prefix}"
+                )
+            authorised_prefix = None
+        else:
+            raise ValueError(
+                f"generic selected partition outcome is not mutation-capable: {outcome}"
+            )
+        scopes.append({
+            "day_utc": day_utc,
+            "connector_id": connector_id,
+            "pollutant_code": pollutant_code,
+            "outcome": outcome,
+            "authorised_tombstone_prefix": authorised_prefix,
+            "replacement_object_keys": (
+                replacement_keys if outcome == "complete_replacement" else []
+            ),
+        })
+    scopes.sort(key=lambda entry: (
+        entry["day_utc"].encode("utf-8"),
+        entry["connector_id"],
+        entry["pollutant_code"].encode("utf-8"),
+    ))
+    authority = {
+        "contract_version": GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT,
+        "history_generation": "v3",
+        "selected_scopes": scopes,
+        "authorised_pollutant_tombstone_prefixes": sorted(
+            {
+                str(scope["authorised_tombstone_prefix"])
+                for scope in scopes
+                if scope["authorised_tombstone_prefix"] is not None
+            },
+            key=lambda value: value.encode("utf-8"),
+        ),
+    }
+    run_state["generic_integrity_selected_scope_authority"] = authority
+    _canonical_generic_integrity_selected_scope_authority(run_state)
+    write_run_state(run_state)
+    return authority
+
+
 def _scoped_observation_partition_rows(
     entries: Iterable[Mapping[str, Any]] | None,
     *,
@@ -20419,6 +20542,12 @@ FINAL_WRITE_SET_PROMOTION_REASON_EXACT_PREFIX = "exact_prefix_replacement"
 SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
     "uk_aq_sos_light_v3_transition_state_fingerprint_v2"
 )
+GENERIC_INTEGRITY_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
+    "uk_aq_generic_integrity_v3_transition_state_fingerprint_v1"
+)
+GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT = (
+    "uk_aq_generic_integrity_v3_selected_scope_authority_v1"
+)
 COORDINATOR_PROGRESS_OBJECT_INTERVAL = 250
 COORDINATOR_PROGRESS_SECONDS = 15.0
 
@@ -20630,7 +20759,10 @@ def _transition_fingerprint_identity_entries(
             "object_key": dependency_key,
             **identity,
         })
-    return sorted(identities, key=lambda identity: identity["object_key"])
+    return sorted(
+        identities,
+        key=lambda identity: identity["object_key"].encode("utf-8"),
+    )
 
 
 def _canonical_sos_light_connector_ids(value: Any, *, label: str) -> list[int]:
@@ -20667,7 +20799,10 @@ def _canonical_sos_light_observation_object_keys(
         )
     root = f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}"
     day_manifest_key = f"{root}/manifest.json"
-    canonical = sorted({_normalise_overlay_object_key(key) for key in value})
+    canonical = sorted(
+        {_normalise_overlay_object_key(key) for key in value},
+        key=lambda key: key.encode("utf-8"),
+    )
     patterns = (
         re.compile(re.escape(root) + r"/connector_id=[1-9]\d*/manifest\.json"),
         re.compile(
@@ -20819,13 +20954,15 @@ def _canonical_sos_light_connector_membership(
             "final_assembled_connector_ids": final_assembled_ids,
             "authoritative_observation_object_keys": authoritative_object_keys,
         })
-    return sorted(membership, key=lambda entry: entry["day_utc"])
+    return sorted(
+        membership, key=lambda entry: entry["day_utc"].encode("utf-8")
+    )
 
 
-def _proposal_transition_state_fingerprint_payload(
+def _proposal_transition_state_common_fingerprint_payload(
     run_state: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Return the narrow canonical state consumed by transition validation."""
+    """Return the mode-neutral frozen graph consumed by transition validation."""
     objects = run_state.get("objects")
     if not isinstance(objects, Mapping):
         raise ValueError(
@@ -20865,7 +21002,7 @@ def _proposal_transition_state_fingerprint_payload(
         dependencies = sorted({
             _normalise_overlay_object_key(str(value))
             for value in raw_dependencies
-        })
+        }, key=lambda value: value.encode("utf-8"))
         if len(dependencies) != len(raw_dependencies):
             raise ValueError(
                 f"fixed-v3 transition fingerprint dependencies are duplicated: "
@@ -20882,7 +21019,7 @@ def _proposal_transition_state_fingerprint_payload(
             planner_dependencies = sorted({
                 _normalise_overlay_object_key(str(value))
                 for value in planner_dependencies_raw
-            })
+            }, key=lambda value: value.encode("utf-8"))
             if len(planner_dependencies) != len(planner_dependencies_raw):
                 raise ValueError(
                     "fixed-v3 transition fingerprint planner dependencies are "
@@ -20963,7 +21100,9 @@ def _proposal_transition_state_fingerprint_payload(
                 entry, "final_source", object_key=object_key,
             ),
         })
-    canonical_objects.sort(key=lambda entry: entry["object_key"])
+    canonical_objects.sort(
+        key=lambda entry: entry["object_key"].encode("utf-8")
+    )
 
     unchanged_keys_raw = run_state.get(
         "proposal_transition_planner_unchanged_keys"
@@ -20975,7 +21114,7 @@ def _proposal_transition_state_fingerprint_payload(
     unchanged_keys = sorted({
         _normalise_overlay_object_key(str(value))
         for value in unchanged_keys_raw
-    })
+    }, key=lambda value: value.encode("utf-8"))
     tombstone_prefixes_raw = run_state.get("tombstone_prefixes") or []
     if not isinstance(tombstone_prefixes_raw, list):
         raise ValueError(
@@ -20987,7 +21126,7 @@ def _proposal_transition_state_fingerprint_payload(
         ).rstrip("/")
         for entry in tombstone_prefixes_raw
         if isinstance(entry, Mapping) and entry.get("proposed")
-    })
+    }, key=lambda value: value.encode("utf-8"))
     final_provenance = run_state.get("final_staged_write_set_provenance")
     if not isinstance(final_provenance, Mapping):
         raise ValueError(
@@ -21012,7 +21151,9 @@ def _proposal_transition_state_fingerprint_payload(
             key,
             label="promotion_reason_counts",
         )
-        for key in sorted(promotion_reason_counts, key=str)
+        for key in sorted(
+            promotion_reason_counts, key=lambda value: str(value).encode("utf-8")
+        )
     }
     canonical_external_edge_counts = {
         str(key): _transition_fingerprint_nonnegative_int(
@@ -21020,7 +21161,9 @@ def _proposal_transition_state_fingerprint_payload(
             key,
             label="external_dependency_edge_counts",
         )
-        for key in sorted(external_edge_counts, key=str)
+        for key in sorted(
+            external_edge_counts, key=lambda value: str(value).encode("utf-8")
+        )
     }
     forced_republication_keys_raw = final_provenance.get(
         "forced_republication_keys"
@@ -21030,10 +21173,6 @@ def _proposal_transition_state_fingerprint_payload(
             "fixed-v3 transition fingerprint forced-republication keys are invalid"
         )
     return {
-        "contract_version":
-            SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
-        "sos_light_connector_membership":
-            _canonical_sos_light_connector_membership(run_state),
         "objects": canonical_objects,
         "proposal_transition_planner_unchanged_keys": unchanged_keys,
         "proposed_tombstone_prefixes": proposed_prefixes,
@@ -21058,7 +21197,7 @@ def _proposal_transition_state_fingerprint_payload(
             "forced_republication_keys": sorted({
                 _normalise_overlay_object_key(str(value))
                 for value in forced_republication_keys_raw
-            }),
+            }, key=lambda value: value.encode("utf-8")),
             "promotion_reason_counts": canonical_promotion_reason_counts,
             "rebuilt_dependency_identity_count":
                 _transition_fingerprint_nonnegative_int(
@@ -21076,6 +21215,185 @@ def _proposal_transition_state_fingerprint_payload(
                 canonical_external_edge_counts,
         },
     }
+
+
+def _canonical_generic_integrity_selected_scope_authority(
+    run_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    authority = run_state.get("generic_integrity_selected_scope_authority")
+    if (
+        not isinstance(authority, Mapping)
+        or authority.get("contract_version")
+        != GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT
+        or authority.get("history_generation") != "v3"
+        or not isinstance(authority.get("selected_scopes"), list)
+        or not authority["selected_scopes"]
+        or not isinstance(
+            authority.get("authorised_pollutant_tombstone_prefixes"), list
+        )
+    ):
+        raise ValueError(
+            "generic fixed-v3 selected-scope authority is unavailable"
+        )
+    allowed_outcomes = {
+        "complete_replacement",
+        "authoritative_no_data_replacement",
+        "source_artifact_unavailable_preserved",
+    }
+    scopes: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, str]] = set()
+    for raw_scope in authority["selected_scopes"]:
+        if not isinstance(raw_scope, Mapping):
+            raise ValueError("generic fixed-v3 selected scope is invalid")
+        day_utc = str(raw_scope.get("day_utc") or "")
+        try:
+            valid_day = dt.date.fromisoformat(day_utc).isoformat() == day_utc
+        except ValueError:
+            valid_day = False
+        connector_id = raw_scope.get("connector_id")
+        pollutant_code = str(raw_scope.get("pollutant_code") or "")
+        outcome = str(raw_scope.get("outcome") or "")
+        if (
+            not valid_day
+            or not isinstance(connector_id, int)
+            or isinstance(connector_id, bool)
+            or connector_id <= 0
+            or pollutant_code not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
+            or outcome not in allowed_outcomes
+        ):
+            raise ValueError("generic fixed-v3 selected scope is invalid")
+        identity = (day_utc, connector_id, pollutant_code)
+        if identity in seen:
+            raise ValueError("generic fixed-v3 selected scope is duplicated")
+        seen.add(identity)
+        expected_prefix = (
+            f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
+            f"connector_id={connector_id}/pollutant_code={pollutant_code}"
+        )
+        authorised_prefix = raw_scope.get("authorised_tombstone_prefix")
+        if outcome == "source_artifact_unavailable_preserved":
+            if authorised_prefix is not None:
+                raise ValueError(
+                    "generic fixed-v3 preserved scope has deletion authority"
+                )
+        elif authorised_prefix != expected_prefix:
+            raise ValueError(
+                "generic fixed-v3 selected scope tombstone is invalid"
+            )
+        replacement_keys_raw = raw_scope.get("replacement_object_keys")
+        if not isinstance(replacement_keys_raw, list):
+            raise ValueError(
+                "generic fixed-v3 replacement object closure is invalid"
+            )
+        replacement_keys = sorted({
+            _normalise_overlay_object_key(str(value))
+            for value in replacement_keys_raw
+        }, key=lambda value: value.encode("utf-8"))
+        if replacement_keys != replacement_keys_raw:
+            raise ValueError(
+                "generic fixed-v3 replacement object closure is not canonical"
+            )
+        if any(not key.startswith(f"{expected_prefix}/") for key in replacement_keys):
+            raise ValueError(
+                "generic fixed-v3 replacement object escaped selected scope"
+            )
+        if outcome == "complete_replacement" and (
+            not any(key.endswith(".parquet") for key in replacement_keys)
+            or f"{expected_prefix}/manifest.json" not in replacement_keys
+        ):
+            raise ValueError(
+                "generic fixed-v3 non-empty replacement closure is incomplete"
+            )
+        if outcome != "complete_replacement" and replacement_keys:
+            raise ValueError(
+                "generic fixed-v3 empty or preserved scope has replacement children"
+            )
+        actual_replacement_keys = sorted(
+            (
+                str(key) for key in dict(run_state.get("objects") or {})
+                if str(key).startswith(f"{expected_prefix}/")
+            ),
+            key=lambda value: value.encode("utf-8"),
+        )
+        if actual_replacement_keys != replacement_keys:
+            raise ValueError(
+                "generic fixed-v3 selected replacement closure changed"
+            )
+        scopes.append({
+            "day_utc": day_utc,
+            "connector_id": connector_id,
+            "pollutant_code": pollutant_code,
+            "outcome": outcome,
+            "authorised_tombstone_prefix": authorised_prefix,
+            "replacement_object_keys": replacement_keys,
+        })
+    scopes.sort(key=lambda entry: (
+        entry["day_utc"].encode("utf-8"),
+        entry["connector_id"],
+        entry["pollutant_code"].encode("utf-8"),
+    ))
+    if authority["selected_scopes"] != scopes:
+        raise ValueError("generic fixed-v3 selected scopes are not canonical")
+    authorised_prefixes = sorted({
+        _normalise_overlay_object_key(str(value)).rstrip("/")
+        for value in authority["authorised_pollutant_tombstone_prefixes"]
+    }, key=lambda value: value.encode("utf-8"))
+    expected_prefixes = sorted({
+        str(scope["authorised_tombstone_prefix"])
+        for scope in scopes
+        if scope["authorised_tombstone_prefix"] is not None
+    }, key=lambda value: value.encode("utf-8"))
+    if (
+        authority["authorised_pollutant_tombstone_prefixes"]
+        != authorised_prefixes
+        or authorised_prefixes != expected_prefixes
+    ):
+        raise ValueError(
+            "generic fixed-v3 authorised tombstone set is not exact"
+        )
+    proposed_prefixes = sorted({
+        _normalise_overlay_object_key(str(entry.get("prefix") or "")).rstrip("/")
+        for entry in list(run_state.get("tombstone_prefixes") or [])
+        if isinstance(entry, Mapping) and entry.get("proposed")
+    }, key=lambda value: value.encode("utf-8"))
+    if proposed_prefixes != authorised_prefixes:
+        raise ValueError(
+            "generic fixed-v3 proposed tombstones exceed selected authority"
+        )
+    return {
+        "contract_version": GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT,
+        "history_generation": "v3",
+        "selected_scopes": scopes,
+        "authorised_pollutant_tombstone_prefixes": authorised_prefixes,
+    }
+
+
+def _proposal_transition_state_fingerprint_payload(
+    run_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    execution_path = str(run_state.get("execution_path") or "")
+    common = _proposal_transition_state_common_fingerprint_payload(run_state)
+    if execution_path == SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH:
+        # Retain the already-deployed SOS-light v2 fingerprint projection exactly.
+        return {
+            "contract_version": SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+            "sos_light_connector_membership":
+                _canonical_sos_light_connector_membership(run_state),
+            **common,
+        }
+    if execution_path == "generic_integrity":
+        return {
+            "contract_version":
+                GENERIC_INTEGRITY_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+            "execution_path": "generic_integrity",
+            "history_generation": "v3",
+            "generic_selected_scope_authority":
+                _canonical_generic_integrity_selected_scope_authority(run_state),
+            **common,
+        }
+    raise ValueError(
+        f"fixed-v3 transition fingerprint execution path is invalid: {execution_path}"
+    )
 
 
 def proposal_transition_state_fingerprint_sha256(
@@ -24854,6 +25172,14 @@ def validate_proposal_run_state_transition(
     *,
     log: logging.Logger | None = None,
 ) -> dict[str, Any]:
+    execution_path = str(run_state.get("execution_path") or "")
+    if execution_path == "generic_integrity":
+        _canonical_generic_integrity_selected_scope_authority(run_state)
+    elif execution_path != SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH:
+        raise ValueError(
+            "coordinator proposal-transition validation failed: "
+            f"unsupported execution path {execution_path!r}"
+        )
     objects = run_state.get("objects")
     if objects is None:
         objects = {}
@@ -25427,21 +25753,46 @@ def run_canonical_apply_executor(
             "node_apply_launched": False,
             "r2_mutation_possible": False,
         }
+    execution_path = str(run_state.get("execution_path") or "")
+    if execution_path == SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH:
+        fingerprint_contract = SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT
+        node_entrypoint = "uk_aq_apply_sos_light_v3_proposal.mjs"
+    elif execution_path == "generic_integrity":
+        fingerprint_contract = (
+            GENERIC_INTEGRITY_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT
+        )
+        node_entrypoint = "uk_aq_apply_generic_v3_proposal.mjs"
+    else:
+        error = f"unsupported fixed-v3 execution path: {execution_path}"
+        run_state["proposal_transition_validation"] = {
+            "status": "failed",
+            "error": error,
+            "node_apply_launch_permitted": False,
+            "validated_at_utc": fmt_iso(utc_now()),
+        }
+        write_run_state(run_state)
+        return {
+            "status": "failed",
+            "reason": "fixed_v3_execution_path_invalid",
+            "error": error,
+            "node_apply_launched": False,
+            "r2_mutation_possible": False,
+        }
     run_state["proposal_transition_validation"] = {
         **transition_validation,
         "validated_at_utc": fmt_iso(utc_now()),
     }
     run_state["proposal_transition_validation"].update({
-        "state_fingerprint_contract_version":
-            SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+        "state_fingerprint_contract_version": fingerprint_contract,
         "state_fingerprint_sha256": transition_fingerprint,
+        "node_apply_entrypoint": node_entrypoint,
     })
     write_run_state(run_state)
     repo_root = _repo_root_for_integrity_script(env)
     node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
     command = [
         node_bin,
-        str(repo_root / "scripts/backup_r2/uk_aq_apply_sos_light_v3_proposal.mjs"),
+        str(repo_root / "scripts/backup_r2" / node_entrypoint),
         "--run-state-json", str(run_state["run_state_path"]),
         "--write-r2",
     ]
@@ -27796,6 +28147,13 @@ def run_v2_integrity_repair_flow(
         metadata=metadata,
         log=log,
     )
+    if not dedicated_sos_historical_replacement and not observation_failed and str(
+        metadata.get("status") or ""
+    ) not in {"failed", "blocked_dependency"}:
+        _finalise_generic_integrity_selected_scope_authority(
+            run_state,
+            observations.get("selected_partition_outcomes") or [],
+        )
     if dedicated_sos_historical_replacement and not observation_failed and str(
         metadata.get("status") or ""
     ) not in {"failed", "blocked_dependency"}:
@@ -32632,6 +32990,9 @@ def main(argv: list[str]) -> int:
             )
             repair_overlay["execution_path"] = sos_historical_route.get(
                 "execution_path"
+            )
+            repair_overlay["dedicated_sos_historical_replacement"] = bool(
+                dedicated_sos_historical_replacement
             )
             repair_overlay["sos_historical_route"] = dict(sos_historical_route)
             if dedicated_sos_historical_replacement:
