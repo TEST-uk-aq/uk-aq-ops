@@ -25562,6 +25562,8 @@ def run_v2_final_verification(
     repair_pollutants: Iterable[str] | None = None,
     timeseries_binding_backup_mode: str = "individual",
     timeseries_binding_pack_root: Path | None = None,
+    apply_result: Mapping[str, Any] | None = None,
+    planned_operation_counts: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One read-only final pass over source cache and final local objects."""
     validate_run_state_core_snapshot_identity(
@@ -25608,14 +25610,59 @@ def run_v2_final_verification(
         verify_derived_index_scopes=derived_index_scopes,
     )
     remaining_scopes: list[dict[str, Any]] = []
-    try:
-        apply_persistence_artifacts = verify_apply_persistence_artifacts(run_state)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        apply_persistence_artifacts = {
-            "status": "failed",
-            "error": str(exc),
-        }
-    if require_remote_state and apply_persistence_artifacts.get("status") != "verified":
+    if (apply_result or {}).get("status") == "skipped_noop":
+        no_operations = (
+            isinstance(planned_operation_counts, Mapping)
+            and all(
+                planned_operation_counts.get(name) == 0
+                for name in ("planned_writes", "planned_deletions")
+            )
+            and isinstance(apply_result.get("output"), Mapping)
+            and all(
+                apply_result["output"].get(name) == 0
+                for name in (
+                    "planned_writes", "planned_deletions",
+                    "completed_writes", "completed_deletions",
+                )
+            )
+            and not any(run_state.get(name) for name in (
+                "objects", "tombstones", "tombstone_prefixes", "apply",
+                "blocked_scopes", "uncertain_r2_objects",
+            ))
+            and not run_state.get("explicit_official_force_replacement")
+            and not (
+                isinstance(run_state.get("proposal_transition_validation"), Mapping)
+                and run_state["proposal_transition_validation"].get("status") == "failed"
+            )
+        )
+        if (
+            apply_result.get("reason") == "no_r2_operations_required"
+            and apply_result.get("proposal_validation_status") == "validated"
+            and no_operations
+        ):
+            apply_persistence_artifacts = {
+                "status": "skipped_noop",
+                "reason": "validated_zero_r2_operations",
+                "proposal_validation_status": "validated",
+                "planned_writes": 0,
+                "planned_deletions": 0,
+                "mutation_journal_required": False,
+            }
+        else:
+            apply_persistence_artifacts = {
+                "status": "failed", "reason": "invalid_noop_evidence",
+            }
+    else:
+        try:
+            apply_persistence_artifacts = verify_apply_persistence_artifacts(run_state)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            apply_persistence_artifacts = {
+                "status": "failed",
+                "error": str(exc),
+            }
+    if require_remote_state and apply_persistence_artifacts.get("status") not in {
+        "verified", "skipped_noop",
+    }:
         remaining_scopes.append({
             "stage": "canonical_apply_persistence",
             "gap_type": "apply_persistence_artifact_verification_failed",
@@ -28994,7 +29041,7 @@ def run_v2_integrity_repair_flow(
         require_file_backed_bodies=True,
         log=log,
     )
-    _finalise_generic_file_backed_proposal_if_ready(
+    generic_proposal_finalised = _finalise_generic_file_backed_proposal_if_ready(
         run_state,
         dedicated_sos_historical_replacement=(
             dedicated_sos_historical_replacement
@@ -29105,6 +29152,14 @@ def run_v2_integrity_repair_flow(
         apply_result = {
             "status": "skipped_noop",
             "reason": "no_r2_operations_required",
+            "proposal_validation_status": (
+                "validated"
+                if observation_manifest_status in {"not_run", "planned", "succeeded", "ok", "validated"}
+                and observation_index_status in {"not_run", "planned", "succeeded", "ok", "validated"}
+                and metadata.get("exit_code") in (None, 0)
+                and (metadata.get("status") == "not_run" or generic_proposal_finalised)
+                else "failed"
+            ),
             "exit_code": 0,
             "output": {
                 "planned_writes": 0,
@@ -29232,6 +29287,8 @@ def run_v2_integrity_repair_flow(
             repair_pollutants=repair_pollutants,
             timeseries_binding_backup_mode=timeseries_binding_backup_mode,
             timeseries_binding_pack_root=timeseries_binding_pack_root,
+            apply_result=apply_result,
+            planned_operation_counts=planned_operation_counts,
         )
     all_observation_repair_entries = [
         entry
@@ -32222,6 +32279,8 @@ def format_summary_md(s: dict[str, Any]) -> str:
             if persistence_artifacts:
                 lines.extend([
                     f"- Apply persistence evidence: {persistence_artifacts.get('status') or '(none)'}",
+                    f"- Apply persistence reason: {persistence_artifacts.get('reason') or '(none)'}",
+                    f"- Mutation journal required: {persistence_artifacts.get('mutation_journal_required', True)}",
                     f"- Mutation journal: {persistence_artifacts.get('mutation_journal_path') or '(none)'}",
                     f"- Mutation journal bytes: {int(persistence_artifacts.get('mutation_journal_bytes') or 0)}",
                     f"- Mutation journal SHA-256: {persistence_artifacts.get('mutation_journal_sha256') or '(none)'}",
