@@ -13107,9 +13107,25 @@ def run_v2_observations_integrity_checks(
                 else:
                     try:
                         idx_payload = json.loads(idx_path.read_text(encoding="utf-8"))
-                        if "timeseries_row_counts" not in idx_payload:
+                        if idx_payload.get("kind") == (
+                            "observation_timeseries_physical_leaf_scoped_manifest"
+                        ):
+                            timeseries_membership = idx_payload.get(
+                                "leaves_by_timeseries_id"
+                            )
+                            membership_missing = not isinstance(
+                                timeseries_membership, Mapping
+                            )
+                        else:
+                            timeseries_membership = idx_payload.get(
+                                "timeseries_row_counts"
+                            )
+                            membership_missing = (
+                                "timeseries_row_counts" not in idx_payload
+                            )
+                        if membership_missing:
                             gaps.append(_v2_obs_gap("index_manifest_missing_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
-                        elif not idx_payload.get("timeseries_row_counts"):
+                        elif not timeseries_membership:
                             gaps.append(_v2_obs_gap("index_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
                     except Exception:
                         gaps.append(_v2_obs_gap("index_manifest_invalid_json", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))

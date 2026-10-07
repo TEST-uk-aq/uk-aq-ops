@@ -2115,6 +2115,114 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             for action in actions
         ))
 
+    def test_final_verification_accepts_exact_v3_scoped_index_membership(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config = INTEGRITY.resolve_history_path_config("v3", {})
+            day_utc = "2026-09-28"
+            connector_id = 9
+            timeseries_id = 1001
+            data_prefix = config.observations_data_prefix.strip("/")
+            index_prefix = (
+                config.observations_timeseries_index_prefix.strip("/")
+            )
+            for pollutant_code in ("no2", "pm10", "pm25"):
+                partition_key = (
+                    f"{data_prefix}/day_utc={day_utc}/"
+                    f"connector_id={connector_id}/"
+                    f"pollutant_code={pollutant_code}"
+                )
+                partition = root / partition_key
+                partition.mkdir(parents=True, exist_ok=True)
+                parquet_key = f"{partition_key}/part-00000.parquet"
+                (root / parquet_key).write_bytes(b"PAR1")
+                (partition / "manifest.json").write_text(json.dumps({
+                    "manifest_kind": "pollutant",
+                    "history_version": "v2",
+                    "domain": "observations",
+                    "grain": None,
+                    "profile": None,
+                    "day_utc": day_utc,
+                    "connector_id": connector_id,
+                    "pollutant_code": pollutant_code,
+                    "row_count": 1,
+                    "source_row_count": 1,
+                    "file_count": 1,
+                    "total_bytes": 4,
+                    "min_timeseries_id": timeseries_id,
+                    "max_timeseries_id": timeseries_id,
+                    "timeseries_row_counts": {str(timeseries_id): 1},
+                    "files": [{
+                        "key": parquet_key,
+                        "bytes": 4,
+                        "timeseries_row_counts": {str(timeseries_id): 1},
+                    }],
+                }), encoding="utf-8")
+                index_manifest = (
+                    root / index_prefix / f"day_utc={day_utc}"
+                    / f"connector_id={connector_id}"
+                    / f"pollutant_code={pollutant_code}" / "manifest.json"
+                )
+                index_manifest.parent.mkdir(parents=True, exist_ok=True)
+                index_manifest.write_text(json.dumps({
+                    "schema_version": 1,
+                    "kind": (
+                        "observation_timeseries_physical_leaf_scoped_manifest"
+                    ),
+                    "index_generation": "v3",
+                    "history_version": "v2",
+                    "domain": "observations",
+                    "history_schema_version": 3,
+                    "day_utc": day_utc,
+                    "connector_id": connector_id,
+                    "pollutant_code": pollutant_code,
+                    "coverage": {
+                        "row_count": 1,
+                        "timeseries_count": 1,
+                    },
+                    "leaves_by_timeseries_id": {
+                        str(timeseries_id): [
+                            f"{index_manifest.parent}/timeseries_id={timeseries_id}.json",
+                            100,
+                            "a" * 64,
+                        ],
+                    },
+                }), encoding="utf-8")
+            latest_path = root / config.observations_latest_index_key.strip("/")
+            latest_path.parent.mkdir(parents=True, exist_ok=True)
+            latest_path.write_text(json.dumps({"status": "test"}), encoding="utf-8")
+            stats = {
+                "row_count": 1,
+                "timeseries_row_counts": {timeseries_id: 1},
+                "min_timeseries_id": timeseries_id,
+                "max_timeseries_id": timeseries_id,
+                "min_timestamp_utc": f"{day_utc}T00:00:00+00:00",
+                "max_timestamp_utc": f"{day_utc}T00:00:00+00:00",
+                "parquet_null_timeseries_id_rows": False,
+            }
+            with mock.patch.object(
+                INTEGRITY,
+                "_read_parquet_partition_stats",
+                return_value=(stats, None),
+            ):
+                result = INTEGRITY.run_v2_observations_integrity_checks(
+                    r2_history_root=root,
+                    config=config,
+                    from_day=day_utc,
+                    to_day=day_utc,
+                    allowed_connector_ids={connector_id},
+                )
+        false_gaps = [
+            gap for gap in result["gaps"]
+            if gap["gap_type"] in {
+                "index_manifest_missing_timeseries_counts",
+                "index_manifest_empty_timeseries_counts",
+            }
+        ]
+        self.assertEqual([], false_gaps)
+
     def test_preservation_parent_actions_compose_with_repaired_sibling(self) -> None:
         repaired = INTEGRITY._merge_changed_observation_metadata_actions(
             [],
