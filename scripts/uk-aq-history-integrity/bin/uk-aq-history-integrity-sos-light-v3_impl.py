@@ -17324,6 +17324,24 @@ def _persist_complete_connector_day_source_evidence(
     official_preservation_dependency = str(
         evidence.get("preserved_baseline_dependency_sha256") or ""
     )
+    is_official_v7 = (
+        source_adapter in OFFICIAL_RDATA_NETWORKS
+        and evidence.get("evidence_contract_version")
+        == OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION
+    )
+    semantic_evidence: dict[str, Any] | None = None
+    acquisition_audit: dict[str, Any] | None = None
+    acquisition_audit_sha256: str | None = None
+    if is_official_v7:
+        semantic_evidence = _official_rdata_v7_semantic_evidence_projection(
+            evidence
+        )
+        acquisition_audit = _official_rdata_v7_acquisition_audit_projection(
+            evidence
+        )
+        acquisition_audit_sha256 = (
+            _official_rdata_v7_acquisition_audit_sha256(evidence)
+        )
     if (
         not day_utc
         or connector_id <= 0
@@ -17353,6 +17371,20 @@ def _persist_complete_connector_day_source_evidence(
             )
         )
         or (
+            is_official_v7
+            and (
+                str(evidence.get("semantic_evidence_sha256") or "")
+                != _official_rdata_v7_semantic_evidence_sha256(evidence)
+                or str(evidence.get("acquisition_audit_sha256") or "")
+                != acquisition_audit_sha256
+                or acquisition_audit is None
+                or acquisition_audit.get("source_evidence_input_sha256")
+                != source_evidence_input_hash
+                or acquisition_audit.get("semantic_evidence_sha256")
+                != str(evidence.get("semantic_evidence_sha256") or "")
+            )
+        )
+        or (
             source_adapter == "sos"
             and not all(
                 re.fullmatch(r"[0-9a-f]{64}", str(value or ""))
@@ -17361,12 +17393,18 @@ def _persist_complete_connector_day_source_evidence(
         )
     ):
         raise ValueError("complete connector-day detector source evidence persistence identity is invalid")
-    evidence_json = json.dumps(evidence, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    evidence_json = json.dumps(
+        semantic_evidence if semantic_evidence is not None else evidence,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
     canonical_rows_json = json.dumps(canonical_rows, separators=(",", ":"), ensure_ascii=False)
     evidence_sha256 = _immutable_source_evidence_sha256(evidence)
     existing = conn.execute(
         """
-        SELECT id, evidence_sha256, canonical_rows_sha256, canonical_rows_bytes
+        SELECT id, evidence_sha256, canonical_rows_sha256, canonical_rows_bytes,
+               evidence_json, canonical_rows_json
         FROM source_connector_day_evidence
         WHERE env_name = ? AND day_utc = ? AND connector_id = ?
           AND source_evidence_input_sha256 = ?
@@ -17378,29 +17416,87 @@ def _persist_complete_connector_day_source_evidence(
             str(existing[1]) != evidence_sha256
             or str(existing[2]) != canonical_rows_sha256
             or int(existing[3]) != canonical_rows_bytes
+            or (
+                is_official_v7
+                and (
+                    str(existing[4]) != evidence_json
+                    or str(existing[5]) != canonical_rows_json
+                )
+            )
         ):
             raise RuntimeError(
                 "immutable complete connector-day source evidence conflicts for identical semantic inputs"
             )
-        return {"evidence_id": int(existing[0]), "evidence_sha256": evidence_sha256}
-    cursor = conn.execute(
-        """
-        INSERT INTO source_connector_day_evidence (
-          env_name, day_utc, connector_id, source_adapter,
-          source_file_identities_sha256, source_evidence_input_sha256,
-          canonical_rows_sha256,
-          canonical_rows_bytes, evidence_sha256, evidence_json,
-          canonical_rows_json, created_at_utc
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            env_name, day_utc, connector_id, source_adapter,
-            source_identity_hash, source_evidence_input_hash,
-            canonical_rows_sha256, canonical_rows_bytes,
-            evidence_sha256, evidence_json, canonical_rows_json, utc_now().isoformat(),
-        ),
-    )
-    return {"evidence_id": int(cursor.lastrowid), "evidence_sha256": evidence_sha256}
+        evidence_id = int(existing[0])
+    else:
+        cursor = conn.execute(
+            """
+            INSERT INTO source_connector_day_evidence (
+              env_name, day_utc, connector_id, source_adapter,
+              source_file_identities_sha256, source_evidence_input_sha256,
+              canonical_rows_sha256,
+              canonical_rows_bytes, evidence_sha256, evidence_json,
+              canonical_rows_json, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                env_name, day_utc, connector_id, source_adapter,
+                source_identity_hash, source_evidence_input_hash,
+                canonical_rows_sha256, canonical_rows_bytes,
+                evidence_sha256, evidence_json, canonical_rows_json,
+                utc_now().isoformat(),
+            ),
+        )
+        evidence_id = int(cursor.lastrowid)
+    result = {
+        "evidence_id": evidence_id,
+        "evidence_sha256": evidence_sha256,
+        "source_evidence_input_sha256": source_evidence_input_hash,
+    }
+    if acquisition_audit is not None and acquisition_audit_sha256 is not None:
+        acquisition_audit_json = json.dumps(
+            acquisition_audit,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        existing_audit = conn.execute(
+            """
+            SELECT id, acquisition_audit_json
+            FROM source_connector_day_acquisition_audits
+            WHERE source_evidence_id = ? AND acquisition_audit_sha256 = ?
+            """,
+            (evidence_id, acquisition_audit_sha256),
+        ).fetchone()
+        if existing_audit is not None:
+            if str(existing_audit[1]) != acquisition_audit_json:
+                raise RuntimeError(
+                    "official RData acquisition audit hash conflicts with "
+                    "persisted audit evidence"
+                )
+            acquisition_audit_id = int(existing_audit[0])
+        else:
+            audit_cursor = conn.execute(
+                """
+                INSERT INTO source_connector_day_acquisition_audits (
+                  source_evidence_id, env_name, day_utc, connector_id,
+                  source_adapter, acquisition_audit_sha256,
+                  acquisition_audit_json, created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    evidence_id, env_name, day_utc, connector_id,
+                    source_adapter, acquisition_audit_sha256,
+                    acquisition_audit_json, utc_now().isoformat(),
+                ),
+            )
+            acquisition_audit_id = int(audit_cursor.lastrowid)
+        result.update({
+            "semantic_evidence_sha256": evidence_sha256,
+            "acquisition_audit_id": acquisition_audit_id,
+            "acquisition_audit_sha256": acquisition_audit_sha256,
+        })
+    return result
 
 
 def _normalise_repair_pollutants(values: Iterable[Any] | None) -> list[str]:
@@ -18125,7 +18221,9 @@ def _assert_detector_and_proposal_source_evidence_agree(
         "canonical_rows_bytes",
         "total_rows",
         "evidence_contract_version",
+        "history_generation",
         "source_evidence_input_sha256",
+        "semantic_evidence_sha256",
         "per_timeseries_counts",
         "per_pollutant_counts",
         "observation_content_hashes",

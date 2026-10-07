@@ -109,6 +109,24 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
         }
 
     @staticmethod
+    def refresh_v7_boundaries(evidence: dict[str, object]) -> None:
+        evidence["semantic_evidence_sha256"] = hashlib.sha256(
+            INTEGRITY._canonical_json_utf8_bytes(
+                INTEGRITY._official_rdata_v7_semantic_evidence_projection(
+                    evidence
+                )
+            )
+        ).hexdigest()
+        evidence["acquisition_audit"]["semantic_evidence_sha256"] = (
+            evidence["semantic_evidence_sha256"]
+        )
+        evidence["acquisition_audit_sha256"] = hashlib.sha256(
+            INTEGRITY._canonical_json_utf8_bytes(
+                evidence["acquisition_audit"]
+            )
+        ).hexdigest()
+
+    @staticmethod
     def stage_official_proposal(
         root: Path,
         *,
@@ -2334,6 +2352,10 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             tampered_availability["source_evidence_input_sha256"] = (
                 INTEGRITY._source_evidence_input_sha256(tampered_availability)
             )
+            tampered_availability["acquisition_audit"][
+                "source_evidence_input_sha256"
+            ] = tampered_availability["source_evidence_input_sha256"]
+            self.refresh_v7_boundaries(tampered_availability)
             evidence_b_path.write_text(
                 json.dumps(tampered_availability), encoding="utf-8"
             )
@@ -2354,6 +2376,7 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             )
             tampered = json.loads(evidence_path.read_text(encoding="utf-8"))
             tampered["source_file_identities"][0]["sha256"] = "e" * 64
+            self.refresh_v7_boundaries(tampered)
             evidence_path.write_text(json.dumps(tampered), encoding="utf-8")
             with self.assertRaisesRegex(
                 ValueError,
@@ -2380,6 +2403,16 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
         self.assertNotIn(
             "preserved_baseline_dependency_sha256", v5_payload
         )
+        v6_payload = INTEGRITY._source_evidence_input_payload({
+            "evidence_contract_version": 6,
+            "source_artifact_availability_sha256": "a" * 64,
+            "preserved_baseline_dependency_sha256": "b" * 64,
+            "history_generation": "v3",
+        })
+        self.assertEqual(
+            v6_payload["preserved_baseline_dependency_sha256"], "b" * 64
+        )
+        self.assertNotIn("history_generation", v6_payload)
         v4_payload = INTEGRITY._source_evidence_input_payload({
             "evidence_contract_version": 4,
             "source_artifact_availability_sha256": "a" * 64,
@@ -2449,10 +2482,30 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
                 evidence=loaded_b,
                 canonical_rows=rows_b,
             )
+            second_repeat = (
+                INTEGRITY._persist_complete_connector_day_source_evidence(
+                    conn=self.conn,
+                    env_name="TEST",
+                    evidence=loaded_b,
+                    canonical_rows=rows_b,
+                )
+            )
             self.assertEqual(first["evidence_id"], second["evidence_id"])
+            self.assertEqual(
+                first["source_evidence_input_sha256"],
+                evidence_a["source_evidence_input_sha256"],
+            )
+            self.assertEqual(
+                second["source_evidence_input_sha256"],
+                evidence_b["source_evidence_input_sha256"],
+            )
             self.assertNotEqual(
                 first["acquisition_audit_id"],
                 second["acquisition_audit_id"],
+            )
+            self.assertEqual(
+                second["acquisition_audit_id"],
+                second_repeat["acquisition_audit_id"],
             )
             self.assertEqual(
                 self.conn.execute(
@@ -2466,11 +2519,110 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
                 ).fetchone()[0],
                 2,
             )
+            persisted_semantic = json.loads(self.conn.execute(
+                "SELECT evidence_json FROM source_connector_day_evidence "
+                "WHERE id = ?",
+                (first["evidence_id"],),
+            ).fetchone()[0])
+            self.assertEqual(
+                persisted_semantic,
+                INTEGRITY._official_rdata_v7_semantic_evidence_projection(
+                    loaded_b
+                ),
+            )
+            self.assertNotIn("acquisition_audit", persisted_semantic)
+            persisted_audit = json.loads(self.conn.execute(
+                "SELECT acquisition_audit_json "
+                "FROM source_connector_day_acquisition_audits WHERE id = ?",
+                (second["acquisition_audit_id"],),
+            ).fetchone()[0])
+            self.assertEqual(
+                persisted_audit["semantic_evidence_sha256"],
+                second["semantic_evidence_sha256"],
+            )
             self.assertEqual(
                 loaded_b["acquisition_audit"]["ratification_audit"][0]
                 ["metadata_source_identity"]["requested_at_utc"],
                 "2026-10-06T22:31:00Z",
             )
+
+    def test_regular_consumer_loads_and_persists_shared_v7_evidence(self) -> None:
+        regular_path = (
+            Path(__file__).resolve().parents[1]
+            / "bin"
+            / "uk-aq-history-integrity_impl.py"
+        )
+        regular_spec = importlib.util.spec_from_file_location(
+            "official_rdata_regular_v7", regular_path
+        )
+        assert regular_spec is not None and regular_spec.loader is not None
+        regular = importlib.util.module_from_spec(regular_spec)
+        sys.modules[regular_spec.name] = regular
+        regular_spec.loader.exec_module(regular)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            stage_root, produced = self.stage_official_proposal(
+                Path(temporary_directory),
+                requested_pollutants=["no2"],
+                rows=[],
+                source_available_pollutants=["no2"],
+            )
+            loaded, rows = regular._load_complete_connector_day_source_evidence(
+                stage_root=stage_root,
+                day_utc="2026-09-28",
+                connector_id=9,
+                repair_pollutants=["no2"],
+            )
+            conn = regular.open_db(":memory:")
+            try:
+                persisted = regular._persist_complete_connector_day_source_evidence(
+                    conn=conn,
+                    env_name="TEST",
+                    evidence=loaded,
+                    canonical_rows=rows,
+                )
+                self.assertEqual(
+                    persisted["source_evidence_input_sha256"],
+                    produced["source_evidence_input_sha256"],
+                )
+                self.assertEqual(
+                    persisted["semantic_evidence_sha256"],
+                    produced["semantic_evidence_sha256"],
+                )
+                self.assertEqual(
+                    persisted["acquisition_audit_sha256"],
+                    produced["acquisition_audit_sha256"],
+                )
+                self.assertEqual(
+                    loaded["empty_final_target_pollutant_codes"], ["no2"]
+                )
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM source_connector_day_evidence"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT COUNT(*) "
+                        "FROM source_connector_day_acquisition_audits"
+                    ).fetchone()[0],
+                    1,
+                )
+                persisted_semantic = json.loads(conn.execute(
+                    "SELECT evidence_json FROM source_connector_day_evidence "
+                    "WHERE id = ?",
+                    (persisted["evidence_id"],),
+                ).fetchone()[0])
+                self.assertEqual(
+                    persisted_semantic,
+                    regular._official_rdata_v7_semantic_evidence_projection(
+                        loaded
+                    ),
+                )
+                self.assertNotIn("acquisition_audit", persisted_semantic)
+            finally:
+                conn.close()
 
     def test_v7_semantic_input_distinguishes_history_generation(self) -> None:
         source_row = {
@@ -2518,8 +2670,12 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             sort_keys=True,
             separators=(",", ":"),
         )
-        historical_sha = INTEGRITY._immutable_source_evidence_sha256(
-            historical_evidence
+        historical_sha = hashlib.sha256(
+            INTEGRITY._canonical_json_utf8_bytes(historical_evidence)
+        ).hexdigest()
+        self.assertEqual(
+            INTEGRITY._immutable_source_evidence_sha256(historical_evidence),
+            historical_sha,
         )
         self.conn.execute(
             """
@@ -2588,21 +2744,7 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             )
             contradictory = json.loads(json.dumps(loaded))
             contradictory["canonical_rows_sha256"] = "f" * 64
-            contradictory["semantic_evidence_sha256"] = hashlib.sha256(
-                INTEGRITY._canonical_json_utf8_bytes(
-                    INTEGRITY._official_rdata_v7_semantic_evidence_projection(
-                        contradictory
-                    )
-                )
-            ).hexdigest()
-            contradictory["acquisition_audit"]["semantic_evidence_sha256"] = (
-                contradictory["semantic_evidence_sha256"]
-            )
-            contradictory["acquisition_audit_sha256"] = hashlib.sha256(
-                INTEGRITY._canonical_json_utf8_bytes(
-                    contradictory["acquisition_audit"]
-                )
-            ).hexdigest()
+            self.refresh_v7_boundaries(contradictory)
             with self.assertRaisesRegex(
                 RuntimeError,
                 "conflicts for identical semantic inputs",
