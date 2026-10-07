@@ -43,7 +43,7 @@ When an external apply/deploy/run is required but not authorised, make the repos
 
 ## Git and pull-request authorisation
 
-The permitted Git workflow depends on where the coding agent is running.
+The permitted Git workflow depends on where the agent is running.
 
 ### Local/editor agents
 
@@ -71,13 +71,26 @@ For agents operating in Codex Cloud:
 - Never deploy as a consequence of creating or updating the pull request.
 - Stop after the PR has been created or updated and report the PR, branch and commit details.
 
+### ChatGPT in Chat mode
+
+For ChatGPT operating in Chat mode with repository/GitHub tools:
+
+- A request to implement, fix, change or update TEST code, configuration or documentation authorises the bounded repository edits and commits needed for that task without further confirmation.
+- By default, create or use a non-`main` working branch, commit the intended changes, push that branch and create a pull request targeting the TEST repository's `main` branch.
+- If the task is already associated with an open pull request, update that existing PR branch instead of creating another PR.
+- No separate confirmation is required for those branch, commit, push and PR operations.
+- Never commit or push directly to `main` unless the user explicitly asks for that in the current task.
+- Never merge a pull request unless the user explicitly asks for the merge in the current task.
+- Never deploy or perform remote operational/data mutations merely because repository changes were requested.
+- Stop after the PR has been created or updated unless the user explicitly requested a further authorised Git or operational action.
+
 ### Common restrictions
 
-Neither local/editor agents nor Codex Cloud agents may push directly to `main`, merge a PR, deploy, modify LIVE, or perform remote operational/data mutations unless the user explicitly authorises that specific action in the current task.
+Local/editor agents, Codex Cloud agents and ChatGPT in Chat mode must not push directly to `main`, merge a PR, deploy, modify LIVE, or perform remote operational/data mutations unless the user explicitly authorises that specific exceptional action in the current task.
 
 The user may explicitly narrow the permitted Git behaviour for the current task; a narrower current-task instruction takes precedence over the defaults above.
 
-Authorisation from an earlier task does not carry forward for exceptional operations such as merging, deployment, LIVE work or remote operational mutation.
+Authorisation from an earlier task does not carry forward for exceptional operations such as direct-`main` writes, merging, deployment, LIVE work or remote operational mutation.
 
 ## Validation policy
 
