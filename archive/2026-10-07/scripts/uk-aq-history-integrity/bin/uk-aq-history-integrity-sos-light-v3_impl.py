@@ -485,28 +485,6 @@ CREATE TABLE IF NOT EXISTS source_connector_day_evidence (
 CREATE INDEX IF NOT EXISTS idx_source_connector_day_evidence_lookup
   ON source_connector_day_evidence(env_name, day_utc, connector_id, id DESC);
 
--- Per-run operational acquisition facts are authenticated separately from
--- reusable official-RData semantic evidence beginning with contract v7.
-CREATE TABLE IF NOT EXISTS source_connector_day_acquisition_audits (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  source_evidence_id INTEGER NOT NULL,
-  env_name TEXT NOT NULL,
-  day_utc TEXT NOT NULL,
-  connector_id INTEGER NOT NULL,
-  source_adapter TEXT NOT NULL,
-  acquisition_audit_sha256 TEXT NOT NULL,
-  acquisition_audit_json TEXT NOT NULL,
-  created_at_utc TEXT NOT NULL,
-  FOREIGN KEY (source_evidence_id)
-    REFERENCES source_connector_day_evidence(id) ON DELETE RESTRICT,
-  UNIQUE (source_evidence_id, acquisition_audit_sha256)
-);
-
-CREATE INDEX IF NOT EXISTS idx_source_connector_day_acquisition_audits_lookup
-  ON source_connector_day_acquisition_audits(
-    source_evidence_id, id DESC
-  );
-
 -- Phase 6.5 Pass B: per-run source-vs-R2 comparison outcomes at
 -- (connector_id, day_utc, timeseries_id) granularity.
 CREATE TABLE IF NOT EXISTS cross_checks (
@@ -16462,14 +16440,7 @@ def _v2_observations_index_rebuild_command(
 
 SOURCE_EVIDENCE_CONTRACT_VERSION = 4
 OFFICIAL_RDATA_SOURCE_AVAILABILITY_CONTRACT_VERSION = 5
-OFFICIAL_RDATA_PRESERVED_BASELINE_EVIDENCE_CONTRACT_VERSION = 6
-OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION = 7
-OFFICIAL_RDATA_ACQUISITION_AUDIT_CONTRACT_VERSION = 1
-OFFICIAL_RDATA_PRESERVED_BASELINE_CONTRACT_VERSION = 1
-OFFICIAL_RDATA_DECODER_CONTRACT_VERSION = 1
-OFFICIAL_RDATA_TIMESTAMP_MAPPING = (
-    "rdata_date_beginning_plus_one_hour_to_observed_at_utc"
-)
+OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION = 6
 OBSERVATION_CONTENT_HASH_COLUMNS = [
     "connector_id",
     "station_id",
@@ -16539,179 +16510,6 @@ def _canonical_json_utf8_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
-OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS = (
-    "schema_version",
-    "semantic_evidence_contract",
-    "source_adapter",
-    "day_utc",
-    "connector_id",
-    "source_file_identities_sha256",
-    "requested_pollutant_set",
-    "contract",
-    "evidence_contract_version",
-    "history_generation",
-    "source_label_registry_snapshot_content_sha256",
-    "authoritative_station_timeseries_mapping_sha256",
-    "sos_site_ref_bridge_mapping_identity",
-    "sos_site_ref_bridge_artifact_sha256",
-    "observed_property_mapping_sha256",
-    "source_artifact_availability_contract_version",
-    "source_artifact_availability_sha256",
-    "preserved_baseline_dependency_contract_version",
-    "preserved_baseline_dependency_sha256",
-    "rdata_decoder_contract_version",
-    "timestamp_mapping",
-    "observation_content_hash_contract_version",
-    "source_evidence_input_sha256",
-    "enumeration_complete",
-    "files_enumerated",
-    "files_required",
-    "files_read",
-    "files_authoritatively_absent",
-    "source_file_identities",
-    "source_records_examined",
-    "source_csv_records_scanned",
-    "canonical_rows_mapped",
-    "missing_binding_groups",
-    "missing_binding_rows",
-    "canonical_rows_file",
-    "canonical_rows_sha256",
-    "canonical_rows_bytes",
-    "total_rows",
-    "per_timeseries_counts",
-    "per_pollutant_counts",
-    "observation_content_hashes",
-    "pollutant_set",
-    "source_available_timeseries_ids",
-    "source_available_pollutant_codes",
-    "source_unavailable_timeseries_ids",
-    "source_unavailable_scopes",
-    "preserved_baseline_rows_file",
-    "preserved_baseline_rows_sha256",
-    "preserved_baseline_rows_bytes",
-    "preserved_baseline_row_count",
-    "preserved_baseline_identity",
-    "final_target_row_count",
-    "final_target_timeseries_row_counts",
-    "final_target_pollutant_counts",
-    "empty_final_target_pollutant_codes",
-    "final_target_observation_content_hashes",
-    "source_rows_before_canonical_dedupe",
-    "duplicate_rows_removed_by_canonical_normalisation",
-    "duplicate_canonical_row_count",
-    "duplicate_canonical_row_identity_samples",
-    "uncanonicalisable_source_row_count",
-    "source_adapter_blocked_row_count",
-    "source_adapter_blocked_row_samples",
-    "out_of_scope_source_adapter_blocked_row_count",
-    "blocked_row_count",
-    "blocked_row_samples",
-    "skipped_row_count",
-    "inactive_identity_rows_skipped",
-    "source_label_classification_counts",
-    "source_label_target_day_row_counts",
-    "source_label_summary",
-    "source_label_classifications",
-    "mapping_audit",
-    "source_verification_status_counts",
-)
-
-
-def _official_rdata_v7_semantic_evidence_projection(
-    evidence: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Return the complete reusable official-RData v7 semantic boundary."""
-    if (
-        str(evidence.get("source_adapter") or "") not in OFFICIAL_RDATA_NETWORKS
-        or evidence.get("evidence_contract_version")
-        != OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION
-    ):
-        raise ValueError("official RData v7 semantic evidence version is invalid")
-    missing = [
-        field for field in OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS
-        if field not in evidence
-    ]
-    if missing:
-        raise ValueError(
-            "official RData v7 semantic evidence field is missing: "
-            + missing[0]
-        )
-    allowed = set(OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS) | {
-        "semantic_evidence_sha256",
-        "acquisition_audit",
-        "acquisition_audit_sha256",
-    }
-    unexpected = sorted(set(evidence) - allowed, key=_canonical_utf8_sort_key)
-    if unexpected:
-        raise ValueError(
-            "official RData v7 evidence field has no authenticated boundary: "
-            + unexpected[0]
-        )
-    return {
-        field: evidence[field]
-        for field in OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS
-    }
-
-
-def _official_rdata_v7_semantic_evidence_sha256(
-    evidence: Mapping[str, Any],
-) -> str:
-    return hashlib.sha256(
-        _canonical_json_utf8_bytes(
-            _official_rdata_v7_semantic_evidence_projection(evidence)
-        )
-    ).hexdigest()
-
-
-def _official_rdata_v7_acquisition_audit_projection(
-    evidence: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Return the separately authenticated current-run acquisition audit."""
-    audit = evidence.get("acquisition_audit")
-    if not isinstance(audit, Mapping):
-        raise ValueError("official RData v7 acquisition audit is unavailable")
-    fields = (
-        "schema_version",
-        "audit_contract",
-        "audit_contract_version",
-        "source_adapter",
-        "day_utc",
-        "connector_id",
-        "history_generation",
-        "source_evidence_input_sha256",
-        "semantic_evidence_sha256",
-        "source_file_acquisition_audit",
-        "source_unavailable_scope_acquisition_audit",
-        "ratification_audit",
-        "rscript_identity",
-        "backed_up_at_utc",
-        "proposal_writer_git_sha",
-    )
-    if set(audit) != set(fields):
-        raise ValueError("official RData v7 acquisition audit shape is invalid")
-    projection = {field: audit[field] for field in fields}
-    for field in (
-        "source_file_acquisition_audit",
-        "source_unavailable_scope_acquisition_audit",
-        "ratification_audit",
-    ):
-        values = projection[field]
-        if not isinstance(values, list):
-            raise ValueError("official RData v7 acquisition audit list is invalid")
-        projection[field] = sorted(values, key=_canonical_json_utf8_bytes)
-    return projection
-
-
-def _official_rdata_v7_acquisition_audit_sha256(
-    evidence: Mapping[str, Any],
-) -> str:
-    return hashlib.sha256(
-        _canonical_json_utf8_bytes(
-            _official_rdata_v7_acquisition_audit_projection(evidence)
-        )
-    ).hexdigest()
-
-
 def _source_evidence_input_payload(evidence: Mapping[str, Any]) -> dict[str, Any]:
     evidence_contract_version = _require_nonnegative_evidence_int(
         evidence, "evidence_contract_version"
@@ -16752,30 +16550,10 @@ def _source_evidence_input_payload(evidence: Mapping[str, Any]) -> dict[str, Any
         payload["source_artifact_availability_sha256"] = evidence.get(
             "source_artifact_availability_sha256"
         )
-    if (
-        evidence_contract_version
-        >= OFFICIAL_RDATA_PRESERVED_BASELINE_EVIDENCE_CONTRACT_VERSION
-    ):
+    if evidence_contract_version >= OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION:
         payload["preserved_baseline_dependency_sha256"] = evidence.get(
             "preserved_baseline_dependency_sha256"
         )
-    if evidence_contract_version >= OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION:
-        payload.update({
-            "history_generation": str(evidence.get("history_generation") or ""),
-            "source_artifact_availability_contract_version": evidence.get(
-                "source_artifact_availability_contract_version"
-            ),
-            "preserved_baseline_dependency_contract_version": evidence.get(
-                "preserved_baseline_dependency_contract_version"
-            ),
-            "rdata_decoder_contract_version": evidence.get(
-                "rdata_decoder_contract_version"
-            ),
-            "timestamp_mapping": str(evidence.get("timestamp_mapping") or ""),
-            "observation_content_hash_contract_version": evidence.get(
-                "observation_content_hash_contract_version"
-            ),
-        })
     return payload
 
 
@@ -16844,12 +16622,6 @@ def _official_rdata_preserved_baseline_dependency_sha256(
 
 
 def _immutable_source_evidence_sha256(evidence: Mapping[str, Any]) -> str:
-    if (
-        str(evidence.get("source_adapter") or "") in OFFICIAL_RDATA_NETWORKS
-        and evidence.get("evidence_contract_version")
-        == OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION
-    ):
-        return _official_rdata_v7_semantic_evidence_sha256(evidence)
     payload = dict(evidence)
     payload.pop("source_label_registry_snapshot_file", None)
     payload.pop("source_label_registry_snapshot_file_sha256", None)
@@ -17009,53 +16781,6 @@ def _load_complete_connector_day_source_evidence(
         or source_evidence_input_sha256 != _source_evidence_input_sha256(evidence)
     ):
         raise ValueError("complete connector-day detector source evidence identity is invalid")
-    if source_adapter in OFFICIAL_RDATA_NETWORKS:
-        semantic_evidence_sha256 = str(
-            evidence.get("semantic_evidence_sha256") or ""
-        )
-        acquisition_audit_sha256 = str(
-            evidence.get("acquisition_audit_sha256") or ""
-        )
-        acquisition_audit = evidence.get("acquisition_audit")
-        if (
-            evidence.get("semantic_evidence_contract")
-            != "official_rdata_semantic_evidence"
-            or evidence.get("source_artifact_availability_contract_version")
-            != OFFICIAL_RDATA_SOURCE_AVAILABILITY_CONTRACT_VERSION
-            or evidence.get("preserved_baseline_dependency_contract_version")
-            != OFFICIAL_RDATA_PRESERVED_BASELINE_CONTRACT_VERSION
-            or evidence.get("rdata_decoder_contract_version")
-            != OFFICIAL_RDATA_DECODER_CONTRACT_VERSION
-            or evidence.get("timestamp_mapping")
-            != OFFICIAL_RDATA_TIMESTAMP_MAPPING
-            or evidence.get("observation_content_hash_contract_version") != 1
-            or not re.fullmatch(r"[0-9a-f]{64}", semantic_evidence_sha256)
-            or semantic_evidence_sha256
-            != _official_rdata_v7_semantic_evidence_sha256(evidence)
-            or not re.fullmatch(r"[0-9a-f]{64}", acquisition_audit_sha256)
-            or acquisition_audit_sha256
-            != _official_rdata_v7_acquisition_audit_sha256(evidence)
-            or not isinstance(acquisition_audit, Mapping)
-            or acquisition_audit.get("schema_version") != 1
-            or acquisition_audit.get("audit_contract")
-            != "official_rdata_run_acquisition_audit"
-            or acquisition_audit.get("audit_contract_version")
-            != OFFICIAL_RDATA_ACQUISITION_AUDIT_CONTRACT_VERSION
-            or acquisition_audit.get("source_adapter") != source_adapter
-            or acquisition_audit.get("day_utc") != day_utc
-            or int(acquisition_audit.get("connector_id") or 0)
-            != int(connector_id)
-            or acquisition_audit.get("history_generation")
-            != evidence.get("history_generation")
-            or acquisition_audit.get("source_evidence_input_sha256")
-            != source_evidence_input_sha256
-            or acquisition_audit.get("semantic_evidence_sha256")
-            != semantic_evidence_sha256
-        ):
-            raise ValueError(
-                "official RData v7 semantic or acquisition evidence identity "
-                "is invalid"
-            )
     files_required = {str(value) for value in list(evidence.get("files_required") or [])}
     files_read = {str(value) for value in list(evidence.get("files_read") or [])}
     files_absent = {

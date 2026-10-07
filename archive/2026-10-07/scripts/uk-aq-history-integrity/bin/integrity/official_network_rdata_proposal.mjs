@@ -68,107 +68,6 @@ function canonicalJson(value) {
   return JSON.stringify(value);
 }
 
-const OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION = 7;
-const OFFICIAL_RDATA_SOURCE_AVAILABILITY_CONTRACT_VERSION = 5;
-const OFFICIAL_RDATA_PRESERVED_BASELINE_CONTRACT_VERSION = 1;
-const OFFICIAL_RDATA_DECODER_CONTRACT_VERSION = 1;
-const OFFICIAL_RDATA_ACQUISITION_AUDIT_CONTRACT_VERSION = 1;
-const OFFICIAL_RDATA_TIMESTAMP_MAPPING =
-  "rdata_date_beginning_plus_one_hour_to_observed_at_utc";
-
-const OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS = Object.freeze([
-  "schema_version",
-  "semantic_evidence_contract",
-  "source_adapter",
-  "day_utc",
-  "connector_id",
-  "source_file_identities_sha256",
-  "requested_pollutant_set",
-  "contract",
-  "evidence_contract_version",
-  "history_generation",
-  "source_label_registry_snapshot_content_sha256",
-  "authoritative_station_timeseries_mapping_sha256",
-  "sos_site_ref_bridge_mapping_identity",
-  "sos_site_ref_bridge_artifact_sha256",
-  "observed_property_mapping_sha256",
-  "source_artifact_availability_contract_version",
-  "source_artifact_availability_sha256",
-  "preserved_baseline_dependency_contract_version",
-  "preserved_baseline_dependency_sha256",
-  "rdata_decoder_contract_version",
-  "timestamp_mapping",
-  "observation_content_hash_contract_version",
-  "source_evidence_input_sha256",
-  "enumeration_complete",
-  "files_enumerated",
-  "files_required",
-  "files_read",
-  "files_authoritatively_absent",
-  "source_file_identities",
-  "source_records_examined",
-  "source_csv_records_scanned",
-  "canonical_rows_mapped",
-  "missing_binding_groups",
-  "missing_binding_rows",
-  "canonical_rows_file",
-  "canonical_rows_sha256",
-  "canonical_rows_bytes",
-  "total_rows",
-  "per_timeseries_counts",
-  "per_pollutant_counts",
-  "observation_content_hashes",
-  "pollutant_set",
-  "source_available_timeseries_ids",
-  "source_available_pollutant_codes",
-  "source_unavailable_timeseries_ids",
-  "source_unavailable_scopes",
-  "preserved_baseline_rows_file",
-  "preserved_baseline_rows_sha256",
-  "preserved_baseline_rows_bytes",
-  "preserved_baseline_row_count",
-  "preserved_baseline_identity",
-  "final_target_row_count",
-  "final_target_timeseries_row_counts",
-  "final_target_pollutant_counts",
-  "empty_final_target_pollutant_codes",
-  "final_target_observation_content_hashes",
-  "source_rows_before_canonical_dedupe",
-  "duplicate_rows_removed_by_canonical_normalisation",
-  "duplicate_canonical_row_count",
-  "duplicate_canonical_row_identity_samples",
-  "uncanonicalisable_source_row_count",
-  "source_adapter_blocked_row_count",
-  "source_adapter_blocked_row_samples",
-  "out_of_scope_source_adapter_blocked_row_count",
-  "blocked_row_count",
-  "blocked_row_samples",
-  "skipped_row_count",
-  "inactive_identity_rows_skipped",
-  "source_label_classification_counts",
-  "source_label_target_day_row_counts",
-  "source_label_summary",
-  "source_label_classifications",
-  "mapping_audit",
-  "source_verification_status_counts",
-]);
-
-function officialRdataV7SemanticEvidenceProjection(evidence) {
-  const projection = {};
-  for (const field of OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS) {
-    if (!Object.prototype.hasOwnProperty.call(evidence, field)) {
-      throw new Error(`official RData v7 semantic evidence field is missing: ${field}`);
-    }
-    projection[field] = evidence[field];
-  }
-  return projection;
-}
-
-function canonicalAuditEntries(values) {
-  return [...(values || [])].sort((left, right) =>
-    compareCanonicalUtf8(canonicalJson(left), canonicalJson(right)));
-}
-
 function writeAtomic(filePath, body) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const temporary = `${filePath}.tmp-${process.pid}`;
@@ -513,8 +412,7 @@ function main() {
     source_file_identities_sha256: sha256(identityBody),
     requested_pollutant_set: requestedPollutants,
     contract,
-    evidence_contract_version: OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION,
-    history_generation: historyGeneration,
+    evidence_contract_version: 6,
     source_label_registry_snapshot_content_sha256: null,
     authoritative_station_timeseries_mapping_sha256: input.authoritative_mapping_sha256 || null,
     sos_site_ref_bridge_mapping_identity: null,
@@ -523,19 +421,12 @@ function main() {
     source_artifact_availability_sha256: sha256(Buffer.from(
       canonicalJson(sourceArtifactAvailabilityIdentity), "utf8",
     )),
-    source_artifact_availability_contract_version:
-      OFFICIAL_RDATA_SOURCE_AVAILABILITY_CONTRACT_VERSION,
     preserved_baseline_dependency_sha256: preservedBaselineDependencySha256,
-    preserved_baseline_dependency_contract_version:
-      OFFICIAL_RDATA_PRESERVED_BASELINE_CONTRACT_VERSION,
-    rdata_decoder_contract_version: OFFICIAL_RDATA_DECODER_CONTRACT_VERSION,
-    timestamp_mapping: OFFICIAL_RDATA_TIMESTAMP_MAPPING,
-    observation_content_hash_contract_version: 1,
   };
-  const semanticEvidence = {
+  const evidence = {
     schema_version: 1,
-    semantic_evidence_contract: "official_rdata_semantic_evidence",
     ...evidenceInput,
+    history_generation: historyGeneration,
     source_evidence_input_sha256: sha256(Buffer.from(canonicalJson(evidenceInput), "utf8")),
     enumeration_complete: true,
     files_enumerated: requiredSourceFiles,
@@ -592,40 +483,10 @@ function main() {
       mapped_source_groups: [],
       excluded_source_groups: [],
     },
+    ratification_audit: input.ratification_audit || [],
     source_verification_status_counts: verificationStatusCounts,
-  };
-  const semanticEvidenceSha256 = sha256(Buffer.from(
-    canonicalJson(officialRdataV7SemanticEvidenceProjection(semanticEvidence)),
-    "utf8",
-  ));
-  const acquisitionAudit = {
-    schema_version: 1,
-    audit_contract: "official_rdata_run_acquisition_audit",
-    audit_contract_version: OFFICIAL_RDATA_ACQUISITION_AUDIT_CONTRACT_VERSION,
-    source_adapter: sourceAdapter,
-    day_utc: dayUtc,
-    connector_id: connectorId,
-    history_generation: historyGeneration,
-    source_evidence_input_sha256: semanticEvidence.source_evidence_input_sha256,
-    semantic_evidence_sha256: semanticEvidenceSha256,
-    source_file_acquisition_audit: canonicalAuditEntries(
-      input.source_file_identities || [],
-    ),
-    source_unavailable_scope_acquisition_audit: canonicalAuditEntries(
-      input.source_unavailable_scopes || [],
-    ),
-    ratification_audit: canonicalAuditEntries(input.ratification_audit || []),
     rscript_identity: input.rscript_identity || null,
-    backed_up_at_utc: backedUpAtUtc,
-    proposal_writer_git_sha: writerGitSha,
-  };
-  const evidence = {
-    ...semanticEvidence,
-    semantic_evidence_sha256: semanticEvidenceSha256,
-    acquisition_audit: acquisitionAudit,
-    acquisition_audit_sha256: sha256(Buffer.from(
-      canonicalJson(acquisitionAudit), "utf8",
-    )),
+    timestamp_mapping: "rdata_date_beginning_plus_one_hour_to_observed_at_utc",
   };
   const evidenceDir = path.join(stageRoot, `day_utc=${dayUtc}`, `connector_id=${connectorId}`);
   writeAtomic(path.join(evidenceDir, "obs_history_rows.json"), rowsBody);

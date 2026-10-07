@@ -118,6 +118,8 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
         source_unavailable_scopes: list[dict[str, object]] | None = None,
         preserved_baseline_identity: dict[str, object] | None = None,
         source_file_identities: list[dict[str, object]] | None = None,
+        history_generation: str = "v3",
+        requested_at_utc: str = "2026-10-06T00:00:00Z",
     ) -> tuple[Path, dict[str, object]]:
         root.mkdir(parents=True, exist_ok=True)
         repo_root = Path(__file__).resolve().parents[3]
@@ -133,9 +135,15 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
         identities = source_file_identities or [{
             "source_file": "waqn:metadata", "sha256": "a" * 64,
             "bytes": 100,
+            "url": "https://example.test/WAQ_metadata.RData",
+            "canonical_url": "https://example.test/WAQ_metadata.RData",
+            "final_url": "https://example.test/WAQ_metadata.RData",
+            "availability": "present",
+            "http_status": 200,
+            "requested_at_utc": requested_at_utc,
         }]
         payload = {
-            "history_generation": "v3",
+            "history_generation": history_generation,
             "day_utc": "2026-09-28",
             "connector_id": 9,
             "source_adapter": "waqn",
@@ -161,7 +169,16 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             "authoritatively_absent_source_files": [],
             "authoritative_mapping_sha256": "b" * 64,
             "observed_property_mapping_sha256": "c" * 64,
-            "ratification_audit": [],
+            "ratification_audit": [{
+                "audit_kind": "site_year_source_coverage",
+                "site_code": "SITE1",
+                "metadata_source_identity": {
+                    "source_file": "waqn:metadata",
+                    "sha256": "a" * 64,
+                    "bytes": 100,
+                    "requested_at_utc": requested_at_utc,
+                },
+            }],
             "mapping_audit": {
                 "mapped_source_groups": [], "excluded_source_groups": [],
             },
@@ -175,7 +192,8 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
         completed = subprocess.run(
             [
                 "node", str(helper), str(input_path), str(stage_root),
-                "history/v3/observations", writer_sha, "v3",
+                f"history/{history_generation}/observations", writer_sha,
+                history_generation,
             ],
             cwd=repo_root, text=True, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, check=False,
@@ -1897,7 +1915,7 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             self.assertFalse(list(
                 generated.rglob("pollutant_code=pm10/manifest.json")
             ))
-            self.assertEqual(evidence["evidence_contract_version"], 6)
+            self.assertEqual(evidence["evidence_contract_version"], 7)
             self.assertEqual(
                 evidence["source_evidence_input_sha256"],
                 INTEGRITY._source_evidence_input_sha256(evidence),
@@ -2348,8 +2366,8 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
                     repair_pollutants=["no2", "pm10"],
                 )
 
-    def test_official_rdata_v6_does_not_advance_sos_contract(self) -> None:
-        self.assertEqual(INTEGRITY.OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION, 6)
+    def test_official_rdata_v7_does_not_advance_sos_contract(self) -> None:
+        self.assertEqual(INTEGRITY.OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION, 7)
         self.assertEqual(INTEGRITY.SOURCE_EVIDENCE_CONTRACT_VERSION, 4)
         v5_payload = INTEGRITY._source_evidence_input_payload({
             "evidence_contract_version": 5,
@@ -2367,6 +2385,234 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             "source_artifact_availability_sha256": "a" * 64,
         })
         self.assertNotIn("source_artifact_availability_sha256", v4_payload)
+
+    def test_v7_semantic_rerun_reuses_evidence_and_retains_current_audit(self) -> None:
+        source_row = {
+            "connector_id": 9,
+            "station_id": 101,
+            "timeseries_id": 1001,
+            "pollutant_code": "no2",
+            "observed_at_utc": "2026-09-28T01:00:00.000Z",
+            "value": 10.0,
+            "verification_status": "P",
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            stage_a, evidence_a = self.stage_official_proposal(
+                root / "a",
+                requested_pollutants=["no2"],
+                rows=[source_row],
+                source_available_pollutants=["no2"],
+                requested_at_utc="2026-10-06T21:46:00Z",
+            )
+            stage_b, evidence_b = self.stage_official_proposal(
+                root / "b",
+                requested_pollutants=["no2"],
+                rows=[source_row],
+                source_available_pollutants=["no2"],
+                requested_at_utc="2026-10-06T22:31:00Z",
+            )
+            loaded_a, rows_a = INTEGRITY._load_complete_connector_day_source_evidence(
+                stage_root=stage_a,
+                day_utc="2026-09-28",
+                connector_id=9,
+                repair_pollutants=["no2"],
+            )
+            loaded_b, rows_b = INTEGRITY._load_complete_connector_day_source_evidence(
+                stage_root=stage_b,
+                day_utc="2026-09-28",
+                connector_id=9,
+                repair_pollutants=["no2"],
+            )
+
+            self.assertEqual(
+                evidence_a["source_evidence_input_sha256"],
+                evidence_b["source_evidence_input_sha256"],
+            )
+            self.assertEqual(
+                evidence_a["semantic_evidence_sha256"],
+                evidence_b["semantic_evidence_sha256"],
+            )
+            self.assertNotEqual(
+                evidence_a["acquisition_audit_sha256"],
+                evidence_b["acquisition_audit_sha256"],
+            )
+            first = INTEGRITY._persist_complete_connector_day_source_evidence(
+                conn=self.conn,
+                env_name="TEST",
+                evidence=loaded_a,
+                canonical_rows=rows_a,
+            )
+            second = INTEGRITY._persist_complete_connector_day_source_evidence(
+                conn=self.conn,
+                env_name="TEST",
+                evidence=loaded_b,
+                canonical_rows=rows_b,
+            )
+            self.assertEqual(first["evidence_id"], second["evidence_id"])
+            self.assertNotEqual(
+                first["acquisition_audit_id"],
+                second["acquisition_audit_id"],
+            )
+            self.assertEqual(
+                self.conn.execute(
+                    "SELECT COUNT(*) FROM source_connector_day_evidence"
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                self.conn.execute(
+                    "SELECT COUNT(*) FROM source_connector_day_acquisition_audits"
+                ).fetchone()[0],
+                2,
+            )
+            self.assertEqual(
+                loaded_b["acquisition_audit"]["ratification_audit"][0]
+                ["metadata_source_identity"]["requested_at_utc"],
+                "2026-10-06T22:31:00Z",
+            )
+
+    def test_v7_semantic_input_distinguishes_history_generation(self) -> None:
+        source_row = {
+            "connector_id": 9,
+            "station_id": 101,
+            "timeseries_id": 1001,
+            "pollutant_code": "no2",
+            "observed_at_utc": "2026-09-28T01:00:00.000Z",
+            "value": 10.0,
+            "verification_status": "R",
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            _, evidence_v2 = self.stage_official_proposal(
+                root / "v2",
+                requested_pollutants=["no2"],
+                rows=[source_row],
+                source_available_pollutants=["no2"],
+                history_generation="v2",
+            )
+            _, evidence_v3 = self.stage_official_proposal(
+                root / "v3",
+                requested_pollutants=["no2"],
+                rows=[source_row],
+                source_available_pollutants=["no2"],
+                history_generation="v3",
+            )
+            self.assertNotEqual(
+                evidence_v2["source_evidence_input_sha256"],
+                evidence_v3["source_evidence_input_sha256"],
+            )
+
+    def test_v6_row_remains_unchanged_and_does_not_block_v7(self) -> None:
+        historical_evidence = {
+            "schema_version": 1,
+            "evidence_contract_version": 6,
+            "source_adapter": "waqn",
+            "day_utc": "2026-09-28",
+            "connector_id": 9,
+            "source_evidence_input_sha256": "6" * 64,
+            "ratification_audit": [{"requested_at_utc": "historical"}],
+        }
+        historical_json = json.dumps(
+            historical_evidence,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        historical_sha = INTEGRITY._immutable_source_evidence_sha256(
+            historical_evidence
+        )
+        self.conn.execute(
+            """
+            INSERT INTO source_connector_day_evidence (
+              env_name, day_utc, connector_id, source_adapter,
+              source_file_identities_sha256, source_evidence_input_sha256,
+              canonical_rows_sha256, canonical_rows_bytes, evidence_sha256,
+              evidence_json, canonical_rows_json, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "TEST", "2026-09-28", 9, "waqn", "a" * 64,
+                "6" * 64, hashlib.sha256(b"[]").hexdigest(), 2,
+                historical_sha, historical_json, "[]",
+                "2026-10-06T21:47:00Z",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            stage_root, evidence_v7 = self.stage_official_proposal(
+                Path(temporary_directory),
+                requested_pollutants=["no2"],
+                rows=[],
+                source_available_pollutants=["no2"],
+            )
+            loaded, rows = INTEGRITY._load_complete_connector_day_source_evidence(
+                stage_root=stage_root,
+                day_utc="2026-09-28",
+                connector_id=9,
+                repair_pollutants=["no2"],
+            )
+            persisted = INTEGRITY._persist_complete_connector_day_source_evidence(
+                conn=self.conn,
+                env_name="TEST",
+                evidence=loaded,
+                canonical_rows=rows,
+            )
+        self.assertEqual(evidence_v7["evidence_contract_version"], 7)
+        self.assertNotEqual(persisted["evidence_id"], 1)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT evidence_sha256, evidence_json, canonical_rows_json "
+                "FROM source_connector_day_evidence WHERE id = 1"
+            ).fetchone(),
+            (historical_sha, historical_json, "[]"),
+        )
+
+    def test_v7_same_semantic_input_with_contradictory_output_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            stage_root, evidence = self.stage_official_proposal(
+                Path(temporary_directory),
+                requested_pollutants=["no2"],
+                rows=[],
+                source_available_pollutants=["no2"],
+            )
+            loaded, rows = INTEGRITY._load_complete_connector_day_source_evidence(
+                stage_root=stage_root,
+                day_utc="2026-09-28",
+                connector_id=9,
+                repair_pollutants=["no2"],
+            )
+            INTEGRITY._persist_complete_connector_day_source_evidence(
+                conn=self.conn,
+                env_name="TEST",
+                evidence=loaded,
+                canonical_rows=rows,
+            )
+            contradictory = json.loads(json.dumps(loaded))
+            contradictory["canonical_rows_sha256"] = "f" * 64
+            contradictory["semantic_evidence_sha256"] = hashlib.sha256(
+                INTEGRITY._canonical_json_utf8_bytes(
+                    INTEGRITY._official_rdata_v7_semantic_evidence_projection(
+                        contradictory
+                    )
+                )
+            ).hexdigest()
+            contradictory["acquisition_audit"]["semantic_evidence_sha256"] = (
+                contradictory["semantic_evidence_sha256"]
+            )
+            contradictory["acquisition_audit_sha256"] = hashlib.sha256(
+                INTEGRITY._canonical_json_utf8_bytes(
+                    contradictory["acquisition_audit"]
+                )
+            ).hexdigest()
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "conflicts for identical semantic inputs",
+            ):
+                INTEGRITY._persist_complete_connector_day_source_evidence(
+                    conn=self.conn,
+                    env_name="TEST",
+                    evidence=contradictory,
+                    canonical_rows=rows,
+                )
 
     def test_january_first_retains_both_raw_source_year_windows(self) -> None:
         day = dt.date(2026, 1, 1)
