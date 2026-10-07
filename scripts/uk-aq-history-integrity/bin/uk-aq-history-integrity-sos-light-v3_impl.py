@@ -22156,6 +22156,65 @@ def _merge_changed_observation_metadata_actions(
     return _dedupe_v2_repair_actions(merged_actions)
 
 
+def _merge_preserved_observation_metadata_actions(
+    metadata_actions: Iterable[Mapping[str, Any]],
+    selected_partition_outcomes: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Add only the parent closure required by preserved generic scopes."""
+    merged_actions = [
+        dict(action) for action in metadata_actions
+        if isinstance(action, Mapping)
+    ]
+    for outcome in selected_partition_outcomes:
+        if (
+            not isinstance(outcome, Mapping)
+            or str(outcome.get("outcome") or "")
+            != "source_artifact_unavailable_preserved"
+        ):
+            continue
+        day_utc = str(outcome.get("day_utc") or "").strip()
+        connector_id = outcome.get("connector_id")
+        pollutant_codes = _normalise_repair_pollutants(
+            outcome.get("pollutant_codes")
+            if outcome.get("pollutant_code") is None
+            else [outcome.get("pollutant_code")]
+        )
+        try:
+            valid_day = dt.date.fromisoformat(day_utc).isoformat() == day_utc
+        except ValueError:
+            valid_day = False
+        if (
+            not valid_day
+            or not isinstance(connector_id, int)
+            or isinstance(connector_id, bool)
+            or connector_id <= 0
+            or not pollutant_codes
+        ):
+            raise ValueError(
+                "generic preserved partition outcome is invalid for metadata planning"
+            )
+        base = {
+            "status": "planned",
+            "executes": False,
+            "data_changes_required": False,
+            "operator_action_required": False,
+            "history_version": "v2",
+            "domain": "observations",
+            "day_utc": day_utc,
+            "requires_index_rebuild": False,
+            "gap_types": ["source_artifact_unavailable_preserved"],
+        }
+        merged_actions.extend([
+            {
+                **base,
+                "kind": "observation_connector_manifest_repair",
+                "connector_id": connector_id,
+            },
+            {**base, "kind": "observation_day_manifest_repair"},
+        ])
+    return _dedupe_v2_repair_actions(merged_actions)
+
+
 def _authoritative_v2_core_timeseries_bindings(
     conn: sqlite3.Connection | None,
 ) -> list[dict[str, Any]]:
@@ -28409,6 +28468,11 @@ def run_v2_integrity_repair_flow(
             ) or []
         ),
     )
+    if not dedicated_sos_historical_replacement:
+        metadata_actions = _merge_preserved_observation_metadata_actions(
+            metadata_actions,
+            observations.get("selected_partition_outcomes") or [],
+        )
     metadata = (
         {"status": "blocked_dependency", "reason": "observation_repair_failed", "results": []}
         if observation_failed else

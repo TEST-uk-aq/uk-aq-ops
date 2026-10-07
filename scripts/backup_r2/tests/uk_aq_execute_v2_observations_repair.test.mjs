@@ -25,6 +25,10 @@ import {
 import {
   computeObservationContentHash,
 } from "../../../workers/shared/uk_aq_observation_content_hash.mjs";
+import {
+  buildObservationHistoryV3SteadyStatePartition,
+  OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES,
+} from "../../../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
 import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
 
 function localStore(objects) {
@@ -210,6 +214,281 @@ test("all-empty authoritative repair rebuilds zero-child connector and day paren
         },
       }),
       /Connector manifest has children hidden by the proposed final state/,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function preservationParentAction(kind, dayUtc, connectorId = null) {
+  return {
+    kind,
+    day_utc: dayUtc,
+    ...(connectorId === null ? {} : { connector_id: connectorId }),
+    status: "planned",
+    executes: false,
+    data_changes_required: false,
+    operator_action_required: false,
+    history_version: "v2",
+    domain: "observations",
+    requires_index_rebuild: false,
+    gap_types: ["source_artifact_unavailable_preserved"],
+  };
+}
+
+function preservationPollutantManifest({ dayUtc, connectorId, pollutantCode, timeseriesId }) {
+  const manifestKey = `history/v3/observations/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/manifest.json`;
+  const partKey = manifestKey.replace("manifest.json", "part-00000.parquet");
+  const { canonical_rows: _canonicalRows, ...observationContentHash } =
+    computeObservationContentHash([{
+      connector_id: connectorId,
+      station_id: timeseriesId,
+      timeseries_id: timeseriesId,
+      pollutant_code: pollutantCode,
+      observed_at_utc: `${dayUtc}T01:00:00.000Z`,
+      value: 10,
+      verification_status: "P",
+    }]);
+  return buildHistoryV2PollutantManifest({
+    domain: "observations",
+    dayUtc,
+    connectorId,
+    pollutantCode,
+    manifestKey,
+    sourceRowCount: 1,
+    fileEntries: [{
+      key: partKey,
+      row_count: 1,
+      bytes: 10,
+      etag_or_hash: "a".repeat(64),
+      min_timeseries_id: timeseriesId,
+      max_timeseries_id: timeseriesId,
+      min_observed_at_utc: `${dayUtc}T01:00:00.000Z`,
+      max_observed_at_utc: `${dayUtc}T01:00:00.000Z`,
+      timeseries_row_counts: { [String(timeseriesId)]: 1 },
+    }],
+    writerGitSha: "b".repeat(40),
+    backedUpAtUtc: `${dayUtc}T02:00:00.000Z`,
+    observationContentHash,
+  });
+}
+
+function writeLocalManifest(root, payload) {
+  const filePath = path.join(root, ...payload.manifest_key.split("/"));
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const body = Buffer.from(JSON.stringify(payload, null, 2));
+  fs.writeFileSync(filePath, body);
+  return { filePath, body };
+}
+
+function preservationPlannerEnvironment({ overlayRoot, dropboxRoot, runStatePath }) {
+  return {
+    UK_AQ_HISTORY_INTEGRITY_OVERLAY_ROOT: overlayRoot,
+    UK_AQ_R2_HISTORY_DROPBOX_ROOT: dropboxRoot,
+    UK_AQ_HISTORY_INTEGRITY_RUN_STATE_JSON: runStatePath,
+    CFLARE_R2_ENDPOINT: "https://example.invalid",
+    CFLARE_R2_BUCKET: "test-fixture",
+    CFLARE_R2_ACCESS_KEY_ID: "test-fixture",
+    CFLARE_R2_SECRET_ACCESS_KEY: "test-fixture",
+  };
+}
+
+test("preservation-only parent actions stage connector and day without leaf or index work", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-preservation-only-"));
+  try {
+    const dayUtc = "2026-09-28";
+    const connectorId = 9;
+    const dropboxRoot = path.join(root, "dropbox");
+    const overlayRoot = path.join(root, "overlay");
+    fs.mkdirSync(overlayRoot, { recursive: true });
+    const pollutant = preservationPollutantManifest({
+      dayUtc, connectorId, pollutantCode: "pm10", timeseriesId: 1001,
+    });
+    const { body: pollutantBody } = writeLocalManifest(dropboxRoot, pollutant);
+    const runStatePath = path.join(root, "run-state.json");
+    fs.writeFileSync(runStatePath, JSON.stringify({
+      objects: {}, tombstones: {}, tombstone_prefixes: [],
+    }));
+    const output = await runGenerationNeutralObservationMetadataRepair({
+      repairPlan: {
+        history_version: "v2",
+        domain: "observations",
+        repair_plan: [
+          preservationParentAction(
+            "observation_connector_manifest_repair", dayUtc, connectorId,
+          ),
+          preservationParentAction("observation_day_manifest_repair", dayUtc),
+        ],
+      },
+      storageGeneration: "v3",
+      planIndexes: false,
+      env: preservationPlannerEnvironment({ overlayRoot, dropboxRoot, runStatePath }),
+    });
+    assert.equal(output.status, "planned");
+    const proposals = new Map(output.planning.proposals.map((item) => [item.key, item]));
+    const dayPrefix = `history/v3/observations/day_utc=${dayUtc}`;
+    const pollutantKey = pollutant.manifest_key;
+    const connectorKey = `${dayPrefix}/connector_id=${connectorId}/manifest.json`;
+    const dayKey = `${dayPrefix}/manifest.json`;
+    assert.deepEqual([...proposals.keys()].sort(), [connectorKey, dayKey].sort());
+    assert.equal(proposals.get(connectorKey).changed, true);
+    assert.equal(proposals.get(dayKey).changed, true);
+    assert.deepEqual(proposals.get(connectorKey).dependency_identities[pollutantKey], {
+      source: "dropbox",
+      sha256: sha256Hex(pollutantBody),
+      bytes: pollutantBody.byteLength,
+    });
+    assert.deepEqual(proposals.get(dayKey).dependency_identities[connectorKey], {
+      source: "planned_overlay",
+      sha256: proposals.get(connectorKey).new_sha256,
+      bytes: proposals.get(connectorKey).bytes,
+    });
+    assert.equal(
+      [...proposals.keys()].some((key) => key.startsWith(
+        pollutantKey.replace(/\/manifest\.json$/, "/"),
+      )),
+      false,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("preservation parents compose with a repaired sibling and another connector", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-preservation-mixed-"));
+  try {
+    const dayUtc = "2026-09-28";
+    const dropboxRoot = path.join(root, "dropbox");
+    const overlayRoot = path.join(root, "overlay");
+    fs.mkdirSync(overlayRoot, { recursive: true });
+    const preservedNo2 = preservationPollutantManifest({
+      dayUtc, connectorId: 9, pollutantCode: "no2", timeseriesId: 1001,
+    });
+    const repairedPm10 = buildObservationHistoryV3SteadyStatePartition({
+      source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.integrity,
+      rows: [{
+        connector_id: 9,
+        station_id: 1002,
+        timeseries_id: 1002,
+        pollutant_code: "pm10",
+        observed_at_utc: `${dayUtc}T01:00:00.000Z`,
+        value: 12,
+        verification_status: "P",
+      }],
+      scope: { day_utc: dayUtc, connector_id: 9, pollutant_code: "pm10" },
+      targetWriterGitSha: "b".repeat(40),
+      backedUpAtUtc: `${dayUtc}T02:00:00.000Z`,
+    });
+    const preservedO3 = preservationPollutantManifest({
+      dayUtc, connectorId: 10, pollutantCode: "o3", timeseriesId: 1003,
+    });
+    const { body: no2Body } = writeLocalManifest(dropboxRoot, preservedNo2);
+    const { body: o3Body } = writeLocalManifest(dropboxRoot, preservedO3);
+    const changedObjects = {};
+    for (const artifact of [
+      ...repairedPm10.file_intents.map((intent) => ({
+        key: intent.key,
+        body: Buffer.from(intent.body),
+      })),
+      {
+        key: repairedPm10.canonical_pollutant_manifest.key,
+        body: Buffer.from(repairedPm10.canonical_pollutant_manifest.body),
+      },
+    ]) {
+      const localPath = path.join(overlayRoot, ...artifact.key.split("/"));
+      fs.mkdirSync(path.dirname(localPath), { recursive: true });
+      fs.writeFileSync(localPath, artifact.body);
+      changedObjects[artifact.key] = {
+        object_key: artifact.key,
+        local_path: localPath,
+        sha256: sha256Hex(artifact.body),
+        bytes: artifact.body.byteLength,
+        stage: "observations_data",
+        proposed: true,
+        built: true,
+        structurally_validated: true,
+        changed: true,
+        included_in_write_set: true,
+        status: "planned",
+      };
+    }
+    const repairedPm10Key = repairedPm10.canonical_pollutant_manifest.key;
+    const pm10Body = Buffer.from(repairedPm10.canonical_pollutant_manifest.body);
+    const runStatePath = path.join(root, "run-state.json");
+    fs.writeFileSync(runStatePath, JSON.stringify({
+      objects: changedObjects,
+      tombstones: {},
+      tombstone_prefixes: [],
+    }));
+    const output = await runGenerationNeutralObservationMetadataRepair({
+      repairPlan: {
+        history_version: "v2",
+        domain: "observations",
+        repair_plan: [
+          {
+            ...preservationParentAction(
+              "observation_pollutant_manifest_repair", dayUtc, 9,
+            ),
+            pollutant_code: "pm10",
+            gap_types: ["observation_repaired"],
+          },
+          preservationParentAction(
+            "observation_connector_manifest_repair", dayUtc, 9,
+          ),
+          preservationParentAction(
+            "observation_connector_manifest_repair", dayUtc, 10,
+          ),
+          preservationParentAction("observation_day_manifest_repair", dayUtc),
+        ],
+      },
+      storageGeneration: "v3",
+      planIndexes: false,
+      env: preservationPlannerEnvironment({ overlayRoot, dropboxRoot, runStatePath }),
+    });
+    assert.equal(output.status, "planned");
+    const proposals = new Map(output.planning.proposals.map((item) => [item.key, item]));
+    const dayPrefix = `history/v3/observations/day_utc=${dayUtc}`;
+    const connector9Key = `${dayPrefix}/connector_id=9/manifest.json`;
+    const connector10Key = `${dayPrefix}/connector_id=10/manifest.json`;
+    const dayKey = `${dayPrefix}/manifest.json`;
+    assert.deepEqual(proposals.get(connector9Key).dependency_identities, {
+      [preservedNo2.manifest_key]: {
+        source: "dropbox", sha256: sha256Hex(no2Body), bytes: no2Body.byteLength,
+      },
+      [repairedPm10Key]: {
+        source: "planned_overlay", sha256: sha256Hex(pm10Body), bytes: pm10Body.byteLength,
+      },
+    });
+    assert.deepEqual(proposals.get(connector10Key).dependency_identities, {
+      [preservedO3.manifest_key]: {
+        source: "dropbox", sha256: sha256Hex(o3Body), bytes: o3Body.byteLength,
+      },
+    });
+    assert.deepEqual(proposals.get(dayKey).dependencies.sort(), [
+      connector10Key, connector9Key,
+    ].sort());
+    for (const connectorKey of [connector9Key, connector10Key]) {
+      assert.deepEqual(proposals.get(dayKey).dependency_identities[connectorKey], {
+        source: "planned_overlay",
+        sha256: proposals.get(connectorKey).new_sha256,
+        bytes: proposals.get(connectorKey).bytes,
+      });
+    }
+    assert.equal(
+      [...proposals.keys()].filter((key) => key === dayKey).length,
+      1,
+    );
+    assert.equal(
+      [...proposals.keys()].some((key) => key.startsWith(
+        preservedNo2.manifest_key.replace(/\/manifest\.json$/, "/"),
+      )),
+      false,
+    );
+    assert.equal(
+      [...proposals.keys()].some((key) => key.startsWith(
+        preservedO3.manifest_key.replace(/\/manifest\.json$/, "/"),
+      )),
+      false,
     );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

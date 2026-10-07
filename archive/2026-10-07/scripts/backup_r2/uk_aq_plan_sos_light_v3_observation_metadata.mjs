@@ -1209,11 +1209,11 @@ async function addExactV3Indexes({
   });
   const selectedDayPrefixes = selectedDays
     .map((day) => `${GENERATION.observations_prefix}/day_utc=${day}/`);
-  const proposals = promoteSelectedDayCanonicalProposals(
-    (output.planning.proposals || [])
-      .filter((proposal) => !String(proposal.key || "").startsWith(`${GENERATION.index_root_prefix}/`)),
-    selectedDays,
-  );
+  const proposals = (output.planning.proposals || [])
+    .filter((proposal) => !String(proposal.key || "").startsWith(`${GENERATION.index_root_prefix}/`))
+    .map((proposal) => selectedDayPrefixes.some((prefix) => String(proposal.key).startsWith(prefix))
+      ? { ...proposal, changed: true, included_in_write_set: true, status: "planned" }
+      : proposal);
   const proposalsByKey = new Map(proposals.map((proposal) => [String(proposal.key), proposal]));
   const prefixes = [GENERATION.observations_prefix];
   const store = createCombinedLocalStore({
@@ -1517,69 +1517,6 @@ async function addExactV3Indexes({
     total_objects: publicationPlan.entries.length,
   });
   return output;
-}
-
-export function promoteSelectedDayCanonicalProposals(
-  proposals,
-  selectedDays,
-) {
-  const selectedDayPrefixes = [...new Set(selectedDays.map(String))]
-    .map((day) => `${GENERATION.observations_prefix}/day_utc=${day}/`);
-  const promoted = proposals.map((proposal) => (
-    selectedDayPrefixes.some((prefix) => String(proposal?.key || "").startsWith(prefix))
-      ? {
-          ...proposal,
-          changed: true,
-          included_in_write_set: true,
-          status: "planned",
-        }
-      : proposal
-  ));
-  const promotedByKey = new Map(
-    promoted.map((proposal) => [String(proposal?.key || ""), proposal]),
-  );
-  return promoted.map((proposal) => {
-    const dependencies = Array.isArray(proposal?.dependencies)
-      ? proposal.dependencies.map(String)
-      : [];
-    const identities = { ...(proposal?.dependency_identities || {}) };
-    let snapshot = proposal?.local_dependency_snapshot
-      ? {
-          ...proposal.local_dependency_snapshot,
-          expected_children: (
-            proposal.local_dependency_snapshot.expected_children || []
-          ).map((child) => ({ ...child })),
-        }
-      : null;
-    for (const dependencyKey of dependencies) {
-      const dependency = promotedByKey.get(dependencyKey);
-      if (dependency?.changed !== true) continue;
-      const identity = {
-        source: "planned_overlay",
-        sha256: dependency.new_sha256,
-        bytes: dependency.bytes,
-      };
-      identities[dependencyKey] = identity;
-      if (snapshot) {
-        snapshot.expected_children = snapshot.expected_children.map((child) => (
-          child.key === dependencyKey
-            ? {
-                ...child,
-                source: identity.source,
-                sha256: identity.sha256,
-                bytes: identity.bytes,
-                staged: true,
-              }
-            : child
-        ));
-      }
-    }
-    return {
-      ...proposal,
-      dependency_identities: identities,
-      ...(snapshot ? { local_dependency_snapshot: snapshot } : {}),
-    };
-  });
 }
 
 export async function planSosLightV3ObservationMetadata(options = {}) {

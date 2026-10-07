@@ -2085,6 +2085,189 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
         )
         self.assertIn(("observation_day_manifest_repair", None), leaf_actions)
 
+    def test_preservation_only_adds_parent_metadata_actions(self) -> None:
+        actions = INTEGRITY._merge_preserved_observation_metadata_actions(
+            [],
+            [{
+                "day_utc": "2026-09-28",
+                "connector_id": 9,
+                "pollutant_codes": ["pm10"],
+                "outcome": "source_artifact_unavailable_preserved",
+                "selected_partition_left_unchanged": True,
+                "tombstone_created": False,
+            }],
+        )
+        self.assertEqual(
+            [(action["kind"], action.get("connector_id")) for action in actions],
+            [
+                ("observation_connector_manifest_repair", 9),
+                ("observation_day_manifest_repair", None),
+            ],
+        )
+        self.assertTrue(all(
+            action["requires_index_rebuild"] is False for action in actions
+        ))
+        self.assertFalse(any(
+            action["kind"] in {
+                "observation_pollutant_manifest_repair",
+                "observation_index_repair",
+            }
+            for action in actions
+        ))
+
+    def test_preservation_parent_actions_compose_with_repaired_sibling(self) -> None:
+        repaired = INTEGRITY._merge_changed_observation_metadata_actions(
+            [],
+            [{
+                "day_utc": "2026-09-28",
+                "connector_id": 9,
+                "timeseries_ids": [1001],
+                "pollutant_codes": ["no2"],
+                "empty_pollutant_codes": [],
+            }],
+        )
+        actions = INTEGRITY._merge_preserved_observation_metadata_actions(
+            repaired,
+            [{
+                "day_utc": "2026-09-28",
+                "connector_id": 9,
+                "pollutant_codes": ["pm10"],
+                "outcome": "source_artifact_unavailable_preserved",
+            }],
+        )
+        identities = [
+            (
+                action["kind"],
+                action.get("connector_id"),
+                action.get("pollutant_code"),
+            )
+            for action in actions
+        ]
+        self.assertEqual(
+            identities.count(
+                ("observation_connector_manifest_repair", 9, None)
+            ),
+            1,
+        )
+        self.assertEqual(
+            identities.count(
+                ("observation_day_manifest_repair", None, None)
+            ),
+            1,
+        )
+        self.assertIn(
+            ("observation_pollutant_manifest_repair", 9, "no2"),
+            identities,
+        )
+        self.assertIn(("observation_index_repair", 9, "no2"), identities)
+        self.assertNotIn(
+            ("observation_pollutant_manifest_repair", 9, "pm10"),
+            identities,
+        )
+        self.assertNotIn(("observation_index_repair", 9, "pm10"), identities)
+
+    def test_preserved_connectors_share_one_canonical_day_action(self) -> None:
+        actions = INTEGRITY._merge_preserved_observation_metadata_actions(
+            [],
+            [
+                {
+                    "day_utc": "2026-09-28",
+                    "connector_id": 9,
+                    "pollutant_codes": ["pm10"],
+                    "outcome": "source_artifact_unavailable_preserved",
+                },
+                {
+                    "day_utc": "2026-09-28",
+                    "connector_id": 10,
+                    "pollutant_codes": ["o3"],
+                    "outcome": "source_artifact_unavailable_preserved",
+                },
+            ],
+        )
+        connector_actions = [
+            action for action in actions
+            if action["kind"] == "observation_connector_manifest_repair"
+        ]
+        day_actions = [
+            action for action in actions
+            if action["kind"] == "observation_day_manifest_repair"
+        ]
+        self.assertEqual(
+            sorted(action["connector_id"] for action in connector_actions),
+            [9, 10],
+        )
+        self.assertEqual(len(day_actions), 1)
+        self.assertNotIn("connector_id", day_actions[0])
+
+    def test_repair_flow_passes_preservation_parents_to_metadata_planner(
+        self,
+    ) -> None:
+        preserved_outcome = {
+            "day_utc": "2026-09-28",
+            "connector_id": 9,
+            "pollutant_codes": ["pm10"],
+            "outcome": "source_artifact_unavailable_preserved",
+            "selected_partition_left_unchanged": True,
+            "tombstone_created": False,
+        }
+        observed_actions: list[dict[str, object]] = []
+
+        class PlannerReached(RuntimeError):
+            pass
+
+        def capture_planner(**kwargs: object) -> dict[str, object]:
+            observed_actions.extend(kwargs["actions"])
+            raise PlannerReached
+
+        with (
+            mock.patch.object(
+                INTEGRITY, "validate_run_state_core_snapshot_identity",
+            ),
+            mock.patch.object(INTEGRITY, "write_run_state"),
+            mock.patch.object(
+                INTEGRITY,
+                "run_v2_gap_backfills",
+                return_value={
+                    "v2_observation_repairs_failed": 0,
+                    "v2_observation_repairs_guard_failed": 0,
+                    "selected_partition_outcomes": [preserved_outcome],
+                },
+            ),
+            mock.patch.object(
+                INTEGRITY,
+                "_run_v3_observation_metadata_proposal",
+                side_effect=capture_planner,
+            ),
+            self.assertRaises(PlannerReached),
+        ):
+            INTEGRITY.run_v2_integrity_repair_flow(
+                run_state={"changed_scopes": {}},
+                conn=self.conn,
+                run_id=1,
+                env_name="TEST",
+                run_compact="20260928T000000Z",
+                env={},
+                v2_observations={"repair_plan": []},
+                final_verification_config=mock.Mock(),
+                from_day="2026-09-28",
+                to_day="2026-09-28",
+                allowed_connector_ids={9},
+                source_scope={"source": "waqn"},
+                limits=mock.Mock(),
+                dry_run=False,
+                log=mock.Mock(spec=logging.Logger),
+                repair_pollutants=["pm10"],
+            )
+
+        self.assertEqual(
+            [(action["kind"], action.get("connector_id"))
+             for action in observed_actions],
+            [
+                ("observation_connector_manifest_repair", 9),
+                ("observation_day_manifest_repair", None),
+            ],
+        )
+
     def test_wholly_unavailable_pollutant_is_excluded_before_empty_replacement(self) -> None:
         unavailable_scope = {
             "day_utc": "2026-09-28",

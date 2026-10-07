@@ -17,6 +17,7 @@ import {
   crossCheckExactV3RegistryCatalogue,
   deriveExactV3ManifestDelta,
   inspectPinnedBaselinePollutantPartition,
+  promoteSelectedDayCanonicalProposals,
   reconcileReconstructedExactV3Hierarchies,
   reconstructCanonicalObservationAggregateHierarchy,
   resolveExactV3PlanningAuthority,
@@ -34,6 +35,9 @@ import {
 import {
   readCanonicalObservationRows,
 } from "../uk_aq_apply_integrity_proposal.mjs";
+import {
+  validateFinalPlannerProposalGraph,
+} from "../uk_aq_execute_v2_observations_repair.mjs";
 import {
   inspectObservationParquetFile,
 } from "../lib/uk_aq_observation_parquet_content_hash.mjs";
@@ -69,6 +73,104 @@ function proposalWithDependency(dependency) {
     },
   };
 }
+
+test("selected-day promotion rewrites only promoted parent dependencies", () => {
+  const dayUtc = "2026-09-28";
+  const dayPrefix = `history/v3/observations/day_utc=${dayUtc}`;
+  const pollutantKey = `${dayPrefix}/connector_id=9/pollutant_code=pm10/manifest.json`;
+  const connectorKey = `${dayPrefix}/connector_id=9/manifest.json`;
+  const dayKey = `${dayPrefix}/manifest.json`;
+  const pollutantIdentity = {
+    source: "dropbox",
+    sha256: "a".repeat(64),
+    bytes: 101,
+  };
+  const connectorIdentity = {
+    source: "dropbox",
+    sha256: "b".repeat(64),
+    bytes: 202,
+  };
+  const promoted = promoteSelectedDayCanonicalProposals([
+    {
+      key: connectorKey,
+      kind: "connector_manifest",
+      changed: false,
+      included_in_write_set: false,
+      status: "skipped_unchanged",
+      new_sha256: connectorIdentity.sha256,
+      bytes: connectorIdentity.bytes,
+      dependencies: [pollutantKey],
+      dependency_identities: { [pollutantKey]: pollutantIdentity },
+      local_dependency_snapshot: {
+        source: "combined_local_snapshot",
+        expected_child_keys: [pollutantKey],
+        expected_children: [{
+          key: pollutantKey,
+          source: "dropbox",
+          sha256: pollutantIdentity.sha256,
+          bytes: pollutantIdentity.bytes,
+          staged: false,
+        }],
+      },
+    },
+    {
+      key: dayKey,
+      kind: "day_manifest",
+      changed: false,
+      included_in_write_set: false,
+      status: "skipped_unchanged",
+      new_sha256: "c".repeat(64),
+      bytes: 303,
+      dependencies: [connectorKey],
+      dependency_identities: { [connectorKey]: connectorIdentity },
+      local_dependency_snapshot: {
+        source: "combined_local_snapshot",
+        expected_child_keys: [connectorKey],
+        expected_children: [{
+          key: connectorKey,
+          source: "dropbox",
+          sha256: connectorIdentity.sha256,
+          bytes: connectorIdentity.bytes,
+          staged: false,
+        }],
+      },
+    },
+  ], [dayUtc]);
+  const byKey = new Map(promoted.map((proposal) => [proposal.key, proposal]));
+  assert.equal(byKey.get(connectorKey).changed, true);
+  assert.equal(byKey.get(dayKey).changed, true);
+  assert.deepEqual(
+    byKey.get(connectorKey).dependency_identities[pollutantKey],
+    pollutantIdentity,
+  );
+  assert.deepEqual(byKey.get(dayKey).dependency_identities[connectorKey], {
+    source: "planned_overlay",
+    sha256: connectorIdentity.sha256,
+    bytes: connectorIdentity.bytes,
+  });
+  assert.deepEqual(
+    byKey.get(dayKey).local_dependency_snapshot.expected_children,
+    [{
+      key: connectorKey,
+      source: "planned_overlay",
+      sha256: connectorIdentity.sha256,
+      bytes: connectorIdentity.bytes,
+      staged: true,
+    }],
+  );
+  assert.deepEqual(
+    validateFinalPlannerProposalGraph({ planning: { proposals: promoted } }),
+    {
+      status: "succeeded",
+      changed_proposal_count: 2,
+      final_changed_write_object_count: 2,
+      dependency_edge_count: 2,
+      staged_dependency_edge_count: 1,
+      external_dependency_edge_counts: { dropbox: 1, overlay: 0 },
+      python_staging_permitted: true,
+    },
+  );
+});
 
 test("fixed-v3 namespace guard accepts only generation-v3 observation authorities", () => {
   assert.doesNotThrow(() => assertFixedV3Proposal(proposalWithDependency(
