@@ -23,9 +23,9 @@ const OUTCOMES = new Set([
 const POLLUTANT_PREFIX = /^history\/v3\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
 
 export const GENERIC_INTEGRITY_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT =
-  "uk_aq_generic_integrity_v3_transition_state_fingerprint_v2";
+  "uk_aq_generic_integrity_v3_transition_state_fingerprint_v3";
 export const GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT =
-  "uk_aq_generic_integrity_v3_selected_scope_authority_v2";
+  "uk_aq_generic_integrity_v3_selected_scope_authority_v3";
 
 function sha256(body) { return createHash("sha256").update(body).digest("hex"); }
 function bytewise(left, right) {
@@ -223,12 +223,56 @@ function deriveGenericPreservedScopeEvidence(runState, { dayUtc, connectorId, po
   };
 }
 
+function derivePinnedMetadataDependencies(runState, { dayUtc, connectorId, pollutantCode }) {
+  if (runState?.dropbox_currentness?.allowed !== true) {
+    throw new Error("Generic metadata-only authority requires accepted Dropbox currentness");
+  }
+  const base = "history/v3/observations";
+  const year = dayUtc.slice(0, 4);
+  const month = dayUtc.slice(5, 7);
+  const keys = [
+    `${base}/_manifests/manifest.json`,
+    `${base}/_manifests/year=${year}/manifest.json`,
+    `${base}/_manifests/year=${year}/month=${month}/manifest.json`,
+    `${base}/day_utc=${dayUtc}/manifest.json`,
+    `${base}/day_utc=${dayUtc}/connector_id=${connectorId}/manifest.json`,
+    `${base}/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${pollutantCode}/manifest.json`,
+  ];
+  const root = String(runState?.base_dropbox_root || "");
+  if (!fs.statSync(root, { throwIfNoEntry: false })?.isDirectory()) {
+    throw new Error("Generic metadata-only pinned Dropbox root is unavailable");
+  }
+  const bodies = keys.map((key) => fs.readFileSync(path.join(root, ...key.split("/"))));
+  const payloads = bodies.map((body, index) => parsePreservedManifest(body, keys[index]));
+  for (let index = 0; index < 5; index += 1) {
+    const field = index < 2 ? "content_hash" : "manifest_hash";
+    const referenceFields = index < 3 ? ["children"]
+      : index === 3 ? ["connector_manifests", "child_manifests"]
+        : ["pollutant_manifests", "child_manifests"];
+    const references = referenceFields.flatMap((name) => payloads[index][name] || [])
+      .filter((entry) => entry?.manifest_key === keys[index + 1]);
+    if (references.length !== 1
+        || !SHA256.test(String(payloads[index + 1][field] || ""))
+        || references[0][field] !== payloads[index + 1][field]) {
+      throw new Error(`Generic metadata-only pinned hierarchy disagrees: ${keys[index]} -> ${keys[index + 1]}`);
+    }
+  }
+  return keys.map((key, index) => ({
+    object_key: key,
+    sha256: sha256(bodies[index]),
+    bytes: bodies[index].byteLength,
+    source: "dropbox",
+  }));
+}
+
 export function canonicalGenericV3SelectedScopeAuthority(runState) {
   const authority = runState?.generic_integrity_selected_scope_authority;
   if (!authority || typeof authority !== "object" || Array.isArray(authority)
       || authority.contract_version !== GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT
       || authority.history_generation !== "v3"
-      || !Array.isArray(authority.selected_scopes) || !authority.selected_scopes.length
+      || !Array.isArray(authority.selected_scopes)
+      || !Array.isArray(authority.metadata_only_scopes)
+      || !(authority.selected_scopes.length || authority.metadata_only_scopes.length)
       || !Array.isArray(authority.authorised_pollutant_tombstone_prefixes)) {
     throw new Error("Generic fixed-v3 selected-scope authority is unavailable");
   }
@@ -326,10 +370,109 @@ export function canonicalGenericV3SelectedScopeAuthority(runState) {
   if (!exactArray(proposed, authorisedPrefixes)) {
     throw new Error("Generic fixed-v3 proposed tombstones exceed selected authority");
   }
+  const dataIdentities = new Set(scopes.map((scope) =>
+    `${scope.day_utc}|${scope.connector_id}|${scope.pollutant_code}`));
+  const metadataSeen = new Set();
+  const objectKeys = Object.keys(runState?.objects || {});
+  const metadataScopes = authority.metadata_only_scopes.map((raw) => {
+    const dayUtc = String(raw?.day_utc || "");
+    const connectorId = raw?.connector_id;
+    const pollutantCode = String(raw?.pollutant_code || "");
+    const identity = `${dayUtc}|${connectorId}|${pollutantCode}`;
+    if (!validDay(dayUtc) || !Number.isSafeInteger(connectorId) || connectorId <= 0
+        || !POLLUTANTS.has(pollutantCode) || dataIdentities.has(identity)
+        || metadataSeen.has(identity)) {
+      throw new Error("Generic metadata-only scope identity is invalid");
+    }
+    metadataSeen.add(identity);
+    const prefix = `history/_index_v3/observations_timeseries/day_utc=${dayUtc}`
+      + `/connector_id=${connectorId}/pollutant_code=${pollutantCode}`;
+    const alignedPrefix = prefix.replace(
+      "observations_timeseries/day_utc=", "observations_timeseries/_aligned/day_utc=",
+    );
+    const derivedKeys = objectKeys.filter((key) => key.startsWith(`${prefix}/`)
+      || key.startsWith(`${alignedPrefix}/`)).sort(bytewise);
+    const dependencies = derivePinnedMetadataDependencies(runState, {
+      dayUtc, connectorId, pollutantCode,
+    });
+    if (raw.derived_index_prefix !== prefix
+        || !derivedKeys.includes(`${prefix}/manifest.json`)
+        || !exactArray(raw.derived_object_keys, derivedKeys)
+        || !exactArray(raw.observation_deletion_prefixes, [])
+        || canonicalTransitionFingerprintJson(raw.canonical_dependencies)
+          !== canonicalTransitionFingerprintJson(dependencies)) {
+      throw new Error("Generic metadata-only scope closure changed");
+    }
+    return {
+      day_utc: dayUtc,
+      connector_id: connectorId,
+      pollutant_code: pollutantCode,
+      derived_index_prefix: prefix,
+      canonical_dependencies: dependencies,
+      derived_object_keys: derivedKeys,
+      observation_deletion_prefixes: [],
+    };
+  }).sort((left, right) => bytewise(left.day_utc, right.day_utc)
+    || left.connector_id - right.connector_id
+    || bytewise(left.pollutant_code, right.pollutant_code));
+  if (canonicalTransitionFingerprintJson(authority.metadata_only_scopes)
+      !== canonicalTransitionFingerprintJson(metadataScopes)) {
+    throw new Error("Generic metadata-only scopes are not canonical");
+  }
+  const latestKey = "history/_index_v3/observations_timeseries_latest.json";
+  const derivedWriteKeys = [...new Set([
+    ...metadataScopes.flatMap((scope) => scope.derived_object_keys),
+    ...(metadataScopes.length && objectKeys.includes(latestKey) ? [latestKey] : []),
+  ])].sort(bytewise);
+  if (!exactArray(authority.metadata_only_derived_write_object_keys, derivedWriteKeys)) {
+    throw new Error("Generic metadata-only derived write set changed");
+  }
+  if (metadataScopes.length && !scopes.length) {
+    const allDerivedKeys = objectKeys.filter((key) =>
+      key.startsWith("history/_index_v3/observations_timeseries/")
+      || key === latestKey).sort(bytewise);
+    if (!exactArray(allDerivedKeys, derivedWriteKeys)
+        || !exactArray([...objectKeys].sort(bytewise), derivedWriteKeys)) {
+      throw new Error("Generic metadata-only derived closure is not exact");
+    }
+  }
+  const forceTargets = runState?.explicit_official_force_partitions || [];
+  if (!Array.isArray(forceTargets) || forceTargets.some((target) =>
+    target?.target_authority !== "explicit_manual_force_replacement"
+    || ![9, 10].includes(target?.connector_id))) {
+    throw new Error("Generic explicit force target is invalid");
+  }
+  const expectedTargets = [...new Set(forceTargets.map((target) =>
+    `${target?.day_utc}|${target?.connector_id}|${target?.pollutant_code}`))]
+    .sort(bytewise).map((value) => {
+      const [dayUtc, connectorId, pollutantCode] = value.split("|");
+      return { day_utc: dayUtc, connector_id: Number(connectorId), pollutant_code: pollutantCode };
+    });
+  if (canonicalTransitionFingerprintJson(authority.explicit_force_targets)
+        !== canonicalTransitionFingerprintJson(expectedTargets)
+      || Boolean(expectedTargets.length) !== Boolean(runState?.explicit_official_force_replacement)
+      || (expectedTargets.length && !exactArray(
+        expectedTargets.map((target) => `${target.day_utc}|${target.connector_id}|${target.pollutant_code}`),
+        [...dataIdentities].sort(bytewise),
+      ))) {
+    throw new Error("Generic explicit force authority changed");
+  }
+  const forcedParquetKeys = objectKeys.filter((key) => key.endsWith(".parquet")
+    && expectedTargets.some((target) => key.startsWith(
+      `history/v3/observations/day_utc=${target.day_utc}`
+      + `/connector_id=${target.connector_id}/pollutant_code=${target.pollutant_code}/`,
+    ))).sort(bytewise);
+  if (!exactArray(authority.forced_republication_parquet_keys, forcedParquetKeys)) {
+    throw new Error("Generic forced Parquet write set changed");
+  }
   return {
     contract_version: GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT,
     history_generation: "v3",
     selected_scopes: scopes,
+    metadata_only_scopes: metadataScopes,
+    metadata_only_derived_write_object_keys: derivedWriteKeys,
+    explicit_force_targets: expectedTargets,
+    forced_republication_parquet_keys: forcedParquetKeys,
     authorised_pollutant_tombstone_prefixes: authorisedPrefixes,
   };
 }

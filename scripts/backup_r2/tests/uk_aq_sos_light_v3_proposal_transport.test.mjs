@@ -994,6 +994,10 @@ function genericV3SelectedScopeState({ authoritativeEmpty = false } = {}) {
         replacement_object_keys: replacementObjectKeys,
         preservation_evidence: null,
       }],
+      metadata_only_scopes: [],
+      metadata_only_derived_write_object_keys: [],
+      explicit_force_targets: [],
+      forced_republication_parquet_keys: [],
       authorised_pollutant_tombstone_prefixes: [prefix],
     },
     proposal_transition_planner_unchanged_keys: [],
@@ -1150,6 +1154,18 @@ test("generic fixed-v3 accepts selected non-empty authority and remains isolated
       () => validateLocalSosLightV3Proposal(fixture.runState),
       /fingerprint contract is unknown|SOS-light proposals only|connector-membership/,
     );
+  } finally {
+    fs.rmSync(fixture.runRoot, { recursive: true, force: true });
+  }
+});
+
+test("generic fixed-v3 rejects persisted v2 authority under v3 semantics", () => {
+  const fixture = genericV3SelectedScopeState();
+  try {
+    fixture.runState.generic_integrity_selected_scope_authority.contract_version =
+      "uk_aq_generic_integrity_v3_selected_scope_authority_v2";
+    assert.throws(() => computeGenericV3TransitionStateFingerprint(fixture.runState),
+      /selected-scope authority is unavailable/);
   } finally {
     fs.rmSync(fixture.runRoot, { recursive: true, force: true });
   }

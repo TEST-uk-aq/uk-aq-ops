@@ -506,6 +506,7 @@ export function reconstructCanonicalObservationAggregateHierarchy({
   proposalsByKey,
   selectedDays,
   store,
+  genericFixedV3 = false,
 }) {
   const basePrefix = GENERATION.observations_prefix;
   const rootKey = buildR2HistoryV2ObservationsRootManifestKey(basePrefix);
@@ -563,6 +564,18 @@ export function reconstructCanonicalObservationAggregateHierarchy({
     }
     for (const dayUtc of selectedMonthDays) {
       const dayKey = buildHistoryV2DayManifestKey(basePrefix, dayUtc);
+      if (genericFixedV3 && proposalsByKey.get(dayKey)?.changed !== true) {
+        const hasChangedChild = [...proposalsByKey.values()].some((proposal) =>
+          proposal.changed === true
+          && String(proposal.key).startsWith(`${basePrefix}/day_utc=${dayUtc}/`));
+        if (hasChangedChild) {
+          throw new Error(`Fixed-v3 changed canonical day proposal is unavailable: ${dayKey}`);
+        }
+        if (!existingDays.has(dayUtc)) {
+          throw new Error(`Fixed-v3 pinned selected day is unavailable: ${dayKey}`);
+        }
+        continue;
+      }
       const payload = validateProposedDayManifest({
         proposal: proposalsByKey.get(dayKey),
         dayUtc,
@@ -845,6 +858,25 @@ export function deriveExactV3ManifestDelta({ finalCatalogue, baselineObjects }) 
     removed_scopes: Object.freeze(removedScopes),
     removed_scope_ids: new Set(removedScopes.map((scope) => scopeIdentity(scope))),
   });
+}
+
+export function deriveExplicitExactV3RepairScopeIds({ repairPlan, finalCatalogue }) {
+  const selected = new Set();
+  for (const action of repairPlan?.repair_plan || []) {
+    if (action?.requires_index_rebuild !== true
+        && !String(action?.kind || "").includes("index")) continue;
+    const dayUtc = String(action?.day_utc || "");
+    const connectorId = Number(action?.connector_id);
+    const pollutantCode = String(action?.pollutant_code || "").toLowerCase();
+    for (const entry of finalCatalogue.entries) {
+      if (entry.scope.day_utc === dayUtc
+          && entry.scope.connector_id === connectorId
+          && (!pollutantCode || entry.scope.pollutant_code === pollutantCode)) {
+        selected.add(entry.scope_id);
+      }
+    }
+  }
+  return selected;
 }
 
 export function crossCheckExactV3RegistryCatalogue({ registryRoots, finalCatalogue, delta }) {
@@ -1200,6 +1232,7 @@ async function addExactV3Indexes({
   targetWriterGitSha,
   reportProgress = () => {},
 }) {
+  const genericFixedV3 = runState?.execution_path === "generic_integrity";
   const selectedDays = [...new Set((repairPlan.repair_plan || [])
     .map((action) => String(action?.day_utc || "")).filter(Boolean))].sort();
   reportProgress({
@@ -1209,10 +1242,22 @@ async function addExactV3Indexes({
   });
   const selectedDayPrefixes = selectedDays
     .map((day) => `${GENERATION.observations_prefix}/day_utc=${day}/`);
+  const forcedPrefixes = genericFixedV3
+    ? (runState.tombstone_prefixes || [])
+      .filter((entry) => entry?.proposed === true)
+      .map((entry) => String(entry.prefix || "").replace(/\/$/, ""))
+      .filter((prefix) => POLLUTANT_MANIFEST.test(`${prefix}/manifest.json`))
+    : [];
+  const forcedParentKeys = new Set(forcedPrefixes.flatMap((prefix) => {
+    const connectorPrefix = prefix.slice(0, prefix.lastIndexOf("/pollutant_code="));
+    const dayPrefix = connectorPrefix.slice(0, connectorPrefix.lastIndexOf("/connector_id="));
+    return [`${connectorPrefix}/manifest.json`, `${dayPrefix}/manifest.json`];
+  }));
   const proposals = promoteSelectedDayCanonicalProposals(
     (output.planning.proposals || [])
       .filter((proposal) => !String(proposal.key || "").startsWith(`${GENERATION.index_root_prefix}/`)),
-    selectedDays,
+    genericFixedV3 ? [] : selectedDays,
+    { forcedPrefixes, forcedParentKeys },
   );
   const proposalsByKey = new Map(proposals.map((proposal) => [String(proposal.key), proposal]));
   const prefixes = [GENERATION.observations_prefix];
@@ -1228,13 +1273,16 @@ async function addExactV3Indexes({
     proposalsByKey,
     selectedDays,
     store,
+    genericFixedV3,
   });
   reportProgress({
     phase: "aggregate_hierarchy_reconstruction_complete",
     completed_objects: canonicalAggregateHierarchy.staged_keys.length,
     total_objects: canonicalAggregateHierarchy.staged_keys.length,
   });
-  const combinedObject = (key) => proposalsByKey.has(key)
+  const combinedObject = (key) => (
+    genericFixedV3 ? proposalsByKey.get(key)?.changed === true : proposalsByKey.has(key)
+  )
     ? proposalObject(proposalsByKey.get(key))
     : store.getObjectIfExists(key);
   const manifestKeys = new Set(store.listAllObjects({
@@ -1265,12 +1313,24 @@ async function addExactV3Indexes({
     finalCatalogue,
     baselineObjects: baselineManifestObjects,
   });
+  const explicitlyRepairedScopeIds = genericFixedV3
+    ? deriveExplicitExactV3RepairScopeIds({ repairPlan, finalCatalogue })
+    : new Set();
+  const affectedEntries = finalCatalogue.entries.filter((entry) =>
+    manifestDelta.affected_scope_ids.has(entry.scope_id)
+    || explicitlyRepairedScopeIds.has(entry.scope_id));
+  const effectiveDelta = {
+    ...manifestDelta,
+    affected_entries: affectedEntries,
+    affected_scope_ids: new Set(affectedEntries.map((entry) => entry.scope_id)),
+  };
   reportProgress({
     phase: "affected_exact_v3_scopes_identified",
     completed_objects: 0,
-    total_objects: manifestDelta.affected_entries.length,
+    total_objects: effectiveDelta.affected_entries.length,
     canonical_scope_count: finalCatalogue.entries.length,
-    affected_scope_count: manifestDelta.affected_entries.length,
+    affected_scope_count: effectiveDelta.affected_entries.length,
+    explicit_repair_scope_count: explicitlyRepairedScopeIds.size,
     removed_scope_count: manifestDelta.removed_scopes.length,
     new_scope_count: manifestDelta.new_scope_count,
     changed_scope_count: manifestDelta.changed_scope_count,
@@ -1284,7 +1344,7 @@ async function addExactV3Indexes({
     runState,
     store,
     finalCatalogue,
-    delta: manifestDelta,
+    delta: effectiveDelta,
   });
   const optimizationMode = authority.mode;
   const compactLatest = optimizationMode === "exact_index_fast_path"
@@ -1308,7 +1368,7 @@ async function addExactV3Indexes({
   }
 
   const rebuildEntries = optimizationMode === "exact_index_fast_path"
-    ? manifestDelta.affected_entries
+    ? effectiveDelta.affected_entries
     : finalCatalogue.entries;
   const hierarchies = [];
   let completedManifestCount = 0;
@@ -1351,7 +1411,8 @@ async function addExactV3Indexes({
     const oldByScope = new Map(compactLatest.roots.map((root) => [scopeIdentity(root), root]));
     const changedHierarchies = hierarchies.filter((hierarchy) => {
       const descriptor = rootDescriptor(hierarchy.scoped_manifest);
-      return !sameRootIdentity(oldByScope.get(scopeIdentity(descriptor)), descriptor);
+      return explicitlyRepairedScopeIds.has(scopeIdentity(descriptor))
+        || !sameRootIdentity(oldByScope.get(scopeIdentity(descriptor)), descriptor);
     });
     const replacementScopedManifests = changedHierarchies
       .map((hierarchy) => hierarchy.scoped_manifest);
@@ -1386,7 +1447,7 @@ async function addExactV3Indexes({
     .flatMap((hierarchy) => hierarchy.publication_objects);
   const canonicalFinalizationPrerequisites = proposals
     .filter((proposal) => (proposal.changed === true
-        || selectedDayPrefixes.some((prefix) => String(proposal.key).startsWith(prefix)))
+        || (!genericFixedV3 && selectedDayPrefixes.some((prefix) => String(proposal.key).startsWith(prefix))))
       && String(proposal.key).startsWith(`${GENERATION.observations_prefix}/`)
       && String(proposal.key).endsWith("/manifest.json"))
     .map((proposal) => ({
@@ -1394,7 +1455,7 @@ async function addExactV3Indexes({
       byte_size: Number(proposal.bytes),
       sha256: String(proposal.new_sha256),
     }));
-  if (!canonicalFinalizationPrerequisites.some(
+  if (!genericFixedV3 && !canonicalFinalizationPrerequisites.some(
     ({ key }) => key === canonicalAggregateHierarchy.root.key,
   )) {
     canonicalFinalizationPrerequisites.push(canonicalAggregateHierarchy.root);
@@ -1481,7 +1542,8 @@ async function addExactV3Indexes({
       bytes: entry.byte_size,
       old_sha256: existing ? exactIdentity(existing, existing.source).sha256 : null,
       new_sha256: entry.sha256,
-      changed: !existing || exactIdentity(existing, existing.source).sha256 !== entry.sha256,
+      changed: genericFixedV3 || !existing
+        || exactIdentity(existing, existing.source).sha256 !== entry.sha256,
       included_in_write_set: true,
       status: "planned",
       ...dependencyFields,
@@ -1501,7 +1563,8 @@ async function addExactV3Indexes({
     mode: optimizationMode,
     fallback_reason: fallbackReason,
     canonical_scope_count: finalCatalogue.entries.length,
-    affected_scope_count: manifestDelta.affected_entries.length,
+    affected_scope_count: effectiveDelta.affected_entries.length,
+    explicit_repair_scope_count: explicitlyRepairedScopeIds.size,
     rebuilt_scope_count: rebuildEntries.length,
     changed_root_count: rebuilt.changedHierarchies.length,
     unchanged_registry_root_count: rebuilt.unchangedRoots.length,
@@ -1522,11 +1585,14 @@ async function addExactV3Indexes({
 export function promoteSelectedDayCanonicalProposals(
   proposals,
   selectedDays,
+  { forcedPrefixes = [], forcedParentKeys = new Set() } = {},
 ) {
   const selectedDayPrefixes = [...new Set(selectedDays.map(String))]
     .map((day) => `${GENERATION.observations_prefix}/day_utc=${day}/`);
   const promoted = proposals.map((proposal) => (
     selectedDayPrefixes.some((prefix) => String(proposal?.key || "").startsWith(prefix))
+      || forcedPrefixes.some((prefix) => String(proposal?.key || "").startsWith(`${prefix}/`))
+      || forcedParentKeys.has(String(proposal?.key || ""))
       ? {
           ...proposal,
           changed: true,

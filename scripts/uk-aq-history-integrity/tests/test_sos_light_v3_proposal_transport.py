@@ -934,6 +934,10 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
                 "replacement_object_keys": [],
                 "preservation_evidence": None,
             }],
+            "metadata_only_scopes": [],
+            "metadata_only_derived_write_object_keys": [],
+            "explicit_force_targets": [],
+            "forced_republication_parquet_keys": [],
             "authorised_pollutant_tombstone_prefixes": [prefix],
         }
         MODULE._finalise_staged_write_set_provenance(self.run_state)
@@ -1072,6 +1076,10 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
                 "replacement_object_keys": [],
                 "preservation_evidence": None,
             }],
+            "metadata_only_scopes": [],
+            "metadata_only_derived_write_object_keys": [],
+            "explicit_force_targets": [],
+            "forced_republication_parquet_keys": [],
             "authorised_pollutant_tombstone_prefixes": [prefix],
         }
         MODULE._finalise_staged_write_set_provenance(self.run_state)
@@ -1106,6 +1114,7 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, python_fingerprint)
+
         self.assertEqual(
             MODULE._proposal_transition_state_fingerprint_payload(
                 self.run_state
@@ -1118,6 +1127,210 @@ class FixedV3ProposalTransportTests(unittest.TestCase):
                 self.run_state
             ),
         )
+
+    def test_generic_metadata_only_authority_has_cross_runtime_fingerprint(self) -> None:
+        day = "2026-09-28"
+        connector = 9
+        pollutant = "pm25"
+        base = "history/v3/observations"
+        keys = [
+            f"{base}/_manifests/manifest.json",
+            f"{base}/_manifests/year=2026/manifest.json",
+            f"{base}/_manifests/year=2026/month=09/manifest.json",
+            f"{base}/day_utc={day}/manifest.json",
+            f"{base}/day_utc={day}/connector_id={connector}/manifest.json",
+            f"{base}/day_utc={day}/connector_id={connector}/pollutant_code={pollutant}/manifest.json",
+        ]
+        hashes = [str(index + 1) * 64 for index in range(6)]
+        payloads = [
+            {"children": [{"manifest_key": keys[1], "content_hash": hashes[1]}]},
+            {"content_hash": hashes[1], "children": [
+                {"manifest_key": keys[2], "content_hash": hashes[2]}]},
+            {"content_hash": hashes[2], "children": [
+                {"manifest_key": keys[3], "manifest_hash": hashes[3]}]},
+            {"manifest_hash": hashes[3], "connector_manifests": [
+                {"manifest_key": keys[4], "manifest_hash": hashes[4]}]},
+            {"manifest_hash": hashes[4], "pollutant_manifests": [
+                {"manifest_key": keys[5], "manifest_hash": hashes[5]}]},
+            {"manifest_hash": hashes[5]},
+        ]
+        for key, payload in zip(keys, payloads):
+            target = self.dropbox / key
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(payload), encoding="utf-8")
+        derived_key = (
+            "history/_index_v3/observations_timeseries/"
+            f"day_utc={day}/connector_id={connector}/"
+            f"pollutant_code={pollutant}/manifest.json"
+        )
+        aligned_key = (
+            "history/_index_v3/observations_timeseries/_aligned/"
+            f"day_utc={day}/connector_id={connector}/"
+            f"pollutant_code={pollutant}/manifest.json"
+        )
+        self.run_state.update({
+            "execution_path": "generic_integrity",
+            "dedicated_sos_historical_replacement": False,
+            "dropbox_currentness": {"allowed": True},
+        })
+        self.run_state.pop("sos_light", None)
+        MODULE.stage_overlay_object(
+            self.run_state, object_key=derived_key,
+            source_path=self.body_path, stage="observation_index_manifest",
+        )
+        MODULE.stage_overlay_object(
+            self.run_state, object_key=aligned_key,
+            source_path=self.body_path, stage="observation_index_manifest",
+        )
+        MODULE._finalise_staged_write_set_provenance(self.run_state)
+        authority = MODULE._finalise_generic_integrity_selected_scope_authority(
+            self.run_state, [], [{
+                "kind": "observation_index_repair", "day_utc": day,
+                "connector_id": connector, "pollutant_code": pollutant,
+                "data_changes_required": False,
+            }],
+        )
+        self.assertEqual(authority["selected_scopes"], [])
+        self.assertEqual(authority["authorised_pollutant_tombstone_prefixes"], [])
+        self.assertEqual(authority["metadata_only_derived_write_object_keys"],
+                         sorted([derived_key, aligned_key]))
+        self.assertEqual(self.run_state["tombstone_prefixes"], [])
+        python_fingerprint = MODULE.proposal_transition_state_fingerprint_sha256(
+            self.run_state
+        )
+        validation_module = (
+            Path(__file__).resolve().parents[3]
+            / "scripts/backup_r2/lib/generic_v3_proposal_validation.mjs"
+        ).as_uri()
+        result = MODULE.subprocess.run(
+            ["node", "--input-type=module", "--eval", (
+                "import fs from 'node:fs';"
+                f"import {{computeGenericV3TransitionStateFingerprint}} from {json.dumps(validation_module)};"
+                "const state=JSON.parse(fs.readFileSync("
+                f"{json.dumps(self.run_state['run_state_path'])},'utf8'));"
+                "process.stdout.write(computeGenericV3TransitionStateFingerprint(state));"
+            )], capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, python_fingerprint)
+        authority["contract_version"] = (
+            "uk_aq_generic_integrity_v3_selected_scope_authority_v2"
+        )
+        with self.assertRaisesRegex(ValueError, "authority is unavailable"):
+            MODULE._canonical_generic_integrity_selected_scope_authority(
+                self.run_state
+            )
+
+    def test_forced_equal_parquet_remains_after_exact_prefix_deletion_freeze(self) -> None:
+        prefix = (
+            "history/v3/observations/day_utc=2026-09-28/"
+            "connector_id=9/pollutant_code=pm25"
+        )
+        part_key = f"{prefix}/part-00000.parquet"
+        manifest_key = f"{prefix}/manifest.json"
+        baseline = self.dropbox / part_key
+        baseline.parent.mkdir(parents=True, exist_ok=True)
+        baseline.write_bytes(self.body)
+        self.run_state.update({
+            "execution_path": "generic_integrity",
+            "dedicated_sos_historical_replacement": False,
+            "explicit_official_force_replacement": True,
+            "explicit_official_force_partitions": [{
+                "day_utc": "2026-09-28", "connector_id": 9,
+                "pollutant_code": "pm25",
+                "target_authority": "explicit_manual_force_replacement",
+            }],
+        })
+        self.run_state.pop("sos_light", None)
+        MODULE.stage_overlay_object(
+            self.run_state, object_key=part_key,
+            source_path=self.body_path, stage="observations_data",
+        )
+        MODULE.stage_overlay_object(
+            self.run_state, object_key=manifest_key,
+            source_path=self.body_path, stage="observations_manifest",
+            dependencies=[part_key], dependency_identities={part_key: {
+                "sha256": hashlib.sha256(self.body).hexdigest(),
+                "bytes": len(self.body), "source": "planned_overlay",
+            }},
+        )
+        self.run_state["tombstone_prefixes"] = [{
+            "prefix": prefix, "proposed": True, "stage": "observations_data",
+        }]
+        MODULE._finalise_staged_write_set_provenance(self.run_state)
+        authority = MODULE._finalise_generic_integrity_selected_scope_authority(
+            self.run_state, [{
+                "day_utc": "2026-09-28", "connector_id": 9,
+                "pollutant_code": "pm25", "outcome": "complete_replacement",
+            }],
+        )
+        self.assertEqual(
+            authority["forced_republication_parquet_keys"], [part_key],
+        )
+        self.assertIn(part_key, self.run_state["objects"])
+        self.assertEqual(
+            self.run_state["objects"][part_key]["sha256"],
+            hashlib.sha256(baseline.read_bytes()).hexdigest(),
+        )
+        python_fingerprint = MODULE.proposal_transition_state_fingerprint_sha256(
+            self.run_state
+        )
+        validation_module = (
+            Path(__file__).resolve().parents[3]
+            / "scripts/backup_r2/lib/generic_v3_proposal_validation.mjs"
+        ).as_uri()
+        result = MODULE.subprocess.run(
+            ["node", "--input-type=module", "--eval", (
+                "import fs from 'node:fs';"
+                f"import {{computeGenericV3TransitionStateFingerprint}} from {json.dumps(validation_module)};"
+                "const state=JSON.parse(fs.readFileSync("
+                f"{json.dumps(self.run_state['run_state_path'])},'utf8'));"
+                "process.stdout.write(computeGenericV3TransitionStateFingerprint(state));"
+            )], capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, python_fingerprint)
+
+    def test_empty_generic_operation_set_skips_authority_and_apply(self) -> None:
+        class FinalVerificationReached(RuntimeError):
+            pass
+
+        self.run_state.update({
+            "execution_path": "generic_integrity",
+            "dedicated_sos_historical_replacement": False,
+        })
+        self.run_state.pop("sos_light", None)
+        with (
+            mock.patch.object(MODULE, "validate_run_state_core_snapshot_identity"),
+            mock.patch.object(MODULE, "write_run_state"),
+            mock.patch.object(MODULE, "run_v2_gap_backfills", return_value={}),
+            mock.patch.object(MODULE, "_run_v3_observation_metadata_proposal",
+                              return_value={"status": "not_run"}),
+            mock.patch.object(MODULE, "_record_metadata_executor_overlay"),
+            mock.patch.object(MODULE, "_finalise_generic_file_backed_proposal_if_ready"),
+            mock.patch.object(MODULE, "_finalise_generic_integrity_selected_scope_authority")
+                as authority_freeze,
+            mock.patch.object(MODULE, "record_integrity_object_operations",
+                              return_value={"planned_writes": 0, "planned_deletions": 0}),
+            mock.patch.object(MODULE, "run_canonical_apply_executor") as apply,
+            mock.patch.object(MODULE, "run_first_value_at_reconciliation",
+                              return_value={"status": "not_run"}),
+            mock.patch.object(MODULE, "run_v2_final_verification",
+                              side_effect=FinalVerificationReached),
+            self.assertRaises(FinalVerificationReached),
+        ):
+            MODULE.run_v2_integrity_repair_flow(
+                run_state=self.run_state, conn=mock.Mock(), run_id=1,
+                env_name="TEST", run_compact="20260928T000000Z", env={},
+                v2_observations={"gaps": [], "repair_plan": []},
+                final_verification_config=mock.Mock(),
+                from_day="2026-09-28", to_day="2026-09-28",
+                allowed_connector_ids={9}, source_scope={"source": "waqn"},
+                limits=mock.Mock(), dry_run=False,
+                log=logging.getLogger("test.generic.noop"),
+            )
+        authority_freeze.assert_not_called()
+        apply.assert_not_called()
 
     def test_generic_source_unavailable_scope_cannot_gain_deletion(self) -> None:
         self.run_state.update({

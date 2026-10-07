@@ -16,6 +16,7 @@ import {
   buildExactV3ManifestCatalogue,
   crossCheckExactV3RegistryCatalogue,
   deriveExactV3ManifestDelta,
+  deriveExplicitExactV3RepairScopeIds,
   inspectPinnedBaselinePollutantPartition,
   promoteSelectedDayCanonicalProposals,
   reconcileReconstructedExactV3Hierarchies,
@@ -894,6 +895,88 @@ test("fixed-v3 aggregate reconstruction follows pinned memberships and overlays 
   assert(reads.some(([key]) => key.endsWith("year=2026/month=07/manifest.json")));
   assert(!reads.some(([key]) => key.includes("day_utc=2026-07-01")));
   assert(!reads.some(([key]) => key.includes("day_utc=2025-12-31")));
+});
+
+test("generic fixed-v3 metadata-only selection keeps the authenticated pinned day external", () => {
+  const { bodies } = pinnedHierarchyFixture();
+  const proposals = [];
+  const proposalsByKey = new Map();
+  const rebuilt = reconstructCanonicalObservationAggregateHierarchy({
+    proposals, proposalsByKey, selectedDays: ["2026-06-01"],
+    genericFixedV3: true,
+    store: {
+      getObjectFromSourceIfExists(key, source) {
+        assert.equal(source, "dropbox");
+        const body = bodies.get(key);
+        return body ? { key, body, source } : null;
+      },
+    },
+  });
+  assert.deepEqual(rebuilt.staged_keys, []);
+  assert.equal(proposalsByKey.size, 0);
+});
+
+test("generic fixed-v3 changed child still requires a staged changed day", () => {
+  const { bodies } = pinnedHierarchyFixture();
+  const childKey = "history/v3/observations/day_utc=2026-06-01/connector_id=9/manifest.json";
+  assert.throws(() => reconstructCanonicalObservationAggregateHierarchy({
+    proposals: [{ key: childKey, changed: true }],
+    proposalsByKey: new Map([[childKey, { key: childKey, changed: true }]]),
+    selectedDays: ["2026-06-01"], genericFixedV3: true,
+    store: {
+      getObjectFromSourceIfExists(key, source) {
+        const body = bodies.get(key);
+        return body ? { key, body, source } : null;
+      },
+    },
+  }), /changed canonical day proposal is unavailable/);
+});
+
+test("generic forced pollutant promotion retains equal bytes without promoting siblings", () => {
+  const dayPrefix = "history/v3/observations/day_utc=2026-06-01";
+  const connectorPrefix = `${dayPrefix}/connector_id=9`;
+  const selectedPrefix = `${connectorPrefix}/pollutant_code=pm25`;
+  const siblingPrefix = `${connectorPrefix}/pollutant_code=no2`;
+  const proposals = [
+    `${selectedPrefix}/manifest.json`, `${siblingPrefix}/manifest.json`,
+    `${connectorPrefix}/manifest.json`, `${dayPrefix}/manifest.json`,
+  ].map((key) => ({
+    key, changed: false, included_in_write_set: false,
+    old_sha256: "a".repeat(64), new_sha256: "a".repeat(64),
+    dependencies: [], dependency_identities: {},
+  }));
+  const promoted = promoteSelectedDayCanonicalProposals(proposals, [], {
+    forcedPrefixes: [selectedPrefix],
+    forcedParentKeys: new Set([
+      `${connectorPrefix}/manifest.json`, `${dayPrefix}/manifest.json`,
+    ]),
+  });
+  assert.deepEqual(promoted.map(({ changed }) => changed), [true, false, true, true]);
+});
+
+test("explicit derived repair selection survives an unchanged canonical manifest identity", () => {
+  const entries = ["no2", "pm10", "pm25"].map((pollutantCode) => ({
+    key: `history/v3/observations/day_utc=2026-09-28/connector_id=9/pollutant_code=${pollutantCode}/manifest.json`,
+    scope: { day_utc: "2026-09-28", connector_id: 9, pollutant_code: pollutantCode },
+    scope_id: `2026-09-28\u00009\u0000${pollutantCode}`,
+    identity: { byte_size: 10, sha256: "a".repeat(64) },
+  }));
+  const finalCatalogue = { entries };
+  const delta = deriveExactV3ManifestDelta({
+    finalCatalogue,
+    baselineObjects: entries.map((entry) => ({
+      key: entry.key, size: 10, content_sha256: "a".repeat(64),
+    })),
+  });
+  assert.equal(delta.affected_entries.length, 0);
+  const repaired = deriveExplicitExactV3RepairScopeIds({
+    finalCatalogue,
+    repairPlan: { repair_plan: [{
+      kind: "observation_index_repair", day_utc: "2026-09-28",
+      connector_id: 9, pollutant_code: "pm25", requires_index_rebuild: true,
+    }] },
+  });
+  assert.deepEqual([...repaired], [entries[2].scope_id]);
 });
 
 test("fixed-v3 aggregate reconstruction fails when a pinned sibling body is missing", () => {

@@ -2242,6 +2242,39 @@ write(latest.key, latest.body);
                 result["observations"]["gaps"][0]["gap_type"],
             )
 
+    def test_dropbox_excluded_exact_v3_tree_is_not_live_damage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._write_final_verification_fixture(root)
+            shutil.rmtree(root / "history/_index_v3/observations_timeseries")
+            result = INTEGRITY.run_v2_observations_integrity_checks(
+                r2_history_root=root,
+                config=INTEGRITY.resolve_history_path_config("v3", {}),
+                from_day="2026-09-28", to_day="2026-09-28",
+                allowed_connector_ids={9},
+                observation_total_connector_ids={9},
+                observation_total_pollutants=("no2", "pm10", "pm25"),
+            )
+            self.assertFalse(any(
+                str(gap.get("gap_type") or "").startswith("index_")
+                for gap in result["gaps"]
+            ))
+            self.assertFalse(any(
+                action.get("kind") == "observation_index_repair"
+                for action in result["repair_plan"]
+            ))
+            final = INTEGRITY.run_v2_post_repair_integrity_rechecks(
+                r2_history_root=root,
+                config=INTEGRITY.resolve_history_path_config("v3", {}),
+                from_day="2026-09-28", to_day="2026-09-28",
+                allowed_connector_ids={9}, source_scope=None, log=mock.Mock(),
+            )
+            self.assertEqual(final["status"], "fail")
+            self.assertTrue(any(
+                gap.get("gap_type") == "index_manifest_missing"
+                for gap in final["observations"]["gaps"]
+            ))
+
     def test_final_verification_rejects_corrupt_exact_v3_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -2529,6 +2562,144 @@ write(latest.key, latest.body);
         )
         self.assertEqual(len(day_actions), 1)
         self.assertNotIn("connector_id", day_actions[0])
+
+    def test_manual_official_force_targets_precede_empty_gap_filter(self) -> None:
+        class TargetsCaptured(RuntimeError):
+            pass
+
+        for source, connector_id in (("waqn", 9), ("saqn", 10)):
+            with self.subTest(source=source):
+                captured: list[dict[str, object]] = []
+
+                def capture(**kwargs: object) -> None:
+                    captured.extend(kwargs["explicit_official_force_partitions"])
+                    raise TargetsCaptured
+
+                state = {"execution_path": "generic_integrity", "changed_scopes": {}}
+                with (
+                    mock.patch.object(
+                        INTEGRITY, "validate_run_state_core_snapshot_identity",
+                    ),
+                    mock.patch.object(INTEGRITY, "write_run_state"),
+                    mock.patch.object(
+                        INTEGRITY, "run_v2_gap_backfills", side_effect=capture,
+                    ),
+                    self.assertRaises(TargetsCaptured),
+                ):
+                    INTEGRITY.run_v2_integrity_repair_flow(
+                        run_state=state, conn=self.conn, run_id=1,
+                        env_name="TEST", run_compact="20260928T000000Z",
+                        env={}, v2_observations={"gaps": [], "repair_plan": []},
+                        final_verification_config=mock.Mock(),
+                        from_day="2026-09-28", to_day="2026-09-28",
+                        allowed_connector_ids={connector_id},
+                        source_scope={"source": source}, limits=mock.Mock(),
+                        dry_run=False, log=logging.getLogger("test.force.targets"),
+                        repair_pollutants=["no2", "pm10", "pm25"],
+                        force_official_rdata_replacement=True,
+                    )
+                self.assertEqual(
+                    {(item["connector_id"], item["pollutant_code"])
+                     for item in captured},
+                    {(connector_id, code) for code in ("no2", "pm10", "pm25")},
+                )
+                self.assertEqual(
+                    state["target_authority"], "explicit_manual_force_replacement",
+                )
+
+    def test_force_flag_requires_explicit_manual_test_scope(self) -> None:
+        args = [
+            "--env", "TEST", "--profile", "manual", "--source", "waqn",
+            "--from-day", "2026-09-28", "--to-day", "2026-09-28",
+            "--run-backfill", "--repair-pollutants", "no2,pm10,pm25",
+            "--force-replace-selected",
+        ]
+        self.assertTrue(INTEGRITY.parse_args(args).force_replace_selected)
+        for before, after in (("TEST", "LIVE"), ("manual", "daily"),
+                              ("waqn", "sos")):
+            with self.subTest(after=after), self.assertRaises(SystemExit):
+                INTEGRITY.parse_args([
+                    after if value == before else value for value in args
+                ])
+
+    def test_forced_unavailable_pollutant_keeps_empty_deletion_set(self) -> None:
+        targets = INTEGRITY.build_explicit_official_rdata_force_partitions(
+            from_day="2026-09-28", to_day="2026-09-28",
+            selected_days=None, connector_id=9, repair_pollutants=["pm25"],
+        )
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            mock.patch.object(
+                INTEGRITY, "_official_rdata_source_for_connector",
+                return_value="waqn",
+            ),
+            mock.patch.object(
+                INTEGRITY, "_official_rdata_source_counts_for_partition",
+                return_value=({}, {
+                    "source_partition_state": "source_artifact_unavailable",
+                }),
+            ),
+            mock.patch.object(INTEGRITY, "_prepare_official_rdata_proposal") as builder,
+        ):
+            state = {"tombstone_prefixes": [], "objects": {}}
+            result = INTEGRITY.run_v2_gap_backfills(
+                conn=self.conn, run_id=1, env_name="TEST",
+                run_compact="20260928T000000Z",
+                env={"UK_AQ_HISTORY_INTEGRITY_LOG_DIR": temporary_directory},
+                v2_observations={"gaps": []}, dry_run=False,
+                run_backfill=True, limits=mock.Mock(),
+                log=logging.getLogger("test.force.unavailable"),
+                run_state=state, repair_pollutants=["pm25"],
+                source_scope={"source": "waqn"},
+                explicit_official_force_partitions=targets,
+            )
+            builder.assert_not_called()
+        self.assertEqual(result["exact_tombstones_created"], 0)
+        self.assertEqual(state["tombstone_prefixes"], [])
+        self.assertEqual(result["selected_partition_outcomes"][0]["outcome"],
+                         "source_artifact_unavailable_preserved")
+
+    def test_force_reaches_repairable_builder_when_detector_has_no_gaps(self) -> None:
+        targets = INTEGRITY.build_explicit_official_rdata_force_partitions(
+            from_day="2026-09-28", to_day="2026-09-28",
+            selected_days=None, connector_id=9, repair_pollutants=["pm25"],
+        )
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            mock.patch.object(
+                INTEGRITY, "_official_rdata_source_for_connector",
+                return_value="waqn",
+            ),
+            mock.patch.object(
+                INTEGRITY, "_official_rdata_source_counts_for_partition",
+                return_value=({1001: 24}, {
+                    "source_partition_state": "present",
+                }),
+            ),
+            mock.patch.object(
+                INTEGRITY, "_prepare_official_rdata_proposal",
+                return_value={"status": "failed", "error": "local_test_stop"},
+            ) as builder,
+        ):
+            state = {"overlay_root": temporary_directory, "tombstone_prefixes": []}
+            kwargs = dict(
+                conn=self.conn, run_id=1, env_name="TEST",
+                run_compact="20260928T000000Z",
+                env={"UK_AQ_HISTORY_INTEGRITY_LOG_DIR": temporary_directory},
+                v2_observations={"gaps": []}, dry_run=False,
+                run_backfill=True, limits=mock.Mock(should_stop=lambda: False),
+                log=logging.getLogger("test.force.equal"),
+                run_state=state, repair_pollutants=["pm25"],
+                source_scope={"source": "waqn"},
+            )
+            ordinary = INTEGRITY.run_v2_gap_backfills(**kwargs)
+            builder.assert_not_called()
+            self.assertEqual(ordinary["v2_observation_repairs_attempted"], 0)
+            forced = INTEGRITY.run_v2_gap_backfills(
+                **kwargs, explicit_official_force_partitions=targets,
+            )
+            builder.assert_called_once()
+            self.assertEqual(forced["observation_backfill_candidate_days"], 1)
 
     def test_repair_flow_passes_preservation_parents_to_metadata_planner(
         self,

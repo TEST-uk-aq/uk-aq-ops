@@ -12706,6 +12706,8 @@ def run_v2_observations_integrity_checks(
     dedicated_sos_historical_replacement: bool = False,
     observation_total_connector_ids: Iterable[int] | None = None,
     observation_total_pollutants: Iterable[str] | None = None,
+    verify_derived_index_scopes: (set[tuple[str, int, str]] |
+                                  frozenset[tuple[str, int, str]] | None) = frozenset(),
 ) -> dict[str, Any]:
     if not r2_history_root:
         raise RuntimeError("UK_AQ_R2_HISTORY_DROPBOX_ROOT is not set")
@@ -13162,22 +13164,32 @@ def run_v2_observations_integrity_checks(
                 for partition_gap in gaps[partition_gap_start:]:
                     if str(partition_gap.get("gap_type") or "").startswith("data_manifest_") or partition_gap.get("gap_type") == "orphan_parquet_without_manifest":
                         partition_gap["parquet_readable"] = parquet_readable
-                idx_rel = f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}/{pollutant_dir.name}/manifest.json"
-                idx_path = root / idx_rel
-                if not idx_path.is_file():
-                    gaps.append(_v2_obs_gap("index_manifest_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
-                else:
-                    index_gap = _verify_exact_v3_index_scope(
-                        root=root,
-                        config=config,
-                        day_utc=day_utc,
-                        connector_id=connector_raw,
-                        pollutant_code=pollutant,
-                        index_key=idx_rel,
-                        allowed_real_roots=allowed_real_roots,
-                    )
-                    if index_gap is not None:
-                        gaps.append(index_gap)
+                # The bulk exact-v3 tree is deliberately excluded from the
+                # Dropbox backup. Its local absence (or an old incidental
+                # local copy) says nothing about the derived objects in R2.
+                # Only an independently authorised repair may rebuild it.
+                if (
+                    index_prefix != "history/_index_v3/observations_timeseries"
+                    or verify_derived_index_scopes is None
+                    or (day_utc, int(connector_raw), pollutant)
+                    in verify_derived_index_scopes
+                ):
+                    idx_rel = f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}/{pollutant_dir.name}/manifest.json"
+                    idx_path = root / idx_rel
+                    if not idx_path.is_file():
+                        gaps.append(_v2_obs_gap("index_manifest_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                    else:
+                        index_gap = _verify_exact_v3_index_scope(
+                            root=root,
+                            config=config,
+                            day_utc=day_utc,
+                            connector_id=connector_raw,
+                            pollutant_code=pollutant,
+                            index_key=idx_rel,
+                            allowed_real_roots=allowed_real_roots,
+                        )
+                        if index_gap is not None:
+                            gaps.append(index_gap)
                 if source_partition_evidence is not None:
                     for partition_gap in gaps[partition_gap_start:]:
                         partition_gap.setdefault("source_evidence", {}).update(source_partition_evidence)
@@ -13568,6 +13580,7 @@ def run_v2_post_repair_integrity_rechecks(
     allowed_real_roots: Iterable[Path] = (),
     observation_total_connector_ids: Iterable[int] | None = None,
     observation_total_pollutants: Iterable[str] | None = None,
+    verify_derived_index_scopes: set[tuple[str, int, str]] | None = None,
 ) -> dict[str, Any]:
     """Re-run observation Integrity after repair."""
     post_obs = run_v2_observations_integrity_checks(
@@ -13584,6 +13597,7 @@ def run_v2_post_repair_integrity_rechecks(
         allowed_real_roots=allowed_real_roots,
         observation_total_connector_ids=observation_total_connector_ids,
         observation_total_pollutants=observation_total_pollutants,
+        verify_derived_index_scopes=verify_derived_index_scopes,
     )
     remaining_observation_gaps = list(post_obs.get("gaps") or [])
     for gap in remaining_observation_gaps:
@@ -17884,9 +17898,70 @@ def _derive_generic_preserved_scope_evidence(
     }
 
 
+def _derive_generic_pinned_metadata_dependencies(
+    run_state: Mapping[str, Any], *, day_utc: str,
+    connector_id: int, pollutant_code: str,
+) -> list[dict[str, Any]]:
+    """Authenticate an unchanged derived scope through the pinned hierarchy."""
+    if (run_state.get("dropbox_currentness") or {}).get("allowed") is not True:
+        raise ValueError("generic metadata-only authority requires accepted Dropbox currentness")
+    base = R2_HISTORY_V2_OBSERVATIONS_PREFIX
+    year, month = day_utc[:4], day_utc[5:7]
+    keys = [
+        f"{base}/_manifests/manifest.json",
+        f"{base}/_manifests/year={year}/manifest.json",
+        f"{base}/_manifests/year={year}/month={month}/manifest.json",
+        f"{base}/day_utc={day_utc}/manifest.json",
+        f"{base}/day_utc={day_utc}/connector_id={connector_id}/manifest.json",
+        f"{base}/day_utc={day_utc}/connector_id={connector_id}/pollutant_code={pollutant_code}/manifest.json",
+    ]
+    payloads: list[dict[str, Any]] = []
+    identities: list[dict[str, Any]] = []
+    root = Path(str(run_state.get("base_dropbox_root") or ""))
+    if not root.is_dir():
+        raise ValueError("generic metadata-only pinned Dropbox root is unavailable")
+    for key in keys:
+        body = (root / key).read_bytes()
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError(f"generic metadata-only manifest is invalid: {key}")
+        payloads.append(payload)
+        identities.append({
+            "object_key": key,
+            "sha256": hashlib.sha256(body).hexdigest(),
+            "bytes": len(body),
+            "source": "dropbox",
+        })
+    for index in range(5):
+        parent = payloads[index]
+        child = payloads[index + 1]
+        field = "content_hash" if index < 2 else "manifest_hash"
+        reference_fields = (
+            ["children"] if index < 3 else
+            ["connector_manifests", "child_manifests"] if index == 3 else
+            ["pollutant_manifests", "child_manifests"]
+        )
+        references = [
+            ref for name in reference_fields
+            for ref in list(parent.get(name) or [])
+            if isinstance(ref, Mapping) and ref.get("manifest_key") == keys[index + 1]
+        ]
+        if (
+            len(references) != 1
+            or not re.fullmatch(r"[a-f0-9]{64}", str(child.get(field) or ""))
+            or references[0].get(field) != child.get(field)
+        ):
+            raise ValueError(
+                "generic metadata-only pinned hierarchy disagrees: "
+                f"{keys[index]} -> {keys[index + 1]}"
+            )
+    return identities
+
+
 def _finalise_generic_integrity_selected_scope_authority(
     run_state: dict[str, Any],
     selected_partition_outcomes: Iterable[Mapping[str, Any]],
+    metadata_actions: Iterable[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Freeze generic selected-scope mutation authority before APPLY."""
     if run_state.get("execution_path") != "generic_integrity":
@@ -17911,8 +17986,6 @@ def _finalise_generic_integrity_selected_scope_authority(
                 "pollutant_code": str(pollutant_value or "").strip().lower(),
                 "outcome": str(raw_outcome.get("outcome") or ""),
             })
-    if not expanded:
-        raise ValueError("generic selected-scope authority is empty")
     objects = run_state.get("objects")
     if not isinstance(objects, Mapping):
         raise ValueError("generic selected-scope objects mapping is unavailable")
@@ -17999,10 +18072,134 @@ def _finalise_generic_integrity_selected_scope_authority(
         entry["connector_id"],
         entry["pollutant_code"].encode("utf-8"),
     ))
+    selected_identities = {
+        (scope["day_utc"], scope["connector_id"], scope["pollutant_code"])
+        for scope in scopes
+    }
+    metadata_only_scopes: list[dict[str, Any]] = []
+    metadata_identities: set[tuple[str, int, str]] = set()
+    expanded_metadata_actions: list[dict[str, Any]] = []
+    for raw_action in metadata_actions:
+        if not isinstance(raw_action, Mapping):
+            continue
+        action = dict(raw_action)
+        if (action.get("kind") == "rebuild_v2_observations_index_only"
+                and not action.get("pollutant_code")):
+            day_utc = str(action.get("day_utc") or "")
+            connector_id = action.get("connector_id")
+            pattern = re.compile(
+                r"^history/_index_v3/observations_timeseries/"
+                + rf"day_utc={re.escape(day_utc)}/"
+                + rf"connector_id={re.escape(str(connector_id))}/"
+                + r"pollutant_code=([a-z0-9_]+)/manifest\.json$"
+            )
+            for key in objects:
+                match = pattern.fullmatch(str(key))
+                if match:
+                    expanded_metadata_actions.append({
+                        **action, "pollutant_code": match.group(1),
+                    })
+        else:
+            expanded_metadata_actions.append(action)
+    for action in expanded_metadata_actions:
+        if (
+            not isinstance(action, Mapping)
+            or action.get("kind") not in {
+                "observation_index_repair", "rebuild_v2_observations_index_only",
+            }
+            or action.get("data_changes_required") is True
+        ):
+            continue
+        day_utc = str(action.get("day_utc") or "")
+        connector_id = action.get("connector_id")
+        pollutant_code = str(action.get("pollutant_code") or "").lower()
+        identity = (day_utc, connector_id, pollutant_code)
+        if (
+            not isinstance(connector_id, int) or isinstance(connector_id, bool)
+            or pollutant_code not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
+            or identity in selected_identities or identity in metadata_identities
+            or any(scope["day_utc"] == day_utc for scope in scopes)
+        ):
+            continue
+        index_prefix = (
+            "history/_index_v3/observations_timeseries/"
+            f"day_utc={day_utc}/connector_id={connector_id}/"
+            f"pollutant_code={pollutant_code}"
+        )
+        aligned_prefix = index_prefix.replace(
+            "observations_timeseries/day_utc=",
+            "observations_timeseries/_aligned/day_utc=", 1,
+        )
+        derived_keys = sorted(
+            (str(key) for key in objects if str(key).startswith(f"{index_prefix}/")
+             or str(key).startswith(f"{aligned_prefix}/")),
+            key=lambda value: value.encode("utf-8"),
+        )
+        if f"{index_prefix}/manifest.json" not in derived_keys:
+            continue
+        if any(
+            str(entry.get("prefix") or "").rstrip("/").startswith(
+                f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
+                f"connector_id={connector_id}/pollutant_code={pollutant_code}"
+            )
+            for entry in tombstones
+        ):
+            raise ValueError("metadata-only scope has observation deletion")
+        metadata_only_scopes.append({
+            "day_utc": day_utc,
+            "connector_id": connector_id,
+            "pollutant_code": pollutant_code,
+            "derived_index_prefix": index_prefix,
+            "canonical_dependencies": _derive_generic_pinned_metadata_dependencies(
+                run_state, day_utc=day_utc, connector_id=connector_id,
+                pollutant_code=pollutant_code,
+            ),
+            "derived_object_keys": derived_keys,
+            "observation_deletion_prefixes": [],
+        })
+        metadata_identities.add(identity)
+    metadata_only_scopes.sort(key=lambda entry: (
+        entry["day_utc"].encode("utf-8"), entry["connector_id"],
+        entry["pollutant_code"].encode("utf-8"),
+    ))
+    if not scopes and not metadata_only_scopes:
+        raise ValueError("generic selected-scope authority is empty")
+    force_targets = list(run_state.get("explicit_official_force_partitions") or [])
+    force_identities = sorted({
+        (str(target.get("day_utc") or ""), int(target.get("connector_id") or 0),
+         str(target.get("pollutant_code") or ""))
+        for target in force_targets if isinstance(target, Mapping)
+    })
+    if force_targets and (
+        not run_state.get("explicit_official_force_replacement")
+        or set(force_identities) != selected_identities
+    ):
+        raise ValueError("generic forced target outcomes are incomplete")
+    forced_parquet_keys = sorted((
+        str(key) for key in objects if str(key).endswith(".parquet")
+        and any(str(key).startswith(
+            f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day}/"
+            f"connector_id={connector}/pollutant_code={pollutant}/"
+        ) for day, connector, pollutant in force_identities)
+    ), key=lambda value: value.encode("utf-8"))
     authority = {
         "contract_version": GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT,
         "history_generation": "v3",
         "selected_scopes": scopes,
+        "metadata_only_scopes": metadata_only_scopes,
+        "metadata_only_derived_write_object_keys": sorted({
+            key for scope in metadata_only_scopes
+            for key in scope["derived_object_keys"]
+        } | ({"history/_index_v3/observations_timeseries_latest.json"}
+             if metadata_only_scopes and
+             "history/_index_v3/observations_timeseries_latest.json" in objects
+             else set()), key=lambda value: value.encode("utf-8")),
+        "forced_republication_parquet_keys": forced_parquet_keys,
+        "explicit_force_targets": [
+            {"day_utc": day, "connector_id": connector,
+             "pollutant_code": pollutant}
+            for day, connector, pollutant in force_identities
+        ],
         "authorised_pollutant_tombstone_prefixes": sorted(
             {
                 str(scope["authorised_tombstone_prefix"])
@@ -18171,6 +18368,33 @@ def build_dedicated_sos_selected_partitions(
             "connector_id": 1,
             "pollutant_code": pollutant_code,
             "target_authority": "explicit_selected_scope",
+        }
+        for day in days
+        for pollutant_code in pollutants
+    ]
+
+
+def build_explicit_official_rdata_force_partitions(
+    *,
+    from_day: str,
+    to_day: str,
+    selected_days: Iterable[str] | None,
+    connector_id: int,
+    repair_pollutants: Iterable[str] | None,
+) -> list[dict[str, Any]]:
+    """Freeze manual official-network targets before gap/equality filtering."""
+    if connector_id not in {9, 10}:
+        raise ValueError("official RData force requires WAQN or SAQN")
+    pollutants = _normalise_repair_pollutants(repair_pollutants)
+    days = _selected_dates_or_range(from_day, to_day, selected_days)
+    if not pollutants or not days:
+        raise ValueError("official RData force requires dates and pollutants")
+    return [
+        {
+            "day_utc": day.isoformat(),
+            "connector_id": connector_id,
+            "pollutant_code": pollutant_code,
+            "target_authority": "explicit_manual_force_replacement",
         }
         for day in days
         for pollutant_code in pollutants
@@ -19567,6 +19791,7 @@ def run_v2_gap_backfills(
     repair_pollutants: Iterable[str] | None = None,
     source_scope: Mapping[str, Any] | None = None,
     explicit_selected_partitions: Iterable[Mapping[str, Any]] | None = None,
+    explicit_official_force_partitions: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Execute direct source -> v2 observation repairs for missing v2 gaps.
 
@@ -19603,9 +19828,15 @@ def run_v2_gap_backfills(
         "source_invalid_partitions_blocked_before_mutation": 0,
         "exact_tombstones_created": 0,
     }
-    if explicit_selected_partitions is not None:
+    if explicit_selected_partitions is not None and explicit_official_force_partitions is not None:
+        raise ValueError("SOS and official direct replacement cannot be combined")
+    if explicit_selected_partitions is not None or explicit_official_force_partitions is not None:
         metrics.update({
-            "target_authority": "explicit_selected_scope",
+            "target_authority": (
+                "explicit_manual_force_replacement"
+                if explicit_official_force_partitions is not None
+                else "explicit_selected_scope"
+            ),
             "gap_detection_bypassed": True,
         })
     if not run_backfill:
@@ -19616,7 +19847,11 @@ def run_v2_gap_backfills(
         list(explicit_selected_partitions)
         if explicit_selected_partitions is not None else None
     )
-    if direct_targets is None and not gaps:
+    official_force_targets = (
+        list(explicit_official_force_partitions)
+        if explicit_official_force_partitions is not None else None
+    )
+    if direct_targets is None and official_force_targets is None and not gaps:
         return metrics
     def gap_partition(gap: Mapping[str, Any]) -> tuple[str, int, str | None] | None:
         day_iso = str(gap.get("day_utc") or "").strip()
@@ -19629,7 +19864,7 @@ def run_v2_gap_backfills(
         pollutant = str(gap.get("pollutant_code") or "").strip().lower() or None
         return day_iso, connector_id, pollutant
 
-    if direct_targets is None:
+    if direct_targets is None and official_force_targets is None:
         (
             executable_pollutants_by_key,
             executable_gap_indexes,
@@ -19638,7 +19873,7 @@ def run_v2_gap_backfills(
             v2_observations=v2_observations,
             requested_pollutants=repair_pollutants,
         )
-    else:
+    elif direct_targets is not None:
         executable_pollutants_by_key = {}
         executable_gap_indexes = set()
         skipped_nonexecutable_gaps = []
@@ -19692,6 +19927,34 @@ def run_v2_gap_backfills(
             pollutant
             for _day, _connector, pollutant in normalized_direct_targets
         })
+    else:
+        executable_pollutants_by_key = {}
+        executable_gap_indexes = set()
+        skipped_nonexecutable_gaps = []
+        for target in official_force_targets or []:
+            day_utc = str(target.get("day_utc") or "").strip()
+            connector_id = target.get("connector_id")
+            pollutant_code = str(target.get("pollutant_code") or "").strip().lower()
+            try:
+                valid_day = dt.date.fromisoformat(day_utc).isoformat() == day_utc
+            except ValueError:
+                valid_day = False
+            if (
+                not valid_day or not isinstance(connector_id, int)
+                or isinstance(connector_id, bool) or connector_id not in {9, 10}
+                or _official_rdata_source_for_connector(connector_id)
+                   != str((source_scope or {}).get("source") or "")
+                or pollutant_code not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
+                or target.get("target_authority") != "explicit_manual_force_replacement"
+            ):
+                raise ValueError("official RData explicit force target is invalid")
+            normalized_direct_targets.append((day_utc, connector_id, pollutant_code))
+        normalized_direct_targets = sorted(set(normalized_direct_targets))
+        if not normalized_direct_targets:
+            raise ValueError("official RData explicit force target set is empty")
+        metrics["explicit_selected_partition_count"] = len(normalized_direct_targets)
+        metrics["selected_dates"] = sorted({day for day, _, _ in normalized_direct_targets})
+        metrics["selected_pollutants"] = sorted({pollutant for _, _, pollutant in normalized_direct_targets})
 
     by_key_sets: dict[tuple[str, int], set[int]] = {}
     gaps_by_key: dict[tuple[str, int], list[dict[str, Any]]] = {}
@@ -19699,7 +19962,7 @@ def run_v2_gap_backfills(
     skipped_metadata_gaps: list[dict[str, Any]] = list(
         skipped_nonexecutable_gaps
     )
-    if direct_targets is None:
+    if direct_targets is None and official_force_targets is None:
         for gap_index, gap in enumerate(gaps):
             partition = gap_partition(gap)
             if partition is None:
@@ -19742,8 +20005,17 @@ def run_v2_gap_backfills(
         (day_utc, connector_id, [], [pollutant_code])
         for day_utc, connector_id, pollutant_code in normalized_direct_targets
     ]
+    official_force_by_key: dict[tuple[str, int], set[str]] = {}
+    if official_force_targets is not None:
+        for day_utc, connector_id, pollutant_code in normalized_direct_targets:
+            official_force_by_key.setdefault((day_utc, connector_id), set()).add(pollutant_code)
+    official_force_work = [
+        (day_utc, connector_id, [], sorted(pollutants))
+        for (day_utc, connector_id), pollutants in sorted(official_force_by_key.items())
+    ]
     metrics["observation_backfill_candidate_days"] = (
-        len(direct_work) if direct_targets is not None else len(by_key)
+        len(direct_work) if direct_targets is not None else
+        len(official_force_work) if official_force_targets is not None else len(by_key)
     )
     metrics["observation_backfill_candidate_timeseries_ids"] = sum(len(ids) for ids in by_key.values())
     metrics["observation_backfill_scope"] = "complete_source_derived_selected_pollutants"
@@ -19753,7 +20025,7 @@ def run_v2_gap_backfills(
                 [pollutant]
             for day_utc, connector_id, pollutant in normalized_direct_targets
         }
-        if direct_targets is not None else
+        if direct_targets is not None or official_force_targets is not None else
         {
             f"{day_utc}/connector_id={connector_id}": list(pollutants)
             for (day_utc, connector_id), pollutants in sorted(
@@ -19772,6 +20044,8 @@ def run_v2_gap_backfills(
     work_items = (
         direct_work
         if direct_targets is not None else
+        official_force_work
+        if official_force_targets is not None else
         [
             (
                 day_iso,
@@ -20034,7 +20308,7 @@ def run_v2_gap_backfills(
         first_cmd = planned_cmds[0] if planned_cmds else None
         idx_cmd = " ".join(_v2_observations_index_rebuild_command(day_iso, connector_id))
         if limits.should_stop():
-            if direct_targets is None:
+            if direct_targets is None and official_force_targets is None:
                 break
             metrics["v2_observation_repairs_failed"] += 1
             metrics["observation_backfills_failed"] += 1
@@ -20860,10 +21134,10 @@ SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
     "uk_aq_sos_light_v3_transition_state_fingerprint_v2"
 )
 GENERIC_INTEGRITY_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
-    "uk_aq_generic_integrity_v3_transition_state_fingerprint_v2"
+    "uk_aq_generic_integrity_v3_transition_state_fingerprint_v3"
 )
 GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT = (
-    "uk_aq_generic_integrity_v3_selected_scope_authority_v2"
+    "uk_aq_generic_integrity_v3_selected_scope_authority_v3"
 )
 COORDINATOR_PROGRESS_OBJECT_INTERVAL = 250
 COORDINATOR_PROGRESS_SECONDS = 15.0
@@ -21544,7 +21818,8 @@ def _canonical_generic_integrity_selected_scope_authority(
         != GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT
         or authority.get("history_generation") != "v3"
         or not isinstance(authority.get("selected_scopes"), list)
-        or not authority["selected_scopes"]
+        or not isinstance(authority.get("metadata_only_scopes"), list)
+        or not (authority["selected_scopes"] or authority["metadata_only_scopes"])
         or not isinstance(
             authority.get("authorised_pollutant_tombstone_prefixes"), list
         )
@@ -21713,10 +21988,129 @@ def _canonical_generic_integrity_selected_scope_authority(
         raise ValueError(
             "generic fixed-v3 proposed tombstones exceed selected authority"
         )
+    metadata_scopes: list[dict[str, Any]] = []
+    data_identities = {
+        (scope["day_utc"], scope["connector_id"], scope["pollutant_code"])
+        for scope in scopes
+    }
+    metadata_seen: set[tuple[str, int, str]] = set()
+    objects = dict(run_state.get("objects") or {})
+    for raw in authority["metadata_only_scopes"]:
+        if not isinstance(raw, Mapping):
+            raise ValueError("generic metadata-only scope is invalid")
+        day_utc = str(raw.get("day_utc") or "")
+        connector_id = raw.get("connector_id")
+        pollutant_code = str(raw.get("pollutant_code") or "")
+        identity = (day_utc, connector_id, pollutant_code)
+        try:
+            valid_day = dt.date.fromisoformat(day_utc).isoformat() == day_utc
+        except ValueError:
+            valid_day = False
+        if (
+            not valid_day or not isinstance(connector_id, int)
+            or isinstance(connector_id, bool) or connector_id <= 0
+            or pollutant_code not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
+            or identity in data_identities or identity in metadata_seen
+        ):
+            raise ValueError("generic metadata-only scope identity is invalid")
+        metadata_seen.add(identity)
+        prefix = (
+            "history/_index_v3/observations_timeseries/"
+            f"day_utc={day_utc}/connector_id={connector_id}/"
+            f"pollutant_code={pollutant_code}"
+        )
+        aligned_prefix = prefix.replace(
+            "observations_timeseries/day_utc=",
+            "observations_timeseries/_aligned/day_utc=", 1,
+        )
+        keys = sorted((
+            str(key) for key in objects if str(key).startswith(f"{prefix}/")
+            or str(key).startswith(f"{aligned_prefix}/")
+        ), key=lambda value: value.encode("utf-8"))
+        if (
+            raw.get("derived_index_prefix") != prefix
+            or f"{prefix}/manifest.json" not in keys
+            or raw.get("derived_object_keys") != keys
+            or raw.get("observation_deletion_prefixes") != []
+            or raw.get("canonical_dependencies")
+            != _derive_generic_pinned_metadata_dependencies(
+                run_state, day_utc=day_utc,
+                connector_id=connector_id, pollutant_code=pollutant_code,
+            )
+        ):
+            raise ValueError("generic metadata-only scope closure changed")
+        metadata_scopes.append({
+            "day_utc": day_utc, "connector_id": connector_id,
+            "pollutant_code": pollutant_code,
+            "derived_index_prefix": prefix,
+            "canonical_dependencies": raw["canonical_dependencies"],
+            "derived_object_keys": keys,
+            "observation_deletion_prefixes": [],
+        })
+    metadata_scopes.sort(key=lambda entry: (
+        entry["day_utc"].encode("utf-8"), entry["connector_id"],
+        entry["pollutant_code"].encode("utf-8"),
+    ))
+    if metadata_scopes != authority["metadata_only_scopes"]:
+        raise ValueError("generic metadata-only scopes are not canonical")
+    derived_write_keys = sorted({
+        key for scope in metadata_scopes for key in scope["derived_object_keys"]
+    } | ({"history/_index_v3/observations_timeseries_latest.json"}
+         if metadata_scopes and
+         "history/_index_v3/observations_timeseries_latest.json" in objects
+         else set()), key=lambda value: value.encode("utf-8"))
+    if authority.get("metadata_only_derived_write_object_keys") != derived_write_keys:
+        raise ValueError("generic metadata-only derived write set changed")
+    if metadata_scopes and not scopes:
+        all_derived_keys = sorted((
+            str(key) for key in objects
+            if str(key).startswith(
+                "history/_index_v3/observations_timeseries/"
+            ) or str(key) == "history/_index_v3/observations_timeseries_latest.json"
+        ), key=lambda value: value.encode("utf-8"))
+        if all_derived_keys != derived_write_keys or set(objects) != set(derived_write_keys):
+            raise ValueError("generic metadata-only derived closure is not exact")
+    force_targets = list(run_state.get("explicit_official_force_partitions") or [])
+    if any(
+        not isinstance(target, Mapping)
+        or target.get("target_authority") != "explicit_manual_force_replacement"
+        or target.get("connector_id") not in {9, 10}
+        for target in force_targets
+    ):
+        raise ValueError("generic explicit force target is invalid")
+    expected_targets = sorted({
+        (str(target.get("day_utc") or ""), int(target.get("connector_id") or 0),
+         str(target.get("pollutant_code") or ""))
+        for target in force_targets if isinstance(target, Mapping)
+    })
+    canonical_targets = [
+        {"day_utc": day, "connector_id": connector,
+         "pollutant_code": pollutant}
+        for day, connector, pollutant in expected_targets
+    ]
+    if (
+        authority.get("explicit_force_targets") != canonical_targets
+        or bool(expected_targets) != bool(run_state.get("explicit_official_force_replacement"))
+        or (expected_targets and set(expected_targets) != data_identities)
+    ):
+        raise ValueError("generic explicit force authority changed")
+    forced_parquet_keys = sorted((
+        str(key) for key in objects if str(key).endswith(".parquet")
+        and any(str(key).startswith(
+            f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day}/"
+            f"connector_id={connector}/pollutant_code={pollutant}/"
+        ) for day, connector, pollutant in expected_targets)
+    ), key=lambda value: value.encode("utf-8"))
+    if authority.get("forced_republication_parquet_keys") != forced_parquet_keys:
+        raise ValueError("generic forced Parquet write set changed")
     return {
         "contract_version": GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT,
         "history_generation": "v3",
         "selected_scopes": scopes,
+        "metadata_only_scopes": metadata_scopes,
+        "metadata_only_derived_write_object_keys": derived_write_keys,
+        "explicit_force_targets": canonical_targets,
+        "forced_republication_parquet_keys": forced_parquet_keys,
         "authorised_pollutant_tombstone_prefixes": authorised_prefixes,
     }
 
@@ -25178,6 +25572,18 @@ def run_v2_final_verification(
         run_state, config=config, from_day=from_day, to_day=to_day,
         selected_days=selected_days,
     )
+    derived_index_scopes: set[tuple[str, int, str]] = set()
+    exact_manifest_pattern = re.compile(
+        r"^history/_index_v3/observations_timeseries/"
+        r"day_utc=(\d{4}-\d{2}-\d{2})/connector_id=(\d+)/"
+        r"pollutant_code=([a-z0-9_]+)/manifest\.json$"
+    )
+    for key in dict(run_state.get("objects") or {}):
+        match = exact_manifest_pattern.fullmatch(str(key))
+        if match:
+            derived_index_scopes.add(
+                (match.group(1), int(match.group(2)), match.group(3))
+            )
     recheck = run_v2_post_repair_integrity_rechecks(
         conn=conn,
         env_name=env_name,
@@ -25199,6 +25605,7 @@ def run_v2_final_verification(
             else (allowed_connector_ids or [])
         ),
         observation_total_pollutants=repair_pollutants,
+        verify_derived_index_scopes=derived_index_scopes,
     )
     remaining_scopes: list[dict[str, Any]] = []
     try:
@@ -28413,6 +28820,7 @@ def run_v2_integrity_repair_flow(
     selected_days: Iterable[str] | None = None,
     repair_pollutants: Iterable[str] | None = None,
     dedicated_sos_historical_replacement: bool = False,
+    force_official_rdata_replacement: bool = False,
     protected_connector_ids: Iterable[int] | None = None,
     timeseries_binding_backup_mode: str = "individual",
     timeseries_binding_pack_root: Path | None = None,
@@ -28424,6 +28832,36 @@ def run_v2_integrity_repair_flow(
     )
     write_run_state(run_state)
     explicit_selected_partitions: list[dict[str, Any]] | None = None
+    explicit_official_force_partitions: list[dict[str, Any]] | None = None
+    if force_official_rdata_replacement:
+        if dry_run or dedicated_sos_historical_replacement:
+            raise RuntimeError("official RData force requires a write-enabled generic run")
+        source = str((source_scope or {}).get("source") or "")
+        connector_id = {"waqn": 9, "saqn": 10}.get(source)
+        if connector_id is None or allowed_connector_ids != {connector_id}:
+            raise RuntimeError("official RData force requires one WAQN or SAQN connector")
+        explicit_official_force_partitions = build_explicit_official_rdata_force_partitions(
+            from_day=from_day,
+            to_day=to_day,
+            selected_days=selected_days,
+            connector_id=connector_id,
+            repair_pollutants=repair_pollutants,
+        )
+        run_state.update({
+            "target_authority": "explicit_manual_force_replacement",
+            "explicit_official_force_replacement": True,
+            "explicit_official_force_partitions": explicit_official_force_partitions,
+            "explicit_selected_partition_count": len(explicit_official_force_partitions),
+            "gap_detection": {
+                "status": "bypassed_for_explicit_targets",
+                "reason": "explicit_manual_force_replacement",
+            },
+            "observation_content_hash_comparison": {
+                "status": "bypassed_for_explicit_targets",
+                "reason": "explicit_manual_force_replacement",
+            },
+        })
+        write_run_state(run_state)
     if dedicated_sos_historical_replacement:
         if dry_run:
             raise RuntimeError(
@@ -28478,6 +28916,7 @@ def run_v2_integrity_repair_flow(
         repair_pollutants=repair_pollutants,
         source_scope=source_scope,
         explicit_selected_partitions=explicit_selected_partitions,
+        explicit_official_force_partitions=explicit_official_force_partitions,
     )
     observation_failed = bool(observations.get("v2_observation_repairs_failed") or observations.get("v2_observation_repairs_guard_failed"))
     metadata_actions = _v2_observation_metadata_actions(v2_observations)
@@ -28567,10 +29006,15 @@ def run_v2_integrity_repair_flow(
     if not dedicated_sos_historical_replacement and not observation_failed and str(
         metadata.get("status") or ""
     ) not in {"failed", "blocked_dependency"}:
-        _finalise_generic_integrity_selected_scope_authority(
-            run_state,
-            observations.get("selected_partition_outcomes") or [],
-        )
+        if run_state.get("objects") or any(
+            isinstance(entry, Mapping) and entry.get("proposed")
+            for entry in list(run_state.get("tombstone_prefixes") or [])
+        ):
+            _finalise_generic_integrity_selected_scope_authority(
+                run_state,
+                observations.get("selected_partition_outcomes") or [],
+                metadata_actions,
+            )
     if dedicated_sos_historical_replacement and not observation_failed and str(
         metadata.get("status") or ""
     ) not in {"failed", "blocked_dependency"}:
@@ -29174,6 +29618,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--run-backfill", action="store_true",
                    help="Enable the ordered v2 repair flow after read-only detection.")
     p.add_argument(
+        "--force-replace-selected",
+        action="store_true",
+        help="Explicit manual TEST WAQN/SAQN selected-pollutant physical replacement.",
+    )
+    p.add_argument(
         "--repair-pollutants",
         default="",
         help="Explicit pollutant-scoped observation repair list: pm25,pm10,no2,o3.",
@@ -29272,6 +29721,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if parsed.check_only and parsed.run_backfill:
         p.error(
             "--check-only and --run-backfill cannot be used together.",
+        )
+    if parsed.force_replace_selected and (
+        parsed.env != "TEST" or parsed.profile != "manual"
+        or parsed.source not in {"waqn", "saqn"}
+        or not parsed.from_day or not parsed.to_day
+        or not parsed.run_backfill or parsed.check_only or parsed.dry_run
+        or not parsed.repair_pollutants
+    ):
+        p.error(
+            "--force-replace-selected requires a write-enabled manual TEST "
+            "WAQN/SAQN run with explicit from/to days and repair pollutants"
         )
     if parsed.env == "LIVE" and parsed.enable_historical_identity_repair:
         p.error("historical identity repair must remain disabled in LIVE")
@@ -33486,6 +33946,7 @@ def main(argv: list[str]) -> int:
                     dedicated_sos_historical_replacement=(
                         dedicated_sos_historical_replacement
                     ),
+                    force_official_rdata_replacement=args.force_replace_selected,
                     protected_connector_ids=protected_connector_ids,
                     timeseries_binding_backup_mode=(
                         args.timeseries_binding_backup_mode
