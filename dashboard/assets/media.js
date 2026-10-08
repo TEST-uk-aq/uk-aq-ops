@@ -1650,13 +1650,19 @@
 
   function sourceCard(source, rules) {
     let config = source.discovery_config_json; try { config = JSON.stringify(JSON.parse(config), null, 2); } catch (_error) {}
-    return `<details class="media-source${source.enabled ? "" : " media-danger-zone"}" data-source-key="${esc(source.source_key)}" data-current-image-policy="${esc(source.image_policy)}"><summary>${esc(source.name)} · ${source.enabled ? "Enabled" : "Disabled"} · ${source.domain_blocked ? "Blocked" : "Not blocked"} · ${esc(source.publication_policy)}</summary><div class="media-source__grid">
+    const domains = source.publisher_domains || [{ domain: source.canonical_domain,
+      blocked: source.domain_blocked, block_domain: source.domain_block_domain,
+      reason: source.domain_block_reason }];
+    const blockedCount = domains.filter(domain => domain.blocked).length;
+    const domainStatus = blockedCount === domains.length ? "Blocked" : blockedCount ? "Some domains blocked" : "Not blocked";
+    return `<details class="media-source${source.enabled ? "" : " media-danger-zone"}" data-source-key="${esc(source.source_key)}" data-current-image-policy="${esc(source.image_policy)}"><summary>${esc(source.name)} · ${source.enabled ? "Enabled" : "Disabled"} · ${domainStatus} · ${esc(source.publication_policy)}</summary><div class="media-source__grid">
       ${[["Canonical domain", source.canonical_domain], ["Source type", source.source_type], ["Discovery adapter", source.discovery_method], ["Review level", source.review_level], ["Content fetch", source.content_fetch_policy], ["AI content", source.ai_content_policy], ["Image policy", source.image_policy], ["Recent run", source.recent_run_status ? `${source.recent_run_status} · ${formatUtcDateTime(source.recent_run_started_at)}` : "No run"]].map(([label, value]) => `<div><span class="media-subtext">${label}</span>${esc(value)}</div>`).join("")}
       <label class="media-field"><span>Publication policy</span><select data-source-policy><option value="manual"${source.publication_policy === "manual" ? " selected" : ""}>manual</option><option value="auto_approve"${source.publication_policy === "auto_approve" ? " selected" : ""}>auto_approve</option></select></label>
       <label class="media-field"><span>Enabled</span><select data-source-enabled><option value="false"${!source.enabled ? " selected" : ""}>No</option><option value="true"${source.enabled ? " selected" : ""}>Yes</option></select></label>
       <button class="media-button media-button--primary" data-save-source>Save source policy</button></div>
       <details><summary>Bounded route/configuration</summary><pre>${esc(config)}</pre></details><div data-source-message></div>
-      ${domainBlockControls(source.domain_block_domain || source.canonical_domain, source.domain_blocked, source.domain_block_reason)}
+      ${domains.length > 1 ? `<p>Each publisher domain has its own decision. Unblocked alternatives remain eligible; a partly blocked source appears in both visibility views.</p>` : ""}
+      ${domains.map(domain => domainBlockControls(domain.block_domain || domain.domain, domain.blocked, domain.reason)).join("")}
       ${sourceImagePolicyHtml(source)}
       <div class="media-author-rules"><div class="media-toolbar"><h4>Author rules</h4>${source.source_key === "the-guardian" ? `<button class="media-button" data-add-author>+ Add author rule</button>` : ""}</div><div data-add-author-form></div>
       ${rules.length ? rules.map(authorRuleRow).join("") : `<p>No author rules.</p>`}</div></details>`;
