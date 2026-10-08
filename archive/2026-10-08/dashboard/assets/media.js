@@ -37,7 +37,6 @@
   const FACEBOOK_PLACEHOLDERS = ["{publisher}"];
   const articleDetailCache = new Map();
   let articleRefreshSequence = 0;
-  let sourceRefreshSequence = 0;
 
   const state = {
     root: null,
@@ -55,13 +54,6 @@
     aiUsage: null,
     aiUsageUnavailable: false,
     batchMessage: "",
-    sourcesVisibility: "non_blocked",
-    sourcesFeedback: "",
-    sourcesRows: [],
-    sourceDomainRows: [],
-    sourceAuthorRules: [],
-    sourcesOffset: 0,
-    sourceDomainsOffset: 0,
     runsKind: "publisher",
     publisherRuns: { rows: null, error: "", loading: false },
     gdeltRuns: { rows: null, error: "", loading: false },
@@ -240,11 +232,7 @@
     });
     if (tab === "articles") void renderArticles(false);
     if (tab === "runs") void renderRuns(true);
-    if (tab === "sources") {
-      state.sourcesVisibility = "non_blocked";
-      state.sourcesFeedback = "";
-      void renderSources();
-    }
+    if (tab === "sources") void renderSources(false);
   }
 
   function checkedFilter(group, value) {
@@ -1524,7 +1512,7 @@
   }
 
   function gdeltRunsTable(rows) {
-    return `<div class="media-table-wrap"><table class="media-table media-table--gdelt"><thead><tr><th>Started<br>UTC</th><th>Duration</th><th>Status</th><th>Window</th><th>Completed<br>through</th><th>Pairs<br>processed</th><th>Pairs<br>replayed</th><th>Missing<br>minutes</th><th>Matches</th><th>Candidates<br>inserted</th><th>Candidates<br>updated</th><th>UK<br>candidates</th><th>UK<br>promoted</th><th>Blocked<br>skipped</th><th>Malformed</th><th>Diagnostics</th></tr></thead><tbody>${rows.length ? rows.map(run => `<tr><td>${esc(formatUtcDateTime(run.started_at, false))}</td><td>${esc(duration(run.started_at, run.finished_at))}</td><td>${esc(run.status)}</td><td class="media-gdelt-window">${esc(formatGdeltMinute(run.window_start))} →<br>${esc(formatGdeltMinute(run.window_end))}</td><td>${esc(formatGdeltMinute(run.completed_through))}</td><td>${esc(run.complete_pairs_processed)}</td><td>${esc(run.complete_pairs_replayed)}</td><td>${esc(run.missing_minutes)}</td><td>${esc(run.matches_seen)}</td><td>${esc(run.candidates_inserted)}</td><td>${esc(run.candidates_updated)}</td><td>${esc(run.candidates_uk)}</td><td>${esc(run.uk_promoted)}</td><td>${esc(run.blocked_skipped ?? 0)}</td><td>${esc(run.malformed_rows)}</td><td>${run.error_code ? `<details><summary>${esc(run.error_code)} · stored run evidence</summary><pre>${esc(JSON.stringify(run, null, 2))}</pre></details>` : "—"}</td></tr>`).join("") : `<tr><td colspan="16" class="media-empty">No GDELT runs found.</td></tr>`}</tbody></table></div>`;
+    return `<div class="media-table-wrap"><table class="media-table media-table--gdelt"><thead><tr><th>Started<br>UTC</th><th>Duration</th><th>Status</th><th>Window</th><th>Completed<br>through</th><th>Pairs<br>processed</th><th>Pairs<br>replayed</th><th>Missing<br>minutes</th><th>Matches</th><th>Candidates<br>inserted</th><th>Candidates<br>updated</th><th>UK<br>candidates</th><th>UK<br>promoted</th><th>Malformed</th><th>Diagnostics</th></tr></thead><tbody>${rows.length ? rows.map(run => `<tr><td>${esc(formatUtcDateTime(run.started_at, false))}</td><td>${esc(duration(run.started_at, run.finished_at))}</td><td>${esc(run.status)}</td><td class="media-gdelt-window">${esc(formatGdeltMinute(run.window_start))} →<br>${esc(formatGdeltMinute(run.window_end))}</td><td>${esc(formatGdeltMinute(run.completed_through))}</td><td>${esc(run.complete_pairs_processed)}</td><td>${esc(run.complete_pairs_replayed)}</td><td>${esc(run.missing_minutes)}</td><td>${esc(run.matches_seen)}</td><td>${esc(run.candidates_inserted)}</td><td>${esc(run.candidates_updated)}</td><td>${esc(run.candidates_uk)}</td><td>${esc(run.uk_promoted)}</td><td>${esc(run.malformed_rows)}</td><td>${run.error_code ? `<details><summary>${esc(run.error_code)} · stored run evidence</summary><pre>${esc(JSON.stringify(run, null, 2))}</pre></details>` : "—"}</td></tr>`).join("") : `<tr><td colspan="15" class="media-empty">No GDELT runs found.</td></tr>`}</tbody></table></div>`;
   }
 
   function renderRunsView() {
@@ -1563,83 +1551,14 @@
     }
   }
 
-  async function renderSources(append = false) {
-    const sequence = ++sourceRefreshSequence;
-    const visibility = state.sourcesVisibility;
-    if (!append) {
-      state.sourcesRows = []; state.sourceDomainRows = []; state.sourceAuthorRules = [];
-      state.sourcesOffset = 0; state.sourceDomainsOffset = 0;
-    }
-    setView(`<section class="media-card">${state.sourcesFeedback ? message(state.sourcesFeedback, "success") : ""}<div class="media-loading">Loading Sources…</div></section>`);
+  async function renderSources() {
+    setView(`<section class="media-card"><div class="media-loading">Loading Sources…</div></section>`);
     try {
-      const data = await request("sources", { params: new URLSearchParams({ visibility,
-        offset: String(state.sourcesOffset), domain_offset: String(state.sourceDomainsOffset) }) });
-      if (sequence !== sourceRefreshSequence || state.tab !== "sources") return;
-      state.sourcesRows.push(...(data.sources || []));
-      state.sourceDomainRows.push(...(data.domain_blocks || []));
-      const rules = new Map(state.sourceAuthorRules.map(rule => [rule.author_key, rule]));
-      (data.author_rules || []).forEach(rule => rules.set(rule.author_key, rule));
-      state.sourceAuthorRules = [...rules.values()];
-      state.sourcesOffset = data.next_offset;
-      state.sourceDomainsOffset = data.next_domain_offset;
-      const rulesBySource = new Map(); state.sourceAuthorRules.forEach(rule => { const group = rulesBySource.get(rule.source_key) || []; group.push(rule); rulesBySource.set(rule.source_key, group); });
-      setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Sources</h3><p>Publication and author-rule changes apply to future discovery. Image-policy revocation takes effect immediately.</p></div><label class="media-source-visibility">Show: <select data-source-visibility aria-label="Source visibility">${[["non_blocked", "Non-blocked"], ["blocked", "Blocked"], ["all", "All"]].map(([value, label]) => `<option value="${value}"${visibility === value ? " selected" : ""}>${label}</option>`).join("")}</select></label><button class="media-button media-button--primary" data-toggle-add-source>+ Add Source</button></div>
-        <div role="status">${state.sourcesFeedback ? message(state.sourcesFeedback, "success") : ""}</div><div data-add-source></div>
-        <details class="media-domain-add"><summary>Block a publisher domain</summary><form class="media-inline-form" data-block-domain-form><label class="media-field"><span>Domain</span><input name="domain" required maxlength="254" placeholder="publisher.co.uk"></label><label class="media-field media-field--grow"><span>Reason (optional)</span><input name="reason" maxlength="1000"></label><button class="media-button" type="submit">Block domain</button></form><div data-domain-add-message></div></details>
-        <div class="media-source-list">${state.sourcesRows.map(source => sourceCard(source, rulesBySource.get(source.source_key) || [])).join("")}${state.sourceDomainRows.map(domainBlockCard).join("")}${!state.sourcesRows.length && !state.sourceDomainRows.length ? `<div class="media-empty">No matching sources or domain decisions.</div>` : ""}</div>${data.has_more ? `<button class="media-button" data-more-sources>Load more</button>` : ""}</section>`);
+      const data = await request("sources");
+      const rulesBySource = new Map(); (data.author_rules || []).forEach(rule => { const group = rulesBySource.get(rule.source_key) || []; group.push(rule); rulesBySource.set(rule.source_key, group); });
+      setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Sources</h3><p>Publication and author-rule changes apply to future discovery. Image-policy revocation takes effect immediately.</p></div><button class="media-button media-button--primary" data-toggle-add-source>+ Add Source</button></div><div data-add-source></div><div class="media-source-list">${(data.sources || []).map(source => sourceCard(source, rulesBySource.get(source.source_key) || [])).join("") || `<div class="media-empty">No Media sources found.</div>`}</div></section>`);
       bindSourceActions();
-      state.root.querySelector("[data-source-visibility]")?.addEventListener("change", event => {
-        state.sourcesVisibility = event.target.value; state.sourcesFeedback = ""; void renderSources();
-      });
-      state.root.querySelector("[data-more-sources]")?.addEventListener("click", () => void renderSources(true));
-      state.root.querySelectorAll("[data-domain-action]").forEach(button => button.addEventListener("click", () => void saveDomainBlock(button)));
-      state.root.querySelector("[data-block-domain-form]")?.addEventListener("submit", event => {
-        event.preventDefault(); void addDomainBlock(event.currentTarget);
-      });
-    } catch (error) {
-      if (sequence === sourceRefreshSequence && state.tab === "sources") {
-        setView(`<section class="media-card"><h3>Sources</h3>${state.sourcesFeedback ? message(state.sourcesFeedback, "success") : ""}${message(error.message, "error")}<button class="media-button" data-retry-sources>Refresh Sources</button></section>`);
-        state.root.querySelector("[data-retry-sources]")?.addEventListener("click", () => void renderSources());
-      }
-    }
-  }
-
-  function domainBlockControls(domain, blocked, reason) {
-    return `<section class="media-domain-controls"><h4>Publisher domain</h4><p><strong>${blocked ? "Blocked" : "Not blocked"}</strong> · ${esc(domain)}</p><div class="media-inline-form"><label class="media-field media-field--grow"><span>Reason (optional)</span><input data-domain-reason maxlength="1000" value="${esc(reason || "")}"></label><button class="media-button" data-domain-action="${blocked ? "unblock" : "block"}" data-domain="${esc(domain)}">${blocked ? "Unblock" : "Block"}</button></div><div data-domain-message></div></section>`;
-  }
-
-  function domainBlockCard(block) {
-    return `<details class="media-source"><summary>${esc(block.domain)} · No source definition · ${block.blocked ? "Blocked" : "Not blocked"}</summary>${domainBlockControls(block.domain, block.blocked, block.reason)}</details>`;
-  }
-
-  async function saveDomainBlock(button) {
-    const controls = button.closest(".media-domain-controls");
-    const output = controls.querySelector("[data-domain-message]");
-    const blocked = button.dataset.domainAction === "block";
-    const domain = button.dataset.domain;
-    button.disabled = true;
-    try {
-      const result = await request("source-domain-blocks", { method: "PUT", idempotent: "domain_block",
-        body: { domain, blocked, reason: controls.querySelector("[data-domain-reason]").value.trim() } });
-      state.sourcesFeedback = `${result.domain_block.domain} ${result.domain_block.blocked ? "blocked" : "unblocked"}. Sources refreshed; the domain may move out of this view. Saved source policies and historical articles are preserved.`;
-      await renderSources();
-    } catch (error) { button.disabled = false; output.innerHTML = message(error.message, "error"); }
-  }
-
-  async function addDomainBlock(form) {
-    const values = new FormData(form);
-    const button = form.querySelector("button");
-    button.disabled = true;
-    try {
-      const result = await request("source-domain-blocks", { method: "PUT", idempotent: "domain_block",
-        body: { domain: String(values.get("domain") || "").trim(), blocked: true,
-          reason: String(values.get("reason") || "").trim() } });
-      state.sourcesFeedback = `${result.domain_block.domain} blocked. Use the Blocked or All view to inspect it.`;
-      await renderSources();
-    } catch (error) {
-      button.disabled = false;
-      form.parentElement.querySelector("[data-domain-add-message]").innerHTML = message(error.message, "error");
-    }
+    } catch (error) { setView(`<section class="media-card"><h3>Sources</h3>${message(error.message, "error")}</section>`); }
   }
 
   function sourceImagePolicyHtml(source) {
@@ -1650,13 +1569,12 @@
 
   function sourceCard(source, rules) {
     let config = source.discovery_config_json; try { config = JSON.stringify(JSON.parse(config), null, 2); } catch (_error) {}
-    return `<details class="media-source${source.enabled ? "" : " media-danger-zone"}" data-source-key="${esc(source.source_key)}" data-current-image-policy="${esc(source.image_policy)}"><summary>${esc(source.name)} · ${source.enabled ? "Enabled" : "Disabled"} · ${source.domain_blocked ? "Blocked" : "Not blocked"} · ${esc(source.publication_policy)}</summary><div class="media-source__grid">
+    return `<details class="media-source${source.enabled ? "" : " media-danger-zone"}" data-source-key="${esc(source.source_key)}" data-current-image-policy="${esc(source.image_policy)}"><summary>${esc(source.name)} · ${source.enabled ? "Enabled" : "Disabled"} · ${esc(source.publication_policy)}</summary><div class="media-source__grid">
       ${[["Canonical domain", source.canonical_domain], ["Source type", source.source_type], ["Discovery adapter", source.discovery_method], ["Review level", source.review_level], ["Content fetch", source.content_fetch_policy], ["AI content", source.ai_content_policy], ["Image policy", source.image_policy], ["Recent run", source.recent_run_status ? `${source.recent_run_status} · ${formatUtcDateTime(source.recent_run_started_at)}` : "No run"]].map(([label, value]) => `<div><span class="media-subtext">${label}</span>${esc(value)}</div>`).join("")}
       <label class="media-field"><span>Publication policy</span><select data-source-policy><option value="manual"${source.publication_policy === "manual" ? " selected" : ""}>manual</option><option value="auto_approve"${source.publication_policy === "auto_approve" ? " selected" : ""}>auto_approve</option></select></label>
       <label class="media-field"><span>Enabled</span><select data-source-enabled><option value="false"${!source.enabled ? " selected" : ""}>No</option><option value="true"${source.enabled ? " selected" : ""}>Yes</option></select></label>
       <button class="media-button media-button--primary" data-save-source>Save source policy</button></div>
       <details><summary>Bounded route/configuration</summary><pre>${esc(config)}</pre></details><div data-source-message></div>
-      ${domainBlockControls(source.domain_block_domain || source.canonical_domain, source.domain_blocked, source.domain_block_reason)}
       ${sourceImagePolicyHtml(source)}
       <div class="media-author-rules"><div class="media-toolbar"><h4>Author rules</h4>${source.source_key === "the-guardian" ? `<button class="media-button" data-add-author>+ Add author rule</button>` : ""}</div><div data-add-author-form></div>
       ${rules.length ? rules.map(authorRuleRow).join("") : `<p>No author rules.</p>`}</div></details>`;
