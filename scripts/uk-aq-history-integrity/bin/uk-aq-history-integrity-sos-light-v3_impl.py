@@ -29650,8 +29650,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     p.add_argument(
         "--source",
-        default="all",
-        choices=["openaq", "sensorcommunity", "sos", "waqn", "saqn", "all"],
+        required=True,
+        choices=["openaq", "sensorcommunity", "sos", "waqn", "saqn"],
         help="Source adapter filter (also scopes cross-check source rows).",
     )
     p.add_argument("--from-day", dest="from_day", default=None,
