@@ -4,6 +4,9 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
+import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -30,6 +33,7 @@ SENSITIVE_NAME_PARTS = (
 )
 DEFAULT_MAX_FILE_BYTES = 50 * 1024 * 1024
 DEFAULT_EXTRA_LOG_COUNT = 30
+DEFAULT_LAUNCHD_JOB_COUNT = 8
 DEFAULT_REPORT_COUNT = 10
 
 
@@ -186,6 +190,68 @@ def run_command(args: list[str], *, cwd: Path) -> str:
     return completed.stdout or ""
 
 
+def launchd_job_status(label: str) -> dict[str, object]:
+    """Collect bounded, non-sensitive launchctl state for a local job."""
+    target = f"gui/{os.getuid()}/{label}"
+    result: dict[str, object] = {"target": target}
+    if sys.platform != "darwin":
+        result["availability"] = "requires_macos"
+        return result
+    try:
+        completed = subprocess.run(
+            ["/bin/launchctl", "print", target],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        result["availability"] = f"query_failed: {type(error).__name__}"
+        return result
+
+    if completed.returncode != 0:
+        result["availability"] = "not_registered_or_unavailable"
+        return result
+
+    result["availability"] = "registered"
+    # Do not package raw launchctl output: it can contain environment values
+    # and full command-line arguments. Capture only useful scalar job status.
+    permitted = {
+        "state": "state",
+        "active count": "active_count",
+        "runs": "runs",
+        "last exit code": "last_exit_code",
+        "pid": "pid",
+    }
+    for line in completed.stdout.splitlines():
+        match = re.fullmatch(
+            r"\s*(state|active count|runs|last exit code|pid)\s*=\s*(.*?)\s*",
+            line,
+        )
+        if match:
+            key = permitted[match.group(1)]
+            value = match.group(2)
+            if key in {"active_count", "runs", "last_exit_code", "pid"}:
+                if value.isdecimal():
+                    result[key] = int(value)
+            else:
+                result[key] = value
+    return result
+
+
+def launchd_run_matches(log_path: Path, run_names: set[str]) -> list[str]:
+    """Associate a launchd stdout log with selected Integrity run IDs."""
+    if not run_names or not log_path.is_file() or log_path.is_symlink():
+        return []
+    try:
+        with log_path.open("rb") as handle:
+            header = handle.read(512 * 1024)
+    except OSError:
+        return []
+    return sorted(name for name in run_names if name.encode("utf-8") in header)
+
+
 def main() -> int:
     args = parse_args()
 
@@ -302,6 +368,23 @@ def main() -> int:
             for candidate in recent_logs:
                 copy_diagnostic(candidate)
 
+        # launchd writes the wrapper's combined stdout/stderr outside Dropbox.
+        # Include recent local logs, including descriptive --log-file names.
+        local_logs_root = state_root / "logs"
+        if local_logs_root.is_dir():
+            recent_local_logs = newest_paths(
+                (
+                    path
+                    for path in local_logs_root.rglob("*")
+                    if path.is_file()
+                    and (path.suffix.lower() in DIAGNOSTIC_SUFFIXES
+                         or path.name.lower() in {"stdout", "stderr"})
+                ),
+                DEFAULT_EXTRA_LOG_COUNT,
+            )
+            for candidate in recent_local_logs:
+                copy_diagnostic(candidate)
+
         # Include recent reports if the project keeps them outside tmp.
         if reports_root.is_dir():
             recent_reports = newest_paths(
@@ -316,9 +399,99 @@ def main() -> int:
             for candidate in recent_reports:
                 copy_diagnostic(candidate)
 
+        # Capture launchd job status without copying raw .plist or launchctl
+        # output. Both can contain command-line arguments or secrets.
+        # Recent jobs are included even when they failed before creating tmp.
+        launchd_jobs: list[dict[str, object]] = []
+        launchd_root = state_root / "launchd"
+        selected_run_names = {
+            run_root.name for run_root in run_roots
+            if run_root.name.startswith("run-")
+        }
+        if launchd_root.is_dir():
+            recent_plists = newest_paths(
+                (
+                    path for path in launchd_root.glob("co.uk.ukaq.integrity.*.plist")
+                    if path.is_file() and not path.is_symlink()
+                ),
+                DEFAULT_LAUNCHD_JOB_COUNT,
+            )
+            for plist_path in recent_plists:
+                try:
+                    if plist_path.stat().st_size > 1024 * 1024:
+                        raise ValueError("plist exceeds 1 MiB")
+                    with plist_path.open("rb") as handle:
+                        job = plistlib.load(handle)
+                    if not isinstance(job, dict):
+                        raise ValueError("plist is not a dictionary")
+                    label = job.get("Label")
+                    if (
+                        not isinstance(label, str)
+                        or label != plist_path.stem
+                        or not label.startswith(
+                            f"co.uk.ukaq.integrity.{environment.lower()}."
+                        )
+                    ):
+                        raise ValueError("unexpected launchd job label")
+                except (OSError, ValueError, TypeError) as error:
+                    skipped.append({
+                        "path": str(plist_path),
+                        "reason": f"invalid_launchd_job: {error}",
+                    })
+                    continue
+
+                program_arguments = job.get("ProgramArguments")
+                log_path: Path | None = None
+                if (
+                    isinstance(program_arguments, list)
+                    and len(program_arguments) >= 8
+                    and program_arguments[5] == "uk-aq-integrity-launchd"
+                    and isinstance(program_arguments[6], str)
+                ):
+                    candidate = Path(program_arguments[6])
+                    if candidate.is_absolute():
+                        log_path = candidate
+                        # Also handles --log-file paths outside state/logs.
+                        copy_diagnostic(log_path)
+
+                environment_variables = job.get("EnvironmentVariables")
+                if not isinstance(environment_variables, dict):
+                    environment_variables = {}
+                launchd_jobs.append({
+                    "label": label,
+                    "definition_path": str(plist_path),
+                    "log_path": str(log_path) if log_path else None,
+                    "matching_selected_runs": (
+                        launchd_run_matches(log_path, selected_run_names)
+                        if log_path is not None else []
+                    ),
+                    "working_directory": job.get("WorkingDirectory"),
+                    "run_at_load": job.get("RunAtLoad"),
+                    "keep_alive": job.get("KeepAlive"),
+                    "configured_path": environment_variables.get("PATH"),
+                    "status": launchd_job_status(label),
+                })
+
+        launchd_status_path = archive_state_root / "launchd" / "job-status.json"
+        launchd_status_path.parent.mkdir(parents=True, exist_ok=True)
+        launchd_status_path.write_text(
+            json.dumps({
+                "captured_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "environment": environment,
+                "selected_run_names": sorted(selected_run_names),
+                "note": (
+                    "Raw plist and launchctl print output are excluded because "
+                    "they may expose command-line arguments or environment values."
+                ),
+                "jobs": launchd_jobs,
+            }, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
         # Include launch scripts that help explain which flags/environment ran.
         launcher_candidates = [
             PROJECT_ROOT / "bin" / "uk-aq-history-integrity-sos-light-v2.sh",
+            PROJECT_ROOT / "bin" / "uk-aq-history-integrity-sos-light-local-wrapper-v3.sh",
             PROJECT_ROOT / "bin" / "uk-aq-history-integrity-sos-light-v3.sh",
             *sorted((PROJECT_ROOT / "bin").glob("*monthly*.sh")),
         ]
@@ -376,13 +549,17 @@ def main() -> int:
             "dropbox_logs_root": str(logs_root),
             "dropbox_reports_root": str(reports_root),
             "selected_tmp_run_roots": [str(path) for path in run_roots],
+            "launchd_jobs_inspected": len(launchd_jobs),
+            "launchd_status_archive_path": f"state/{environment}/launchd/job-status.json",
             "included_file_count": len(included),
             "included_files": included,
             "skipped_files": skipped,
             "notes": [
                 "Only diagnostic text/JSON/CSV/Markdown files were considered.",
                 "Parquet files, SQLite databases, env files, and obvious credential/token files were excluded.",
-                "Recent Dropbox logs and reports were added in addition to the selected local tmp run root.",
+                "Recent Dropbox, local Integrity and launchd logs were added in addition to the selected tmp run root.",
+                "Recent launchd job status and non-sensitive configuration details are in state/<ENV>/launchd/job-status.json.",
+                "Raw launchd plists and launchctl output were excluded to avoid disclosing command-line arguments.",
             ],
         }
         (staging_root / "bundle-manifest.json").write_text(
