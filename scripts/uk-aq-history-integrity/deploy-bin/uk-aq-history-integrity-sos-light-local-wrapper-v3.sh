@@ -162,6 +162,10 @@ export UK_AQ_ENV_NAME="${ENV_NAME}"
 export UK_AQ_OPS_REPO_ROOT="${OPS_REPO_ROOT}"
 export UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT="${LOCAL_ROOT}"
 if [[ "${USE_LAUNCHD}" == false ]]; then
+  # Foreground invocations must not reuse provenance inherited from another job.
+  unset UK_AQ_HISTORY_INTEGRITY_LAUNCHD_JOB_LABEL \
+    UK_AQ_HISTORY_INTEGRITY_LAUNCHD_DOMAIN \
+    UK_AQ_HISTORY_INTEGRITY_LAUNCHD_LOG_PATH
   exec "${RUNNER}" "${ORIGINAL_ARGS[@]}"
 fi
 
@@ -221,14 +225,14 @@ trap 'exit 129' HUP
 generate_launch_plist() {
   python3 - "${PLIST_FILE}" "${LOG_FILE}" "${JOB_LABEL}" \
   "${RUNNER}" "${ENV_NAME}" "${OPS_REPO_ROOT}" "${LOCAL_ROOT}" \
-  "${LAUNCH_PATH}" "${ORIGINAL_ARGS[@]}" <<'PYLAUNCH'
+  "${LAUNCH_PATH}" "${LAUNCH_DOMAIN}" "${ORIGINAL_ARGS[@]}" <<'PYLAUNCH'
 import os
 from pathlib import Path
 import plistlib
 import stat
 import sys
 
-plist_path, log_path, label, runner, env, repo, local_root, path = sys.argv[1:9]
+plist_path, log_path, label, runner, env, repo, local_root, path, domain = sys.argv[1:10]
 job = {
     "Label": label,
     # Static shell code only: $0 is a descriptive name; $1 is the log path.
@@ -236,12 +240,16 @@ job = {
     # stdout descriptor is duplicated to stderr before the runner starts.
     "ProgramArguments": ["/bin/bash", "--noprofile", "--norc", "-c",
                          'exec >>"$1" 2>&1; shift; exec "$@"',
-                         "uk-aq-integrity-launchd", log_path, runner, *sys.argv[9:]],
+                         "uk-aq-integrity-launchd", log_path, runner, *sys.argv[10:]],
     "EnvironmentVariables": {
         "PATH": path,
         "UK_AQ_ENV_NAME": env,
         "UK_AQ_OPS_REPO_ROOT": repo,
         "UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT": local_root,
+        # Invocation-only provenance; never populate these from repository .env.
+        "UK_AQ_HISTORY_INTEGRITY_LAUNCHD_JOB_LABEL": label,
+        "UK_AQ_HISTORY_INTEGRITY_LAUNCHD_DOMAIN": domain,
+        "UK_AQ_HISTORY_INTEGRITY_LAUNCHD_LOG_PATH": log_path,
     },
     "WorkingDirectory": repo,
     "RunAtLoad": True,

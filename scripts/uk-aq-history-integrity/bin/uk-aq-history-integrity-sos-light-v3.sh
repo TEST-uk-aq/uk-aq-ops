@@ -105,6 +105,13 @@ LOCAL_ROOT="${UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT:-/Users/mikehinford/uk-aq-histo
 [[ "${LOCAL_ROOT}" = /* ]] || error "UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT must be absolute"
 reject_archive_path "UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT" "${LOCAL_ROOT}"
 
+# Capture the launcher's non-secret, invocation-only provenance before .env loads.
+LAUNCHD_METADATA=(
+  "${UK_AQ_HISTORY_INTEGRITY_LAUNCHD_JOB_LABEL:-}"
+  "${UK_AQ_HISTORY_INTEGRITY_LAUNCHD_DOMAIN:-}"
+  "${UK_AQ_HISTORY_INTEGRITY_LAUNCHD_LOG_PATH:-}"
+)
+
 load_env_file_safe() {
   local env_path="${1}"
   python3 - "${env_path}" <<'PYENV'
@@ -185,6 +192,11 @@ apply_env_file_safe() {
 }
 
 apply_env_file_safe "${ROOT_ENV_FILE}"
+
+# Empty values also prevent the coordinator's .env loader supplying stale defaults.
+export UK_AQ_HISTORY_INTEGRITY_LAUNCHD_JOB_LABEL="${LAUNCHD_METADATA[0]}"
+export UK_AQ_HISTORY_INTEGRITY_LAUNCHD_DOMAIN="${LAUNCHD_METADATA[1]}"
+export UK_AQ_HISTORY_INTEGRITY_LAUNCHD_LOG_PATH="${LAUNCHD_METADATA[2]}"
 
 if [[ "$(printf '%s' "${UKAQ_ENV_NAME:-}" | sed 's/[[:space:]]*$//')" != "${ENV_NAME}" ]]; then
   error "UKAQ_ENV_NAME in the selected repository root .env does not match --env=${ENV_NAME}"
