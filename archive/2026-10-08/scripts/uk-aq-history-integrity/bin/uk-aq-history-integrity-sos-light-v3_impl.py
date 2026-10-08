@@ -79,7 +79,6 @@ from integrity.current_state.audit import (
     start_target_attempt,
 )
 from integrity.runtime import CANONICAL_REPAIR_STAGE_ORDER
-from integrity.history_cache import freeze_plan, prepare_verified_event, deliver_after_lock
 from integrity.timeseries_binding_provider import (
     PackedBindingError,
     binding_backup_view,
@@ -27017,16 +27016,6 @@ def run_integrity_under_global_operation_lock(
         },
         check=False,
     )
-    if args.env == "TEST" and args.run_backfill and not args.dry_run and not args.check_only:
-        try:
-            deliver_after_lock(
-                state_path=Path(env["UK_AQ_HISTORY_INTEGRITY_TMP_DIR"]) / f"run-{run_compact}" / "run-state.json",
-                settings={**os.environ, **{str(key): str(value) for key, value in env.items()}},
-                log_path=Path(log_path),
-                report_path=Path(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"]) / f"{run_compact}-summary.json",
-            )
-        except Exception as exc:
-            sys.stderr.write(f"History cache delivery remains pending ({type(exc).__name__}); repair exit status preserved.\n")
     return int(completed.returncode)
 
 
@@ -29185,21 +29174,6 @@ def run_v2_integrity_repair_flow(
             "reason": "repair_dry_run",
         }
     else:
-        if env_name == "TEST":
-            run_state["history_cache_generation"] = CURRENT_INTEGRITY_HISTORY_VERSION
-            try:
-                run_state["history_cache_plan"] = freeze_plan(
-                    run_state, CURRENT_INTEGRITY_HISTORY_VERSION,
-                    resolve_path=resolve_combined_local_path,
-                    load_rows=_observation_rows_from_local_parquet_for_shared_hash,
-                    node_bin=str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node"),
-                    preserved_outcomes=list(observations.get("selected_partition_outcomes") or []),
-                )
-            except Exception as exc:
-                run_state["history_cache_plan"] = {
-                    "status": "unresolved", "error": type(exc).__name__ + ":cache_plan_unavailable",
-                }
-            write_run_state(run_state)
         apply_result = run_canonical_apply_executor(run_state=run_state, env=env, log=log)
         record_integrity_object_operations(
             conn, run_id=run_id, run_state=run_state, log=log,
@@ -29316,22 +29290,6 @@ def run_v2_integrity_repair_flow(
             apply_result=apply_result,
             planned_operation_counts=planned_operation_counts,
         )
-    # Persist verified publication independently before current-state reconciliation.
-    # Network delivery happens only in the outer invocation after the global lock exits.
-    if env_name == "TEST" and not dry_run:
-        run_state["history_cache_verified_final"] = dict(final_verification)
-        run_state["history_cache_verified_apply"] = {"status": apply_result.get("status")}
-        try:
-            run_state["history_cache_invalidation"] = prepare_verified_event(
-                run_state, final=final_verification, apply_result=apply_result, dry_run=dry_run,
-            )
-            write_run_state(run_state)
-        except Exception as exc:
-            run_state["history_cache_invalidation"] = {
-                "status": "pending", "retryable": True,
-                "error": type(exc).__name__ + ":cache_event_persistence_unavailable",
-            }
-            log.warning("History cache event remains pending (%s); verified repair criteria unchanged", type(exc).__name__)
     all_observation_repair_entries = [
         entry
         for entry in list(
@@ -29636,7 +29594,6 @@ def run_v2_integrity_repair_flow(
             "exact_tombstones_created"
         ),
         "canonical_apply": apply_result,
-        "history_cache_invalidation": run_state.get("history_cache_invalidation"),
         **apply_reporting,
         "latest_snapshot_auth_preflight": auth_preflight,
         "first_value_at_reconciliation": first_value_at_reconciliation,
@@ -32369,12 +32326,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 ),
                 "",
             ])
-    cache_delivery = repair_flow.get("history_cache_invalidation") or s.get("history_cache_invalidation")
-    if cache_delivery:
-        lines.extend(["", "## History cache invalidation", "",
-                      f"- Status: {cache_delivery.get('status')}",
-                      f"- Retry eligible: {cache_delivery.get('retryable', False)}",
-                      f"- Audit: {cache_delivery.get('event_path', '(pending event persistence)')}"])
     reported_current_state = s.get("current_state_reconciliation") or {}
     if reported_current_state and not repair_flow.get("current_state_reconciliation"):
         lines.extend([

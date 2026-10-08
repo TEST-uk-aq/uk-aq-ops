@@ -1,0 +1,11 @@
+{
+  "environment": "TEST",
+  "reader_hostname": "history-test.sleepercar.co.uk",
+  "reader_zone_name": "sleepercar.co.uk",
+  "proxy_hostname": "cic-test.chronicillnesschannel.co.uk",
+  "proxy_zone_name": "chronicillnesschannel.co.uk",
+  "tag_template": "ukaq-test-history-{generation}-ts-{timeseries_id}",
+  "cutover_marker": "tagged-history-1",
+  "max_response_tags": 128,
+  "purge_batch_size": 100
+}

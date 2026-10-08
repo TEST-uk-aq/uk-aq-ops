@@ -1,4 +1,3 @@
-import { applyHistoryDependencyHeaders, authenticatedHistoryTags, historyCacheEnabled, historyCacheKeyUrl, HISTORY_CACHE_CONTRACT } from "../shared/uk_aq_history_cache.mjs";
 import observationHistoryV3 from "./worker_v3.mjs";
 import { resolveObservationHistoryGeneration } from "../shared/uk_aq_observation_history_generation.mjs";
 import { observationHistoryPhysicalSchemaForColumns, selectObservationVerificationStatusColumn } from "../shared/uk_aq_observation_history_schema.mjs";
@@ -816,7 +815,7 @@ export function buildCanonicalCacheKey(requestUrl, {
   endIso,
   sinceIso,
   limit,
-}, readVersion = "v1", verificationIdentity = null, env = {}) {
+}, readVersion = "v1", verificationIdentity = null) {
   const cacheUrl = new URL(requestUrl);
   cacheUrl.pathname = "/v1/observations";
   cacheUrl.search = "";
@@ -839,10 +838,10 @@ export function buildCanonicalCacheKey(requestUrl, {
   if (limit !== null) {
     cacheUrl.searchParams.set("limit", String(limit));
   }
-  return new Request(historyCacheKeyUrl(cacheUrl.toString(), env).toString(), { method: "GET" });
+  return new Request(cacheUrl.toString(), { method: "GET" });
 }
 
-function buildTimeseriesBindingCacheKey(requestUrl, requestParams, env = {}) {
+function buildTimeseriesBindingCacheKey(requestUrl, requestParams) {
   const cacheUrl = new URL(requestUrl);
   cacheUrl.pathname = "/v1/timeseries-binding";
   cacheUrl.search = "";
@@ -850,7 +849,7 @@ function buildTimeseriesBindingCacheKey(requestUrl, requestParams, env = {}) {
   cacheUrl.searchParams.set("timeseries_id", String(requestParams.timeseriesId));
   cacheUrl.searchParams.set("__ukaq_observs_history_read_v", "v2");
   cacheUrl.searchParams.set("__ukaq_observs_history_cache_gen", TIMESERIES_BINDING_CACHE_GENERATION);
-  return new Request(historyCacheKeyUrl(cacheUrl.toString(), env).toString(), { method: "GET" });
+  return new Request(cacheUrl.toString(), { method: "GET" });
 }
 
 function extractParquetKeysFromTimeseriesIndex(
@@ -1585,9 +1584,6 @@ export default {
     }
 
     const requestUrl = new URL(request.url);
-    if (historyCacheEnabled(env) && requestUrl.hostname !== HISTORY_CACHE_CONTRACT.reader_hostname) {
-      return jsonResponse({ ok: false, error: "history_custom_domain_required" }, { status: 503, noStore: true });
-    }
     if (requestUrl.pathname === DAILY_PROVENANCE_PATH) {
       const requestParams = parseDailyProvenanceRequest(requestUrl);
       if (!requestParams.ok) {
@@ -1606,7 +1602,7 @@ export default {
           noStore: true,
         });
       }
-      const cacheKey = buildTimeseriesBindingCacheKey(request.url, requestParams, env);
+      const cacheKey = buildTimeseriesBindingCacheKey(request.url, requestParams);
       const cached = await caches.default.match(cacheKey);
       if (cached) return withCacheMarker(cached, "HIT");
       const response = await handleTimeseriesBindingRequest(requestParams, env);
@@ -1639,10 +1635,9 @@ export default {
       requestParams,
       readVersion,
       verificationManifestIdentity?.sha256 || null,
-      env,
     );
     const cached = await caches.default.match(cacheKey);
-    if (cached && (!historyCacheEnabled(env) || authenticatedHistoryTags(cached.headers, env))) {
+    if (cached) {
       return withCacheMarker(cached, "HIT");
     }
 
@@ -1690,11 +1685,6 @@ export default {
     const eligibility = await inspectObservationsCacheEligibility(response);
     response = withObservationsCacheDiagnostics(response, eligibility);
     if (response.ok && eligibility.cache_eligible) {
-      const payload = await response.clone().json().catch(() => null);
-      const headers = applyHistoryDependencyHeaders(new Headers(response.headers), env, [payload?.timeseries_id]);
-      response = new Response(response.body, { status: response.status, headers });
-    }
-    if (response.ok && eligibility.cache_eligible && !response.headers.get("Cache-Control")?.includes("no-store")) {
       ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
     }
     return withCacheMarker(response, "MISS");

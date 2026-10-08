@@ -1,4 +1,3 @@
-import { applyHistoryDependencyHeaders } from "../../shared/uk_aq_history_cache.mjs";
 import {
   dedupeSourceObservationRows,
   helperRowsToNormalizedAqiV1Rows,
@@ -641,7 +640,7 @@ async function buildFeatureStationSeries(request, bindingContext, env, policy, n
       combined.aqi.next_chunk_end_utc = outputStartMs > request.startMs ? new Date(outputStartMs).toISOString() : null;
       combined.aqi.next_older_aqi_chunk_end_utc = combined.aqi.next_chunk_end_utc;
     }
-    return { body: combined, continuity, cacheTimeseriesIds: ingestSegments.map((segment) => segment.timeseriesId) };
+    return { body: combined, continuity };
   }
   const legacy = await buildStationSeries(request, env, nowMs, observationReadBudget);
   return {
@@ -652,7 +651,6 @@ async function buildFeatureStationSeries(request, bindingContext, env, policy, n
       observations: request.includeObservations ? combined.observations : disabledObservationSection(),
     },
     continuity,
-    cacheTimeseriesIds: [...new Set([...ingestSegments.map((segment) => segment.timeseriesId), request.timeseriesId])],
   };
 }
 
@@ -744,7 +742,7 @@ async function handleObservationHistoryChunk(request, env, ctx) {
           console.warn(JSON.stringify({ event: "station_history_aqi_validation_error", error: error instanceof Error ? error.message : String(error) }));
         }));
       }
-      return new Response(JSON.stringify(body), { status: 200, headers: applyHistoryDependencyHeaders(chunkHeaders(body), env, selectContinuitySegments(continuity, chunk.startMs - chunk.contextHours * HOUR_MS, chunk.endMs + (chunk.includeAqi ? 1 : 0)).segments.map((member) => member.timeseriesId)) });
+      return new Response(JSON.stringify(body), { status: 200, headers: chunkHeaders(body) });
     } catch (error) {
       return identityErrorResponse(error, url.pathname) || errorResponse(502, error instanceof Error ? error.message : "observation_history_combined_failed", url.pathname);
     }
@@ -769,7 +767,7 @@ async function handleObservationHistoryChunk(request, env, ctx) {
         connector_id: chunk.connectorId,
         pollutant: chunk.pollutant,
       }, Date.now(), { physicalPageLimit: STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET });
-      return new Response(JSON.stringify(body), { status: 200, headers: applyHistoryDependencyHeaders(chunkHeaders(body), env, [chunk.timeseriesId]) });
+      return new Response(JSON.stringify(body), { status: 200, headers: chunkHeaders(body) });
     } catch (error) {
       return errorResponse(502, error instanceof Error ? error.message : "observation_history_r2_failed", url.pathname);
     }
@@ -781,7 +779,7 @@ async function handleObservationHistoryChunk(request, env, ctx) {
     endMs: chunk.endMs,
     limit: chunk.limit,
   });
-  try { const body = buildObservationHistoryChunk(chunk, await fetchJsonUpstream(target, secret, "observation_history_r2_failed")); return new Response(JSON.stringify(body), { status: 200, headers: applyHistoryDependencyHeaders(chunkHeaders(body), env, [chunk.timeseriesId]) }); }
+  try { const body = buildObservationHistoryChunk(chunk, await fetchJsonUpstream(target, secret, "observation_history_r2_failed")); return new Response(JSON.stringify(body), { status: 200, headers: chunkHeaders(body) }); }
   catch (error) { return errorResponse(502, error instanceof Error ? error.message : "observation_history_r2_failed", url.pathname); }
 }
 
@@ -815,7 +813,7 @@ export default {
           console.warn(JSON.stringify({ event: "station_history_aqi_validation_error", error: error instanceof Error ? error.message : String(error) }));
         }));
       }
-      return new Response(JSON.stringify(body), { status: 200, headers: applyHistoryDependencyHeaders(headersFor({ "Content-Type": "application/json; charset=utf-8", "Cache-Control": complete ? "public, max-age=60, s-maxage=60" : "no-store", "X-UK-AQ-Station-History-Source-Mode": body.source.mode, "X-UK-AQ-Station-History-Ingest-Fetches": String(body.source.ingest_fetch_count) }), env, built.cacheTimeseriesIds || [identity.timeseriesId]) });
+      return new Response(JSON.stringify(body), { status: 200, headers: headersFor({ "Content-Type": "application/json; charset=utf-8", "Cache-Control": complete ? "public, max-age=60, s-maxage=60" : "no-store", "X-UK-AQ-Station-History-Source-Mode": body.source.mode, "X-UK-AQ-Station-History-Ingest-Fetches": String(body.source.ingest_fetch_count) }) });
     } catch (error) {
       return ingestErrorResponse(error, url.pathname)
         || identityErrorResponse(error, url.pathname)

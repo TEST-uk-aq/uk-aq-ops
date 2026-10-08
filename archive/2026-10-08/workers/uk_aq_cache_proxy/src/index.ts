@@ -1,4 +1,3 @@
-import { authenticatedHistoryTags, historyCacheEnabled, historyCacheKeyUrl, HISTORY_CACHE_CONTRACT } from "../../shared/uk_aq_history_cache.mjs";
 import { resolveObservationHistoryGeneration } from "../../shared/uk_aq_observation_history_generation.mjs";
 import {
   buildTimeseriesV2SupabaseFillPlan,
@@ -17,7 +16,6 @@ import * as stationHistoryStaleCache from "./station_history/stale_cache.mjs";
 
 export interface Env {
   UK_AQ_R2_HISTORY_VERSION: unknown;
-  UK_AQ_ENV_NAME: unknown;
   STATION_HISTORY?: { fetch(input: Request | string, init?: RequestInit): Promise<Response> };
   SUPABASE_URL: unknown;
   SB_PUBLISHABLE_DEFAULT_KEY: unknown;
@@ -3085,19 +3083,9 @@ export default {
       return makeErrorResponse(500, "missing_upstream_auth_secret", requestOrigin, allowedOrigins);
     }
 
-    let shouldUseCache = shouldCacheRequest(request, bypassRequested);
+    const shouldUseCache = shouldCacheRequest(request, bypassRequested);
     const cache = (caches as unknown as { default: Cache }).default;
-    const historyCacheEnv = {
-      UK_AQ_ENV_NAME: await readSecret(env.UK_AQ_ENV_NAME),
-      UK_AQ_R2_HISTORY_VERSION: await readSecret(env.UK_AQ_R2_HISTORY_VERSION),
-    };
-    const historyDependentRoute = Boolean(stationHistoryInternalRoute || usingStationSeriesUpstream || upstreamFunction === TIMESERIES_UPSTREAM_FUNCTION || usingExternalAqiHistoryUpstream);
-    const targetedHistoryCache = historyDependentRoute && historyCacheEnabled(historyCacheEnv);
-    const historyCacheOwned = !targetedHistoryCache || url.hostname === HISTORY_CACHE_CONTRACT.proxy_hostname;
-    if (!historyCacheOwned) shouldUseCache = false;
-    const historyCacheUrl = historyDependentRoute
-      ? historyCacheKeyUrl(normalizedRequestUrl.toString(), historyCacheEnv)
-      : new URL(normalizedRequestUrl.toString());
+    const historyCacheUrl = new URL(normalizedRequestUrl.toString());
     if (stationHistoryInternalRoute || usingStationSeriesUpstream || useTimeseriesV2Skeleton || usingExternalAqiHistoryUpstream) {
       try {
         const generation = resolveObservationHistoryGeneration({
@@ -3116,9 +3104,6 @@ export default {
 
     if (shouldUseCache && request.method === "GET") {
       let cachedResponse = await cache.match(cacheKey);
-      if (cachedResponse && targetedHistoryCache && !authenticatedHistoryTags(cachedResponse.headers, historyCacheEnv)) {
-        cachedResponse = undefined;
-      }
       if (
         cachedResponse
         && stationHistoryStaleRequestSupported
@@ -3256,7 +3241,6 @@ export default {
       }
       addCorsHeaders(responseHeaders, requestOrigin, allowedOrigins);
 
-      if (targetedHistoryCache) responseHeaders.set("Cache-Control", "no-store");
       if (matchesIfNoneMatch(request.headers.get("If-None-Match"), etag)) {
         const notModifiedHeaders = new Headers(responseHeaders);
         return new Response(null, { status: 304, headers: notModifiedHeaders });
@@ -3266,7 +3250,7 @@ export default {
         status: 200,
         headers: responseHeaders,
       });
-      if (!targetedHistoryCache && timeseriesResponseCacheable && shouldUseCache && request.method === "GET") {
+      if (timeseriesResponseCacheable && shouldUseCache && request.method === "GET") {
         ctx.waitUntil(cache.put(cacheKey, stitchedResponse.clone()));
       }
       return stitchedResponse;
@@ -3308,7 +3292,6 @@ export default {
         if (!storedStale || !stationHistoryStaleCache.isValidStaleCacheResponse(storedStale)) {
           return null;
         }
-        if (targetedHistoryCache && !authenticatedHistoryTags(storedStale.headers, historyCacheEnv)) return null;
         if (!await stationHistoryCacheKeys.cachedStationSeriesIdentityMatchesRequest(
           storedStale,
           url,
@@ -3348,8 +3331,6 @@ export default {
         const staleResponse = await tryStaleFallback(`upstream_status_${internalResponse.status}`);
         if (staleResponse) return staleResponse;
       }
-      const dependencyTags = targetedHistoryCache && historyCacheOwned ? authenticatedHistoryTags(internalResponse.headers, historyCacheEnv) : null;
-      const dependenciesCacheable = !targetedHistoryCache || Boolean(dependencyTags);
       const stationHistoryInspection = stationHistoryStaleRequestSupported
         ? await stationHistoryStaleCache.inspectStationHistoryResponse(
           internalResponse.clone(),
@@ -3357,10 +3338,6 @@ export default {
         )
         : null;
       const responseHeaders = new Headers(internalResponse.headers);
-      if (targetedHistoryCache) {
-        if (dependencyTags) responseHeaders.set("Cache-Tag", dependencyTags.join(","));
-        else responseHeaders.set("Cache-Control", "no-store");
-      }
       responseHeaders.delete("Set-Cookie");
       responseHeaders.set("X-UK-AQ-Cache", shouldUseCache ? "MISS" : "BYPASS");
       responseHeaders.set("X-UK-AQ-Cache-Profile", profileName);
@@ -3370,7 +3347,6 @@ export default {
       let stationHistoryCachePolicy: ReturnType<typeof stationHistoryStaleCache.resolveRouteCachePolicy> | null = null;
       if (
         stationHistoryInspection?.cacheable
-        && dependenciesCacheable
         && shouldUseCache
         && request.method === "GET"
         && stationHistoryVersionedKeys
@@ -3421,7 +3397,6 @@ export default {
         ]));
       } else if (
         !stationHistoryStaleRequestSupported
-        && dependenciesCacheable
         && shouldUseCache
         && request.method === "GET"
         && isCacheableUpstreamResponse(internalResponse, { allowAqiAuthenticatedNoStore: usingExternalAqiHistoryUpstream })
@@ -3549,16 +3524,11 @@ export default {
       );
     }
 
-    const upstreamDependencyTags = targetedHistoryCache && historyCacheOwned ? authenticatedHistoryTags(upstreamResponse.headers, historyCacheEnv) : null;
-    const upstreamResponseCacheable = (!targetedHistoryCache || Boolean(upstreamDependencyTags)) && isCacheableUpstreamResponse(upstreamResponse, {
+    const upstreamResponseCacheable = isCacheableUpstreamResponse(upstreamResponse, {
       allowAqiAuthenticatedNoStore: usingExternalAqiHistoryUpstream,
     });
     const cacheStatusLabel: "MISS" | "HIT" | "BYPASS" = shouldUseCache ? "MISS" : "BYPASS";
     const responseHeaders = new Headers(upstreamResponse.headers);
-    if (targetedHistoryCache) {
-      if (upstreamDependencyTags) responseHeaders.set("Cache-Tag", upstreamDependencyTags.join(","));
-      else responseHeaders.set("Cache-Control", "no-store");
-    }
     responseHeaders.delete("Set-Cookie");
     responseHeaders.set("X-UK-AQ-Cache", cacheStatusLabel);
     responseHeaders.set("X-UK-AQ-Cache-Profile", profileName);

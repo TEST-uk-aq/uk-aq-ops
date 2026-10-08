@@ -1,4 +1,3 @@
-import { applyHistoryDependencyHeaders, authenticatedHistoryTags, historyCacheEnabled, historyCacheKeyUrl, HISTORY_CACHE_CONTRACT } from "../shared/uk_aq_history_cache.mjs";
 import { resolveObservationHistoryGeneration, getObservationHistoryGeneration } from "../shared/uk_aq_observation_history_generation.mjs";
 import {
   createR2ObservationHistoryV3Source,
@@ -505,8 +504,8 @@ function cachePolicy(endIso) {
   return { scope: immutable ? "immutable" : "recent", seconds: immutable ? DEFAULT_IMMUTABLE_CACHE_SECONDS : DEFAULT_MUTABLE_CACHE_SECONDS };
 }
 
-function cacheKey(requestUrl, generation, verificationIdentity = null, env = {}) {
-  const url = historyCacheKeyUrl(requestUrl, env);
+function cacheKey(requestUrl, generation, verificationIdentity = null) {
+  const url = new URL(requestUrl);
   url.searchParams.set("__ukaq_observs_history_read_v", generation);
   url.searchParams.set("__ukaq_observs_history_cache_gen", generation === INDEX_GENERATION ? RESPONSE_CACHE_GENERATION : TIMESERIES_BINDING_CACHE_GENERATION);
   if (verificationIdentity) {
@@ -692,9 +691,6 @@ export default {
     const auth = authorize(request, env);
     if (!auth.ok) return jsonResponse({ ok: false, error: auth.error }, { status: auth.status, noStore: true });
     const url = new URL(request.url);
-    if (historyCacheEnabled(env) && url.hostname !== HISTORY_CACHE_CONTRACT.reader_hostname) {
-      return jsonResponse({ ok: false, error: "history_custom_domain_required" }, { status: 503, noStore: true });
-    }
     let context = null;
     try {
       assertGenerationConfiguration(env);
@@ -707,7 +703,7 @@ export default {
         assertGenerationConfiguration(env);
         const params = parseBindingRequest(url);
         if (!params.ok) return jsonResponse({ ok: false, error: params.error }, { status: params.status, noStore: true });
-        const key = cacheKey(request.url, "v3-binding", null, env);
+        const key = cacheKey(request.url, "v3-binding");
         const cached = await caches.default.match(key);
         if (cached) return withCacheHeaders(cached, "HIT", TIMESERIES_BINDING_CACHE_GENERATION);
         const response = await handleBinding(params, env);
@@ -759,28 +755,23 @@ export default {
         request.url,
         INDEX_GENERATION,
         verificationManifestIdentity?.sha256 || null,
-        env,
       );
       const cached = await caches.default.match(key);
-      if (cached && (!historyCacheEnabled(env) || authenticatedHistoryTags(cached.headers, env))) return withCacheHeaders(cached, "HIT", RESPONSE_CACHE_GENERATION);
+      if (cached) return withCacheHeaders(cached, "HIT", RESPONSE_CACHE_GENERATION);
       const verificationAuthority = await loadObservationVerificationAuthority({
         bucket: env.UK_AQ_HISTORY_BUCKET,
         connectorId: params.connectorId,
         discovery: verificationDiscovery,
         cache: caches.default,
       });
-      let response = await handleObservations(
+      const response = await handleObservations(
         params,
         env,
         null,
         verificationAuthority,
       );
       const payload = await response.clone().json().catch(() => null);
-      if (response.ok) {
-        const headers = applyHistoryDependencyHeaders(new Headers(response.headers), env, [payload?.timeseries_id]);
-        response = new Response(response.body, { status: response.status, headers });
-      }
-      if (!response.headers.get("Cache-Control")?.includes("no-store") && response.ok && payload?.response_complete === true && payload?.has_gap !== true) {
+      if (response.ok && payload?.response_complete === true && payload?.has_gap !== true) {
         ctx?.waitUntil?.(caches.default.put(key, response.clone()));
       }
       return withCacheHeaders(response, "MISS", RESPONSE_CACHE_GENERATION);

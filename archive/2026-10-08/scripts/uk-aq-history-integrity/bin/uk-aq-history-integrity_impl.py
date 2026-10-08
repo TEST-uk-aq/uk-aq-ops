@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""UK-AQ SOS-light v3 History Integrity — entrypoint.
+"""UK-AQ History Integrity — entrypoint.
 
 Phase 1: env loading, guardrails, schema, run row + report.
 Phase 2: core snapshot import from the local Dropbox R2 history backup.
@@ -79,23 +79,11 @@ from integrity.current_state.audit import (
     start_target_attempt,
 )
 from integrity.runtime import CANONICAL_REPAIR_STAGE_ORDER
-from integrity.history_cache import freeze_plan, prepare_verified_event, deliver_after_lock
-from integrity.timeseries_binding_provider import (
-    PackedBindingError,
-    binding_backup_view,
-)
+from integrity.timeseries_binding_provider import binding_backup_view
 from integrity.official_network_rdata import (
-    AuthoritativeSourceArtifactAbsent,
-    COVERAGE_AUTHORITATIVE_NO_COVERAGE,
-    COVERAGE_INDETERMINATE,
-    COVERAGE_REQUIRED,
     NETWORKS as OFFICIAL_RDATA_NETWORKS,
     RDATA_COLUMN_TO_POLLUTANT,
-    canonical_day_has_available_window as official_rdata_day_has_available_window,
     canonical_rows_for_site_year,
-    canonical_timestamp_is_in_windows as official_rdata_timestamp_is_in_windows,
-    canonical_unavailable_windows as official_rdata_canonical_unavailable_windows,
-    classify_site_year_coverage,
     download_pinned as download_official_rdata_pinned,
     extract_metadata as extract_official_rdata_metadata,
     extract_site_year as extract_official_rdata_site_year,
@@ -150,8 +138,8 @@ DROPBOX_APP_ROOT = Path(
     "/Users/mikehinford/Dropbox/Apps/github-uk-air-quality-networks",
 )
 DEFAULT_R2_HISTORY_DROPBOX_DIR = "R2_history_backup"
-CURRENT_INTEGRITY_HISTORY_VERSION = "v3"
-CURRENT_INTEGRITY_CORE_PREFIX = "history/v3/core"
+CURRENT_INTEGRITY_HISTORY_VERSION = "v2"
+CURRENT_INTEGRITY_CORE_PREFIX = "history/v2/core"
 SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH = (
     "sos_light"
 )
@@ -257,11 +245,11 @@ CROSS_CHECK_BACKFILL_CONNECTOR_CODES_BY_FILTER: dict[str, tuple[str, ...]] = {
 OFFICIAL_RDATA_RUN_CONTEXTS: dict[str, dict[str, Any]] = {}
 
 # Subset of core tables that the integrity DB needs. Other tables in the
-# manifest (categories, offerings, features, procedures, networks, sos_*,
-# station_metadata)
+# manifest (categories, observed_properties, offerings, features, procedures,
+# networks, sos_*, station_metadata)
 # are accepted in the manifest but not imported in this phase.
 CORE_TABLES_TO_IMPORT = (
-    "connectors", "stations", "timeseries", "phenomena", "observed_properties",
+    "connectors", "stations", "timeseries", "phenomena",
     "observed_property_mappings", "sos_station_timeseries_site_refs",
 )
 
@@ -279,7 +267,6 @@ CREATE TABLE IF NOT EXISTS core_snapshot_imports (
   rows_stations INTEGER DEFAULT 0,
   rows_timeseries INTEGER DEFAULT 0,
   rows_pollutants INTEGER DEFAULT 0,
-  rows_observed_properties INTEGER DEFAULT 0,
   rows_lookup INTEGER DEFAULT 0,
   rows_sos_site_ref_bridge INTEGER DEFAULT 0,
   sos_site_ref_bridge_sha256 TEXT,
@@ -341,15 +328,6 @@ CREATE TABLE IF NOT EXISTS core_phenomena_snapshot (
   observed_property_id INTEGER,
   connector_id INTEGER NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS core_observed_properties_snapshot (
-  id INTEGER PRIMARY KEY,
-  code TEXT,
-  display_name TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_core_observed_properties_snapshot_code
-  ON core_observed_properties_snapshot(code);
 
 CREATE TABLE IF NOT EXISTS core_observed_property_mappings_snapshot (
   id INTEGER PRIMARY KEY,
@@ -882,14 +860,17 @@ def _core_snapshot_identity_relationship_warnings(
                OR s.id IS NULL OR c.id IS NULL OR p.id IS NULL
                OR s.connector_id != t.connector_id
         """,
-        "phenomenon_observed_property": """
+        "phenomenon_observed_property_mapping": """
             SELECT COUNT(*)
             FROM core_phenomena_snapshot p
-            LEFT JOIN core_observed_properties_snapshot o
-              ON o.id = p.observed_property_id
             WHERE p.id IS NULL OR p.connector_id IS NULL
                OR p.observed_property_id IS NULL
-               OR o.id IS NULL OR TRIM(COALESCE(o.code, '')) = ''
+               OR NOT EXISTS (
+                   SELECT 1
+                   FROM core_observed_property_mappings_snapshot m
+                   WHERE m.connector_id = p.connector_id
+                     AND m.observed_property_id = p.observed_property_id
+               )
         """,
     }
     warnings: list[dict[str, Any]] = []
@@ -1531,14 +1512,7 @@ def snapshot_tables_have_rows(
     mappings = conn.execute(
         "SELECT COUNT(*) FROM core_observed_property_mappings_snapshot"
     ).fetchone()
-    observed_properties = conn.execute(
-        "SELECT COUNT(*) FROM core_observed_properties_snapshot"
-    ).fetchone()
-    if not bool(
-        stations and stations[0] > 0
-        and mappings and mappings[0] > 0
-        and observed_properties and observed_properties[0] > 0
-    ):
+    if not bool(stations and stations[0] > 0 and mappings and mappings[0] > 0):
         return False
     if manifest is None:
         return _table_exists(conn, "sos_station_timeseries_site_refs_snapshot")
@@ -1675,23 +1649,6 @@ def _phenomena_insert_spec() -> tuple[str, Any]:
     return sql, to_tuple
 
 
-def _observed_properties_insert_spec() -> tuple[str, Any]:
-    sql = (
-        "INSERT INTO core_observed_properties_snapshot "
-        "(id, code, display_name) VALUES (?, ?, ?)"
-    )
-    def to_tuple(r: dict[str, Any]) -> tuple:
-        observed_property_id = _row_get_int(r, "id")
-        if observed_property_id is None or observed_property_id <= 0:
-            raise ValueError("observed_properties row has invalid id")
-        return (
-            observed_property_id,
-            _row_get_str(r, "code"),
-            _row_get_str(r, "display_name"),
-        )
-    return sql, to_tuple
-
-
 def _observed_property_mappings_insert_spec() -> tuple[str, Any]:
     sql = (
         "INSERT INTO core_observed_property_mappings_snapshot "
@@ -1754,7 +1711,6 @@ _INSERT_SPECS = {
     "stations":   _stations_insert_spec,
     "timeseries": _timeseries_insert_spec,
     "phenomena":  _phenomena_insert_spec,
-    "observed_properties": _observed_properties_insert_spec,
     "observed_property_mappings": _observed_property_mappings_insert_spec,
     "sos_station_timeseries_site_refs": _sos_site_ref_bridge_insert_spec,
 }
@@ -1764,7 +1720,6 @@ _TARGET_TABLES = {
     "stations":   "core_stations_snapshot",
     "timeseries": "core_timeseries_snapshot",
     "phenomena":  "core_phenomena_snapshot",
-    "observed_properties": "core_observed_properties_snapshot",
     "observed_property_mappings": "core_observed_property_mappings_snapshot",
     "sos_station_timeseries_site_refs":
         "sos_station_timeseries_site_refs_snapshot",
@@ -1866,20 +1821,20 @@ def _build_lookup(conn: sqlite3.Connection, log: logging.Logger) -> int:
 
 def resolve_core_history_version_for_mode(history_version_mode: str) -> str:
     if str(history_version_mode or "").strip().lower() != CURRENT_INTEGRITY_HISTORY_VERSION:
-        raise ValueError("fixed SOS-light-v3 supports history version v3 only")
+        raise ValueError("current history integrity supports history version v2 only")
     return CURRENT_INTEGRITY_HISTORY_VERSION
 
 def resolve_core_snapshot_prefix(history_version: str, env: Mapping[str, str] | None = None) -> str:
     values = os.environ if env is None else env
     if str(history_version or "").strip().lower() != CURRENT_INTEGRITY_HISTORY_VERSION:
-        raise ValueError("fixed SOS-light-v3 supports history version v3 only")
+        raise ValueError("current history integrity supports history version v2 only")
     prefix = _normalize_history_prefix(
         values.get("UK_AQ_R2_HISTORY_V2_CORE_PREFIX"),
         CURRENT_INTEGRITY_CORE_PREFIX,
     )
     if prefix != CURRENT_INTEGRITY_CORE_PREFIX:
         raise ValueError(
-            "UK_AQ_R2_HISTORY_V2_CORE_PREFIX must be history/v3/core for current history integrity",
+            "UK_AQ_R2_HISTORY_V2_CORE_PREFIX must be history/v2/core for current history integrity",
         )
     return prefix
 
@@ -1931,14 +1886,14 @@ def resolve_core_snapshot_root(
     values = os.environ if env is None else env
     version = str(history_version or "").strip().lower()
     if version != CURRENT_INTEGRITY_HISTORY_VERSION:
-        raise ValueError("fixed SOS-light-v3 supports history version v3 only")
+        raise ValueError("current history integrity supports history version v2 only")
     core_prefix = resolve_core_snapshot_prefix(version, values)
     explicit_root = str(values.get("UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT", "") or "").strip()
     if explicit_root:
         normalized = explicit_root.replace("\\", "/").rstrip("/")
         if not normalized.endswith(f"/{core_prefix}") and normalized != core_prefix:
             raise ValueError(
-                "UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT must target history/v3/core; "
+                "UK_AQ_CORE_SNAPSHOT_DROPBOX_ROOT must target history/v2/core; "
                 f"got {explicit_root}",
             )
         return explicit_root
@@ -2178,7 +2133,6 @@ def import_core_snapshot(
               rows_stations = ?,
               rows_timeseries = ?,
               rows_pollutants = ?,
-              rows_observed_properties = ?,
               rows_lookup = ?,
               rows_sos_site_ref_bridge = ?,
               sos_site_ref_bridge_sha256 = ?,
@@ -2192,7 +2146,6 @@ def import_core_snapshot(
                 rows_by_table.get("stations", 0),
                 rows_by_table.get("timeseries", 0),
                 rows_by_table.get("phenomena", 0),
-                rows_by_table.get("observed_properties", 0),
                 rows_lookup,
                 rows_by_table.get("sos_station_timeseries_site_refs", 0),
                 str(bridge_entry["sha256"]),
@@ -5320,12 +5273,14 @@ def _planned_backfill_command(
     pollutants_csv = ",".join(selected_pollutants)
     iso = day.isoformat()
     wrapper_command = wrapper
-    if wrapper_raw and Path(wrapper_raw).name == "uk_aq_integrity_backfill_v3.sh":
+    if wrapper_raw and Path(wrapper_raw).name == "uk_aq_integrity_backfill.sh":
         cli_parts = [
             shlex.quote(wrapper),
             "--env",
             shlex.quote(str(env_name or env.get("UK_AQ_ENV_NAME") or os.environ.get("UK_AQ_ENV_NAME") or "<env unset>")),
             "--observs-only",
+            "--history-version",
+            shlex.quote(str(history_version)),
             "--from-day",
             iso,
             "--to-day",
@@ -5357,7 +5312,7 @@ def _planned_backfill_command(
 
 def adapter_backfill_history_version(history_version_mode: str) -> str:
     if history_version_mode != CURRENT_INTEGRITY_HISTORY_VERSION:
-        raise ValueError("fixed SOS-light-v3 supports history version v3 only")
+        raise ValueError("current history integrity supports history version v2 only")
     return CURRENT_INTEGRITY_HISTORY_VERSION
 
 
@@ -5856,8 +5811,6 @@ def run_narrow_backfill(
     history_version: str = "v1",
     complete_connector_day: bool = False,
     repair_pollutants: Iterable[str] | None = None,
-    worker_purpose: Literal["source_evidence_only", "repair_proposal", "source_repair"],
-    canonical_writes_allowed: bool,
 ) -> dict[str, Any]:
     """Invoke `uk_aq_backfill_local.sh` for one scope (single day by default).
 
@@ -5868,48 +5821,6 @@ def run_narrow_backfill(
     When log_dir is set, full stdout+stderr is also written to a file under
     that directory and the path is returned in `log_path`.
     """
-    if worker_purpose == "source_evidence_only":
-        if canonical_writes_allowed:
-            raise ValueError(
-                "source_evidence_only cannot allow canonical writes"
-            )
-        if not complete_connector_day or not _is_truthy(
-            (extra_env or {}).get(
-                "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY"
-            )
-        ):
-            raise ValueError(
-                "source_evidence_only requires complete connector-day evidence mode"
-            )
-    elif worker_purpose == "repair_proposal":
-        if canonical_writes_allowed:
-            raise ValueError("repair_proposal cannot allow canonical writes")
-        if str((extra_env or {}).get(
-            "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE"
-        ) or "") != "prepare":
-            raise ValueError("repair_proposal requires proposal mode=prepare")
-    elif worker_purpose == "source_repair":
-        if not canonical_writes_allowed:
-            raise ValueError("source_repair requires canonical write permission")
-        if str(history_version).strip().lower() == "v3":
-            raise ValueError(
-                "fixed-v3 source repair must use a local repair_proposal; "
-                "canonical publication is coordinator-owned"
-            )
-    else:  # pragma: no cover - protected by the Literal contract
-        raise ValueError(f"unsupported Integrity worker purpose: {worker_purpose}")
-
-    effective_mode = str(
-        os.environ.get("UK_AQ_INTEGRITY_EFFECTIVE_MODE") or ""
-    ).strip()
-    if effective_mode == "check_only" and (
-        worker_purpose != "source_evidence_only" or canonical_writes_allowed
-    ):
-        raise ValueError(
-            "check_only may launch only source_evidence_only workers with "
-            "canonical writes disabled"
-        )
-
     result: dict[str, Any] = {
         "status": None,
         "exit_code": None,
@@ -5943,7 +5854,6 @@ def run_narrow_backfill(
             "UK_AQ_INTEGRITY_CORE_SNAPSHOT_DROPBOX_ROOT",
             "UK_AQ_INTEGRITY_EFFECTIVE_MODE",
             "UK_AQ_INTEGRITY_INVOCATION",
-            INTEGRITY_TARGET_WRITER_GIT_SHA_ENV,
         )
         if (value := os.environ.get(key)) is not None
     }
@@ -5958,7 +5868,6 @@ def run_narrow_backfill(
         "UK_AQ_INTEGRITY_CORE_SNAPSHOT_STAGE",
         "UK_AQ_INTEGRITY_EFFECTIVE_MODE",
         "UK_AQ_INTEGRITY_INVOCATION",
-        INTEGRITY_TARGET_WRITER_GIT_SHA_ENV,
     )
     for key in internal_scope_keys:
         sub_env.pop(key, None)
@@ -5995,10 +5904,6 @@ def run_narrow_backfill(
         "UK_AQ_BACKFILL_TO_DAY_UTC": to_iso,
         # Always force trigger_mode=manual (wrapper enforces this anyway).
         "UK_AQ_BACKFILL_TRIGGER_MODE": "manual",
-        "UK_AQ_INTEGRITY_WORKER_PURPOSE": worker_purpose,
-        "UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED": (
-            "true" if canonical_writes_allowed else "false"
-        ),
     })
     if complete_connector_day:
         sub_env.pop("UK_AQ_BACKFILL_TIMESERIES_IDS", None)
@@ -6058,7 +5963,7 @@ def run_narrow_backfill(
 
     wrapper_name = Path(wrapper_path).name
     cmd = ["bash", wrapper_path]
-    if wrapper_name == "uk_aq_integrity_backfill_v3.sh":
+    if wrapper_name == "uk_aq_integrity_backfill.sh":
         for required_identity_key in (
             "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_JSON",
             "UK_AQ_INTEGRITY_CORE_SNAPSHOT_IDENTITY_FILE",
@@ -6075,6 +5980,8 @@ def run_narrow_backfill(
             "--env",
             env_name,
             "--observs-only",
+            "--history-version",
+            history_version,
             "--from-day",
             iso,
             "--to-day",
@@ -6093,97 +6000,66 @@ def run_narrow_backfill(
 
     stdout_text = ""
     stderr_text = ""
-    label = log_label or f"day_{iso}"
-    durable_log_path = log_dir / f"{label}.log" if log_dir is not None else None
-    durable_stderr_path = (
-        log_dir / f"{label}.stderr.log" if log_dir is not None else None
-    )
-    started_at = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-    with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-child-") as temp_dir:
-        stdout_path = durable_log_path or Path(temp_dir) / "stdout.log"
-        stderr_path = durable_stderr_path or Path(temp_dir) / "stderr.log"
-        if log_dir is not None:
-            log_dir.mkdir(parents=True, exist_ok=True)
-            result["log_path"] = str(stdout_path)
-        try:
-            with (
-                stdout_path.open("w+", encoding="utf-8") as stdout_fh,
-                stderr_path.open("w+", encoding="utf-8") as stderr_fh,
-            ):
-                stdout_fh.write(f"# stage: {label}\n")
-                stdout_fh.write(f"# wrapper: {wrapper_path}\n")
-                stdout_fh.write(f"# env_file: {env_file_path}\n")
-                stdout_fh.write(f"# day: {iso}\n")
-                stdout_fh.write(f"# to_day: {to_iso}\n")
-                stdout_fh.write(
-                    "# connector_ids: "
-                    f"{sub_env.get('UK_AQ_BACKFILL_CONNECTOR_IDS', 'all')}\n"
-                )
-                stdout_fh.write(
-                    "# repair_pollutants: "
-                    f"{sub_env.get('UK_AQ_BACKFILL_INTEGRITY_REPAIR_POLLUTANTS', 'all')}\n"
-                )
-                stdout_fh.write(f"# worker_purpose: {worker_purpose}\n")
-                stdout_fh.write(f"# command: {' '.join(cmd)}\n")
-                stdout_fh.write(f"# started_at: {started_at}\n")
-                stdout_fh.write("# completion: pending\n\n# === STDOUT ===\n")
-                stdout_fh.flush()
-                os.fsync(stdout_fh.fileno())
-                try:
-                    proc = subprocess.run(
-                        cmd,
-                        env=sub_env,
-                        stdout=stdout_fh,
-                        stderr=stderr_fh,
-                        text=True,
-                        timeout=timeout_seconds,
-                        check=False,
-                    )
-                    result["exit_code"] = proc.returncode
-                    result["status"] = "ok" if proc.returncode == 0 else "error"
-                    if proc.returncode != 0:
-                        result["error"] = f"wrapper exit_code={proc.returncode}"
-                except subprocess.TimeoutExpired:
-                    result["status"] = "timeout"
-                    result["error"] = f"wrapper timed out after {timeout_seconds}s"
-                except OSError as exc:
-                    result["status"] = "spawn_error"
-                    result["error"] = f"spawn failed: {exc}"
-                stdout_fh.flush()
-                stderr_fh.flush()
-                stdout_fh.seek(0)
-                stdout_text = stdout_fh.read()
-                stdout_text = stdout_text.split("# === STDOUT ===\n", 1)[-1]
-                stderr_fh.seek(0)
-                stderr_text = stderr_fh.read()
-                # Preserve compatibility with mocked subprocess.run calls that
-                # return captured strings despite receiving file handles.
-                if 'proc' in locals() and getattr(proc, "stdout", None):
-                    stdout_text += str(proc.stdout)
-                if 'proc' in locals() and getattr(proc, "stderr", None):
-                    stderr_text += str(proc.stderr)
-                if durable_log_path is not None:
-                    stdout_fh.seek(0, os.SEEK_END)
-                    stdout_fh.write("\n# === STDERR ===\n")
-                    stdout_fh.write(stderr_text)
-                    stdout_fh.write(
-                        "\n# === COMPLETION ===\n"
-                        f"# exit_code: {result['exit_code']}\n"
-                        f"# status: {result['status']}\n"
-                        f"# duration_seconds: {round(time.monotonic() - started, 3)}\n"
-                        "# completion: complete\n"
-                    )
-                    stdout_fh.flush()
-                    os.fsync(stdout_fh.fileno())
-        except OSError as exc:
-            if result["status"] is None:
-                result["status"] = "spawn_error"
-                result["error"] = f"child log setup failed: {exc}"
-            log.warning("backfill log_path write failed: %s", exc)
+    try:
+        proc = subprocess.run(
+            cmd,
+            env=sub_env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        stdout_text = proc.stdout or ""
+        stderr_text = proc.stderr or ""
+        result["exit_code"] = proc.returncode
+        result["status"] = "ok" if proc.returncode == 0 else "error"
+        if proc.returncode != 0:
+            result["error"] = f"wrapper exit_code={proc.returncode}"
+    except subprocess.TimeoutExpired as exc:
+        result["status"] = "timeout"
+        result["error"] = f"wrapper timed out after {timeout_seconds}s"
+        if isinstance(exc.stdout, (bytes, bytearray)):
+            stdout_text = exc.stdout.decode("utf-8", errors="replace")
+        else:
+            stdout_text = exc.stdout or ""
+        if isinstance(exc.stderr, (bytes, bytearray)):
+            stderr_text = exc.stderr.decode("utf-8", errors="replace")
+        else:
+            stderr_text = exc.stderr or ""
+    except OSError as exc:
+        result["status"] = "spawn_error"
+        result["error"] = f"spawn failed: {exc}"
 
     result["stdout_tail"] = _tail_bytes(stdout_text)
     result["stderr_tail"] = _tail_bytes(stderr_text)
     result.update(_extract_source_to_r2_observation_status(stdout_text))
+
+    if log_dir is not None and (stdout_text or stderr_text or result["status"]):
+        log_dir.mkdir(parents=True, exist_ok=True)
+        label = log_label or f"day_{iso}"
+        log_path = log_dir / f"{label}.log"
+        try:
+            with log_path.open("w", encoding="utf-8") as fh:
+                fh.write(f"# wrapper: {wrapper_path}\n")
+                fh.write(f"# env_file: {env_file_path}\n")
+                fh.write(f"# day: {iso}\n")
+                fh.write(f"# connector_ids: {sub_env.get('UK_AQ_BACKFILL_CONNECTOR_IDS', 'all')}\n")
+                fh.write(
+                    f"# timeseries_ids: {sub_env.get('UK_AQ_BACKFILL_TIMESERIES_IDS', 'complete_connector_day')}\n"
+                )
+                fh.write(f"# output_scope: {sub_env.get('UK_AQ_BACKFILL_OUTPUT_SCOPE', 'default')}\n")
+                if extra_env:
+                    fh.write(f"# extra_env: {json.dumps(extra_env, sort_keys=True)}\n")
+                fh.write(f"# command: {' '.join(cmd)}\n")
+                fh.write(f"# exit_code: {result['exit_code']}\n")
+                fh.write(f"# status: {result['status']}\n")
+                fh.write("\n# === STDOUT ===\n")
+                fh.write(stdout_text)
+                fh.write("\n# === STDERR ===\n")
+                fh.write(stderr_text)
+            result["log_path"] = str(log_path)
+        except OSError as exc:
+            log.warning("backfill log_path write failed: %s", exc)
 
     result["duration_seconds"] = round(time.monotonic() - started, 3)
     log.info(
@@ -6196,16 +6072,6 @@ def run_narrow_backfill(
         if result.get("stderr_tail"):
             log.warning("backfill stderr tail:\n%s", result["stderr_tail"])
     return result
-
-
-def _v2_observation_worker_log_label(
-    *, stage: str, day_utc: str, connector_id: int, pollutant_code: str | None
-) -> str:
-    stage_prefix = "v2_obs_detector" if stage == "detector" else "v2_obs"
-    label = f"{stage_prefix}_day_{day_utc}_connector_{connector_id}"
-    if pollutant_code:
-        label += f"_pollutant_{pollutant_code}"
-    return label
 
 
 def _record_backfill_on_event(
@@ -6374,7 +6240,7 @@ def check_openaq(
                     _check_one_openaq_file_threadsafe,
                     db_path, env_name, base_url, loc, day,
                     tmp_dir, cache_root, log, limits,
-                    force_download_when_cache_missing=(history_version == CURRENT_INTEGRITY_HISTORY_VERSION),
+                    force_download_when_cache_missing=(history_version == "v2"),
                 ))
         total_tasks = len(futures)
         progress.update(
@@ -6449,7 +6315,7 @@ def check_openaq(
                     day_obj = dt.date.fromisoformat(result["day"])
                     connector_ids = (
                         _connector_ids_for_timeseries(conn, result["timeseries_ids"])
-                        if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
+                        if history_version == "v2"
                         else None
                     )
                     cmd = _planned_backfill_command(
@@ -6523,7 +6389,7 @@ def check_openaq(
             union_ids = sorted({ts for entry in group for ts in entry["timeseries_ids"]})
             connector_ids = (
                 _connector_ids_for_timeseries(conn, union_ids)
-                if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
+                if history_version == "v2"
                 else None
             )
             chunks = _chunk_timeseries_ids(union_ids)
@@ -6549,8 +6415,6 @@ def check_openaq(
                     log_dir=backfill_log_dir,
                     log_label=chunk_label,
                     history_version=history_version,
-                    worker_purpose="source_repair",
-                    canonical_writes_allowed=True,
                 )
                 metrics["backfills_attempted"] += 1
                 if bf["status"] == "ok":
@@ -7170,7 +7034,7 @@ def check_sensor_community(
                 _check_one_sc_file_threadsafe,
                 db_path, env_name, base_url, sensor_id, day, filename,
                 tmp_dir, cache_root, log, limits,
-                force_download_when_cache_missing=(history_version == CURRENT_INTEGRITY_HISTORY_VERSION),
+                force_download_when_cache_missing=(history_version == "v2"),
             ))
         total_tasks = len(futures)
         completed_tasks = 0
@@ -7245,7 +7109,7 @@ def check_sensor_community(
                     day_obj = dt.date.fromisoformat(result["day"])
                     connector_ids = (
                         _connector_ids_for_timeseries(conn, result["timeseries_ids"])
-                        if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
+                        if history_version == "v2"
                         else None
                     )
                     cmd = _planned_backfill_command(
@@ -7319,7 +7183,7 @@ def check_sensor_community(
             union_ids = sorted({ts for entry in group for ts in entry["timeseries_ids"]})
             connector_ids = (
                 _connector_ids_for_timeseries(conn, union_ids)
-                if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
+                if history_version == "v2"
                 else None
             )
             chunks = _chunk_timeseries_ids(union_ids)
@@ -7345,8 +7209,6 @@ def check_sensor_community(
                     log_dir=backfill_log_dir,
                     log_label=chunk_label,
                     history_version=history_version,
-                    worker_purpose="source_repair",
-                    canonical_writes_allowed=True,
                 )
                 metrics["backfills_attempted"] += 1
                 if bf["status"] == "ok":
@@ -8785,7 +8647,7 @@ def check_sos_flat_files(
 
     source_count_mapping_identity: str | None = None
     source_count_mapping_hash: str | None = None
-    if history_version == CURRENT_INTEGRITY_HISTORY_VERSION:
+    if history_version == "v2":
         connector_rows = conn.execute(
             """
             SELECT id FROM core_connectors_snapshot
@@ -8795,7 +8657,7 @@ def check_sos_flat_files(
         ).fetchall()
         if len(connector_rows) != 1:
             raise RuntimeError(
-                "fixed-v3 SOS annual-file processing requires exactly one imported "
+                "v2 SOS annual-file processing requires exactly one imported "
                 f"SOS connector; found={len(connector_rows)}"
             )
         bridge = _load_authoritative_sos_bridge_mapping(
@@ -8828,7 +8690,7 @@ def check_sos_flat_files(
     if not grouped_mappings:
         metrics["skipped_reason"] = (
             "no UK-AIR site_ref mappings in imported SOS bridge"
-            if history_version == CURRENT_INTEGRITY_HISTORY_VERSION
+            if history_version == "v2"
             else "no UK-AIR site_ref mappings returned from Supabase"
         )
         log.warning("sos flat-file: skipped — %s", metrics["skipped_reason"])
@@ -9629,10 +9491,10 @@ def check_sos(
 R2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX = "history/_index/observations_timeseries"
 R2_HISTORY_INDEX_PREFIX = "history/_index"
 R2_HISTORY_OBSERVATIONS_PREFIX = "history/v1/observations"
-R2_HISTORY_V2_INDEX_PREFIX = "history/_index_v3"
-R2_HISTORY_V2_OBSERVATIONS_PREFIX = "history/v3/observations"
+R2_HISTORY_V2_INDEX_PREFIX = "history/_index_v2"
+R2_HISTORY_V2_OBSERVATIONS_PREFIX = "history/v2/observations"
 R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX = (
-    "history/_index_v3/observations_timeseries"
+    "history/_index_v2/observations_timeseries"
 )
 CROSS_CHECK_MAX_REPORT_DISCREPANCIES = 250
 
@@ -9685,7 +9547,7 @@ def resolve_history_version_mode(args: argparse.Namespace | None = None) -> str:
         ).strip().lower()
     if raw not in HISTORY_VERSION_CHOICES:
         raise ValueError(
-            "fixed SOS-light-v3 supports v3 only "
+            "current history integrity supports --history-version v2 only "
             f"(got {raw!r})",
         )
     return CURRENT_INTEGRITY_HISTORY_VERSION
@@ -9695,7 +9557,7 @@ def expand_history_versions(history_version_mode: str) -> list[str]:
     if history_version_mode == CURRENT_INTEGRITY_HISTORY_VERSION:
         return [CURRENT_INTEGRITY_HISTORY_VERSION]
     raise ValueError(
-        "fixed SOS-light-v3 supports history version v3 only "
+        "current history integrity supports history version v2 only "
         f"(got {history_version_mode!r})",
     )
 
@@ -9734,7 +9596,7 @@ def resolve_history_path_config(
             checks_implemented=True,
         )
     raise ValueError(
-        "fixed SOS-light-v3 supports history version v3 only "
+        "current history integrity supports history version v2 only "
         f"(got {history_version!r})",
     )
 
@@ -9898,134 +9760,6 @@ def _local_v2_observations_evidence(
     return True, [str(base.relative_to(root))]
 
 
-_SOURCE_PARTITION_UNAVAILABLE_STATES = {
-    "connection_unavailable",
-    "scope_unavailable",
-    "metadata_unavailable",
-    "pollutant_absent",
-    "counts_unavailable",
-}
-
-_RECONSTRUCTIBLE_OBSERVATION_MANIFEST_GAP_TYPES = {
-    "data_manifest_empty_timeseries_counts",
-    "data_manifest_file_count_mismatch",
-    "data_manifest_row_count_mismatch",
-    "data_manifest_timeseries_row_count_mismatch",
-    "data_manifest_total_bytes_mismatch",
-}
-
-_RECONSTRUCTIBLE_OBSERVATION_MANIFEST_SCHEMA_FIELDS = {"grain", "profile"}
-
-_RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS = {
-    "file_count",
-    "max_observed_at_utc",
-    "max_timeseries_id",
-    "min_observed_at_utc",
-    "min_timeseries_id",
-    "row_count",
-    "source_row_count",
-    "timeseries_row_counts",
-    "total_bytes",
-}
-
-
-def _observation_partition_key(gap: Mapping[str, Any]) -> tuple[str, str, str]:
-    return (
-        str(gap.get("day_utc") or ""),
-        str(gap.get("connector_id") or ""),
-        str(gap.get("pollutant_code") or ""),
-    )
-
-
-def _reconstructible_observation_manifest_gap(
-    gap: Mapping[str, Any],
-    all_gaps: Iterable[Mapping[str, Any]],
-) -> bool:
-    """Allow metadata-only planning only when live Parquet proves the data state."""
-    if gap.get("parquet_readable") is not True:
-        return False
-    gap_type = str(gap.get("gap_type") or "")
-    if gap_type == "data_manifest_schema_mismatch":
-        related = gap.get("related_paths")
-        if not isinstance(related, list) or not related:
-            return False
-        normalized_fields = []
-        for field in related:
-            text = str(field)
-            if text.startswith("field="):
-                text = text[6:].split(" ", 1)[0]
-            normalized_fields.append(text)
-        if not all(
-            field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_SCHEMA_FIELDS
-            or field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS
-            for field in normalized_fields
-        ):
-            return False
-    elif gap_type.startswith("data_manifest_") and gap_type.endswith("_schema_mismatch"):
-        field = gap_type[len("data_manifest_"):-len("_schema_mismatch")]
-        if field not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS:
-            return False
-    elif gap_type not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_GAP_TYPES:
-        return False
-
-    partition_key = _observation_partition_key(gap)
-    uncertain_gap_types = {
-        "data_manifest_duplicate_file_key",
-        "data_manifest_listed_parquet_missing",
-        "data_manifest_unlisted_parquet",
-        "orphan_parquet_without_manifest",
-        "parquet_empty_or_placeholder",
-        "parquet_missing",
-        "parquet_null_timeseries_id_rows",
-        "parquet_reader_unavailable",
-        "parquet_unreadable",
-        "source_r2_timeseries_row_mismatch",
-    }
-    for sibling in all_gaps:
-        if _observation_partition_key(sibling) != partition_key:
-            continue
-        sibling_type = str(sibling.get("gap_type") or "")
-        if sibling_type in uncertain_gap_types:
-            return False
-        if sibling_type == "data_manifest_schema_mismatch":
-            related = sibling.get("related_paths")
-            if not isinstance(related, list) or not related:
-                return False
-            normalized_fields = []
-            for field in related:
-                text = str(field)
-                if text.startswith("field="):
-                    text = text[6:].split(" ", 1)[0]
-                normalized_fields.append(text)
-            if not all(
-                field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_SCHEMA_FIELDS
-                or field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS
-                for field in normalized_fields
-            ):
-                return False
-        elif sibling_type.startswith("data_manifest_") and sibling_type.endswith("_schema_mismatch"):
-            field = sibling_type[len("data_manifest_"):-len("_schema_mismatch")]
-            if field not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS:
-                return False
-        elif sibling_type not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_GAP_TYPES:
-            if sibling_type.startswith("data_manifest_"):
-                return False
-    return True
-
-
-def _source_partition_state_from_gap(gap: Mapping[str, Any]) -> str | None:
-    evidence = gap.get("source_evidence")
-    if not isinstance(evidence, Mapping):
-        return None
-    partition = evidence.get("partition")
-    if isinstance(partition, Mapping):
-        state = partition.get("state")
-        if state:
-            return str(state)
-    state = evidence.get("source_partition_state")
-    return str(state) if state else None
-
-
 def _enrich_v2_observations_repair_plans(
     *,
     root: Path,
@@ -10049,179 +9783,6 @@ def _enrich_v2_observations_repair_plans(
         gap["suggested_repair"] = suggested_repair_from_decision(
             decision, sos_scope=sos_scope
         )
-
-
-def build_v2_repair_plan(
-    *,
-    observation_gaps: Iterable[Mapping[str, Any]] = (),
-    conn: sqlite3.Connection | None = None,
-) -> list[dict[str, Any]]:
-    """Summarize retained v2 observation repairs in operator order."""
-    del conn  # Kept for compatibility with the shared observation call sites.
-    observation_gaps = list(observation_gaps)
-    partition_priority = {
-        "observation_data_repair": 3,
-        "source_mapping_issue": 2,
-        "observation_pollutant_manifest_repair": 1,
-        "observation_index_repair": 0,
-    }
-    actions: dict[tuple[str, str, int | str | None, str | None], dict[str, Any]] = {}
-
-    for gap in observation_gaps:
-        pollutant_code = gap.get("pollutant_code")
-        if (
-            pollutant_code
-            and str(pollutant_code).strip().lower()
-            not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
-        ):
-            continue
-        decision = decide_observation_repair(
-            gap,
-            source_partition_unavailable=(
-                _source_partition_state_from_gap(gap)
-                in _SOURCE_PARTITION_UNAVAILABLE_STATES
-            ),
-            reconstructible_manifest=_reconstructible_observation_manifest_gap(
-                gap, observation_gaps
-            ),
-        )
-        if decision.repair_kind == "unclassified":
-            continue
-        kind = decision.repair_kind
-        day_utc = gap.get("day_utc")
-        connector_id = gap.get("connector_id")
-        pollutant_code = decision.pollutant_code
-        if kind == "observation_day_manifest_repair":
-            connector_id = None
-            pollutant_code = None
-        key = (
-            kind,
-            str(day_utc or ""),
-            connector_id,
-            str(pollutant_code or "") or None,
-        )
-        entry = actions.get(key)
-        gap_type = str(gap.get("gap_type") or "")
-        if entry is None:
-            entry = {
-                "kind": kind,
-                "status": "planned",
-                "day_utc": day_utc,
-                "connector_id": connector_id,
-                "pollutant_code": pollutant_code,
-                "requires_index_rebuild": bool(decision.requires_index_rebuild),
-                "data_changes_required": bool(decision.data_changes_required),
-                "executes": False,
-                "operator_action_required": (
-                    decision.executability_policy == "operator_action_required"
-                ),
-                "gap_types": [gap_type] if gap_type else [],
-                "commands": [],
-                "notes": decision.reason,
-                "repair_decision": decision.as_dict(),
-            }
-            actions[key] = entry
-        else:
-            if gap_type and gap_type not in entry["gap_types"]:
-                entry["gap_types"].append(gap_type)
-            entry["requires_index_rebuild"] = bool(
-                entry["requires_index_rebuild"] or decision.requires_index_rebuild
-            )
-            entry["operator_action_required"] = bool(
-                entry["operator_action_required"]
-                or decision.executability_policy == "operator_action_required"
-            )
-            entry["data_changes_required"] = bool(
-                entry["data_changes_required"] or decision.data_changes_required
-            )
-            if decision.reason and decision.reason not in str(entry.get("notes") or ""):
-                entry["notes"] = f"{entry['notes']}; {decision.reason}"
-
-        source_evidence = gap.get("source_evidence")
-        rollover_evidence = (
-            list(source_evidence.get("historical_identity_rollovers") or [])
-            if isinstance(source_evidence, Mapping)
-            else []
-        )
-        if rollover_evidence and kind == "observation_data_repair":
-            entry["identity_classification"] = (
-                "bridge_known_historical_identity_rollover"
-            )
-            entry["historical_identity_repair_gate_required"] = True
-            merged_rollovers = {
-                (
-                    int(item.get("existing_r2_timeseries_id") or 0),
-                    int(item.get("date_valid_timeseries_id") or 0),
-                ): dict(item)
-                for item in list(entry.get("historical_identity_rollovers") or [])
-                if isinstance(item, Mapping)
-            }
-            for item in rollover_evidence:
-                if isinstance(item, Mapping):
-                    merged_rollovers[(
-                        int(item.get("existing_r2_timeseries_id") or 0),
-                        int(item.get("date_valid_timeseries_id") or 0),
-                    )] = dict(item)
-            entry["historical_identity_rollovers"] = [
-                merged_rollovers[item_key] for item_key in sorted(merged_rollovers)
-            ]
-
-    selected_actions: dict[tuple[str, str, str], str] = {}
-    for entry in actions.values():
-        kind = str(entry.get("kind") or "")
-        if kind not in partition_priority:
-            continue
-        pollutant_code = entry.get("pollutant_code")
-        day_utc = entry.get("day_utc")
-        connector_id = entry.get("connector_id")
-        if pollutant_code is None or day_utc is None or connector_id is None:
-            continue
-        key = (str(day_utc), str(connector_id), str(pollutant_code))
-        current_kind = selected_actions.get(key)
-        if (
-            current_kind is None
-            or partition_priority[kind] > partition_priority[current_kind]
-        ):
-            selected_actions[key] = kind
-
-    filtered_actions = []
-    for entry in actions.values():
-        kind = str(entry.get("kind") or "")
-        pollutant_code = entry.get("pollutant_code")
-        day_utc = entry.get("day_utc")
-        connector_id = entry.get("connector_id")
-        if (
-            kind in partition_priority
-            and pollutant_code is not None
-            and day_utc is not None
-            and connector_id is not None
-            and selected_actions[(str(day_utc), str(connector_id), str(pollutant_code))]
-            != kind
-        ):
-            continue
-        entry["gap_types"] = sorted(set(entry.get("gap_types") or []))
-        filtered_actions.append(entry)
-
-    order = [
-        "observation_data_repair",
-        "source_mapping_issue",
-        "observation_pollutant_manifest_repair",
-        "observation_index_repair",
-        "observation_connector_manifest_repair",
-        "observation_day_manifest_repair",
-    ]
-    position = {kind: index for index, kind in enumerate(order)}
-    return sorted(
-        filtered_actions,
-        key=lambda entry: (
-            position.get(str(entry.get("kind") or ""), 999),
-            str(entry.get("day_utc") or ""),
-            int(entry["connector_id"])
-            if str(entry.get("connector_id") or "").isdigit()
-            else -1,
-            str(entry.get("pollutant_code") or ""),
-        ),
-    )
 
 
 def _manifest_codes_from_child_list(payload: Mapping[str, Any], field: str, id_key: str) -> set[str]:
@@ -10877,10 +10438,6 @@ def _manifest_file_keys_from_entries(entries: Iterable[Any]) -> set[str]:
 
 def _manifest_file_keys(payload: Mapping[str, Any]) -> set[str]:
     return _manifest_file_keys_from_entries(_manifest_files(payload))
-
-
-def _is_positive_int(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def _child_manifest_aggregate(payloads: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
@@ -11899,14 +11456,6 @@ def _current_source_counts_for_v2_partition(
             pollutant_code=pollutant_code,
         )
 
-    official_rdata_source = _official_rdata_source_for_connector(connector_id)
-    if official_rdata_source and official_rdata_source in source_keys:
-        return _official_rdata_source_counts_for_partition(
-            source_key=official_rdata_source,
-            day_utc=day_utc,
-            pollutant_code=pollutant_code,
-        )
-
     day = dt.date.fromisoformat(day_utc)
     lookup_rows = conn.execute(
         f"""
@@ -12628,68 +12177,6 @@ def _v2_observation_repair_source_evidence_summary(
     return summary
 
 
-def _verify_exact_v3_index_scope(
-    *,
-    root: Path,
-    config: HistoryPathConfig,
-    day_utc: str,
-    connector_id: str,
-    pollutant_code: str,
-    index_key: str,
-    allowed_real_roots: Iterable[Path],
-) -> dict[str, Any] | None:
-    """Authenticate local exact-v3 authority against the shared physical builder."""
-    helper = _INTEGRITY_BIN_DIR / "integrity" / "exact_v3_verification.mjs"
-    try:
-        completed = subprocess.run(
-            [
-                os.environ.get("UK_AQ_BACKFILL_NODE_BIN")
-                or shutil.which("node") or "node",
-                str(helper),
-            ],
-            input=json.dumps({
-                "root": str(root.resolve()),
-                "allowed_real_roots": [str(path.resolve()) for path in allowed_real_roots],
-                "scope": {
-                    "day_utc": day_utc,
-                    "connector_id": int(connector_id),
-                    "pollutant_code": pollutant_code,
-                },
-                "index_prefix": config.observations_timeseries_index_prefix.strip("/"),
-                "data_prefix": config.observations_data_prefix.strip("/"),
-                "index_key": index_key,
-            }),
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        result = json.loads(completed.stdout)
-        if completed.returncode == 0 and result == {"status": "ok"}:
-            return None
-        if (
-            not isinstance(result, dict)
-            or result.get("status") != "fail"
-            or not str(result.get("gap_type") or "").startswith("index_")
-        ):
-            raise ValueError("exact-v3 verifier returned no valid failure evidence")
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        result = {
-            "gap_type": "index_manifest_verification_failed",
-            "reason": str(exc),
-        }
-    return _v2_obs_gap(
-        result["gap_type"],
-        day_utc=day_utc,
-        connector_id=connector_id,
-        pollutant_code=pollutant_code,
-        expected_path=index_key,
-        related_paths=[
-            str(result.get("key") or index_key),
-            str(result.get("reason") or "exact-v3 verification failed"),
-        ],
-    )
-
-
 def run_v2_observations_integrity_checks(
     *,
     r2_history_root: str | Path | None,
@@ -12707,8 +12194,6 @@ def run_v2_observations_integrity_checks(
     dedicated_sos_historical_replacement: bool = False,
     observation_total_connector_ids: Iterable[int] | None = None,
     observation_total_pollutants: Iterable[str] | None = None,
-    verify_derived_index_scopes: (set[tuple[str, int, str]] |
-                                  frozenset[tuple[str, int, str]] | None) = frozenset(),
 ) -> dict[str, Any]:
     if not r2_history_root:
         raise RuntimeError("UK_AQ_R2_HISTORY_DROPBOX_ROOT is not set")
@@ -12721,7 +12206,6 @@ def run_v2_observations_integrity_checks(
     gaps: list[dict[str, Any]] = []
     hash_check_candidates: list[dict[str, Any]] = []
     source_resolution_by_pollutant: dict[str, dict[str, Any]] = {}
-    source_unavailable_scopes: list[dict[str, Any]] = []
     all_unmapped_partitions_left_unchanged: list[dict[str, Any]] = []
     connector_day_source_evidence: dict[
         tuple[str, int], dict[str, dict[str, Any]]
@@ -13165,32 +12649,19 @@ def run_v2_observations_integrity_checks(
                 for partition_gap in gaps[partition_gap_start:]:
                     if str(partition_gap.get("gap_type") or "").startswith("data_manifest_") or partition_gap.get("gap_type") == "orphan_parquet_without_manifest":
                         partition_gap["parquet_readable"] = parquet_readable
-                # The bulk exact-v3 tree is deliberately excluded from the
-                # Dropbox backup. Its local absence (or an old incidental
-                # local copy) says nothing about the derived objects in R2.
-                # Only an independently authorised repair may rebuild it.
-                if (
-                    index_prefix != "history/_index_v3/observations_timeseries"
-                    or verify_derived_index_scopes is None
-                    or (day_utc, int(connector_raw), pollutant)
-                    in verify_derived_index_scopes
-                ):
-                    idx_rel = f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}/{pollutant_dir.name}/manifest.json"
-                    idx_path = root / idx_rel
-                    if not idx_path.is_file():
-                        gaps.append(_v2_obs_gap("index_manifest_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
-                    else:
-                        index_gap = _verify_exact_v3_index_scope(
-                            root=root,
-                            config=config,
-                            day_utc=day_utc,
-                            connector_id=connector_raw,
-                            pollutant_code=pollutant,
-                            index_key=idx_rel,
-                            allowed_real_roots=allowed_real_roots,
-                        )
-                        if index_gap is not None:
-                            gaps.append(index_gap)
+                idx_rel = f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}/{pollutant_dir.name}/manifest.json"
+                idx_path = root / idx_rel
+                if not idx_path.is_file():
+                    gaps.append(_v2_obs_gap("index_manifest_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                else:
+                    try:
+                        idx_payload = json.loads(idx_path.read_text(encoding="utf-8"))
+                        if "timeseries_row_counts" not in idx_payload:
+                            gaps.append(_v2_obs_gap("index_manifest_missing_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                        elif not idx_payload.get("timeseries_row_counts"):
+                            gaps.append(_v2_obs_gap("index_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                    except Exception:
+                        gaps.append(_v2_obs_gap("index_manifest_invalid_json", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
                 if source_partition_evidence is not None:
                     for partition_gap in gaps[partition_gap_start:]:
                         partition_gap.setdefault("source_evidence", {}).update(source_partition_evidence)
@@ -13245,16 +12716,6 @@ def run_v2_observations_integrity_checks(
                     )
                     or ""
                 )
-                if source_partition_evidence is not None:
-                    source_unavailable_scopes.extend(
-                        dict(scope)
-                        for scope in list(
-                            source_partition_evidence.get(
-                                "source_unavailable_scopes"
-                            )
-                            or []
-                        )
-                    )
                 if (
                     parquet_stats is not None
                     and connector_id_for_source is not None
@@ -13263,75 +12724,13 @@ def run_v2_observations_integrity_checks(
                         "successful_empty",
                     }
                 ):
-                    available_timeseries_ids = {
-                        int(value)
-                        for value in list(
-                            (source_partition_evidence or {}).get(
-                                "source_available_timeseries_ids"
-                            )
-                            or []
-                        )
-                    }
-                    comparison_r2_counts = _normalize_timeseries_row_counts(
-                        parquet_stats["timeseries_row_counts"]
-                    )
-                    unavailable_scopes_for_comparison = [
-                        dict(scope)
-                        for scope in list(
-                            (source_partition_evidence or {}).get(
-                                "source_unavailable_scopes"
-                            )
-                            or []
-                        )
-                        if str(scope.get("pollutant_code") or "") == pollutant
-                    ]
-                    if unavailable_scopes_for_comparison:
-                        try:
-                            baseline_rows_for_comparison = (
-                                _observation_rows_from_local_parquet_for_shared_hash(
-                                    parquet_paths=[
-                                        str(path) for path in sorted(local_parquets)
-                                    ],
-                                )
-                            )
-                            comparable_rows = _official_rdata_source_available_rows(
-                                baseline_rows_for_comparison,
-                                unavailable_scopes_for_comparison,
-                            )
-                        except (OSError, RuntimeError, ValueError) as exc:
-                            gaps.append(_v2_obs_gap(
-                                "parquet_unreadable",
-                                day_utc=day_utc,
-                                connector_id=connector_raw,
-                                pollutant_code=pollutant,
-                                expected_path=manifest_rel,
-                                related_paths=[
-                                    "source_available_subset_read_failed:"
-                                    + _truncate_text(str(exc), 500)
-                                ],
-                            ))
-                            continue
-                        comparison_r2_counts = {}
-                        for row in comparable_rows:
-                            timeseries_id = int(row["timeseries_id"])
-                            comparison_r2_counts[timeseries_id] = (
-                                comparison_r2_counts.get(timeseries_id, 0) + 1
-                            )
-                    elif "source_available_timeseries_ids" in (
-                        source_partition_evidence or {}
-                    ):
-                        comparison_r2_counts = {
-                            timeseries_id: count
-                            for timeseries_id, count in comparison_r2_counts.items()
-                            if timeseries_id in available_timeseries_ids
-                        }
                     stale_gap = _build_v2_source_r2_mismatch_gap_if_complete(
                         day_utc=day_utc,
                         connector_id=connector_raw,
                         pollutant_code=pollutant,
                         expected_path=manifest_rel,
                         source_counts=source_counts,
-                        r2_counts=comparison_r2_counts,
+                        r2_counts=parquet_stats["timeseries_row_counts"],
                         source_partition_evidence=source_partition_evidence,
                     )
                     if stale_gap is not None:
@@ -13345,9 +12744,12 @@ def run_v2_observations_integrity_checks(
                             )
                             or ""
                         )
-                        in {"successful_non_empty", "successful_empty"}
+                        == "successful_non_empty"
+                        and source_counts
                         and _normalize_timeseries_row_counts(source_counts)
-                        == comparison_r2_counts
+                        == _normalize_timeseries_row_counts(
+                            parquet_stats["timeseries_row_counts"]
+                        )
                     ):
                         hash_check_candidates.append({
                             "day_utc": day_utc,
@@ -13378,11 +12780,6 @@ def run_v2_observations_integrity_checks(
                                     "historical_identity_rollover_groups",
                                     "historical_identity_rollovers",
                                     "identity_classification",
-                                    "source_available_timeseries_ids",
-                                    "source_available_pollutant_codes",
-                                    "source_unavailable_timeseries_ids",
-                                    "source_unavailable_scopes",
-                                    "comparison_scope",
                                 )
                                 if field in source_partition_evidence
                             },
@@ -13477,22 +12874,6 @@ def run_v2_observations_integrity_checks(
             for pollutant in sorted(V2_OBSERVATION_INTEGRITY_POLLUTANTS)
         },
         "source_resolution_by_pollutant": source_resolution_by_pollutant,
-        "source_unavailable_scopes": sorted(
-            {
-                (
-                    str(entry.get("day_utc") or ""),
-                    str(entry.get("site_code") or ""),
-                    int(entry.get("source_year") or 0),
-                    str(entry.get("pollutant_code") or ""),
-                    int(entry.get("timeseries_id") or 0),
-                ): entry
-                for entry in source_unavailable_scopes
-            }.values(),
-            key=lambda entry: (
-                entry.get("day_utc"), entry.get("pollutant_code"),
-                entry.get("timeseries_id"), entry.get("source_year"),
-            ),
-        ),
         "all_unmapped_partitions_left_unchanged": sorted(
             {
                 (
@@ -13514,7 +12895,9 @@ def run_v2_observations_integrity_checks(
             "eligible_scopes": [],
             "blocked_scopes": blocked_first_value_at_scopes,
         },
-        "repair_plan": build_v2_repair_plan(observation_gaps=gaps, conn=conn),
+        "repair_plan": build_v2_repair_plan(
+            observation_gaps=gaps, conn=conn,
+        ),
         "connector_observation_partition_rows": [
             {
                 "day_utc": day_utc,
@@ -13566,6 +12949,334 @@ def _log_v2_integrity_gaps(
 
 
 
+_SOURCE_PARTITION_UNAVAILABLE_STATES = {
+    "connection_unavailable",
+    "scope_unavailable",
+    "metadata_unavailable",
+    "pollutant_absent",
+    "counts_unavailable",
+}
+
+_RECONSTRUCTIBLE_OBSERVATION_MANIFEST_GAP_TYPES = {
+    "data_manifest_empty_timeseries_counts",
+    "data_manifest_file_count_mismatch",
+    "data_manifest_row_count_mismatch",
+    "data_manifest_timeseries_row_count_mismatch",
+    "data_manifest_total_bytes_mismatch",
+}
+
+_RECONSTRUCTIBLE_OBSERVATION_MANIFEST_SCHEMA_FIELDS = {
+    "grain",
+    "profile",
+}
+
+_RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS = {
+    "file_count",
+    "max_observed_at_utc",
+    "max_timeseries_id",
+    "min_observed_at_utc",
+    "min_timeseries_id",
+    "row_count",
+    "source_row_count",
+    "timeseries_row_counts",
+    "total_bytes",
+}
+
+
+def _observation_partition_key(gap: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(gap.get("day_utc") or ""),
+        str(gap.get("connector_id") or ""),
+        str(gap.get("pollutant_code") or ""),
+    )
+
+
+def _reconstructible_observation_manifest_gap(
+    gap: Mapping[str, Any],
+    all_gaps: Iterable[Mapping[str, Any]],
+) -> bool:
+    """Allow metadata-only planning only when live Parquet proves the data state."""
+    if gap.get("parquet_readable") is not True:
+        return False
+    gap_type = str(gap.get("gap_type") or "")
+    if gap_type == "data_manifest_schema_mismatch":
+        related = gap.get("related_paths")
+        if not isinstance(related, list) or not related:
+            return False
+        normalized_fields = []
+        for field in related:
+            text = str(field)
+            if text.startswith("field="):
+                text = text[6:].split(" ", 1)[0]
+            normalized_fields.append(text)
+        if not all(
+            field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_SCHEMA_FIELDS
+            or field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS
+            for field in normalized_fields
+        ):
+            return False
+    elif gap_type.startswith("data_manifest_") and gap_type.endswith("_schema_mismatch"):
+        field = gap_type[len("data_manifest_"):-len("_schema_mismatch")]
+        if field not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS:
+            return False
+    elif gap_type in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_GAP_TYPES:
+        pass
+    else:
+        return False
+
+    partition_key = _observation_partition_key(gap)
+    uncertain_gap_types = {
+        "data_manifest_duplicate_file_key",
+        "data_manifest_listed_parquet_missing",
+        "data_manifest_unlisted_parquet",
+        "orphan_parquet_without_manifest",
+        "parquet_empty_or_placeholder",
+        "parquet_missing",
+        "parquet_null_timeseries_id_rows",
+        "parquet_reader_unavailable",
+        "parquet_unreadable",
+        "source_r2_timeseries_row_mismatch",
+    }
+    for sibling in all_gaps:
+        if _observation_partition_key(sibling) != partition_key:
+            continue
+        sibling_type = str(sibling.get("gap_type") or "")
+        if sibling_type in uncertain_gap_types:
+            return False
+        if sibling_type == "data_manifest_schema_mismatch":
+            related = sibling.get("related_paths")
+            if not isinstance(related, list) or not related:
+                return False
+            normalized_fields = []
+            for field in related:
+                text = str(field)
+                if text.startswith("field="):
+                    text = text[6:].split(" ", 1)[0]
+                normalized_fields.append(text)
+            if not all(
+                field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_SCHEMA_FIELDS
+                or field in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS
+                for field in normalized_fields
+            ):
+                return False
+        elif sibling_type.startswith("data_manifest_") and sibling_type.endswith("_schema_mismatch"):
+            field = sibling_type[len("data_manifest_"):-len("_schema_mismatch")]
+            if field not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_AGGREGATE_FIELDS:
+                return False
+        elif sibling_type not in _RECONSTRUCTIBLE_OBSERVATION_MANIFEST_GAP_TYPES:
+            if sibling_type.startswith("data_manifest_"):
+                return False
+    return True
+
+def _source_partition_state_from_gap(gap: Mapping[str, Any]) -> str | None:
+    evidence = gap.get("source_evidence")
+    if not isinstance(evidence, Mapping):
+        return None
+    partition = evidence.get("partition")
+    if isinstance(partition, Mapping):
+        state = partition.get("state")
+        if state:
+            return str(state)
+    state = evidence.get("source_partition_state")
+    if state:
+        return str(state)
+    return None
+
+
+def build_v2_repair_plan(
+    *,
+    observation_gaps: Iterable[Mapping[str, Any]] = (),
+    conn: sqlite3.Connection | None = None,
+) -> list[dict[str, Any]]:
+    """Summarize retained v2 observation repairs in operator order."""
+    del conn  # Kept for compatibility with the shared observation call sites.
+    observation_gaps = list(observation_gaps)
+    observation_partition_priority = {
+        "observation_data_repair": 3,
+        "source_mapping_issue": 2,
+        "observation_pollutant_manifest_repair": 1,
+        "observation_index_repair": 0,
+    }
+
+    actions: dict[tuple[str, str, int | str | None, str | None], dict[str, Any]] = {}
+
+    def add_action(
+        kind: str,
+        *,
+        gap: Mapping[str, Any],
+        requires_index_rebuild: bool = False,
+        executes: bool = False,
+        operator_action_required: bool = False,
+        data_changes_required: bool = False,
+        notes: str | None = None,
+    ) -> None:
+        day_utc = gap.get("day_utc")
+        connector_id = gap.get("connector_id")
+        pollutant_code = gap.get("pollutant_code")
+        # Day manifests aggregate every connector beneath the day.  Their
+        # repair action must never inherit an incidental connector/pollutant
+        # from an individual integrity finding.
+        if kind == "observation_day_manifest_repair":
+            connector_id = None
+            pollutant_code = None
+        key = (kind, str(day_utc or ""), connector_id, str(pollutant_code or "") or None)
+        entry = actions.get(key)
+        gap_type = str(gap.get("gap_type") or "")
+        if entry is None:
+            entry = {
+                "kind": kind,
+                "status": "planned",
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "pollutant_code": pollutant_code,
+                "requires_index_rebuild": bool(requires_index_rebuild),
+                "data_changes_required": bool(data_changes_required),
+                "executes": False,
+                "operator_action_required": bool(operator_action_required),
+                "gap_types": [gap_type] if gap_type else [],
+                "commands": [],
+                "notes": notes or "",
+            }
+            repair_decision = gap.get("repair_decision")
+            if isinstance(repair_decision, Mapping):
+                entry["repair_decision"] = dict(repair_decision)
+            actions[key] = entry
+        else:
+            if gap_type and gap_type not in entry["gap_types"]:
+                entry["gap_types"].append(gap_type)
+            entry["requires_index_rebuild"] = bool(entry["requires_index_rebuild"] or requires_index_rebuild)
+            entry["executes"] = bool(entry["executes"] or executes)
+            entry["operator_action_required"] = bool(entry["operator_action_required"] or operator_action_required)
+            entry["data_changes_required"] = bool(entry["data_changes_required"] or data_changes_required)
+            if notes and notes not in str(entry.get("notes") or ""):
+                entry["notes"] = f"{entry['notes']}; {notes}" if entry.get("notes") else notes
+        source_evidence = gap.get("source_evidence")
+        rollover_evidence = (
+            list(source_evidence.get("historical_identity_rollovers") or [])
+            if isinstance(source_evidence, Mapping)
+            else []
+        )
+        if rollover_evidence and kind == "observation_data_repair":
+            entry["identity_classification"] = (
+                "bridge_known_historical_identity_rollover"
+            )
+            entry["historical_identity_repair_gate_required"] = True
+            merged_rollovers = {
+                (
+                    int(item.get("existing_r2_timeseries_id") or 0),
+                    int(item.get("date_valid_timeseries_id") or 0),
+                ): dict(item)
+                for item in list(entry.get("historical_identity_rollovers") or [])
+                if isinstance(item, Mapping)
+            }
+            for item in rollover_evidence:
+                if not isinstance(item, Mapping):
+                    continue
+                merged_rollovers[(
+                    int(item.get("existing_r2_timeseries_id") or 0),
+                    int(item.get("date_valid_timeseries_id") or 0),
+                )] = dict(item)
+            entry["historical_identity_rollovers"] = [
+                merged_rollovers[key] for key in sorted(merged_rollovers)
+            ]
+
+    for gap in observation_gaps:
+        source_partition_state = _source_partition_state_from_gap(gap)
+        if (
+            gap.get("pollutant_code")
+            and str(gap.get("pollutant_code")).strip().lower()
+            not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
+        ):
+            continue
+        decision = decide_observation_repair(
+            gap,
+            source_partition_unavailable=(
+                source_partition_state in _SOURCE_PARTITION_UNAVAILABLE_STATES
+            ),
+            reconstructible_manifest=_reconstructible_observation_manifest_gap(
+                gap, observation_gaps
+            ),
+        )
+        if decision.repair_kind == "unclassified":
+            continue
+        repair_gap = dict(gap)
+        repair_gap["pollutant_code"] = decision.pollutant_code
+        repair_gap["repair_decision"] = decision.as_dict()
+        add_action(
+            decision.repair_kind,
+            gap=repair_gap,
+            requires_index_rebuild=decision.requires_index_rebuild,
+            operator_action_required=(
+                decision.executability_policy == "operator_action_required"
+            ),
+            data_changes_required=decision.data_changes_required,
+            notes=decision.reason,
+        )
+    selected_observation_actions: dict[tuple[str, str, str], str] = {}
+    for entry in actions.values():
+        kind = str(entry.get("kind") or "")
+        if kind not in observation_partition_priority:
+            continue
+        pollutant_code = entry.get("pollutant_code")
+        day_utc = entry.get("day_utc")
+        connector_id = entry.get("connector_id")
+        if pollutant_code is None or day_utc is None or connector_id is None:
+            continue
+        key = (str(day_utc), str(connector_id), str(pollutant_code))
+        current_kind = selected_observation_actions.get(key)
+        if current_kind is None or observation_partition_priority[kind] > observation_partition_priority[current_kind]:
+            selected_observation_actions[key] = kind
+
+    filtered_actions: dict[tuple[str, str, int | str | None, str | None], dict[str, Any]] = {}
+    for action_key, entry in actions.items():
+        kind = str(entry.get("kind") or "")
+        pollutant_code = entry.get("pollutant_code")
+        day_utc = entry.get("day_utc")
+        connector_id = entry.get("connector_id")
+        if pollutant_code is None or day_utc is None or connector_id is None:
+            filtered_actions[action_key] = entry
+            continue
+        partition_key = (str(day_utc), str(connector_id), str(pollutant_code))
+        selected_kind = selected_observation_actions.get(partition_key)
+        if kind in observation_partition_priority and selected_kind != kind:
+            continue
+        filtered_actions[action_key] = entry
+
+    order = [
+        "observation_data_repair",
+        "source_mapping_issue",
+        "observation_pollutant_manifest_repair",
+        "observation_index_repair",
+        "observation_connector_manifest_repair",
+        "observation_day_manifest_repair",
+    ]
+    position = {kind: idx for idx, kind in enumerate(order)}
+    for entry in filtered_actions.values():
+        entry["gap_types"] = sorted(set(entry.get("gap_types") or []))
+    return sorted(
+        filtered_actions.values(),
+        key=lambda entry: (
+            position.get(str(entry.get("kind") or ""), 999),
+            str(entry.get("day_utc") or ""),
+            int(entry["connector_id"]) if str(entry.get("connector_id") or "").isdigit() else -1,
+            str(entry.get("pollutant_code") or ""),
+        ),
+    )
+
+
+def _is_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _load_json_file(path: Path) -> tuple[Any | None, str | None]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), None
+    except json.JSONDecodeError:
+        return None, "invalid_json"
+    except OSError:
+        return None, "unreadable"
+
+
 def run_v2_post_repair_integrity_rechecks(
     *,
     conn: sqlite3.Connection | None = None,
@@ -13581,7 +13292,6 @@ def run_v2_post_repair_integrity_rechecks(
     allowed_real_roots: Iterable[Path] = (),
     observation_total_connector_ids: Iterable[int] | None = None,
     observation_total_pollutants: Iterable[str] | None = None,
-    verify_derived_index_scopes: set[tuple[str, int, str]] | None = None,
 ) -> dict[str, Any]:
     """Re-run observation Integrity after repair."""
     post_obs = run_v2_observations_integrity_checks(
@@ -13598,18 +13308,20 @@ def run_v2_post_repair_integrity_rechecks(
         allowed_real_roots=allowed_real_roots,
         observation_total_connector_ids=observation_total_connector_ids,
         observation_total_pollutants=observation_total_pollutants,
-        verify_derived_index_scopes=verify_derived_index_scopes,
     )
+    obs_status = str(post_obs.get("status") or "fail")
+    message = "v2 observations fixed" if obs_status == "ok" else "v2 observations still failing"
+    status = "ok" if obs_status == "ok" else "fail"
     remaining_observation_gaps = list(post_obs.get("gaps") or [])
     for gap in remaining_observation_gaps:
         log.warning(
-            "observation post-repair remaining gap details=%s",
+            "v2 post-repair remaining gap domain=observations details=%s",
             json.dumps(gap, sort_keys=True, default=str),
         )
     return {
         "ran": True,
-        "status": str(post_obs.get("status") or "fail"),
-        "message": "observations verified" if not remaining_observation_gaps else "observations still failing",
+        "status": status,
+        "message": message,
         "observations": post_obs,
         "remaining_observation_gap_count": len(remaining_observation_gaps),
     }
@@ -13750,69 +13462,6 @@ def run_r2_cross_checks(
         per_ts = grouped.setdefault(key, {})
         per_ts[int(timeseries_id)] = int(source_row_count or 0)
 
-    official_comparison_by_scope: dict[
-        tuple[str, int], dict[str, Any]
-    ] = {}
-    for official_source, context in OFFICIAL_RDATA_RUN_CONTEXTS.items():
-        if official_source not in source_keys:
-            continue
-        connector_id = int(context["connector_id"])
-        for day_utc in sorted((context.get("rows_by_day") or {})):
-            scope = (str(day_utc), connector_id)
-            selected_binding_ids = {
-                int(binding["timeseries_id"])
-                for site_bindings in dict(context.get("bindings") or {}).values()
-                for binding in dict(site_bindings).values()
-            }
-            unavailable_scopes = [
-                dict(item)
-                for item in list(
-                    (context.get("source_unavailable_by_day") or {}).get(
-                        day_utc
-                    )
-                    or []
-                )
-            ]
-            windows_by_timeseries: dict[int, list[dict[str, Any]]] = {}
-            for unavailable_scope in unavailable_scopes:
-                windows_by_timeseries.setdefault(
-                    int(unavailable_scope["timeseries_id"]), []
-                ).extend(
-                    dict(window) for window in list(
-                        unavailable_scope.get("canonical_unavailable_windows")
-                        or []
-                    )
-                )
-            comparable_ids = {
-                timeseries_id for timeseries_id in selected_binding_ids
-                if official_rdata_day_has_available_window(
-                    str(day_utc),
-                    windows_by_timeseries.get(timeseries_id, []),
-                )
-            }
-            partial_window_ids = comparable_ids & set(windows_by_timeseries)
-            official_comparison_by_scope[scope] = {
-                "timeseries_ids": comparable_ids,
-                "unavailable_scopes": unavailable_scopes,
-                "requires_exact_baseline_rows": bool(partial_window_ids),
-            }
-            if not comparable_ids:
-                grouped.pop(scope, None)
-                continue
-            current_counts: dict[int, int] = {}
-            for row in list((context.get("rows_by_day") or {}).get(day_utc) or []):
-                timeseries_id = int(row["timeseries_id"])
-                if (
-                    timeseries_id in comparable_ids
-                    and not _official_rdata_row_is_source_unavailable(
-                        row, unavailable_scopes,
-                    )
-                ):
-                    current_counts[timeseries_id] = (
-                        current_counts.get(timeseries_id, 0) + 1
-                    )
-            grouped[scope] = current_counts
-
     status_counts = {
         "ok": 0,
         "mismatch": 0,
@@ -13884,50 +13533,6 @@ def run_r2_cross_checks(
                     notes,
                 ))
             continue
-
-        official_comparison = official_comparison_by_scope.get(
-            (day_utc, connector_id)
-        )
-        if official_comparison is not None:
-            available_timeseries_ids = set(
-                official_comparison["timeseries_ids"]
-            )
-            if official_comparison["requires_exact_baseline_rows"]:
-                connector_root = (
-                    root / R2_HISTORY_V2_OBSERVATIONS_PREFIX
-                    / f"day_utc={day_utc}"
-                    / f"connector_id={int(connector_id)}"
-                )
-                parquet_paths = sorted(
-                    str(path) for path in connector_root.glob(
-                        "pollutant_code=*/part-*.parquet"
-                    )
-                )
-                baseline_rows = (
-                    _observation_rows_from_local_parquet_for_shared_hash(
-                        parquet_paths=parquet_paths,
-                    )
-                )
-                exact_counts: dict[int, int] = {}
-                for row in baseline_rows:
-                    timeseries_id = int(row.get("timeseries_id") or 0)
-                    if (
-                        timeseries_id in available_timeseries_ids
-                        and not _official_rdata_row_is_source_unavailable(
-                            row,
-                            official_comparison["unavailable_scopes"],
-                        )
-                    ):
-                        exact_counts[timeseries_id] = (
-                            exact_counts.get(timeseries_id, 0) + 1
-                        )
-                r2_counts = exact_counts
-            else:
-                r2_counts = {
-                    timeseries_id: count
-                    for timeseries_id, count in r2_counts.items()
-                    if timeseries_id in available_timeseries_ids
-                }
 
         for timeseries_id in sorted(set(source_counts) | set(r2_counts)):
             source_row_count = source_counts.get(timeseries_id)
@@ -14359,71 +13964,6 @@ def _repo_root_for_integrity_script(env: Mapping[str, str] | None = None) -> Pat
     return path
 
 
-INTEGRITY_TARGET_WRITER_GIT_SHA_ENV = (
-    "UK_AQ_INTEGRITY_TARGET_WRITER_GIT_SHA"
-)
-_FULL_LOWER_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-
-
-def resolve_and_pin_integrity_target_writer_git_sha(
-    env: dict[str, str],
-) -> str:
-    """Resolve the executing ops checkout once and pin it for every child."""
-    repo_root = _repo_root_for_integrity_script(env)
-    try:
-        completed = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-    except OSError as exc:
-        raise RuntimeError(
-            f"cannot resolve Integrity target writer Git SHA from {repo_root}: {exc}"
-        ) from exc
-    resolved = completed.stdout.strip().lower()
-    if completed.returncode != 0 or not _FULL_LOWER_GIT_SHA_RE.fullmatch(resolved):
-        detail = (completed.stderr or completed.stdout).strip()
-        raise RuntimeError(
-            "cannot establish Integrity target writer Git SHA from the ops "
-            f"repository {repo_root}: {detail or 'invalid git rev-parse output'}"
-        )
-    try:
-        worktree = subprocess.run(
-            [
-                "git", "-C", str(repo_root), "status", "--porcelain",
-                "--untracked-files=normal",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-    except OSError as exc:
-        raise RuntimeError(
-            "fixed-v3 Integrity writer provenance requires a clean ops "
-            f"repository worktree: cannot inspect {repo_root}: {exc}"
-        ) from exc
-    if worktree.returncode != 0 or worktree.stdout:
-        detail = (worktree.stderr or worktree.stdout).strip()
-        raise RuntimeError(
-            "fixed-v3 Integrity writer provenance requires a clean ops "
-            f"repository worktree: {repo_root}: {detail or 'git status failed'}"
-        )
-    inherited = str(os.environ.get(INTEGRITY_TARGET_WRITER_GIT_SHA_ENV, "")).strip()
-    if inherited and (
-        not _FULL_LOWER_GIT_SHA_RE.fullmatch(inherited) or inherited != resolved
-    ):
-        raise RuntimeError(
-            f"{INTEGRITY_TARGET_WRITER_GIT_SHA_ENV} must exactly match the "
-            "full lower-case Git SHA of the executing ops repository"
-        )
-    os.environ[INTEGRITY_TARGET_WRITER_GIT_SHA_ENV] = resolved
-    env[INTEGRITY_TARGET_WRITER_GIT_SHA_ENV] = resolved
-    return resolved
-
-
 def _v2_observation_connector_manifest_key(
     *,
     day_utc: str,
@@ -14436,15 +13976,6 @@ def _v2_observation_connector_manifest_key(
         f"{config.observations_data_prefix.strip('/')}"
         f"/day_utc={day_utc}/connector_id={int(connector_id)}/manifest.json"
     )
-
-
-def _load_json_file(path: Path) -> tuple[Any | None, str | None]:
-    try:
-        return json.loads(path.read_text(encoding="utf-8")), None
-    except json.JSONDecodeError:
-        return None, "invalid_json"
-    except OSError:
-        return None, "unreadable"
 
 
 def _read_json_manifest_for_guard(
@@ -14917,6 +14448,16 @@ def _sos_day_scoped_expected_counts(
     return counts, sorted(pollutants)
 
 
+def _safe_non_negative_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed < 0:
+        return None
+    return parsed
+
+
 def _timeseries_ids_for_connector(conn: sqlite3.Connection, connector_id: int) -> list[int]:
     rows = conn.execute(
         """
@@ -14995,94 +14536,6 @@ def _official_rdata_source_file_key(
     return f"{source_key}:site_ref={site_code.upper()}:year={int(year)}"
 
 
-def _official_rdata_row_is_source_unavailable(
-    row: Mapping[str, Any],
-    unavailable_scopes: Iterable[Mapping[str, Any]],
-) -> bool:
-    timeseries_id = int(row.get("timeseries_id") or 0)
-    pollutant_code = str(row.get("pollutant_code") or "")
-    observed_at_utc = str(
-        row.get("observed_at_utc") or row.get("observed_at") or ""
-    )
-    for scope in unavailable_scopes:
-        scope_windows = list(
-            scope.get("canonical_unavailable_windows") or []
-        )
-        if not scope_windows:
-            raise ValueError(
-                "official RData unavailable scope has no canonical windows"
-            )
-        if (
-            int(scope.get("timeseries_id") or 0) != timeseries_id
-            or str(scope.get("pollutant_code") or "") != pollutant_code
-        ):
-            continue
-        if official_rdata_timestamp_is_in_windows(
-            observed_at_utc,
-            scope_windows,
-        ):
-            return True
-    return False
-
-
-def _official_rdata_source_available_rows(
-    rows: Iterable[Mapping[str, Any]],
-    unavailable_scopes: Iterable[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    scopes = [dict(scope) for scope in unavailable_scopes]
-    return [
-        dict(row) for row in rows
-        if not _official_rdata_row_is_source_unavailable(row, scopes)
-    ]
-
-
-def _official_rdata_partition_availability(
-    *,
-    context: Mapping[str, Any],
-    day_utc: str,
-    pollutant_code: str,
-) -> tuple[set[int], set[int], list[dict[str, Any]]]:
-    binding_ids = {
-        int(binding["timeseries_id"])
-        for site_bindings in dict(context.get("bindings") or {}).values()
-        for code, binding in dict(site_bindings).items()
-        if str(code) == pollutant_code
-    }
-    unavailable_scopes = [
-        dict(scope)
-        for scope in list(
-            (context.get("source_unavailable_by_day") or {}).get(day_utc) or []
-        )
-        if str(scope.get("pollutant_code") or "") == pollutant_code
-    ]
-    unavailable_ids = {
-        int(scope["timeseries_id"]) for scope in unavailable_scopes
-    }
-    windows_by_timeseries: dict[int, list[dict[str, Any]]] = {}
-    for scope in unavailable_scopes:
-        scope_windows = list(
-            scope.get("canonical_unavailable_windows") or []
-        )
-        if not scope_windows:
-            raise ValueError(
-                "official RData unavailable scope has no canonical windows"
-            )
-        windows_by_timeseries.setdefault(
-            int(scope["timeseries_id"]), []
-        ).extend(
-            dict(window)
-            for window in scope_windows
-        )
-    available_ids = {
-        timeseries_id for timeseries_id in binding_ids
-        if official_rdata_day_has_available_window(
-            day_utc,
-            windows_by_timeseries.get(timeseries_id, []),
-        )
-    }
-    return available_ids, unavailable_ids, unavailable_scopes
-
-
 def _official_rdata_bindings(
     conn: sqlite3.Connection,
     *,
@@ -15095,30 +14548,34 @@ def _official_rdata_bindings(
     dict[str, list[dict[str, Any]]],
 ]:
     """Resolve one authoritative active timeseries per site/pollutant."""
-    config = OFFICIAL_RDATA_NETWORKS.get(source_key)
-    if config is None:
-        raise ValueError(f"unsupported official RData source: {source_key}")
     rows = conn.execute(
         """
         SELECT
           UPPER(TRIM(l.source_location_id)),
           l.station_id,
-          l.connector_id,
           l.timeseries_id,
-          t.station_id,
-          t.connector_id,
-          p.connector_id,
-          p.observed_property_id,
-          o.id,
-          LOWER(TRIM(o.code)),
+          LOWER(TRIM(m.observed_property_code)),
+          m.observed_property_code_count,
+          m.observed_property_codes,
           p.label,
           p.source_label,
           p.pollutant_label
         FROM source_station_timeseries_lookup l
         JOIN core_timeseries_snapshot t ON t.id = l.timeseries_id
         JOIN core_phenomena_snapshot p ON p.id = t.phenomenon_id
-        LEFT JOIN core_observed_properties_snapshot o
-          ON o.id = p.observed_property_id
+        LEFT JOIN (
+          SELECT connector_id, observed_property_id,
+                 MIN(LOWER(TRIM(observed_property_code))) AS observed_property_code,
+                 COUNT(DISTINCT LOWER(TRIM(observed_property_code))) AS observed_property_code_count,
+                 GROUP_CONCAT(DISTINCT LOWER(TRIM(observed_property_code))) AS observed_property_codes
+          FROM core_observed_property_mappings_snapshot
+          WHERE is_active = 1
+            AND observed_property_id IS NOT NULL
+            AND TRIM(observed_property_code) != ''
+          GROUP BY connector_id, observed_property_id
+        ) m
+          ON m.connector_id = t.connector_id
+         AND m.observed_property_id = p.observed_property_id
         WHERE l.source_key = ?
           AND l.is_active = 1
           AND l.source_location_id IS NOT NULL
@@ -15140,12 +14597,16 @@ def _official_rdata_bindings(
     excluded_rows: list[dict[str, Any]] = []
     mapping_defects: list[dict[str, Any]] = []
     for (
-        site_code, lookup_station_id, lookup_connector_id, timeseries_id,
-        timeseries_station_id, timeseries_connector_id, phenomenon_connector_id,
-        observed_property_id, canonical_observed_property_id, pollutant_code,
-        phenomenon_label, phenomenon_source_label, phenomenon_pollutant_label,
+        site_code, station_id, timeseries_id, pollutant_code, code_count,
+        observed_property_codes, phenomenon_label, phenomenon_source_label,
+        phenomenon_pollutant_label,
     ) in rows:
         code = str(pollutant_code or "").strip().lower()
+        mapped_codes = sorted({
+            value.strip().lower()
+            for value in str(observed_property_codes or "").split(",")
+            if value.strip()
+        })
         label_codes = sorted({
             normalized
             for normalized in (
@@ -15157,65 +14618,47 @@ def _official_rdata_bindings(
         })
         identity = {
             "site_code": str(site_code),
-            "station_id": int(lookup_station_id),
+            "station_id": int(station_id),
             "timeseries_id": int(timeseries_id),
-            "observed_property_id": (
-                int(observed_property_id)
-                if observed_property_id is not None else None
-            ),
-            "canonical_observed_property_code": code,
-        }
-        diagnostic_identity = {
-            **identity,
-            "phenomenon_label": phenomenon_label,
-            "phenomenon_source_label": phenomenon_source_label,
-            "phenomenon_pollutant_label": phenomenon_pollutant_label,
+            "observed_property_code": code,
+            "observed_property_code_count": int(code_count or 0),
+            "observed_property_codes": mapped_codes,
             "phenomenon_pollutant_codes": label_codes,
         }
-        identity_contradictions = []
-        if int(lookup_connector_id) != config.connector_id:
-            identity_contradictions.append("lookup_connector_id")
-        if int(timeseries_connector_id) != config.connector_id:
-            identity_contradictions.append("timeseries_connector_id")
-        if int(phenomenon_connector_id) != config.connector_id:
-            identity_contradictions.append("phenomenon_connector_id")
-        if int(timeseries_station_id) != int(lookup_station_id):
-            identity_contradictions.append("timeseries_station_id")
-        defect_reason = None
-        if identity_contradictions:
-            defect_reason = "contradictory_station_timeseries_identity"
-        elif observed_property_id is None:
-            defect_reason = "missing_observed_property_id"
-        elif canonical_observed_property_id is None:
-            defect_reason = "missing_canonical_observed_property"
-        elif int(canonical_observed_property_id) != int(observed_property_id):
-            defect_reason = "contradictory_canonical_observed_property"
-        elif not code:
-            defect_reason = "blank_canonical_observed_property_code"
-        if defect_reason is not None:
-            mapping_defects.append({
-                **diagnostic_identity,
-                "identity_contradictions": identity_contradictions,
-                "reason": defect_reason,
-            })
+        if int(code_count or 0) != 1:
+            audit_row = {
+                **identity,
+                "reason": (
+                    "ambiguous_active_observed_property_mapping"
+                    if int(code_count or 0) > 1
+                    else "missing_active_observed_property_mapping"
+                ),
+            }
+            if selected.intersection(set(mapped_codes) | set(label_codes)):
+                observed_property_rows.append(identity)
+                mapping_defects.append(audit_row)
+            else:
+                excluded_rows.append({
+                    **audit_row,
+                    "reason": f"unselected_{audit_row['reason']}",
+                })
             continue
         if code not in supported:
             excluded_rows.append({
-                **diagnostic_identity,
+                **identity,
                 "reason": "unsupported_integrity_pollutant",
             })
             continue
         if code not in selected:
             excluded_rows.append({
-                **diagnostic_identity,
+                **identity,
                 "reason": "not_selected_pollutant",
             })
             continue
         observed_property_rows.append(identity)
         binding = {
-            "station_id": int(lookup_station_id),
+            "station_id": int(station_id),
             "timeseries_id": int(timeseries_id),
-            "observed_property_id": int(observed_property_id),
         }
         grouped.setdefault((str(site_code), code), []).append(binding)
     if mapping_defects:
@@ -15225,7 +14668,7 @@ def _official_rdata_bindings(
             for row in mapping_defects[:10]
         )
         raise RuntimeError(
-            f"{source_key} authoritative observed-property identity is defective: "
+            f"{source_key} authoritative observed-property mapping is defective: "
             f"{sample}"
         )
     ambiguous = {
@@ -15241,17 +14684,11 @@ def _official_rdata_bindings(
         )
     bindings: dict[str, dict[str, dict[str, int]]] = {}
     for (site_code, pollutant_code), values in sorted(grouped.items()):
-        selected_binding = values[0]
-        bindings.setdefault(site_code, {})[pollutant_code] = {
-            "station_id": selected_binding["station_id"],
-            "timeseries_id": selected_binding["timeseries_id"],
-        }
+        bindings.setdefault(site_code, {})[pollutant_code] = values[0]
         mapping_rows.append({
             "site_code": site_code,
             "pollutant_code": pollutant_code,
-            "station_id": selected_binding["station_id"],
-            "timeseries_id": selected_binding["timeseries_id"],
-            "observed_property_id": selected_binding["observed_property_id"],
+            **values[0],
         })
     if not bindings:
         raise RuntimeError(
@@ -15327,7 +14764,6 @@ def check_official_network_rdata(
     run_root.mkdir(parents=True, exist_ok=True)
     now_iso = utc_now().isoformat()
     identities_by_key: dict[str, dict[str, Any]] = {}
-    acquisition_records: list[dict[str, Any]] = []
     downloaded_bytes = 0
 
     def record_acquisition_failure(
@@ -15340,11 +14776,7 @@ def check_official_network_rdata(
         exc: Exception,
     ) -> Path:
         http_status = (
-            int(exc.code)
-            if isinstance(exc, urllib.error.HTTPError)
-            else int(exc.http_status)
-            if isinstance(exc, AuthoritativeSourceArtifactAbsent)
-            else None
+            int(exc.code) if isinstance(exc, urllib.error.HTTPError) else None
         )
         reason = (
             "unexpected_required_source_http_404"
@@ -15382,18 +14814,8 @@ def check_official_network_rdata(
     def acquire(
         *, source_file_key: str, url: str, destination: Path,
         site_code: str | None, year: int | None,
-        allow_authoritative_absence: bool = False,
     ) -> dict[str, Any]:
         nonlocal downloaded_bytes
-        if allow_authoritative_absence and (
-            not site_code
-            or year is None
-            or Path(urllib.parse.urlsplit(url).path).name
-            != f"{site_code}_{int(year)}.RData"
-        ):
-            raise ValueError(
-                "authoritative absence is limited to canonical site-year RData objects"
-            )
         if limits.should_stop():
             raise RuntimeError(
                 f"{source_key} RData acquisition stopped by {limits.stopped_for}"
@@ -15401,64 +14823,7 @@ def check_official_network_rdata(
         prior = _fetch_prior_state(conn, source_file_key)
         started = time.monotonic()
         try:
-            pinned = download_official_rdata_pinned(
-                url,
-                destination,
-                config=config,
-            )
-        except AuthoritativeSourceArtifactAbsent as exc:
-            if not allow_authoritative_absence:
-                failure_path = record_acquisition_failure(
-                    source_file_key=source_file_key,
-                    url=url,
-                    site_code=site_code,
-                    year=year,
-                    stage="fetch",
-                    exc=exc,
-                )
-                raise RuntimeError(
-                    f"{source_key} required metadata RData fetch failed closed: "
-                    f"status=404 url={url}; audit={failure_path}"
-                ) from exc
-            record = {
-                "source_adapter": source_key,
-                "connector_id": config.connector_id,
-                "source_file": source_file_key,
-                "site_code": site_code,
-                "source_year": year,
-                "canonical_url": exc.canonical_url,
-                "final_url": exc.final_url,
-                "availability": "authoritatively_absent",
-                "http_status": exc.http_status,
-                "requested_at_utc": exc.requested_at_utc,
-                "reason": "source_artifact_unavailable",
-                "authoritative_no_data": False,
-            }
-            _upsert_source_state(
-                conn=conn, source_key=source_key,
-                remote_scheme="openair_rdata",
-                source_file_key=source_file_key, env_name=env_name,
-                remote_url_or_key=url, station_ref=site_code,
-                source_location_id=site_code, day=days[0],
-                exists_remote=False, content_length=None, etag=None,
-                last_modified_utc=None, sha256_downloaded=None,
-                sha256_uncompressed=None, local_cached_path=None,
-                now_iso=now_iso, last_changed_at=now_iso,
-                last_status="authoritatively_absent",
-                notes=(
-                    "canonical provider site-year artifact unavailable; "
-                    f"HTTP 404; year={year}; final_url={exc.final_url}"
-                ),
-                source_count_mapping_identity="official_network_rdata_v1",
-                source_count_mapping_hash=mapping_hash,
-            )
-            acquisition_records.append(record)
-            log.warning(
-                "%s source artifact unavailable: site=%s year=%s status=404 "
-                "action=preserve_pinned_baseline_scope",
-                source_key.upper(), site_code, year,
-            )
-            return record
+            pinned = download_official_rdata_pinned(url, destination)
         except Exception as exc:
             failure_path = record_acquisition_failure(
                 source_file_key=source_file_key,
@@ -15528,22 +14893,10 @@ def check_official_network_rdata(
         identity = {
             "source_file": source_file_key,
             "url": url,
-            "canonical_url": str(pinned.get("canonical_url") or url),
-            "final_url": str(pinned.get("final_url") or url),
-            "availability": "present",
-            "http_status": int(pinned.get("http_status") or 200),
-            "requested_at_utc": str(pinned.get("requested_at_utc") or now_iso),
             "bytes": int(pinned["bytes"]),
             "sha256": str(pinned["sha256"]),
         }
         identities_by_key[source_file_key] = identity
-        acquisition_records.append({
-            "source_adapter": source_key,
-            "connector_id": config.connector_id,
-            "site_code": site_code,
-            "source_year": year,
-            **identity,
-        })
         return identity
 
     metadata_key = f"{source_key}:metadata"
@@ -15580,169 +14933,24 @@ def check_official_network_rdata(
     required_by_day: dict[str, set[str]] = {
         day.isoformat(): {metadata_key} for day in days
     }
-    coverage_audit: list[dict[str, Any]] = []
-    unavailable_scopes: list[dict[str, Any]] = []
-    unavailable_by_day: dict[str, list[dict[str, Any]]] = {
-        day.isoformat(): [] for day in days
-    }
-    site_year_files_authoritative_no_coverage = 0
     decoded_files = 0
     for site_code, site_bindings in sorted(bindings.items()):
         for year in official_rdata_required_site_years(days):
             source_file_key = _official_rdata_source_file_key(
                 source_key, site_code, year,
             )
-            filename = f"{site_code}_{year}.RData"
-            source_url = config.base_url + filename
-            relevant_days = [
-                day for day in days
-                if year in official_rdata_required_site_years((day,))
-            ]
-            day_coverage: list[dict[str, Any]] = []
-            for day in relevant_days:
-                coverage = classify_site_year_coverage(
-                    metadata_rows,
-                    site_code=site_code,
-                    bindings_by_pollutant=site_bindings,
-                    selected_days=(day,),
-                    source_year=year,
-                )
-                evidence = {
-                    "schema_version": 1,
-                    "source_adapter": source_key,
-                    "connector_id": config.connector_id,
-                    "source_file": source_file_key,
-                    "url": source_url,
-                    "metadata_source_identity": dict(
-                        identities_by_key[metadata_key]
-                    ),
-                    **coverage,
-                }
-                day_coverage.append(evidence)
-                audits_by_day[day.isoformat()].append({
-                    "audit_kind": "site_year_source_coverage",
-                    **evidence,
-                })
-                if coverage["classification"] != COVERAGE_AUTHORITATIVE_NO_COVERAGE:
+            for day in days:
+                if year in official_rdata_required_site_years((day,)):
                     required_by_day[day.isoformat()].add(source_file_key)
-
-            classifications = {
-                str(evidence["classification"]) for evidence in day_coverage
-            }
-            if COVERAGE_REQUIRED in classifications:
-                classification = COVERAGE_REQUIRED
-                reason = "selected_day_requires_site_year"
-            elif COVERAGE_INDETERMINATE in classifications:
-                classification = COVERAGE_INDETERMINATE
-                reason = "selected_day_coverage_indeterminate"
-            else:
-                classification = COVERAGE_AUTHORITATIVE_NO_COVERAGE
-                reason = "all_selected_days_authoritative_no_coverage"
-            coverage_record = {
-                "schema_version": 1,
-                "source_adapter": source_key,
-                "connector_id": config.connector_id,
-                "site_code": site_code,
-                "source_year": year,
-                "source_file": source_file_key,
-                "url": source_url,
-                "selected_pollutants": sorted(site_bindings),
-                "selected_canonical_days": [
-                    day.isoformat() for day in relevant_days
-                ],
-                "metadata_source_identity": dict(
-                    identities_by_key[metadata_key]
-                ),
-                "classification": classification,
-                "reason": reason,
-                "day_classifications": day_coverage,
-                "acquisition_action": (
-                    "not_fetched_authoritative_no_coverage"
-                    if classification == COVERAGE_AUTHORITATIVE_NO_COVERAGE
-                    else "fetched_fail_closed_indeterminate"
-                    if classification == COVERAGE_INDETERMINATE
-                    else "fetched_required"
-                ),
-            }
-            coverage_audit.append(coverage_record)
-            if classification == COVERAGE_AUTHORITATIVE_NO_COVERAGE:
-                site_year_files_authoritative_no_coverage += 1
-                coverage_record["source_artifact_availability"] = (
-                    "not_requested_authoritative_no_coverage"
-                )
-                continue
-
+            filename = f"{site_code}_{year}.RData"
             destination = run_root / f"site={site_code}" / filename
             identity = acquire(
                 source_file_key=source_file_key,
-                url=source_url,
+                url=config.base_url + filename,
                 destination=destination,
                 site_code=site_code,
                 year=year,
-                allow_authoritative_absence=True,
             )
-            availability = str(identity.get("availability") or "present")
-            coverage_record["source_artifact_availability"] = availability
-            coverage_record["canonical_url"] = str(
-                identity.get("canonical_url") or source_url
-            )
-            coverage_record["final_url"] = str(
-                identity.get("final_url") or source_url
-            )
-            coverage_record["http_status"] = int(
-                identity.get("http_status") or 200
-            )
-            coverage_record["request_audit_timestamp"] = str(
-                identity.get("requested_at_utc") or now_iso
-            )
-            if availability == "authoritatively_absent":
-                for day_evidence in day_coverage:
-                    day_utc = str(
-                        (day_evidence.get("selected_canonical_days") or [""])[0]
-                    )
-                    required_by_day[day_utc].discard(source_file_key)
-                    for binding_evidence in list(
-                        day_evidence.get("selected_bindings") or []
-                    ):
-                        if (
-                            binding_evidence.get("classification")
-                            == COVERAGE_AUTHORITATIVE_NO_COVERAGE
-                        ):
-                            continue
-                        scope = {
-                            "day_utc": day_utc,
-                            "site_code": site_code,
-                            "source_year": int(year),
-                            "source_file_key": source_file_key,
-                            "pollutant_code": str(
-                                binding_evidence["pollutant_code"]
-                            ),
-                            "station_id": int(binding_evidence["station_id"]),
-                            "timeseries_id": int(
-                                binding_evidence["timeseries_id"]
-                            ),
-                            "reason": "source_artifact_unavailable",
-                            "canonical_url": str(identity["canonical_url"]),
-                            "final_url": str(identity["final_url"]),
-                            "http_status": 404,
-                            "request_audit_timestamp": str(
-                                identity["requested_at_utc"]
-                            ),
-                            "raw_source_windows": list(
-                                day_evidence.get("raw_source_windows") or []
-                            ),
-                            "canonical_unavailable_windows": (
-                                official_rdata_canonical_unavailable_windows(
-                                    list(
-                                        day_evidence.get("raw_source_windows")
-                                        or []
-                                    )
-                                )
-                            ),
-                        }
-                        unavailable_scopes.append(scope)
-                        unavailable_by_day[day_utc].append(scope)
-                continue
             try:
                 decoded = extract_official_rdata_site_year(
                     destination, site_code=site_code, year=year,
@@ -15750,7 +14958,7 @@ def check_official_network_rdata(
             except Exception as exc:
                 failure_path = record_acquisition_failure(
                     source_file_key=source_file_key,
-                    url=source_url,
+                    url=config.base_url + filename,
                     site_code=site_code,
                     year=year,
                     stage="decode",
@@ -15772,7 +14980,7 @@ def check_official_network_rdata(
             except Exception as exc:
                 failure_path = record_acquisition_failure(
                     source_file_key=source_file_key,
-                    url=source_url,
+                    url=config.base_url + filename,
                     site_code=site_code,
                     year=year,
                     stage="canonicalize",
@@ -15797,10 +15005,6 @@ def check_official_network_rdata(
             decoded_files += 1
 
     for day_utc, rows in rows_by_day.items():
-        rows[:] = _official_rdata_source_available_rows(
-            rows,
-            unavailable_by_day[day_utc],
-        )
         rows.sort(key=lambda row: (
             row["observed_at_utc"], row["timeseries_id"], row["pollutant_code"],
         ))
@@ -15822,37 +15026,17 @@ def check_official_network_rdata(
     context = {
         "source_key": source_key,
         "connector_id": config.connector_id,
-        "bindings": bindings,
         "rows_by_day": rows_by_day,
         "audits_by_day": audits_by_day,
         "required_by_day": {
             key: sorted(value) for key, value in required_by_day.items()
         },
-        "source_unavailable_by_day": {
-            key: sorted(
-                value,
-                key=lambda item: (
-                    item["pollutant_code"], item["timeseries_id"],
-                    item["source_year"],
-                ),
-            )
-            for key, value in unavailable_by_day.items()
-        },
-        "source_unavailable_scopes": sorted(
-            unavailable_scopes,
-            key=lambda item: (
-                item["day_utc"], item["pollutant_code"],
-                item["timeseries_id"], item["source_year"],
-            ),
-        ),
-        "acquisition_records": acquisition_records,
         "identities_by_key": identities_by_key,
         "absent_keys": [],
         "selected_pollutants": selected,
         "authoritative_mapping_sha256": mapping_hash,
         "observed_property_mapping_sha256": observed_property_hash,
         "mapping_audit": mapping_audit,
-        "site_year_coverage_audit": coverage_audit,
         "rscript_identity": official_rdata_rscript_identity(),
         "run_root": str(run_root),
     }
@@ -15870,18 +15054,7 @@ def check_official_network_rdata(
         "metadata_files_fetched": 1,
         "site_year_files_fetched": len(identities_by_key) - 1,
         "site_year_files_decoded": decoded_files,
-        "site_year_files_authoritative_no_coverage": (
-            site_year_files_authoritative_no_coverage
-        ),
-        "site_year_files_source_unavailable": sum(
-            1 for record in acquisition_records
-            if record.get("source_year") is not None
-            and record.get("availability") == "authoritatively_absent"
-        ),
-        "site_year_files_indeterminate": 0,
         "source_files_authoritatively_absent": 0,
-        "source_unavailable_scope_count": len(unavailable_scopes),
-        "source_unavailable_scopes": context["source_unavailable_scopes"],
         "downloaded_bytes": downloaded_bytes,
         "canonical_rows": sum(len(rows) for rows in rows_by_day.values()),
         "selected_day_count": len(days),
@@ -15916,161 +15089,6 @@ def _prepare_official_rdata_proposal(
         dict(row) for row in context["rows_by_day"].get(day_utc, [])
         if str(row.get("pollutant_code") or "") in pollutants
     ]
-    unavailable_scopes = [
-        {
-            key: value
-            for key, value in dict(scope).items()
-            if key != "request_audit_timestamp"
-        }
-        for scope in list(
-            (context.get("source_unavailable_by_day") or {}).get(day_utc) or []
-        )
-        if str(scope.get("pollutant_code") or "") in pollutants
-    ]
-    unavailable_timeseries_ids = {
-        int(scope["timeseries_id"]) for scope in unavailable_scopes
-    }
-    source_available_timeseries_ids: set[int] = set()
-    source_available_pollutant_codes: list[str] = []
-    for pollutant_code in pollutants:
-        pollutant_available_ids, _unavailable_ids, _scopes = (
-            _official_rdata_partition_availability(
-                context=context,
-                day_utc=day_utc,
-                pollutant_code=pollutant_code,
-            )
-        )
-        source_available_timeseries_ids.update(pollutant_available_ids)
-        if pollutant_available_ids:
-            source_available_pollutant_codes.append(pollutant_code)
-    preserved_rows: list[dict[str, Any]] = []
-    preserved_baseline_identity: dict[str, Any] = {
-        "source": "dropbox",
-        "partition_identities": [],
-    }
-    if unavailable_timeseries_ids:
-        baseline_root = Path(resolve_r2_history_root({**os.environ, **env}))
-        for pollutant_code in pollutants:
-            pollutant_unavailable_scopes = [
-                dict(scope) for scope in unavailable_scopes
-                if scope["pollutant_code"] == pollutant_code
-            ]
-            pollutant_unavailable_ids = {
-                int(scope["timeseries_id"])
-                for scope in pollutant_unavailable_scopes
-            }
-            if not pollutant_unavailable_scopes:
-                continue
-            partition_prefix = (
-                f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
-                f"connector_id={int(connector_id)}/"
-                f"pollutant_code={pollutant_code}"
-            )
-            manifest_path = baseline_root / partition_prefix / "manifest.json"
-            partition_identity: dict[str, Any] = {
-                "day_utc": day_utc,
-                "connector_id": int(connector_id),
-                "pollutant_code": pollutant_code,
-                "source_unavailable_timeseries_ids": sorted(
-                    pollutant_unavailable_ids
-                ),
-                "source_unavailable_scopes": pollutant_unavailable_scopes,
-                "manifest_key": f"{partition_prefix}/manifest.json",
-            }
-            if not manifest_path.is_file():
-                partition_identity.update({
-                    "baseline_state": "partition_absent",
-                    "preserved_row_count": 0,
-                    "object_identities": [],
-                })
-                preserved_baseline_identity["partition_identities"].append(
-                    partition_identity
-                )
-                continue
-            manifest_body = manifest_path.read_bytes()
-            manifest = json.loads(manifest_body)
-            files = list(manifest.get("files") or []) if isinstance(
-                manifest, Mapping
-            ) else []
-            parquet_paths: list[str] = []
-            object_identities = [{
-                "object_key": f"{partition_prefix}/manifest.json",
-                "bytes": len(manifest_body),
-                "sha256": hashlib.sha256(manifest_body).hexdigest(),
-            }]
-            for entry in files:
-                object_key = str(
-                    entry.get("key") if isinstance(entry, Mapping) else ""
-                ).strip().lstrip("/")
-                expected_prefix = partition_prefix.rstrip("/") + "/"
-                if not object_key.startswith(expected_prefix):
-                    raise ValueError(
-                        "pinned baseline pollutant manifest escaped its partition"
-                    )
-                object_path = baseline_root / object_key
-                if not object_path.is_file():
-                    raise FileNotFoundError(
-                        f"pinned baseline object is unavailable: {object_key}"
-                    )
-                body = object_path.read_bytes()
-                body_sha256 = hashlib.sha256(body).hexdigest()
-                try:
-                    recorded_bytes = int(entry.get("bytes"))
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(
-                        "pinned baseline pollutant manifest has invalid file bytes"
-                    ) from exc
-                recorded_sha256 = str(
-                    entry.get("etag_or_hash") or ""
-                ).strip().lower()
-                if (
-                    recorded_bytes != len(body)
-                    or recorded_sha256 != body_sha256
-                ):
-                    raise ValueError(
-                        "pinned baseline pollutant file identity changed: "
-                        f"{object_key}"
-                    )
-                parquet_paths.append(str(object_path))
-                object_identities.append({
-                    "object_key": object_key,
-                    "bytes": len(body),
-                    "sha256": body_sha256,
-                })
-            baseline_rows = (
-                _observation_rows_from_local_parquet_for_shared_hash(
-                    parquet_paths=parquet_paths,
-                )
-                if parquet_paths else []
-            )
-            selected_baseline_rows = []
-            for row in baseline_rows:
-                if not _official_rdata_row_is_source_unavailable(
-                    row,
-                    pollutant_unavailable_scopes,
-                ):
-                    continue
-                timeseries_id = int(row.get("timeseries_id") or 0)
-                selected_baseline_rows.append({
-                    "connector_id": int(row["connector_id"]),
-                    "station_id": int(row["station_id"]),
-                    "timeseries_id": timeseries_id,
-                    "pollutant_code": str(row["pollutant_code"]),
-                    "observed_at_utc": str(row["observed_at_utc"]),
-                    "value": float(row["value"]),
-                    "verification_status": row.get(
-                        "verification_status", row.get("status")
-                    ),
-                })
-            preserved_rows.extend(selected_baseline_rows)
-            partition_identity.update({
-                "baseline_state": "partition_present",
-                "preserved_row_count": len(selected_baseline_rows),
-                "object_identities": object_identities,
-            })
-            preserved_baseline_identity["partition_identities"].append(
-                partition_identity
-            )
     required = list(context["required_by_day"].get(day_utc, []))
     identities = [
         context["identities_by_key"][key]
@@ -16096,18 +15114,6 @@ def _prepare_official_rdata_proposal(
         "requested_pollutant_set": pollutants,
         "backed_up_at_utc": utc_now().isoformat().replace("+00:00", "Z"),
         "rows": rows,
-        "preserved_baseline_rows": preserved_rows,
-        "preserved_baseline_identity": preserved_baseline_identity,
-        "source_unavailable_scopes": unavailable_scopes,
-        "source_available_timeseries_ids": sorted(
-            source_available_timeseries_ids
-        ),
-        "source_available_pollutant_codes": sorted(
-            source_available_pollutant_codes
-        ),
-        "source_unavailable_timeseries_ids": sorted(
-            unavailable_timeseries_ids
-        ),
         "source_file_identities": identities,
         "required_source_files": required,
         "authoritatively_absent_source_files": absent,
@@ -16155,10 +15161,9 @@ def _prepare_official_rdata_proposal(
         "backfill_run_status": "ok",
         "integrity_proposal_chunk_staged_events": 1,
         "integrity_proposal_staged_rows": len(rows),
-        "max_integrity_proposal_staged_rows": len(rows) + len(preserved_rows),
-        "preserved_baseline_rows": len(preserved_rows),
+        "max_integrity_proposal_staged_rows": len(rows),
         "repaired_timeseries_row_counts": result.get(
-            "final_target_timeseries_row_counts", {}
+            "source_timeseries_row_counts", {}
         ),
     })
     return result
@@ -16174,100 +15179,6 @@ def _official_rdata_source_for_connector(connector_id: int) -> str | None:
             f"official RData connector maps to multiple run contexts: {connector_id}"
         )
     return matches[0] if matches else None
-
-
-def _official_rdata_source_counts_for_partition(
-    *,
-    source_key: str,
-    day_utc: str,
-    pollutant_code: str,
-) -> tuple[dict[int, int], dict[str, Any]]:
-    """Return current-run counts for exact source-available timestamp windows."""
-    context = OFFICIAL_RDATA_RUN_CONTEXTS[source_key]
-    all_bindings = {
-        int(binding["timeseries_id"])
-        for site_bindings in dict(context.get("bindings") or {}).values()
-        for code, binding in dict(site_bindings).items()
-        if str(code) == pollutant_code
-    }
-    available_ids, unavailable_ids, unavailable_scopes = (
-        _official_rdata_partition_availability(
-            context=context,
-            day_utc=day_utc,
-            pollutant_code=pollutant_code,
-        )
-    )
-    counts: dict[int, int] = {}
-    for row in list((context.get("rows_by_day") or {}).get(day_utc) or []):
-        timeseries_id = int(row["timeseries_id"])
-        if (
-            str(row.get("pollutant_code") or "") == pollutant_code
-            and timeseries_id in available_ids
-            and not _official_rdata_row_is_source_unavailable(
-                row,
-                unavailable_scopes,
-            )
-        ):
-            counts[timeseries_id] = counts.get(timeseries_id, 0) + 1
-    if not all_bindings:
-        state = "counts_unavailable"
-        skip_reason = "official_rdata_selected_binding_scope_empty"
-        available = False
-    elif not available_ids:
-        state = "source_artifact_unavailable"
-        skip_reason = "all_timeseries_source_artifacts_unavailable"
-        available = False
-    else:
-        state = "successful_non_empty" if counts else "successful_empty"
-        skip_reason = None
-        available = True
-    required_files = sorted(
-        (context.get("required_by_day") or {}).get(day_utc) or []
-    )
-    unavailable_files = sorted({
-        str(scope["source_file_key"]) for scope in unavailable_scopes
-    })
-    evidence: dict[str, Any] = {
-        "source_partition_state": state,
-        "source_counts_present": bool(counts),
-        "source_counts_available": available,
-        "source_rows": sum(counts.values()),
-        "source_timeseries_row_counts": {
-            str(key): value for key, value in sorted(counts.items())
-        },
-        "source_available_timeseries_ids": sorted(available_ids),
-        "source_unavailable_timeseries_ids": sorted(unavailable_ids),
-        "source_unavailable_scopes": unavailable_scopes,
-        "source_file_count": len(required_files),
-        "source_file_keys": required_files,
-        "required_source_file_count": len(required_files),
-        "successful_source_file_count": len(required_files),
-        "source_unavailable_file_keys": unavailable_files,
-        "source_skip_reason": skip_reason,
-        "source_available_pollutant_codes": (
-            [pollutant_code] if available_ids else []
-        ),
-        "comparison_scope": "source_available_timestamp_windows",
-    }
-    evidence["partition"] = {
-        "state": state,
-        "source_counts_present": bool(counts),
-        "source_counts_available": available,
-        "source_rows": sum(counts.values()),
-        "source_timeseries_row_counts": dict(
-            evidence["source_timeseries_row_counts"]
-        ),
-        "source_available_timeseries_ids": sorted(available_ids),
-        "source_unavailable_timeseries_ids": sorted(unavailable_ids),
-        "source_skip_reason": skip_reason,
-        "required_source_file_count": len(required_files),
-        "successful_source_file_count": len(required_files),
-        "source_available_pollutant_codes": (
-            [pollutant_code] if available_ids else []
-        ),
-        "comparison_scope": "source_available_timestamp_windows",
-    }
-    return counts, evidence
 
 
 def _source_cache_status_for_connector_day(
@@ -16620,17 +15531,10 @@ def _canonical_json_utf8_bytes(value: Any) -> bytes:
 
 
 OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS = (
-    "schema_version",
-    "semantic_evidence_contract",
-    "source_adapter",
-    "day_utc",
-    "connector_id",
-    "source_file_identities_sha256",
-    "requested_pollutant_set",
-    "contract",
-    "evidence_contract_version",
-    "history_generation",
-    "source_label_registry_snapshot_content_sha256",
+    "schema_version", "semantic_evidence_contract", "source_adapter",
+    "day_utc", "connector_id", "source_file_identities_sha256",
+    "requested_pollutant_set", "contract", "evidence_contract_version",
+    "history_generation", "source_label_registry_snapshot_content_sha256",
     "authoritative_station_timeseries_mapping_sha256",
     "sos_site_ref_bridge_mapping_identity",
     "sos_site_ref_bridge_artifact_sha256",
@@ -16639,60 +15543,34 @@ OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS = (
     "source_artifact_availability_sha256",
     "preserved_baseline_dependency_contract_version",
     "preserved_baseline_dependency_sha256",
-    "rdata_decoder_contract_version",
-    "timestamp_mapping",
+    "rdata_decoder_contract_version", "timestamp_mapping",
     "observation_content_hash_contract_version",
-    "source_evidence_input_sha256",
-    "enumeration_complete",
-    "files_enumerated",
-    "files_required",
-    "files_read",
-    "files_authoritatively_absent",
-    "source_file_identities",
-    "source_records_examined",
-    "source_csv_records_scanned",
-    "canonical_rows_mapped",
-    "missing_binding_groups",
-    "missing_binding_rows",
-    "canonical_rows_file",
-    "canonical_rows_sha256",
-    "canonical_rows_bytes",
-    "total_rows",
-    "per_timeseries_counts",
-    "per_pollutant_counts",
-    "observation_content_hashes",
-    "pollutant_set",
-    "source_available_timeseries_ids",
-    "source_available_pollutant_codes",
-    "source_unavailable_timeseries_ids",
-    "source_unavailable_scopes",
-    "preserved_baseline_rows_file",
-    "preserved_baseline_rows_sha256",
-    "preserved_baseline_rows_bytes",
-    "preserved_baseline_row_count",
-    "preserved_baseline_identity",
-    "final_target_row_count",
-    "final_target_timeseries_row_counts",
-    "final_target_pollutant_counts",
+    "source_evidence_input_sha256", "enumeration_complete",
+    "files_enumerated", "files_required", "files_read",
+    "files_authoritatively_absent", "source_file_identities",
+    "source_records_examined", "source_csv_records_scanned",
+    "canonical_rows_mapped", "missing_binding_groups",
+    "missing_binding_rows", "canonical_rows_file", "canonical_rows_sha256",
+    "canonical_rows_bytes", "total_rows", "per_timeseries_counts",
+    "per_pollutant_counts", "observation_content_hashes", "pollutant_set",
+    "source_available_timeseries_ids", "source_available_pollutant_codes",
+    "source_unavailable_timeseries_ids", "source_unavailable_scopes",
+    "preserved_baseline_rows_file", "preserved_baseline_rows_sha256",
+    "preserved_baseline_rows_bytes", "preserved_baseline_row_count",
+    "preserved_baseline_identity", "final_target_row_count",
+    "final_target_timeseries_row_counts", "final_target_pollutant_counts",
     "empty_final_target_pollutant_codes",
     "final_target_observation_content_hashes",
     "source_rows_before_canonical_dedupe",
     "duplicate_rows_removed_by_canonical_normalisation",
-    "duplicate_canonical_row_count",
-    "duplicate_canonical_row_identity_samples",
-    "uncanonicalisable_source_row_count",
-    "source_adapter_blocked_row_count",
+    "duplicate_canonical_row_count", "duplicate_canonical_row_identity_samples",
+    "uncanonicalisable_source_row_count", "source_adapter_blocked_row_count",
     "source_adapter_blocked_row_samples",
-    "out_of_scope_source_adapter_blocked_row_count",
-    "blocked_row_count",
-    "blocked_row_samples",
-    "skipped_row_count",
-    "inactive_identity_rows_skipped",
-    "source_label_classification_counts",
-    "source_label_target_day_row_counts",
-    "source_label_summary",
-    "source_label_classifications",
-    "mapping_audit",
+    "out_of_scope_source_adapter_blocked_row_count", "blocked_row_count",
+    "blocked_row_samples", "skipped_row_count",
+    "inactive_identity_rows_skipped", "source_label_classification_counts",
+    "source_label_target_day_row_counts", "source_label_summary",
+    "source_label_classifications", "mapping_audit",
     "source_verification_status_counts",
 )
 
@@ -16713,12 +15591,10 @@ def _official_rdata_v7_semantic_evidence_projection(
     ]
     if missing:
         raise ValueError(
-            "official RData v7 semantic evidence field is missing: "
-            + missing[0]
+            "official RData v7 semantic evidence field is missing: " + missing[0]
         )
     allowed = set(OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS) | {
-        "semantic_evidence_sha256",
-        "acquisition_audit",
+        "semantic_evidence_sha256", "acquisition_audit",
         "acquisition_audit_sha256",
     }
     unexpected = sorted(set(evidence) - allowed, key=_canonical_utf8_sort_key)
@@ -16751,21 +15627,12 @@ def _official_rdata_v7_acquisition_audit_projection(
     if not isinstance(audit, Mapping):
         raise ValueError("official RData v7 acquisition audit is unavailable")
     fields = (
-        "schema_version",
-        "audit_contract",
-        "audit_contract_version",
-        "source_adapter",
-        "day_utc",
-        "connector_id",
-        "history_generation",
-        "source_evidence_input_sha256",
-        "semantic_evidence_sha256",
+        "schema_version", "audit_contract", "audit_contract_version",
+        "source_adapter", "day_utc", "connector_id", "history_generation",
+        "source_evidence_input_sha256", "semantic_evidence_sha256",
         "source_file_acquisition_audit",
-        "source_unavailable_scope_acquisition_audit",
-        "ratification_audit",
-        "rscript_identity",
-        "backed_up_at_utc",
-        "proposal_writer_git_sha",
+        "source_unavailable_scope_acquisition_audit", "ratification_audit",
+        "rscript_identity", "backed_up_at_utc", "proposal_writer_git_sha",
     )
     if set(audit) != set(fields):
         raise ValueError("official RData v7 acquisition audit shape is invalid")
@@ -16868,7 +15735,6 @@ def _source_evidence_input_sha256(evidence: Mapping[str, Any]) -> str:
 def _official_rdata_source_artifact_availability_identity(
     evidence: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    """Canonicalise unavailable scopes exactly as the proposal writer does."""
     normalized = [
         {
             "day_utc": str(scope.get("day_utc") or ""),
@@ -16918,9 +15784,7 @@ def _official_rdata_preserved_baseline_dependency_sha256(
             _official_rdata_source_artifact_availability_identity(evidence)
         ),
     }
-    return hashlib.sha256(
-        _canonical_json_utf8_bytes(payload)
-    ).hexdigest()
+    return hashlib.sha256(_canonical_json_utf8_bytes(payload)).hexdigest()
 
 
 def _immutable_source_evidence_sha256(evidence: Mapping[str, Any]) -> str:
@@ -17438,16 +16302,12 @@ def _persist_complete_connector_day_source_evidence(
         or (
             source_adapter in OFFICIAL_RDATA_NETWORKS
             and (
-                not isinstance(
-                    evidence.get("preserved_baseline_identity"), Mapping
-                )
+                not isinstance(evidence.get("preserved_baseline_identity"), Mapping)
                 or not re.fullmatch(
                     r"[0-9a-f]{64}", official_preservation_dependency
                 )
                 or official_preservation_dependency
-                != _official_rdata_preserved_baseline_dependency_sha256(
-                    evidence
-                )
+                != _official_rdata_preserved_baseline_dependency_sha256(evidence)
             )
         )
         or (
@@ -17514,9 +16374,8 @@ def _persist_complete_connector_day_source_evidence(
             INSERT INTO source_connector_day_evidence (
               env_name, day_utc, connector_id, source_adapter,
               source_file_identities_sha256, source_evidence_input_sha256,
-              canonical_rows_sha256,
-              canonical_rows_bytes, evidence_sha256, evidence_json,
-              canonical_rows_json, created_at_utc
+              canonical_rows_sha256, canonical_rows_bytes, evidence_sha256,
+              evidence_json, canonical_rows_json, created_at_utc
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -17586,634 +16445,6 @@ def _normalise_repair_pollutants(values: Iterable[Any] | None) -> list[str]:
     if invalid:
         raise ValueError(f"unsupported repair pollutant(s): {','.join(invalid)}")
     return normalized
-
-
-def _observation_changed_scope_pollutants(
-    *,
-    validated_overlay_keys: Iterable[str],
-    source_evidence: Mapping[str, Any],
-    requested_repair_pollutants: Iterable[str] | None,
-) -> tuple[list[str], list[str]]:
-    staged_pollutants = {
-        match.group(1)
-        for key in validated_overlay_keys
-        if (match := re.search(r"/pollutant_code=([a-z0-9_]+)/", str(key)))
-    }
-    empty_pollutants = (
-        {
-            str(value).strip().lower()
-            for value in list(
-                source_evidence.get("empty_final_target_pollutant_codes") or []
-            )
-            if str(value or "").strip()
-        }
-        if str(source_evidence.get("source_adapter") or "")
-        in OFFICIAL_RDATA_NETWORKS
-        else set()
-    )
-    changed_pollutants = staged_pollutants | empty_pollutants
-    requested = set(_normalise_repair_pollutants(requested_repair_pollutants))
-    if requested and not changed_pollutants.issubset(requested):
-        raise ValueError(
-            "OBSERVS_CHANGED pollutant scope escaped requested repair scope"
-        )
-    return sorted(changed_pollutants), sorted(empty_pollutants)
-
-
-def _official_rdata_selected_partition_outcomes(
-    *,
-    day_utc: str,
-    connector_id: int,
-    pollutant_codes: Iterable[str],
-    empty_pollutant_codes: Iterable[str],
-    validated_overlay_keys: Iterable[str],
-    created_tombstones: Iterable[str],
-) -> list[dict[str, Any]]:
-    empty = set(empty_pollutant_codes)
-    object_keys = list(validated_overlay_keys)
-    tombstones = set(created_tombstones)
-    outcomes: list[dict[str, Any]] = []
-    for pollutant_code in sorted(set(pollutant_codes)):
-        authoritative_no_data = pollutant_code in empty
-        tombstone_prefix = (
-            f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
-            f"connector_id={int(connector_id)}/"
-            f"pollutant_code={pollutant_code}"
-        )
-        outcomes.append({
-            "day_utc": day_utc,
-            "connector_id": int(connector_id),
-            "pollutant_code": pollutant_code,
-            "outcome": (
-                "authoritative_no_data_replacement"
-                if authoritative_no_data else "complete_replacement"
-            ),
-            "tombstone_created": tombstone_prefix in tombstones,
-            "exact_tombstone_count": int(tombstone_prefix in tombstones),
-            "replacement_object_keys": [
-                key for key in object_keys
-                if f"/pollutant_code={pollutant_code}/" in key
-            ],
-        })
-    return outcomes
-
-
-def _generic_preserved_manifest_reference(
-    payload: Mapping[str, Any],
-    *,
-    parent_key: str,
-    child_key: str,
-    reference_fields: tuple[str, ...],
-) -> str:
-    references: dict[str, str] = {}
-    for field in reference_fields:
-        raw_references = payload.get(field) or []
-        if not isinstance(raw_references, list):
-            raise ValueError(
-                f"generic preserved parent references are invalid: {parent_key}"
-            )
-        for raw_reference in raw_references:
-            if not isinstance(raw_reference, Mapping):
-                raise ValueError(
-                    f"generic preserved parent reference is invalid: {parent_key}"
-                )
-            manifest_key = str(raw_reference.get("manifest_key") or "")
-            manifest_hash = str(raw_reference.get("manifest_hash") or "")
-            if not manifest_key:
-                continue
-            previous = references.get(manifest_key)
-            if previous is not None and previous != manifest_hash:
-                raise ValueError(
-                    "generic preserved parent has contradictory child identity: "
-                    f"{parent_key} -> {manifest_key}"
-                )
-            references[manifest_key] = manifest_hash
-    manifest_hash = references.get(child_key)
-    if not re.fullmatch(r"[a-f0-9]{64}", str(manifest_hash or "")):
-        raise ValueError(
-            "generic preserved parent lacks exact child reference: "
-            f"{parent_key} -> {child_key}"
-        )
-    return str(manifest_hash)
-
-
-def _read_generic_preserved_json(
-    path: Path,
-    *,
-    object_key: str,
-) -> tuple[bytes, Mapping[str, Any]]:
-    try:
-        body = path.read_bytes()
-        payload = json.loads(body)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            f"generic preserved manifest is unavailable or invalid: {object_key}"
-        ) from exc
-    if not isinstance(payload, Mapping):
-        raise ValueError(
-            f"generic preserved manifest JSON is invalid: {object_key}"
-        )
-    return body, payload
-
-
-def _derive_generic_preserved_scope_evidence(
-    run_state: Mapping[str, Any],
-    *,
-    day_utc: str,
-    connector_id: int,
-    pollutant_code: str,
-) -> dict[str, Any]:
-    day_prefix = (
-        f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}"
-    )
-    connector_prefix = f"{day_prefix}/connector_id={connector_id}"
-    pollutant_prefix = f"{connector_prefix}/pollutant_code={pollutant_code}"
-    pollutant_manifest_key = f"{pollutant_prefix}/manifest.json"
-    connector_manifest_key = f"{connector_prefix}/manifest.json"
-    day_manifest_key = f"{day_prefix}/manifest.json"
-    objects = run_state.get("objects")
-    if not isinstance(objects, Mapping):
-        raise ValueError("generic preserved scope objects mapping is unavailable")
-    connector_entry = objects.get(connector_manifest_key)
-    day_entry = objects.get(day_manifest_key)
-    if not isinstance(connector_entry, Mapping) or not isinstance(day_entry, Mapping):
-        raise ValueError(
-            "generic preserved scope requires staged connector and day manifests: "
-            f"{pollutant_prefix}"
-        )
-
-    connector_identities = connector_entry.get("dependency_identities")
-    connector_dependencies = connector_entry.get("dependencies")
-    raw_pollutant_identity = (
-        connector_identities.get(pollutant_manifest_key)
-        if isinstance(connector_identities, Mapping) else None
-    )
-    if (
-        not isinstance(connector_dependencies, list)
-        or pollutant_manifest_key not in connector_dependencies
-        or not isinstance(raw_pollutant_identity, Mapping)
-    ):
-        raise ValueError(
-            "generic preserved connector lacks the exact pollutant dependency: "
-            f"{connector_manifest_key} -> {pollutant_manifest_key}"
-        )
-    pollutant_identity = _normalise_proposal_dependency_identity(
-        parent_key=connector_manifest_key,
-        dependency_key=pollutant_manifest_key,
-        identity=raw_pollutant_identity,
-    )
-    if pollutant_identity["source"] not in PROPOSAL_TRANSITION_EXTERNAL_SOURCES:
-        raise ValueError(
-            "generic preserved pollutant manifest is not externally pinned: "
-            f"{pollutant_manifest_key}"
-        )
-    external_root_name = (
-        "base_dropbox_root"
-        if pollutant_identity["source"] == "dropbox" else "overlay_root"
-    )
-    external_root_value = str(run_state.get(external_root_name) or "")
-    external_root = Path(external_root_value)
-    if not external_root_value or not external_root.is_dir():
-        raise ValueError(
-            "generic preserved external root is unavailable: "
-            f"{pollutant_identity['source']}"
-        )
-    external_body, pollutant_payload = _read_generic_preserved_json(
-        external_root / pollutant_manifest_key,
-        object_key=pollutant_manifest_key,
-    )
-    if (
-        len(external_body) != pollutant_identity["bytes"]
-        or hashlib.sha256(external_body).hexdigest()
-        != pollutant_identity["sha256"]
-    ):
-        raise ValueError(
-            "generic preserved pollutant manifest identity changed: "
-            f"{pollutant_manifest_key}"
-        )
-    pollutant_manifest_hash = str(
-        pollutant_payload.get("manifest_hash") or ""
-    )
-    if not re.fullmatch(r"[a-f0-9]{64}", pollutant_manifest_hash):
-        raise ValueError(
-            "generic preserved pollutant manifest hash is invalid: "
-            f"{pollutant_manifest_key}"
-        )
-
-    connector_body, connector_payload = _read_generic_preserved_json(
-        Path(str(connector_entry.get("local_path") or "")),
-        object_key=connector_manifest_key,
-    )
-    if (
-        len(connector_body) != connector_entry.get("bytes")
-        or hashlib.sha256(connector_body).hexdigest()
-        != str(connector_entry.get("sha256") or "")
-    ):
-        raise ValueError(
-            "generic preserved connector manifest identity changed: "
-            f"{connector_manifest_key}"
-        )
-    connector_child_hash = _generic_preserved_manifest_reference(
-        connector_payload,
-        parent_key=connector_manifest_key,
-        child_key=pollutant_manifest_key,
-        reference_fields=("pollutant_manifests", "child_manifests"),
-    )
-    if connector_child_hash != pollutant_manifest_hash:
-        raise ValueError(
-            "generic preserved connector references stale pollutant identity: "
-            f"{pollutant_manifest_key}"
-        )
-    connector_manifest_hash = str(
-        connector_payload.get("manifest_hash") or ""
-    )
-    if not re.fullmatch(r"[a-f0-9]{64}", connector_manifest_hash):
-        raise ValueError(
-            "generic preserved connector manifest hash is invalid: "
-            f"{connector_manifest_key}"
-        )
-
-    day_dependencies = day_entry.get("dependencies")
-    day_identities = day_entry.get("dependency_identities")
-    raw_connector_identity = (
-        day_identities.get(connector_manifest_key)
-        if isinstance(day_identities, Mapping) else None
-    )
-    expected_connector_identity = {
-        "sha256": str(connector_entry.get("sha256") or ""),
-        "bytes": connector_entry.get("bytes"),
-        "source": "planned_overlay",
-    }
-    if (
-        not isinstance(day_dependencies, list)
-        or connector_manifest_key not in day_dependencies
-        or not isinstance(raw_connector_identity, Mapping)
-        or _normalise_proposal_dependency_identity(
-            parent_key=day_manifest_key,
-            dependency_key=connector_manifest_key,
-            identity=raw_connector_identity,
-        ) != expected_connector_identity
-    ):
-        raise ValueError(
-            "generic preserved day parent lacks the staged connector identity: "
-            f"{day_manifest_key} -> {connector_manifest_key}"
-        )
-    day_body, day_payload = _read_generic_preserved_json(
-        Path(str(day_entry.get("local_path") or "")),
-        object_key=day_manifest_key,
-    )
-    if (
-        len(day_body) != day_entry.get("bytes")
-        or hashlib.sha256(day_body).hexdigest()
-        != str(day_entry.get("sha256") or "")
-    ):
-        raise ValueError(
-            f"generic preserved day manifest identity changed: {day_manifest_key}"
-        )
-    day_child_hash = _generic_preserved_manifest_reference(
-        day_payload,
-        parent_key=day_manifest_key,
-        child_key=connector_manifest_key,
-        reference_fields=("connector_manifests", "child_manifests"),
-    )
-    if day_child_hash != connector_manifest_hash:
-        raise ValueError(
-            "generic preserved day parent references stale connector identity: "
-            f"{connector_manifest_key}"
-        )
-    return {
-        "pollutant_manifest": {
-            "object_key": pollutant_manifest_key,
-            **pollutant_identity,
-        },
-        "connector_parent": {
-            "object_key": connector_manifest_key,
-            "pollutant_manifest_key": pollutant_manifest_key,
-            "pollutant_manifest_hash": pollutant_manifest_hash,
-        },
-        "day_parent": {
-            "object_key": day_manifest_key,
-            "connector_manifest_key": connector_manifest_key,
-            "connector_manifest_hash": connector_manifest_hash,
-        },
-    }
-
-
-def _derive_generic_pinned_metadata_dependencies(
-    run_state: Mapping[str, Any], *, day_utc: str,
-    connector_id: int, pollutant_code: str,
-) -> list[dict[str, Any]]:
-    """Authenticate an unchanged derived scope through the pinned hierarchy."""
-    if (run_state.get("dropbox_currentness") or {}).get("allowed") is not True:
-        raise ValueError("generic metadata-only authority requires accepted Dropbox currentness")
-    base = R2_HISTORY_V2_OBSERVATIONS_PREFIX
-    year, month = day_utc[:4], day_utc[5:7]
-    keys = [
-        f"{base}/_manifests/manifest.json",
-        f"{base}/_manifests/year={year}/manifest.json",
-        f"{base}/_manifests/year={year}/month={month}/manifest.json",
-        f"{base}/day_utc={day_utc}/manifest.json",
-        f"{base}/day_utc={day_utc}/connector_id={connector_id}/manifest.json",
-        f"{base}/day_utc={day_utc}/connector_id={connector_id}/pollutant_code={pollutant_code}/manifest.json",
-    ]
-    payloads: list[dict[str, Any]] = []
-    identities: list[dict[str, Any]] = []
-    root = Path(str(run_state.get("base_dropbox_root") or ""))
-    if not root.is_dir():
-        raise ValueError("generic metadata-only pinned Dropbox root is unavailable")
-    for key in keys:
-        body = (root / key).read_bytes()
-        payload = json.loads(body)
-        if not isinstance(payload, dict):
-            raise ValueError(f"generic metadata-only manifest is invalid: {key}")
-        payloads.append(payload)
-        identities.append({
-            "object_key": key,
-            "sha256": hashlib.sha256(body).hexdigest(),
-            "bytes": len(body),
-            "source": "dropbox",
-        })
-    for index in range(5):
-        parent = payloads[index]
-        child = payloads[index + 1]
-        field = "content_hash" if index < 2 else "manifest_hash"
-        reference_fields = (
-            ["children"] if index < 3 else
-            ["connector_manifests", "child_manifests"] if index == 3 else
-            ["pollutant_manifests", "child_manifests"]
-        )
-        references = [
-            ref for name in reference_fields
-            for ref in list(parent.get(name) or [])
-            if isinstance(ref, Mapping) and ref.get("manifest_key") == keys[index + 1]
-        ]
-        if (
-            len(references) != 1
-            or not re.fullmatch(r"[a-f0-9]{64}", str(child.get(field) or ""))
-            or references[0].get(field) != child.get(field)
-        ):
-            raise ValueError(
-                "generic metadata-only pinned hierarchy disagrees: "
-                f"{keys[index]} -> {keys[index + 1]}"
-            )
-    return identities
-
-
-def _finalise_generic_integrity_selected_scope_authority(
-    run_state: dict[str, Any],
-    selected_partition_outcomes: Iterable[Mapping[str, Any]],
-    metadata_actions: Iterable[Mapping[str, Any]] = (),
-) -> dict[str, Any]:
-    """Freeze generic selected-scope mutation authority before APPLY."""
-    if run_state.get("execution_path") != "generic_integrity":
-        raise ValueError(
-            "generic selected-scope authority requires execution_path=generic_integrity"
-        )
-    expanded: list[dict[str, Any]] = []
-    for raw_outcome in selected_partition_outcomes:
-        if not isinstance(raw_outcome, Mapping):
-            raise ValueError("generic selected partition outcome is invalid")
-        pollutant_values = (
-            list(raw_outcome.get("pollutant_codes") or [])
-            if raw_outcome.get("pollutant_code") is None
-            else [raw_outcome.get("pollutant_code")]
-        )
-        if not pollutant_values:
-            raise ValueError("generic selected partition outcome has no pollutant")
-        for pollutant_value in pollutant_values:
-            expanded.append({
-                "day_utc": str(raw_outcome.get("day_utc") or ""),
-                "connector_id": raw_outcome.get("connector_id"),
-                "pollutant_code": str(pollutant_value or "").strip().lower(),
-                "outcome": str(raw_outcome.get("outcome") or ""),
-            })
-    objects = run_state.get("objects")
-    if not isinstance(objects, Mapping):
-        raise ValueError("generic selected-scope objects mapping is unavailable")
-    tombstones = [
-        entry for entry in list(run_state.get("tombstone_prefixes") or [])
-        if isinstance(entry, dict) and entry.get("proposed")
-    ]
-    scopes: list[dict[str, Any]] = []
-    seen: set[tuple[str, int, str]] = set()
-    for raw_scope in expanded:
-        day_utc = raw_scope["day_utc"]
-        connector_id = raw_scope["connector_id"]
-        pollutant_code = raw_scope["pollutant_code"]
-        outcome = raw_scope["outcome"]
-        if not isinstance(connector_id, int) or isinstance(connector_id, bool):
-            raise ValueError("generic selected partition connector is invalid")
-        identity = (day_utc, connector_id, pollutant_code)
-        if identity in seen:
-            raise ValueError("generic selected partition outcome is duplicated")
-        seen.add(identity)
-        prefix = (
-            f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
-            f"connector_id={connector_id}/pollutant_code={pollutant_code}"
-        )
-        matching_tombstones = [
-            entry for entry in tombstones
-            if str(entry.get("prefix") or "").rstrip("/") == prefix
-        ]
-        replacement_keys = sorted(
-            (key for key in objects if str(key).startswith(f"{prefix}/")),
-            key=lambda value: str(value).encode("utf-8"),
-        )
-        if outcome in {
-            "complete_replacement", "authoritative_no_data_replacement",
-        }:
-            if len(matching_tombstones) != 1:
-                raise ValueError(
-                    "generic selected replacement requires one exact tombstone: "
-                    f"{prefix}"
-                )
-            matching_tombstones[0].update({
-                "authority_outcome": outcome,
-                "authority_scope": {
-                    "day_utc": day_utc,
-                    "connector_id": connector_id,
-                    "pollutant_code": pollutant_code,
-                },
-            })
-            authorised_prefix: str | None = prefix
-        elif outcome == "source_artifact_unavailable_preserved":
-            if matching_tombstones:
-                raise ValueError(
-                    "generic source-unavailable scope cannot be deleted: "
-                    f"{prefix}"
-                )
-            authorised_prefix = None
-        else:
-            raise ValueError(
-                f"generic selected partition outcome is not mutation-capable: {outcome}"
-            )
-        preservation_evidence = (
-            _derive_generic_preserved_scope_evidence(
-                run_state,
-                day_utc=day_utc,
-                connector_id=connector_id,
-                pollutant_code=pollutant_code,
-            )
-            if outcome == "source_artifact_unavailable_preserved" else None
-        )
-        scopes.append({
-            "day_utc": day_utc,
-            "connector_id": connector_id,
-            "pollutant_code": pollutant_code,
-            "pollutant_prefix": prefix,
-            "outcome": outcome,
-            "authorised_tombstone_prefix": authorised_prefix,
-            "replacement_object_keys": (
-                replacement_keys if outcome == "complete_replacement" else []
-            ),
-            "preservation_evidence": preservation_evidence,
-        })
-    scopes.sort(key=lambda entry: (
-        entry["day_utc"].encode("utf-8"),
-        entry["connector_id"],
-        entry["pollutant_code"].encode("utf-8"),
-    ))
-    selected_identities = {
-        (scope["day_utc"], scope["connector_id"], scope["pollutant_code"])
-        for scope in scopes
-    }
-    metadata_only_scopes: list[dict[str, Any]] = []
-    metadata_identities: set[tuple[str, int, str]] = set()
-    expanded_metadata_actions: list[dict[str, Any]] = []
-    for raw_action in metadata_actions:
-        if not isinstance(raw_action, Mapping):
-            continue
-        action = dict(raw_action)
-        if (action.get("kind") == "rebuild_v2_observations_index_only"
-                and not action.get("pollutant_code")):
-            day_utc = str(action.get("day_utc") or "")
-            connector_id = action.get("connector_id")
-            pattern = re.compile(
-                r"^history/_index_v3/observations_timeseries/"
-                + rf"day_utc={re.escape(day_utc)}/"
-                + rf"connector_id={re.escape(str(connector_id))}/"
-                + r"pollutant_code=([a-z0-9_]+)/manifest\.json$"
-            )
-            for key in objects:
-                match = pattern.fullmatch(str(key))
-                if match:
-                    expanded_metadata_actions.append({
-                        **action, "pollutant_code": match.group(1),
-                    })
-        else:
-            expanded_metadata_actions.append(action)
-    for action in expanded_metadata_actions:
-        if (
-            not isinstance(action, Mapping)
-            or action.get("kind") not in {
-                "observation_index_repair", "rebuild_v2_observations_index_only",
-            }
-            or action.get("data_changes_required") is True
-        ):
-            continue
-        day_utc = str(action.get("day_utc") or "")
-        connector_id = action.get("connector_id")
-        pollutant_code = str(action.get("pollutant_code") or "").lower()
-        identity = (day_utc, connector_id, pollutant_code)
-        if (
-            not isinstance(connector_id, int) or isinstance(connector_id, bool)
-            or pollutant_code not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
-            or identity in selected_identities or identity in metadata_identities
-            or any(scope["day_utc"] == day_utc for scope in scopes)
-        ):
-            continue
-        index_prefix = (
-            "history/_index_v3/observations_timeseries/"
-            f"day_utc={day_utc}/connector_id={connector_id}/"
-            f"pollutant_code={pollutant_code}"
-        )
-        aligned_prefix = index_prefix.replace(
-            "observations_timeseries/day_utc=",
-            "observations_timeseries/_aligned/day_utc=", 1,
-        )
-        derived_keys = sorted(
-            (str(key) for key in objects if str(key).startswith(f"{index_prefix}/")
-             or str(key).startswith(f"{aligned_prefix}/")),
-            key=lambda value: value.encode("utf-8"),
-        )
-        if f"{index_prefix}/manifest.json" not in derived_keys:
-            continue
-        if any(
-            str(entry.get("prefix") or "").rstrip("/").startswith(
-                f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
-                f"connector_id={connector_id}/pollutant_code={pollutant_code}"
-            )
-            for entry in tombstones
-        ):
-            raise ValueError("metadata-only scope has observation deletion")
-        metadata_only_scopes.append({
-            "day_utc": day_utc,
-            "connector_id": connector_id,
-            "pollutant_code": pollutant_code,
-            "derived_index_prefix": index_prefix,
-            "canonical_dependencies": _derive_generic_pinned_metadata_dependencies(
-                run_state, day_utc=day_utc, connector_id=connector_id,
-                pollutant_code=pollutant_code,
-            ),
-            "derived_object_keys": derived_keys,
-            "observation_deletion_prefixes": [],
-        })
-        metadata_identities.add(identity)
-    metadata_only_scopes.sort(key=lambda entry: (
-        entry["day_utc"].encode("utf-8"), entry["connector_id"],
-        entry["pollutant_code"].encode("utf-8"),
-    ))
-    if not scopes and not metadata_only_scopes:
-        raise ValueError("generic selected-scope authority is empty")
-    force_targets = list(run_state.get("explicit_official_force_partitions") or [])
-    force_identities = sorted({
-        (str(target.get("day_utc") or ""), int(target.get("connector_id") or 0),
-         str(target.get("pollutant_code") or ""))
-        for target in force_targets if isinstance(target, Mapping)
-    })
-    if force_targets and (
-        not run_state.get("explicit_official_force_replacement")
-        or set(force_identities) != selected_identities
-    ):
-        raise ValueError("generic forced target outcomes are incomplete")
-    forced_parquet_keys = sorted((
-        str(key) for key in objects if str(key).endswith(".parquet")
-        and any(str(key).startswith(
-            f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day}/"
-            f"connector_id={connector}/pollutant_code={pollutant}/"
-        ) for day, connector, pollutant in force_identities)
-    ), key=lambda value: value.encode("utf-8"))
-    authority = {
-        "contract_version": GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT,
-        "history_generation": "v3",
-        "selected_scopes": scopes,
-        "metadata_only_scopes": metadata_only_scopes,
-        "metadata_only_derived_write_object_keys": sorted({
-            key for scope in metadata_only_scopes
-            for key in scope["derived_object_keys"]
-        } | ({"history/_index_v3/observations_timeseries_latest.json"}
-             if metadata_only_scopes and
-             "history/_index_v3/observations_timeseries_latest.json" in objects
-             else set()), key=lambda value: value.encode("utf-8")),
-        "forced_republication_parquet_keys": forced_parquet_keys,
-        "explicit_force_targets": [
-            {"day_utc": day, "connector_id": connector,
-             "pollutant_code": pollutant}
-            for day, connector, pollutant in force_identities
-        ],
-        "authorised_pollutant_tombstone_prefixes": sorted(
-            {
-                str(scope["authorised_tombstone_prefix"])
-                for scope in scopes
-                if scope["authorised_tombstone_prefix"] is not None
-            },
-            key=lambda value: value.encode("utf-8"),
-        ),
-    }
-    run_state["generic_integrity_selected_scope_authority"] = authority
-    _canonical_generic_integrity_selected_scope_authority(run_state)
-    write_run_state(run_state)
-    return authority
 
 
 def _scoped_observation_partition_rows(
@@ -18369,33 +16600,6 @@ def build_dedicated_sos_selected_partitions(
             "connector_id": 1,
             "pollutant_code": pollutant_code,
             "target_authority": "explicit_selected_scope",
-        }
-        for day in days
-        for pollutant_code in pollutants
-    ]
-
-
-def build_explicit_official_rdata_force_partitions(
-    *,
-    from_day: str,
-    to_day: str,
-    selected_days: Iterable[str] | None,
-    connector_id: int,
-    repair_pollutants: Iterable[str] | None,
-) -> list[dict[str, Any]]:
-    """Freeze manual official-network targets before gap/equality filtering."""
-    if connector_id not in {9, 10}:
-        raise ValueError("official RData force requires WAQN or SAQN")
-    pollutants = _normalise_repair_pollutants(repair_pollutants)
-    days = _selected_dates_or_range(from_day, to_day, selected_days)
-    if not pollutants or not days:
-        raise ValueError("official RData force requires dates and pollutants")
-    return [
-        {
-            "day_utc": day.isoformat(),
-            "connector_id": connector_id,
-            "pollutant_code": pollutant_code,
-            "target_authority": "explicit_manual_force_replacement",
         }
         for day in days
         for pollutant_code in pollutants
@@ -18634,28 +16838,7 @@ def _derive_observation_hash_check_pollutants(
             source_row_count = int(candidate.get("source_row_count") or 0)
         except (TypeError, ValueError):
             source_row_count = 0
-        source_state = str(
-            (
-                candidate.get("source_evidence")
-                if isinstance(candidate.get("source_evidence"), Mapping)
-                else {}
-            ).get("source_partition_state")
-            or ""
-        )
-        valid_non_empty = (
-            source_state == "successful_non_empty"
-            and source_row_count > 0
-            and isinstance(source_counts, Mapping)
-            and bool(source_counts)
-        )
-        valid_empty = (
-            _official_rdata_source_for_connector(connector_id) is not None
-            and source_state == "successful_empty"
-            and source_row_count == 0
-            and isinstance(source_counts, Mapping)
-            and not source_counts
-        )
-        if not (valid_non_empty or valid_empty):
+        if source_row_count <= 0 or not isinstance(source_counts, Mapping) or not source_counts:
             skipped[key] = "no_executable_source_rows"
             continue
         suitable, reason = _observation_repair_source_evidence_is_complete(
@@ -18912,22 +17095,7 @@ def _assert_detector_and_proposal_source_evidence_agree(
         "source_label_registry_snapshot_content_sha256",
         "authoritative_station_timeseries_mapping_sha256",
         "observed_property_mapping_sha256",
-        "source_artifact_availability_sha256",
         "source_csv_records_scanned",
-        "source_available_timeseries_ids",
-        "source_available_pollutant_codes",
-        "source_unavailable_timeseries_ids",
-        "source_unavailable_scopes",
-        "preserved_baseline_rows_sha256",
-        "preserved_baseline_rows_bytes",
-        "preserved_baseline_row_count",
-        "preserved_baseline_identity",
-        "preserved_baseline_dependency_sha256",
-        "final_target_row_count",
-        "final_target_timeseries_row_counts",
-        "final_target_pollutant_counts",
-        "empty_final_target_pollutant_codes",
-        "final_target_observation_content_hashes",
     )
     mismatched = [field for field in fields if detector.get(field) != proposal.get(field)]
     if mismatched:
@@ -18975,31 +17143,9 @@ def _compute_observation_hash_with_shared_javascript(
     )
 
 
-_CANONICAL_OBSERVATION_PARQUET_PHYSICAL_SCHEMA = (
-    ("connector_id", "INT32", "OPTIONAL", None),
-    ("station_id", "INT32", "OPTIONAL", None),
-    ("timeseries_id", "INT32", "OPTIONAL", None),
-    ("pollutant_code", "BYTE_ARRAY", "OPTIONAL", "UTF8"),
-    ("observed_at_utc", "INT64", "OPTIONAL", "TIMESTAMP_MILLIS"),
-    ("value", "DOUBLE", "OPTIONAL", None),
-    ("verification_status", "BYTE_ARRAY", "OPTIONAL", "UTF8"),
-)
-
-
-def _format_observation_parquet_physical_schema(
-    schema: Iterable[tuple[str, str, str, str | None]],
-) -> str:
-    return "[" + ",".join(
-        f"{name}:{physical_type}:{repetition_type}"
-        + (f":{converted_type}" if converted_type else "")
-        for name, physical_type, repetition_type, converted_type in schema
-    ) + "]"
-
-
 def _observation_rows_from_local_parquet_for_shared_hash(
     *,
     parquet_paths: Iterable[str],
-    require_canonical_schema: bool = False,
 ) -> list[dict[str, Any]]:
     paths = sorted({str(Path(path)) for path in parquet_paths if Path(path).is_file()})
     if not paths:
@@ -19011,8 +17157,7 @@ def _observation_rows_from_local_parquet_for_shared_hash(
     connection = _connect_duckdb_utc(duckdb)
     try:
         description = connection.execute(
-            "DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true, "
-            "hive_partitioning=false)",
+            "DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true, hive_partitioning=false, filename=false)",
             [paths],
         ).fetchall()
         columns = {str(row[0]) for row in description}
@@ -19040,48 +17185,13 @@ def _observation_rows_from_local_parquet_for_shared_hash(
             )
         supported = (required, required | {"status"}, required | {"verification_status"})
         for parquet_path in paths:
-            file_description = connection.execute(
-                "DESCRIBE SELECT * FROM read_parquet(?, hive_partitioning=false)",
-                [parquet_path],
-            ).fetchall()
-            file_columns = {str(row[0]) for row in file_description}
+            file_columns = {
+                str(row[0]) for row in connection.execute(
+                    "DESCRIBE SELECT * FROM read_parquet(?, hive_partitioning=false, filename=false)", [parquet_path]
+                ).fetchall()
+            }
             if file_columns not in supported:
-                actual = ",".join(
-                    f"{str(row[0])}:{str(row[1])}" for row in file_description
-                )
-                raise ValueError(
-                    "unsupported observation Parquet physical schema: "
-                    "expected_columns="
-                    "[connector_id,station_id,timeseries_id,pollutant_code,"
-                    "observed_at_utc,value,(verification_status|status|absent)] "
-                    f"actual=[{actual}]"
-                )
-            if require_canonical_schema:
-                actual_physical_schema = tuple(
-                    (
-                        str(row[0]),
-                        str(row[1]),
-                        str(row[2]),
-                        None if row[3] is None else str(row[3]),
-                    )
-                    for row in connection.execute(
-                        "SELECT name, type, repetition_type, converted_type "
-                        "FROM parquet_schema(?) WHERE num_children IS NULL",
-                        [parquet_path],
-                    ).fetchall()
-                )
-                if actual_physical_schema != _CANONICAL_OBSERVATION_PARQUET_PHYSICAL_SCHEMA:
-                    raise ValueError(
-                        "unsupported canonical observation Parquet physical schema: "
-                        "expected="
-                        + _format_observation_parquet_physical_schema(
-                            _CANONICAL_OBSERVATION_PARQUET_PHYSICAL_SCHEMA
-                        )
-                        + " actual="
-                        + _format_observation_parquet_physical_schema(
-                            actual_physical_schema
-                        )
-                    )
+                raise ValueError("unsupported observation Parquet physical schema")
         status_column = status_columns[0] if status_columns else None
         status_select = (
             f', "{status_column}" AS source_status'
@@ -19094,7 +17204,7 @@ def _observation_rows_from_local_parquet_for_shared_hash(
                    observed_at_utc, "value"
             """
             + status_select
-            + " FROM read_parquet(?, union_by_name=true, hive_partitioning=false)",
+            + " FROM read_parquet(?, union_by_name=true, hive_partitioning=false, filename=false)",
             [paths],
         ).fetchall()
     finally:
@@ -19342,7 +17452,7 @@ def run_v2_observation_content_hash_checks(
                         f"v2_obs_hash_day_{day_utc}_connector_{connector_id}"
                     ),
                     output_scope="observations_only",
-                    history_version=CURRENT_INTEGRITY_HISTORY_VERSION,
+                    history_version="v2",
                     extra_env={
                         "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
                         "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(stage_root),
@@ -19361,8 +17471,6 @@ def run_v2_observation_content_hash_checks(
                     },
                     complete_connector_day=True,
                     repair_pollutants=selected_pollutants,
-                    worker_purpose="source_evidence_only",
-                    canonical_writes_allowed=False,
                 )
             if result.get("status") != "ok":
                 raise RuntimeError(
@@ -19541,96 +17649,6 @@ def run_v2_observation_content_hash_checks(
             new_gaps.append(gap)
             metrics["invalid_contract"] += 1
             continue
-        unavailable_timeseries_ids = {
-            int(value)
-            for value in list(
-                (candidate.get("source_evidence") or {}).get(
-                    "source_unavailable_timeseries_ids"
-                )
-                or []
-            )
-        }
-        unavailable_scopes = [
-            dict(scope)
-            for scope in list(
-                (candidate.get("source_evidence") or {}).get(
-                    "source_unavailable_scopes"
-                )
-                or []
-            )
-            if str(scope.get("pollutant_code") or "") == pollutant_code
-        ]
-        if unavailable_scopes:
-            try:
-                baseline_rows = _observation_rows_from_local_parquet_for_shared_hash(
-                    parquet_paths=candidate.get("parquet_paths") or [],
-                )
-                baseline_available_rows = _official_rdata_source_available_rows(
-                    baseline_rows,
-                    unavailable_scopes,
-                )
-                baseline_available_hash = (
-                    _compute_observation_hash_with_shared_javascript(
-                        rows=baseline_available_rows,
-                        is_sos=False,
-                        env=env,
-                        allow_empty=True,
-                    )
-                )
-            except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
-                gap = _v2_obs_gap(
-                    "observation_content_hash_invalid_contract",
-                    day_utc=day_utc,
-                    connector_id=connector_id,
-                    pollutant_code=pollutant_code,
-                    expected_path=str(candidate.get("manifest_rel") or ""),
-                    related_paths=[f"available_subset_hash_failed:{exc}"],
-                )
-                new_gaps.append(gap)
-                metrics["invalid_contract"] += 1
-                continue
-            subset_matches = (
-                baseline_available_hash["observation_content_hash"]
-                == source_hash["observation_content_hash"]
-                and baseline_available_hash["verification_status_counts"]
-                == source_hash["verification_status_counts"]
-            )
-            if not subset_matches:
-                gap = _v2_obs_gap(
-                    "observation_content_hash_mismatch",
-                    day_utc=day_utc,
-                    connector_id=connector_id,
-                    pollutant_code=pollutant_code,
-                    expected_path=str(candidate.get("manifest_rel") or ""),
-                    related_paths=[
-                        "source_available_subset_differs_from_source",
-                        f"source_hash={source_hash['observation_content_hash']}",
-                        "baseline_available_hash="
-                        + baseline_available_hash["observation_content_hash"],
-                    ],
-                )
-                gap["source_evidence"] = dict(
-                    candidate.get("source_evidence") or {}
-                )
-                new_gaps.append(gap)
-                metrics["mismatch"] += 1
-            else:
-                verified_partitions.append({
-                    "day_utc": day_utc,
-                    "connector_id": connector_id,
-                    "pollutant_code": pollutant_code,
-                    "status": (
-                        "source_available_subset_observation_content_hash_verified"
-                    ),
-                    "observation_content_hash": source_hash[
-                        "observation_content_hash"
-                    ],
-                    "source_unavailable_timeseries_ids": sorted(
-                        unavailable_timeseries_ids
-                    ),
-                })
-                metrics["verified"] += 1
-            continue
         manifest = json.loads(
             Path(str(candidate["manifest_path"])).read_text(encoding="utf-8")
         )
@@ -19792,7 +17810,7 @@ def run_v2_gap_backfills(
     repair_pollutants: Iterable[str] | None = None,
     source_scope: Mapping[str, Any] | None = None,
     explicit_selected_partitions: Iterable[Mapping[str, Any]] | None = None,
-    explicit_official_force_partitions: Iterable[Mapping[str, Any]] | None = None,
+    proposal_staging: _SosLightV2ProposalStaging | None = None,
 ) -> dict[str, Any]:
     """Execute direct source -> v2 observation repairs for missing v2 gaps.
 
@@ -19829,15 +17847,9 @@ def run_v2_gap_backfills(
         "source_invalid_partitions_blocked_before_mutation": 0,
         "exact_tombstones_created": 0,
     }
-    if explicit_selected_partitions is not None and explicit_official_force_partitions is not None:
-        raise ValueError("SOS and official direct replacement cannot be combined")
-    if explicit_selected_partitions is not None or explicit_official_force_partitions is not None:
+    if explicit_selected_partitions is not None:
         metrics.update({
-            "target_authority": (
-                "explicit_manual_force_replacement"
-                if explicit_official_force_partitions is not None
-                else "explicit_selected_scope"
-            ),
+            "target_authority": "explicit_selected_scope",
             "gap_detection_bypassed": True,
         })
     if not run_backfill:
@@ -19848,11 +17860,7 @@ def run_v2_gap_backfills(
         list(explicit_selected_partitions)
         if explicit_selected_partitions is not None else None
     )
-    official_force_targets = (
-        list(explicit_official_force_partitions)
-        if explicit_official_force_partitions is not None else None
-    )
-    if direct_targets is None and official_force_targets is None and not gaps:
+    if direct_targets is None and not gaps:
         return metrics
     def gap_partition(gap: Mapping[str, Any]) -> tuple[str, int, str | None] | None:
         day_iso = str(gap.get("day_utc") or "").strip()
@@ -19865,7 +17873,7 @@ def run_v2_gap_backfills(
         pollutant = str(gap.get("pollutant_code") or "").strip().lower() or None
         return day_iso, connector_id, pollutant
 
-    if direct_targets is None and official_force_targets is None:
+    if direct_targets is None:
         (
             executable_pollutants_by_key,
             executable_gap_indexes,
@@ -19874,7 +17882,7 @@ def run_v2_gap_backfills(
             v2_observations=v2_observations,
             requested_pollutants=repair_pollutants,
         )
-    elif direct_targets is not None:
+    else:
         executable_pollutants_by_key = {}
         executable_gap_indexes = set()
         skipped_nonexecutable_gaps = []
@@ -19928,34 +17936,6 @@ def run_v2_gap_backfills(
             pollutant
             for _day, _connector, pollutant in normalized_direct_targets
         })
-    else:
-        executable_pollutants_by_key = {}
-        executable_gap_indexes = set()
-        skipped_nonexecutable_gaps = []
-        for target in official_force_targets or []:
-            day_utc = str(target.get("day_utc") or "").strip()
-            connector_id = target.get("connector_id")
-            pollutant_code = str(target.get("pollutant_code") or "").strip().lower()
-            try:
-                valid_day = dt.date.fromisoformat(day_utc).isoformat() == day_utc
-            except ValueError:
-                valid_day = False
-            if (
-                not valid_day or not isinstance(connector_id, int)
-                or isinstance(connector_id, bool) or connector_id not in {9, 10}
-                or _official_rdata_source_for_connector(connector_id)
-                   != str((source_scope or {}).get("source") or "")
-                or pollutant_code not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
-                or target.get("target_authority") != "explicit_manual_force_replacement"
-            ):
-                raise ValueError("official RData explicit force target is invalid")
-            normalized_direct_targets.append((day_utc, connector_id, pollutant_code))
-        normalized_direct_targets = sorted(set(normalized_direct_targets))
-        if not normalized_direct_targets:
-            raise ValueError("official RData explicit force target set is empty")
-        metrics["explicit_selected_partition_count"] = len(normalized_direct_targets)
-        metrics["selected_dates"] = sorted({day for day, _, _ in normalized_direct_targets})
-        metrics["selected_pollutants"] = sorted({pollutant for _, _, pollutant in normalized_direct_targets})
 
     by_key_sets: dict[tuple[str, int], set[int]] = {}
     gaps_by_key: dict[tuple[str, int], list[dict[str, Any]]] = {}
@@ -19963,7 +17943,7 @@ def run_v2_gap_backfills(
     skipped_metadata_gaps: list[dict[str, Any]] = list(
         skipped_nonexecutable_gaps
     )
-    if direct_targets is None and official_force_targets is None:
+    if direct_targets is None:
         for gap_index, gap in enumerate(gaps):
             partition = gap_partition(gap)
             if partition is None:
@@ -20006,17 +17986,8 @@ def run_v2_gap_backfills(
         (day_utc, connector_id, [], [pollutant_code])
         for day_utc, connector_id, pollutant_code in normalized_direct_targets
     ]
-    official_force_by_key: dict[tuple[str, int], set[str]] = {}
-    if official_force_targets is not None:
-        for day_utc, connector_id, pollutant_code in normalized_direct_targets:
-            official_force_by_key.setdefault((day_utc, connector_id), set()).add(pollutant_code)
-    official_force_work = [
-        (day_utc, connector_id, [], sorted(pollutants))
-        for (day_utc, connector_id), pollutants in sorted(official_force_by_key.items())
-    ]
     metrics["observation_backfill_candidate_days"] = (
-        len(direct_work) if direct_targets is not None else
-        len(official_force_work) if official_force_targets is not None else len(by_key)
+        len(direct_work) if direct_targets is not None else len(by_key)
     )
     metrics["observation_backfill_candidate_timeseries_ids"] = sum(len(ids) for ids in by_key.values())
     metrics["observation_backfill_scope"] = "complete_source_derived_selected_pollutants"
@@ -20026,7 +17997,7 @@ def run_v2_gap_backfills(
                 [pollutant]
             for day_utc, connector_id, pollutant in normalized_direct_targets
         }
-        if direct_targets is not None or official_force_targets is not None else
+        if direct_targets is not None else
         {
             f"{day_utc}/connector_id={connector_id}": list(pollutants)
             for (day_utc, connector_id), pollutants in sorted(
@@ -20045,8 +18016,6 @@ def run_v2_gap_backfills(
     work_items = (
         direct_work
         if direct_targets is not None else
-        official_force_work
-        if official_force_targets is not None else
         [
             (
                 day_iso,
@@ -20062,6 +18031,27 @@ def run_v2_gap_backfills(
     dedicated_registry_snapshot: dict[str, Any] | None = None
     dedicated_bridge_snapshot: dict[str, Any] | None = None
     dedicated_source_acquisition: dict[str, Any] | None = None
+    selected_partition_progress = _BoundedCoordinatorProgress(
+        log=log if direct_targets is not None else None,
+        phase="selected_partition_processing",
+        total_objects=len(work_items),
+    )
+    detector_progress = _BoundedCoordinatorProgress(
+        log=log if direct_targets is not None else None,
+        phase="detector_source_evidence",
+        total_objects=len(work_items),
+    )
+    proposal_worker_progress = _BoundedCoordinatorProgress(
+        log=log if direct_targets is not None else None,
+        phase="proposal_worker",
+        total_objects=len(work_items),
+    )
+    selected_partition_progress.start()
+    detector_progress.start()
+    proposal_worker_progress.start()
+    detector_completed = 0
+    proposal_worker_completed = 0
+    selected_partition_completed = 0
     if direct_targets is not None:
         if limits.should_stop():
             raise RuntimeError(
@@ -20073,6 +18063,16 @@ def run_v2_gap_backfills(
             )
         selected_dates = list(metrics["selected_dates"])
         selected_pollutants = list(metrics["selected_pollutants"])
+        acquisition_progress = _BoundedCoordinatorProgress(
+            log=log,
+            phase="sos_source_acquisition",
+            total_objects=len(selected_dates) * len(selected_pollutants),
+        )
+        acquisition_progress.start(
+            from_day=selected_dates[0],
+            to_day=selected_dates[-1],
+            pollutants=selected_pollutants,
+        )
         acquisition_root = (
             Path(str(run_state["run_root"])) / "sos-source-cache"
         )
@@ -20138,8 +18138,6 @@ def run_v2_gap_backfills(
             },
             complete_connector_day=True,
             repair_pollutants=selected_pollutants,
-            worker_purpose="source_evidence_only",
-            canonical_writes_allowed=False,
         )
         _record_backfill_core_snapshot_identity_audits(
             run_state,
@@ -20244,6 +18242,12 @@ def run_v2_gap_backfills(
             f"{snapshot_day}/connector_id=1/acquisition"
         ] = dedicated_registry_snapshot
         write_run_state(run_state)
+        acquisition_progress.complete(
+            int(dedicated_source_acquisition.get("partition_dataset_count") or 0),
+            source_files_opened=int(
+                dedicated_source_acquisition.get("source_files_opened") or 0
+            ),
+        )
     for day_iso, connector_id, ts_ids, selected_repair_pollutants in work_items:
         if not selected_repair_pollutants:
             metrics["skipped_v2_observation_repairs"].append({
@@ -20252,43 +18256,6 @@ def run_v2_gap_backfills(
                 "reason": "no_executable_observation_repair_pollutants",
             })
             continue
-        scoped_official_source = _official_rdata_source_for_connector(
-            connector_id
-        )
-        if scoped_official_source:
-            repairable_pollutants: list[str] = []
-            unavailable_only_pollutants: list[str] = []
-            for pollutant_code in selected_repair_pollutants:
-                _counts, partition_evidence = (
-                    _official_rdata_source_counts_for_partition(
-                        source_key=scoped_official_source,
-                        day_utc=day_iso,
-                        pollutant_code=pollutant_code,
-                    )
-                )
-                if partition_evidence.get("source_partition_state") == (
-                    "source_artifact_unavailable"
-                ):
-                    unavailable_only_pollutants.append(pollutant_code)
-                else:
-                    repairable_pollutants.append(pollutant_code)
-            if unavailable_only_pollutants:
-                outcome = {
-                    "day_utc": day_iso,
-                    "connector_id": connector_id,
-                    "pollutant_codes": unavailable_only_pollutants,
-                    "outcome": "source_artifact_unavailable_preserved",
-                    "selected_partition_left_unchanged": True,
-                    "tombstone_created": False,
-                }
-                metrics["selected_partition_outcomes"].append(outcome)
-                metrics["skipped_v2_observation_repairs"].append({
-                    **outcome,
-                    "reason": "all_timeseries_source_artifacts_unavailable",
-                })
-            selected_repair_pollutants = repairable_pollutants
-            if not selected_repair_pollutants:
-                continue
         day_obj = dt.date.fromisoformat(day_iso)
         partition_pollutant = (
             selected_repair_pollutants[0]
@@ -20309,7 +18276,7 @@ def run_v2_gap_backfills(
         first_cmd = planned_cmds[0] if planned_cmds else None
         idx_cmd = " ".join(_v2_observations_index_rebuild_command(day_iso, connector_id))
         if limits.should_stop():
-            if direct_targets is None and official_force_targets is None:
+            if direct_targets is None:
                 break
             metrics["v2_observation_repairs_failed"] += 1
             metrics["observation_backfills_failed"] += 1
@@ -20415,38 +18382,31 @@ def run_v2_gap_backfills(
                 )
             else:
                 detector_result = run_narrow_backfill(
-                wrapper_path=resolve_integrity_backfill_wrapper(),
-                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
-                env_name=env_name,
-                timeseries_ids=[],
-                connector_ids=[connector_id],
-                day=day_obj,
-                log=log,
-                log_dir=backfill_log_dir,
-                log_label=_v2_observation_worker_log_label(
-                    stage="detector",
-                    day_utc=day_iso,
-                    connector_id=connector_id,
-                    pollutant_code=partition_pollutant,
-                ),
-                output_scope="observations_only",
-                history_version="v2",
-                extra_env={
-                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
-                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(detector_stage_root),
-                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "false",
-                    "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
-                    "UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY": "true",
-                    "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
-                    **source_acquisition_consumer_env,
-                    **({"UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE": registry_snapshot["path"]} if registry_snapshot else {}),
-                    **({"UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE": bridge_snapshot["path"]} if bridge_snapshot else {}),
-                },
-                complete_connector_day=True,
-                repair_pollutants=selected_repair_pollutants,
-                worker_purpose="source_evidence_only",
-                canonical_writes_allowed=False,
-            )
+                    wrapper_path=resolve_integrity_backfill_wrapper(),
+                    env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+                    env_name=env_name,
+                    timeseries_ids=[],
+                    connector_ids=[connector_id],
+                    day=day_obj,
+                    log=log,
+                    log_dir=backfill_log_dir,
+                    log_label=f"v2_obs_detector_day_{day_iso}_connector_{connector_id}",
+                    output_scope="observations_only",
+                    history_version="v2",
+                    extra_env={
+                        "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_MODE": "prepare",
+                        "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_ROOT": str(detector_stage_root),
+                        "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_FINALIZE": "false",
+                        "UK_AQ_BACKFILL_INTEGRITY_PROPOSAL_CLEANUP": "false",
+                        "UK_AQ_BACKFILL_INTEGRITY_COMPLETE_CONNECTOR_DAY": "true",
+                        "UK_AQ_BACKFILL_INTEGRITY_SOURCE_EVIDENCE_ONLY": "true",
+                        **source_acquisition_consumer_env,
+                        **({"UK_AQ_BACKFILL_SOS_SOURCE_LABEL_REGISTRY_FILE": registry_snapshot["path"]} if registry_snapshot else {}),
+                        **({"UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE": bridge_snapshot["path"]} if bridge_snapshot else {}),
+                    },
+                    complete_connector_day=True,
+                    repair_pollutants=selected_repair_pollutants,
+                )
             if run_state is not None and not official_rdata_source:
                 _record_backfill_core_snapshot_identity_audits(
                     run_state,
@@ -20508,6 +18468,12 @@ def run_v2_gap_backfills(
             "reason": "complete canonical source rows and source-file hashes were persisted before proposal"
             if detector_evidence_error is None else detector_evidence_error,
         }
+        detector_completed += 1
+        detector_progress.progress(
+            detector_completed,
+            current_day=day_iso,
+            current_pollutant=partition_pollutant,
+        )
         all_unmapped_selected_partition = bool(
             direct_targets is not None
             and detector_evidence_error is None
@@ -20557,6 +18523,19 @@ def run_v2_gap_backfills(
                 partition_pollutant,
                 "all_groups_excluded_no_authoritative_binding",
             )
+            proposal_worker_completed += 1
+            proposal_worker_progress.progress(
+                proposal_worker_completed,
+                current_day=day_iso,
+                current_pollutant=partition_pollutant,
+                outcome="skipped_all_unmapped",
+            )
+            selected_partition_completed += 1
+            selected_partition_progress.progress(
+                selected_partition_completed,
+                current_day=day_iso,
+                current_pollutant=partition_pollutant,
+            )
             continue
         for gap in gaps_by_key.get((day_iso, connector_id), []):
             _set_v2_source_repair_plan(
@@ -20572,12 +18551,7 @@ def run_v2_gap_backfills(
                 break
             if limits.should_stop():
                 break
-            chunk_label = _v2_observation_worker_log_label(
-                stage="proposal",
-                day_utc=day_iso,
-                connector_id=connector_id,
-                pollutant_code=partition_pollutant,
-            )
+            chunk_label = f"v2_obs_day_{day_iso}_connector_{connector_id}"
             if len(chunks) > 1:
                 chunk_label = f"{chunk_label}_chunk_{chunk_index:03d}_of_{len(chunks):03d}"
             # Chunking is local acquisition only. The final chunk builds one
@@ -20604,23 +18578,21 @@ def run_v2_gap_backfills(
                 )
             else:
                 bf = run_narrow_backfill(
-                wrapper_path=resolve_integrity_backfill_wrapper(),
-                env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
-                env_name=env_name,
-                timeseries_ids=chunk_ids,
-                connector_ids=[connector_id],
-                day=day_obj,
-                log=log,
-                log_dir=backfill_log_dir,
-                log_label=chunk_label,
-                output_scope="observations_only",
-                history_version="v2",
-                extra_env=extra_env,
-                complete_connector_day=True,
-                repair_pollutants=selected_repair_pollutants,
-                worker_purpose="repair_proposal",
-                canonical_writes_allowed=False,
-            )
+                    wrapper_path=resolve_integrity_backfill_wrapper(),
+                    env_file_path=os.environ.get("UK_AQ_BACKFILL_ENV_FILE"),
+                    env_name=env_name,
+                    timeseries_ids=chunk_ids,
+                    connector_ids=[connector_id],
+                    day=day_obj,
+                    log=log,
+                    log_dir=backfill_log_dir,
+                    log_label=chunk_label,
+                    output_scope="observations_only",
+                    history_version="v2",
+                    extra_env=extra_env,
+                    complete_connector_day=True,
+                    repair_pollutants=selected_repair_pollutants,
+                )
             if run_state is not None and not official_rdata_source:
                 _record_backfill_core_snapshot_identity_audits(
                     run_state,
@@ -20757,32 +18729,15 @@ def run_v2_gap_backfills(
                     day_utc=day_iso,
                     connector_id=connector_id,
                     repair_pollutants=selected_repair_pollutants,
+                    proposal_staging=proposal_staging,
                 )
-                proposal_is_official_rdata = str(
-                    source_evidence.get("source_adapter") or ""
-                ) in OFFICIAL_RDATA_NETWORKS
                 expected_timeseries_row_counts = _normalize_timeseries_row_counts(
-                    source_evidence.get(
-                        "final_target_timeseries_row_counts"
-                        if proposal_is_official_rdata
-                        else "per_timeseries_counts"
-                    )
+                    source_evidence.get("per_timeseries_counts")
                 )
-                expected_pollutant_codes = (
-                    sorted(dict(source_evidence.get(
-                        "final_target_pollutant_counts"
-                    ) or {}))
-                    if proposal_is_official_rdata
-                    else [
-                        str(value) for value in list(
-                            source_evidence.get("pollutant_set") or []
-                        )
-                    ]
-                )
-                expected_min_manifest_rows = int(source_evidence.get(
-                    "final_target_row_count"
-                    if proposal_is_official_rdata else "total_rows"
-                ) or 0)
+                expected_pollutant_codes = [
+                    str(value) for value in list(source_evidence.get("pollutant_set") or [])
+                ]
+                expected_min_manifest_rows = int(source_evidence.get("total_rows") or 0)
                 evidence_path = Path(str(
                     partition_source_evidence.get("evidence_path")
                     or (
@@ -20935,20 +18890,25 @@ def run_v2_gap_backfills(
             ],
         }
         metrics["v2_observation_repair_results"].append(repair_entry)
+        proposal_worker_completed += 1
+        proposal_worker_progress.progress(
+            proposal_worker_completed,
+            current_day=day_iso,
+            current_pollutant=partition_pollutant,
+            outcome=repair_status,
+        )
         if repair_ok:
             metrics["v2_observation_repairs_ok"] += 1
             metrics["observation_backfills_ok"] += 1
             if run_state is not None:
+                proposal_pollutants = sorted({
+                    match.group(1)
+                    for key in validated_overlay_keys
+                    if (match := re.search(r"/pollutant_code=([a-z0-9_]+)/", key))
+                })
                 requested_repair_pollutants = selected_repair_pollutants
-                proposal_pollutants, empty_pollutants = (
-                    _observation_changed_scope_pollutants(
-                        validated_overlay_keys=validated_overlay_keys,
-                        source_evidence=source_evidence,
-                        requested_repair_pollutants=(
-                            requested_repair_pollutants
-                        ),
-                    )
-                )
+                if requested_repair_pollutants and not set(proposal_pollutants).issubset(set(requested_repair_pollutants)):
+                    raise ValueError("OBSERVS_CHANGED pollutant scope escaped requested repair scope")
                 affected_pollutants = sorted({
                     str(gap.get("pollutant_code") or "").strip().lower()
                     for gap in gaps_by_key.get((day_iso, connector_id), [])
@@ -20974,14 +18934,14 @@ def run_v2_gap_backfills(
                     "object_keys": validated_overlay_keys,
                     "stage": "observs",
                 }
-                proposal_is_official_rdata = str(
-                    source_evidence.get("source_adapter") or ""
-                ) in OFFICIAL_RDATA_NETWORKS
-                if proposal_is_official_rdata:
-                    changed_scope["empty_pollutant_codes"] = empty_pollutants
-                record_changed_scope(
-                    run_state, "OBSERVS_CHANGED", changed_scope
-                )
+                if proposal_staging is not None:
+                    proposal_staging.record_changed_scope(
+                        "OBSERVS_CHANGED", changed_scope,
+                    )
+                else:
+                    record_changed_scope(
+                        run_state, "OBSERVS_CHANGED", changed_scope,
+                    )
                 tombstones_after = {
                     str(entry.get("prefix") or "")
                     for entry in list(
@@ -20995,49 +18955,26 @@ def run_v2_gap_backfills(
                 metrics["exact_tombstones_created"] += (
                     exact_tombstones_created
                 )
-                created_tombstones = tombstones_after - tombstones_before
-                if proposal_is_official_rdata:
-                    outcomes = _official_rdata_selected_partition_outcomes(
-                        day_utc=day_iso,
-                        connector_id=connector_id,
-                        pollutant_codes=proposal_pollutants,
-                        empty_pollutant_codes=empty_pollutants,
-                        validated_overlay_keys=validated_overlay_keys,
-                        created_tombstones=created_tombstones,
-                    )
-                    metrics["selected_partition_outcomes"].extend(outcomes)
-                    metrics["authoritative_no_data_replacements"] += sum(
-                        outcome["outcome"]
-                        == "authoritative_no_data_replacement"
-                        for outcome in outcomes
-                    )
-                    metrics["complete_replacements"] += sum(
-                        outcome["outcome"] == "complete_replacement"
-                        for outcome in outcomes
-                    )
+                authoritative_no_data = (
+                    int(source_evidence.get("total_rows") or 0) == 0
+                )
+                outcome_name = (
+                    "authoritative_no_data_replacement"
+                    if authoritative_no_data else "complete_replacement"
+                )
+                metrics["selected_partition_outcomes"].append({
+                    "day_utc": day_iso,
+                    "connector_id": connector_id,
+                    "pollutant_code": partition_pollutant,
+                    "outcome": outcome_name,
+                    "tombstone_created": exact_tombstones_created == 1,
+                    "exact_tombstone_count": exact_tombstones_created,
+                    "replacement_object_keys": list(validated_overlay_keys),
+                })
+                if authoritative_no_data:
+                    metrics["authoritative_no_data_replacements"] += 1
                 else:
-                    authoritative_no_data = (
-                        int(source_evidence.get("total_rows") or 0) == 0
-                    )
-                    outcome_name = (
-                        "authoritative_no_data_replacement"
-                        if authoritative_no_data else "complete_replacement"
-                    )
-                    metrics["selected_partition_outcomes"].append({
-                        "day_utc": day_iso,
-                        "connector_id": connector_id,
-                        "pollutant_code": partition_pollutant,
-                        "outcome": outcome_name,
-                        "tombstone_created": exact_tombstones_created == 1,
-                        "exact_tombstone_count": exact_tombstones_created,
-                        "replacement_object_keys": list(
-                            validated_overlay_keys
-                        ),
-                    })
-                    if authoritative_no_data:
-                        metrics["authoritative_no_data_replacements"] += 1
-                    else:
-                        metrics["complete_replacements"] += 1
+                    metrics["complete_replacements"] += 1
         elif no_observation_rows:
             metrics["v2_observation_repairs_no_rows"] += 1
             log.warning(
@@ -21097,6 +19034,15 @@ def run_v2_gap_backfills(
                 ),
                 "tombstone_created": False,
             })
+        selected_partition_completed += 1
+        selected_partition_progress.progress(
+            selected_partition_completed,
+            current_day=day_iso,
+            current_pollutant=partition_pollutant,
+        )
+    detector_progress.complete(detector_completed)
+    proposal_worker_progress.complete(proposal_worker_completed)
+    selected_partition_progress.complete(selected_partition_completed)
     return metrics
 
 def fmt_iso(t: dt.datetime) -> str:
@@ -21131,21 +19077,16 @@ PROPOSAL_TRANSITION_DEPENDENCY_SOURCES = frozenset({
     "planned_overlay", *PROPOSAL_TRANSITION_EXTERNAL_SOURCES,
 })
 FINAL_WRITE_SET_PROMOTION_REASON_EXACT_PREFIX = "exact_prefix_replacement"
-SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
-    "uk_aq_sos_light_v3_transition_state_fingerprint_v2"
-)
-GENERIC_INTEGRITY_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
-    "uk_aq_generic_integrity_v3_transition_state_fingerprint_v3"
-)
-GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT = (
-    "uk_aq_generic_integrity_v3_selected_scope_authority_v3"
+SOS_LIGHT_V2_STAGING_CONTRACT = "uk_aq_sos_light_v2_coordinator_staging_v1"
+SOS_LIGHT_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
+    "uk_aq_sos_light_v2_transition_state_fingerprint_v2"
 )
 COORDINATOR_PROGRESS_OBJECT_INTERVAL = 250
 COORDINATOR_PROGRESS_SECONDS = 15.0
 
 
 class _BoundedCoordinatorProgress:
-    """Emit stable progress events without producing one log line per object."""
+    """Emit compact count/time progress through the established log channel."""
 
     def __init__(
         self,
@@ -21153,11 +19094,13 @@ class _BoundedCoordinatorProgress:
         log: logging.Logger | None,
         phase: str,
         total_objects: int | None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.log = log
         self.phase = phase
         self.total_objects = total_objects
-        self.started_at = time.monotonic()
+        self._monotonic = monotonic
+        self.started_at = monotonic()
         self.last_progress_at = self.started_at
         self.last_completed_objects = 0
 
@@ -21166,8 +19109,6 @@ class _BoundedCoordinatorProgress:
         suffix: str,
         *,
         completed_objects: int,
-        checkpoint_count: int | None = None,
-        changed_scope_count: int | None = None,
         **details: Any,
     ) -> None:
         if self.log is None:
@@ -21176,12 +19117,8 @@ class _BoundedCoordinatorProgress:
             "phase": f"{self.phase}_{suffix}",
             "completed_objects": completed_objects,
             "total_objects": self.total_objects,
-            "elapsed_seconds": round(time.monotonic() - self.started_at, 3),
+            "elapsed_seconds": round(self._monotonic() - self.started_at, 3),
         }
-        if checkpoint_count is not None:
-            payload["checkpoint_count"] = checkpoint_count
-        if changed_scope_count is not None:
-            payload["changed_scope_count"] = changed_scope_count
         payload.update(details)
         self.log.info(
             "UK_AQ_INTEGRITY_PROGRESS %s",
@@ -21192,7 +19129,7 @@ class _BoundedCoordinatorProgress:
         self._emit("started", completed_objects=0, **details)
 
     def is_due(self, completed_objects: int) -> bool:
-        now = time.monotonic()
+        now = self._monotonic()
         return (
             completed_objects - self.last_completed_objects
             >= COORDINATOR_PROGRESS_OBJECT_INTERVAL
@@ -21210,36 +19147,373 @@ class _BoundedCoordinatorProgress:
             return False
         self._emit("progress", completed_objects=completed_objects, **details)
         self.last_completed_objects = completed_objects
-        self.last_progress_at = time.monotonic()
+        self.last_progress_at = self._monotonic()
         return True
 
     def complete(self, completed_objects: int, **details: Any) -> None:
         self._emit("complete", completed_objects=completed_objects, **details)
 
 
-def _emit_proposal_checkpoint_progress(
+def _transition_fingerprint_optional_bool(
+    entry: Mapping[str, Any], field: str, *, object_key: str,
+) -> bool | None:
+    value = entry.get(field)
+    if value is not None and not isinstance(value, bool):
+        raise ValueError(
+            "fixed-v2 transition fingerprint boolean is invalid: "
+            f"{object_key}:{field}"
+        )
+    return value
+
+
+def _transition_fingerprint_optional_text(
+    entry: Mapping[str, Any], field: str, *, object_key: str,
+) -> str | None:
+    value = entry.get(field)
+    if value is not None and not isinstance(value, str):
+        raise ValueError(
+            "fixed-v2 transition fingerprint text is invalid: "
+            f"{object_key}:{field}"
+        )
+    return value
+
+
+def _transition_fingerprint_nonnegative_int(
+    entry: Mapping[str, Any], field: str, *, label: str,
+) -> int:
+    value = entry.get(field)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(
+            f"fixed-v2 transition fingerprint count is invalid: {label}:{field}"
+        )
+    return value
+
+
+def _transition_fingerprint_connector_ids(
+    run_state: Mapping[str, Any], field: str,
+) -> list[int]:
+    raw_values = run_state.get(field)
+    if not isinstance(raw_values, list):
+        raise ValueError(
+            f"fixed-v2 transition fingerprint connector IDs are invalid: {field}"
+        )
+    values: list[int] = []
+    for value in raw_values:
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            or value > 2**53 - 1
+        ):
+            raise ValueError(
+                f"fixed-v2 transition fingerprint connector IDs are invalid: {field}"
+            )
+        values.append(value)
+    if len(set(values)) != len(values):
+        raise ValueError(
+            f"fixed-v2 transition fingerprint connector IDs are duplicated: {field}"
+        )
+    return sorted(values)
+
+
+def _transition_fingerprint_operation_identity(
+    run_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    identity: dict[str, Any] = {}
+    for field in ("environment", "execution_path", "mode"):
+        value = run_state.get(field)
+        if not isinstance(value, str) or not value:
+            raise ValueError(
+                f"fixed-v2 transition fingerprint operation identity is invalid: {field}"
+            )
+        identity[field] = value
+    dedicated = run_state.get("dedicated_sos_historical_replacement")
+    if not isinstance(dedicated, bool):
+        raise ValueError(
+            "fixed-v2 transition fingerprint operation identity is invalid: "
+            "dedicated_sos_historical_replacement"
+        )
+    identity["dedicated_sos_historical_replacement"] = dedicated
+    for field in (
+        "mutation_connector_ids",
+        "selected_mutation_connector_ids",
+        "protected_connector_ids",
+    ):
+        identity[field] = _transition_fingerprint_connector_ids(
+            run_state, field
+        )
+    return identity
+
+
+def _transition_fingerprint_identity_entries(
     *,
-    log: logging.Logger | None,
-    suffix: str,
-    completed_objects: int,
-    total_objects: int,
-    checkpoint_count: int,
-    changed_scope_count: int,
-    started_at: float,
-) -> None:
-    if log is None:
-        return
-    log.info(
-        "UK_AQ_INTEGRITY_PROGRESS %s",
-        json.dumps({
-            "phase": f"proposal_run_state_checkpoint_{suffix}",
-            "completed_objects": completed_objects,
-            "total_objects": total_objects,
-            "elapsed_seconds": round(time.monotonic() - started_at, 3),
-            "checkpoint_count": checkpoint_count,
-            "changed_scope_count": changed_scope_count,
-        }, sort_keys=True, separators=(",", ":")),
+    parent_key: str,
+    raw_identities: Any,
+    label: str,
+) -> list[dict[str, Any]] | None:
+    if raw_identities is None:
+        return None
+    if not isinstance(raw_identities, Mapping):
+        raise ValueError(
+            f"fixed-v2 transition fingerprint {label} is invalid: {parent_key}"
+        )
+    identities: list[dict[str, Any]] = []
+    for raw_dependency_key, raw_identity in raw_identities.items():
+        dependency_key = _normalise_overlay_object_key(str(raw_dependency_key))
+        if str(raw_dependency_key) != dependency_key:
+            raise ValueError(
+                "fixed-v2 transition fingerprint dependency key is not canonical: "
+                f"{parent_key} -> {raw_dependency_key}"
+            )
+        if not isinstance(raw_identity, Mapping):
+            raise ValueError(
+                f"fixed-v2 transition fingerprint {label} entry is invalid: "
+                f"{parent_key} -> {dependency_key}"
+            )
+        identity = _normalise_proposal_dependency_identity(
+            parent_key=parent_key,
+            dependency_key=dependency_key,
+            identity=raw_identity,
+        )
+        identities.append({"object_key": dependency_key, **identity})
+    return sorted(identities, key=lambda identity: identity["object_key"])
+
+
+def _proposal_transition_state_fingerprint_payload(
+    run_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the narrow deterministic authority consumed by v2 validation."""
+    objects = run_state.get("objects")
+    if not isinstance(objects, Mapping):
+        raise ValueError("fixed-v2 transition fingerprint objects mapping is invalid")
+    canonical_objects: list[dict[str, Any]] = []
+    for raw_object_key, raw_entry in objects.items():
+        object_key = _normalise_overlay_object_key(str(raw_object_key))
+        if str(raw_object_key) != object_key or not isinstance(raw_entry, Mapping):
+            raise ValueError(
+                f"fixed-v2 transition fingerprint object is invalid: {raw_object_key}"
+            )
+        entry = raw_entry
+        sha256 = str(entry.get("sha256") or "").strip().lower()
+        byte_count = entry.get("bytes")
+        if (
+            not re.fullmatch(r"[a-f0-9]{64}", sha256)
+            or not isinstance(byte_count, int)
+            or isinstance(byte_count, bool)
+            or byte_count < 0
+        ):
+            raise ValueError(
+                f"fixed-v2 transition fingerprint object identity is invalid: {object_key}"
+            )
+        raw_dependencies = entry.get("dependencies")
+        if not isinstance(raw_dependencies, list):
+            raise ValueError(
+                f"fixed-v2 transition fingerprint dependencies are invalid: {object_key}"
+            )
+        dependencies = sorted({
+            _normalise_overlay_object_key(str(value))
+            for value in raw_dependencies
+        })
+        if len(dependencies) != len(raw_dependencies):
+            raise ValueError(
+                f"fixed-v2 transition fingerprint dependencies are duplicated: {object_key}"
+            )
+        planner_dependencies_raw = entry.get("planner_dependencies")
+        planner_dependencies = None
+        if planner_dependencies_raw is not None:
+            if not isinstance(planner_dependencies_raw, list):
+                raise ValueError(
+                    "fixed-v2 transition fingerprint planner dependencies are "
+                    f"invalid: {object_key}"
+                )
+            planner_dependencies = sorted({
+                _normalise_overlay_object_key(str(value))
+                for value in planner_dependencies_raw
+            })
+            if len(planner_dependencies) != len(planner_dependencies_raw):
+                raise ValueError(
+                    "fixed-v2 transition fingerprint planner dependencies are "
+                    f"duplicated: {object_key}"
+                )
+        canonical_objects.append({
+            "object_key": object_key,
+            "sha256": sha256,
+            "bytes": byte_count,
+            "stage": _transition_fingerprint_optional_text(
+                entry, "stage", object_key=object_key,
+            ),
+            "dependencies": dependencies,
+            "dependency_identities": _transition_fingerprint_identity_entries(
+                parent_key=object_key,
+                raw_identities=entry.get("dependency_identities"),
+                label="dependency identities",
+            ),
+            "proposed": _transition_fingerprint_optional_bool(
+                entry, "proposed", object_key=object_key,
+            ),
+            "built": _transition_fingerprint_optional_bool(
+                entry, "built", object_key=object_key,
+            ),
+            "structurally_validated": _transition_fingerprint_optional_bool(
+                entry, "structurally_validated", object_key=object_key,
+            ),
+            "changed": _transition_fingerprint_optional_bool(
+                entry, "changed", object_key=object_key,
+            ),
+            "included_in_write_set": _transition_fingerprint_optional_bool(
+                entry, "included_in_write_set", object_key=object_key,
+            ),
+            "status": _transition_fingerprint_optional_text(
+                entry, "status", object_key=object_key,
+            ),
+            "planner_changed": _transition_fingerprint_optional_bool(
+                entry, "planner_changed", object_key=object_key,
+            ),
+            "planner_status": _transition_fingerprint_optional_text(
+                entry, "planner_status", object_key=object_key,
+            ),
+            "planner_included_in_write_set": _transition_fingerprint_optional_bool(
+                entry, "planner_included_in_write_set", object_key=object_key,
+            ),
+            "planner_dependencies": planner_dependencies,
+            "planner_dependency_identities": _transition_fingerprint_identity_entries(
+                parent_key=object_key,
+                raw_identities=entry.get("planner_dependency_identities"),
+                label="planner dependency identities",
+            ),
+            "proposal_changed": _transition_fingerprint_optional_bool(
+                entry, "proposal_changed", object_key=object_key,
+            ),
+            "planner_source": _transition_fingerprint_optional_text(
+                entry, "planner_source", object_key=object_key,
+            ),
+            "baseline_source": _transition_fingerprint_optional_text(
+                entry, "baseline_source", object_key=object_key,
+            ),
+            "included_in_final_staged_write_set": _transition_fingerprint_optional_bool(
+                entry,
+                "included_in_final_staged_write_set",
+                object_key=object_key,
+            ),
+            "promotion_reason": _transition_fingerprint_optional_text(
+                entry, "promotion_reason", object_key=object_key,
+            ),
+            "final_source": _transition_fingerprint_optional_text(
+                entry, "final_source", object_key=object_key,
+            ),
+        })
+    canonical_objects.sort(key=lambda entry: entry["object_key"])
+
+    unchanged_keys_raw = run_state.get(
+        "proposal_transition_planner_unchanged_keys"
+    ) or []
+    if not isinstance(unchanged_keys_raw, list):
+        raise ValueError(
+            "fixed-v2 transition fingerprint unchanged-planner keys are invalid"
+        )
+    unchanged_keys = sorted({
+        _normalise_overlay_object_key(str(value))
+        for value in unchanged_keys_raw
+    })
+    tombstone_prefixes_raw = run_state.get("tombstone_prefixes") or []
+    if not isinstance(tombstone_prefixes_raw, list):
+        raise ValueError(
+            "fixed-v2 transition fingerprint tombstone prefixes are invalid"
+        )
+    proposed_prefixes = sorted({
+        _normalise_overlay_object_key(str(entry.get("prefix") or "")).rstrip("/")
+        for entry in tombstone_prefixes_raw
+        if isinstance(entry, Mapping) and entry.get("proposed")
+    })
+    final_provenance = run_state.get("final_staged_write_set_provenance")
+    if not isinstance(final_provenance, Mapping):
+        raise ValueError("fixed-v2 transition fingerprint final provenance is invalid")
+    promotion_reason_counts = final_provenance.get("promotion_reason_counts")
+    external_edge_counts = final_provenance.get(
+        "external_dependency_edge_counts"
     )
+    forced_keys_raw = final_provenance.get("forced_republication_keys")
+    if (
+        not isinstance(promotion_reason_counts, Mapping)
+        or not isinstance(external_edge_counts, Mapping)
+        or not isinstance(forced_keys_raw, list)
+    ):
+        raise ValueError(
+            "fixed-v2 transition fingerprint provenance fields are invalid"
+        )
+    return {
+        "contract_version": SOS_LIGHT_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+        "operation_identity": _transition_fingerprint_operation_identity(
+            run_state
+        ),
+        "objects": canonical_objects,
+        "proposal_transition_planner_unchanged_keys": unchanged_keys,
+        "proposed_tombstone_prefixes": proposed_prefixes,
+        "final_staged_write_set_provenance": {
+            "status": _transition_fingerprint_optional_text(
+                final_provenance,
+                "status",
+                object_key="final_staged_write_set_provenance",
+            ),
+            "final_staged_object_count": _transition_fingerprint_nonnegative_int(
+                final_provenance,
+                "final_staged_object_count",
+                label="final_staged_write_set_provenance",
+            ),
+            "forced_republication_count": _transition_fingerprint_nonnegative_int(
+                final_provenance,
+                "forced_republication_count",
+                label="final_staged_write_set_provenance",
+            ),
+            "forced_republication_keys": sorted({
+                _normalise_overlay_object_key(str(value))
+                for value in forced_keys_raw
+            }),
+            "promotion_reason_counts": {
+                str(key): _transition_fingerprint_nonnegative_int(
+                    promotion_reason_counts,
+                    key,
+                    label="promotion_reason_counts",
+                )
+                for key in sorted(promotion_reason_counts, key=str)
+            },
+            "rebuilt_dependency_identity_count":
+                _transition_fingerprint_nonnegative_int(
+                    final_provenance,
+                    "rebuilt_dependency_identity_count",
+                    label="final_staged_write_set_provenance",
+                ),
+            "staged_dependency_edge_count":
+                _transition_fingerprint_nonnegative_int(
+                    final_provenance,
+                    "staged_dependency_edge_count",
+                    label="final_staged_write_set_provenance",
+                ),
+            "external_dependency_edge_counts": {
+                str(key): _transition_fingerprint_nonnegative_int(
+                    external_edge_counts,
+                    key,
+                    label="external_dependency_edge_counts",
+                )
+                for key in sorted(external_edge_counts, key=str)
+            },
+        },
+    }
+
+
+def proposal_transition_state_fingerprint_sha256(
+    run_state: Mapping[str, Any],
+) -> str:
+    canonical = json.dumps(
+        _proposal_transition_state_fingerprint_payload(run_state),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 
 
 def _normalise_proposal_dependency_identity(
@@ -21274,888 +19548,6 @@ def _is_forced_republication_entry(entry: Mapping[str, Any]) -> bool:
         == FINAL_WRITE_SET_PROMOTION_REASON_EXACT_PREFIX
         and str(entry.get("final_source") or "").strip() == "planned_overlay"
     )
-
-
-def _transition_fingerprint_optional_bool(
-    entry: Mapping[str, Any], field: str, *, object_key: str,
-) -> bool | None:
-    value = entry.get(field)
-    if value is not None and not isinstance(value, bool):
-        raise ValueError(
-            "fixed-v3 transition fingerprint boolean is invalid: "
-            f"{object_key}:{field}"
-        )
-    return value
-
-
-def _transition_fingerprint_optional_text(
-    entry: Mapping[str, Any], field: str, *, object_key: str,
-) -> str | None:
-    value = entry.get(field)
-    if value is not None and not isinstance(value, str):
-        raise ValueError(
-            "fixed-v3 transition fingerprint text is invalid: "
-            f"{object_key}:{field}"
-        )
-    return value
-
-
-def _transition_fingerprint_nonnegative_int(
-    entry: Mapping[str, Any], field: str, *, label: str,
-) -> int:
-    value = entry.get(field)
-    if (
-        not isinstance(value, int)
-        or isinstance(value, bool)
-        or value < 0
-    ):
-        raise ValueError(
-            f"fixed-v3 transition fingerprint count is invalid: {label}:{field}"
-        )
-    return value
-
-
-def _transition_fingerprint_identity_entries(
-    *,
-    parent_key: str,
-    raw_identities: Any,
-    label: str,
-) -> list[dict[str, Any]] | None:
-    if raw_identities is None:
-        return None
-    if not isinstance(raw_identities, Mapping):
-        raise ValueError(
-            f"fixed-v3 transition fingerprint {label} is invalid: {parent_key}"
-        )
-    identities: list[dict[str, Any]] = []
-    for raw_dependency_key, raw_identity in raw_identities.items():
-        dependency_key = _normalise_overlay_object_key(
-            str(raw_dependency_key)
-        )
-        if str(raw_dependency_key) != dependency_key:
-            raise ValueError(
-                "fixed-v3 transition fingerprint dependency key is not "
-                f"canonical: {parent_key} -> {raw_dependency_key}"
-            )
-        if not isinstance(raw_identity, Mapping):
-            raise ValueError(
-                f"fixed-v3 transition fingerprint {label} entry is invalid: "
-                f"{parent_key} -> {dependency_key}"
-            )
-        identity = _normalise_proposal_dependency_identity(
-            parent_key=parent_key,
-            dependency_key=dependency_key,
-            identity=raw_identity,
-        )
-        identities.append({
-            "object_key": dependency_key,
-            **identity,
-        })
-    return sorted(
-        identities,
-        key=lambda identity: identity["object_key"].encode("utf-8"),
-    )
-
-
-def _canonical_sos_light_connector_ids(value: Any, *, label: str) -> list[int]:
-    if (
-        not isinstance(value, list)
-        or any(
-            not isinstance(connector_id, int)
-            or isinstance(connector_id, bool)
-            or connector_id <= 0
-            for connector_id in value
-        )
-    ):
-        raise ValueError(
-            f"fixed-v3 SOS-light connector membership is invalid: {label}"
-        )
-    canonical = sorted(set(value))
-    if value != canonical:
-        raise ValueError(
-            f"fixed-v3 SOS-light connector membership is not canonical: {label}"
-        )
-    return canonical
-
-
-def _canonical_sos_light_observation_object_keys(
-    value: Any,
-    *,
-    day_utc: str,
-) -> list[str]:
-    if not isinstance(value, list) or any(
-        not isinstance(object_key, str) for object_key in value
-    ):
-        raise ValueError(
-            f"fixed-v3 SOS-light observation closure is invalid: {day_utc}"
-        )
-    root = f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}"
-    day_manifest_key = f"{root}/manifest.json"
-    canonical = sorted(
-        {_normalise_overlay_object_key(key) for key in value},
-        key=lambda key: key.encode("utf-8"),
-    )
-    patterns = (
-        re.compile(re.escape(root) + r"/connector_id=[1-9]\d*/manifest\.json"),
-        re.compile(
-            re.escape(root)
-            + r"/connector_id=[1-9]\d*/pollutant_code=[a-z0-9_]+/"
-            + r"manifest\.json"
-        ),
-        re.compile(
-            re.escape(root)
-            + r"/connector_id=[1-9]\d*/pollutant_code=[a-z0-9_]+/"
-            + r"[^/]+\.parquet"
-        ),
-    )
-    if (
-        value != canonical
-        or day_manifest_key not in canonical
-        or any(
-            key != day_manifest_key
-            and not any(pattern.fullmatch(key) for pattern in patterns)
-            for key in canonical
-        )
-    ):
-        raise ValueError(
-            "fixed-v3 SOS-light observation closure is not canonical: "
-            f"{day_utc}"
-        )
-    return canonical
-
-
-def _canonical_sos_light_connector_membership(
-    run_state: Mapping[str, Any],
-) -> list[dict[str, Any]]:
-    audit = run_state.get("sos_light")
-    if (
-        not isinstance(audit, Mapping)
-        or audit.get("mode") != "sos-light"
-        or not isinstance(audit.get("days"), list)
-        or not audit["days"]
-    ):
-        raise ValueError(
-            "fixed-v3 SOS-light connector-membership evidence is unavailable"
-        )
-    membership: list[dict[str, Any]] = []
-    seen_days: set[str] = set()
-    for entry in audit["days"]:
-        if not isinstance(entry, Mapping):
-            raise ValueError(
-                "fixed-v3 SOS-light connector-membership day is invalid"
-            )
-        day_utc = str(entry.get("day_utc") or "")
-        try:
-            valid_day = dt.date.fromisoformat(day_utc).isoformat() == day_utc
-        except ValueError:
-            valid_day = False
-        if not valid_day or day_utc in seen_days:
-            raise ValueError(
-                "fixed-v3 SOS-light connector-membership day is invalid: "
-                f"{day_utc}"
-            )
-        seen_days.add(day_utc)
-        pinned_present = entry.get("pinned_day_manifest_present")
-        if not isinstance(pinned_present, bool):
-            raise ValueError(
-                "fixed-v3 SOS-light pinned day-manifest presence is invalid: "
-                f"{day_utc}"
-            )
-        pinned_key = entry.get("pinned_day_manifest_key")
-        pinned_hash = entry.get("pinned_day_manifest_hash")
-        if pinned_present:
-            expected_key = (
-                f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/"
-                f"day_utc={day_utc}/manifest.json"
-            )
-            if (
-                pinned_key != expected_key
-                or not re.fullmatch(r"[a-f0-9]{64}", str(pinned_hash or ""))
-            ):
-                raise ValueError(
-                    "fixed-v3 SOS-light pinned day-manifest identity is "
-                    f"invalid: {day_utc}"
-                )
-        elif pinned_key is not None or pinned_hash is not None:
-            raise ValueError(
-                "fixed-v3 SOS-light absent day-manifest identity is "
-                f"contradictory: {day_utc}"
-            )
-        baseline_ids = _canonical_sos_light_connector_ids(
-            entry.get("pinned_baseline_connector_ids"),
-            label=f"{day_utc}:pinned_baseline_connector_ids",
-        )
-        expected_preserved_ids = _canonical_sos_light_connector_ids(
-            entry.get("expected_preserved_connector_ids"),
-            label=f"{day_utc}:expected_preserved_connector_ids",
-        )
-        expected_final_ids = _canonical_sos_light_connector_ids(
-            entry.get("expected_final_connector_ids"),
-            label=f"{day_utc}:expected_final_connector_ids",
-        )
-        final_assembled_ids = _canonical_sos_light_connector_ids(
-            entry.get("final_assembled_connector_ids"),
-            label=f"{day_utc}:final_assembled_connector_ids",
-        )
-        authoritative_object_keys = (
-            _canonical_sos_light_observation_object_keys(
-                entry.get("authoritative_observation_object_keys"),
-                day_utc=day_utc,
-            )
-        )
-        derived_preserved_ids = [
-            connector_id for connector_id in baseline_ids if connector_id != 1
-        ]
-        derived_final_ids = sorted({1, *derived_preserved_ids})
-        root = f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}"
-        connector_parent_pattern = re.compile(
-            re.escape(root) + r"/connector_id=([1-9]\d*)/manifest\.json"
-        )
-        connector_object_pattern = re.compile(
-            re.escape(root) + r"/connector_id=([1-9]\d*)/"
-        )
-        closure_connector_ids = sorted(
-            int(match.group(1))
-            for key in authoritative_object_keys
-            if (match := connector_parent_pattern.fullmatch(key))
-        )
-        closure_has_unexpected_connector = any(
-            int(match.group(1)) not in derived_final_ids
-            for key in authoritative_object_keys
-            if (match := connector_object_pattern.match(key))
-        )
-        if (
-            expected_preserved_ids != derived_preserved_ids
-            or expected_final_ids != derived_final_ids
-            or final_assembled_ids != derived_final_ids
-            or closure_connector_ids != derived_final_ids
-            or closure_has_unexpected_connector
-        ):
-            raise ValueError(
-                "fixed-v3 SOS-light frozen connector membership disagrees: "
-                f"{day_utc}"
-            )
-        membership.append({
-            "day_utc": day_utc,
-            "pinned_day_manifest_present": pinned_present,
-            "pinned_day_manifest_key": pinned_key,
-            "pinned_day_manifest_hash": pinned_hash,
-            "pinned_baseline_connector_ids": baseline_ids,
-            "expected_preserved_connector_ids": expected_preserved_ids,
-            "expected_final_connector_ids": expected_final_ids,
-            "final_assembled_connector_ids": final_assembled_ids,
-            "authoritative_observation_object_keys": authoritative_object_keys,
-        })
-    return sorted(
-        membership, key=lambda entry: entry["day_utc"].encode("utf-8")
-    )
-
-
-def _proposal_transition_state_common_fingerprint_payload(
-    run_state: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Return the mode-neutral frozen graph consumed by transition validation."""
-    objects = run_state.get("objects")
-    if not isinstance(objects, Mapping):
-        raise ValueError(
-            "fixed-v3 transition fingerprint objects mapping is invalid"
-        )
-    canonical_objects: list[dict[str, Any]] = []
-    for raw_object_key, raw_entry in objects.items():
-        object_key = _normalise_overlay_object_key(str(raw_object_key))
-        if str(raw_object_key) != object_key:
-            raise ValueError(
-                "fixed-v3 transition fingerprint object key is not canonical: "
-                f"{raw_object_key}"
-            )
-        if not isinstance(raw_entry, Mapping):
-            raise ValueError(
-                f"fixed-v3 transition fingerprint object is invalid: {object_key}"
-            )
-        entry = raw_entry
-        sha256 = str(entry.get("sha256") or "").strip().lower()
-        byte_count = entry.get("bytes")
-        if (
-            not re.fullmatch(r"[a-f0-9]{64}", sha256)
-            or not isinstance(byte_count, int)
-            or isinstance(byte_count, bool)
-            or byte_count < 0
-        ):
-            raise ValueError(
-                f"fixed-v3 transition fingerprint object identity is invalid: "
-                f"{object_key}"
-            )
-        raw_dependencies = entry.get("dependencies")
-        if not isinstance(raw_dependencies, list):
-            raise ValueError(
-                f"fixed-v3 transition fingerprint dependencies are invalid: "
-                f"{object_key}"
-            )
-        dependencies = sorted({
-            _normalise_overlay_object_key(str(value))
-            for value in raw_dependencies
-        }, key=lambda value: value.encode("utf-8"))
-        if len(dependencies) != len(raw_dependencies):
-            raise ValueError(
-                f"fixed-v3 transition fingerprint dependencies are duplicated: "
-                f"{object_key}"
-            )
-        planner_dependencies_raw = entry.get("planner_dependencies")
-        planner_dependencies = None
-        if planner_dependencies_raw is not None:
-            if not isinstance(planner_dependencies_raw, list):
-                raise ValueError(
-                    "fixed-v3 transition fingerprint planner dependencies are "
-                    f"invalid: {object_key}"
-                )
-            planner_dependencies = sorted({
-                _normalise_overlay_object_key(str(value))
-                for value in planner_dependencies_raw
-            }, key=lambda value: value.encode("utf-8"))
-            if len(planner_dependencies) != len(planner_dependencies_raw):
-                raise ValueError(
-                    "fixed-v3 transition fingerprint planner dependencies are "
-                    f"duplicated: {object_key}"
-                )
-        canonical_objects.append({
-            "object_key": object_key,
-            "sha256": sha256,
-            "bytes": byte_count,
-            "stage": _transition_fingerprint_optional_text(
-                entry, "stage", object_key=object_key,
-            ),
-            "dependencies": dependencies,
-            "dependency_identities":
-                _transition_fingerprint_identity_entries(
-                    parent_key=object_key,
-                    raw_identities=entry.get("dependency_identities"),
-                    label="dependency identities",
-                ),
-            "proposed": _transition_fingerprint_optional_bool(
-                entry, "proposed", object_key=object_key,
-            ),
-            "built": _transition_fingerprint_optional_bool(
-                entry, "built", object_key=object_key,
-            ),
-            "structurally_validated": _transition_fingerprint_optional_bool(
-                entry, "structurally_validated", object_key=object_key,
-            ),
-            "changed": _transition_fingerprint_optional_bool(
-                entry, "changed", object_key=object_key,
-            ),
-            "included_in_write_set": _transition_fingerprint_optional_bool(
-                entry, "included_in_write_set", object_key=object_key,
-            ),
-            "status": _transition_fingerprint_optional_text(
-                entry, "status", object_key=object_key,
-            ),
-            "planner_changed": _transition_fingerprint_optional_bool(
-                entry, "planner_changed", object_key=object_key,
-            ),
-            "planner_status": _transition_fingerprint_optional_text(
-                entry, "planner_status", object_key=object_key,
-            ),
-            "planner_included_in_write_set":
-                _transition_fingerprint_optional_bool(
-                    entry,
-                    "planner_included_in_write_set",
-                    object_key=object_key,
-                ),
-            "planner_dependencies": planner_dependencies,
-            "planner_dependency_identities":
-                _transition_fingerprint_identity_entries(
-                    parent_key=object_key,
-                    raw_identities=entry.get(
-                        "planner_dependency_identities"
-                    ),
-                    label="planner dependency identities",
-                ),
-            "proposal_changed": _transition_fingerprint_optional_bool(
-                entry, "proposal_changed", object_key=object_key,
-            ),
-            "planner_source": _transition_fingerprint_optional_text(
-                entry, "planner_source", object_key=object_key,
-            ),
-            "baseline_source": _transition_fingerprint_optional_text(
-                entry, "baseline_source", object_key=object_key,
-            ),
-            "included_in_final_staged_write_set":
-                _transition_fingerprint_optional_bool(
-                    entry,
-                    "included_in_final_staged_write_set",
-                    object_key=object_key,
-                ),
-            "promotion_reason": _transition_fingerprint_optional_text(
-                entry, "promotion_reason", object_key=object_key,
-            ),
-            "final_source": _transition_fingerprint_optional_text(
-                entry, "final_source", object_key=object_key,
-            ),
-        })
-    canonical_objects.sort(
-        key=lambda entry: entry["object_key"].encode("utf-8")
-    )
-
-    unchanged_keys_raw = run_state.get(
-        "proposal_transition_planner_unchanged_keys"
-    ) or []
-    if not isinstance(unchanged_keys_raw, list):
-        raise ValueError(
-            "fixed-v3 transition fingerprint unchanged-planner keys are invalid"
-        )
-    unchanged_keys = sorted({
-        _normalise_overlay_object_key(str(value))
-        for value in unchanged_keys_raw
-    }, key=lambda value: value.encode("utf-8"))
-    tombstone_prefixes_raw = run_state.get("tombstone_prefixes") or []
-    if not isinstance(tombstone_prefixes_raw, list):
-        raise ValueError(
-            "fixed-v3 transition fingerprint tombstone prefixes are invalid"
-        )
-    proposed_prefixes = sorted({
-        _normalise_overlay_object_key(
-            str(entry.get("prefix") or "")
-        ).rstrip("/")
-        for entry in tombstone_prefixes_raw
-        if isinstance(entry, Mapping) and entry.get("proposed")
-    }, key=lambda value: value.encode("utf-8"))
-    final_provenance = run_state.get("final_staged_write_set_provenance")
-    if not isinstance(final_provenance, Mapping):
-        raise ValueError(
-            "fixed-v3 transition fingerprint final provenance is invalid"
-        )
-    promotion_reason_counts = final_provenance.get(
-        "promotion_reason_counts"
-    )
-    external_edge_counts = final_provenance.get(
-        "external_dependency_edge_counts"
-    )
-    if (
-        not isinstance(promotion_reason_counts, Mapping)
-        or not isinstance(external_edge_counts, Mapping)
-    ):
-        raise ValueError(
-            "fixed-v3 transition fingerprint provenance counts are invalid"
-        )
-    canonical_promotion_reason_counts = {
-        str(key): _transition_fingerprint_nonnegative_int(
-            promotion_reason_counts,
-            key,
-            label="promotion_reason_counts",
-        )
-        for key in sorted(
-            promotion_reason_counts, key=lambda value: str(value).encode("utf-8")
-        )
-    }
-    canonical_external_edge_counts = {
-        str(key): _transition_fingerprint_nonnegative_int(
-            external_edge_counts,
-            key,
-            label="external_dependency_edge_counts",
-        )
-        for key in sorted(
-            external_edge_counts, key=lambda value: str(value).encode("utf-8")
-        )
-    }
-    forced_republication_keys_raw = final_provenance.get(
-        "forced_republication_keys"
-    )
-    if not isinstance(forced_republication_keys_raw, list):
-        raise ValueError(
-            "fixed-v3 transition fingerprint forced-republication keys are invalid"
-        )
-    return {
-        "objects": canonical_objects,
-        "proposal_transition_planner_unchanged_keys": unchanged_keys,
-        "proposed_tombstone_prefixes": proposed_prefixes,
-        "final_staged_write_set_provenance": {
-            "status": _transition_fingerprint_optional_text(
-                final_provenance,
-                "status",
-                object_key="final_staged_write_set_provenance",
-            ),
-            "final_staged_object_count":
-                _transition_fingerprint_nonnegative_int(
-                    final_provenance,
-                    "final_staged_object_count",
-                    label="final_staged_write_set_provenance",
-                ),
-            "forced_republication_count":
-                _transition_fingerprint_nonnegative_int(
-                    final_provenance,
-                    "forced_republication_count",
-                    label="final_staged_write_set_provenance",
-                ),
-            "forced_republication_keys": sorted({
-                _normalise_overlay_object_key(str(value))
-                for value in forced_republication_keys_raw
-            }, key=lambda value: value.encode("utf-8")),
-            "promotion_reason_counts": canonical_promotion_reason_counts,
-            "rebuilt_dependency_identity_count":
-                _transition_fingerprint_nonnegative_int(
-                    final_provenance,
-                    "rebuilt_dependency_identity_count",
-                    label="final_staged_write_set_provenance",
-                ),
-            "staged_dependency_edge_count":
-                _transition_fingerprint_nonnegative_int(
-                    final_provenance,
-                    "staged_dependency_edge_count",
-                    label="final_staged_write_set_provenance",
-                ),
-            "external_dependency_edge_counts":
-                canonical_external_edge_counts,
-        },
-    }
-
-
-def _canonical_generic_integrity_selected_scope_authority(
-    run_state: Mapping[str, Any],
-) -> dict[str, Any]:
-    authority = run_state.get("generic_integrity_selected_scope_authority")
-    if (
-        not isinstance(authority, Mapping)
-        or authority.get("contract_version")
-        != GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT
-        or authority.get("history_generation") != "v3"
-        or not isinstance(authority.get("selected_scopes"), list)
-        or not isinstance(authority.get("metadata_only_scopes"), list)
-        or not (authority["selected_scopes"] or authority["metadata_only_scopes"])
-        or not isinstance(
-            authority.get("authorised_pollutant_tombstone_prefixes"), list
-        )
-    ):
-        raise ValueError(
-            "generic fixed-v3 selected-scope authority is unavailable"
-        )
-    allowed_outcomes = {
-        "complete_replacement",
-        "authoritative_no_data_replacement",
-        "source_artifact_unavailable_preserved",
-    }
-    scopes: list[dict[str, Any]] = []
-    seen: set[tuple[str, int, str]] = set()
-    for raw_scope in authority["selected_scopes"]:
-        if not isinstance(raw_scope, Mapping):
-            raise ValueError("generic fixed-v3 selected scope is invalid")
-        day_utc = str(raw_scope.get("day_utc") or "")
-        try:
-            valid_day = dt.date.fromisoformat(day_utc).isoformat() == day_utc
-        except ValueError:
-            valid_day = False
-        connector_id = raw_scope.get("connector_id")
-        pollutant_code = str(raw_scope.get("pollutant_code") or "")
-        outcome = str(raw_scope.get("outcome") or "")
-        if (
-            not valid_day
-            or not isinstance(connector_id, int)
-            or isinstance(connector_id, bool)
-            or connector_id <= 0
-            or pollutant_code not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
-            or outcome not in allowed_outcomes
-        ):
-            raise ValueError("generic fixed-v3 selected scope is invalid")
-        identity = (day_utc, connector_id, pollutant_code)
-        if identity in seen:
-            raise ValueError("generic fixed-v3 selected scope is duplicated")
-        seen.add(identity)
-        expected_prefix = (
-            f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
-            f"connector_id={connector_id}/pollutant_code={pollutant_code}"
-        )
-        if raw_scope.get("pollutant_prefix") != expected_prefix:
-            raise ValueError(
-                "generic fixed-v3 selected pollutant prefix is invalid"
-            )
-        authorised_prefix = raw_scope.get("authorised_tombstone_prefix")
-        if outcome == "source_artifact_unavailable_preserved":
-            if authorised_prefix is not None:
-                raise ValueError(
-                    "generic fixed-v3 preserved scope has deletion authority"
-                )
-            if any(
-                isinstance(entry, Mapping)
-                and entry.get("proposed")
-                and _normalise_overlay_object_key(
-                    str(entry.get("prefix") or "")
-                ).rstrip("/") == expected_prefix
-                for entry in list(run_state.get("tombstone_prefixes") or [])
-            ):
-                raise ValueError(
-                    "generic fixed-v3 source-unavailable scope has proposed deletion"
-                )
-        elif authorised_prefix != expected_prefix:
-            raise ValueError(
-                "generic fixed-v3 selected scope tombstone is invalid"
-            )
-        replacement_keys_raw = raw_scope.get("replacement_object_keys")
-        if not isinstance(replacement_keys_raw, list):
-            raise ValueError(
-                "generic fixed-v3 replacement object closure is invalid"
-            )
-        replacement_keys = sorted({
-            _normalise_overlay_object_key(str(value))
-            for value in replacement_keys_raw
-        }, key=lambda value: value.encode("utf-8"))
-        if replacement_keys != replacement_keys_raw:
-            raise ValueError(
-                "generic fixed-v3 replacement object closure is not canonical"
-            )
-        if any(not key.startswith(f"{expected_prefix}/") for key in replacement_keys):
-            raise ValueError(
-                "generic fixed-v3 replacement object escaped selected scope"
-            )
-        if outcome == "complete_replacement" and (
-            not any(key.endswith(".parquet") for key in replacement_keys)
-            or f"{expected_prefix}/manifest.json" not in replacement_keys
-        ):
-            raise ValueError(
-                "generic fixed-v3 non-empty replacement closure is incomplete"
-            )
-        if outcome != "complete_replacement" and replacement_keys:
-            raise ValueError(
-                "generic fixed-v3 empty or preserved scope has replacement children"
-            )
-        actual_replacement_keys = sorted(
-            (
-                str(key) for key in dict(run_state.get("objects") or {})
-                if str(key).startswith(f"{expected_prefix}/")
-            ),
-            key=lambda value: value.encode("utf-8"),
-        )
-        if actual_replacement_keys != replacement_keys:
-            raise ValueError(
-                "generic fixed-v3 selected replacement closure changed"
-            )
-        preservation_evidence = raw_scope.get("preservation_evidence")
-        if outcome == "source_artifact_unavailable_preserved":
-            expected_preservation_evidence = (
-                _derive_generic_preserved_scope_evidence(
-                    run_state,
-                    day_utc=day_utc,
-                    connector_id=connector_id,
-                    pollutant_code=pollutant_code,
-                )
-            )
-            if preservation_evidence != expected_preservation_evidence:
-                raise ValueError(
-                    "generic fixed-v3 preserved scope evidence changed"
-                )
-            preservation_evidence = expected_preservation_evidence
-        elif preservation_evidence is not None:
-            raise ValueError(
-                "generic fixed-v3 replacement scope has preservation evidence"
-            )
-        scopes.append({
-            "day_utc": day_utc,
-            "connector_id": connector_id,
-            "pollutant_code": pollutant_code,
-            "pollutant_prefix": expected_prefix,
-            "outcome": outcome,
-            "authorised_tombstone_prefix": authorised_prefix,
-            "replacement_object_keys": replacement_keys,
-            "preservation_evidence": preservation_evidence,
-        })
-    scopes.sort(key=lambda entry: (
-        entry["day_utc"].encode("utf-8"),
-        entry["connector_id"],
-        entry["pollutant_code"].encode("utf-8"),
-    ))
-    if authority["selected_scopes"] != scopes:
-        raise ValueError("generic fixed-v3 selected scopes are not canonical")
-    authorised_prefixes = sorted({
-        _normalise_overlay_object_key(str(value)).rstrip("/")
-        for value in authority["authorised_pollutant_tombstone_prefixes"]
-    }, key=lambda value: value.encode("utf-8"))
-    expected_prefixes = sorted({
-        str(scope["authorised_tombstone_prefix"])
-        for scope in scopes
-        if scope["authorised_tombstone_prefix"] is not None
-    }, key=lambda value: value.encode("utf-8"))
-    if (
-        authority["authorised_pollutant_tombstone_prefixes"]
-        != authorised_prefixes
-        or authorised_prefixes != expected_prefixes
-    ):
-        raise ValueError(
-            "generic fixed-v3 authorised tombstone set is not exact"
-        )
-    proposed_prefixes = sorted({
-        _normalise_overlay_object_key(str(entry.get("prefix") or "")).rstrip("/")
-        for entry in list(run_state.get("tombstone_prefixes") or [])
-        if isinstance(entry, Mapping) and entry.get("proposed")
-    }, key=lambda value: value.encode("utf-8"))
-    if proposed_prefixes != authorised_prefixes:
-        raise ValueError(
-            "generic fixed-v3 proposed tombstones exceed selected authority"
-        )
-    metadata_scopes: list[dict[str, Any]] = []
-    data_identities = {
-        (scope["day_utc"], scope["connector_id"], scope["pollutant_code"])
-        for scope in scopes
-    }
-    metadata_seen: set[tuple[str, int, str]] = set()
-    objects = dict(run_state.get("objects") or {})
-    for raw in authority["metadata_only_scopes"]:
-        if not isinstance(raw, Mapping):
-            raise ValueError("generic metadata-only scope is invalid")
-        day_utc = str(raw.get("day_utc") or "")
-        connector_id = raw.get("connector_id")
-        pollutant_code = str(raw.get("pollutant_code") or "")
-        identity = (day_utc, connector_id, pollutant_code)
-        try:
-            valid_day = dt.date.fromisoformat(day_utc).isoformat() == day_utc
-        except ValueError:
-            valid_day = False
-        if (
-            not valid_day or not isinstance(connector_id, int)
-            or isinstance(connector_id, bool) or connector_id <= 0
-            or pollutant_code not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
-            or identity in data_identities or identity in metadata_seen
-        ):
-            raise ValueError("generic metadata-only scope identity is invalid")
-        metadata_seen.add(identity)
-        prefix = (
-            "history/_index_v3/observations_timeseries/"
-            f"day_utc={day_utc}/connector_id={connector_id}/"
-            f"pollutant_code={pollutant_code}"
-        )
-        aligned_prefix = prefix.replace(
-            "observations_timeseries/day_utc=",
-            "observations_timeseries/_aligned/day_utc=", 1,
-        )
-        keys = sorted((
-            str(key) for key in objects if str(key).startswith(f"{prefix}/")
-            or str(key).startswith(f"{aligned_prefix}/")
-        ), key=lambda value: value.encode("utf-8"))
-        if (
-            raw.get("derived_index_prefix") != prefix
-            or f"{prefix}/manifest.json" not in keys
-            or raw.get("derived_object_keys") != keys
-            or raw.get("observation_deletion_prefixes") != []
-            or raw.get("canonical_dependencies")
-            != _derive_generic_pinned_metadata_dependencies(
-                run_state, day_utc=day_utc,
-                connector_id=connector_id, pollutant_code=pollutant_code,
-            )
-        ):
-            raise ValueError("generic metadata-only scope closure changed")
-        metadata_scopes.append({
-            "day_utc": day_utc, "connector_id": connector_id,
-            "pollutant_code": pollutant_code,
-            "derived_index_prefix": prefix,
-            "canonical_dependencies": raw["canonical_dependencies"],
-            "derived_object_keys": keys,
-            "observation_deletion_prefixes": [],
-        })
-    metadata_scopes.sort(key=lambda entry: (
-        entry["day_utc"].encode("utf-8"), entry["connector_id"],
-        entry["pollutant_code"].encode("utf-8"),
-    ))
-    if metadata_scopes != authority["metadata_only_scopes"]:
-        raise ValueError("generic metadata-only scopes are not canonical")
-    derived_write_keys = sorted({
-        key for scope in metadata_scopes for key in scope["derived_object_keys"]
-    } | ({"history/_index_v3/observations_timeseries_latest.json"}
-         if metadata_scopes and
-         "history/_index_v3/observations_timeseries_latest.json" in objects
-         else set()), key=lambda value: value.encode("utf-8"))
-    if authority.get("metadata_only_derived_write_object_keys") != derived_write_keys:
-        raise ValueError("generic metadata-only derived write set changed")
-    if metadata_scopes and not scopes:
-        all_derived_keys = sorted((
-            str(key) for key in objects
-            if str(key).startswith(
-                "history/_index_v3/observations_timeseries/"
-            ) or str(key) == "history/_index_v3/observations_timeseries_latest.json"
-        ), key=lambda value: value.encode("utf-8"))
-        if all_derived_keys != derived_write_keys or set(objects) != set(derived_write_keys):
-            raise ValueError("generic metadata-only derived closure is not exact")
-    force_targets = list(run_state.get("explicit_official_force_partitions") or [])
-    if any(
-        not isinstance(target, Mapping)
-        or target.get("target_authority") != "explicit_manual_force_replacement"
-        or target.get("connector_id") not in {9, 10}
-        for target in force_targets
-    ):
-        raise ValueError("generic explicit force target is invalid")
-    expected_targets = sorted({
-        (str(target.get("day_utc") or ""), int(target.get("connector_id") or 0),
-         str(target.get("pollutant_code") or ""))
-        for target in force_targets if isinstance(target, Mapping)
-    })
-    canonical_targets = [
-        {"day_utc": day, "connector_id": connector,
-         "pollutant_code": pollutant}
-        for day, connector, pollutant in expected_targets
-    ]
-    if (
-        authority.get("explicit_force_targets") != canonical_targets
-        or bool(expected_targets) != bool(run_state.get("explicit_official_force_replacement"))
-        or (expected_targets and set(expected_targets) != data_identities)
-    ):
-        raise ValueError("generic explicit force authority changed")
-    forced_parquet_keys = sorted((
-        str(key) for key in objects if str(key).endswith(".parquet")
-        and any(str(key).startswith(
-            f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day}/"
-            f"connector_id={connector}/pollutant_code={pollutant}/"
-        ) for day, connector, pollutant in expected_targets)
-    ), key=lambda value: value.encode("utf-8"))
-    if authority.get("forced_republication_parquet_keys") != forced_parquet_keys:
-        raise ValueError("generic forced Parquet write set changed")
-    return {
-        "contract_version": GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT,
-        "history_generation": "v3",
-        "selected_scopes": scopes,
-        "metadata_only_scopes": metadata_scopes,
-        "metadata_only_derived_write_object_keys": derived_write_keys,
-        "explicit_force_targets": canonical_targets,
-        "forced_republication_parquet_keys": forced_parquet_keys,
-        "authorised_pollutant_tombstone_prefixes": authorised_prefixes,
-    }
-
-
-def _proposal_transition_state_fingerprint_payload(
-    run_state: Mapping[str, Any],
-) -> dict[str, Any]:
-    execution_path = str(run_state.get("execution_path") or "")
-    common = _proposal_transition_state_common_fingerprint_payload(run_state)
-    if execution_path == SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH:
-        # Retain the already-deployed SOS-light v2 fingerprint projection exactly.
-        return {
-            "contract_version": SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
-            "sos_light_connector_membership":
-                _canonical_sos_light_connector_membership(run_state),
-            **common,
-        }
-    if execution_path == "generic_integrity":
-        return {
-            "contract_version":
-                GENERIC_INTEGRITY_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
-            "execution_path": "generic_integrity",
-            "history_generation": "v3",
-            "generic_selected_scope_authority":
-                _canonical_generic_integrity_selected_scope_authority(run_state),
-            **common,
-        }
-    raise ValueError(
-        f"fixed-v3 transition fingerprint execution path is invalid: {execution_path}"
-    )
-
-
-def proposal_transition_state_fingerprint_sha256(
-    run_state: Mapping[str, Any],
-) -> str:
-    payload = _proposal_transition_state_fingerprint_payload(run_state)
-    canonical = json.dumps(
-        payload,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()
 
 
 def _record_coordinator_complete_run_state_write(
@@ -22208,6 +19600,137 @@ def write_run_state(run_state: Mapping[str, Any]) -> Path:
     )
     temp_path.replace(state_path)
     return state_path
+
+
+class _SosLightV2ProposalStaging:
+    """Batch dedicated v2 proposal state while keeping persisted checkpoints exact."""
+
+    def __init__(
+        self,
+        *,
+        run_state: dict[str, Any],
+        log: logging.Logger | None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.run_state = run_state
+        self.log = log
+        self._monotonic = monotonic
+        self.started_at = monotonic()
+        self.last_checkpoint_at = self.started_at
+        self.completed_events = 0
+        self.last_checkpoint_events = 0
+        self.checkpoint_count = 0
+        self.scope_indexes: dict[str, dict[str, dict[str, Any]]] = {}
+        changed_scopes = run_state.get("changed_scopes")
+        if not isinstance(changed_scopes, dict):
+            raise ValueError("overlay run state has no changed_scopes mapping")
+        for scope_set in OVERLAY_CHANGED_SCOPE_SETS:
+            index: dict[str, dict[str, Any]] = {}
+            for raw_scope in list(changed_scopes.get(scope_set) or []):
+                if not isinstance(raw_scope, Mapping):
+                    raise ValueError(f"overlay changed scope is invalid: {scope_set}")
+                canonical_scope = json.loads(json.dumps(
+                    dict(raw_scope), sort_keys=True, default=str,
+                ))
+                identity = json.dumps(
+                    canonical_scope, sort_keys=True, separators=(",", ":"),
+                )
+                index[identity] = canonical_scope
+            self.scope_indexes[scope_set] = index
+        run_state["sos_light_v2_proposal_staging"] = {
+            "contract_version": SOS_LIGHT_V2_STAGING_CONTRACT,
+            "status": "in_progress",
+            "completed_object_count": len(dict(run_state.get("objects") or {})),
+            "total_object_count": None,
+            "checkpoint_count": 0,
+            "changed_scope_count": self.changed_scope_count,
+            "final_provenance_status": "not_started",
+            "python_transition_validation_status": "not_started",
+            "persisted_state_equality_status": "not_checked",
+            "node_apply_launch_permitted": False,
+        }
+
+    @property
+    def changed_scope_count(self) -> int:
+        return sum(len(index) for index in self.scope_indexes.values())
+
+    def record_changed_scope(
+        self, scope_set: str, scope: Mapping[str, Any],
+    ) -> None:
+        if scope_set not in self.scope_indexes:
+            raise ValueError(f"unknown changed scope set: {scope_set}")
+        canonical_scope = json.loads(json.dumps(
+            dict(scope), sort_keys=True, default=str,
+        ))
+        identity = json.dumps(
+            canonical_scope, sort_keys=True, separators=(",", ":"),
+        )
+        self.scope_indexes[scope_set][identity] = canonical_scope
+
+    def _materialise_changed_scopes(self) -> None:
+        changed_scopes = self.run_state["changed_scopes"]
+        for scope_set, index in self.scope_indexes.items():
+            changed_scopes[scope_set] = [index[key] for key in sorted(index)]
+
+    def object_completed(self, *, phase: str, **details: Any) -> bool:
+        self.completed_events += 1
+        return self.checkpoint_if_due(phase=phase, **details)
+
+    def checkpoint_if_due(self, *, phase: str, **details: Any) -> bool:
+        now = self._monotonic()
+        due = (
+            self.completed_events - self.last_checkpoint_events
+            >= COORDINATOR_PROGRESS_OBJECT_INTERVAL
+            or now - self.last_checkpoint_at >= COORDINATOR_PROGRESS_SECONDS
+        )
+        if not due:
+            return False
+        self.persist_checkpoint(phase=phase, final=False, **details)
+        return True
+
+    def persist_checkpoint(
+        self,
+        *,
+        phase: str,
+        final: bool,
+        **details: Any,
+    ) -> None:
+        self._materialise_changed_scopes()
+        self.checkpoint_count += 1
+        completed_object_count = len(dict(self.run_state.get("objects") or {}))
+        staging = self.run_state["sos_light_v2_proposal_staging"]
+        staging.update({
+            "status": "complete" if final else "in_progress",
+            "completed_object_count": completed_object_count,
+            "total_object_count": completed_object_count if final else None,
+            "checkpoint_count": self.checkpoint_count,
+            "changed_scope_count": self.changed_scope_count,
+            "last_checkpoint_phase": phase,
+            "node_apply_launch_permitted": False,
+        })
+        write_run_state(self.run_state)
+        elapsed_seconds = round(self._monotonic() - self.started_at, 3)
+        if self.log is not None:
+            payload = {
+                "phase": "sos_light_v2_proposal_staging_checkpoint",
+                "status": staging["status"],
+                "completed_objects": completed_object_count,
+                "total_objects": staging["total_object_count"],
+                "checkpoint_count": self.checkpoint_count,
+                "changed_scope_count": self.changed_scope_count,
+                "elapsed_seconds": elapsed_seconds,
+                "checkpoint_phase": phase,
+                **details,
+            }
+            self.log.info(
+                "UK_AQ_INTEGRITY_PROGRESS %s",
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            )
+        self.last_checkpoint_events = self.completed_events
+        self.last_checkpoint_at = self._monotonic()
+
+    def complete(self, *, phase: str = "complete_proposal_staging") -> None:
+        self.persist_checkpoint(phase=phase, final=True)
 
 
 def create_run_overlay(
@@ -22275,6 +19798,7 @@ def stage_overlay_object(
     stage: str,
     dependencies: Iterable[str] = (),
     dependency_identities: Mapping[str, Mapping[str, Any]] | None = None,
+    persist: bool = True,
 ) -> Path:
     normalized_key = _normalise_overlay_object_key(object_key)
     source = Path(source_path)
@@ -22326,69 +19850,6 @@ def stage_overlay_object(
         "uploaded_at_utc": None,
         "r2_verified": False,
         "r2_verified_at_utc": None,
-    }
-    write_run_state(run_state)
-    return target
-
-
-def stage_file_backed_proposal_object(
-    run_state: dict[str, Any],
-    *,
-    proposal: Mapping[str, Any],
-    object_key: str,
-    stage: str,
-    dependencies: Iterable[str] = (),
-    dependency_identities: Mapping[str, Mapping[str, Any]] | None = None,
-    resolved_body_identity: tuple[Path, str, int] | None = None,
-    persist: bool = True,
-) -> Path:
-    normalized_key = _normalise_overlay_object_key(object_key)
-    target, actual_sha256, actual_bytes = (
-        resolved_body_identity
-        or _resolve_v3_proposal_body_reference(
-            run_state=run_state,
-            proposal=proposal,
-            object_key=normalized_key,
-        )
-    )
-    normalized_dependencies = sorted({
-        _normalise_overlay_object_key(value) for value in dependencies
-    })
-    supplied_identities = dependency_identities or {}
-    normalized_identities: dict[str, dict[str, Any]] = {}
-    for dependency in normalized_dependencies:
-        identity = supplied_identities.get(dependency)
-        if not isinstance(identity, Mapping):
-            raise ValueError(
-                f"overlay dependency identity is unavailable: {normalized_key} -> {dependency}"
-            )
-        normalized_identities[dependency] = _normalise_proposal_dependency_identity(
-            parent_key=normalized_key,
-            dependency_key=dependency,
-            identity=identity,
-        )
-    objects = run_state.get("objects")
-    if not isinstance(objects, dict):
-        raise ValueError("overlay run state has no objects mapping")
-    objects[normalized_key] = {
-        "object_key": normalized_key,
-        "local_path": str(target),
-        "sha256": actual_sha256,
-        "bytes": actual_bytes,
-        "stage": stage,
-        "dependencies": normalized_dependencies,
-        "dependency_identities": normalized_identities,
-        "proposed": True,
-        "built": True,
-        "structurally_validated": False,
-        "structurally_validated_at_utc": None,
-        "uploaded": False,
-        "uploaded_at_utc": None,
-        "r2_verified": False,
-        "r2_verified_at_utc": None,
-        "body_reference_contract_version":
-            SOS_LIGHT_V3_BODY_REFERENCE_CONTRACT,
-        "body_reference_source": "planned_overlay",
     }
     if persist:
         write_run_state(run_state)
@@ -22521,158 +19982,6 @@ def _v2_observation_metadata_actions(v2_observations: Mapping[str, Any]) -> list
             continue
         actions.append(dict(action))
     return _dedupe_v2_repair_actions(actions)
-
-
-def _merge_changed_observation_metadata_actions(
-    metadata_actions: Iterable[Mapping[str, Any]],
-    changed_scopes: Iterable[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Add exact leaf and parent finalisation for successfully changed scopes."""
-    scopes = [dict(scope) for scope in changed_scopes if isinstance(scope, Mapping)]
-    empty_partitions = {
-        (
-            str(scope.get("day_utc") or ""),
-            int(scope.get("connector_id") or 0),
-            str(pollutant_code).strip().lower(),
-        )
-        for scope in scopes
-        for pollutant_code in list(scope.get("empty_pollutant_codes") or [])
-        if str(pollutant_code or "").strip()
-    }
-    legacy_empty_connector_days = {
-        (
-            str(scope.get("day_utc") or ""),
-            int(scope.get("connector_id") or 0),
-        )
-        for scope in scopes
-        if not list(scope.get("pollutant_codes") or [])
-    }
-    merged_actions = [
-        dict(action)
-        for action in metadata_actions
-        if isinstance(action, Mapping)
-        and not (
-            str(action.get("kind") or "")
-            == "observation_pollutant_manifest_repair"
-            and (
-                (
-                    str(action.get("day_utc") or ""),
-                    int(action.get("connector_id") or 0),
-                    str(action.get("pollutant_code") or "").strip().lower(),
-                ) in empty_partitions
-                or (
-                    str(action.get("day_utc") or ""),
-                    int(action.get("connector_id") or 0),
-                ) in legacy_empty_connector_days
-            )
-        )
-    ]
-    for scope in scopes:
-        day_utc = str(scope.get("day_utc") or "").strip()
-        connector_id = scope.get("connector_id")
-        empty_pollutants = {
-            str(value).strip().lower()
-            for value in list(scope.get("empty_pollutant_codes") or [])
-            if str(value or "").strip()
-        }
-        base = {
-            "status": "planned",
-            "executes": False,
-            "data_changes_required": False,
-            "operator_action_required": False,
-            "history_version": "v2",
-            "domain": "observations",
-            "day_utc": day_utc,
-            "connector_id": connector_id,
-            "targeted_replacement_timeseries_ids": sorted({
-                int(timeseries_id)
-                for timeseries_id in list(scope.get("timeseries_ids") or [])
-                if str(timeseries_id).strip().isdigit()
-                and int(timeseries_id) > 0
-            }),
-            "requires_index_rebuild": True,
-            "gap_types": ["observation_repaired"],
-        }
-        for pollutant_code in list(scope.get("pollutant_codes") or []):
-            if pollutant_code not in empty_pollutants:
-                merged_actions.append({
-                    **base,
-                    "kind": "observation_pollutant_manifest_repair",
-                    "pollutant_code": pollutant_code,
-                })
-            merged_actions.append({
-                **base,
-                "kind": "observation_index_repair",
-                "pollutant_code": pollutant_code,
-            })
-        day_base = {
-            key: value for key, value in base.items()
-            if key not in {"connector_id", "pollutant_code"}
-        }
-        merged_actions.extend([
-            {**base, "kind": "observation_connector_manifest_repair"},
-            {**day_base, "kind": "observation_day_manifest_repair"},
-        ])
-    return _dedupe_v2_repair_actions(merged_actions)
-
-
-def _merge_preserved_observation_metadata_actions(
-    metadata_actions: Iterable[Mapping[str, Any]],
-    selected_partition_outcomes: Iterable[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Add only the parent closure required by preserved generic scopes."""
-    merged_actions = [
-        dict(action) for action in metadata_actions
-        if isinstance(action, Mapping)
-    ]
-    for outcome in selected_partition_outcomes:
-        if (
-            not isinstance(outcome, Mapping)
-            or str(outcome.get("outcome") or "")
-            != "source_artifact_unavailable_preserved"
-        ):
-            continue
-        day_utc = str(outcome.get("day_utc") or "").strip()
-        connector_id = outcome.get("connector_id")
-        pollutant_codes = _normalise_repair_pollutants(
-            outcome.get("pollutant_codes")
-            if outcome.get("pollutant_code") is None
-            else [outcome.get("pollutant_code")]
-        )
-        try:
-            valid_day = dt.date.fromisoformat(day_utc).isoformat() == day_utc
-        except ValueError:
-            valid_day = False
-        if (
-            not valid_day
-            or not isinstance(connector_id, int)
-            or isinstance(connector_id, bool)
-            or connector_id <= 0
-            or not pollutant_codes
-        ):
-            raise ValueError(
-                "generic preserved partition outcome is invalid for metadata planning"
-            )
-        base = {
-            "status": "planned",
-            "executes": False,
-            "data_changes_required": False,
-            "operator_action_required": False,
-            "history_version": "v2",
-            "domain": "observations",
-            "day_utc": day_utc,
-            "requires_index_rebuild": False,
-            "gap_types": ["source_artifact_unavailable_preserved"],
-        }
-        merged_actions.extend([
-            {
-                **base,
-                "kind": "observation_connector_manifest_repair",
-                "connector_id": connector_id,
-            },
-            {**base, "kind": "observation_day_manifest_repair"},
-        ])
-    return _dedupe_v2_repair_actions(merged_actions)
 
 
 def _authoritative_v2_core_timeseries_bindings(
@@ -22871,378 +20180,6 @@ def _run_v2_observation_metadata_executor(
     }
 
 
-SOS_LIGHT_V3_BODY_REFERENCE_CONTRACT = (
-    "uk_aq_sos_light_v3_overlay_body_ref_v1"
-)
-SOS_LIGHT_V3_PROPOSAL_ARTIFACT_CONTRACT = (
-    "uk_aq_sos_light_v3_compact_proposal_artifact_v1"
-)
-SOS_LIGHT_V3_PROPOSAL_TRANSPORT_CONTRACT = (
-    "uk_aq_sos_light_v3_file_backed_transport_v1"
-)
-
-
-def _file_sha256_and_bytes(path: Path) -> tuple[str, int]:
-    digest = hashlib.sha256()
-    byte_count = 0
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(64 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-            byte_count += len(chunk)
-    return digest.hexdigest(), byte_count
-
-
-def _path_inside_run_root(
-    *, root: Path, candidate: Path, label: str,
-) -> Path:
-    resolved_root = root.resolve(strict=True)
-    resolved = candidate.resolve(strict=True)
-    try:
-        relative = resolved.relative_to(resolved_root)
-    except ValueError as exc:
-        raise ValueError(f"{label} is outside its permitted run-local boundary") from exc
-    if not relative.parts:
-        raise ValueError(f"{label} does not identify a run-local file")
-    return resolved
-
-
-def _resolve_v3_proposal_body_reference(
-    *, run_state: Mapping[str, Any], proposal: Mapping[str, Any], object_key: str,
-) -> tuple[Path, str, int]:
-    normalized_key = _normalise_overlay_object_key(object_key)
-    reference = proposal.get("body_ref")
-    if not isinstance(reference, Mapping):
-        raise ValueError(
-            f"fixed-v3 proposal body reference is unavailable: {normalized_key}"
-        )
-    if (
-        str(reference.get("contract_version") or "")
-        != SOS_LIGHT_V3_BODY_REFERENCE_CONTRACT
-        or str(reference.get("source") or "") != "planned_overlay"
-    ):
-        raise ValueError(
-            f"fixed-v3 proposal body reference contract is invalid: {normalized_key}"
-        )
-    relative_path = _normalise_overlay_object_key(
-        str(reference.get("relative_path") or "")
-    )
-    if relative_path != normalized_key:
-        raise ValueError(
-            f"fixed-v3 proposal body reference does not match its object key: {normalized_key}"
-        )
-    overlay_root = Path(str(run_state.get("overlay_root") or ""))
-    candidate = overlay_root / relative_path
-    if candidate.is_symlink() or not candidate.is_file():
-        raise ValueError(
-            f"fixed-v3 proposal staged body is missing or unsafe: {normalized_key}"
-        )
-    resolved = _path_inside_run_root(
-        root=overlay_root,
-        candidate=candidate,
-        label=f"fixed-v3 proposal staged body {normalized_key}",
-    )
-    actual_sha256, actual_bytes = _file_sha256_and_bytes(resolved)
-    declared_sha256 = str(proposal.get("new_sha256") or "").strip().lower()
-    reference_sha256 = str(reference.get("sha256") or "").strip().lower()
-    declared_bytes = proposal.get("bytes")
-    reference_bytes = reference.get("bytes")
-    if (
-        not re.fullmatch(r"[a-f0-9]{64}", declared_sha256)
-        or reference_sha256 != declared_sha256
-        or not isinstance(declared_bytes, int)
-        or isinstance(declared_bytes, bool)
-        or declared_bytes < 0
-        or not isinstance(reference_bytes, int)
-        or isinstance(reference_bytes, bool)
-        or reference_bytes != declared_bytes
-        or actual_sha256 != declared_sha256
-        or actual_bytes != declared_bytes
-    ):
-        raise ValueError(
-            f"fixed-v3 proposal staged body identity is invalid: {normalized_key}"
-        )
-    return resolved, actual_sha256, actual_bytes
-
-
-def _load_authenticated_v3_proposal_result(
-    *,
-    run_state: Mapping[str, Any],
-    envelope: Mapping[str, Any],
-    expected_result_path: Path,
-    log: logging.Logger | None = None,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    envelope_proposal_count = (
-        envelope.get("proposal_count") if isinstance(envelope, Mapping) else None
-    )
-    progress = _BoundedCoordinatorProgress(
-        log=log,
-        phase="proposal_artifact_authentication",
-        total_objects=(
-            envelope_proposal_count
-            if isinstance(envelope_proposal_count, int)
-            and not isinstance(envelope_proposal_count, bool)
-            else None
-        ),
-    )
-    progress.start()
-    if (
-        not isinstance(envelope, Mapping)
-        or envelope.get("schema_version") != 1
-        or envelope.get("kind")
-        != "uk_aq_sos_light_v3_proposal_transport_envelope"
-        or envelope.get("transport_contract_version")
-        != SOS_LIGHT_V3_PROPOSAL_TRANSPORT_CONTRACT
-        or envelope.get("transport_mode") != "file_backed_compact_proposal"
-        or envelope.get("status") != "planned"
-    ):
-        raise ValueError("fixed-v3 proposal transport envelope is invalid")
-    artifact_identity = envelope.get("proposal_artifact")
-    if not isinstance(artifact_identity, Mapping):
-        raise ValueError("fixed-v3 proposal artifact identity is unavailable")
-    if (
-        artifact_identity.get("contract_version")
-        != SOS_LIGHT_V3_PROPOSAL_ARTIFACT_CONTRACT
-    ):
-        raise ValueError("fixed-v3 proposal artifact contract is invalid")
-    run_root = Path(str(run_state.get("run_root") or ""))
-    relative_path = _normalise_overlay_object_key(
-        str(artifact_identity.get("relative_path") or "")
-    )
-    candidate = run_root / relative_path
-    if candidate.is_symlink() or not candidate.is_file():
-        raise ValueError("fixed-v3 proposal artifact is missing or unsafe")
-    artifact_path = _path_inside_run_root(
-        root=run_root,
-        candidate=candidate,
-        label="fixed-v3 proposal artifact",
-    )
-    if artifact_path != expected_result_path.resolve(strict=True):
-        raise ValueError("fixed-v3 proposal artifact path is not the requested result path")
-    actual_sha256, actual_bytes = _file_sha256_and_bytes(artifact_path)
-    expected_sha256 = str(artifact_identity.get("sha256") or "").strip().lower()
-    expected_bytes = artifact_identity.get("bytes")
-    if (
-        not re.fullmatch(r"[a-f0-9]{64}", expected_sha256)
-        or actual_sha256 != expected_sha256
-        or not isinstance(expected_bytes, int)
-        or isinstance(expected_bytes, bool)
-        or actual_bytes != expected_bytes
-    ):
-        raise ValueError("fixed-v3 proposal artifact identity is invalid")
-    with artifact_path.open("r", encoding="utf-8") as handle:
-        artifact = json.load(handle)
-    if (
-        not isinstance(artifact, Mapping)
-        or artifact.get("contract_version")
-        != SOS_LIGHT_V3_PROPOSAL_ARTIFACT_CONTRACT
-        or artifact.get("kind") != "uk_aq_sos_light_v3_compact_proposal"
-        or not isinstance(artifact.get("output"), Mapping)
-    ):
-        raise ValueError("fixed-v3 compact proposal artifact is invalid")
-    output = dict(artifact["output"])
-    if output.get("ok") is not True:
-        raise ValueError("fixed-v3 compact proposal did not complete successfully")
-    planning = output.get("planning")
-    proposals = planning.get("proposals") if isinstance(planning, Mapping) else None
-    if not isinstance(proposals, list):
-        raise ValueError("fixed-v3 compact proposal graph is unavailable")
-    progress.total_objects = len(proposals)
-    file_backed_count = 0
-    file_backed_bytes = 0
-    file_backed_changed_count = 0
-    file_backed_changed_bytes = 0
-    for completed_objects, raw in enumerate(proposals, start=1):
-        if not isinstance(raw, Mapping):
-            raise ValueError("fixed-v3 compact proposal entry is invalid")
-        proposal = raw
-        object_key = _normalise_overlay_object_key(str(proposal.get("key") or ""))
-        if proposal.get("proposed_body") is not None or proposal.get("body") is not None:
-            raise ValueError(
-                f"fixed-v3 compact proposal still contains an inline body: {object_key}"
-            )
-        if proposal.get("changed") is True or proposal.get("included_in_write_set") is True:
-            _, _, body_bytes = _resolve_v3_proposal_body_reference(
-                run_state=run_state,
-                proposal=proposal,
-                object_key=object_key,
-            )
-            file_backed_count += 1
-            file_backed_bytes += body_bytes
-            if proposal.get("changed") is True:
-                file_backed_changed_count += 1
-                file_backed_changed_bytes += body_bytes
-        progress.progress(completed_objects)
-    if envelope.get("proposal_count") != len(proposals):
-        raise ValueError("fixed-v3 proposal envelope count is contradictory")
-    transport = planning.get("proposal_transport")
-    expected_counts = {
-        "proposal_count": len(proposals),
-        "file_backed_body_count": file_backed_count,
-        "file_backed_body_total_bytes": file_backed_bytes,
-        "file_backed_changed_body_count": file_backed_changed_count,
-        "file_backed_changed_body_total_bytes": file_backed_changed_bytes,
-    }
-    if not isinstance(transport, Mapping) or any(
-        transport.get(field) != value for field, value in expected_counts.items()
-    ):
-        raise ValueError("fixed-v3 proposal transport audit is contradictory")
-    if (
-        envelope.get("file_backed_changed_body_count")
-        != file_backed_changed_count
-        or envelope.get("file_backed_changed_body_total_bytes")
-        != file_backed_changed_bytes
-    ):
-        raise ValueError("fixed-v3 proposal envelope body counts are contradictory")
-    audit = {
-        "status": "authenticated",
-        "transport_mode": "file_backed_compact_proposal",
-        "proposal_artifact_path": str(artifact_path),
-        "proposal_artifact_relative_path": relative_path,
-        "proposal_artifact_sha256": actual_sha256,
-        "proposal_artifact_bytes": actual_bytes,
-        **expected_counts,
-    }
-    progress.complete(len(proposals))
-    return output, audit
-
-
-def _run_v3_observation_metadata_proposal(
-    *,
-    env: Mapping[str, str],
-    actions: list[dict[str, Any]],
-    dry_run: bool,
-    log: logging.Logger,
-    run_state: Mapping[str, Any],
-    conn: sqlite3.Connection | None = None,
-) -> dict[str, Any]:
-    """Run the proposal-only fixed-v3 observation metadata planner."""
-    if not actions:
-        return {"status": "not_run", "reason": "no_observation_metadata_actions", "results": []}
-    repo_root = _repo_root_for_integrity_script(env)
-    node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
-    proposal_result_path = (
-        Path(str(run_state["run_root"]))
-        / "proposal-results"
-        / "fixed-v3-observation-metadata.json"
-    )
-    command = [
-        node_bin,
-        str(repo_root / "scripts/backup_r2/uk_aq_plan_sos_light_v3_observation_metadata.mjs"),
-        "--repair-plan-stdin",
-        "--overlay-root", str(run_state["overlay_root"]),
-        "--dropbox-root", str(run_state["base_dropbox_root"]),
-        "--run-state-json", str(run_state["run_state_path"]),
-        "--proposal-result-json", str(proposal_result_path),
-    ]
-    plan = {
-        # Canonical manifest semantics deliberately remain v2; storage routing
-        # is selected independently by the dedicated fixed-v3 entry point.
-        "history_version": "v2",
-        "domain": "observations",
-        "repair_plan": actions,
-        "authoritative_core_timeseries": _authoritative_v2_core_timeseries_bindings(conn),
-    }
-    proc = subprocess.Popen(
-        command,
-        cwd=repo_root,
-        env={**os.environ, **{str(key): str(value) for key, value in env.items()}},
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    stdout_lines: list[str] = []
-    stderr_lines: list[str] = []
-    stdout_limit_exceeded = threading.Event()
-    stdout_byte_limit = 64 * 1024
-
-    def _drain_bounded_stdout(stream: Any) -> None:
-        captured_bytes = 0
-        for chunk in iter(lambda: stream.read(8192), ""):
-            encoded_bytes = len(chunk.encode("utf-8"))
-            captured_bytes += encoded_bytes
-            if captured_bytes <= stdout_byte_limit:
-                stdout_lines.append(chunk)
-            else:
-                stdout_limit_exceeded.set()
-        stream.close()
-
-    def _drain(stream: Any, destination: list[str], *, progress: bool) -> None:
-        for line in iter(stream.readline, ""):
-            destination.append(line)
-            if progress:
-                log.info("v3 metadata proposal planner %s", line.rstrip())
-        stream.close()
-
-    stdout_thread = threading.Thread(
-        target=_drain_bounded_stdout, args=(proc.stdout,), daemon=True,
-    )
-    stderr_thread = threading.Thread(
-        target=_drain, args=(proc.stderr, stderr_lines), kwargs={"progress": True}, daemon=True,
-    )
-    stdout_thread.start()
-    stderr_thread.start()
-    assert proc.stdin is not None
-    proc.stdin.write(json.dumps(plan))
-    proc.stdin.close()
-    proc.wait()
-    stdout_thread.join()
-    stderr_thread.join()
-    stdout = "".join(stdout_lines)
-    stderr = "".join(stderr_lines)
-    if stdout_limit_exceeded.is_set():
-        return {
-            "status": "failed",
-            "exit_code": proc.returncode,
-            "error": "fixed-v3 proposal control envelope exceeded 64 KiB",
-            "output": {},
-            "results": [],
-        }
-    try:
-        envelope = json.loads(stdout) if stdout.strip() else {}
-    except json.JSONDecodeError:
-        envelope = {}
-    if proc.returncode != 0:
-        log.warning(
-            "v3 observation metadata proposal failed exit_code=%s stderr=%s",
-            proc.returncode,
-            _truncate_text(stderr or stdout or "", 2000),
-        )
-        return {
-            "status": str(envelope.get("status") or "failed") if isinstance(envelope, Mapping) else "failed",
-            "exit_code": proc.returncode,
-            "error": _truncate_text(stderr or stdout or "", 4000),
-            "output": {},
-            "results": [],
-        }
-    try:
-        output, transport_audit = _load_authenticated_v3_proposal_result(
-            run_state=run_state,
-            envelope=envelope,
-            expected_result_path=proposal_result_path,
-            log=log,
-        )
-    except (OSError, TypeError, ValueError) as exc:
-        return {
-            "status": "failed",
-            "exit_code": proc.returncode,
-            "error": str(exc),
-            "output": {},
-            "results": [],
-            "transport": dict(envelope) if isinstance(envelope, Mapping) else {},
-        }
-    return {
-        "status": str(output.get("status") or "planned"),
-        "exit_code": proc.returncode,
-        "output": output,
-        "results": output.get("results") if isinstance(output, Mapping) else [],
-        "transport": transport_audit,
-    }
-
-
 def _record_metadata_executor_overlay(
     *,
     run_state: dict[str, Any],
@@ -23252,7 +20189,7 @@ def _record_metadata_executor_overlay(
     index_scope_set: str = "OBS_INDEXES_CHANGED",
     manifest_stage: str = "observs_manifests",
     index_stage: str = "observs_indexes",
-    require_file_backed_bodies: bool = False,
+    proposal_staging: _SosLightV2ProposalStaging | None = None,
     log: logging.Logger | None = None,
 ) -> None:
     """Stage structurally validated metadata/index proposals locally."""
@@ -23261,13 +20198,6 @@ def _record_metadata_executor_overlay(
     planning = output.get("planning") if isinstance(output, Mapping) else None
     if not isinstance(planning, Mapping):
         return
-    transport = executor_result.get("transport")
-    if require_file_backed_bodies:
-        if not isinstance(transport, Mapping) or transport.get("status") != "authenticated":
-            raise ValueError(
-                "fixed-v3 authenticated proposal transport evidence is unavailable"
-            )
-        run_state["proposal_transport"] = dict(transport)
     core_identity_audit = planning.get("core_snapshot_identity_validation")
     if isinstance(core_identity_audit, Mapping):
         consumer_audit = run_state.setdefault(
@@ -23300,120 +20230,12 @@ def _record_metadata_executor_overlay(
             run_state.get("proposal_transition_planner_unchanged_keys") or []
         )
     }
-    proposals = sorted(
+    for proposal in sorted(
         (item for item in list(planning.get("proposals") or []) if isinstance(item, Mapping)),
         key=lambda item: str(item.get("key") or ""),
-    )
-    staged_proposal_count = sum(
-        1
-        for proposal in proposals
-        if str(proposal.get("key") or "").strip()
-        and (
-            proposal.get("changed") is True
-            or any(
-                _normalise_overlay_object_key(
-                    str(proposal.get("key") or "")
-                ).startswith(f"{prefix}/")
-                for prefix in sos_light_day_prefixes
-            )
-        )
-    )
-    staging_progress = _BoundedCoordinatorProgress(
-        log=log if require_file_backed_bodies else None,
-        phase="proposal_overlay_staging",
-        total_objects=staged_proposal_count,
-    )
-    staging_started_at = time.monotonic()
-    staging_progress.start()
-    completed_objects = 0
-    checkpoint_count = 0
-    last_checkpoint_count = 0
-    last_checkpoint_at = staging_started_at
-    bulk_scope_indexes: dict[str, dict[str, dict[str, Any]]] = {}
-    if require_file_backed_bodies:
-        changed_scopes = run_state.get("changed_scopes")
-        if not isinstance(changed_scopes, dict):
-            raise ValueError("overlay run state has no changed_scopes mapping")
-        for scope_set in (manifest_scope_set, index_scope_set):
-            scope_index: dict[str, dict[str, Any]] = {}
-            for raw_scope in list(changed_scopes.get(scope_set) or []):
-                if not isinstance(raw_scope, Mapping):
-                    raise ValueError(
-                        f"overlay changed scope is invalid: {scope_set}"
-                    )
-                canonical_scope = json.loads(json.dumps(
-                    dict(raw_scope), sort_keys=True, default=str,
-                ))
-                scope_index[json.dumps(
-                    canonical_scope, sort_keys=True, separators=(",", ":"),
-                )] = canonical_scope
-            bulk_scope_indexes[scope_set] = scope_index
-        run_state["proposal_ingestion"] = {
-            "status": "in_progress",
-            "transport_mode": "file_backed_compact_proposal",
-            "completed_object_count": 0,
-            "total_object_count": staged_proposal_count,
-            "checkpoint_count": 0,
-            "node_apply_launch_permitted": False,
-            "started_at_utc": fmt_iso(utc_now()),
-        }
-
-    def persist_bulk_checkpoint(*, final: bool) -> None:
-        nonlocal checkpoint_count, last_checkpoint_at, last_checkpoint_count
-        if not require_file_backed_bodies:
-            return
-        changed_scopes = run_state["changed_scopes"]
-        for scope_set, scope_index in bulk_scope_indexes.items():
-            changed_scopes[scope_set] = [
-                scope_index[key] for key in sorted(scope_index)
-            ]
-        run_state["proposal_transition_planner_unchanged_keys"] = sorted(
-            planner_unchanged_keys
-        )
-        checkpoint_count += 1
-        changed_scope_count = sum(
-            len(scope_index) for scope_index in bulk_scope_indexes.values()
-        )
-        ingestion = run_state["proposal_ingestion"]
-        ingestion.update({
-            "status": "complete" if final else "in_progress",
-            "completed_object_count": completed_objects,
-            "total_object_count": staged_proposal_count,
-            "checkpoint_count": checkpoint_count,
-            "changed_scope_count": changed_scope_count,
-            "node_apply_launch_permitted": False,
-            "completed_at_utc": fmt_iso(utc_now()) if final else None,
-        })
-        _emit_proposal_checkpoint_progress(
-            log=log,
-            suffix="started",
-            completed_objects=completed_objects,
-            total_objects=staged_proposal_count,
-            checkpoint_count=checkpoint_count,
-            changed_scope_count=changed_scope_count,
-            started_at=staging_started_at,
-        )
-        write_run_state(run_state)
-        _emit_proposal_checkpoint_progress(
-            log=log,
-            suffix="complete",
-            completed_objects=completed_objects,
-            total_objects=staged_proposal_count,
-            checkpoint_count=checkpoint_count,
-            changed_scope_count=changed_scope_count,
-            started_at=staging_started_at,
-        )
-        staging_progress.progress(
-            completed_objects,
-            force=True,
-            checkpoint_count=checkpoint_count,
-            changed_scope_count=changed_scope_count,
-        )
-        last_checkpoint_count = completed_objects
-        last_checkpoint_at = time.monotonic()
-
-    for proposal in proposals:
+    ):
         object_key = str(proposal.get("key") or "").strip()
+        body = proposal.get("proposed_body")
         if not object_key:
             continue
         normalized_object_key = _normalise_overlay_object_key(object_key)
@@ -23428,79 +20250,46 @@ def _record_metadata_executor_overlay(
                 continue
         else:
             planner_unchanged_keys.discard(normalized_object_key)
-        body_bytes: bytes | None = None
-        file_backed_identity: tuple[Path, str, int] | None = None
-        if require_file_backed_bodies:
-            if proposal.get("proposed_body") is not None or proposal.get("body") is not None:
-                raise ValueError(
-                    "fixed-v3 compact proposal contains an inline body: "
-                    f"{normalized_object_key}"
-                )
-            file_backed_identity = _resolve_v3_proposal_body_reference(
-                run_state=run_state,
-                proposal=proposal,
-                object_key=normalized_object_key,
+        if not isinstance(body, str):
+            raise ValueError(
+                "required planner proposal body is unavailable: "
+                f"{normalized_object_key}"
             )
-            _, actual_sha256, actual_bytes = file_backed_identity
-        else:
-            body = proposal.get("proposed_body")
-            if not isinstance(body, str):
-                raise ValueError(
-                    "required planner proposal body is unavailable: "
-                    f"{normalized_object_key}"
-                )
-            body_bytes = body.encode("utf-8")
-            actual_sha256 = hashlib.sha256(body_bytes).hexdigest()
-            actual_bytes = len(body_bytes)
+        body_bytes = body.encode("utf-8")
         if required_sos_light_day_object and not planner_changed:
             old_sha256 = str(proposal.get("old_sha256") or "").strip().lower()
             new_sha256 = str(proposal.get("new_sha256") or "").strip().lower()
             declared_bytes = proposal.get("bytes")
+            actual_sha256 = hashlib.sha256(body_bytes).hexdigest()
             if (
                 old_sha256 != new_sha256
                 or new_sha256 != actual_sha256
                 or not isinstance(declared_bytes, int)
                 or isinstance(declared_bytes, bool)
-                or declared_bytes != actual_bytes
+                or declared_bytes != len(body_bytes)
             ):
                 raise ValueError(
                     "SOS-light unchanged required object identity is invalid: "
                     f"{normalized_object_key}"
                 )
-        stage = str(proposal.get("publication_stage") or "").strip() or (
-            manifest_stage
-            if "manifest" in str(proposal.get("kind") or "")
-            else index_stage
-        )
-        if require_file_backed_bodies:
-            stage_file_backed_proposal_object(
-                run_state,
-                proposal=proposal,
-                object_key=object_key,
-                stage=stage,
+        with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-proposal-") as temp_dir:
+            source = Path(temp_dir) / "generated-object"
+            source.write_text(body, encoding="utf-8")
+            stage = str(proposal.get("publication_stage") or "").strip() or (
+                manifest_stage
+                if "manifest" in str(proposal.get("kind") or "")
+                else index_stage
+            )
+            stage_overlay_object(
+                run_state, object_key=object_key, source_path=source, stage=stage,
                 dependencies=[str(value) for value in list(proposal.get("dependencies") or [])],
                 dependency_identities=(
                     proposal.get("dependency_identities")
                     if isinstance(proposal.get("dependency_identities"), Mapping)
                     else None
                 ),
-                resolved_body_identity=file_backed_identity,
-                persist=False,
+                persist=proposal_staging is None,
             )
-        else:
-            assert body_bytes is not None
-            with tempfile.TemporaryDirectory(prefix="uk-aq-integrity-proposal-") as temp_dir:
-                source = Path(temp_dir) / "generated-object"
-                source.write_bytes(body_bytes)
-                stage_overlay_object(
-                    run_state, object_key=object_key, source_path=source, stage=stage,
-                    dependencies=[str(value) for value in list(proposal.get("dependencies") or [])],
-                    dependency_identities=(
-                        proposal.get("dependency_identities")
-                        if isinstance(proposal.get("dependency_identities"), Mapping)
-                        else None
-                    ),
-                )
         snapshot = proposal.get("local_dependency_snapshot")
         staged_entry = _overlay_object_entry(run_state, object_key)
         staged_entry["changed"] = planner_changed
@@ -23547,7 +20336,7 @@ def _record_metadata_executor_overlay(
         mark_overlay_structurally_validated(
             run_state,
             object_key,
-            persist=not require_file_backed_bodies,
+            persist=proposal_staging is None,
         )
         if planner_changed:
             scope_set = manifest_scope_set if "manifest" in str(proposal.get("kind") or "") else index_scope_set
@@ -23556,68 +20345,19 @@ def _record_metadata_executor_overlay(
                 "stage": stage,
                 "provenance": proposal.get("provenance") or "repair_generated",
             }
-            if require_file_backed_bodies:
-                canonical_scope = json.loads(json.dumps(
-                    scope, sort_keys=True, default=str,
-                ))
-                bulk_scope_indexes[scope_set][json.dumps(
-                    canonical_scope,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )] = canonical_scope
+            if proposal_staging is not None:
+                proposal_staging.record_changed_scope(scope_set, scope)
             else:
                 record_changed_scope(run_state, scope_set, scope)
-        completed_objects += 1
-        if require_file_backed_bodies and (
-            completed_objects - last_checkpoint_count
-            >= COORDINATOR_PROGRESS_OBJECT_INTERVAL
-            or time.monotonic() - last_checkpoint_at
-            >= COORDINATOR_PROGRESS_SECONDS
-        ):
-            persist_bulk_checkpoint(final=False)
+        if proposal_staging is not None:
+            proposal_staging.object_completed(
+                phase="observation_metadata_staging",
+                publication_stage=stage,
+            )
     run_state["proposal_transition_planner_unchanged_keys"] = sorted(
         planner_unchanged_keys
     )
-    prefix_tombstones = list(run_state.get("tombstone_prefixes") or [])
-    for removed_scope in list(planning.get("removed_exact_v3_scopes") or []):
-        if not isinstance(removed_scope, Mapping):
-            raise ValueError("fixed-v3 removed scope evidence is invalid")
-        for hierarchy, field in (
-            ("exact", "exact_prefix"),
-            ("aligned", "aligned_prefix"),
-        ):
-            prefix = _normalise_overlay_object_key(
-                str(removed_scope.get(field) or "")
-            ).rstrip("/")
-            prefix_tombstones.append({
-                "prefix": prefix,
-                "proposed": True,
-                "deleted": False,
-                "deletion_verified": False,
-                "stage": "sos_light_exact_v3_scope_removal",
-                "hierarchy": hierarchy,
-                "day_utc": str(removed_scope.get("day_utc") or ""),
-                "connector_id": int(removed_scope.get("connector_id") or 0),
-                "pollutant_code": str(
-                    removed_scope.get("pollutant_code") or ""
-                ),
-                "authority": "pinned_dropbox_latest_minus_canonical_reconstruction",
-            })
-    run_state["tombstone_prefixes"] = sorted(
-        {entry["prefix"]: entry for entry in prefix_tombstones}.values(),
-        key=lambda entry: str(entry["prefix"]),
-    )
-    if require_file_backed_bodies:
-        persist_bulk_checkpoint(final=True)
-        changed_scope_count = sum(
-            len(scope_index) for scope_index in bulk_scope_indexes.values()
-        )
-        staging_progress.complete(
-            completed_objects,
-            checkpoint_count=checkpoint_count,
-            changed_scope_count=changed_scope_count,
-        )
-    else:
+    if proposal_staging is None:
         write_run_state(run_state)
 
 
@@ -23632,7 +20372,7 @@ def _finalise_staged_write_set_provenance(
         raise ValueError("final staged write-set objects mapping is unavailable")
     progress = _BoundedCoordinatorProgress(
         log=log,
-        phase="final_staged_write_set_finalisation",
+        phase="final_staged_write_set_provenance",
         total_objects=len(objects) * 2,
     )
     progress.start()
@@ -23749,47 +20489,6 @@ def _finalise_staged_write_set_provenance(
     return audit
 
 
-def _finalise_generic_file_backed_proposal_if_ready(
-    run_state: dict[str, Any],
-    *,
-    dedicated_sos_historical_replacement: bool,
-    observation_failed: bool,
-    metadata: Mapping[str, Any],
-    log: logging.Logger | None = None,
-) -> bool:
-    """Persist the generic fixed-v3 final ownership freeze when it is valid."""
-    if dedicated_sos_historical_replacement or observation_failed:
-        return False
-    manifest_status = str(
-        metadata.get("manifest_status") or metadata.get("status") or "not_run"
-    )
-    index_status = str(
-        metadata.get("index_status") or metadata.get("status") or "not_run"
-    )
-    if (
-        manifest_status in {"failed", "blocked_dependency"}
-        or index_status in {"failed", "blocked_dependency"}
-        or bool(run_state.get("blocked_scopes"))
-    ):
-        return False
-    transport = run_state.get("proposal_transport")
-    ingestion = run_state.get("proposal_ingestion")
-    if (
-        not isinstance(transport, Mapping)
-        or transport.get("transport_mode")
-        != "file_backed_compact_proposal"
-        or not isinstance(ingestion, Mapping)
-        or ingestion.get("status") != "complete"
-        or ingestion.get("node_apply_launch_permitted") is not False
-        or ingestion.get("completed_object_count")
-        != ingestion.get("total_object_count")
-    ):
-        return False
-    _finalise_staged_write_set_provenance(run_state, log=log)
-    write_run_state(run_state)
-    return True
-
-
 def _validated_observation_pollutant_manifest_row_count(
     payload: Any,
     *,
@@ -23828,6 +20527,7 @@ def _validated_observation_pollutant_manifest_row_count(
 def assemble_sos_light_complete_days(
     run_state: dict[str, Any],
     *,
+    proposal_staging: _SosLightV2ProposalStaging | None = None,
     log: logging.Logger | None = None,
 ) -> dict[str, Any]:
     """Materialise the source-plus-Dropbox day proposal, then select full-day deletion."""
@@ -23843,13 +20543,6 @@ def assemble_sos_light_complete_days(
     day_entries = [entry for entry in list(audit.get("days") or []) if isinstance(entry, Mapping)]
     if not day_entries:
         raise ValueError("SOS-light local assembly contains no selected days")
-    assembly_progress = _BoundedCoordinatorProgress(
-        log=log,
-        phase="sos_light_complete_day_assembly",
-        total_objects=None,
-    )
-    assembly_progress.start(selected_day_count=len(day_entries))
-    assembly_work_count = 0
     old_prefixes = [
         _normalise_overlay_object_key(str(entry.get("prefix") or "")).rstrip("/")
         for entry in list(run_state.get("tombstone_prefixes") or [])
@@ -23901,6 +20594,12 @@ def assemble_sos_light_complete_days(
 
     total_day_uploads = 0
     dropbox_day_absent_days: list[str] = []
+    assembly_progress = _BoundedCoordinatorProgress(
+        log=log,
+        phase="complete_day_assembly",
+        total_objects=len(day_entries),
+    )
+    assembly_progress.start()
     for completed_days, raw_day in enumerate(day_entries, start=1):
         day = dict(raw_day)
         day_utc = str(day.get("day_utc") or "")
@@ -23946,21 +20645,20 @@ def assemble_sos_light_complete_days(
                 audit["dropbox_warning_count"] = int(
                     audit.get("dropbox_warning_count") or 0
                 ) + 1
-        authoritative_day_keys = _canonical_sos_light_observation_object_keys(
-            day.get("authoritative_observation_object_keys"),
-            day_utc=day_utc,
-        )
-        for object_key in authoritative_day_keys:
-            assembly_work_count += 1
-            assembly_progress.progress(
-                assembly_work_count,
-                completed_days=completed_days - 1,
-            )
+        omitted_prefixes = [
+            _normalise_overlay_object_key(str(value)).rstrip("/")
+            for value in list(day.get("omitted_dropbox_connector_prefixes") or [])
+        ]
+        for source in (
+            sorted(path for path in baseline_day.rglob("*") if path.is_file())
+            if dropbox_day_present
+            else []
+        ):
+            object_key = source.relative_to(dropbox_root).as_posix()
             baseline_pollutant = requested_baseline_manifest_keys.get(
                 object_key
             )
-            source = dropbox_root / object_key
-            if baseline_pollutant is not None and source.is_file():
+            if baseline_pollutant is not None:
                 baseline_payload = json.loads(source.read_text(encoding="utf-8"))
                 baseline_partition_rows[
                     (day_utc, 1, baseline_pollutant)
@@ -23974,15 +20672,9 @@ def assemble_sos_light_complete_days(
             if object_key in objects:
                 continue
             if any(object_key.startswith(f"{prefix}/") for prefix in old_prefixes):
-                raise ValueError(
-                    "SOS-light authoritative object beneath a replacement "
-                    f"scope was not rebuilt: {object_key}"
-                )
-            if not source.is_file():
-                raise ValueError(
-                    "SOS-light authoritative Dropbox object is unavailable: "
-                    f"{object_key}"
-                )
+                continue
+            if any(object_key.startswith(f"{prefix}/") for prefix in omitted_prefixes):
+                continue
             target = overlay_root / object_key
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
@@ -24005,40 +20697,18 @@ def assemble_sos_light_complete_days(
                 "r2_verified": False,
                 "r2_verified_at_utc": None,
             }
+            if proposal_staging is not None:
+                proposal_staging.object_completed(
+                    phase="complete_day_assembly",
+                    current_day=day_utc,
+                    assembled_days=completed_days - 1,
+                    total_days=len(day_entries),
+                )
         day_keys = sorted(
             key for key in objects if key.startswith(f"{day_prefix}/")
         )
-        if day_keys != authoritative_day_keys:
-            unexpected = sorted(set(day_keys) - set(authoritative_day_keys))
-            missing = sorted(set(authoritative_day_keys) - set(day_keys))
-            raise ValueError(
-                "SOS-light complete-day object closure differs from frozen "
-                f"authority: {day_utc}; unexpected={unexpected[:3]}; "
-                f"missing={missing[:3]}"
-            )
         if f"{day_prefix}/manifest.json" not in day_keys:
             raise ValueError(f"SOS-light assembled day parent is unavailable: {day_utc}")
-        expected_connector_ids = _canonical_sos_light_connector_ids(
-            day.get("expected_final_connector_ids"),
-            label=f"{day_utc}:expected_final_connector_ids",
-        )
-        actual_connector_ids = sorted({
-            int(match.group(1))
-            for key in day_keys
-            if (
-                match := re.fullmatch(
-                    re.escape(f"{day_prefix}/connector_id=")
-                    + r"([1-9]\d*)/manifest\.json",
-                    key,
-                )
-            )
-        })
-        if actual_connector_ids != expected_connector_ids:
-            raise ValueError(
-                "SOS-light complete-day connector membership differs from "
-                f"pinned authority: {day_utc}; "
-                f"expected={expected_connector_ids}; actual={actual_connector_ids}"
-            )
         connector1_parent = f"{day_prefix}/connector_id=1/manifest.json"
         if connector1_parent not in day_keys:
             raise ValueError(f"SOS-light connector 1 parent is unavailable: {day_utc}")
@@ -24046,11 +20716,6 @@ def assemble_sos_light_complete_days(
         # including Dropbox-derived sibling connectors.  These identities are
         # part of the preflight graph; apply must never rediscover them live.
         for object_key in day_keys:
-            assembly_work_count += 1
-            assembly_progress.progress(
-                assembly_work_count,
-                completed_days=completed_days - 1,
-            )
             entry = objects[object_key]
             if object_key.endswith(".parquet"):
                 entry["stage"] = "observations_data"
@@ -24158,14 +20823,14 @@ def assemble_sos_light_complete_days(
         day["complete_day_delete_prefix"] = f"{day_prefix}/"
         total_day_uploads += len(day_keys)
         raw_day.update(day)
+        assembly_progress.progress(
+            completed_days,
+            force=True,
+            current_day=day_utc,
+            complete_day_object_count=len(day_keys),
+        )
 
-    existing_index_scope_removals = [
-        dict(entry)
-        for entry in list(run_state.get("tombstone_prefixes") or [])
-        if isinstance(entry, Mapping)
-        and entry.get("stage") == "sos_light_exact_v3_scope_removal"
-    ]
-    run_state["tombstone_prefixes"] = existing_index_scope_removals + [
+    run_state["tombstone_prefixes"] = [
         {
             "prefix": (
                 f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/"
@@ -24181,6 +20846,8 @@ def assemble_sos_light_complete_days(
         }
         for entry in sorted(day_entries, key=lambda value: str(value["day_utc"]))
     ]
+    if proposal_staging is not None:
+        proposal_staging.complete()
     final_provenance = _finalise_staged_write_set_provenance(
         run_state,
         log=log,
@@ -24260,11 +20927,13 @@ def assemble_sos_light_complete_days(
         "no_old_live_r2_body_planning_or_preservation": True,
     })
     run_state["mode"] = "sos-light"
+    staging = run_state.get("sos_light_v2_proposal_staging")
+    if isinstance(staging, dict):
+        staging["final_provenance_status"] = "complete"
     write_run_state(run_state)
-    assembly_progress.total_objects = assembly_work_count
     assembly_progress.complete(
-        assembly_work_count,
-        completed_days=len(day_entries),
+        len(day_entries),
+        complete_day_object_count=total_day_uploads,
     )
     return dict(audit)
 
@@ -24274,6 +20943,7 @@ def _capture_local_v2_observation_scope(
     day_utc: str,
     connector_id: int,
     repair_pollutants: Iterable[str] | None = None,
+    proposal_staging: _SosLightV2ProposalStaging | None = None,
 ) -> list[str]:
     """Prove source/Parquet equality, then stage one connector-day proposal."""
     stage_root = Path(str(run_state["overlay_root"]))
@@ -24285,10 +20955,17 @@ def _capture_local_v2_observation_scope(
     selected_pollutants = _normalise_repair_pollutants(repair_pollutants)
     source_root = generated_root / connector_prefix
     manifest_source = source_root / "manifest.json"
-    manifest = (
-        json.loads(manifest_source.read_text(encoding="utf-8"))
-        if manifest_source.is_file() else None
-    )
+    if not manifest_source.is_file():
+        raise FileNotFoundError(f"canonical connector manifest is unavailable: {connector_prefix}")
+    manifest = json.loads(manifest_source.read_text(encoding="utf-8"))
+    if (
+        not isinstance(manifest, Mapping)
+        or manifest.get("history_version") != "v2"
+        or manifest.get("domain") != "observations"
+        or str(manifest.get("day_utc") or "") != day_utc
+        or int(manifest.get("connector_id") or 0) != int(connector_id)
+    ):
+        raise ValueError("canonical connector manifest identity is invalid")
     evidence_path = (
         stage_root / f"day_utc={day_utc}" /
         f"connector_id={int(connector_id)}" / "source-evidence.json"
@@ -24343,66 +21020,25 @@ def _capture_local_v2_observation_scope(
     if not isinstance(source_hashes, Mapping):
         raise ValueError("source observation content hash evidence is unavailable")
     is_sos = str(evidence.get("source_adapter") or "") == "sos"
-    is_official_rdata = str(evidence.get("source_adapter") or "") in (
-        OFFICIAL_RDATA_NETWORKS
-    )
-    empty_final_target_pollutants = sorted(
-        str(value) for value in list(
-            evidence.get("empty_final_target_pollutant_codes") or []
-        )
-    )
-    empty_only_proposal = (
-        is_official_rdata
-        and bool(selected_pollutants)
-        and empty_final_target_pollutants == selected_pollutants
-    )
-    if manifest is None:
-        if not empty_only_proposal:
-            raise FileNotFoundError(
-                f"canonical connector manifest is unavailable: {connector_prefix}"
-            )
-    elif (
-        not isinstance(manifest, Mapping)
-        or manifest.get("history_version") != "v2"
-        or manifest.get("domain") != "observations"
-        or str(manifest.get("day_utc") or "") != day_utc
-        or int(manifest.get("connector_id") or 0) != int(connector_id)
-    ):
-        raise ValueError("canonical connector manifest identity is invalid")
-    target_hashes = (
-        evidence.get("final_target_observation_content_hashes")
-        if is_official_rdata else source_hashes
-    )
-    if not isinstance(target_hashes, Mapping):
-        raise ValueError("final target observation content hash evidence is unavailable")
     selected_hash_pollutants = (
         selected_pollutants
         if selected_pollutants
-        else sorted(str(value) for value in target_hashes)
+        else sorted(str(value) for value in source_hashes)
     )
     for pollutant_code in selected_hash_pollutants:
-        source_hash = target_hashes.get(pollutant_code)
+        source_hash = source_hashes.get(pollutant_code)
         pollutant_paths = [
             str(path)
             for path in parquet_paths
             if path.parent.name == f"pollutant_code={pollutant_code}"
         ]
-        if is_official_rdata:
-            authoritative_no_data = (
-                pollutant_code in empty_final_target_pollutants
-                and int(dict(
-                    evidence.get("final_target_pollutant_counts") or {}
-                ).get(pollutant_code, -1)) == 0
-                and int(evidence.get("missing_binding_rows") or 0) == 0
-            )
-        else:
-            authoritative_no_data = (
-                run_state.get("execution_path")
-                == SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH
-                and len(selected_pollutants) == 1
-                and int(evidence.get("total_rows") or 0) == 0
-                and int(evidence.get("missing_binding_rows") or 0) == 0
-            )
+        authoritative_no_data = (
+            run_state.get("execution_path")
+            == SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH
+            and len(selected_pollutants) == 1
+            and int(evidence.get("total_rows") or 0) == 0
+            and int(evidence.get("missing_binding_rows") or 0) == 0
+        )
         if not isinstance(source_hash, Mapping) and not authoritative_no_data:
             raise ValueError(
                 f"source observation content hash is missing: {pollutant_code}"
@@ -24410,7 +21046,6 @@ def _capture_local_v2_observation_scope(
         parquet_rows = (
             _observation_rows_from_local_parquet_for_shared_hash(
                 parquet_paths=pollutant_paths,
-                require_canonical_schema=True,
             )
             if pollutant_paths else []
         )
@@ -24434,8 +21069,6 @@ def _capture_local_v2_observation_scope(
         pollutant_manifest_path = (
             source_root / f"pollutant_code={pollutant_code}" / "manifest.json"
         )
-        if authoritative_no_data and not pollutant_manifest_path.is_file():
-            continue
         pollutant_manifest = json.loads(
             pollutant_manifest_path.read_text(encoding="utf-8")
         )
@@ -24455,60 +21088,41 @@ def _capture_local_v2_observation_scope(
             )
 
     expected_counts = _normalize_timeseries_row_counts(
-        evidence.get(
-            "final_target_timeseries_row_counts"
-            if is_official_rdata else "per_timeseries_counts"
-        )
+        evidence.get("per_timeseries_counts")
     )
     expected_pollutant_counts = {
         str(code): int(count)
-        for code, count in dict(evidence.get(
-            "final_target_pollutant_counts"
-            if is_official_rdata else "per_pollutant_counts"
-        ) or {}).items()
+        for code, count in dict(evidence.get("per_pollutant_counts") or {}).items()
     }
     if selected_pollutants and (
         sorted(expected_pollutant_counts) != sorted(set(expected_pollutant_counts) & set(selected_pollutants))
         or not set(expected_pollutant_counts).issubset(set(selected_pollutants))
     ):
         raise ValueError("canonical proposal pollutant set escaped requested repair scope")
-    evidence_pollutants = (
-        sorted(expected_pollutant_counts)
-        if is_official_rdata
-        else list(evidence.get("pollutant_set") or [])
+    evidence_pollutants = list(evidence.get("pollutant_set") or [])
+    manifest_summary, mismatches = _v2_observation_manifest_evidence_mismatches(
+        manifest,
+        expected_source_row_count=len(source_rows),
+        expected_timeseries_row_counts=expected_counts,
+        expected_pollutant_counts=expected_pollutant_counts,
+        source_evidence_pollutant_set=evidence_pollutants,
     )
-    expected_target_row_count = int(
-        evidence.get("final_target_row_count")
-        if is_official_rdata else len(source_rows)
-    )
-    if manifest is not None:
-        manifest_pollutant_counts = {
-            code: count for code, count in expected_pollutant_counts.items()
-            if count > 0
-        }
-        manifest_summary, mismatches = _v2_observation_manifest_evidence_mismatches(
-            manifest,
-            expected_source_row_count=sum(manifest_pollutant_counts.values()),
-            expected_timeseries_row_counts=expected_counts,
-            expected_pollutant_counts=manifest_pollutant_counts,
-            source_evidence_pollutant_set=sorted(manifest_pollutant_counts),
+    if mismatches:
+        first_field = str(mismatches[0].get("field") or "manifest")
+        raise CanonicalConnectorManifestValidationError(
+            f"source_evidence_{first_field}_mismatch",
+            {
+                "expected_source_row_count": len(source_rows),
+                "expected_timeseries_count": len(expected_counts),
+                "expected_pollutant_counts": dict(sorted(expected_pollutant_counts.items())),
+                "source_evidence_pollutant_set": sorted(
+                    str(value).strip() for value in evidence_pollutants
+                    if str(value or "").strip()
+                ),
+                "manifest": manifest_summary,
+                "mismatches": mismatches[:25],
+            },
         )
-        if mismatches:
-            first_field = str(mismatches[0].get("field") or "manifest")
-            raise CanonicalConnectorManifestValidationError(
-                f"source_evidence_{first_field}_mismatch",
-                {
-                    "expected_source_row_count": expected_target_row_count,
-                    "expected_timeseries_count": len(expected_counts),
-                    "expected_pollutant_counts": dict(sorted(expected_pollutant_counts.items())),
-                    "source_evidence_pollutant_set": sorted(
-                        str(value).strip() for value in evidence_pollutants
-                        if str(value or "").strip()
-                    ),
-                    "manifest": manifest_summary,
-                    "mismatches": mismatches[:25],
-                },
-            )
     object_paths = sorted(
         path for path in source_root.rglob("*") if path.is_file() and (
             not selected_pollutants
@@ -24518,7 +21132,7 @@ def _capture_local_v2_observation_scope(
             )
         )
     )
-    if not object_paths and not empty_only_proposal:
+    if not object_paths:
         raise ValueError("canonical connector proposal has no objects")
     captured: list[str] = []
     parquet_pattern = re.compile(
@@ -24533,9 +21147,24 @@ def _capture_local_v2_observation_scope(
         stage_overlay_object(
             run_state, object_key=object_key, source_path=source,
             stage="observations_data", dependencies=(),
+            persist=proposal_staging is None,
         )
-        mark_overlay_structurally_validated(run_state, object_key)
+        mark_overlay_structurally_validated(
+            run_state,
+            object_key,
+            persist=proposal_staging is None,
+        )
         captured.append(object_key)
+        if proposal_staging is not None:
+            relative_key = source.relative_to(source_root).as_posix()
+            pollutant_match = re.match(r"^pollutant_code=([^/]+)/", relative_key)
+            proposal_staging.object_completed(
+                phase="selected_partition_processing",
+                day_utc=day_utc,
+                pollutant_code=(
+                    pollutant_match.group(1) if pollutant_match else None
+                ),
+            )
     prefix_tombstones = run_state.setdefault("tombstone_prefixes", [])
     tombstone_prefixes = (
         [f"{connector_prefix}/pollutant_code={pollutant}" for pollutant in selected_pollutants]
@@ -24551,7 +21180,8 @@ def _capture_local_v2_observation_scope(
         {entry["prefix"]: entry for entry in prefix_tombstones}.values(),
         key=lambda entry: str(entry["prefix"]),
     )
-    write_run_state(run_state)
+    if proposal_staging is None:
+        write_run_state(run_state)
     return captured
 
 def _create_final_verification_view(
@@ -24778,56 +21408,6 @@ def _validate_v2_timeseries_bindings(
     return gaps
 
 
-def run_timeseries_binding_verification(
-    *,
-    conn: sqlite3.Connection,
-    config: HistoryPathConfig,
-    individual_root: Path,
-    backup_mode: str,
-    pack_root: Path | None,
-    connector_ids: set[int] | None,
-    stage: str,
-) -> dict[str, Any]:
-    """Validate connector-scoped core bindings through one physical provider."""
-    expected = _expected_v2_core_timeseries_bindings(
-        conn,
-        allowed_connector_ids=connector_ids,
-    )
-    required_ids = set(expected)
-    provider_audit: dict[str, Any]
-    with binding_backup_view(
-        mode=backup_mode,
-        individual_root=individual_root,
-        pack_root=pack_root,
-        required_timeseries_ids=required_ids,
-        observation_generation="v3",
-    ) as (view_root, mutable_audit):
-        provider_audit = mutable_audit
-        gaps = _validate_v2_timeseries_bindings(
-            conn=conn,
-            view_root=view_root,
-            config=config,
-            allowed_connector_ids=connector_ids,
-        )
-    result = {
-        "stage": stage,
-        "status": "ok" if not gaps else "fail",
-        "connector_ids": (
-            sorted(connector_ids)
-            if connector_ids is not None else sorted({
-                int(value["connector_id"])
-                for value in expected.values()
-            })
-        ),
-        "required_binding_count": len(required_ids),
-        "semantic_binding_count_checked": len(required_ids),
-        "gap_count": len(gaps),
-        "gaps": gaps,
-        "provider": dict(provider_audit),
-    }
-    return result
-
-
 def run_sos_timeseries_binding_verification(
     *,
     conn: sqlite3.Connection,
@@ -24839,17 +21419,37 @@ def run_sos_timeseries_binding_verification(
     log: logging.Logger | None = None,
 ) -> dict[str, Any]:
     """Run established connector-1 semantics through one physical provider."""
-    result = run_timeseries_binding_verification(
-        conn=conn,
-        config=config,
-        individual_root=individual_root,
-        backup_mode=backup_mode,
-        pack_root=pack_root,
-        connector_ids={1},
-        stage=stage,
+    connector_ids = {1}
+    expected = _expected_v2_core_timeseries_bindings(
+        conn,
+        allowed_connector_ids=connector_ids,
     )
+    required_ids = set(expected)
+    provider_audit: dict[str, Any]
+    with binding_backup_view(
+        mode=backup_mode,
+        individual_root=individual_root,
+        pack_root=pack_root,
+        required_timeseries_ids=required_ids,
+    ) as (view_root, mutable_audit):
+        provider_audit = mutable_audit
+        gaps = _validate_v2_timeseries_bindings(
+            conn=conn,
+            view_root=view_root,
+            config=config,
+            allowed_connector_ids=connector_ids,
+        )
+    result = {
+        "stage": stage,
+        "status": "ok" if not gaps else "fail",
+        "connector_ids": [1],
+        "required_binding_count": len(required_ids),
+        "semantic_binding_count_checked": len(required_ids),
+        "gap_count": len(gaps),
+        "gaps": gaps,
+        "provider": dict(provider_audit),
+    }
     if log is not None:
-        provider_audit = result["provider"]
         log.info(
             "SOS timeseries binding verification stage=%s mode=%s status=%s "
             "required=%s gaps=%s ranges_verified=%s members_verified=%s "
@@ -24947,9 +21547,6 @@ def _verified_deleted_object_keys(
 
 MUTATION_EVENT_HASH_CONTRACT_VERSION = "integrity-apply-mutation-event-v1"
 PUBLICATION_SCHEDULE_CONTRACT_VERSION = "integrity-apply-publication-schedule-v1"
-SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT = (
-    "sos-light-v3-apply-persistence-v1"
-)
 
 
 def canonical_mutation_event_hash_input(event: Mapping[str, Any]) -> bytes:
@@ -25049,244 +21646,10 @@ def verify_publication_schedule(
     }
 
 
-def _verify_sos_light_v3_apply_persistence(
-    run_state: Mapping[str, Any],
-) -> dict[str, Any]:
-    apply_summary = run_state.get("apply") or {}
-    persistence = apply_summary.get("persistence") or {}
-    journal_path = _resolve_run_scoped_apply_artifact(
-        run_state, persistence.get("mutation_journal_path")
-    )
-    body = journal_path.read_bytes()
-    expected_bytes = int(persistence.get("mutation_journal_bytes") or -1)
-    expected_sha256 = str(
-        persistence.get("mutation_journal_sha256") or ""
-    ).strip().lower()
-    if (
-        len(body) != expected_bytes
-        or hashlib.sha256(body).hexdigest() != expected_sha256
-    ):
-        raise ValueError(f"mutation journal identity mismatch: {journal_path}")
-    lines = [line for line in body.splitlines() if line]
-    if len(lines) != int(persistence.get("mutation_journal_event_count") or 0):
-        raise ValueError(
-            f"mutation journal event-count mismatch: {journal_path}"
-        )
-    run_id = str(run_state.get("run_id") or "")
-    previous_sha256: str | None = None
-    parsed_events: list[Mapping[str, Any]] = []
-    event_types: dict[str, int] = {}
-    publication_events: dict[int, list[Mapping[str, Any]]] = {}
-    publication_event_types = {
-        "put_started",
-        "put_completed",
-        "post_put_get_started",
-        "post_put_get_verified",
-        "put_or_verification_failed",
-    }
-    for line in lines:
-        event = json.loads(line.decode("utf-8"))
-        if not isinstance(event, Mapping):
-            raise ValueError("mutation journal event is not an object")
-        if str(event.get("run_id") or "") != run_id:
-            raise ValueError("mutation journal run identity mismatch")
-        if (
-            event.get("event_hash_contract_version")
-            != MUTATION_EVENT_HASH_CONTRACT_VERSION
-        ):
-            raise ValueError("unsupported legacy mutation journal contract")
-        if event.get("previous_event_sha256") != previous_sha256:
-            raise ValueError("mutation journal event-chain linkage mismatch")
-        event_sha256 = str(event.get("event_sha256") or "").strip().lower()
-        recomputed_sha256 = hashlib.sha256(
-            canonical_mutation_event_hash_input(event)
-        ).hexdigest()
-        if event_sha256 != recomputed_sha256:
-            raise ValueError("mutation journal event-hash mismatch")
-        previous_sha256 = recomputed_sha256
-        event_type = str(event.get("event_type") or "")
-        event_types[event_type] = event_types.get(event_type, 0) + 1
-        parsed_events.append(event)
-        if event_type in publication_event_types:
-            operation_id = int(event.get("operation_id") or 0)
-            if operation_id <= 0:
-                raise ValueError(
-                    "v3 publication event operation identity is invalid"
-                )
-            publication_events.setdefault(operation_id, []).append(event)
-    if (
-        previous_sha256
-        != persistence.get("mutation_journal_tail_event_sha256")
-    ):
-        raise ValueError("mutation journal event-chain tail mismatch")
-
-    evidence_entries = list(
-        apply_summary.get("v3_publication_evidence") or []
-    )
-    if apply_summary.get("status") == "succeeded":
-        if (
-            not parsed_events
-            or parsed_events[-1].get("event_type")
-            != "canonical_apply_completed"
-        ):
-            raise ValueError("v3 mutation journal completion is absent")
-        expected_event_sequence = [
-            "put_started",
-            "put_completed",
-            "post_put_get_started",
-            "post_put_get_verified",
-        ]
-        evidence_operation_ids: set[int] = set()
-        uploaded_count = 0
-        skipped_count = 0
-        for raw_evidence in evidence_entries:
-            if not isinstance(raw_evidence, Mapping):
-                raise ValueError("v3 publication evidence is invalid")
-            operation_id = int(raw_evidence.get("operation_id") or 0)
-            key = str(raw_evidence.get("object_key") or "")
-            sha256 = str(raw_evidence.get("sha256") or "").strip().lower()
-            byte_size = int(raw_evidence.get("bytes") or -1)
-            events = publication_events.get(operation_id) or []
-            if (
-                operation_id <= 0
-                or operation_id in evidence_operation_ids
-                or not key
-                or not re.fullmatch(r"[a-f0-9]{64}", sha256)
-                or byte_size < 0
-                or raw_evidence.get("r2_verified") is not True
-                or raw_evidence.get("durable") is not True
-                or int(
-                    raw_evidence.get("post_put_verification_get_count") or 0
-                )
-                != 1
-                or [str(event.get("event_type") or "") for event in events]
-                != expected_event_sequence
-                or any(
-                    str(event.get("canonical_key") or "") != key
-                    or str(event.get("sha256") or "") != sha256
-                    or int(event.get("byte_size") or -1) != byte_size
-                    for event in events
-                )
-            ):
-                raise ValueError(
-                    f"v3 publication evidence is incomplete: {key}"
-                )
-            uploaded = raw_evidence.get("uploaded") is True
-            skipped = raw_evidence.get("skipped_unchanged") is True
-            if uploaded == skipped:
-                raise ValueError(
-                    f"v3 publication disposition is contradictory: {key}"
-                )
-            uploaded_count += int(uploaded)
-            skipped_count += int(skipped)
-            evidence_operation_ids.add(operation_id)
-        if evidence_operation_ids != set(publication_events):
-            raise ValueError("v3 publication journal/evidence operations differ")
-        completed = len(evidence_entries)
-        if not (
-            completed
-            == int(apply_summary.get("completed_writes") or 0)
-            == int(
-                apply_summary.get("completed_post_put_verifications") or 0
-            )
-            == int(apply_summary.get("get_verified_writes") or 0)
-            and uploaded_count
-            == int(apply_summary.get("uploaded_writes") or 0)
-            and skipped_count
-            == int(apply_summary.get("skipped_unchanged_writes") or 0)
-        ):
-            raise ValueError("v3 publication evidence counts differ")
-        writer_result = apply_summary.get("canonical_v3_writer_result")
-        if (
-            not isinstance(writer_result, Mapping)
-            or writer_result.get("ok") is not True
-        ):
-            raise ValueError("canonical v3 writer result is absent")
-
-    sidecars: list[dict[str, Any]] = []
-    verified_deletions = 0
-    for raw_prefix in list(run_state.get("tombstone_prefixes") or []):
-        if not isinstance(raw_prefix, Mapping) or not raw_prefix.get("proposed"):
-            continue
-        if raw_prefix.get("deletion_verified") is not True:
-            if apply_summary.get("status") == "succeeded":
-                raise ValueError("successful v3 apply has unverified deletion")
-            continue
-        keys = _verified_deleted_object_keys(run_state, raw_prefix)
-        verified_deletions += 1
-        sidecars.append({
-            "prefix": str(raw_prefix.get("prefix") or ""),
-            "path": str(raw_prefix.get("deleted_keys_sidecar_path") or ""),
-            "bytes": int(raw_prefix.get("deleted_keys_sidecar_bytes") or 0),
-            "sha256": str(raw_prefix.get("deleted_keys_sha256") or ""),
-            "deleted_object_count": len(keys),
-        })
-    if (
-        len(sidecars)
-        != int(persistence.get("deleted_key_sidecar_count") or 0)
-    ):
-        raise ValueError("deleted-key sidecar-count mismatch")
-    if apply_summary.get("status") == "succeeded" and not (
-        verified_deletions
-        == int(apply_summary.get("completed_deletions") or 0)
-        == (
-            int(event_types.get("deletion_verified") or 0)
-            + int(event_types.get("exact_v3_scope_deletion_verified") or 0)
-        )
-    ):
-        raise ValueError("v3 deletion verification counts differ")
-
-    node_writes = int(
-        persistence.get("node_complete_run_state_write_count") or 0
-    )
-    coordinator_writes = int(
-        persistence.get("coordinator_complete_run_state_write_count") or 0
-    )
-    total_writes = int(
-        persistence.get("total_complete_run_state_write_count") or 0
-    )
-    if total_writes != node_writes + coordinator_writes:
-        raise ValueError("complete run-state write count mismatch")
-    if (
-        "complete_run_state_write_count" in persistence
-        and int(persistence.get("complete_run_state_write_count") or 0)
-        != total_writes
-    ):
-        raise ValueError(
-            "legacy complete run-state write count is not an exact total alias"
-        )
-    return {
-        "status": "verified",
-        "contract_version": SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT,
-        "mutation_journal_path": str(journal_path),
-        "mutation_journal_bytes": len(body),
-        "mutation_journal_sha256": expected_sha256,
-        "mutation_journal_event_count": len(lines),
-        "mutation_journal_tail_event_sha256": previous_sha256,
-        "event_type_counts": event_types,
-        "verified_publication_object_count": len(evidence_entries),
-        "deleted_key_sidecars": sidecars,
-        "compact_checkpoint_count": int(
-            persistence.get("compact_checkpoint_count") or 0
-        ),
-        "node_complete_run_state_write_count": node_writes,
-        "coordinator_complete_run_state_write_count": coordinator_writes,
-        "total_complete_run_state_write_count": total_writes,
-        "mutation_journal_flush_count": int(
-            persistence.get("mutation_journal_flush_count") or 0
-        ),
-    }
-
-
 def verify_apply_persistence_artifacts(
     run_state: Mapping[str, Any],
 ) -> dict[str, Any]:
     persistence = ((run_state.get("apply") or {}).get("persistence") or {})
-    if (
-        persistence.get("contract_version")
-        == SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT
-    ):
-        return _verify_sos_light_v3_apply_persistence(run_state)
     journal_path_raw = persistence.get("mutation_journal_path")
     if not journal_path_raw:
         return {"status": "not_available", "reason": "mutation_journal_not_recorded"}
@@ -25561,10 +21924,6 @@ def run_v2_final_verification(
     selected_days: Iterable[str] | None = None,
     require_remote_state: bool = True,
     repair_pollutants: Iterable[str] | None = None,
-    timeseries_binding_backup_mode: str = "individual",
-    timeseries_binding_pack_root: Path | None = None,
-    apply_result: Mapping[str, Any] | None = None,
-    planned_operation_counts: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One read-only final pass over source cache and final local objects."""
     validate_run_state_core_snapshot_identity(
@@ -25575,18 +21934,6 @@ def run_v2_final_verification(
         run_state, config=config, from_day=from_day, to_day=to_day,
         selected_days=selected_days,
     )
-    derived_index_scopes: set[tuple[str, int, str]] = set()
-    exact_manifest_pattern = re.compile(
-        r"^history/_index_v3/observations_timeseries/"
-        r"day_utc=(\d{4}-\d{2}-\d{2})/connector_id=(\d+)/"
-        r"pollutant_code=([a-z0-9_]+)/manifest\.json$"
-    )
-    for key in dict(run_state.get("objects") or {}):
-        match = exact_manifest_pattern.fullmatch(str(key))
-        if match:
-            derived_index_scopes.add(
-                (match.group(1), int(match.group(2)), match.group(3))
-            )
     recheck = run_v2_post_repair_integrity_rechecks(
         conn=conn,
         env_name=env_name,
@@ -25608,62 +21955,16 @@ def run_v2_final_verification(
             else (allowed_connector_ids or [])
         ),
         observation_total_pollutants=repair_pollutants,
-        verify_derived_index_scopes=derived_index_scopes,
     )
     remaining_scopes: list[dict[str, Any]] = []
-    if (apply_result or {}).get("status") == "skipped_noop":
-        no_operations = (
-            isinstance(planned_operation_counts, Mapping)
-            and all(
-                planned_operation_counts.get(name) == 0
-                for name in ("planned_writes", "planned_deletions")
-            )
-            and isinstance(apply_result.get("output"), Mapping)
-            and all(
-                apply_result["output"].get(name) == 0
-                for name in (
-                    "planned_writes", "planned_deletions",
-                    "completed_writes", "completed_deletions",
-                )
-            )
-            and not any(run_state.get(name) for name in (
-                "objects", "tombstones", "tombstone_prefixes", "apply",
-                "blocked_scopes", "uncertain_r2_objects",
-            ))
-            and not run_state.get("explicit_official_force_replacement")
-            and not (
-                isinstance(run_state.get("proposal_transition_validation"), Mapping)
-                and run_state["proposal_transition_validation"].get("status") == "failed"
-            )
-        )
-        if (
-            apply_result.get("reason") == "no_r2_operations_required"
-            and apply_result.get("proposal_validation_status") == "validated"
-            and no_operations
-        ):
-            apply_persistence_artifacts = {
-                "status": "skipped_noop",
-                "reason": "validated_zero_r2_operations",
-                "proposal_validation_status": "validated",
-                "planned_writes": 0,
-                "planned_deletions": 0,
-                "mutation_journal_required": False,
-            }
-        else:
-            apply_persistence_artifacts = {
-                "status": "failed", "reason": "invalid_noop_evidence",
-            }
-    else:
-        try:
-            apply_persistence_artifacts = verify_apply_persistence_artifacts(run_state)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            apply_persistence_artifacts = {
-                "status": "failed",
-                "error": str(exc),
-            }
-    if require_remote_state and apply_persistence_artifacts.get("status") not in {
-        "verified", "skipped_noop",
-    }:
+    try:
+        apply_persistence_artifacts = verify_apply_persistence_artifacts(run_state)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        apply_persistence_artifacts = {
+            "status": "failed",
+            "error": str(exc),
+        }
+    if require_remote_state and apply_persistence_artifacts.get("status") != "verified":
         remaining_scopes.append({
             "stage": "canonical_apply_persistence",
             "gap_type": "apply_persistence_artifact_verification_failed",
@@ -25678,53 +21979,23 @@ def run_v2_final_verification(
                 for value in raw_connector_ids
                 if str(value).strip().isdigit() and int(value) > 0
             }
-    try:
-        timeseries_binding_verification = run_timeseries_binding_verification(
-            conn=conn,
-            config=config,
-            individual_root=view_root,
-            backup_mode=timeseries_binding_backup_mode,
-            pack_root=timeseries_binding_pack_root,
-            connector_ids=binding_connector_ids,
-            stage="final_verification",
-        )
-    except PackedBindingError as exc:
-        timeseries_binding_verification = {
-            "stage": "final_verification",
-            "status": "fail",
-            "connector_ids": (
-                sorted(binding_connector_ids)
-                if binding_connector_ids is not None else None
-            ),
-            "required_binding_count": None,
-            "semantic_binding_count_checked": 0,
-            "gap_count": 1,
-            "gaps": [{
-                "stage": "timeseries_binding",
-                "gap_type": "timeseries_binding_backup_view_failed",
-                "error": str(exc),
-            }],
-            "provider": {
-                "mode": timeseries_binding_backup_mode,
-                "status": "failed",
-                "error": str(exc),
-            },
-        }
-    remaining_scopes.extend(timeseries_binding_verification["gaps"])
-    for domain, gaps in (
-        ("observations", list((recheck.get("observations") or {}).get("gaps") or [])),
-    ):
-        for gap in gaps:
-            if isinstance(gap, Mapping) and str(gap.get("severity") or "error") == "error":
-                remaining_scopes.append({
-                    "stage": _final_verification_stage_for_gap(domain, gap),
-                    "domain": domain,
-                    "day_utc": gap.get("day_utc"),
-                    "connector_id": gap.get("connector_id"),
-                    "pollutant_code": gap.get("pollutant_code"),
-                    "gap_type": gap.get("gap_type"),
-                    "expected_path": gap.get("expected_path"),
-                })
+    remaining_scopes.extend(_validate_v2_timeseries_bindings(
+        conn=conn,
+        view_root=view_root,
+        config=config,
+        allowed_connector_ids=binding_connector_ids,
+    ))
+    for gap in list((recheck.get("observations") or {}).get("gaps") or []):
+        if isinstance(gap, Mapping) and str(gap.get("severity") or "error") == "error":
+            remaining_scopes.append({
+                "stage": _final_verification_stage_for_gap("observations", gap),
+                "domain": "observations",
+                "day_utc": gap.get("day_utc"),
+                "connector_id": gap.get("connector_id"),
+                "pollutant_code": gap.get("pollutant_code"),
+                "gap_type": gap.get("gap_type"),
+                "expected_path": gap.get("expected_path"),
+            })
     verification_evidence: list[dict[str, Any]] = []
     r2_delete_verification_evidence: list[dict[str, Any]] = []
     r2_written_keys: set[str] = set()
@@ -25842,7 +22113,6 @@ def run_v2_final_verification(
         "r2_delete_verification_evidence": r2_delete_verification_evidence,
         "apply_persistence_artifacts": apply_persistence_artifacts,
         "application_failures": application_failures,
-        "timeseries_binding_verification": timeseries_binding_verification,
         "r2_objects_written": len(r2_written_keys),
         "r2_objects_deleted": sum(
             int(evidence.get("deleted_object_count") or 1)
@@ -26039,14 +22309,6 @@ def validate_proposal_run_state_transition(
     *,
     log: logging.Logger | None = None,
 ) -> dict[str, Any]:
-    execution_path = str(run_state.get("execution_path") or "")
-    if execution_path == "generic_integrity":
-        _canonical_generic_integrity_selected_scope_authority(run_state)
-    elif execution_path != SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH:
-        raise ValueError(
-            "coordinator proposal-transition validation failed: "
-            f"unsupported execution path {execution_path!r}"
-        )
     objects = run_state.get("objects")
     if objects is None:
         objects = {}
@@ -26055,16 +22317,16 @@ def validate_proposal_run_state_transition(
             "coordinator proposal-transition validation failed: "
             "final run-state objects mapping is invalid"
         )
-    changed_keys = {
-        _normalise_overlay_object_key(str(key)) for key in objects
-    }
     progress = _BoundedCoordinatorProgress(
         log=log,
         phase="proposal_transition_validation",
-        total_objects=len(changed_keys),
+        total_objects=len(objects),
     )
     progress.start()
     completed_objects = 0
+    changed_keys = {
+        _normalise_overlay_object_key(str(key)) for key in objects
+    }
     unchanged_planner_keys = {
         _normalise_overlay_object_key(str(key))
         for key in list(
@@ -26175,26 +22437,7 @@ def validate_proposal_run_state_transition(
                 dependency_in_final_write_set=True,
             )
         local_path = Path(str(entry.get("local_path") or ""))
-        overlay_root = Path(str(run_state.get("overlay_root") or ""))
-        expected_local_path = overlay_root / parent_key
-        try:
-            resolved_local_path = _path_inside_run_root(
-                root=overlay_root,
-                candidate=local_path,
-                label=f"final staged object {parent_key}",
-            )
-            safe_local_path = (
-                not local_path.is_symlink()
-                and resolved_local_path == expected_local_path.resolve(strict=True)
-            )
-        except (FileNotFoundError, OSError, ValueError):
-            safe_local_path = False
-            resolved_local_path = local_path
-        body = (
-            resolved_local_path.read_bytes()
-            if safe_local_path and resolved_local_path.is_file()
-            else None
-        )
+        body = local_path.read_bytes() if local_path.is_file() else None
         declared_sha256 = str(entry.get("sha256") or "").strip().lower()
         declared_bytes = entry.get("bytes")
         if (
@@ -26473,6 +22716,7 @@ def validate_proposal_run_state_transition(
                         else None
                     ),
                 )
+
         completed_objects += 1
         progress.progress(completed_objects)
 
@@ -26492,45 +22736,79 @@ def validate_proposal_run_state_transition(
     return result
 
 
-def _require_complete_persisted_file_backed_proposal(
+def _is_dedicated_sos_light_v2_run_state(
+    run_state: Mapping[str, Any],
+) -> bool:
+    return (
+        run_state.get("execution_path") == SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH
+        and run_state.get("mode") == "sos-light"
+        and run_state.get("dedicated_sos_historical_replacement") is True
+        and run_state.get("mutation_connector_ids") == [1]
+        and run_state.get("selected_mutation_connector_ids") == [1]
+    )
+
+
+def _require_complete_v2_sos_light_staging(
+    run_state: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    staging = run_state.get("sos_light_v2_proposal_staging")
+    if (
+        not isinstance(staging, Mapping)
+        or staging.get("contract_version") != SOS_LIGHT_V2_STAGING_CONTRACT
+        or staging.get("status") != "complete"
+        or staging.get("node_apply_launch_permitted") is not False
+        or not isinstance(staging.get("completed_object_count"), int)
+        or isinstance(staging.get("completed_object_count"), bool)
+        or staging.get("completed_object_count") != staging.get("total_object_count")
+        or staging.get("completed_object_count")
+        != len(dict(run_state.get("objects") or {}))
+    ):
+        raise ValueError(
+            "fixed-v2 SOS-light proposal staging checkpoint is incomplete"
+        )
+    provenance = run_state.get("final_staged_write_set_provenance")
+    if (
+        not isinstance(provenance, Mapping)
+        or provenance.get("status") != "finalised"
+        or provenance.get("final_staged_object_count")
+        != len(dict(run_state.get("objects") or {}))
+        or staging.get("final_provenance_status") != "complete"
+        or staging.get("python_transition_validation_status") != "not_started"
+        or staging.get("persisted_state_equality_status") != "not_checked"
+    ):
+        raise ValueError(
+            "fixed-v2 SOS-light final staged write-set provenance is incomplete"
+        )
+    return staging
+
+
+def _v2_sos_light_persisted_equality_projection(
+    run_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    staging = _require_complete_v2_sos_light_staging(run_state)
+    return {
+        "staging": json.loads(json.dumps(staging, sort_keys=True, default=str)),
+        "transition_authority": _proposal_transition_state_fingerprint_payload(
+            run_state
+        ),
+    }
+
+
+def _require_v2_sos_light_persisted_state_equality(
     run_state: Mapping[str, Any],
 ) -> None:
-    transport = run_state.get("proposal_transport")
-    if (
-        not isinstance(transport, Mapping)
-        or transport.get("transport_mode") != "file_backed_compact_proposal"
-    ):
-        return
-    ingestion = run_state.get("proposal_ingestion")
-    if (
-        not isinstance(ingestion, Mapping)
-        or ingestion.get("status") != "complete"
-        or ingestion.get("node_apply_launch_permitted") is not False
-        or ingestion.get("completed_object_count")
-        != ingestion.get("total_object_count")
-    ):
-        raise ValueError(
-            "fixed-v3 proposal ingestion has no complete fail-closed checkpoint"
-        )
-    final_provenance = run_state.get("final_staged_write_set_provenance")
-    if (
-        not isinstance(final_provenance, Mapping)
-        or final_provenance.get("status") != "finalised"
-    ):
-        raise ValueError(
-            "fixed-v3 final staged write-set provenance is not finalised"
-        )
     state_path = Path(str(run_state.get("run_state_path") or ""))
     try:
         persisted = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(
-            "fixed-v3 complete final run-state checkpoint is unavailable"
+            "fixed-v2 SOS-light complete final run-state checkpoint is unavailable"
         ) from exc
-    current = json.loads(json.dumps(run_state, default=str))
-    if persisted != current:
+    current_projection = _v2_sos_light_persisted_equality_projection(run_state)
+    persisted_projection = _v2_sos_light_persisted_equality_projection(persisted)
+    if persisted_projection != current_projection:
         raise ValueError(
-            "fixed-v3 complete final run-state checkpoint is stale"
+            "fixed-v2 SOS-light complete final run-state checkpoint is stale"
         )
 
 
@@ -26540,27 +22818,29 @@ def run_canonical_apply_executor(
     env: Mapping[str, str],
     log: logging.Logger,
 ) -> dict[str, Any]:
-    try:
-        _require_complete_persisted_file_backed_proposal(run_state)
-    except (OSError, TypeError, ValueError) as exc:
-        error = str(exc)
-        run_state["proposal_transition_validation"] = {
-            "status": "failed",
-            "stage": "complete_final_run_state_checkpoint",
-            "error": error,
-            "node_apply_launch_permitted": False,
-            "r2_mutation_possible": False,
-            "validated_at_utc": fmt_iso(utc_now()),
-        }
-        write_run_state(run_state)
-        log.error("%s", error)
-        return {
-            "status": "failed",
-            "reason": "complete_final_run_state_checkpoint_invalid",
-            "error": error,
-            "node_apply_launched": False,
-            "r2_mutation_possible": False,
-        }
+    dedicated_sos_light_v2 = _is_dedicated_sos_light_v2_run_state(run_state)
+    if dedicated_sos_light_v2:
+        try:
+            _require_complete_v2_sos_light_staging(run_state)
+        except (OSError, TypeError, ValueError) as exc:
+            error = str(exc)
+            run_state["proposal_transition_validation"] = {
+                "status": "failed",
+                "stage": "complete_v2_sos_light_staging",
+                "error": error,
+                "node_apply_launch_permitted": False,
+                "r2_mutation_possible": False,
+                "validated_at_utc": fmt_iso(utc_now()),
+            }
+            write_run_state(run_state)
+            log.error("%s", error)
+            return {
+                "status": "failed",
+                "reason": "complete_v2_sos_light_staging_invalid",
+                "error": error,
+                "node_apply_launched": False,
+                "r2_mutation_possible": False,
+            }
     try:
         validate_run_state_core_snapshot_identity(
             run_state,
@@ -26585,23 +22865,48 @@ def run_canonical_apply_executor(
             "node_apply_launched": False,
             "r2_mutation_possible": False,
         }
-    transport = run_state.get("proposal_transport")
-    if (
-        isinstance(transport, Mapping)
-        and transport.get("transport_mode")
-        == "file_backed_compact_proposal"
-    ):
-        # Core identity validation records its consumer audit in memory.  Freeze
-        # that final pre-transition state before the body/provenance pass.
+    if dedicated_sos_light_v2:
+        # Core validation may add consumer audit evidence, which is deliberately
+        # outside the transition-authoritative projection. Compare against the
+        # already persisted final checkpoint before writing any current state.
+        try:
+            _require_v2_sos_light_persisted_state_equality(run_state)
+        except (OSError, TypeError, ValueError) as exc:
+            error = str(exc)
+            staging = run_state.get("sos_light_v2_proposal_staging")
+            if isinstance(staging, dict):
+                staging.update({
+                    "persisted_state_equality_status": "failed",
+                    "node_apply_launch_permitted": False,
+                })
+            run_state["proposal_transition_validation"] = {
+                "status": "failed",
+                "stage": "persisted_state_equality",
+                "error": error,
+                "node_apply_launch_permitted": False,
+                "r2_mutation_possible": False,
+                "validated_at_utc": fmt_iso(utc_now()),
+            }
+            write_run_state(run_state)
+            log.error("%s", error)
+            return {
+                "status": "failed",
+                "reason": "v2_sos_light_persisted_state_equality_failed",
+                "error": error,
+                "node_apply_launched": False,
+                "r2_mutation_possible": False,
+            }
+        staging = run_state["sos_light_v2_proposal_staging"]
+        staging["persisted_state_equality_status"] = "succeeded"
         write_run_state(run_state)
-        _require_complete_persisted_file_backed_proposal(run_state)
     try:
         transition_validation = validate_proposal_run_state_transition(
             run_state,
             log=log,
         )
-        transition_fingerprint = proposal_transition_state_fingerprint_sha256(
-            run_state
+        transition_fingerprint = (
+            proposal_transition_state_fingerprint_sha256(run_state)
+            if dedicated_sos_light_v2 else None
         )
     except (OSError, TypeError, ValueError) as exc:
         error = str(exc)
@@ -26611,6 +22916,12 @@ def run_canonical_apply_executor(
             "node_apply_launch_permitted": False,
             "validated_at_utc": fmt_iso(utc_now()),
         }
+        staging = run_state.get("sos_light_v2_proposal_staging")
+        if isinstance(staging, dict):
+            staging.update({
+                "python_transition_validation_status": "failed",
+                "node_apply_launch_permitted": False,
+            })
         write_run_state(run_state)
         log.error("%s", error)
         return {
@@ -26620,46 +22931,36 @@ def run_canonical_apply_executor(
             "node_apply_launched": False,
             "r2_mutation_possible": False,
         }
-    execution_path = str(run_state.get("execution_path") or "")
-    if execution_path == SOS_HISTORICAL_REPLACEMENT_EXECUTION_PATH:
-        fingerprint_contract = SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT
-        node_entrypoint = "uk_aq_apply_sos_light_v3_proposal.mjs"
-    elif execution_path == "generic_integrity":
-        fingerprint_contract = (
-            GENERIC_INTEGRITY_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT
-        )
-        node_entrypoint = "uk_aq_apply_generic_v3_proposal.mjs"
-    else:
-        error = f"unsupported fixed-v3 execution path: {execution_path}"
-        run_state["proposal_transition_validation"] = {
-            "status": "failed",
-            "error": error,
-            "node_apply_launch_permitted": False,
-            "validated_at_utc": fmt_iso(utc_now()),
-        }
-        write_run_state(run_state)
-        return {
-            "status": "failed",
-            "reason": "fixed_v3_execution_path_invalid",
-            "error": error,
-            "node_apply_launched": False,
-            "r2_mutation_possible": False,
-        }
     run_state["proposal_transition_validation"] = {
         **transition_validation,
         "validated_at_utc": fmt_iso(utc_now()),
     }
-    run_state["proposal_transition_validation"].update({
-        "state_fingerprint_contract_version": fingerprint_contract,
-        "state_fingerprint_sha256": transition_fingerprint,
-        "node_apply_entrypoint": node_entrypoint,
-    })
+    if dedicated_sos_light_v2:
+        run_state["proposal_transition_validation"].update({
+            "state_fingerprint_contract_version":
+                SOS_LIGHT_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+            "state_fingerprint_sha256": transition_fingerprint,
+        })
+        staging = run_state["sos_light_v2_proposal_staging"]
+        staging.update({
+            "python_transition_validation_status": "succeeded",
+            "node_apply_launch_permitted": True,
+        })
     write_run_state(run_state)
+    if dedicated_sos_light_v2:
+        recovery_state_path = str(
+            run_state.get("fixed_v2_lock_recovery_state_path") or ""
+        ).strip()
+        if not recovery_state_path:
+            raise RuntimeError(
+                "fixed-v2 SOS-light Node APPLY requires durable lock-recovery authority"
+            )
+        _permit_fixed_v2_node_apply_launch(recovery_state_path)
     repo_root = _repo_root_for_integrity_script(env)
     node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
     command = [
         node_bin,
-        str(repo_root / "scripts/backup_r2" / node_entrypoint),
+        str(repo_root / "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs"),
         "--run-state-json", str(run_state["run_state_path"]),
         "--write-r2",
     ]
@@ -26884,6 +23185,459 @@ def observations_global_operation_lock_context(
 
 INTEGRITY_LOGICAL_RUN_CONTEXT_ENV = "UK_AQ_INTEGRITY_LOGICAL_RUN_CONTEXT"
 INTEGRITY_LOGICAL_RUN_CONTEXT_VERSION = 1
+FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE = "fixed-v2-sos-light-pre-mutation"
+FIXED_V2_SOS_LIGHT_RECOVERY_CONTRACT = (
+    "uk_aq_sos_light_v2_pre_mutation_lock_recovery_v1"
+)
+FIXED_V2_SOS_LIGHT_RECOVERY_STATE_ENV = (
+    "UK_AQ_FIXED_V2_SOS_LIGHT_LOCK_RECOVERY_STATE_PATH"
+)
+FIXED_V2_SOS_LIGHT_RECOVERY_REENTRY_ENV = (
+    "UK_AQ_FIXED_V2_SOS_LIGHT_LOCK_RECOVERY_REENTRY"
+)
+FIXED_V2_SOS_LIGHT_RECOVERY_GENERATION_ENV = (
+    "UK_AQ_FIXED_V2_SOS_LIGHT_LOCK_RECOVERY_GENERATION"
+)
+
+
+def _atomic_write_fixed_v2_recovery_state(
+    state_path: str | Path,
+    state: Mapping[str, Any],
+) -> None:
+    path = Path(state_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(state, handle, indent=2, sort_keys=True, default=str)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _read_fixed_v2_recovery_state(state_path: str | Path) -> dict[str, Any]:
+    try:
+        state = json.loads(Path(state_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "fixed-v2 SOS-light recovery authority is unavailable or invalid"
+        ) from exc
+    if (
+        not isinstance(state, dict)
+        or state.get("contract_version")
+        != FIXED_V2_SOS_LIGHT_RECOVERY_CONTRACT
+        or state.get("profile") != FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE
+        or state.get("generation") != "v2"
+        or state.get("authority_status") != "complete"
+        or not isinstance(state.get("logical_run"), dict)
+        or not isinstance(state.get("r2_mutation_started"), bool)
+    ):
+        raise RuntimeError(
+            "fixed-v2 SOS-light recovery authority is incomplete or contradictory"
+        )
+    return state
+
+
+def _writer_run_matches_logical_identity(
+    run: Mapping[str, Any],
+    *,
+    daily_task_health_run_id: str | None,
+    platform_run_id: str,
+    integrity_run_id: int | None = None,
+    environment: str | None = None,
+) -> bool:
+    summary = run.get("summary")
+    summary = summary if isinstance(summary, Mapping) else {}
+    actual_health_run_id = str(
+        run.get("run_id") or run.get("id") or ""
+    ).strip()
+    expected_health_run_id = str(daily_task_health_run_id or "").strip()
+    if expected_health_run_id:
+        return actual_health_run_id == expected_health_run_id
+
+    actual_platform_run_id = str(
+        run.get("platform_run_id")
+        or run.get("external_run_id")
+        or summary.get("platform_run_id")
+        or ""
+    ).strip()
+    expected_platform_run_id = str(platform_run_id or "").strip()
+    if expected_platform_run_id and actual_platform_run_id:
+        return actual_platform_run_id == expected_platform_run_id
+
+    actual_integrity_run_id = summary.get("integrity_run_id")
+    actual_environment = str(summary.get("env") or "").strip()
+    return bool(
+        integrity_run_id is not None
+        and actual_integrity_run_id is not None
+        and str(actual_integrity_run_id) == str(integrity_run_id)
+        and str(environment or "").strip()
+        and actual_environment == str(environment).strip()
+    )
+
+
+def _fixed_v2_recovery_self_writer_context(
+    recovery_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    logical_run = recovery_state.get("logical_run")
+    writer_watermarks = recovery_state.get("writer_watermarks")
+    if not isinstance(logical_run, Mapping) or not isinstance(
+        writer_watermarks, Mapping
+    ):
+        raise RuntimeError(
+            "fixed-v2 recovery self-writer authority is unavailable"
+        )
+    original_integrity_watermark = writer_watermarks.get(
+        "ops.history_integrity"
+    )
+    if not isinstance(original_integrity_watermark, Mapping):
+        raise RuntimeError(
+            "fixed-v2 recovery self-writer watermark is unavailable"
+        )
+    return {
+        "daily_task_health_run_id": logical_run.get(
+            "daily_task_health_run_id"
+        ),
+        "platform_run_id": logical_run.get("platform_run_id"),
+        "integrity_run_id": logical_run.get("integrity_run_id"),
+        "environment": logical_run.get("environment"),
+        "original_history_integrity_watermark": json.loads(json.dumps(
+            original_integrity_watermark,
+            sort_keys=True,
+            default=str,
+        )),
+    }
+
+
+def _normalise_recovery_self_writer_runs(
+    writer_runs: Iterable[Mapping[str, Any]],
+    recovery_self_writer: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    normalised = json.loads(json.dumps(
+        list(writer_runs), sort_keys=True, default=str,
+    ))
+    audit: dict[str, Any] = {
+        "running_run": None,
+        "latest_finished_run": None,
+    }
+    for writer in normalised:
+        if writer.get("task_key") != "ops.history_integrity":
+            continue
+        for field in ("running_run", "latest_finished_run"):
+            candidate = writer.get(field)
+            if not isinstance(candidate, Mapping):
+                continue
+            if not _writer_run_matches_logical_identity(
+                candidate,
+                daily_task_health_run_id=recovery_self_writer.get(
+                    "daily_task_health_run_id"
+                ),
+                platform_run_id=str(
+                    recovery_self_writer.get("platform_run_id") or ""
+                ),
+                integrity_run_id=recovery_self_writer.get("integrity_run_id"),
+                environment=str(
+                    recovery_self_writer.get("environment") or ""
+                ),
+            ):
+                continue
+            audit[field] = json.loads(json.dumps(
+                candidate, sort_keys=True, default=str,
+            ))
+            if field == "running_run":
+                writer["running_run"] = None
+                writer["is_running"] = False
+            else:
+                original = recovery_self_writer.get(
+                    "original_history_integrity_watermark"
+                )
+                if not isinstance(original, Mapping):
+                    raise RuntimeError(
+                        "fixed-v2 recovery original Integrity watermark is invalid"
+                    )
+                writer["latest_finished_run"] = json.loads(json.dumps(
+                    original.get("latest_finished_run"),
+                    sort_keys=True,
+                    default=str,
+                ))
+    return normalised, audit
+
+
+def _fixed_v2_writer_watermarks(
+    backup_readiness: Mapping[str, Any],
+    *,
+    daily_task_health_run_id: str | None,
+    platform_run_id: str,
+) -> dict[str, Any]:
+    expected = {
+        "ops.prune_daily",
+        "ops.r2_core_snapshot",
+        "ops.history_integrity",
+    }
+    entries = list(backup_readiness.get("writer_runs") or [])
+    if (
+        len(entries) != len(expected)
+        or {
+            str(entry.get("task_key") or "")
+            for entry in entries if isinstance(entry, Mapping)
+        } != expected
+    ):
+        raise RuntimeError("fixed-v2 SOS-light writer watermarks are incomplete")
+    result: dict[str, Any] = {}
+    for entry in entries:
+        task_key = str(entry["task_key"])
+        latest = entry.get("latest_finished_run")
+        running = entry.get("running_run")
+        if latest is not None and not isinstance(latest, Mapping):
+            raise RuntimeError("fixed-v2 SOS-light writer watermark is invalid")
+        if running is not None and not isinstance(running, Mapping):
+            raise RuntimeError("fixed-v2 SOS-light running-writer evidence is invalid")
+        own_running = bool(
+            task_key == "ops.history_integrity"
+            and isinstance(running, Mapping)
+            and _writer_run_matches_logical_identity(
+                running,
+                daily_task_health_run_id=daily_task_health_run_id,
+                platform_run_id=platform_run_id,
+            )
+        )
+        result[task_key] = {
+            "latest_finished_run": (
+                json.loads(json.dumps(latest, sort_keys=True, default=str))
+                if isinstance(latest, Mapping) else None
+            ),
+            "running_run": (
+                None if own_running else
+                json.loads(json.dumps(running, sort_keys=True, default=str))
+                if isinstance(running, Mapping) else None
+            ),
+        }
+    return result
+
+
+def _fixed_v2_recovery_authority_projection(
+    *,
+    args: argparse.Namespace,
+    started_iso: str,
+    run_compact: str,
+    integrity_run_id: int,
+    daily_task_health_run_id: str | None,
+    platform_run_id: str,
+    requested_from_day: str,
+    requested_to_day: str,
+    global_operation_lock: Mapping[str, Any],
+    backup_readiness: Mapping[str, Any],
+    dropbox_currentness: Mapping[str, Any],
+    core_snapshot_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    checkpoint = dropbox_currentness.get("checkpoint")
+    live_root = dropbox_currentness.get("live_observations_root")
+    if (
+        not backup_readiness.get("backup_ready")
+        or not isinstance(checkpoint, Mapping)
+        or not isinstance(live_root, Mapping)
+        or dropbox_currentness.get("checkpoint_live_root_match") is not True
+    ):
+        raise RuntimeError(
+            "fixed-v2 SOS-light recovery authority cannot be pinned from incomplete Step 0"
+        )
+    dropbox_hash = str(
+        checkpoint.get("observations_processed_source_root_hash") or ""
+    )
+    live_hash = str(live_root.get("content_hash") or "")
+    if not dropbox_hash or dropbox_hash != live_hash:
+        raise RuntimeError("fixed-v2 SOS-light recovery root authority is invalid")
+    return {
+        "logical_run": {
+            "environment": args.env,
+            "started_at_utc": started_iso,
+            "run_compact": run_compact,
+            "lock_run_id": f"integrity:{args.env}:{run_compact}",
+            "integrity_run_id": int(integrity_run_id),
+            "daily_task_health_run_id": daily_task_health_run_id,
+            "platform_run_id": platform_run_id,
+        },
+        "request": {
+            "source": args.source,
+            "from_day": requested_from_day,
+            "to_day": requested_to_day,
+            "repair_pollutants": sorted(args.repair_pollutants),
+            "run_backfill": bool(args.run_backfill),
+            "dry_run": bool(args.dry_run),
+            "check_only": bool(args.check_only),
+        },
+        "generation": "v2",
+        "backup": {
+            key: backup_readiness.get(key)
+            for key in (
+                "backup_run_id",
+                "backup_started_at",
+                "backup_finished_at",
+            )
+        },
+        "checkpoint": json.loads(json.dumps(
+            checkpoint, sort_keys=True, default=str,
+        )),
+        "observations_roots": {
+            "dropbox_content_hash": dropbox_hash,
+            "live_r2_content_hash": live_hash,
+            "equal": True,
+        },
+        "writer_watermarks": _fixed_v2_writer_watermarks(
+            backup_readiness,
+            daily_task_health_run_id=daily_task_health_run_id,
+            platform_run_id=platform_run_id,
+        ),
+        "core_snapshot_identity": _normalise_core_snapshot_identity(
+            core_snapshot_identity,
+            stage="fixed_v2_lock_recovery_authority",
+        ),
+        "lock_session": {
+            key: global_operation_lock.get(key)
+            for key in (
+                "logical_identity", "run_id", "nonce", "wait_ms", "outcome"
+            )
+        },
+    }
+
+
+def _initialise_fixed_v2_recovery_state(
+    state_path: str | Path,
+    authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    state = {
+        "contract_version": FIXED_V2_SOS_LIGHT_RECOVERY_CONTRACT,
+        "profile": FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE,
+        "authority_status": "complete",
+        **json.loads(json.dumps(authority, sort_keys=True, default=str)),
+        "r2_mutation_started": False,
+        "r2_mutation_started_at_utc": None,
+        "automatic_lock_recovery_permitted": True,
+        "resume": "permitted",
+        "node_apply_launch_permitted": False,
+        "r2_mutation_possible": False,
+        "recovery": {
+            "recovery_generation": 0,
+            "lock_loss_count": 0,
+            "reacquire_attempt_count": 0,
+            "outcome": "not_required",
+            "gate_results": [],
+        },
+    }
+    _atomic_write_fixed_v2_recovery_state(state_path, state)
+    return state
+
+
+def _revalidate_fixed_v2_recovery_state(
+    state_path: str | Path,
+    current_authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    state = _read_fixed_v2_recovery_state(state_path)
+    original = {
+        key: state.get(key)
+        for key in (
+            "logical_run", "request", "generation", "backup", "checkpoint",
+            "observations_roots", "writer_watermarks", "core_snapshot_identity",
+        )
+    }
+    current = json.loads(json.dumps(
+        current_authority, sort_keys=True, default=str,
+    ))
+    gate_results: list[dict[str, Any]] = []
+    for key in (
+        "logical_run", "request", "generation", "backup", "checkpoint",
+        "observations_roots", "writer_watermarks", "core_snapshot_identity",
+    ):
+        gate_results.append({
+            "gate": key,
+            "status": "succeeded" if original[key] == current[key] else "changed",
+        })
+    active_different_writers = [
+        task_key
+        for task_key, watermark in dict(current["writer_watermarks"]).items()
+        if isinstance(watermark, Mapping)
+        and watermark.get("running_run") is not None
+    ]
+    gate_results.append({
+        "gate": "no_incompatible_active_writer",
+        "status": "succeeded" if not active_different_writers else "changed",
+        "task_keys": active_different_writers,
+    })
+    mutation_unchanged = state.get("r2_mutation_started") is False
+    gate_results.append({
+        "gate": "r2_mutation_started",
+        "status": "succeeded" if mutation_unchanged else "uncertain",
+    })
+    changed = any(item["status"] == "changed" for item in gate_results)
+    uncertain = any(item["status"] == "uncertain" for item in gate_results)
+    recovery = state.setdefault("recovery", {})
+    recovery["gate_results"] = gate_results
+    recovery["rechecked_authority"] = current
+    recovery["finished_at_utc"] = fmt_iso(utc_now())
+    if changed or uncertain:
+        recovery["outcome"] = (
+            "blocked_authority_changed" if changed
+            else "blocked_authority_uncertain"
+        )
+        state["resume"] = "forbidden"
+        state["node_apply_launch_permitted"] = False
+        state["r2_mutation_possible"] = False
+        _atomic_write_fixed_v2_recovery_state(state_path, state)
+        raise RuntimeError(
+            "fixed-v2 SOS-light lock recovery authority changed or is uncertain"
+        )
+    recovery["outcome"] = "resumed"
+    state["resume"] = "permitted"
+    state["node_apply_launch_permitted"] = False
+    state["r2_mutation_possible"] = False
+    _atomic_write_fixed_v2_recovery_state(state_path, state)
+    return state
+
+
+def _block_fixed_v2_recovery_state(
+    state_path: str | Path,
+    *,
+    outcome: str,
+    reason: str,
+) -> None:
+    state = _read_fixed_v2_recovery_state(state_path)
+    recovery = state.setdefault("recovery", {})
+    recovery.update({
+        "outcome": outcome,
+        "finished_at_utc": fmt_iso(utc_now()),
+        "error": reason,
+    })
+    state["resume"] = "forbidden"
+    state["node_apply_launch_permitted"] = False
+    state["r2_mutation_possible"] = False
+    _atomic_write_fixed_v2_recovery_state(state_path, state)
+
+
+def _permit_fixed_v2_node_apply_launch(
+    state_path: str | Path,
+) -> dict[str, Any]:
+    state = _read_fixed_v2_recovery_state(state_path)
+    if (
+        state.get("resume") != "permitted"
+        or state.get("r2_mutation_started") is not False
+        or state.get("recovery", {}).get("outcome")
+        not in {"not_required", "resumed"}
+    ):
+        raise RuntimeError(
+            "fixed-v2 SOS-light recovery state does not permit Node APPLY launch"
+        )
+    state["node_apply_launch_permitted"] = True
+    state["r2_mutation_possible"] = True
+    state.setdefault("recovery", {})[
+        "node_apply_launch_permitted_at_utc"
+    ] = fmt_iso(utc_now())
+    _atomic_write_fixed_v2_recovery_state(state_path, state)
+    return state
 
 
 def build_integrity_logical_run_context(
@@ -26911,8 +23665,8 @@ def inherited_integrity_logical_run_context(
 ) -> dict[str, Any] | None:
     raw = str(env.get(INTEGRITY_LOGICAL_RUN_CONTEXT_ENV) or "").strip()
     if not global_operation_lock.get("valid"):
-        # A top-level invocation always creates a fresh identity. In particular,
-        # stale caller environment cannot opt itself into an earlier run.
+        # Only a retained-lock child may inherit context. A stale variable in
+        # an ordinary top-level shell must never reuse an earlier identity.
         return None
     if not raw:
         raise RuntimeError(
@@ -26959,10 +23713,7 @@ def inherited_integrity_logical_run_context(
         raise RuntimeError(
             "Integrity retained-lock child logical run context identity disagrees"
         )
-    return {
-        **payload,
-        "started_at": started_at,
-    }
+    return {**payload, "started_at": started_at}
 
 
 def run_integrity_under_global_operation_lock(
@@ -26973,6 +23724,7 @@ def run_integrity_under_global_operation_lock(
     run_compact: str,
     started_at_utc: str,
     log_path: str | Path,
+    fixed_v2_recovery_enabled: bool = False,
 ) -> int:
     repo_root = _repo_root_for_integrity_script(env)
     node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
@@ -26982,6 +23734,19 @@ def run_integrity_under_global_operation_lock(
             "SUPABASE_DB_URL (or DATABASE_URL) is required for the Integrity observations global operation lock"
         )
     lock_run_id = f"integrity:{args.env}:{run_compact}"
+    recovery_state_path = (
+        Path(env["UK_AQ_HISTORY_INTEGRITY_TMP_DIR"])
+        / "fixed-v2-sos-light-lock-recovery"
+        / f"{run_compact}.json"
+        if fixed_v2_recovery_enabled else None
+    )
+    recovery_options = (
+        [
+            "--recovery-profile", FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE,
+            "--recovery-state-json", str(recovery_state_path),
+        ]
+        if fixed_v2_recovery_enabled else []
+    )
     command = [
         node_bin,
         str(
@@ -26990,6 +23755,7 @@ def run_integrity_under_global_operation_lock(
         ),
         "--owner", "integrity",
         "--run-id", lock_run_id,
+        *recovery_options,
         "--",
         sys.executable,
         str(Path(__file__).resolve()),
@@ -27014,19 +23780,13 @@ def run_integrity_under_global_operation_lock(
                 sort_keys=True,
                 separators=(",", ":"),
             ),
+            **(
+                {FIXED_V2_SOS_LIGHT_RECOVERY_STATE_ENV: str(recovery_state_path)}
+                if fixed_v2_recovery_enabled else {}
+            ),
         },
         check=False,
     )
-    if args.env == "TEST" and args.run_backfill and not args.dry_run and not args.check_only:
-        try:
-            deliver_after_lock(
-                state_path=Path(env["UK_AQ_HISTORY_INTEGRITY_TMP_DIR"]) / f"run-{run_compact}" / "run-state.json",
-                settings={**os.environ, **{str(key): str(value) for key, value in env.items()}},
-                log_path=Path(log_path),
-                report_path=Path(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"]) / f"{run_compact}-summary.json",
-            )
-        except Exception as exc:
-            sys.stderr.write(f"History cache delivery remains pending ({type(exc).__name__}); repair exit status preserved.\n")
     return int(completed.returncode)
 
 
@@ -27047,7 +23807,7 @@ def run_integrity_dropbox_currentness_gate(
             / "scripts/backup_r2/uk_aq_check_integrity_dropbox_currentness.mjs"
         ),
         "--dropbox-root", str(dropbox_root),
-        "--observation-generation", "v3",
+        "--observation-generation", "v2",
         "--observations-prefix", observations_prefix,
         "--timeseries-binding-backup-mode", timeseries_binding_backup_mode,
     ]
@@ -28675,41 +25435,14 @@ def summarize_ordered_apply_verification(
         })
     written_keys: list[str] = []
     verification_evidence: list[dict[str, Any]] = []
-    persistence_contract = str(
-        ((run_state.get("apply") or {}).get("persistence") or {}).get(
-            "contract_version"
-        )
-        or ""
-    )
-    if persistence_contract == SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT:
-        ordered_entries = [
-            (
-                str(entry.get("object_key") or ""),
-                {
-                    **dict(entry),
-                    "proposed": True,
-                },
-            )
-            for entry in list(
-                (run_state.get("apply") or {}).get(
-                    "v3_publication_evidence"
-                )
-                or []
-            )
-            if isinstance(entry, Mapping)
-        ]
-    else:
-        ordered_entries = sorted(
-            dict(run_state.get("objects") or {}).items()
-        )
-    for object_key, raw_entry in ordered_entries:
+    for object_key, raw_entry in sorted(dict(run_state.get("objects") or {}).items()):
         if not isinstance(raw_entry, Mapping) or not raw_entry.get("proposed"):
             continue
         entry = dict(raw_entry)
         get_count = int(entry.get("post_put_verification_get_count") or 0)
         evidence = {
             "object_key": object_key,
-            "bytes": entry.get("bytes", entry.get("byte_size")),
+            "bytes": entry.get("bytes"),
             "sha256": entry.get("sha256"),
             "uploaded": bool(entry.get("uploaded")),
             "r2_verified": bool(entry.get("r2_verified")),
@@ -28721,17 +25454,6 @@ def summarize_ordered_apply_verification(
             "final_live_sha256": entry.get("final_live_sha256"),
         }
         verification_evidence.append(evidence)
-        if persistence_contract == SOS_LIGHT_V3_APPLY_PERSISTENCE_CONTRACT and (
-            evidence["r2_verified"]
-            and get_count == 1
-            and (
-                evidence["uploaded"]
-                or evidence["skipped_unchanged"]
-            )
-        ):
-            if evidence["uploaded"]:
-                written_keys.append(str(object_key))
-            continue
         if (
             evidence["delegated_global_latest_finalization"]
             and evidence["skipped_unchanged"]
@@ -28878,7 +25600,6 @@ def run_v2_integrity_repair_flow(
     selected_days: Iterable[str] | None = None,
     repair_pollutants: Iterable[str] | None = None,
     dedicated_sos_historical_replacement: bool = False,
-    force_official_rdata_replacement: bool = False,
     protected_connector_ids: Iterable[int] | None = None,
     timeseries_binding_backup_mode: str = "individual",
     timeseries_binding_pack_root: Path | None = None,
@@ -28890,36 +25611,7 @@ def run_v2_integrity_repair_flow(
     )
     write_run_state(run_state)
     explicit_selected_partitions: list[dict[str, Any]] | None = None
-    explicit_official_force_partitions: list[dict[str, Any]] | None = None
-    if force_official_rdata_replacement:
-        if dry_run or dedicated_sos_historical_replacement:
-            raise RuntimeError("official RData force requires a write-enabled generic run")
-        source = str((source_scope or {}).get("source") or "")
-        connector_id = {"waqn": 9, "saqn": 10}.get(source)
-        if connector_id is None or allowed_connector_ids != {connector_id}:
-            raise RuntimeError("official RData force requires one WAQN or SAQN connector")
-        explicit_official_force_partitions = build_explicit_official_rdata_force_partitions(
-            from_day=from_day,
-            to_day=to_day,
-            selected_days=selected_days,
-            connector_id=connector_id,
-            repair_pollutants=repair_pollutants,
-        )
-        run_state.update({
-            "target_authority": "explicit_manual_force_replacement",
-            "explicit_official_force_replacement": True,
-            "explicit_official_force_partitions": explicit_official_force_partitions,
-            "explicit_selected_partition_count": len(explicit_official_force_partitions),
-            "gap_detection": {
-                "status": "bypassed_for_explicit_targets",
-                "reason": "explicit_manual_force_replacement",
-            },
-            "observation_content_hash_comparison": {
-                "status": "bypassed_for_explicit_targets",
-                "reason": "explicit_manual_force_replacement",
-            },
-        })
-        write_run_state(run_state)
+    proposal_staging: _SosLightV2ProposalStaging | None = None
     if dedicated_sos_historical_replacement:
         if dry_run:
             raise RuntimeError(
@@ -28966,6 +25658,10 @@ def run_v2_integrity_repair_flow(
                 "reason": "explicit_selected_scope_is_replacement_authority",
             },
         })
+        proposal_staging = _SosLightV2ProposalStaging(
+            run_state=run_state,
+            log=log,
+        )
         write_run_state(run_state)
     observations = run_v2_gap_backfills(
         conn=conn, run_id=run_id, env_name=env_name, run_compact=run_compact,
@@ -28974,8 +25670,13 @@ def run_v2_integrity_repair_flow(
         repair_pollutants=repair_pollutants,
         source_scope=source_scope,
         explicit_selected_partitions=explicit_selected_partitions,
-        explicit_official_force_partitions=explicit_official_force_partitions,
+        proposal_staging=proposal_staging,
     )
+    if proposal_staging is not None:
+        proposal_staging.persist_checkpoint(
+            phase="proposal_worker_complete",
+            final=False,
+        )
     observation_failed = bool(observations.get("v2_observation_repairs_failed") or observations.get("v2_observation_repairs_guard_failed"))
     metadata_actions = _v2_observation_metadata_actions(v2_observations)
     if dedicated_sos_historical_replacement:
@@ -29022,23 +25723,60 @@ def run_v2_integrity_repair_flow(
             action for action in metadata_actions
             if not suppress_all_unmapped_action(action)
         ]
-    metadata_actions = _merge_changed_observation_metadata_actions(
-        metadata_actions,
-        list(
-            (run_state.get("changed_scopes") or {}).get(
-                "OBSERVS_CHANGED"
-            ) or []
-        ),
-    )
-    if not dedicated_sos_historical_replacement:
-        metadata_actions = _merge_preserved_observation_metadata_actions(
-            metadata_actions,
-            observations.get("selected_partition_outcomes") or [],
+    empty_replacement_scopes = {
+        (str(scope.get("day_utc") or ""), int(scope.get("connector_id") or 0))
+        for scope in list((run_state.get("changed_scopes") or {}).get("OBSERVS_CHANGED") or [])
+        if isinstance(scope, Mapping) and not list(scope.get("pollutant_codes") or [])
+    }
+    metadata_actions = [
+        action for action in metadata_actions
+        if not (
+            str(action.get("kind") or "") == "observation_pollutant_manifest_repair"
+            and (str(action.get("day_utc") or ""), int(action.get("connector_id") or 0))
+            in empty_replacement_scopes
         )
+    ]
+    # A repaired leaf always makes its pollutant/connector/day metadata and
+    # targeted index eligible.  Keep one action set per day+connector so the
+    # executor writes each parent only after the full child set is final.
+    for scope in list((run_state.get("changed_scopes") or {}).get("OBSERVS_CHANGED") or []):
+        if not isinstance(scope, Mapping):
+            continue
+        day_utc = str(scope.get("day_utc") or "").strip()
+        connector_id = scope.get("connector_id")
+        base = {
+            "status": "planned",
+            "executes": False,
+            "data_changes_required": False,
+            "operator_action_required": False,
+            "history_version": "v2",
+            "domain": "observations",
+            "day_utc": day_utc,
+            "connector_id": connector_id,
+            "targeted_replacement_timeseries_ids": sorted({
+                int(timeseries_id)
+                for timeseries_id in list(scope.get("timeseries_ids") or [])
+                if str(timeseries_id).strip().isdigit() and int(timeseries_id) > 0
+            }),
+            "requires_index_rebuild": True,
+            "gap_types": ["observation_repaired"],
+        }
+        for pollutant_code in list(scope.get("pollutant_codes") or []):
+            metadata_actions.append({**base, "kind": "observation_pollutant_manifest_repair", "pollutant_code": pollutant_code})
+            metadata_actions.append({**base, "kind": "observation_index_repair", "pollutant_code": pollutant_code})
+        day_base = {
+            key: value for key, value in base.items()
+            if key not in {"connector_id", "pollutant_code"}
+        }
+        metadata_actions.extend([
+            {**base, "kind": "observation_connector_manifest_repair"},
+            {**day_base, "kind": "observation_day_manifest_repair"},
+        ])
+    metadata_actions = _dedupe_v2_repair_actions(metadata_actions)
     metadata = (
         {"status": "blocked_dependency", "reason": "observation_repair_failed", "results": []}
         if observation_failed else
-        _run_v3_observation_metadata_proposal(
+        _run_v2_observation_metadata_executor(
             env=env, actions=metadata_actions, dry_run=dry_run, log=log,
             run_state=run_state, conn=conn,
         )
@@ -29049,34 +25787,22 @@ def run_v2_integrity_repair_flow(
         run_state=run_state,
         executor_result=metadata,
         dry_run=dry_run,
-        require_file_backed_bodies=True,
+        proposal_staging=proposal_staging,
         log=log,
     )
-    generic_proposal_finalised = _finalise_generic_file_backed_proposal_if_ready(
-        run_state,
-        dedicated_sos_historical_replacement=(
-            dedicated_sos_historical_replacement
-        ),
-        observation_failed=observation_failed,
-        metadata=metadata,
-        log=log,
-    )
-    if not dedicated_sos_historical_replacement and not observation_failed and str(
-        metadata.get("status") or ""
-    ) not in {"failed", "blocked_dependency"}:
-        if run_state.get("objects") or any(
-            isinstance(entry, Mapping) and entry.get("proposed")
-            for entry in list(run_state.get("tombstone_prefixes") or [])
-        ):
-            _finalise_generic_integrity_selected_scope_authority(
-                run_state,
-                observations.get("selected_partition_outcomes") or [],
-                metadata_actions,
-            )
+    if proposal_staging is not None:
+        proposal_staging.persist_checkpoint(
+            phase="observation_metadata_staging_complete",
+            final=False,
+        )
     if dedicated_sos_historical_replacement and not observation_failed and str(
         metadata.get("status") or ""
     ) not in {"failed", "blocked_dependency"}:
-        assemble_sos_light_complete_days(run_state, log=log)
+        assemble_sos_light_complete_days(
+            run_state,
+            proposal_staging=proposal_staging,
+            log=log,
+        )
     observation_manifest_status = str(metadata.get("manifest_status") or metadata.get("status") or "not_run")
     observation_index_status = str(metadata.get("index_status") or metadata.get("status") or "not_run")
     proposal_failed = (
@@ -29163,14 +25889,6 @@ def run_v2_integrity_repair_flow(
         apply_result = {
             "status": "skipped_noop",
             "reason": "no_r2_operations_required",
-            "proposal_validation_status": (
-                "validated"
-                if observation_manifest_status in {"not_run", "planned", "succeeded", "ok", "validated"}
-                and observation_index_status in {"not_run", "planned", "succeeded", "ok", "validated"}
-                and metadata.get("exit_code") in (None, 0)
-                and (metadata.get("status") == "not_run" or generic_proposal_finalised)
-                else "failed"
-            ),
             "exit_code": 0,
             "output": {
                 "planned_writes": 0,
@@ -29185,27 +25903,10 @@ def run_v2_integrity_repair_flow(
             "reason": "repair_dry_run",
         }
     else:
-        if env_name == "TEST":
-            run_state["history_cache_generation"] = CURRENT_INTEGRITY_HISTORY_VERSION
-            try:
-                run_state["history_cache_plan"] = freeze_plan(
-                    run_state, CURRENT_INTEGRITY_HISTORY_VERSION,
-                    resolve_path=resolve_combined_local_path,
-                    load_rows=_observation_rows_from_local_parquet_for_shared_hash,
-                    node_bin=str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node"),
-                    preserved_outcomes=list(observations.get("selected_partition_outcomes") or []),
-                )
-            except Exception as exc:
-                run_state["history_cache_plan"] = {
-                    "status": "unresolved", "error": type(exc).__name__ + ":cache_plan_unavailable",
-                }
-            write_run_state(run_state)
         apply_result = run_canonical_apply_executor(run_state=run_state, env=env, log=log)
         record_integrity_object_operations(
             conn, run_id=run_id, run_state=run_state, log=log,
         )
-        if apply_result.get("status") == "succeeded":
-            pass
 
     if proposal_failed or apply_result.get("status") == "failed":
         first_value_at_reconciliation: dict[str, Any] = {
@@ -29311,27 +26012,7 @@ def run_v2_integrity_repair_flow(
             log=log,
             require_remote_state=not dry_run,
             repair_pollutants=repair_pollutants,
-            timeseries_binding_backup_mode=timeseries_binding_backup_mode,
-            timeseries_binding_pack_root=timeseries_binding_pack_root,
-            apply_result=apply_result,
-            planned_operation_counts=planned_operation_counts,
         )
-    # Persist verified publication independently before current-state reconciliation.
-    # Network delivery happens only in the outer invocation after the global lock exits.
-    if env_name == "TEST" and not dry_run:
-        run_state["history_cache_verified_final"] = dict(final_verification)
-        run_state["history_cache_verified_apply"] = {"status": apply_result.get("status")}
-        try:
-            run_state["history_cache_invalidation"] = prepare_verified_event(
-                run_state, final=final_verification, apply_result=apply_result, dry_run=dry_run,
-            )
-            write_run_state(run_state)
-        except Exception as exc:
-            run_state["history_cache_invalidation"] = {
-                "status": "pending", "retryable": True,
-                "error": type(exc).__name__ + ":cache_event_persistence_unavailable",
-            }
-            log.warning("History cache event remains pending (%s); verified repair criteria unchanged", type(exc).__name__)
     all_observation_repair_entries = [
         entry
         for entry in list(
@@ -29636,7 +26317,6 @@ def run_v2_integrity_repair_flow(
             "exact_tombstones_created"
         ),
         "canonical_apply": apply_result,
-        "history_cache_invalidation": run_state.get("history_cache_invalidation"),
         **apply_reporting,
         "latest_snapshot_auth_preflight": auth_preflight,
         "first_value_at_reconciliation": first_value_at_reconciliation,
@@ -29683,7 +26363,7 @@ def run_v2_integrity_repair_flow(
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="uk-aq-history-integrity",
-        description="UK-AQ SOS-light v3 History Integrity entrypoint (Phase 1).",
+        description="UK-AQ History Integrity entrypoint (Phase 1).",
     )
     p.add_argument("--env", required=True, choices=["TEST", "LIVE"])
     p.add_argument(
@@ -29707,21 +26387,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="UTC scheduled logical date (YYYY-MM-DD); daily profile retries reuse this identity.",
     )
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument(
-        "--check-only",
-        action="store_true",
-        help=(
-            "Detect changes and acquire diagnostic source evidence; do not "
-            "execute repairs or canonical writes."
-        ),
-    )
+    p.add_argument("--check-only", action="store_true",
+                   help="Detect changes; do not trigger backfill.")
     p.add_argument("--run-backfill", action="store_true",
                    help="Enable the ordered v2 repair flow after read-only detection.")
-    p.add_argument(
-        "--force-replace-selected",
-        action="store_true",
-        help="Explicit manual TEST WAQN/SAQN selected-pollutant physical replacement.",
-    )
     p.add_argument(
         "--repair-pollutants",
         default="",
@@ -29777,18 +26446,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=default_history_version,
         choices=list(HISTORY_VERSION_CHOICES),
         help=(
-            "Fixed SOS-light v3 history layout "
+            "R2 history layout version to check (v2 only) "
             f"(default {default_history_version!r}; env UK_AQ_R2_HISTORY_INTEGRITY_VERSION)."
         ),
     )
     p.add_argument(
         "--timeseries-binding-backup-mode",
         choices=["individual", "pack"],
-        default=None,
+        default="individual",
         help=(
-            "Physical Dropbox binding representation; defaults to pack for "
-            "sos, waqn, saqn and all in TEST, while other sources default to "
-            "individual. Fixed-v3 source=sos rejects individual mode."
+            "Physical Dropbox binding representation for source=sos "
+            "(default: individual)."
         ),
     )
     p.add_argument(
@@ -29822,28 +26490,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         p.error(
             "--check-only and --run-backfill cannot be used together.",
         )
-    if parsed.force_replace_selected and (
-        parsed.env != "TEST" or parsed.profile != "manual"
-        or parsed.source not in {"waqn", "saqn"}
-        or not parsed.from_day or not parsed.to_day
-        or not parsed.run_backfill or parsed.check_only or parsed.dry_run
-        or not parsed.repair_pollutants
-    ):
-        p.error(
-            "--force-replace-selected requires a write-enabled manual TEST "
-            "WAQN/SAQN run with explicit from/to days and repair pollutants"
-        )
     if parsed.env == "LIVE" and parsed.enable_historical_identity_repair:
         p.error("historical identity repair must remain disabled in LIVE")
-    if parsed.timeseries_binding_backup_mode is None:
-        if parsed.source == "sos":
-            parsed.timeseries_binding_backup_mode = "pack"
-        elif parsed.env == "TEST" and parsed.source in {"waqn", "saqn", "all"}:
-            parsed.timeseries_binding_backup_mode = "pack"
-        else:
-            parsed.timeseries_binding_backup_mode = "individual"
-    if parsed.source == "sos" and parsed.timeseries_binding_backup_mode != "pack":
-        p.error("fixed-v3 SOS-light source=sos requires packed Timeseries Binding backup state")
     if parsed.timeseries_binding_pack_root:
         pack_root = Path(parsed.timeseries_binding_pack_root)
         if parsed.timeseries_binding_backup_mode != "pack":
@@ -29858,11 +26506,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                 "--timeseries-binding-pack-root points at the other environment"
             )
     if parsed.timeseries_binding_backup_mode == "pack":
-        if parsed.source not in {"sos", "waqn", "saqn", "all"}:
-            p.error(
-                "pack binding mode is supported only with --source sos, "
-                "waqn, saqn, or all"
-            )
+        if parsed.source != "sos":
+            p.error("pack binding mode is currently supported only with --source sos")
         if parsed.env != "TEST":
             p.error("pack binding mode is currently TEST-only")
     return parsed
@@ -29916,11 +26561,7 @@ def select_sos_historical_replacement_route(
     requirements = {
         "source_sos": str(getattr(args, "source", "")) == "sos",
         "real_run_backfill": resolve_effective_mode(args) == "repair_apply",
-        "fixed_history_generation_v3": (
-            str(getattr(args, "history_version", ""))
-            == CURRENT_INTEGRITY_HISTORY_VERSION
-            == "v3"
-        ),
+        "history_version_v2": str(getattr(args, "history_version", "")) == "v2",
         "explicit_from_day": bool(str(getattr(args, "from_day", "") or "").strip()),
         "explicit_to_day": bool(str(getattr(args, "to_day", "") or "").strip()),
         "explicit_repair_pollutants": bool(
@@ -30009,6 +26650,7 @@ def check_dropbox_backup_ready(
     integrity_started_at_utc: str,
     allow_stale_dropbox: bool = False,
     rpc_name: str = "uk_aq_rpc_history_integrity_readiness",
+    recovery_self_writer: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "backup_gate_checked": True,
@@ -30105,6 +26747,44 @@ def check_dropbox_backup_ready(
         "latest_writer_finished_at",
     ):
         summary[key] = data.get(key)
+    recovery_self_evidence: dict[str, Any] | None = None
+    if recovery_self_writer is not None:
+        try:
+            writer_runs, recovery_self_evidence = (
+                _normalise_recovery_self_writer_runs(
+                    writer_runs,
+                    recovery_self_writer,
+                )
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            summary["blocked_reason"] = (
+                f"invalid_recovery_self_writer_context:{exc}"
+            )
+            return summary
+        summary["recovery_self_writer_evidence"] = recovery_self_evidence
+        if recovery_self_evidence.get("latest_finished_run") is not None:
+            completed_values = []
+            for writer_run in writer_runs:
+                latest = writer_run.get("latest_finished_run")
+                if not isinstance(latest, Mapping):
+                    continue
+                completed_raw = str(
+                    latest.get("completed_at")
+                    or latest.get("finished_at")
+                    or latest.get("failed_at")
+                    or ""
+                ).strip()
+                completed_at = _parse_iso_utc(completed_raw)
+                if completed_at is None:
+                    summary["blocked_reason"] = (
+                        "daily_task_health_query_returned_unexpected_shape"
+                    )
+                    return summary
+                completed_values.append((completed_at, completed_raw))
+            summary["latest_writer_finished_at"] = (
+                max(completed_values, key=lambda item: item[0])[1]
+                if completed_values else None
+            )
     summary["writer_runs"] = writer_runs
 
     if summary["running_backup_run"] is not None and not isinstance(summary["running_backup_run"], dict):
@@ -30127,7 +26807,22 @@ def check_dropbox_backup_ready(
             and bool(running_writer_keys)
             and running_writer_keys <= {"ops.prune_daily"}
         )
-        if not may_overlap_prune:
+        may_ignore_recovery_self_running = bool(
+            recovery_self_evidence
+            and recovery_self_evidence.get("running_run") is not None
+            and blocked_reason == "relevant_writer_running"
+            and running_writer_keys <= {"ops.prune_daily"}
+        )
+        may_ignore_recovery_self_finished = bool(
+            recovery_self_evidence
+            and recovery_self_evidence.get("latest_finished_run") is not None
+            and blocked_reason == "backup_started_before_latest_writer_finished"
+        )
+        if not (
+            may_overlap_prune
+            or may_ignore_recovery_self_running
+            or may_ignore_recovery_self_finished
+        ):
             summary["blocked_reason"] = blocked_reason
             return summary
 
@@ -30144,7 +26839,9 @@ def check_dropbox_backup_ready(
     if backup_finished_at >= integrity_started_at:
         summary["blocked_reason"] = "backup_finished_at_or_after_integrity_start"
         return summary
-    latest_writer_raw = str(data.get("latest_writer_finished_at") or "").strip()
+    latest_writer_raw = str(
+        summary.get("latest_writer_finished_at") or ""
+    ).strip()
     if latest_writer_raw:
         latest_writer_finished_at = _parse_iso_utc(latest_writer_raw)
         if latest_writer_finished_at is None:
@@ -30188,18 +26885,33 @@ def resolve_backup_gate_credentials(values: Mapping[str, Any] | None = None) -> 
     )
 
 
-def run_scheduled_backup_gate(args: argparse.Namespace, started_iso: str) -> dict[str, Any]:
+def run_scheduled_backup_gate(
+    args: argparse.Namespace,
+    started_iso: str,
+    *,
+    recovery_self_writer: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     supabase_url, service_role_key = resolve_backup_gate_credentials()
+    fixed_v2_sos_light_write_enabled = bool(
+        select_sos_historical_replacement_route(args).get("arguments_qualify")
+    )
     return check_dropbox_backup_ready(
         supabase_url=supabase_url,
         service_role_key=service_role_key,
         integrity_started_at_utc=started_iso,
-        allow_stale_dropbox=bool(args.allow_stale_dropbox and not args.run_backfill),
+        allow_stale_dropbox=bool(
+            args.allow_stale_dropbox
+            and not fixed_v2_sos_light_write_enabled
+        ),
         rpc_name=str(
             os.environ.get(
                 "UK_AQ_HISTORY_INTEGRITY_BACKUP_READINESS_RPC",
                 "uk_aq_rpc_history_integrity_readiness",
             )
+        ),
+        recovery_self_writer=(
+            recovery_self_writer
+            if fixed_v2_sos_light_write_enabled else None
         ),
     )
 
@@ -31062,7 +27774,7 @@ def collect_preflight_errors(
             )
 
         nested_wrapper = loaded_backfill_env.get("UK_AQ_BACKFILL_WRAPPER", "").strip()
-        wrapper_is_integrity = Path(wrapper_raw).name == "uk_aq_integrity_backfill_v3.sh" if wrapper_raw else False
+        wrapper_is_integrity = Path(wrapper_raw).name == "uk_aq_integrity_backfill.sh" if wrapper_raw else False
         if wrapper_is_integrity and not nested_wrapper:
             errors.append(
                 "UK_AQ_BACKFILL_WRAPPER in UK_AQ_BACKFILL_ENV_FILE is required when the integrity wrapper is used, but it is not set.",
@@ -31334,8 +28046,8 @@ class SingleLineProgress:
         self._active = False
 
 
-def _v3_dry_run_repair_proposal_verified(repair_flow: Mapping[str, Any]) -> bool:
-    """Report a verified local proposal without implying a LIVE apply."""
+def _v2_dry_run_repair_proposal_verified(repair_flow: Mapping[str, Any]) -> bool:
+    """Recognise a complete local proposal without claiming a LIVE repair."""
     apply = repair_flow.get("canonical_apply") or {}
     final = repair_flow.get("final_verification") or {}
     first_value_at = repair_flow.get("first_value_at_reconciliation") or {}
@@ -31362,16 +28074,20 @@ def _v3_dry_run_repair_proposal_verified(repair_flow: Mapping[str, Any]) -> bool
     )
 
 
-def _v3_dry_run_report_state(
-    *, pre_repair_status: str, pre_repair_gap_count: int,
+def _v2_dry_run_report_state(
+    *,
+    pre_repair_status: str,
+    pre_repair_gap_count: int,
     repair_flow: Mapping[str, Any],
     run_status: str,
 ) -> dict[str, Any]:
     final = repair_flow.get("final_verification") or {}
     remaining = final.get("remaining_gap_count")
     proposed_verified = (
-        final.get("ran") is True and final.get("status") == "planned"
-        and isinstance(remaining, int) and not isinstance(remaining, bool)
+        final.get("ran") is True
+        and final.get("status") == "planned"
+        and isinstance(remaining, int)
+        and not isinstance(remaining, bool)
         and remaining == 0
     )
     proposed_failed = (
@@ -31439,9 +28155,8 @@ def _v2_top_level_status_after_repair_planning(
         if dry_run_repair_verified is True:
             return "planned"
         return current_status
-    # Check-only has no repair phase.  Report observed differences in full,
-    # but do not turn a successfully completed diagnostic into a failed run
-    # merely because repairable differences remain.
+    if v2_gap_count > 0:
+        return "fail"
     return current_status
 
 
@@ -31468,7 +28183,6 @@ def open_db(db_path: str) -> sqlite3.Connection:
     ensure_columns(conn, "core_snapshot_imports", {
         "snapshot_day_utc": "TEXT",
         "bytes_read": "INTEGER DEFAULT 0",
-        "rows_observed_properties": "INTEGER DEFAULT 0",
         "rows_sos_site_ref_bridge": "INTEGER DEFAULT 0",
         "sos_site_ref_bridge_sha256": "TEXT",
     })
@@ -31896,7 +28610,7 @@ def setup_logging(log_dir: str, run_compact: str, verbose: bool) -> Path:
 
 def format_summary_md(s: dict[str, Any]) -> str:
     lines = [
-        f"# UK-AQ SOS-light v3 History Integrity run — {s['env']} / {s['profile']}",
+        f"# UK-AQ History Integrity run — {s['env']} / {s['profile']}",
         "",
         f"- Started:   {s['started_at_utc']}",
         f"- Finished:  {s.get('finished_at_utc', '')}",
@@ -31911,22 +28625,25 @@ def format_summary_md(s: dict[str, Any]) -> str:
         "",
     ]
 
-    if s.get("dry_run") and s.get("run_backfill") and "pre_repair_status" in s:
+    v2_state = (s.get("history_version_results") or {}).get("v2") or {}
+    if s.get("dry_run") and s.get("run_backfill") and "pre_repair_status" in v2_state:
+        pre_gap_count = v2_state.get("pre_repair_gap_count")
+        proposed_gap_count = v2_state.get("proposed_remaining_gap_count")
         lines.extend([
-            "## V3 repair dry-run outcome",
+            "## V2 repair dry-run outcome",
             "",
             (
                 "Dry run planned successfully."
                 if s.get("status") == "planned"
                 else "Dry-run repair did not complete successfully."
             ),
-            f"- Current LIVE before repair: {s.get('pre_repair_status')} / {s.get('pre_repair_gap_count')} gaps detected.",
-            f"- Proposed repaired state: {s.get('proposed_state_status')} / {s.get('proposed_remaining_gap_count')} remaining gaps.",
-            "- Repair applied: False.",
+            f"- Current LIVE before repair: {v2_state.get('pre_repair_status')} / {pre_gap_count} gaps detected.",
+            f"- Proposed repaired state: {v2_state.get('proposed_state_status')} / {proposed_gap_count} remaining gaps.",
+            f"- Repair applied: {bool(v2_state.get('repair_applied'))}.",
             (
                 "- LIVE gaps remain unresolved; no R2 changes were applied."
-                if s.get("live_state_status") == "unresolved"
-                else f"- LIVE state: {s.get('live_state_status')}."
+                if v2_state.get("live_state_status") == "unresolved"
+                else f"- LIVE state: {v2_state.get('live_state_status')}."
             ),
             "",
         ])
@@ -32165,7 +28882,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
     repair_flow = s.get("repair_flow") or {}
     if repair_flow:
         lines.extend([
-            "## Observation repair coordinator",
+            "## V2 repair coordinator",
             "",
             f"- Status: {repair_flow.get('status') or '(none)'}",
             f"- Execution path: {repair_flow.get('execution_path') or 'generic_integrity'}",
@@ -32322,8 +29039,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
             if persistence_artifacts:
                 lines.extend([
                     f"- Apply persistence evidence: {persistence_artifacts.get('status') or '(none)'}",
-                    f"- Apply persistence reason: {persistence_artifacts.get('reason') or '(none)'}",
-                    f"- Mutation journal required: {persistence_artifacts.get('mutation_journal_required', True)}",
                     f"- Mutation journal: {persistence_artifacts.get('mutation_journal_path') or '(none)'}",
                     f"- Mutation journal bytes: {int(persistence_artifacts.get('mutation_journal_bytes') or 0)}",
                     f"- Mutation journal SHA-256: {persistence_artifacts.get('mutation_journal_sha256') or '(none)'}",
@@ -32369,12 +29084,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 ),
                 "",
             ])
-    cache_delivery = repair_flow.get("history_cache_invalidation") or s.get("history_cache_invalidation")
-    if cache_delivery:
-        lines.extend(["", "## History cache invalidation", "",
-                      f"- Status: {cache_delivery.get('status')}",
-                      f"- Retry eligible: {cache_delivery.get('retryable', False)}",
-                      f"- Audit: {cache_delivery.get('event_path', '(pending event persistence)')}"])
     reported_current_state = s.get("current_state_reconciliation") or {}
     if reported_current_state and not repair_flow.get("current_state_reconciliation"):
         lines.extend([
@@ -32412,37 +29121,6 @@ def format_summary_md(s: dict[str, Any]) -> str:
                 f"- {source_key}: stations={int(entry.get('active_stations', 0))} "
                 f"timeseries={int(entry.get('active_timeseries', 0))}"
             )
-        lines.append("")
-
-    for official_source in ("waqn", "saqn"):
-        official = s.get(official_source) or {}
-        if not (official.get("ran") or official.get("skipped_reason")):
-            continue
-        lines.extend([
-            f"## {official_source.upper()} official RData",
-            "",
-            f"- Ran: {bool(official.get('ran'))}",
-            f"- Site-year files fetched: {int(official.get('site_year_files_fetched') or 0)}",
-            "- Site-year lifecycle no-coverage: "
-            f"{int(official.get('site_year_files_authoritative_no_coverage') or 0)}",
-            "- Site-year source artifacts unavailable: "
-            f"{int(official.get('site_year_files_source_unavailable') or 0)}",
-            f"- Indeterminate acquisitions: {int(official.get('site_year_files_indeterminate') or 0)}",
-            "- Unavailable binding scopes preserved/unverifiable: "
-            f"{int(official.get('source_unavailable_scope_count') or 0)}",
-        ])
-        for scope in list(official.get("source_unavailable_scopes") or [])[:50]:
-            lines.append(
-                "  - source artifact unavailable: "
-                f"site={scope.get('site_code')} year={scope.get('source_year')} "
-                f"day={scope.get('day_utc')} pollutant={scope.get('pollutant_code')} "
-                f"timeseries_id={scope.get('timeseries_id')} status=404 "
-                "canonical_windows="
-                f"{json.dumps(scope.get('canonical_unavailable_windows') or [], separators=(',', ':'))} "
-                "action=preserve_pinned_baseline_scope"
-            )
-        if official.get("skipped_reason"):
-            lines.append(f"- Skipped reason: {official['skipped_reason']}")
         lines.append("")
 
     sc = s.get("sensor_community") or {}
@@ -32935,6 +29613,7 @@ def format_summary_md(s: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+
 def write_reports(
     report_dir: str,
     run_compact: str,
@@ -32952,9 +29631,27 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     effective_mode = resolve_effective_mode(args)
     sos_historical_route = select_sos_historical_replacement_route(args)
+    fixed_v2_sos_light_write_enabled = bool(
+        sos_historical_route.get("arguments_qualify")
+    )
+    recovery_state_path_raw = str(
+        os.environ.get(FIXED_V2_SOS_LIGHT_RECOVERY_STATE_ENV) or ""
+    ).strip()
+    fixed_v2_recovery_reentry = (
+        str(os.environ.get(FIXED_V2_SOS_LIGHT_RECOVERY_REENTRY_ENV) or "")
+        .strip().lower() == "true"
+    )
+    fixed_v2_recovery_state: dict[str, Any] | None = None
+    if fixed_v2_recovery_reentry:
+        if not fixed_v2_sos_light_write_enabled or not recovery_state_path_raw:
+            raise RuntimeError(
+                "fixed-v2 SOS-light recovery re-entry is not valid for this request"
+            )
+        fixed_v2_recovery_state = _read_fixed_v2_recovery_state(
+            recovery_state_path_raw
+        )
     dedicated_sos_historical_replacement = False
     env = load_env_or_die()
-    resolve_and_pin_integrity_target_writer_git_sha(env)
     protected_connector_ids = (
         resolve_protected_connector_ids(os.environ)
         if sos_historical_route.get("arguments_qualify") else None
@@ -32963,9 +29660,6 @@ def main(argv: list[str]) -> int:
     history_version_mode = resolve_history_version_mode(args)
     checked_history_versions = expand_history_versions(history_version_mode)
     history_path_configs = resolve_history_path_configs(history_version_mode)
-    observation_history_config = history_path_configs[
-        CURRENT_INTEGRITY_HISTORY_VERSION
-    ]
     serialized_history_path_configs = serialize_history_path_configs(history_path_configs)
     site_read_version = str(os.environ.get("UK_AQ_R2_HISTORY_VERSION", "")).strip() or None
 
@@ -33113,7 +29807,7 @@ def main(argv: list[str]) -> int:
                 "daily profile cannot discover the latest R2 observations day: "
                 "UK_AQ_R2_HISTORY_DROPBOX_ROOT is unavailable"
             )
-        observations_prefix = observation_history_config.observations_data_prefix
+        observations_prefix = history_path_configs["v2"].observations_data_prefix
         try:
             observations_days = discover_observations_days(r2_history_root, observations_prefix)
         except Exception as exc:
@@ -33189,6 +29883,12 @@ def main(argv: list[str]) -> int:
         }
     log.info("IngestDB boundary check: %s", json.dumps(ingest_boundary, sort_keys=True, default=str))
     if not ingest_boundary.get("allowed"):
+        if fixed_v2_recovery_reentry and recovery_state_path_raw:
+            _block_fixed_v2_recovery_state(
+                recovery_state_path_raw,
+                outcome="blocked_authority_changed",
+                reason="request-level IngestDB boundary changed during recovery",
+            )
         summary = {
             "env": args.env,
             "profile": args.profile,
@@ -33230,12 +29930,13 @@ def main(argv: list[str]) -> int:
             run_compact=run_compact,
             started_at_utc=started_iso,
             log_path=log_path,
+            fixed_v2_recovery_enabled=fixed_v2_sos_light_write_enabled,
         )
 
     # The child process is now inside the retained PostgreSQL session lock.
-    # Load the existing optional backfill environment before resolving live R2
-    # credentials, then pin the complete Dropbox checkpoint to the locked live
-    # observations root. This gate cannot be bypassed by --allow-stale-dropbox.
+    # Qualifying fixed-v2 SOS-light separates checkpoint completeness from the
+    # later locked live-root comparison so writer ordering can run between
+    # them. Other Integrity modes retain their existing combined gate.
     load_backfill_env_file_if_set()
     dropbox_root = resolve_r2_history_root(os.environ)
     if not dropbox_root:
@@ -33248,21 +29949,31 @@ def main(argv: list[str]) -> int:
         dropbox_currentness = run_integrity_dropbox_currentness_gate(
             env={**env, **os.environ},
             dropbox_root=dropbox_root,
-            observations_prefix=observation_history_config.observations_data_prefix,
+            observations_prefix=history_path_configs["v2"].observations_data_prefix,
             timeseries_binding_backup_mode=(
                 args.timeseries_binding_backup_mode
             ),
-            checkpoint_only=True,
+            checkpoint_only=fixed_v2_sos_light_write_enabled,
         )
     log.info(
         "observations global operation lock: %s",
         json.dumps(global_operation_lock, sort_keys=True, default=str),
     )
     log.info(
-        "Dropbox checkpoint completeness gate: %s",
+        (
+            "Dropbox checkpoint completeness gate: %s"
+            if fixed_v2_sos_light_write_enabled
+            else "Dropbox checkpoint/live observations root gate: %s"
+        ),
         json.dumps(dropbox_currentness, sort_keys=True, default=str),
     )
     if not dropbox_currentness.get("allowed"):
+        if fixed_v2_recovery_reentry and recovery_state_path_raw:
+            _block_fixed_v2_recovery_state(
+                recovery_state_path_raw,
+                outcome="blocked_authority_uncertain",
+                reason="Dropbox checkpoint could not be revalidated during recovery",
+            )
         summary = {
             "env": args.env,
             "profile": args.profile,
@@ -33272,7 +29983,11 @@ def main(argv: list[str]) -> int:
             "date_selection": selection_summary,
             "started_at_utc": started_iso,
             "finished_at_utc": fmt_iso(utc_now()),
-            "status": "blocked_dropbox_checkpoint_incomplete",
+            "status": (
+                "blocked_dropbox_checkpoint_incomplete"
+                if fixed_v2_sos_light_write_enabled
+                else "blocked_dropbox_checkpoint_not_current"
+            ),
             "dry_run": bool(args.dry_run),
             **({"repair_applied": False} if args.dry_run else {}),
             "check_only": bool(args.check_only),
@@ -33295,9 +30010,26 @@ def main(argv: list[str]) -> int:
         write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
         return 2
 
-    backup_gate_summary = run_scheduled_backup_gate(args, started_iso)
+    backup_gate_summary = run_scheduled_backup_gate(
+        args,
+        started_iso,
+        recovery_self_writer=(
+            _fixed_v2_recovery_self_writer_context(
+                fixed_v2_recovery_state
+            )
+            if fixed_v2_recovery_reentry
+            and fixed_v2_recovery_state is not None
+            else None
+        ),
+    )
     log.info("dropbox backup gate: %s", json.dumps(backup_gate_summary, sort_keys=True, default=str))
     if not backup_gate_summary.get("backup_ready"):
+        if fixed_v2_recovery_reentry and recovery_state_path_raw:
+            _block_fixed_v2_recovery_state(
+                recovery_state_path_raw,
+                outcome="blocked_authority_changed",
+                reason="writer ordering or backup identity changed during recovery",
+            )
         log.error("backup gate blocked after the IngestDB boundary: %s", backup_gate_summary.get("blocked_reason"))
         summary = {
             "env": args.env,
@@ -33331,39 +30063,60 @@ def main(argv: list[str]) -> int:
         write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
         return 2
 
-    # The complete checkpoint is now proven newer than every relevant writer.
-    # Only now compare its observations-root hash with the locked live R2 root;
-    # successful equality pins this Dropbox generation for DETECT/PROPOSE.
-    dropbox_currentness = run_integrity_dropbox_currentness_gate(
-        env={**env, **os.environ},
-        dropbox_root=dropbox_root,
-        observations_prefix=observation_history_config.observations_data_prefix,
-        timeseries_binding_backup_mode=args.timeseries_binding_backup_mode,
-    )
-    log.info(
-        "Dropbox checkpoint/live observations root gate: %s",
-        json.dumps(dropbox_currentness, sort_keys=True, default=str),
-    )
-    if not dropbox_currentness.get("allowed"):
-        summary = {
-            "env": args.env,
-            "profile": args.profile,
-            "source": args.source,
-            "from_day": from_day,
-            "to_day": to_day,
-            "started_at_utc": started_iso,
-            "finished_at_utc": fmt_iso(utc_now()),
-            "status": "blocked_dropbox_checkpoint_not_current",
-            "effective_mode": effective_mode,
-            "dropbox_baseline": str(dropbox_root),
-            "backup_readiness": backup_gate_summary,
-            "ingestdb_boundary": ingest_boundary,
-            "observations_global_operation_lock": global_operation_lock,
-            "dropbox_currentness": dropbox_currentness,
-            "metrics": {},
-        }
-        write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
-        return 2
+    if fixed_v2_sos_light_write_enabled:
+        # The complete checkpoint is now proven newer than every relevant
+        # writer. Only now compare its observations-root hash with the locked
+        # live R2 root; equality pins this generation for DETECT/PROPOSE.
+        dropbox_currentness = run_integrity_dropbox_currentness_gate(
+            env={**env, **os.environ},
+            dropbox_root=dropbox_root,
+            observations_prefix=history_path_configs["v2"].observations_data_prefix,
+            timeseries_binding_backup_mode=args.timeseries_binding_backup_mode,
+        )
+        log.info(
+            "Dropbox checkpoint/live observations root gate: %s",
+            json.dumps(dropbox_currentness, sort_keys=True, default=str),
+        )
+        if not dropbox_currentness.get("allowed"):
+            if fixed_v2_recovery_reentry and recovery_state_path_raw:
+                _block_fixed_v2_recovery_state(
+                    recovery_state_path_raw,
+                    outcome="blocked_authority_changed",
+                    reason="Dropbox/live observations-root identity changed during recovery",
+                )
+            summary = {
+                "env": args.env,
+                "profile": args.profile,
+                "source": args.source,
+                "from_day": from_day,
+                "to_day": to_day,
+                "date_selection": selection_summary,
+                "started_at_utc": started_iso,
+                "finished_at_utc": fmt_iso(utc_now()),
+                "status": "blocked_dropbox_checkpoint_not_current",
+                "dry_run": bool(args.dry_run),
+                **({"repair_applied": False} if args.dry_run else {}),
+                "check_only": bool(args.check_only),
+                "run_backfill": bool(args.run_backfill),
+                "effective_mode": effective_mode,
+                "dropbox_baseline": str(dropbox_root),
+                "repair_mode": bool(args.run_backfill),
+                "allow_stale_dropbox": bool(args.allow_stale_dropbox),
+                "db_path": env["UK_AQ_HISTORY_INTEGRITY_DB_PATH"],
+                "log_path": str(log_path),
+                "history_version_mode": history_version_mode,
+                "checked_versions": checked_history_versions,
+                "history_path_configs": serialized_history_path_configs,
+                "backup_readiness": backup_gate_summary,
+                "ingestdb_boundary": ingest_boundary,
+                "observations_global_operation_lock": global_operation_lock,
+                "dropbox_currentness": dropbox_currentness,
+                "metrics": {},
+            }
+            write_reports(
+                env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary
+            )
+            return 2
 
     # Only after the request-wide boundary and backup readiness pass may
     # normal Dropbox inspection and mutable local run state begin.
@@ -33384,27 +30137,48 @@ def main(argv: list[str]) -> int:
             **(selection_summary or {}),
             "state_row_status": "planned",
         }
-    run_id: int | None = None
+    run_id: int | None = (
+        int(fixed_v2_recovery_state["logical_run"]["integrity_run_id"])
+        if fixed_v2_recovery_state is not None else None
+    )
     try:
-        cur = conn.execute(
-            """
-            INSERT INTO integrity_runs (
-              started_at_utc, env_name, profile, source_filter,
-              from_day, to_day, effective_mode, dropbox_baseline,
-              allow_stale_dropbox, status, notes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
+        if fixed_v2_recovery_state is not None:
+            existing_run = conn.execute(
+                """
+                SELECT started_at_utc, env_name, profile, source_filter,
+                       from_day, to_day, effective_mode
+                FROM integrity_runs WHERE id = ?
+                """,
+                (int(run_id),),
+            ).fetchone()
+            if existing_run is None or tuple(existing_run) != (
                 started_iso, args.env, args.profile, args.source,
                 from_day, to_day, effective_mode,
-                resolve_r2_history_root(os.environ),
-                1 if args.allow_stale_dropbox else 0, "running",
-                "history integrity run in progress.",
-            ),
-        )
-        run_id = cur.lastrowid
-        conn.commit()
-        log.info("integrity_runs.id=%s", run_id)
+            ):
+                raise RuntimeError(
+                    "fixed-v2 SOS-light recovery SQLite logical run identity disagrees"
+                )
+            log.info("reusing integrity_runs.id=%s after lock recovery", run_id)
+        else:
+            cur = conn.execute(
+                """
+                INSERT INTO integrity_runs (
+                  started_at_utc, env_name, profile, source_filter,
+                  from_day, to_day, effective_mode, dropbox_baseline,
+                  allow_stale_dropbox, status, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    started_iso, args.env, args.profile, args.source,
+                    from_day, to_day, effective_mode,
+                    resolve_r2_history_root(os.environ),
+                    1 if args.allow_stale_dropbox else 0, "running",
+                    "history integrity run in progress.",
+                ),
+            )
+            run_id = cur.lastrowid
+            conn.commit()
+            log.info("integrity_runs.id=%s", run_id)
         if daily_selection is not None:
             _upsert_daily_profile_state(
                 conn,
@@ -33414,9 +30188,14 @@ def main(argv: list[str]) -> int:
                 status="running",
                 started_at_utc=started_iso,
             )
-        if daily_task_health_enabled:
+        if daily_task_health_enabled and fixed_v2_recovery_state is not None:
+            daily_task_health_run_id = fixed_v2_recovery_state[
+                "logical_run"
+            ].get("daily_task_health_run_id")
+        elif daily_task_health_enabled:
             start_summary = {
                 "env": args.env, "profile": args.profile, "source": args.source,
+                "platform_run_id": daily_task_platform_run_id,
                 "from_day": from_day, "to_day": to_day,
                 "date_selection": selection_summary,
                 "logical_run_date": logical_run_date.isoformat(),
@@ -33495,6 +30274,52 @@ def main(argv: list[str]) -> int:
             json.dumps(core_snapshot_identity, sort_keys=True),
             core_snapshot_identity_path,
         )
+        if fixed_v2_sos_light_write_enabled:
+            if not recovery_state_path_raw:
+                raise RuntimeError(
+                    "write-enabled fixed-v2 SOS-light requires its durable lock-recovery state path"
+                )
+            recovery_authority = _fixed_v2_recovery_authority_projection(
+                args=args,
+                started_iso=started_iso,
+                run_compact=run_compact,
+                integrity_run_id=int(run_id),
+                daily_task_health_run_id=daily_task_health_run_id,
+                platform_run_id=daily_task_platform_run_id,
+                requested_from_day=from_day,
+                requested_to_day=to_day,
+                global_operation_lock=global_operation_lock,
+                backup_readiness=backup_gate_summary,
+                dropbox_currentness=dropbox_currentness or {},
+                core_snapshot_identity=core_snapshot_identity,
+            )
+            if fixed_v2_recovery_reentry:
+                fixed_v2_recovery_state = (
+                    _revalidate_fixed_v2_recovery_state(
+                        recovery_state_path_raw,
+                        recovery_authority,
+                    )
+                )
+                stale_run_root = (
+                    Path(env["UK_AQ_HISTORY_INTEGRITY_TMP_DIR"])
+                    / f"run-{run_compact}"
+                )
+                if stale_run_root.exists():
+                    shutil.rmtree(stale_run_root)
+                log.info(
+                    "fixed-v2 SOS-light lock recovery authority unchanged; "
+                    "same logical run resumed generation=%s",
+                    os.environ.get(
+                        FIXED_V2_SOS_LIGHT_RECOVERY_GENERATION_ENV, ""
+                    ),
+                )
+            else:
+                fixed_v2_recovery_state = (
+                    _initialise_fixed_v2_recovery_state(
+                        recovery_state_path_raw,
+                        recovery_authority,
+                    )
+                )
         if args.skip_snapshot_import:
             log.warning("--skip-snapshot-import: skipping core snapshot import")
             snapshot_result = {
@@ -33594,18 +30419,14 @@ def main(argv: list[str]) -> int:
         lookup_source_counts: dict[str, dict[str, int]] = (
             collect_lookup_active_counts_by_source(conn)
         )
-        # ``resolve_v2_source_scope`` is a legacy-named canonical core-snapshot
-        # helper, not a physical-v2 router.  Fixed-v3 SOS-light must preserve
-        # that authoritative connector/source mapping instead of falling back
-        # to a different lookup merely because its R2 generation is v3.
-        v3_allowed_connector_ids: set[int] | None = None
-        v3_source_scope = {"source": args.source, "connector_ids": None, "scope": "all"}
-        if snapshot_ok:
-            v3_allowed_connector_ids, v3_source_scope = resolve_v2_source_scope(conn, args.source)
-            log.info("fixed-v3 canonical source scope: %s", v3_source_scope)
+        v2_allowed_connector_ids: set[int] | None = None
+        v2_source_scope = {"source": args.source, "connector_ids": None, "scope": "all"}
+        if "v2" in checked_history_versions and snapshot_ok:
+            v2_allowed_connector_ids, v2_source_scope = resolve_v2_source_scope(conn, args.source)
+            log.info("v2 source scope: %s", v2_source_scope)
             sos_historical_route = select_sos_historical_replacement_route(
                 args,
-                mutation_connector_ids=v3_allowed_connector_ids,
+                mutation_connector_ids=v2_allowed_connector_ids,
                 protected_connector_ids=protected_connector_ids,
             )
             dedicated_sos_historical_replacement = bool(
@@ -33814,17 +30635,17 @@ def main(argv: list[str]) -> int:
                 r2_history_root = resolve_r2_history_root(os.environ)
                 v2_obs = run_v2_observations_integrity_checks(
                     r2_history_root=r2_history_root,
-                    config=observation_history_config,
+                    config=history_path_configs["v2"],
                     from_day=from_day,
                     to_day=to_day,
                     selected_days=selected_day_values,
                     conn=conn,
                     env_name=args.env,
-                    allowed_connector_ids=v3_allowed_connector_ids,
-                    source_scope=v3_source_scope,
+                    allowed_connector_ids=v2_allowed_connector_ids,
+                    source_scope=v2_source_scope,
                     log=log,
                     observation_total_connector_ids=(
-                        v3_source_scope.get("connector_ids") or []
+                        v2_source_scope.get("connector_ids") or []
                     ),
                     observation_total_pollutants=args.repair_pollutants,
                 )
@@ -33835,7 +30656,7 @@ def main(argv: list[str]) -> int:
                         run_compact=run_compact,
                         env=env,
                         v2_observations=v2_obs,
-                        source_scope=v3_source_scope,
+                        source_scope=v2_source_scope,
                         log=log,
                         repair_pollutants=args.repair_pollutants,
                         verified_first_value_at_scope_sink=(
@@ -33845,9 +30666,9 @@ def main(argv: list[str]) -> int:
                 )
             cross_check_metrics = {
                 "ran": True,
-                "history_version": CURRENT_INTEGRITY_HISTORY_VERSION,
+                "history_version": "v2",
                 "skipped_reason": None,
-                "source_scope": v3_source_scope,
+                "source_scope": v2_source_scope,
                 "v2_observations": v2_obs,
                 "observation_content_hash_checks": observation_hash_metrics,
                 "cross_checks_total": int(v2_obs.get("checked_partitions", 0) or 0),
@@ -33865,7 +30686,7 @@ def main(argv: list[str]) -> int:
             )
             sos_binding_verification = run_pack_mode_sos_timeseries_binding_verification(
                 conn=conn,
-                config=observation_history_config,
+                config=history_path_configs["v2"],
                 individual_root=individual_binding_root,
                 backup_mode=args.timeseries_binding_backup_mode,
                 pack_root=packed_binding_root,
@@ -33970,14 +30791,18 @@ def main(argv: list[str]) -> int:
             repair_overlay["observations_global_operation_lock"] = dict(
                 global_operation_lock
             )
+            if fixed_v2_sos_light_write_enabled:
+                repair_overlay["fixed_v2_lock_recovery_state_path"] = (
+                    recovery_state_path_raw
+                )
+                repair_overlay["fixed_v2_lock_recovery"] = (
+                    _read_fixed_v2_recovery_state(recovery_state_path_raw)
+                )
             repair_overlay["dropbox_currentness"] = dict(
                 dropbox_currentness or {}
             )
             repair_overlay["execution_path"] = sos_historical_route.get(
                 "execution_path"
-            )
-            repair_overlay["dedicated_sos_historical_replacement"] = bool(
-                dedicated_sos_historical_replacement
             )
             repair_overlay["sos_historical_route"] = dict(sos_historical_route)
             if dedicated_sos_historical_replacement:
@@ -34041,12 +30866,12 @@ def main(argv: list[str]) -> int:
                 verified_first_value_at_connector_days=(
                     verified_first_value_at_connector_days
                 ),
-                final_verification_config=observation_history_config,
+                final_verification_config=history_path_configs["v2"],
                 from_day=from_day,
                 to_day=to_day,
                 selected_days=selected_day_values,
-                allowed_connector_ids=v3_allowed_connector_ids,
-                source_scope=v3_source_scope,
+                allowed_connector_ids=v2_allowed_connector_ids,
+                source_scope=v2_source_scope,
                 limits=limits,
                 dry_run=not mode_allows_remote_apply(effective_mode),
                     log=log,
@@ -34054,7 +30879,6 @@ def main(argv: list[str]) -> int:
                     dedicated_sos_historical_replacement=(
                         dedicated_sos_historical_replacement
                     ),
-                    force_official_rdata_replacement=args.force_replace_selected,
                     protected_connector_ids=protected_connector_ids,
                     timeseries_binding_backup_mode=(
                         args.timeseries_binding_backup_mode
@@ -34065,6 +30889,7 @@ def main(argv: list[str]) -> int:
                         else Path(str(dropbox_root))
                     ),
                 )
+
         any_adapter_ran = (
             openaq_metrics.get("ran")
             or sc_metrics.get("ran")
@@ -34081,33 +30906,7 @@ def main(argv: list[str]) -> int:
         )
 
         # Decide top-level run status.
-        source_execution_failed = (
-            not snapshot_ok
-            and snapshot_result.get("status") not in {"skipped", "dry_run"}
-        ) or any(
-            int(metrics.get(key) or 0) > 0
-            for metrics in (openaq_metrics, sc_metrics, sos_metrics)
-            for key in (
-                "errors",
-                "temporary_errors",
-                "permanent_errors",
-                "persistence_failed_count",
-                "worker_database_retry_exhausted_count",
-            )
-        )
-        diagnostic_check_failed = (
-            source_execution_failed
-            or int((cross_check_metrics.get(
-                "observation_content_hash_checks"
-            ) or {}).get("invalid_contract") or 0) > 0
-            or (
-                sos_binding_verification is not None
-                and sos_binding_verification.get("status") == "fail"
-            )
-        )
-        if source_execution_failed:
-            status = "fail"
-        elif any_stopped:
+        if any_stopped:
             status = "stopped_limit"
         elif any_adapter_ran:
             status = "ok"
@@ -34133,16 +30932,15 @@ def main(argv: list[str]) -> int:
             and final_verification.get("status") == "ok"
         )
         dry_run_repair_verified = (
-            args.run_backfill and args.dry_run
-            and _v3_dry_run_repair_proposal_verified(repair_flow)
+            args.run_backfill
+            and args.dry_run
+            and _v2_dry_run_repair_proposal_verified(repair_flow)
         )
         status = _v2_top_level_status_after_repair_planning(
             status,
             run_backfill=args.run_backfill,
             dry_run=args.dry_run,
-            coordinator_failed=coordinator_failed or (
-                args.dry_run and diagnostic_check_failed
-            ),
+            coordinator_failed=coordinator_failed,
             any_stopped=bool(any_stopped),
             v2_gap_count=v2_gap_count_for_status,
             real_repair_verified=real_repair_verified,
@@ -34151,8 +30949,6 @@ def main(argv: list[str]) -> int:
             ),
             dry_run_repair_verified=dry_run_repair_verified,
         )
-        if effective_mode == "check_only" and diagnostic_check_failed:
-            status = "fail"
 
         if daily_selection is not None:
             daily_state_status = (
@@ -34250,7 +31046,7 @@ def main(argv: list[str]) -> int:
             if args.run_backfill:
                 if cross_check_metrics.get("v2_repair_status_message"):
                     notes_parts.append(
-                        "post-repair-check "
+                        "v2-post-repair-check "
                         f"status={(cross_check_metrics.get('v2_post_repair') or {}).get('status')} "
                         f"message={cross_check_metrics.get('v2_repair_status_message')}"
                     )
@@ -34330,12 +31126,6 @@ def main(argv: list[str]) -> int:
             sos_metrics.get(
                 "no_authoritative_timeseries_binding_groups"
             ) or 0
-        )
-        warnings_count_total += int(
-            waqn_metrics.get("source_unavailable_scope_count") or 0
-        )
-        warnings_count_total += int(
-            saqn_metrics.get("source_unavailable_scope_count") or 0
         )
         warnings_count_total += int(
             ((repair_flow.get("sos_light") or {}).get("warning_count")) or 0
@@ -34538,7 +31328,7 @@ def main(argv: list[str]) -> int:
             if final_binding_result is not None:
                 v2_result["timeseries_bindings"] = final_binding_result
         elif args.run_backfill and args.dry_run:
-            v2_result.update(_v3_dry_run_report_state(
+            v2_result.update(_v2_dry_run_report_state(
                 pre_repair_status=v2_result["status"],
                 pre_repair_gap_count=v2_gap_count_for_status,
                 repair_flow=repair_flow,
@@ -34567,7 +31357,7 @@ def main(argv: list[str]) -> int:
         selected_total_connector_ids = (
             [1]
             if dedicated_sos_historical_replacement
-            else list(v3_source_scope.get("connector_ids") or [])
+            else list(v2_source_scope.get("connector_ids") or [])
         )
         connector_observation_totals = build_connector_observation_totals(
             successful_real_repair=bool(
@@ -34617,7 +31407,7 @@ def main(argv: list[str]) -> int:
             "checked_versions": checked_history_versions,
             "history_path_configs": serialized_history_path_configs,
             "history_version_results": history_version_results,
-            "source_scope": v3_source_scope,
+            "source_scope": v2_source_scope if "v2" in checked_history_versions else None,
             "requested_repair_pollutants": list(args.repair_pollutants),
             "site_read_version": site_read_version,
             "backfill_env_file": LAST_BACKFILL_ENV_LOAD_RESULT,
@@ -34651,6 +31441,11 @@ def main(argv: list[str]) -> int:
             "backup_readiness": backup_gate_summary,
             "observations_global_operation_lock": global_operation_lock,
             "dropbox_currentness": dropbox_currentness,
+            "fixed_v2_lock_recovery": (
+                _read_fixed_v2_recovery_state(recovery_state_path_raw)
+                if fixed_v2_sos_light_write_enabled
+                and recovery_state_path_raw else None
+            ),
             "repair_flow": repair_flow,
             "current_state_reconciliation": current_state_summary,
             "r2_history_status": current_state_summary.get("r2_history_status"),
@@ -34690,7 +31485,7 @@ def main(argv: list[str]) -> int:
                 summary.update({
                     key: v2_result[key]
                     for key in (
-                        "repair_applied", "pre_repair_status", "pre_repair_gap_count",
+                        "pre_repair_status", "pre_repair_gap_count",
                         "proposed_state_status", "proposed_remaining_gap_count",
                         "live_state_status",
                     )
@@ -34734,6 +31529,7 @@ def main(argv: list[str]) -> int:
                 "env": args.env,
                 "profile": args.profile,
                 "source": args.source,
+                "platform_run_id": daily_task_platform_run_id,
                 "from_day": from_day,
                 "to_day": to_day,
                 "date_selection": selection_summary,
@@ -34844,6 +31640,36 @@ def main(argv: list[str]) -> int:
                     raise
         return 1 if status in {"fail", "stopped_limit"} else 0
     except Exception as exc:
+        if fixed_v2_recovery_reentry and recovery_state_path_raw:
+            try:
+                recovery_failure_state = _read_fixed_v2_recovery_state(
+                    recovery_state_path_raw
+                )
+                recovery_evidence = recovery_failure_state.setdefault(
+                    "recovery", {}
+                )
+                if recovery_evidence.get("outcome") not in {
+                    "blocked_authority_changed",
+                    "blocked_authority_uncertain",
+                    "post_mutation_lock_loss",
+                    "reacquire_timeout",
+                }:
+                    recovery_evidence.update({
+                        "outcome": "blocked_authority_uncertain",
+                        "finished_at_utc": fmt_iso(utc_now()),
+                        "error": str(exc),
+                    })
+                    recovery_failure_state["resume"] = "forbidden"
+                    recovery_failure_state[
+                        "node_apply_launch_permitted"
+                    ] = False
+                    recovery_failure_state["r2_mutation_possible"] = False
+                    _atomic_write_fixed_v2_recovery_state(
+                        recovery_state_path_raw,
+                        recovery_failure_state,
+                    )
+            except Exception:
+                pass
         log.exception("run failed: %s", exc)
         if run_id is not None:
             try:
@@ -34880,6 +31706,7 @@ def main(argv: list[str]) -> int:
                 "env": args.env,
                 "profile": args.profile,
                 "source": args.source,
+                "platform_run_id": daily_task_platform_run_id,
                 "from_day": from_day if "from_day" in locals() else args.from_day,
                 "to_day": to_day if "to_day" in locals() else args.to_day,
                 "date_selection": selection_summary if "selection_summary" in locals() else None,
