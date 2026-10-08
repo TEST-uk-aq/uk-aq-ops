@@ -692,16 +692,18 @@ export default {
     const auth = authorize(request, env);
     if (!auth.ok) return jsonResponse({ ok: false, error: auth.error }, { status: auth.status, noStore: true });
     const url = new URL(request.url);
-    if (historyCacheEnabled(env) && url.hostname !== HISTORY_CACHE_CONTRACT.reader_hostname) {
-      return jsonResponse({ ok: false, error: "history_custom_domain_required" }, { status: 503, noStore: true });
-    }
     let context = null;
     try {
       assertGenerationConfiguration(env);
+      // Authenticated WHO provenance is always no-store, including compatibility
+      // requests; cached history/binding reads below still require the owned host.
       if (url.pathname === DAILY_PROVENANCE_PATH) {
         const params = parseDailyProvenanceRequest(url);
         if (!params.ok) return jsonResponse({ ok: false, error: params.error }, { status: params.status, noStore: true });
         return await handleDailyProvenance(params, env);
+      }
+      if (historyCacheEnabled(env) && url.hostname !== HISTORY_CACHE_CONTRACT.reader_hostname) {
+        return jsonResponse({ ok: false, error: "history_custom_domain_required" }, { status: 503, noStore: true });
       }
       if (url.pathname === "/v1/timeseries-binding") {
         assertGenerationConfiguration(env);

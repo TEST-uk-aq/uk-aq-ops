@@ -1585,9 +1585,8 @@ export default {
     }
 
     const requestUrl = new URL(request.url);
-    if (historyCacheEnabled(env) && requestUrl.hostname !== HISTORY_CACHE_CONTRACT.reader_hostname) {
-      return jsonResponse({ ok: false, error: "history_custom_domain_required" }, { status: 503, noStore: true });
-    }
+    // Authenticated WHO provenance is always no-store; preserve its compatibility
+    // route before enforcing the owned hostname for cached history/binding reads.
     if (requestUrl.pathname === DAILY_PROVENANCE_PATH) {
       const requestParams = parseDailyProvenanceRequest(requestUrl);
       if (!requestParams.ok) {
@@ -1596,6 +1595,9 @@ export default {
         });
       }
       return handleDailyProvenanceV2(requestParams, env);
+    }
+    if (historyCacheEnabled(env) && requestUrl.hostname !== HISTORY_CACHE_CONTRACT.reader_hostname) {
+      return jsonResponse({ ok: false, error: "history_custom_domain_required" }, { status: 503, noStore: true });
     }
     if (requestUrl.pathname === "/v1/timeseries-binding") {
       const requestParams = parseTimeseriesBindingRequest(requestUrl);

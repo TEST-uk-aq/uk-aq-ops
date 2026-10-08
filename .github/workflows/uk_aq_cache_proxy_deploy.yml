@@ -36,6 +36,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
       - name: Validate cache deployment identity and Cloudflare credentials
         run: |
           set -euo pipefail
@@ -221,7 +226,7 @@ jobs:
         working-directory: workers/uk_aq_cache_proxy
         run: |
           set -euo pipefail
-          npx --yes wrangler@4 deploy \
+          npx --yes wrangler@4.130.0 deploy \
             --dry-run \
             --config wrangler.deploy.toml \
             --name "${UK_AQ_CACHE_WORKER_NAME}" \
@@ -238,7 +243,7 @@ jobs:
             local worker_name="$1"
             local role="$2"
             local versions_json="$3"
-            if ! npx --yes wrangler@4 versions list \
+            if ! npx --yes wrangler@4.130.0 versions list \
               --config wrangler.deploy.toml \
               --name "${worker_name}" \
               --json > "${versions_json}"; then
@@ -275,7 +280,7 @@ jobs:
           jq -e 'type == "object" and length > 0 and all(.[]; type == "string")' \
             "${SECRETS_PAYLOAD_PATH}" >/dev/null
           for attempt in 1 2 3; do
-            if npx --yes wrangler@4 secret bulk \
+            if npx --yes wrangler@4.130.0 secret bulk \
               "${SECRETS_PAYLOAD_PATH}" \
               --name "${UK_AQ_CACHE_WORKER_NAME}"; then
               exit 0
@@ -293,6 +298,7 @@ jobs:
           apiToken: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN }}
           accountId: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: workers/uk_aq_cache_proxy
+          wranglerVersion: "4.130.0"
           command: deploy --config wrangler.deploy.toml --name ${{ env.UK_AQ_CACHE_WORKER_NAME }}
 
       - name: Report deployed STATION_HISTORY target

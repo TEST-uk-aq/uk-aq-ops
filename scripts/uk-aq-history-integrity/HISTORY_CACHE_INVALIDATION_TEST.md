@@ -1,11 +1,43 @@
 # TEST History Integrity cache invalidation
 
-Implementation handover, 8 October 2026. These changes are local and uncommitted.
-Nothing has been deployed, purged or repaired by this implementation task.
-Functional acceptance remains a real TEST operation after deployment.
-The authoritative system documentation was read, not edited.
+Implementation and deployment-correction handover, 8 October 2026.
+The original implementation is committed and pushed to TEST main as
+`15844b9c6aca04d7c4b357ad08636b8491136103`. Its deployment is partial:
 
-## Files changed
+| GitHub Actions run | Confirmed result |
+| --- | --- |
+| [Reader and dashboard, 37839646067](https://github.com/TEST-uk-aq/uk-aq-ops/actions/runs/37839646067) | Successful. The existing reader now has `history-test.sleepercar.co.uk`. Adding the route without an explicit `workers_dev` setting disabled the old reader hostname. The dependent dashboard also deployed. |
+| [Station history, 37839645358](https://github.com/TEST-uk-aq/uk-aq-ops/actions/runs/37839645358) | Failed configuration validation before secret writes/deployment: the existing GitHub upstream URL still points to the reader's workers.dev origin. |
+| [Cache proxy, 37839645326](https://github.com/TEST-uk-aq/uk-aq-ops/actions/runs/37839645326) | Wrangler 4 dry-run passed, and the bulk-secret step succeeded. Final wrangler-action deployment failed under its default Wrangler 3.90.0 when parsing the shared JSON import attributes. The failed deploy did not publish the new proxy code; earlier secret writes did occur. |
+
+These results were checked against the actual Actions logs. They do not establish
+functional cache-invalidation acceptance or healthy old-host consumers.
+Only the corrections described below are currently local and uncommitted.
+This correction task did not deploy, change Cloudflare resources/GitHub variables,
+purge caches, execute repairs or edit authoritative system documentation.
+Functional acceptance remains a real TEST operation after the corrected deployment.
+
+## Local deployment corrections
+
+| File | Correction |
+| --- | --- |
+| `.github/workflows/uk_aq_station_history_deploy.yml` | Explicit Node 22; Wrangler 4.130.0 for dry-run, secret upload and final wrangler-action; package dry-run before remote secret writes; actionable strict custom-domain validation error, including rejection of non-default ports. |
+| `.github/workflows/uk_aq_cache_proxy_deploy.yml` | Explicit Node 22; Wrangler 4.130.0 for every CLI call and final wrangler-action, so package validation and deployment use the same bundler. |
+| `.github/workflows/uk_aq_observs_history_r2_api_worker_deploy.yml` | Explicit TEST-only top-level `workers_dev = true` alongside the existing Custom Domain. This retains authenticated WHO-summary/provenance/descriptor compatibility endpoints; observation and binding reads still require the owned custom domain. |
+| `workers/uk_aq_observs_history_r2_api_worker/worker.mjs`; `worker_v3.mjs` | Keep authenticated, always-no-store WHO daily-validation provenance ahead of the domain guard. The cached observation/binding routes remain custom-domain-only. |
+| This handover | Actual deployment status, consumer migration prerequisites, deployment-toolchain evidence and remaining acceptance. |
+
+The [pinned action](https://github.com/cloudflare/wrangler-action/blob/da0e0dfe58b7a431659754fdf3f186c529afbe65/action.yml)
+supports `wranglerVersion`; leaving this input absent was the
+cause of the final-build mismatch. The JSON import remains the shared writer/purger
+definition and uses syntax supported by the corrected toolchain. Account selection,
+Worker names, binding target resolution, routes, secrets and authentication are
+unchanged except for explicitly retaining the reader compatibility hostname in TEST.
+Cloudflare's [Wrangler configuration rules](https://developers.cloudflare.com/workers/wrangler/configuration/)
+make `workers_dev` default to false when routes are configured, so compatibility
+retention must be explicit.
+
+## Original implementation in commit 15844b9c6aca
 
 | Files | Change |
 | --- | --- |
@@ -31,12 +63,14 @@ database schema, migration or queue.
 
 | Layer | Worker / serving boundary | Owning zone | TEST zone ID |
 | --- | --- | --- | --- |
-| Authenticated observation reader | Existing TEST reader, future Custom Domain `history-test.sleepercar.co.uk` | `sleepercar.co.uk` | `76ce2d07b41572e3efe08c3dc2496bc0` |
+| Authenticated observation reader | Existing TEST reader, deployed Custom Domain `history-test.sleepercar.co.uk` | `sleepercar.co.uk` | `76ce2d07b41572e3efe08c3dc2496bc0` |
 | Public history cache, fresh and stale | Deployed `uk-aq-cache-test`, route `cic-test.chronicillnesschannel.co.uk/api/aq/*` | `chronicillnesschannel.co.uk` | `4b72b6262bcbb226dddefcb620aa901d` |
 
 The proxy ownership was resolved from read-only deployed Worker route/domain
 configuration, independently of the reader account. Both zone IDs were obtained
-through read-only Cloudflare configuration. No route or domain was changed.
+through read-only Cloudflare configuration during implementation. The successful
+Actions deployment subsequently attached the reader Custom Domain; this correction
+task made no remote route or domain changes.
 The temporary probe hostname is not used by the implementation.
 
 `config/uk_aq_history_cache.json` is the single writer/purger tag definition.
@@ -49,8 +83,11 @@ HTTP 200 plus `success:true` and no reported errors means accepted delivery,
 not demonstrated eviction. No Purge Everything or local-only deletion is used.
 
 The reader preserves upstream-secret authentication and refuses TEST history
-data/binding/provenance requests on other hostnames after activation. Existing
-unrelated WHO and generation-descriptor entry routes retain their behaviour.
+observation/binding requests on other hostnames after activation. Existing
+unrelated WHO-summary, daily-validation-provenance and generation-descriptor
+entry handlers retain their behaviour.
+Their workers.dev reachability was lost in the successful original deployment;
+the explicit TEST compatibility setting restores it only after redeployment.
 Do not put Cloudflare Access in front of the private reader. The existing public
 site Access boundary, proxy session authentication and Service Binding remain.
 On other proxy hostnames, TEST history responses are not reusable cached entries.
@@ -81,6 +118,39 @@ The local `RESPONSE_CACHE_GENERATION` was checked against GitHub and already
 equals `side-by-side-v3-exact-leaf-4`; it was not overwritten or incremented.
 The cut-over component is separate from both this recovery baseline and
 `UK_AQ_R2_HISTORY_VERSION`. Never change either marker as a routine repair step.
+
+Code review covered the reader's canonical v2/v3 cache keys and writes, authenticated
+station dependencies after binding/continuity selection, PM context intervals,
+proxy fresh/stale cache hits and writes, frozen changed/removal identities,
+post-verification event persistence, post-lock delivery and original-event retry.
+The selective tag vocabulary, no-store gates, normal lifetimes and `-4` baseline
+remain unchanged. The only runtime correction is the authenticated no-store WHO
+provenance route exemption from the cache-owned hostname guard; no correction was
+identified in the selective invalidation/event/retry paths.
+This is a structural/code review conclusion; deployed eviction, continuity and
+failure/retry behaviour still require the real TEST acceptance below.
+
+## Consumers of the old reader hostname
+
+Read-only GitHub variable inspection still finds
+`UK_AQ_OBSERVS_HISTORY_R2_API_URL=https://uk-aq-observs-history-r2-api.cic-test.workers.dev`.
+The consumers use this existing shared variable rather than a hard-coded old host:
+
+| Consumer | Effect and migration |
+| --- | --- |
+| Station history (`index.mjs`, `continuity.mjs`, `r2_observations.mjs`) | Observation and binding requests require the owned custom domain. The station deployment correctly remains blocked until the existing variable is updated. |
+| Cache proxy legacy observation stitching | Must receive the custom-domain URL through its existing secret payload when redeployed. No workers.dev data fallback is enabled. |
+| Cache proxy WHO summary (`who_summary_route.ts`) | Derives `/v1/who-summary` from the configured origin. Its reader handler remains authenticated and separate from history cache tagging. Explicit workers.dev retention protects compatibility until the proxy receives the new URL. |
+| Cache proxy WHO daily series (`who_daily_series_route.ts`) | Private `/v1/daily-validation-provenance` enrichment uses the configured reader origin. The corrected reader preserves this authenticated, always-no-store route on workers.dev during migration. Redeploy the proxy with the custom-domain URL; existing degraded-mode behaviour is preserved. |
+| Online dashboard (`history_generation.ts`, `station_snapshot_v2.ts`) | The successfully deployed dashboard still received the old URL. Descriptor resolution can fail while workers.dev is disabled; snapshot observation reads also require the custom domain. Redeploy the dashboard after updating the shared URL. Retaining workers.dev only restores the authenticated descriptor compatibility path. |
+| AQI reader optional observation fallback (`worker.mjs`) | If enabled, it also requires the new observation URL. Its existing deployment workflow copies the same variable; redeploy before enabling/using that fallback. |
+
+The explicit v3 candidate workflow uses a separate candidate reader identity and
+remains isolated; do not replace its candidate authority with the stable service.
+Bounded searches found no literal old-host consumer in the active TEST ingest,
+website, Integrity Factory or ops worker/local/config paths searched (archives,
+dependency trees, logs and secret catalogues excluded). No unrelated reader-route
+implementation or authentication was changed.
 
 ## Verified event and independent delivery
 
@@ -163,18 +233,19 @@ secret payloads, public APIs or reports. No remote secrets were created here.
 Both hostname zones also host other content, so explicit tag-only operations and
 the TEST tag namespace remain necessary even with zone-scoped credentials.
 
-## Manual TEST deployment, in dependency order
+## Manual TEST recovery deployment, in dependency order
 
 These are future operator commands, not commands executed during implementation.
-First review the working tree and make the reviewed code available at an operator
-chosen TEST repository ref. The current uncommitted files cannot be deployed by
-GitHub Actions until that separate step is performed. Do not use a main push that
-starts station/proxy deployments concurrently during initial cut-over.
+The original implementation is already on TEST main and partially deployed.
+First review these local corrections and make them available at an operator-chosen
+TEST repository ref. Actions cannot deploy the new uncommitted corrections until
+that separate step is performed. Avoid concurrent station/proxy activation during
+recovery. Changing a GitHub variable alone does not update deployed Worker secrets.
 
-From the TEST ops checkout, set only the existing environment/upstream variables:
+From the TEST ops checkout, the operator must update the existing upstream variable
+(not performed by this task). `UK_AQ_ENV_NAME` is already confirmed as `TEST`:
 
 ```bash
-gh variable set UK_AQ_ENV_NAME --repo TEST-uk-aq/uk-aq-ops --body TEST
 gh variable set UK_AQ_OBSERVS_HISTORY_R2_API_URL --repo TEST-uk-aq/uk-aq-ops --body https://history-test.sleepercar.co.uk/v1/observations
 ```
 
@@ -190,14 +261,17 @@ required. Populate the local purge configuration before the first repaired run.
    gh run watch <reader-run-id> --repo TEST-uk-aq/uk-aq-ops --exit-status
    ```
 
-   The modified workflow adds a real Custom Domain on the existing reader Worker
-   in the R2 account. Verify the resulting attachment is exactly
+   The corrected workflow retains the already attached Custom Domain and explicitly
+   retains workers.dev for authenticated WHO/provenance/descriptor compatibility routes. Verify the attachment is exactly
    `history-test.sleepercar.co.uk`, with the existing bucket and upstream secret.
-   Confirm normal authenticated reads work there before moving the upstream.
+   Confirm normal authenticated reads work there before deploying its consumers.
    An unauthenticated history request must still fail authentication. An
    authenticated history request to the old workers.dev endpoint must return
    `503/history_custom_domain_required` with `no-store`; unrelated entry routes
-   remain available. This creates a controlled transition interval before step 2.
+   remain available. Confirm authenticated `/v1/who-summary`, `/v1/daily-validation-provenance` and
+   `/v1/history-generation` on both configured origins, and authentication failures
+   without the existing secret. Daily provenance and the descriptor remain `no-store`; observation and binding
+   requests remain custom-domain-only.
 
 2. Deploy station history:
 
@@ -207,7 +281,7 @@ required. Populate the local purge configuration before the first repaired run.
    ```
 
    The validator permits exactly the configured TEST hostname, HTTPS,
-   `/v1/observations`, no credentials/query/fragment, and the stable Worker identity.
+   `/v1/observations`, no non-default port/credentials/query/fragment, and the stable Worker identity.
    Non-TEST validation remains unchanged. The Worker remains private via binding.
 
 3. Deploy the proxy:
@@ -221,7 +295,22 @@ required. Populate the local purge configuration before the first repaired run.
    `cic-test.chronicillnesschannel.co.uk/api/aq/*` route were preserved. Both fresh
    and stale history entries must use the new fixed cut-over component.
 
-4. Use the existing active TEST Integrity repository/local wrapper, which selects
+4. Redeploy the dashboard with the updated URL; if the optional AQI reader
+   observation fallback is used, redeploy that consumer too:
+
+   ```bash
+   gh workflow run uk_aq_ops_dashboard_api_worker_deploy.yml --repo TEST-uk-aq/uk-aq-ops --ref <reviewed-ref>
+   gh run watch <dashboard-run-id> --repo TEST-uk-aq/uk-aq-ops --exit-status
+   # Only if this optional consumer is used:
+   gh workflow run uk_aq_aqi_history_r2_api_worker_deploy.yml --repo TEST-uk-aq/uk-aq-ops --ref <reviewed-ref>
+   gh run watch <aqi-reader-run-id> --repo TEST-uk-aq/uk-aq-ops --exit-status
+   ```
+
+   Verify WHO summary and daily provenance enrichment, dashboard generation and
+   snapshots, and any enabled AQI fallback use the intended stable reader with
+   their existing secrets. Do not enable new fallback paths as part of migration.
+
+5. Use the existing active TEST Integrity repository/local wrapper, which selects
    this checkout. No database schema or wrapper redeployment is needed for the
    normal active path. Do not activate a repair until all three serving Workers
    and the local scoped purge settings are in place.
@@ -284,12 +373,26 @@ are performed. A rate-limit failure must expose cooldown, not an immediate loop.
 
 ## Structural evidence, rollback and documentation handover
 
-Local checks: changed JS syntax parsing; changed Python AST parsing; shared JSON
-parse and retry CLI/module import; Bash syntax for retry/deployment scripts; YAML
-and embedded Node/Python deployment script parsing; esbuild module-graph bundling
-of the reader, station and proxy with external runtime packages; Git whitespace
-check. No functional suite, synthetic repair or deployment was run. External
-packages remain the existing deployment-time dependency installation responsibility.
+The original standalone esbuild/module checks did not exercise the final pinned
+wrangler-action default or route inference. They therefore missed the Wrangler
+3.90.0 mismatch and the implicit workers.dev disablement.
+
+Correction checks use Node 22.23.3 and Wrangler 4.130.0 with actual
+`wrangler deploy --dry-run`, without externalizing dependencies:
+
+- Station history: existing `wrangler.toml`, deployed TEST Worker name.
+- Cache proxy: `wrangler.deploy.toml` generated by the actual workflow's binding/media
+  preparation script, existing TEST binding and media origin.
+- Reader: TEST configuration generated by the actual workflow's domain-preparation
+  script, existing TEST bucket, v3 authority, Custom Domain and explicit workers.dev.
+
+Reader JS syntax, YAML/embedded Bash, Node and Python parsing, the actual station
+validator accepting the owned TEST URL and rejecting the old hostname, matching
+CLI/action Wrangler pins and
+Git whitespace checks supplement those package checks. No functional suite,
+synthetic repair or deployment was run. Generated validation configs are removed.
+These local checks exercise the deploy command/bundler version selected by the
+corrected workflows; they do not claim that new GitHub Actions runs have succeeded.
 CodeQL already includes active Python. Exact pre-change active source was preserved
 under today's archive convention; archives remain reference-only.
 
@@ -303,6 +406,9 @@ while rolling back an individual component: reverting directly to legacy cache
 keys can expose pre-tagged stale objects. A full serving rollback must explicitly
 retain a fresh TEST cache-key component or temporarily keep those history paths
 uncached. Never assume reverting to the old `-4` code alone restores freshness.
+Removing the explicit Wrangler pin or workers.dev retention reintroduces the
+confirmed deployment/compatibility failures. Local working-tree rollback does not
+undo the already deployed reader domain or the proxy secret writes.
 
 Remaining boundaries: the separate future Integrity Factory is not integrated.
 The protected frozen `stable-sos-light/` emergency fallback is unchanged and does
@@ -315,5 +421,8 @@ Chat-mode system-doc handover should record the implemented tag template,
 reader/proxy owning zones, fixed initial marker, bounded audit/retry artifacts,
 local credential names, normal active-route integration and the frozen fallback
 boundary. Keep implementation/deployment/functional acceptance status separate.
+Record the partial deployments/failures above and the authenticated workers.dev
+compatibility route boundary; the recovery corrections are still uncommitted and
+undeployed. The shared GitHub URL and deployed consumers still need migration.
 Add real TEST acceptance evidence only after those operations occur; no LIVE
 activation or probe cleanup is included in this task.

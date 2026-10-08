@@ -76,13 +76,17 @@ jobs:
           if [ "${UK_AQ_ENV_NAME}" = "TEST" ]; then
             test "${GITHUB_REPOSITORY_OWNER}" = "TEST-uk-aq" || { echo "TEST cache activation requires the TEST repository."; exit 1; }
             # The existing Worker/R2 account owns this real Custom Domain.
-            # History data routes reject workers.dev; unrelated WHO/descriptor routes remain available.
+            # Observation/binding routes reject workers.dev; unrelated WHO/descriptor routes remain available.
             python3 - <<'PYDOMAIN'
           from pathlib import Path
           import json
           contract = json.loads(Path('config/uk_aq_history_cache.json').read_text())
           path = Path('workers/uk_aq_observs_history_r2_api_worker/wrangler.toml')
           text = path.read_text()
+          # Custom-domain routes otherwise implicitly disable workers.dev.
+          # Retain authenticated WHO/provenance/descriptor compatibility entry points;
+          # observation/binding routes still enforce the owned custom-domain guard.
+          text = 'workers_dev = true\n' + text
           text = text.replace('[vars]\n', '[vars]\nUK_AQ_ENV_NAME = "TEST"\n', 1)
           text += '\n[[routes]]\npattern = "' + contract['reader_hostname'] + '"\ncustom_domain = true\n'
           path.write_text(text)
