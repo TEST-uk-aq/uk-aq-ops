@@ -549,12 +549,3 @@ button.media-save-state { cursor: pointer; }
   .media-detail pre,
   .media-message pre { max-width: 100%; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 }
-
-.media-source-visibility { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
-.media-source-visibility select { min-width: 130px; max-width: 100%; }
-.media-domain-controls, .media-domain-add { margin: 12px 0; padding: 12px 0; border-top: 1px solid var(--border); }
-.media-domain-controls p { overflow-wrap: anywhere; }
-@media (max-width: 640px) {
-  .media-source-visibility { width: 100%; }
-  .media-source-visibility select { flex: 1; }
-}
