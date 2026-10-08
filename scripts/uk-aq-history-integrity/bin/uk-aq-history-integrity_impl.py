@@ -27163,6 +27163,31 @@ def _daily_task_health_strict() -> bool:
     )
 
 
+def _daily_task_launcher_metadata(env_name: str) -> dict[str, str] | None:
+    """Read optional v2 launchd provenance without changing the Integrity outcome."""
+    label = os.environ.get("UK_AQ_HISTORY_INTEGRITY_LAUNCHD_JOB_LABEL", "")
+    domain = os.environ.get("UK_AQ_HISTORY_INTEGRITY_LAUNCHD_DOMAIN", "")
+    log_path = os.environ.get("UK_AQ_HISTORY_INTEGRITY_LAUNCHD_LOG_PATH", "")
+    if env_name not in {"TEST", "LIVE"}:
+        return None
+    if not re.fullmatch(
+        rf"co\.uk\.ukaq\.integrity\.{env_name.lower()}\.v2\.[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*", label
+    ):
+        return None
+    if not re.fullmatch(r"gui/[0-9]+", domain):
+        return None
+    if not log_path.startswith("/") or log_path.endswith("/"):
+        return None
+    if any(ord(char) < 32 or ord(char) == 127 for char in log_path):
+        return None
+    return {
+        "type": "launchd",
+        "job_label": label,
+        "domain": domain,
+        "log_path": log_path,
+    }
+
+
 def _truncate_text(value: Any, limit: int = DAILY_TASK_HEALTH_ERROR_LIMIT) -> str:
     text = str(value or "")
     if len(text) <= limit:
@@ -29753,6 +29778,7 @@ def main(argv: list[str]) -> int:
             "resumed under observations global operation lock run_compact=%s",
             run_compact,
         )
+    launcher_metadata = _daily_task_launcher_metadata(args.env)
     daily_task_health_config = _resolve_daily_task_health_config(env_name=args.env)
     daily_task_health_enabled = bool(daily_task_health_config.get("enabled"))
     daily_task_health_strict = bool(daily_task_health_config.get("strict"))
@@ -30243,6 +30269,7 @@ def main(argv: list[str]) -> int:
             ].get("daily_task_health_run_id")
         elif daily_task_health_enabled:
             start_summary = {
+                **({"launcher": launcher_metadata} if launcher_metadata else {}),
                 "env": args.env, "profile": args.profile, "source": args.source,
                 "platform_run_id": daily_task_platform_run_id,
                 "from_day": from_day, "to_day": to_day,
@@ -31575,6 +31602,7 @@ def main(argv: list[str]) -> int:
         log.info("done status=%s runtime_seconds=%s", status, runtime_seconds)
         if daily_task_health_enabled:
             finish_summary = {
+                **({"launcher": launcher_metadata} if launcher_metadata else {}),
                 "env": args.env,
                 "profile": args.profile,
                 "source": args.source,
@@ -31752,6 +31780,7 @@ def main(argv: list[str]) -> int:
         if daily_task_health_enabled:
             failed_iso = fmt_iso(utc_now())
             fail_summary = {
+                **({"launcher": launcher_metadata} if launcher_metadata else {}),
                 "env": args.env,
                 "profile": args.profile,
                 "source": args.source,
