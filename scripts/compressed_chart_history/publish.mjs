@@ -171,17 +171,17 @@ async function verifiedObject(r2, key, expectedSha256, expectedSize) {
 }
 async function publishPrepared(prepared, bucket) {
   check(process.env.UK_AQ_ENV_NAME === "TEST", "TEST environment required");
-  check(/^[a-z0-9][a-z0-9-]*-test$/.test(bucket) && bucket !== "uk-aq-history-cic-test", "Separate TEST derived bucket required");
+  check(bucket === "uk-aq-chart-history-json-test", "Only the approved Sleepercar TEST derived bucket is permitted");
   const endpoint = process.env.UK_AQ_COMPRESSED_CHART_R2_ENDPOINT;
   let endpointUrl;
   try { endpointUrl = new URL(endpoint); } catch { throw new Error("Dedicated derived R2 endpoint required"); }
   check(endpointUrl.protocol === "https:" && /^[a-z0-9-]+\.r2\.cloudflarestorage\.com$/.test(endpointUrl.hostname)
     && endpointUrl.pathname === "/" && !endpointUrl.search && !endpointUrl.hash
     && !endpointUrl.username && !endpointUrl.password, "Dedicated derived R2 endpoint must be an account S3 HTTPS origin");
-  const mainAccountId = String(process.env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || "").trim();
-  check(/^[0-9a-f]{32}$/.test(mainAccountId)
-    && endpointUrl.hostname === `${mainAccountId}.r2.cloudflarestorage.com`,
-  "Derived R2 endpoint must match the configured main TEST Cloudflare account");
+  // TEST-only: the derived bucket is in Sleepercar, not the ukaq.co.uk proxy account.
+  const sleepercarTestAccountId = "41a81f781d3bd7234fde0b25df51e879";
+  check(endpointUrl.hostname === `${sleepercarTestAccountId}.r2.cloudflarestorage.com`,
+    "Derived R2 endpoint must belong to the Sleepercar TEST Cloudflare account");
   const r2 = { endpoint: endpointUrl.origin, region: "auto", bucket,
     access_key_id: process.env.UK_AQ_COMPRESSED_CHART_R2_ACCESS_KEY_ID,
     secret_access_key: process.env.UK_AQ_COMPRESSED_CHART_R2_SECRET_ACCESS_KEY };
@@ -231,7 +231,7 @@ async function publishPrepared(prepared, bucket) {
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
-    console.log("Usage: node --env-file=.env.compressed-chart-test scripts/compressed_chart_history/publish.mjs --candidate /absolute/candidate-manifest.<sha>.json --sample-id v3-september-2026|v3-2026-09-01|v2-2026-09-01 [--derived-bucket PRIVATE-TEST-BUCKET --publish]; publishing requires main TEST UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID and dedicated UK_AQ_COMPRESSED_CHART_R2_ENDPOINT/ACCESS_KEY_ID/SECRET_ACCESS_KEY");
+    console.log("Usage: node --env-file=.env.compressed-chart-test scripts/compressed_chart_history/publish.mjs --candidate /absolute/candidate-manifest.<sha>.json --sample-id v3-september-2026|v3-2026-09-01|v2-2026-09-01 [--derived-bucket PRIVATE-TEST-BUCKET --publish]; publishing requires Sleepercar TEST R2 endpoint (account 41a81f781d3bd7234fde0b25df51e879) and dedicated UK_AQ_COMPRESSED_CHART_R2_ENDPOINT/ACCESS_KEY_ID/SECRET_ACCESS_KEY");
     return;
   }
   const prepared = await preparePublication(options);
