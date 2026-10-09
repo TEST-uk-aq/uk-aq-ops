@@ -1822,9 +1822,9 @@ export function loadImmutableSourcePartition({ runState, dayUtc, connectorId, po
   )) {
     throw new Error(`Immutable source evidence selected pollutant is invalid: ${identity}`);
   }
-  const reconstructedRows = rows.map((row, index) => {
+  const reconstructRows = (rawRows, label) => rawRows.map((row, index) => {
     if (!row || typeof row !== "object" || Array.isArray(row)) {
-      throw new Error(`Immutable source evidence row is invalid: day=${dayUtc} connector=${connectorId} row=${index}`);
+      throw new Error(`Immutable ${label} evidence row is invalid: day=${dayUtc} connector=${connectorId} row=${index}`);
     }
     if (Object.hasOwn(row, "connector_id") && Number(row.connector_id) !== connectorId) {
       throw new Error(`Immutable source evidence row has conflicting connector_id: day=${dayUtc} connector=${connectorId} row=${index}`);
@@ -1850,6 +1850,7 @@ export function loadImmutableSourcePartition({ runState, dayUtc, connectorId, po
       verification_status: row.verification_status,
     });
   });
+  const reconstructedRows = reconstructRows(rows, "source");
   const reconstructedByPollutant = new Map();
   for (const row of reconstructedRows) {
     const partitionRows = reconstructedByPollutant.get(row.pollutant_code) || [];
@@ -1898,6 +1899,75 @@ export function loadImmutableSourcePartition({ runState, dayUtc, connectorId, po
       );
     }
   }
+  let finalTargetRows = selectedRows;
+  let finalTargetMetadata = computed;
+  let finalTargetEncodedRows = selectedRows.map(encodeCanonicalObservationRow).sort();
+  let finalTargetTimeseriesRowCounts = timeseriesRowCounts(selectedRows);
+  if (evidence.semantic_evidence_contract === "official_rdata_semantic_evidence") {
+    const preservedRowsPath = path.join(path.dirname(rowsPath), "preserved_baseline_rows.json");
+    const preservedRowsBody = fs.readFileSync(preservedRowsPath);
+    const preservedRows = JSON.parse(preservedRowsBody.toString("utf8"));
+    if (!Array.isArray(preservedRows)
+        || preservedRowsBody.byteLength !== Number(evidence.preserved_baseline_rows_bytes)
+        || sha256Hex(preservedRowsBody) !== evidence.preserved_baseline_rows_sha256
+        || preservedRows.length !== Number(evidence.preserved_baseline_row_count)) {
+      throw new Error(`Immutable preserved baseline identity is invalid: ${identity}`);
+    }
+    const reconstructedPreservedRows = reconstructRows(preservedRows, "preserved baseline");
+    const allTargetRows = [...reconstructedRows, ...reconstructedPreservedRows];
+    if (allTargetRows.length !== Number(evidence.final_target_row_count)) {
+      throw new Error(`Immutable final target row count changed: ${identity}`);
+    }
+    const targetByPollutant = new Map();
+    for (const row of allTargetRows) {
+      const partitionRows = targetByPollutant.get(row.pollutant_code) || [];
+      partitionRows.push(row);
+      targetByPollutant.set(row.pollutant_code, partitionRows);
+    }
+    const requestedPollutants = [...new Set(
+      (evidence.requested_pollutant_set || []).map(String),
+    )].sort();
+    const targetCounts = Object.fromEntries(requestedPollutants.map((code) => [
+      code, (targetByPollutant.get(code) || []).length,
+    ]));
+    const recordedTargetCounts = Object.fromEntries(Object.entries(
+      evidence.final_target_pollutant_counts || {},
+    ).sort(([left], [right]) => left.localeCompare(right)).map(([code, count]) => [
+      code, Number(count),
+    ]));
+    if (!sameJson(targetCounts, recordedTargetCounts)) {
+      throw new Error(`Immutable final target pollutant counts changed: ${identity}`);
+    }
+    const targetTimeseriesCounts = timeseriesRowCounts(allTargetRows);
+    const recordedTargetTimeseriesCounts = Object.fromEntries(Object.entries(
+      evidence.final_target_timeseries_row_counts || {},
+    ).sort(([left], [right]) => Number(left) - Number(right)).map(([key, count]) => [
+      key, Number(count),
+    ]));
+    if (!sameJson(targetTimeseriesCounts, recordedTargetTimeseriesCounts)) {
+      throw new Error(`Immutable final target timeseries counts changed: ${identity}`);
+    }
+    for (const code of requestedPollutants) {
+      const partitionRows = targetByPollutant.get(code) || [];
+      const targetHash = partitionRows.length
+        ? computeObservationContentHash(partitionRows)
+        : computeEmptyObservationContentHash();
+      const recordedTargetHash = evidence.final_target_observation_content_hashes?.[code];
+      validateObservationContentHashMetadata(recordedTargetHash, { rowCount: partitionRows.length });
+      const targetDifferences = semanticDifferences(targetHash, recordedTargetHash);
+      if (targetDifferences.length) {
+        throw new Error(
+          `Immutable final target semantic identity changed: day=${dayUtc} connector=${connectorId} pollutant=${code} differing_fields=${targetDifferences.join(",")}`,
+        );
+      }
+    }
+    finalTargetRows = targetByPollutant.get(pollutantCode) || [];
+    finalTargetMetadata = finalTargetRows.length
+      ? computeObservationContentHash(finalTargetRows)
+      : computeEmptyObservationContentHash();
+    finalTargetEncodedRows = finalTargetRows.map(encodeCanonicalObservationRow).sort();
+    finalTargetTimeseriesRowCounts = timeseriesRowCounts(finalTargetRows);
+  }
   return {
     evidence,
     evidencePath,
@@ -1909,6 +1979,10 @@ export function loadImmutableSourcePartition({ runState, dayUtc, connectorId, po
     encodedRows: selectedRows.map(encodeCanonicalObservationRow).sort(),
     metadata: semanticMetadata(computed),
     timeseriesRowCounts: timeseriesRowCounts(selectedRows),
+    finalTargetRows,
+    finalTargetEncodedRows,
+    finalTargetMetadata: semanticMetadata(finalTargetMetadata),
+    finalTargetTimeseriesRowCounts,
   };
 }
 
@@ -2198,8 +2272,16 @@ export async function validateFinalProposalGraph({
           differingFields: [`immutable_source_evidence:${error instanceof Error ? error.message : String(error)}`],
         });
       }
+      const expected = selected.authority_scope?.source_evidence_authority
+        ? {
+          rows: source.finalTargetRows,
+          encodedRows: source.finalTargetEncodedRows,
+          metadata: source.finalTargetMetadata,
+          timeseriesRowCounts: source.finalTargetTimeseriesRowCounts,
+        }
+        : source;
       if (authoritativeEmpty) {
-        if (source.rows.length !== 0 || manifestObject || partObjects.length) {
+        if (expected.rows.length !== 0 || manifestObject || partObjects.length) {
           throw finalProposalError({
             key: manifestKey,
             object: manifestObject,
@@ -2211,13 +2293,14 @@ export async function validateFinalProposalGraph({
           partition_prefix: selected.prefix,
           proposal_owner: "source_derived_authoritative_empty_repair",
           source_content_hash: source.metadata.observation_content_hash,
+          final_target_content_hash: expected.metadata.observation_content_hash,
           row_count: 0,
           status: "validated_authoritative_empty",
         });
         audit.validated_partition_count += 1;
         continue;
       }
-      if (!partObjects.length && source.rows.length) {
+      if (!partObjects.length && expected.rows.length) {
         throw finalProposalError({
           key: manifestKey,
           object: manifestObject,
@@ -2247,24 +2330,24 @@ export async function validateFinalProposalGraph({
         ? computeObservationContentHash(stagedRows)
         : computeEmptyObservationContentHash();
       const stagedEncodedRows = stagedRows.map(encodeCanonicalObservationRow).sort();
-      const stagedDifferences = semanticDifferences(source.metadata, staged);
-      if (!sameJson(source.encodedRows, stagedEncodedRows)) stagedDifferences.push("canonical_row_identity_and_duplicate_multiplicity");
+      const stagedDifferences = semanticDifferences(expected.metadata, staged);
+      if (!sameJson(expected.encodedRows, stagedEncodedRows)) stagedDifferences.push("canonical_row_identity_and_duplicate_multiplicity");
       if (stagedDifferences.length) {
         throw finalProposalError({ key: manifestKey, object: manifestObject, differingFields: stagedDifferences });
       }
       const manifest = parseManifestObject(manifestObject, "pollutant");
-      const manifestDifferences = semanticDifferences(source.metadata, manifest);
+      const manifestDifferences = semanticDifferences(expected.metadata, manifest);
       if (manifest.day_utc !== dayUtc || Number(manifest.connector_id) !== connectorId
         || manifest.pollutant_code !== pollutantCode || manifest.manifest_key !== manifestKey) {
         manifestDifferences.push("manifest_scope_identity");
       }
-      if (Number(manifest.source_row_count) !== source.rows.length
-        || Number(manifest.row_count) !== source.rows.length) {
+      if (Number(manifest.source_row_count) !== expected.rows.length
+        || Number(manifest.row_count) !== expected.rows.length) {
         manifestDifferences.push("manifest_row_count");
       }
       const manifestTimeseriesRowCounts = manifest.timeseries_row_counts
-        ?? (source.rows.length === 0 ? {} : null);
-      if (!sameJson(manifestTimeseriesRowCounts, source.timeseriesRowCounts)) {
+        ?? (expected.rows.length === 0 ? {} : null);
+      if (!sameJson(manifestTimeseriesRowCounts, expected.timeseriesRowCounts)) {
         manifestDifferences.push("manifest_timeseries_row_counts");
       }
       const manifestPartKeys = [...new Set((manifest.parquet_object_keys || []).map(String))].sort();
@@ -2303,6 +2386,10 @@ export async function validateFinalProposalGraph({
         immutable_source_content_hash: source.metadata.observation_content_hash,
         immutable_source_row_count: source.rows.length,
         immutable_source_verification_status_counts: source.metadata.verification_status_counts,
+        immutable_final_target_content_hash: expected.metadata.observation_content_hash,
+        immutable_final_target_row_count: expected.rows.length,
+        immutable_final_target_verification_status_counts:
+          expected.metadata.verification_status_counts,
       });
       for (const part of partObjects) {
         Object.assign(part.entry, {
@@ -2314,9 +2401,10 @@ export async function validateFinalProposalGraph({
         manifest_key: manifestKey,
         proposal_owner: "source_derived_observation_repair",
         source_content_hash: source.metadata.observation_content_hash,
+        final_target_content_hash: expected.metadata.observation_content_hash,
         staged_content_hash: staged.observation_content_hash,
         proposed_manifest_content_hash: manifest.observation_content_hash,
-        row_count: source.rows.length,
+        row_count: expected.rows.length,
         status: "validated",
       });
       audit.validated_partition_count += 1;

@@ -735,6 +735,11 @@ export function requireOfficialRdataTimestampAuthority(runState) {
     throw new Error("Official RData timestamp and unit authority is not accepted");
   }
   for (const comparison of authority.comparisons) {
+    const graphLocal = Date.parse(String(comparison?.graph?.interpreted_europe_london || ""));
+    const rdataLocal = Date.parse(String(comparison?.rdata?.interpreted_europe_london || ""));
+    const graphUtc = Date.parse(String(comparison?.graph?.observed_at_utc || ""));
+    const rdataUtc = Date.parse(String(comparison?.rdata?.observed_at_utc || ""));
+    const canonicalUtc = Date.parse(String(comparison?.canonical?.observed_at_utc || ""));
     if (!comparison || typeof comparison !== "object" || Array.isArray(comparison)
         || comparison.source_adapter !== authority.source_adapter
         || !String(comparison.site_code || "")
@@ -742,7 +747,16 @@ export function requireOfficialRdataTimestampAuthority(runState) {
         || !comparison.graph || !comparison.rdata || !comparison.canonical
         || !String(comparison.graph.original_timestamp || "")
         || !String(comparison.rdata.original_timestamp || "")
+        || !String(comparison.graph.interpreted_europe_london || "")
+        || !String(comparison.rdata.interpreted_europe_london || "")
         || !String(comparison.canonical.observed_at_utc || "")
+        || !Number.isFinite(graphLocal) || !Number.isFinite(rdataLocal)
+        || !Number.isFinite(graphUtc) || !Number.isFinite(rdataUtc)
+        || !Number.isFinite(canonicalUtc)
+        || graphLocal !== canonicalUtc
+        || graphUtc !== canonicalUtc
+        || rdataLocal + 60 * 60 * 1000 !== canonicalUtc
+        || rdataUtc !== canonicalUtc
         || typeof comparison.graph.value !== "string"
         || typeof comparison.rdata.value !== "string"
         || typeof comparison.canonical.value !== "string"
@@ -752,8 +766,12 @@ export function requireOfficialRdataTimestampAuthority(runState) {
         || !String(comparison.graph.unit || "")
         || comparison.graph.unit !== comparison.rdata.unit
         || comparison.graph.unit !== comparison.canonical.unit
-        || !String(comparison.europe_london_offset || "")
-        || !String(comparison.hour_convention || "")) {
+        || !/^[-+]\d{2}:\d{2}$/.test(String(comparison.europe_london_offset || ""))
+        || !String(comparison.graph.interpreted_europe_london).endsWith(
+          comparison.europe_london_offset,
+        )
+        || comparison.hour_convention
+          !== "rdata_beginning_plus_one_hour_equals_graph_end") {
       throw new Error("Official RData timestamp comparison is incomplete");
     }
   }
