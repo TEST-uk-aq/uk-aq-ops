@@ -157,14 +157,32 @@ jobs:
           # service policy and approved v3 sample are actually deployed.
           http_code="$(curl --silent --show-error --max-time 20 --connect-timeout 10 \
             --output "${RUNNER_TEMP}/uk_aq_chart_history_prototype_manifest.json" \
-            --write-out '%{http_code}' \
+            --write-out '%{http_code}|%{content_type}' \
             --header "CF-Access-Client-Id: ${PILOT_ACCESS_ID}" \
             --header "CF-Access-Client-Secret: ${PILOT_ACCESS_SECRET}" \
             --header "X-UK-AQ-Upstream-Auth: ${PILOT_UPSTREAM_SECRET}" \
             --header "Accept: application/json" \
             "${PILOT_ORIGIN}/v1/manifest?sample=v3-september-2026")"
-          if [ "${http_code}" != "200" ]; then
-            echo "Sleepercar Worker not yet reachable/published through Access (HTTP ${http_code})."
+          # Safe diagnostics: classify rejected responses without printing the
+          # Access credentials, upstream secret, response body or any headers.
+          http_status="${http_code%%|*}"
+          content_type="${http_code#*|}"
+          if [ "${http_status}" != "200" ]; then
+            case "${content_type}" in
+              application/json*)
+                error_code="$(jq -r '.error.code // "unknown_json_error"' \
+                  "${RUNNER_TEMP}/uk_aq_chart_history_prototype_manifest.json" 2>/dev/null || echo "invalid_json")"
+                case "${error_code}" in
+                  forbidden|pilot_not_configured|pilot_publication_unavailable|pilot_sample_invalid|pilot_query_invalid|method_not_allowed|route_not_found)
+                    echo "Sleepercar preflight rejected: HTTP ${http_status}; Worker JSON error ${error_code}."
+                    ;;
+                  *) echo "Sleepercar preflight rejected: HTTP ${http_status}; unrecognised JSON error." ;;
+                esac
+                ;;
+              *)
+                echo "Sleepercar preflight rejected: HTTP ${http_status}; response type ${content_type:-unknown} (not Worker JSON)."
+                ;;
+            esac
             exit 1
           fi
           jq -e '.schema_version == 1 and .sample_id == "v3-september-2026"
