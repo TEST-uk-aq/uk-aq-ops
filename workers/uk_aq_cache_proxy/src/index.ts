@@ -19,7 +19,10 @@ export interface Env {
   UK_AQ_R2_HISTORY_VERSION: unknown;
   UK_AQ_ENV_NAME: unknown;
   STATION_HISTORY?: { fetch(input: Request | string, init?: RequestInit): Promise<Response> };
-  COMPRESSED_CHART_HISTORY?: { fetch(input: Request | string, init?: RequestInit): Promise<Response> };
+  UK_AQ_COMPRESSED_CHART_ENABLED?: unknown;
+  UK_AQ_COMPRESSED_CHART_UPSTREAM_URL?: unknown;
+  UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_ID?: unknown;
+  UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_SECRET?: unknown;
   SUPABASE_URL: unknown;
   SB_PUBLISHABLE_DEFAULT_KEY: unknown;
   SB_SECRET_KEY: unknown;
@@ -2928,17 +2931,49 @@ export default {
       if (!sessionToken) return makeErrorResponse(401, "missing_session_cookie", requestOrigin, allowedOrigins);
       const authCheck = await verifyAccessToken(sessionToken, tokenSecret, requestOrigin);
       if (!authCheck.ok) return makeErrorResponse(401, authCheck.error, requestOrigin, allowedOrigins);
-      if (!env.COMPRESSED_CHART_HISTORY) return makeErrorResponse(503, "prototype_binding_unavailable", requestOrigin, allowedOrigins);
+      // The pilot Worker/R2 live in the separate Sleepercar TEST account.
+      // Normal proxy deployments have this flag disabled; never use a service
+      // binding, unauthenticated URL, local-dev bypass or browser-supplied host.
+      if (String(env.UK_AQ_ENV_NAME) !== "TEST"
+        || String(env.UK_AQ_COMPRESSED_CHART_ENABLED) !== "true") {
+        return makeErrorResponse(503, "prototype_binding_unavailable", requestOrigin, allowedOrigins);
+      }
       const secret = await readSecret(env.UK_AQ_EDGE_UPSTREAM_SECRET);
-      if (!secret) return makeErrorResponse(503, "prototype_auth_unavailable", requestOrigin, allowedOrigins);
-      const upstreamUrl = new URL(request.url);
-      upstreamUrl.pathname = `/v1/${prototypeMatch[1]}`;
-      const prototypeHeaders = new Headers({ "X-UK-AQ-Upstream-Auth": secret, Accept: "application/json" });
+      const upstreamOrigin = String(await readSecret(env.UK_AQ_COMPRESSED_CHART_UPSTREAM_URL) || "").trim();
+      const accessId = await readSecret(env.UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_ID);
+      const accessSecret = await readSecret(env.UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_SECRET);
+      if (!secret || !accessId || !accessSecret || !upstreamOrigin) {
+        return makeErrorResponse(503, "prototype_auth_unavailable", requestOrigin, allowedOrigins);
+      }
+      let origin: URL;
+      try { origin = new URL(upstreamOrigin); } catch {
+        return makeErrorResponse(503, "prototype_origin_invalid", requestOrigin, allowedOrigins);
+      }
+      if (origin.protocol !== "https:" || !/^[a-z0-9-]+\\.sleepercar\\.co\\.uk$/.test(origin.hostname)
+        || origin.port || origin.pathname !== "/" || origin.search || origin.hash
+        || origin.username || origin.password) {
+        return makeErrorResponse(503, "prototype_origin_invalid", requestOrigin, allowedOrigins);
+      }
+      const upstreamUrl = new URL(`/v1/${prototypeMatch[1]}${url.search}`, origin);
+      const prototypeHeaders = new Headers({
+        "X-UK-AQ-Upstream-Auth": secret,
+        "CF-Access-Client-Id": accessId,
+        "CF-Access-Client-Secret": accessSecret,
+        Accept: "application/json",
+      });
       const requestId = request.headers.get("X-UK-AQ-Prototype-Request-ID");
       if (requestId && /^[a-zA-Z0-9-]{1,64}$/.test(requestId)) prototypeHeaders.set("X-UK-AQ-Prototype-Request-ID", requestId);
       let upstream: Response;
-      try { upstream = await env.COMPRESSED_CHART_HISTORY.fetch(new Request(upstreamUrl.toString(), { method: "GET", headers: prototypeHeaders })); }
-      catch { return makeErrorResponse(502, "prototype_upstream_unavailable", requestOrigin, allowedOrigins); }
+      try {
+        // Never follow a redirect carrying the Access service token.
+        upstream = await fetch(upstreamUrl.toString(), { method: "GET", headers: prototypeHeaders, redirect: "manual" });
+      } catch {
+        return makeErrorResponse(502, "prototype_upstream_unavailable", requestOrigin, allowedOrigins);
+      }
+      if (upstream.status >= 300 && upstream.status < 400) {
+        await upstream.body?.cancel();
+        return makeErrorResponse(502, "prototype_upstream_redirect_refused", requestOrigin, allowedOrigins);
+      }
       const headers = new Headers(upstream.headers);
       headers.delete("Set-Cookie");
       headers.set("Cache-Control", "no-store");
