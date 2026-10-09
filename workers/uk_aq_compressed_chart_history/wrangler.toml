@@ -4,13 +4,17 @@ compatibility_date = "2026-10-09"
 workers_dev = false
 preview_urls = false
 
-# Intentionally no route or custom domain. Only the cache-proxy service binding calls this Worker.
-# Replace this syntactically valid sentinel with the real private derived TEST bucket before deployment.
+# Deploy in the Sleepercar TEST account (41a81f781d3bd7234fde0b25df51e879).
+# No public endpoint in this baseline config. Before deployment, explicitly
+# provision a TEST-only HTTPS hostname protected by Cloudflare Access (Service Auth)
+# and add its custom-domain route ONLY in a temporary operator deployment config.
+# Keep workers.dev and preview URLs disabled.
 [[r2_buckets]]
 binding = "UK_AQ_COMPRESSED_CHART_BUCKET"
-bucket_name = "uk-aq-compressed-chart-unconfigured-test"
+bucket_name = "uk-aq-chart-history-json-test"
 
 [vars]
 UK_AQ_ENV_NAME = "TEST"
 
-# Runtime secret: UK_AQ_EDGE_UPSTREAM_SECRET (same TEST service-binding secret as cache proxy).
+# Runtime secret: UK_AQ_EDGE_UPSTREAM_SECRET (same authenticated upstream secret as TEST proxy).
+# External Access policy/service token is enforced at the Sleepercar hostname.
