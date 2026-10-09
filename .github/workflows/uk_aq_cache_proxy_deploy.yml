@@ -162,6 +162,7 @@ jobs:
           # service policy and approved v3 sample are actually deployed.
           http_code="$(curl --silent --show-error --max-time 20 --connect-timeout 10 \
             --output "${RUNNER_TEMP}/uk_aq_chart_history_prototype_manifest.json" \
+            --dump-header "${RUNNER_TEMP}/uk_aq_chart_history_prototype_headers.txt" \
             --write-out '%{http_code}|%{content_type}' \
             --header "CF-Access-Client-Id: ${PILOT_ACCESS_ID}" \
             --header "CF-Access-Client-Secret: ${PILOT_ACCESS_SECRET}" \
@@ -185,7 +186,23 @@ jobs:
                 esac
                 ;;
               *)
-                echo "Sleepercar preflight rejected: HTTP ${http_status}; response type ${content_type:-unknown} (not Worker JSON)."
+                # Safe, fixed-category HTML inspection. Never print the response
+                # body or arbitrary headers; CF-Ray alone helps trace an edge block.
+                response_file="${RUNNER_TEMP}/uk_aq_chart_history_prototype_manifest.json"
+                header_file="${RUNNER_TEMP}/uk_aq_chart_history_prototype_headers.txt"
+                if grep -qi '^cf-mitigated: *challenge' "${header_file}"; then
+                  origin_category="cloudflare_challenge"
+                elif grep -Eqi 'error[[:space:]]*1020|error code:[[:space:]]*1020' "${response_file}"; then
+                  origin_category="cloudflare_rule_1020"
+                elif grep -Eqi 'cloudflare access|access denied' "${response_file}"; then
+                  origin_category="access_or_firewall_denial"
+                elif grep -Eqi 'just a moment|checking your browser|cf-chl' "${response_file}"; then
+                  origin_category="cloudflare_challenge_page"
+                else
+                  origin_category="unclassified_html"
+                fi
+                ray="$(awk 'tolower($1) == "cf-ray:" {gsub(/\\r/, "", $2); print $2; exit}' "${header_file}")"
+                echo "Sleepercar preflight rejected: HTTP ${http_status}; response type ${content_type:-unknown}; category ${origin_category}; CF-Ray ${ray:-unavailable}."
                 ;;
             esac
             exit 1
