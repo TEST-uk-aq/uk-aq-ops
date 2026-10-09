@@ -1,0 +1,1015 @@
+{
+  "snapshot_date": "2026-10-09",
+  "source_repository": "TEST-uk-aq/uk-aq-ops",
+  "source_commit": "34709a077f6732b8eb0cf590c8cea795ea4ea13a",
+  "authoritative_contract": {
+    "url": "https://github.com/TEST-uk-aq/uk-aq-system-docs/blob/main/system_docs/r2_history/sos_light_stable_fallback_contract.md",
+    "git_blob": "7d3191df30841657b2f205b712beb9053e533edd",
+    "local_docs_checkout": "17f37d09fca9e4f304df9a8e5625098102c9190b",
+    "local_docs_note": "Local checkout predates the versioned fallback amendment; amended contract read using read-only GitHub fetch_file."
+  },
+  "frozen_files": [
+    {
+      "path": "daily_profile.py",
+      "sha256": "ebccf363455b1c25c852453d49f74a5831ed9f9768836fec4661f418049e503c",
+      "git_blob": "46ce284fc873ac99d2d00ebc4f1624457341d828",
+      "source_path": "scripts/uk-aq-history-integrity/bin/daily_profile.py",
+      "source_identity": {
+        "sha256": "ebccf363455b1c25c852453d49f74a5831ed9f9768836fec4661f418049e503c",
+        "git_blob": "46ce284fc873ac99d2d00ebc4f1624457341d828"
+      },
+      "byte_identical_to_source": true
+    },
+    {
+      "path": "integrity/__init__.py",
+      "sha256": "ece815cc24624943d8feba0274588998fe809f9448bb5bd005140ae70b90a384",
+      "git_blob": "2082d6ddbf9eefbfc0de9e447678776ba1d2d0bc",
+      "source_path": "scripts/uk-aq-history-integrity/bin/integrity/__init__.py",
+      "source_identity": {
+        "sha256": "ece815cc24624943d8feba0274588998fe809f9448bb5bd005140ae70b90a384",
+        "git_blob": "2082d6ddbf9eefbfc0de9e447678776ba1d2d0bc"
+      },
+      "byte_identical_to_source": true
+    },
+    {
+      "path": "integrity/current_state/__init__.py",
+      "sha256": "b02ca5a89453f36bf8141156438d6de21cd2fcfa62b8bf70cb687bd22589554c",
+      "git_blob": "a28d335285d0fdbdc26821f6f5d12cb68c186b84",
+      "source_path": "scripts/uk-aq-history-integrity/bin/integrity/current_state/__init__.py",
+      "source_identity": {
+        "sha256": "b02ca5a89453f36bf8141156438d6de21cd2fcfa62b8bf70cb687bd22589554c",
+        "git_blob": "a28d335285d0fdbdc26821f6f5d12cb68c186b84"
+      },
+      "byte_identical_to_source": true
+    },
+    {
+      "path": "integrity/current_state/audit.py",
+      "sha256": "003474b9d3e04331448143613ee8c361068b467d3431b60a57d11d4dc0a9af45",
+      "git_blob": "a4e852a95dd82a2ca89526751507f9ad02a14075",
+      "source_path": "scripts/uk-aq-history-integrity/bin/integrity/current_state/audit.py",
+      "source_identity": {
+        "sha256": "003474b9d3e04331448143613ee8c361068b467d3431b60a57d11d4dc0a9af45",
+        "git_blob": "a4e852a95dd82a2ca89526751507f9ad02a14075"
+      },
+      "byte_identical_to_source": true
+    },
+    {
+      "path": "integrity/current_state/auth.py",
+      "sha256": "a6088929927e91ffaf36fabb37d2b808860541ad39cd94cc8b2442ffcc070cc0",
+      "git_blob": "13643e320e810934ec6109522f6a3c5eeb07141a",
+      "source_path": "scripts/uk-aq-history-integrity/bin/integrity/current_state/auth.py",
+      "source_identity": {
+        "sha256": "a6088929927e91ffaf36fabb37d2b808860541ad39cd94cc8b2442ffcc070cc0",
+        "git_blob": "13643e320e810934ec6109522f6a3c5eeb07141a"
+      },
+      "byte_identical_to_source": true
+    },
+    {
+      "path": "integrity/current_state/latest_snapshot_policy.mjs",
+      "sha256": "8a4fc86e5dc06b55fb06af0d9887eb66cd79b20dba57e945b0c40f792c53a462",
+      "git_blob": "0d56beda7a8a958c274757fa5cf2bd53dd386c8c",
+      "source_path": "scripts/uk-aq-history-integrity/bin/integrity/current_state/latest_snapshot_policy.mjs",
+      "source_identity": {
+        "sha256": "8a4fc86e5dc06b55fb06af0d9887eb66cd79b20dba57e945b0c40f792c53a462",
+        "git_blob": "0d56beda7a8a958c274757fa5cf2bd53dd386c8c"
+      },
+      "byte_identical_to_source": true
+    },
+    {
+      "path": "integrity/history_cache.py",
+      "sha256": "75c8344f5a4cfd57953c2044a643605629159515544e6f08459b74e4475ed6ed",
+      "git_blob": "f06717fc58fa0e0741888fb35d3120f517099239",
+      "source_path": "scripts/uk-aq-history-integrity/bin/integrity/history_cache.py",
+      "source_identity": {
+        "sha256": "75c8344f5a4cfd57953c2044a643605629159515544e6f08459b74e4475ed6ed",
+        "git_blob": "f06717fc58fa0e0741888fb35d3120f517099239"
+      },
+      "byte_identical_to_source": true
+    },
+    {
+      "path": "integrity/history_cache_rows.mjs",
+      "sha256": "2184b242b74f61813eee6920b722ad3dd752cc2bc4858f0923dfa859e93777ef",
+      "git_blob": "f62a372917cdf83a42028056c7d985f90222ef70",
+      "source_path": "scripts/uk-aq-history-integrity/bin/integrity/history_cache_rows.mjs",
+      "source_identity": {
+        "sha256": "2184b242b74f61813eee6920b722ad3dd752cc2bc4858f0923dfa859e93777ef",
+        "git_blob": "f62a372917cdf83a42028056c7d985f90222ef70"
+      },
+      "byte_identical_to_source": true
+    },
+    {
+      "path": "integrity/official_network_rdata.py",
+      "sha256": "6fabc1cc7252fdc35aad278584e1ea255fa0948dbc87c5d22b167e8787883ca4",
+      "git_blob": "0817e5c24cd101f3555190e7d0b5bec0085f148c",
+      "source_path": "scripts/uk-aq-history-integrity/bin/integrity/official_network_rdata.py",
+      "source_identity": {
+        "sha256": "6fabc1cc7252fdc35aad278584e1ea255fa0948dbc87c5d22b167e8787883ca4",
+        "git_blob": "0817e5c24cd101f3555190e7d0b5bec0085f148c"
+      },
+      "byte_identical_to_source": true
+    },
+    {
+      "path": "integrity/official_network_rdata_timestamp_authority.py",
+      "sha256": "132fecf461ec063bff34ff7328d547fc76b615b51229bfb57e8fbb6958ee684a",
+      "git_blob": "a72194430c371155743b04732c26bf8f8363e35f",
+      "source_path": "scripts/uk-aq-history-integrity/bin/integrity/official_network_rdata_timestamp_authority.py",
+      "source_identity": {
+        "sha256": "132fecf461ec063bff34ff7328d547fc76b615b51229bfb57e8fbb6958ee684a",
+        "git_blob": "a72194430c371155743b04732c26bf8f8363e35f"
+      },
+      "byte_identical_to_source": true
+    },
+    {
+      "path": "integrity/repair/__init__.py",
+      "sha256": "8cc4a55ab4adaa78f589275461ee197577882d4ccdc37647669614668b120644",
+      "git_blob": "1ecca04dabf57190def90e1a2e9f44dfcff86bff",
+      "source_path": "scripts/uk-aq-history-integrity/bin/integrity/repair/__init__.py",
+      "source_identity": {
+        "sha256": "8cc4a55ab4adaa78f589275461ee197577882d4ccdc37647669614668b120644",
+        "git_blob": "1ecca04dabf57190def90e1a2e9f44dfcff86bff"
+      },
+      "byte_identical_to_source": true
+    },
+    {
+      "path": "integrity/repair/decisions.py",
+      "sha256": "ff2b0a6f2a1293442fa3e24c36ef66ea87d01233e25e7eeef1ffcf85f8b19e2d",
+      "git_blob": "d07271a4ece0f5e7bb23b7e501d65f320d6d642e",
+      "source_path": "scripts/uk-aq-history-integrity/bin/integrity/repair/decisions.py",
+      "source_identity": {
+        "sha256": "ff2b0a6f2a1293442fa3e24c36ef66ea87d01233e25e7eeef1ffcf85f8b19e2d",
+        "git_blob": "d07271a4ece0f5e7bb23b7e501d65f320d6d642e"
+      },
+      "byte_identical_to_source": true
+    },
+    {
+      "path": "integrity/runtime.py",
+      "sha256": "3e397f8a1bbe98fb5d7e43f2276f350e0b3b87504628157be38545f69cb5b434",
+      "git_blob": "66318dad3fd5e0dbd06437fbec116d73b7c19949",
+      "source_path": "scripts/uk-aq-history-integrity/bin/integrity/runtime.py",
+      "source_identity": {
+        "sha256": "3e397f8a1bbe98fb5d7e43f2276f350e0b3b87504628157be38545f69cb5b434",
+        "git_blob": "66318dad3fd5e0dbd06437fbec116d73b7c19949"
+      },
+      "byte_identical_to_source": true
+    },
+    {
+      "path": "integrity/timeseries_binding_provider.py",
+      "sha256": "4902f7455416c5c55aa38ca3080798a3ffe974a330844dc25512e26664925413",
+      "git_blob": "23d8a8435a3b48e7881aff1ca8d5dcfd452b281a",
+      "source_path": "scripts/uk-aq-history-integrity/bin/integrity/timeseries_binding_provider.py",
+      "source_identity": {
+        "sha256": "4902f7455416c5c55aa38ca3080798a3ffe974a330844dc25512e26664925413",
+        "git_blob": "23d8a8435a3b48e7881aff1ca8d5dcfd452b281a"
+      },
+      "byte_identical_to_source": true
+    },
+    {
+      "path": "uk-aq-history-integrity-sos-light-stable-v2.py",
+      "sha256": "803a97e8aaa96a9bfb725365810cfa5828657c976edd6c1411190a629e764521",
+      "git_blob": "384c79c0ff782fc604ad5f956df5ae6b836da354",
+      "source_path": "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity.py",
+      "source_identity": {
+        "sha256": "a783d9ddeacef1d71e9bd7ee6f3a51ebe7ab7b049cc119b7f120523fa9067708",
+        "git_blob": "82ac7ac1b27c2d657c69658955b24be1a6403ea2"
+      },
+      "byte_identical_to_source": false
+    },
+    {
+      "path": "uk-aq-history-integrity-sos-light-stable-v2.sh",
+      "sha256": "85f10f6e3ee075cdb645a85a4876274a0228eab6cc00ec0eee5964e2ae9b8986",
+      "git_blob": "14cd0ff57754785fed8e32bff001d520ffce3e85",
+      "source_path": "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v2.sh",
+      "source_identity": {
+        "sha256": "d2536f2eb1cdb222be8a2c64b153a0715f520681294d1c29cb47c131716a4ad0",
+        "git_blob": "8a4087dd7796c4699b0512d44f4e2231e333f265"
+      },
+      "byte_identical_to_source": false
+    },
+    {
+      "path": "uk-aq-history-integrity-sos-light-stable-v2_impl.py",
+      "sha256": "ac0d51108dcbed2e2d2244c895317bb3625fc770d92ce27cb08a3a2fbbc526b0",
+      "git_blob": "fdd060cbef2a07451afd837f22a4cbe76895d953",
+      "source_path": "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py",
+      "source_identity": {
+        "sha256": "ac0d51108dcbed2e2d2244c895317bb3625fc770d92ce27cb08a3a2fbbc526b0",
+        "git_blob": "fdd060cbef2a07451afd837f22a4cbe76895d953"
+      },
+      "byte_identical_to_source": true
+    },
+    {
+      "path": "uk_aq_integrity_backfill.sh",
+      "sha256": "e1e2e860a23ff9299aeeb349eca80c06ce0afc6c1e87e2d9a08e63f799976356",
+      "git_blob": "afd6070c43a879a86c5e5a3d338014a082786cb4",
+      "source_path": "scripts/uk-aq-history-integrity/bin/uk_aq_integrity_backfill.sh",
+      "source_identity": {
+        "sha256": "74dde8510463ce183781447168bb445edf2965b7f098f356a8004da829819ab3",
+        "git_blob": "b1edb12417c716304eecdf3cd70e999598412236"
+      },
+      "byte_identical_to_source": false
+    }
+  ],
+  "shared_files": [
+    {
+      "path": "config/uk_aq_history_cache.json",
+      "sha256": "e550dc3b6869a803bdf74c84e0311e921fd0906a50930104341c785564bf0214",
+      "git_blob": "ac443b8e3d206092cc48acb5bc72f306a19304dd",
+      "role": "shared cache invalidation configuration read by frozen history_cache module",
+      "required_by": [
+        "config/uk_aq_history_cache.json"
+      ]
+    },
+    {
+      "path": "deno.lock",
+      "sha256": "7af4db953b8662aa83cf9469b8e51373c8ceeade32f06a226256ad51ccdaf8db",
+      "git_blob": "e698e4130b59b58d4426459d1ccf626108b35f1a",
+      "role": "normal Deno dependency lock",
+      "required_by": [
+        "deno.lock"
+      ]
+    },
+    {
+      "path": "lib/aqi/aqi_levels.mjs",
+      "sha256": "64c4a15e5c9dfbac8f18d6d1f449387c5a36ba10c16c5fd1fc2362df474f736e",
+      "git_blob": "a0782f5acee36070645ff8c76dd5993edc7c5e05",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/uk_aq_backfill_local/backfill_core.mjs"
+      ]
+    },
+    {
+      "path": "package-lock.json",
+      "sha256": "a5e4cb442a1dfa12db85842bed801a382f0e4ef51106e33d2d911a5a255e5b46",
+      "git_blob": "bb73a9c68f2ffb167bcaf4a3c70b37a849ee0571",
+      "role": "normal Node dependency lock",
+      "required_by": [
+        "package-lock.json"
+      ]
+    },
+    {
+      "path": "package.json",
+      "sha256": "9406a23ba2fe6163e5e5cb34de252bf9d6f760554c26f8e13cf60c5dda3d9de8",
+      "git_blob": "2f49cbd43ac794fcc87915c11df2efc226aefa46",
+      "role": "normal Node/Deno package configuration",
+      "required_by": [
+        "package.json"
+      ]
+    },
+    {
+      "path": "requirements-dev.txt",
+      "sha256": "77c8e48433fa62f63f514af242ad207b3baa8711cebfed717df53e5b5ac09a4f",
+      "git_blob": "af6111f57429769d161629e6ead2c57fd2c17926",
+      "role": "normal Python environment dependency declarations; no credentials or environment copied",
+      "required_by": [
+        "requirements-dev.txt"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/lib/hierarchical_backup_v2.mjs",
+      "sha256": "2bf1b590d601a15e51fd33f8a80c019e83f19ed9f85759017d3d294ac40ddd21",
+      "git_blob": "eb0d2ba638487faed5f36086354f863ffdc65155",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/lib/hierarchical_timeseries_binding_pack_sync_v1.mjs",
+        "scripts/backup_r2/lib/timeseries_binding_backup_pack_v1.mjs",
+        "scripts/backup_r2/lib/timeseries_binding_pack_inventory_v1.mjs",
+        "scripts/backup_r2/uk_aq_check_integrity_dropbox_currentness.mjs"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/lib/hierarchical_timeseries_binding_pack_sync_v1.mjs",
+      "sha256": "12f5e1d9422e4ae72f0962abd615f475233df9163dbdd22d30f9ce3fd9236aee",
+      "git_blob": "23afc05be606ac5d6e81ffe2e66222d94f6c4b6b",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_check_integrity_dropbox_currentness.mjs"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/lib/integrity_r2_get_retry.mjs",
+      "sha256": "d81fc64d4eac6c867f7447ff0dcbb7203061dd8c3764816b20bf65abfda5652b",
+      "git_blob": "45ad036432ae5ff73e26d737c08442d58ce55d91",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/lib/observation_history_integrity_key_allowlist.mjs",
+      "sha256": "9fded72e2f3f83c1754686fbb8a42937bb8f48a4a516e391a55ad608a31ee1a2",
+      "git_blob": "3b882d1a0914b43ad75e2a45fe9b944d091f4a18",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/lib/rclone.mjs",
+      "sha256": "f1d80c6d4dcdbdaf43539c058adc2ab063a2cff771ec2e7439fc9afc7fc5ac95",
+      "git_blob": "2320958c02e0f72c36190b887c0a54e32452955e",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/lib/timeseries_binding_pack_inventory_v1.mjs"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/lib/sos_light_v2_coordinator_validation.mjs",
+      "sha256": "9746369dd66b4857e248f4bff7aff351901e7114c800947ad17e6bd66e9b9760",
+      "git_blob": "6db6cbc3140cb32ba945c13eec1426883295e6c2",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/lib/timeseries_binding_backup_pack_v1.mjs",
+      "sha256": "35c6fcee543347191dda0f13cdf5da976eb6129bcb0fb0e9c4acc90d6921cf56",
+      "git_blob": "8230c1ab157bc5ba91ed7978495cc3e4528d5dd9",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/lib/timeseries_binding_pack_inventory_v1.mjs"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/lib/timeseries_binding_pack_inventory_v1.mjs",
+      "sha256": "1989f2246b882726a7425ea8bdf50ccabc3b1c905af35635b65c7aa23c9b049f",
+      "git_blob": "1d59beeab4a7fd88a2d8d74728a4a5bdad6d23b3",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_check_integrity_dropbox_currentness.mjs"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs",
+      "sha256": "127954f28899431901a7383baff724b198180aa6efed10d97bca1122c2b75b16",
+      "git_blob": "2b47999782f4bf56766ebbd8f2fee6bca92fdab7",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/lib/timeseries_binding_backup_pack_v1.mjs",
+        "scripts/backup_r2/lib/timeseries_binding_pack_inventory_v1.mjs"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/lib/uk_aq_integrity_core_snapshot_identity.mjs",
+      "sha256": "347a0cf13bcbc6b24a4e16635dc45e09a6a9a04e3a7e2914760b5fe89d13a588",
+      "git_blob": "a9fb46255f2da563e2121c754a0c6cd35eb715b2",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
+        "scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/lib/uk_aq_observation_parquet_content_hash.mjs",
+      "sha256": "afdebc347ce5367b9c383bd4c8a0ff6f5af2169d1b26cf7e0752fc6a5d372406",
+      "git_blob": "a33a746d53a9a9ed994161018df2b356a009dee8",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/uk_aq_backfill_local/r2_history/canonical_manifest_compatibility.mjs",
+        "workers/uk_aq_backfill_local/r2_history/metadata_repair.mjs",
+        "workers/uk_aq_backfill_local/r2_history/proposal_ownership.mjs"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/lib/uk_aq_parquet_dependencies.mjs",
+      "sha256": "ab3631b095d8b8b2a115e4bc40b3ca24e26747c850d5df651714cc9de9631ea8",
+      "git_blob": "d97dea4e76e0d0172a1b3a7c306abbc40facca3f",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/lib/uk_aq_observation_parquet_content_hash.mjs",
+        "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
+        "scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs",
+        "workers/uk_aq_backfill_local/r2_history/canonical_manifest_compatibility.mjs",
+        "workers/uk_aq_backfill_local/r2_history/metadata_repair.mjs"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/lib/uk_aq_v2_observations_manifest_validation.mjs",
+      "sha256": "1228643eebc38c2862beed9705204274708d0d6909514fe12ed7b40aaa3762fc",
+      "git_blob": "266c57f566069033e14a38470aa177c3b81440a7",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs",
+        "workers/uk_aq_backfill_local/r2_history/canonical_manifest_compatibility.mjs"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
+      "sha256": "7524d9d2c37bab1720d3e06856e700c365d3372e7f67c5fa60e52d4b5a91691c",
+      "git_blob": "085be7b38c691ef2cf1b99595a32f11d61b9c7b0",
+      "role": "canonical v2 APPLY, independent frozen-state validation, fingerprint gate, journalling and final verification",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/uk_aq_build_r2_history_index.mjs",
+      "sha256": "4c802e7089042daf5df93c67734b7a3ddba9caeb5a6fc163b07b3f3bd09e8423",
+      "git_blob": "95e24cbcc284737dbc3d81b8048fb267b10f02c9",
+      "role": "v2 local overlay metadata/index planner",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_build_r2_history_index.mjs"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/uk_aq_check_integrity_dropbox_currentness.mjs",
+      "sha256": "8364a72eaa4d458ad3e1677a9e0bab780d0e63061711a8a401cf20800a28760a",
+      "git_blob": "9d59c061528a3768f8abe55bcbd4cab53fad4592",
+      "role": "Step 0 accepted checkpoint/root currentness and pinned baseline proof",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_check_integrity_dropbox_currentness.mjs"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/uk_aq_check_integrity_ingest_boundary.mjs",
+      "sha256": "19024ec7b85a7b13ee7df5d04d003abaf7260d2d588235c98a00345798269ed3",
+      "git_blob": "9c2f7371e4f44c5f54dac68e3fa8220ae84e01db",
+      "role": "request-wide connector 1 IngestDB boundary; no clipping",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_check_integrity_ingest_boundary.mjs"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs",
+      "sha256": "76bcafab1969ad91886972592e27adb9f4aa348722e296e55cd219a39d33c5ed",
+      "git_blob": "bf6a6f4045891a1d267faa6150bdb46da97cfe71",
+      "role": "existing v2 repair helper referenced by retained SOS check/dry-run/generic paths",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs"
+      ]
+    },
+    {
+      "path": "scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs",
+      "sha256": "9d2c866c800fe3eeb91580ebed9c28365da5bf2c2c559cac5d235c5f9e85ce97",
+      "git_blob": "59f74560edb5909adbbb264362d989f264051018",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs"
+      ]
+    },
+    {
+      "path": "scripts/operations/lib/uk_aq_sos_light_v2_lock_recovery.mjs",
+      "sha256": "87ec525bab6338bfdfbaefcaa43b347644797205c721d885f69653a4a58e70b6",
+      "git_blob": "923d4d97cae5888f1306ae0bfcefc6f808ddeaae",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
+        "scripts/operations/uk_aq_with_observations_global_operation_lock.mjs"
+      ]
+    },
+    {
+      "path": "scripts/operations/uk_aq_observations_global_operation_child_supervisor.mjs",
+      "sha256": "2a06aea981d568ce7b21795f1e565f09ec07f0e4401ec4151487af124c8c8fa3",
+      "git_blob": "b010ca8f05599a8a547135c7f0e1ba883c4c52ae",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/operations/uk_aq_with_observations_global_operation_lock.mjs"
+      ]
+    },
+    {
+      "path": "scripts/operations/uk_aq_with_observations_global_operation_lock.mjs",
+      "sha256": "53492fbc0dd49e4b2e9682e0d776caa1bff2230e0cd3513fc23459ed016c101a",
+      "git_blob": "fb6668ded7072723f60da1785276638b2574285b",
+      "role": "same shared advisory-lock owner and pre-mutation recovery; re-executes the frozen Python entrypoint",
+      "required_by": [
+        "scripts/operations/uk_aq_with_observations_global_operation_lock.mjs"
+      ]
+    },
+    {
+      "path": "scripts/uk_aq_backfill_local.sh",
+      "sha256": "65a5dc66c141520dbb7672a4cb6f10fa7f89ae54d4ba2bca607533c56bf767a9",
+      "git_blob": "a67bec0a8e7ace52ee8ded63435c41a3f2a22d98",
+      "role": "shared nested backfill launcher; source_to_r2 + SOS=1 + observations_only; single complete-range acquisition; no nested full-index rebuild",
+      "required_by": [
+        "scripts/uk_aq_backfill_local.sh"
+      ]
+    },
+    {
+      "path": "workers/shared/r2_sigv4.mjs",
+      "sha256": "e0e32efc5e979ec8d2f690b2acdff5c14d011a933c94eb0c7deb1bbaf25995fd",
+      "git_blob": "0d6ff40eab42a267afe7b075832f4409cc890286",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/lib/integrity_r2_get_retry.mjs",
+        "scripts/backup_r2/lib/timeseries_binding_backup_pack_v1.mjs",
+        "scripts/backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs",
+        "scripts/backup_r2/lib/uk_aq_v2_observations_manifest_validation.mjs",
+        "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
+        "scripts/backup_r2/uk_aq_check_integrity_dropbox_currentness.mjs",
+        "scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs",
+        "workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs",
+        "workers/shared/uk_aq_observation_history_index_v3.mjs",
+        "workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs",
+        "workers/shared/uk_aq_observation_history_target_writer.mjs",
+        "workers/shared/uk_aq_r2_checksum_publication.mjs",
+        "workers/shared/uk_aq_r2_history_canonical.mjs",
+        "workers/shared/uk_aq_r2_history_index.mjs",
+        "workers/shared/uk_aq_r2_history_manifest_validation.mjs",
+        "workers/shared/uk_aq_r2_observations_manifest_hierarchy_finalizer.mjs",
+        "workers/uk_aq_backfill_local/integrity/source_evidence.ts",
+        "workers/uk_aq_backfill_local/r2_history/canonical_manifest_compatibility.mjs",
+        "workers/uk_aq_backfill_local/r2_history/metadata_repair.mjs",
+        "workers/uk_aq_backfill_local/r2_history/proposal_ownership.mjs",
+        "workers/uk_aq_backfill_local/run_job.ts"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_connector_day_gate.mjs",
+      "sha256": "87e106238e9c37a942b6ee097019bc8f146cd16d25ec7e08e0d3fe3ad76330ed",
+      "git_blob": "fddd4f7ab572e5cc20aeb930351b60e3f4c1e693",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/shared/uk_aq_r2_history_writer.mjs"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_observation_content_hash.mjs",
+      "sha256": "e83562911fdad0435b0f8ce69e1c16dca9a402ba84bb542e9ab1954c04ec0f3f",
+      "git_blob": "1d2d93633503989ffb6e30efc849957a3ad51141",
+      "role": "single canonical observation normalization, verification_status and content-hash owner",
+      "required_by": [
+        "scripts/backup_r2/lib/uk_aq_observation_parquet_content_hash.mjs",
+        "scripts/backup_r2/lib/uk_aq_v2_observations_manifest_validation.mjs",
+        "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
+        "scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs",
+        "workers/shared/uk_aq_observation_content_hash.mjs",
+        "workers/shared/uk_aq_observation_history_index_v3.mjs",
+        "workers/shared/uk_aq_observation_history_target_writer.mjs",
+        "workers/shared/uk_aq_prune_connector_source_identity.mjs",
+        "workers/uk_aq_backfill_local/r2_history/proposal_ownership.mjs",
+        "workers/uk_aq_backfill_local/run_job.ts"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs",
+      "sha256": "1b467dc74558dfb62553190cac92309971364ce75efef0d515dceccf1f42cfbc",
+      "git_blob": "8b46059c3593d2b0ccc1f33953c378d34bb15780",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_observation_history_generation.mjs",
+      "sha256": "41f2a37eb1b2f3cfbbfe6ed3f9c06f9fa093638b7c4f086d5688a6a5a9915141",
+      "git_blob": "6c7bd1e6cfa13aa62014c93b5f953762b25c8c10",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/lib/hierarchical_backup_v2.mjs",
+        "scripts/backup_r2/lib/uk_aq_integrity_core_snapshot_identity.mjs",
+        "scripts/backup_r2/uk_aq_check_integrity_dropbox_currentness.mjs",
+        "scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs",
+        "workers/shared/uk_aq_connector_day_gate.mjs",
+        "workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs",
+        "workers/uk_aq_backfill_local/run_job.ts"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_observation_history_index_v3.mjs",
+      "sha256": "0ee02f8bda1e5f49ab634e9e0d7137ff0085f8b9c5b3d97e0477f0e71b215433",
+      "git_blob": "fe5b8e65f31d6ea0eb5330fa59cb19d28a8606cd",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs",
+        "workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_observation_history_random_access_v3.mjs",
+      "sha256": "f039b0a5de7c861a463f3e3ffe87d478dd16c56ab937db3f0c3485f996afa048",
+      "git_blob": "2ce490964cf217d5ff719709fe6f0abfb63347d5",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/shared/uk_aq_observation_history_reader_v3.mjs"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_observation_history_reader_v3.mjs",
+      "sha256": "c9b99cc20bf647f6cf7481529a3a995244c987fd065cae246402c1d2db6275b0",
+      "git_blob": "695aaf44b4b1aa2ce5a7754fe6a1e4c75cb418b2",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_observation_history_schema.mjs",
+      "sha256": "7e68c8fc17dea1a8d0112e7b5a3d6ce1267e2fe80a87bf0ecc17b139c05c658a",
+      "git_blob": "5fcf69f843c7082f01c5ae9355663ca9e0c2a061",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/lib/uk_aq_observation_parquet_content_hash.mjs",
+        "scripts/backup_r2/lib/uk_aq_v2_observations_manifest_validation.mjs",
+        "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
+        "scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs",
+        "workers/shared/uk_aq_observation_content_hash.mjs",
+        "workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs",
+        "workers/shared/uk_aq_observation_history_index_v3.mjs",
+        "workers/shared/uk_aq_observation_history_reader_v3.mjs",
+        "workers/shared/uk_aq_observation_history_scoped_manifest_v3.mjs",
+        "workers/shared/uk_aq_observation_history_target_writer.mjs",
+        "workers/shared/uk_aq_r2_history_canonical.mjs",
+        "workers/uk_aq_backfill_local/r2_history/canonical_manifest_compatibility.mjs",
+        "workers/uk_aq_backfill_local/r2_history/metadata_repair.mjs",
+        "workers/uk_aq_backfill_local/r2_history/proposal_ownership.mjs",
+        "workers/uk_aq_backfill_local/run_job.ts"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_observation_history_scoped_manifest_v3.mjs",
+      "sha256": "91cc79c548a3a2157282aa25f981881bb8f41be0c6ba7080a7451b2c5da145d1",
+      "git_blob": "ed5a265e112c14088e29166a6e8c2f6cad4cf495",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/shared/uk_aq_observation_history_index_v3.mjs",
+        "workers/shared/uk_aq_observation_history_reader_v3.mjs"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs",
+      "sha256": "a0bc8d6a6242ce679cb9ce7593a4f0920a31b1f7fe56162838ad3e984324f810",
+      "git_blob": "42269c650361d71adff594ac0aee83ca5d04eb32",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/uk_aq_backfill_local/fixed_v3_integrity_observation_proposal.mjs",
+        "workers/uk_aq_backfill_local/run_job.ts"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_observation_history_target_writer.mjs",
+      "sha256": "31abb9b8ef7df447f5087564efe952c872a8291d4a1aeaa845f28d65b9c93598",
+      "git_blob": "77429e611877532b0ba0045a49cdc28c5bf5f2da",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs",
+        "workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_observation_history_writer_limits_v3.mjs",
+      "sha256": "6dd69f2dc54fcc12b92df6285e90114a3429ec8367fd2e37b76e6a05e8007004",
+      "git_blob": "42ab5fce914a4a4eab858dd5818a23c87fb3c8f4",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_observation_property_code.mjs",
+      "sha256": "1e37f4062bf87a8d819ad4a19a3a71b2f7dabc1248a6e4b72d470d55bc789e18",
+      "git_blob": "dffa5d8f99ebd7efaec0e777d13fabb3578c5e6f",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/shared/uk_aq_observation_history_index_v3.mjs",
+        "workers/shared/uk_aq_observation_history_reader_v3.mjs",
+        "workers/shared/uk_aq_observation_history_scoped_manifest_v3.mjs",
+        "workers/shared/uk_aq_r2_history_index.mjs"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_observation_verification_overlay.mjs",
+      "sha256": "d3dadf4e10ad811f55ce7605e86efcd0da0054b69c2305e7fc09dace6cc0c8d9",
+      "git_blob": "ee593a879f7a5ef37855f44a690bee486352c795",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/lib/hierarchical_backup_v2.mjs"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_prune_connector_source_identity.mjs",
+      "sha256": "f19635907d015b00c2007b089b9df2864cde033157439a53a1c3045113ccdf7a",
+      "git_blob": "2286515084f0dbc9da134d400c0e313c2ea6ea07",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/shared/uk_aq_connector_day_gate.mjs"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_r2_checksum_publication.mjs",
+      "sha256": "c8da6a7a8e9e22c3a7bf1a456be8c0c8e91ea090c6ff9207c35d5249ed02ea8f",
+      "git_blob": "5a1ead5d93b43862150bfe40743c279b62fed362",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
+        "workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_r2_history_canonical.mjs",
+      "sha256": "d1b0ede422de118433836223063724c0cd4354796563a27c26682f7ab8f0b63c",
+      "git_blob": "b45dae1692e46967187678b55adb7507c597b5c1",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
+        "scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs",
+        "workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs",
+        "workers/shared/uk_aq_r2_history_writer.mjs",
+        "workers/uk_aq_backfill_local/aqilevels/manifests.ts",
+        "workers/uk_aq_backfill_local/observations/manifests.ts",
+        "workers/uk_aq_backfill_local/r2/history_paths.ts",
+        "workers/uk_aq_backfill_local/r2_history/canonical_manifest_compatibility.mjs",
+        "workers/uk_aq_backfill_local/r2_history/metadata_repair.mjs",
+        "workers/uk_aq_backfill_local/run_job.ts"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_r2_history_index.mjs",
+      "sha256": "75427fc3d0953312e35d0e68f296f6cd52823bdb853c66637c227477fbc61887",
+      "git_blob": "a68524a209101a04eb6ff0c21c4facbbedc3ee92",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
+        "scripts/backup_r2/uk_aq_build_r2_history_index.mjs",
+        "scripts/backup_r2/uk_aq_check_integrity_dropbox_currentness.mjs",
+        "scripts/backup_r2/uk_aq_execute_v2_observations_repair_impl.mjs"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_r2_history_manifest_validation.mjs",
+      "sha256": "88634e2a43ace57c00c3db1b7850c91e7c9be506690474b593a58b96fbc52776",
+      "git_blob": "aca066233c50f6d136710283465c69c18c49e546",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/shared/uk_aq_r2_history_canonical.mjs"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_r2_history_version.mjs",
+      "sha256": "4cc2a026d927d7141ca9276513a5aed47014acbee77bc4921013fadf9d208c32",
+      "git_blob": "f251361b5e82ab365f7186e7aafc36a663229f2f",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/shared/uk_aq_observation_history_generation.mjs"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_r2_history_writer.mjs",
+      "sha256": "c2635e517ece2f33cbf9b0a18727875ae6329be0c19127acf27d8ba9bdabeef8",
+      "git_blob": "25f565802d420f3b7ef45c3ef73890167af4aaf4",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs",
+        "scripts/backup_r2/uk_aq_check_integrity_dropbox_currentness.mjs",
+        "scripts/backup_r2/uk_aq_check_integrity_ingest_boundary.mjs",
+        "scripts/operations/uk_aq_with_observations_global_operation_lock.mjs",
+        "workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs",
+        "workers/shared/uk_aq_r2_observations_global_finalizer.mjs"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_r2_observations_global_finalizer.mjs",
+      "sha256": "ed96fca0d1507dc9d515964a14159ed2d0b521d115f1481296e96601ac739782",
+      "git_blob": "4d4540393e966accbd041b91df2a6114fa2d71ec",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_apply_integrity_proposal.mjs"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs",
+      "sha256": "644c100142ad35a323d87cefcf74960d08e41bf1cfc534d986b4f1cbe0caffd6",
+      "git_blob": "e855fcd6192e79595a8611995ac328898409e626",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_check_integrity_dropbox_currentness.mjs",
+        "workers/shared/uk_aq_r2_observations_manifest_hierarchy_finalizer.mjs"
+      ]
+    },
+    {
+      "path": "workers/shared/uk_aq_r2_observations_manifest_hierarchy_finalizer.mjs",
+      "sha256": "b91099af494ec0d994e4c1e6960e089f2bdaed031677233cebc51413df4139fb",
+      "git_blob": "e3e9e033943cb71216ad4c70a47f016bb96e37cb",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/shared/uk_aq_r2_observations_global_finalizer.mjs"
+      ]
+    },
+    {
+      "path": "workers/uk_aq_backfill_local/aqilevels/manifests.ts",
+      "sha256": "7c1ffa67b264438a63a6284a8ede58e02016d16050ac2252de6a0e7c39e79997",
+      "git_blob": "460beba4ee8e9fa7ceabce888162ca599bf7047d",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/uk_aq_backfill_local/run_job.ts"
+      ]
+    },
+    {
+      "path": "workers/uk_aq_backfill_local/backfill_core.mjs",
+      "sha256": "9d08c9ec0f4f6f9147069216cd51f0fc9685b1f9a14d954f11a175786d04c4a0",
+      "git_blob": "e12af1c4e88132a06baac01305c5b480e959a3ba",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/uk_aq_backfill_local/run_job.ts"
+      ]
+    },
+    {
+      "path": "workers/uk_aq_backfill_local/fixed_v3_integrity_observation_proposal.mjs",
+      "sha256": "260086b56128fa16ffdb25e74ba5981c104ee9f4c1be81ddf45e975400b91459",
+      "git_blob": "a2e8218ddb5afcdbe25428903a7bcdeb7450e850",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/uk_aq_backfill_local/run_job.ts"
+      ]
+    },
+    {
+      "path": "workers/uk_aq_backfill_local/integrity/source_evidence.ts",
+      "sha256": "040bd8ce0d0121b20165c0d40272f0df38d16fd1d86b92299629b1f0532df20d",
+      "git_blob": "4010b67be7ff65dde09614d91d409bb185e17fa0",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/uk_aq_backfill_local/run_job.ts"
+      ]
+    },
+    {
+      "path": "workers/uk_aq_backfill_local/observations/manifests.ts",
+      "sha256": "bbcba23c1b8fa53a0fda9331e5a6af213c69b40bfa20e605d349e8d8990559da",
+      "git_blob": "f770766a4966d71725ab499eb6f81d5f2d0355d4",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/uk_aq_backfill_local/run_job.ts"
+      ]
+    },
+    {
+      "path": "workers/uk_aq_backfill_local/r2/history_paths.ts",
+      "sha256": "9b629739ca3537ac15c48b828759fdaedd9806c9d8bd4abc0d7fa9305dd7b234",
+      "git_blob": "eaa67193f32b344826f261dbdd77612f77b1d70b",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/uk_aq_backfill_local/run_job.ts"
+      ]
+    },
+    {
+      "path": "workers/uk_aq_backfill_local/r2_history/canonical_manifest_compatibility.mjs",
+      "sha256": "fa9b8d920bdb7a507497bf42bf60b911f080a1e5ac692d06e4c79f861965ce47",
+      "git_blob": "b66d70324df22835330abcf7acfd199f27ae47f7",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/uk_aq_backfill_local/r2_history/canonical_manifest_compatibility_view.mjs"
+      ]
+    },
+    {
+      "path": "workers/uk_aq_backfill_local/r2_history/canonical_manifest_compatibility_view.mjs",
+      "sha256": "fc0159195abce54c3b411de79ffb777f252ae78786be115c05663786f059d91c",
+      "git_blob": "29b3ff08a521d049a367f9695927329e6ad84eb6",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs"
+      ]
+    },
+    {
+      "path": "workers/uk_aq_backfill_local/r2_history/canonical_manifest_declarations.mjs",
+      "sha256": "f45e6c82d4a12daa9661cc51539f45f31deec5d3a28a25b1c8c21362829e6ae5",
+      "git_blob": "94c7ec149d30d386656c2df89be9becd485f141e",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/uk_aq_backfill_local/r2_history/canonical_manifest_compatibility_view.mjs"
+      ]
+    },
+    {
+      "path": "workers/uk_aq_backfill_local/r2_history/metadata_repair.mjs",
+      "sha256": "57136dee3ea6dfc635a8f9878971dc7dbda7586ad40a25d8a32debb226e165f5",
+      "git_blob": "07eaf1697daddf1b16a26ada7287b36be29b6266",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs"
+      ]
+    },
+    {
+      "path": "workers/uk_aq_backfill_local/r2_history/metadata_repair_guard.mjs",
+      "sha256": "0bddc8b9800f7444a6d3269c91bc029bde16ebd67d39664da77e803898c22faa",
+      "git_blob": "a95743ec49f6333b4fad1d7f353f0be1e21b5c0d",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "scripts/backup_r2/uk_aq_execute_v2_observations_repair.mjs"
+      ]
+    },
+    {
+      "path": "workers/uk_aq_backfill_local/r2_history/proposal_ownership.mjs",
+      "sha256": "578549e31398e70efd16992293ef0ac5f83a34a650bea0d76e9dd64e5c992132",
+      "git_blob": "8e0cb423550045468c2a47e09edca504f92a4b0d",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/uk_aq_backfill_local/r2_history/canonical_manifest_compatibility.mjs",
+        "workers/uk_aq_backfill_local/r2_history/metadata_repair.mjs"
+      ]
+    },
+    {
+      "path": "workers/uk_aq_backfill_local/run_job.ts",
+      "sha256": "a59756b39f7806a090ec4aa1a1b7d7025a22545e0bba841db8396ec22b27efa2",
+      "git_blob": "e498c0af28142702d58b9d405f44b3c6ccc684e5",
+      "role": "shared Deno SOS acquisition/detector/proposal worker; only connector 1 selected; fixed v2 writer and normal core/source-evidence interface",
+      "required_by": [
+        "workers/uk_aq_backfill_local/run_job.ts"
+      ]
+    },
+    {
+      "path": "workers/uk_aq_backfill_local/source_adapters/registry.ts",
+      "sha256": "823d0e3bf4f0172e34d17cd285df3b4e20545f5b98c5358e248245aafc9424a0",
+      "git_blob": "7b5d22ff71c38a91f30e77a96c97ceb3e9f0d675",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/uk_aq_backfill_local/run_job.ts"
+      ]
+    },
+    {
+      "path": "workers/uk_aq_backfill_local/source_integrity/blocked_rows.ts",
+      "sha256": "a05f03434df02ec0c62e941cd15f86588129398d9dcb31d1b9d5f60e80afb843",
+      "git_blob": "1d4e76f793469f6c3a8cb9112cf3eebe26f2c72c",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/uk_aq_backfill_local/run_job.ts"
+      ]
+    },
+    {
+      "path": "workers/uk_aq_backfill_local/source_integrity/types.ts",
+      "sha256": "b96f97ec0f48e560bc6effe8129e313fd7ce6a8b18e00dae3899e9f7f1e0fc95",
+      "git_blob": "abd1d074102918bd9fd551220831818cc0314900",
+      "role": "transitive dependency of the protected shared executable roots",
+      "required_by": [
+        "workers/uk_aq_backfill_local/source_integrity/blocked_rows.ts"
+      ]
+    },
+    {
+      "path": "workers/uk_aq_backfill_local/uk_air_timestamp.mjs",
+      "sha256": "4cb638933d5bb502778a52d8282aacdcf774a86b3f4e9206da8350732012a3ba",
+      "git_blob": "22e4cdac550824e0d3594a746a83b88e0216a659",
+      "role": "shared UK-AIR hour-ending UTC parser",
+      "required_by": [
+        "workers/uk_aq_backfill_local/run_job.ts",
+        "workers/uk_aq_backfill_local/uk_air_timestamp.mjs"
+      ]
+    },
+    {
+      "path": "workers/uk_aq_latest_snapshot_cloud_run/latest_value_policy.mjs",
+      "sha256": "8cc9b91c03684cf3520dca208a736f10c6d876d5993074448909c48b59ab439a",
+      "git_blob": "bd0c42b25d4fa74fe95ed682da1da961db625c14",
+      "role": "owner policy consumed by the frozen local current-state eligibility adapter",
+      "required_by": [
+        "workers/uk_aq_latest_snapshot_cloud_run/latest_value_policy.mjs"
+      ]
+    }
+  ],
+  "external_imports": [
+    "apache-arrow",
+    "hyparquet",
+    "hyparquet-compressors",
+    "parquet-wasm/esm",
+    "pg"
+  ],
+  "protection": "Shared files and their transitive imports are protected interfaces under the stable fallback contract. Review identities and compatibility before any future change; if SOS semantics must change, reconsider the fallback/contract boundary before mutation. This manifest records identities, not a new runtime gate.",
+  "separate_launcher": {
+    "path": "scripts/uk-aq-history-integrity/deploy-bin/uk-aq-history-integrity-sos-light-stable-local-wrapper-v2.sh",
+    "sha256": "856ece0e21c94bb5ddad98419983e5d6266a37cdd78dcaf7cd36f09d7186a88d",
+    "source_path": "scripts/uk-aq-history-integrity/deploy-bin/uk-aq-history-integrity-sos-light-stable-local-wrapper-v3.sh",
+    "source_git_blob": "da2a83ba8e04b01b467d1619d692738d6c5bf2c2"
+  },
+  "preserved_v3_files": [
+    {
+      "path": "scripts/uk-aq-history-integrity/stable-sos-light-v3/uk-aq-history-integrity-sos-light-stable-v3.py",
+      "sha256": "aed5815ca7009e343b2ba7cd04385d4485d3e0dbbe5f00ba61e1d9f2b4d87b0c",
+      "source_path": "scripts/uk-aq-history-integrity/stable-sos-light/uk-aq-history-integrity-sos-light-stable-v3.py",
+      "source_sha256": "aed5815ca7009e343b2ba7cd04385d4485d3e0dbbe5f00ba61e1d9f2b4d87b0c",
+      "source_git_blob": "01da2308282d62eae7c4bf29ee00aeba4ae714c3",
+      "last_source_commit": "7e9a407911cf95526033f4fa9d11676993dbbc82",
+      "change": "byte-identical relocation"
+    },
+    {
+      "path": "scripts/uk-aq-history-integrity/stable-sos-light-v3/uk-aq-history-integrity-sos-light-stable-v3.sh",
+      "sha256": "055303f3eded352f71c46c8148f37081b190642c6cfaf3bde17b32afbbb98f43",
+      "source_path": "scripts/uk-aq-history-integrity/stable-sos-light/uk-aq-history-integrity-sos-light-stable-v3.sh",
+      "source_sha256": "7a466fe8cea9f6f07762974cd9f40a8e2f7dc1ae5b1f74167a7f68761e115fd0",
+      "source_git_blob": "7f65538ace6486ad70af838cfeebbafcc3050a8e",
+      "last_source_commit": "7e9a407911cf95526033f4fa9d11676993dbbc82",
+      "change": "entrypoint directory substitution only"
+    },
+    {
+      "path": "scripts/uk-aq-history-integrity/stable-sos-light-v3/uk-aq-history-integrity-sos-light-stable-v3_impl.py",
+      "sha256": "f7b3b2ba65864e7dd78b3dc4d2ae710496b7be03cbd4b1e9794cd09667ced02c",
+      "source_path": "scripts/uk-aq-history-integrity/stable-sos-light/uk-aq-history-integrity-sos-light-stable-v3_impl.py",
+      "source_sha256": "f7b3b2ba65864e7dd78b3dc4d2ae710496b7be03cbd4b1e9794cd09667ced02c",
+      "source_git_blob": "62a2bb93c5a0eb8f4054d16cdd55cf7115044ff9",
+      "last_source_commit": "0cdcd4eea5ee71c227fc9c7a183d79f1216135ce",
+      "change": "byte-identical relocation"
+    }
+  ],
+  "runtime_requirements": {
+    "python": "Python 3.14+ for the unchanged current TEST v2 source (import passed on 3.14.7; native 3.12.14 fails at the pre-existing forward annotation in _impl.py:18449). Normal repository .venv/bin/python remains the runner interpreter; no runtime environment installed by this task.",
+    "node": "Node >=20 per package.json; use normal UK_AQ_BACKFILL_NODE_BIN/PATH resolution",
+    "deno": "Normal Deno worker runtime; normal UK_AQ_BACKFILL_DENO_BIN/PATH resolution and deno.lock",
+    "python_external_imports": [
+      "duckdb (lazy Parquet reader)"
+    ],
+    "cli_helpers": [
+      "bash and normal POSIX/macOS utilities",
+      "git (writer source revision provenance)",
+      "gcloud only for the existing gcloud identity-token authentication mode; static token mode is separately supported",
+      "rclone is imported transitively by backup utilities; normal local mirrored-baseline checks do not dispatch a backup here"
+    ],
+    "locked_node_packages": {
+      "apache-arrow": "21.1.0",
+      "hyparquet": "1.25.1",
+      "hyparquet-compressors": "1.1.1",
+      "parquet-wasm": "0.7.1",
+      "pg": "8.19.0"
+    }
+  }
+}

@@ -411,7 +411,7 @@ confirmed deployment/compatibility failures. Local working-tree rollback does no
 undo the already deployed reader domain or the proxy secret writes.
 
 Remaining boundaries: the separate future Integrity Factory is not integrated.
-The protected frozen `stable-sos-light/` emergency fallback is unchanged and does
+The protected frozen `stable-sos-light-v3/` emergency fallback is unchanged and does
 not acquire this new automatic post-repair stage; normal active SOS-light and
 generic repair paths do. An externally supplied already-held global operation
 lock also has no outer post-lock delivery hook: its verified pending event can
