@@ -15211,6 +15211,7 @@ def check_official_network_rdata(
             )
         identity = {
             "source_file": source_file_key,
+            "local_path": str(destination.resolve()),
             "url": url,
             "bytes": int(pinned["bytes"]),
             "sha256": str(pinned["sha256"]),
@@ -15539,11 +15540,7 @@ def _prepare_official_rdata_proposal(
         if str(row.get("pollutant_code") or "") in pollutants
     ]
     unavailable_scopes = [
-        {
-            key: value
-            for key, value in dict(scope).items()
-            if key != "request_audit_timestamp"
-        }
+        dict(scope)
         for scope in list(
             (context.get("unavailable_scopes_by_day") or {}).get(day_utc) or []
         )
@@ -23554,6 +23551,272 @@ def assemble_sos_light_complete_days(
     )
     return dict(audit)
 
+def _authenticate_official_rdata_final_target(
+    *, run_state: Mapping[str, Any], stage_root: Path,
+    evidence: Mapping[str, Any], source_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Authenticate source and pinned preservation separately, then reconstruct target."""
+    def content(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        return _compute_observation_hash_with_shared_javascript(
+            rows=rows, is_sos=False, env=os.environ, allow_empty=True,
+        )
+
+    def same_content(rows: list[dict[str, Any]], expected: Mapping[str, Any]) -> None:
+        actual = content(rows)
+        if _validate_observation_content_hash_metadata(expected, row_count=len(rows)) != actual:
+            raise ValueError("official RData canonical content identity changed")
+
+    day = str(evidence["day_utc"])
+    connector = int(evidence["connector_id"])
+    selected = set(evidence["requested_pollutant_set"])
+    context = OFFICIAL_RDATA_RUN_CONTEXTS.get(str(evidence["source_adapter"]))
+    if context is None or int(context["connector_id"]) != connector:
+        raise ValueError("official RData pinned acquisition context is unavailable")
+    if (evidence["authoritative_station_timeseries_mapping_sha256"] != context["authoritative_mapping_sha256"]
+            or evidence["observed_property_mapping_sha256"] != context["observed_property_mapping_sha256"]
+            or evidence["mapping_audit"] != context["mapping_audit"]):
+        raise ValueError("official RData authoritative mapping changed")
+    audit = evidence["acquisition_audit"]
+    if _official_rdata_source_artifact_availability_identity({
+        "source_unavailable_scopes": audit["source_unavailable_scope_acquisition_audit"],
+    }) != list(evidence["source_unavailable_scopes"]):
+        raise ValueError("official RData availability audit disagrees with semantic evidence")
+    audit_files = {item["source_file"]: item for item in audit["source_file_acquisition_audit"]}
+    for identity in evidence["source_file_identities"]:
+        pinned = context["identities_by_key"].get(identity["source_file"])
+        acquisition = audit_files.get(identity["source_file"])
+        if pinned is None or acquisition != pinned:
+            raise ValueError("official RData source acquisition identity changed")
+        body = Path(str(pinned["local_path"])).read_bytes()
+        if len(body) != identity["bytes"] or hashlib.sha256(body).hexdigest() != identity["sha256"]:
+            raise ValueError("official RData authenticated source bytes changed")
+    canonical_source = [{
+        **row, "observed_at_utc": row["observed_at"],
+    } for row in source_rows]
+    decoded_source = [row for row in context["rows_by_day"].get(day, [])
+                      if row["pollutant_code"] in selected]
+    if content(canonical_source) != content(decoded_source):
+        raise ValueError("official RData source rows differ from authenticated decoding")
+    scopes = list(evidence["source_unavailable_scopes"])
+    available_codes = []
+    available_ids: set[int] = set()
+    for code in sorted(selected):
+        ids, _unavailable_ids, _ = _official_rdata_partition_availability(
+            context=context, day_utc=day, pollutant_code=code,
+        )
+        available_ids.update(ids)
+        if ids:
+            available_codes.append(code)
+    if available_codes != evidence["source_available_pollutant_codes"] or sorted(available_ids) != evidence["source_available_timeseries_ids"]:
+        raise ValueError("official RData repairable source availability changed")
+    if any(row["pollutant_code"] not in selected or
+           _official_rdata_row_is_source_unavailable(row, scopes)
+           for row in canonical_source):
+        raise ValueError("official RData source rows escaped availability authority")
+    for code, expected in evidence["observation_content_hashes"].items():
+        same_content([row for row in canonical_source if row["pollutant_code"] == code], expected)
+
+    preserved_path = stage_root / f"day_utc={day}" / f"connector_id={connector}" / "preserved_baseline_rows.json"
+    preserved_rows = [{**row, "observed_at_utc": row["observed_at"]}
+                      for row in json.loads(preserved_path.read_bytes())]
+    if any(int(row.get("connector_id", connector)) != connector
+           or str(row["observed_at_utc"])[:10] != day
+           or row["pollutant_code"] not in selected
+           or not _official_rdata_row_is_source_unavailable(row, scopes)
+           for row in preserved_rows):
+        raise ValueError("official RData preserved rows escaped unavailable scope")
+    baseline = Path(str(run_state["base_dropbox_root"]))
+    preservation = evidence["preserved_baseline_identity"]
+    partitions = preservation["partition_identities"]
+    if preservation.get("source") != "dropbox" or sorted(p["pollutant_code"] for p in partitions) != sorted({s["pollutant_code"] for s in scopes}):
+        raise ValueError("official RData preservation dependency set is incomplete")
+    for partition in partitions:
+        code = partition["pollutant_code"]
+        prefix = f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day}/connector_id={connector}/pollutant_code={code}"
+        manifest_key = prefix + "/manifest.json"
+        expected_scopes = [s for s in scopes if s["pollutant_code"] == code]
+        if partition["day_utc"] != day or partition["connector_id"] != connector or partition["manifest_key"] != manifest_key or _official_rdata_source_artifact_availability_identity({
+            "source_unavailable_scopes": partition["source_unavailable_scopes"],
+        }) != expected_scopes or partition["source_unavailable_timeseries_ids"] != sorted({s["timeseries_id"] for s in expected_scopes}):
+            raise ValueError("official RData baseline partition authority changed")
+        objects = partition["object_identities"]
+        manifest_path = baseline / manifest_key
+        _authenticate_official_rdata_pinned_hierarchy(run_state, partition)
+        parquet_paths = []
+        if partition["baseline_state"] == "partition_absent":
+            if objects or manifest_path.exists() or list((baseline / prefix).glob("*.parquet")):
+                raise ValueError("official RData absent baseline partition changed")
+        elif partition["baseline_state"] == "partition_present":
+            manifest = json.loads(manifest_path.read_bytes())
+            expected_keys = {manifest_key} | {item["key"] for item in manifest["files"]}
+            if len(objects) != len(expected_keys) or {item["object_key"] for item in objects} != expected_keys:
+                raise ValueError("official RData pinned baseline child closure changed")
+            for item in objects:
+                key = _normalise_overlay_object_key(item["object_key"])
+                if not key.startswith(prefix + "/"):
+                    raise ValueError("official RData preservation escaped pollutant scope")
+                body = (baseline / key).read_bytes()
+                if len(body) != item["bytes"] or hashlib.sha256(body).hexdigest() != item["sha256"]:
+                    raise ValueError("official RData pinned preservation bytes changed")
+                if key.endswith(".parquet"):
+                    parquet_paths.append(str(baseline / key))
+            for item in manifest["files"]:
+                identity = next(obj for obj in objects if obj["object_key"] == item["key"])
+                if identity["bytes"] != item["bytes"] or identity["sha256"] != item["etag_or_hash"]:
+                    raise ValueError("official RData baseline manifest file identity disagrees")
+        else:
+            raise ValueError("official RData baseline state is invalid")
+        baseline_rows = _observation_rows_from_local_parquet_for_shared_hash(parquet_paths=parquet_paths) if parquet_paths else []
+        pinned_rows = [row for row in baseline_rows if _official_rdata_row_is_source_unavailable(row, expected_scopes)]
+        selected_preserved = [row for row in preserved_rows if row["pollutant_code"] == code]
+        if partition["preserved_row_count"] != len(pinned_rows) or content(pinned_rows) != content(selected_preserved):
+            raise ValueError("official RData preserved rows do not equal pinned baseline")
+    target = canonical_source + preserved_rows
+    pollutant_counts = {code: sum(row["pollutant_code"] == code for row in target)
+                       for code in selected if code in available_codes or any(row["pollutant_code"] == code for row in target)}
+    if pollutant_counts != evidence["final_target_pollutant_counts"]:
+        raise ValueError("official RData reconstructed pollutant authority changed")
+    counts: dict[str, int] = {}
+    for row in target:
+        key = str(row["timeseries_id"])
+        counts[key] = counts.get(key, 0) + 1
+    if counts != {str(key): int(value) for key, value in evidence["final_target_timeseries_row_counts"].items()} or len(target) != evidence["final_target_row_count"]:
+        raise ValueError("official RData reconstructed final target counts changed")
+    for code, expected in evidence["final_target_observation_content_hashes"].items():
+        selected_rows = [row for row in target if row["pollutant_code"] == code]
+        if len(selected_rows) != evidence["final_target_pollutant_counts"][code]:
+            raise ValueError("official RData final pollutant count changed")
+        same_content(selected_rows, expected)
+    return target
+
+
+def _authenticate_official_rdata_pinned_hierarchy(
+    run_state: Mapping[str, Any], partition: Mapping[str, Any],
+) -> None:
+    """Prove a preservation partition's presence/absence from the pinned root."""
+    base = R2_HISTORY_V2_OBSERVATIONS_PREFIX
+    day = str(partition["day_utc"])
+    keys = [
+        f"{base}/_manifests/manifest.json",
+        f"{base}/_manifests/year={day[:4]}/manifest.json",
+        f"{base}/_manifests/year={day[:4]}/month={day[5:7]}/manifest.json",
+        f"{base}/day_utc={day}/manifest.json",
+        f"{base}/day_utc={day}/connector_id={partition['connector_id']}/manifest.json",
+        str(partition["manifest_key"]),
+    ]
+    root = Path(str(run_state["base_dropbox_root"]))
+    parent: Mapping[str, Any] | None = None
+    for index, key in enumerate(keys):
+        fields = (["children"] if index <= 3 else
+                  ["connector_manifests", "child_manifests"] if index == 4 else
+                  ["pollutant_manifests", "child_manifests"])
+        references = [item for field in fields for item in (parent or {}).get(field, [])
+                      if item.get("manifest_key") == key]
+        if not (root / key).is_file():
+            if parent is None or references or partition["baseline_state"] != "partition_absent" or any((root / later).exists() for later in keys[index:]):
+                raise ValueError("official RData pinned hierarchy does not prove absence")
+            return
+        payload = json.loads((root / key).read_bytes())
+        if parent is None:
+            checkpoint = ((run_state.get("dropbox_currentness") or {}).get("checkpoint") or {})
+            if payload.get("content_hash") != checkpoint.get("observations_processed_source_root_hash"):
+                raise ValueError("official RData preservation root differs from checkpoint")
+        else:
+            field = "content_hash" if index < 3 else "manifest_hash"
+            if len(references) != 1 or references[0].get(field) != payload.get(field) or not re.fullmatch(r"[a-f0-9]{64}", str(payload.get(field) or "")):
+                raise ValueError("official RData pinned hierarchy identity changed")
+        parent = payload
+    if partition["baseline_state"] != "partition_present":
+        raise ValueError("official RData baseline absence contradicts hierarchy")
+
+
+def _capture_official_rdata_v2_observation_scope(
+    *, run_state: dict[str, Any], day_utc: str, connector_id: int,
+    repair_pollutants: Iterable[str] | None,
+) -> list[str]:
+    """Capture repairable pollutant targets, including authenticated childless emptiness."""
+    stage_root = Path(str(run_state["overlay_root"]))
+    selected = _normalise_repair_pollutants(repair_pollutants)
+    evidence, rows = _load_complete_connector_day_source_evidence(
+        stage_root=stage_root, day_utc=day_utc, connector_id=connector_id,
+        repair_pollutants=selected,
+    )
+    expected_adapter = _official_rdata_source_for_connector(connector_id)
+    if evidence["source_adapter"] != expected_adapter or evidence["history_generation"] != "v2" or not selected:
+        raise ValueError("official RData capture scope is invalid")
+    target = _authenticate_official_rdata_final_target(
+        run_state=run_state, stage_root=stage_root, evidence=evidence, source_rows=rows,
+    )
+    repairable = sorted(set(selected) & set(evidence["source_available_pollutant_codes"]))
+    empty = set(evidence["empty_final_target_pollutant_codes"])
+    if not empty.issubset(repairable):
+        raise ValueError("source-unavailable pollutant acquired empty-target authority")
+    generated_root = stage_root / "generated-objects"
+    connector_prefix = f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/connector_id={connector_id}"
+    connector_root = generated_root / connector_prefix
+    captured = []
+    for code in repairable:
+        pollutant_root = connector_root / f"pollutant_code={code}"
+        paths = sorted(p for p in pollutant_root.rglob("*") if p.is_file())
+        parts = [p for p in paths if re.fullmatch(r"part-\d+\.parquet", p.name)]
+        selected_target = [row for row in target if row["pollutant_code"] == code]
+        if code in empty:
+            if selected_target or paths:
+                raise ValueError("official RData authoritative empty target has synthetic children")
+            continue
+        manifest_path = pollutant_root / "manifest.json"
+        if not selected_target or not parts or set(paths) != set(parts + [manifest_path]):
+            raise ValueError("official RData non-empty target has incomplete canonical closure")
+        manifest = json.loads(manifest_path.read_bytes())
+        parquet_rows = _observation_rows_from_local_parquet_for_shared_hash(parquet_paths=[str(p) for p in parts])
+        expected_hash = evidence["final_target_observation_content_hashes"][code]
+        actual = _compute_observation_hash_with_shared_javascript(rows=parquet_rows, is_sos=False, env=os.environ)
+        _validate_observation_content_hash_metadata(manifest, row_count=len(selected_target))
+        if (actual != _validate_observation_content_hash_metadata(expected_hash, row_count=len(selected_target))
+                or any(manifest.get(field) != value for field, value in actual.items())):
+            raise ValueError("official RData staged canonical target hash changed")
+        if manifest.get("day_utc") != day_utc or manifest.get("connector_id") != connector_id or manifest.get("pollutant_code") != code or manifest.get("row_count") != len(selected_target):
+            raise ValueError("official RData staged pollutant manifest scope changed")
+        for source in paths:
+            key = source.relative_to(generated_root).as_posix()
+            stage_overlay_object(run_state, object_key=key, source_path=source, stage="observations_data", dependencies=())
+            mark_overlay_structurally_validated(run_state, key)
+            captured.append(key)
+    nonempty_target = [row for row in target if row["pollutant_code"] in repairable]
+    connector_manifest_path = connector_root / "manifest.json"
+    if nonempty_target:
+        manifest = json.loads(connector_manifest_path.read_bytes())
+        target_counts: dict[str, int] = {}
+        for row in nonempty_target:
+            key = str(row["timeseries_id"])
+            target_counts[key] = target_counts.get(key, 0) + 1
+        _summary, mismatches = _v2_observation_manifest_evidence_mismatches(
+            manifest, expected_source_row_count=len(nonempty_target),
+            expected_timeseries_row_counts=_normalize_timeseries_row_counts(target_counts),
+            expected_pollutant_counts={code: count for code, count in evidence["final_target_pollutant_counts"].items() if code in repairable and count > 0},
+            source_evidence_pollutant_set=sorted({row["pollutant_code"] for row in nonempty_target}),
+        )
+        if manifest.get("history_version") != "v2" or manifest.get("domain") != "observations" or manifest.get("day_utc") != day_utc or manifest.get("connector_id") != connector_id or mismatches:
+            raise ValueError("official RData generated connector target identity changed")
+    elif connector_manifest_path.exists():
+        raise ValueError("official RData all-empty target has synthetic connector child")
+    # Parents and indexes are rebuilt by the existing complete-child metadata
+    # finaliser, including when no generated connector manifest exists.
+    for code in repairable:
+        prefix = f"{connector_prefix}/pollutant_code={code}"
+        run_state.setdefault("tombstone_prefixes", []).append({
+            "prefix": prefix, "proposed": True, "deleted": False,
+            "deletion_verified": False, "stage": "observations_data",
+            "repair_pollutants": repairable,
+        })
+    run_state["tombstone_prefixes"] = sorted(
+        {entry["prefix"]: entry for entry in run_state.get("tombstone_prefixes", [])}.values(),
+        key=lambda entry: entry["prefix"],
+    )
+    write_run_state(run_state)
+    return captured
+
+
 def _capture_local_v2_observation_scope(
     *,
     run_state: dict[str, Any],
@@ -23563,6 +23826,11 @@ def _capture_local_v2_observation_scope(
     proposal_staging: _SosLightV2ProposalStaging | None = None,
 ) -> list[str]:
     """Prove source/Parquet equality, then stage one connector-day proposal."""
+    if _official_rdata_source_for_connector(connector_id) is not None:
+        return _capture_official_rdata_v2_observation_scope(
+            run_state=run_state, day_utc=day_utc, connector_id=connector_id,
+            repair_pollutants=repair_pollutants,
+        )
     stage_root = Path(str(run_state["overlay_root"]))
     generated_root = Path(str(run_state["overlay_root"])) / "generated-objects"
     connector_prefix = (
@@ -25520,6 +25788,7 @@ def run_canonical_apply_executor(
     run_state: dict[str, Any],
     env: Mapping[str, str],
     log: logging.Logger,
+    validation_only: bool = False,
 ) -> dict[str, Any]:
     dedicated_sos_light_v2 = _is_dedicated_sos_light_v2_run_state(run_state)
     generic_official_v2 = bool(
@@ -25528,6 +25797,10 @@ def run_canonical_apply_executor(
         and run_state.get("official_rdata_source_adapter")
         in OFFICIAL_RDATA_NETWORKS
     )
+    if validation_only:
+        if not generic_official_v2:
+            raise ValueError("mutation-free final admission requires generic official-RData")
+        run_state["dry_run"] = True
     if generic_official_v2:
         try:
             _canonical_generic_integrity_selected_scope_authority(run_state)
@@ -25693,6 +25966,45 @@ def run_canonical_apply_executor(
     else:
         node_entrypoint = "uk_aq_apply_integrity_proposal.mjs"
     write_run_state(run_state)
+    if validation_only:
+        # A separate local-only entrypoint has no APPLY call, R2 adapters or
+        # history-writer session. Python uses the same final transition above.
+        repo_root = _repo_root_for_integrity_script(env)
+        node_bin = str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node")
+        process = subprocess.run([
+            node_bin, str(repo_root / "scripts/backup_r2/uk_aq_validate_generic_v2_official_rdata_proposal.mjs"),
+            "--run-state-json", str(run_state["run_state_path"]),
+        ], cwd=repo_root, env={**os.environ, **{str(key): str(value) for key, value in env.items()}}, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        try:
+            output = json.loads(process.stdout)
+        except (TypeError, ValueError):
+            output = {}
+        if not isinstance(output, dict):
+            output = {}
+        validated = (
+            process.returncode == 0
+            and output.get("status") == "validated"
+            and output.get("mutation_enabled") is False
+            and output.get("state_fingerprint_sha256") == transition_fingerprint
+            and (output.get("final_proposal_graph_validation") or {}).get("status") == "succeeded"
+            and output.get("publication_schedule_validation") == "succeeded"
+        )
+        run_state["generic_v2_dry_run_validation"] = (
+            output if validated else {
+                "status": "failed", "mutation_enabled": False,
+                "error": _tail_bytes(process.stderr or process.stdout or "final Node admission failed", 4000),
+            }
+        )
+        write_run_state(run_state)
+        return {
+            "status": "planned" if validated else "failed",
+            "reason": "repair_dry_run" if validated else "final_node_admission_failed",
+            "exit_code": process.returncode if process.returncode else (0 if validated else 1),
+            "final_admission_validated": validated, "r2_mutation_possible": False,
+            "node_apply_launched": False, "output": output,
+            **({} if validated else {"error": run_state["generic_v2_dry_run_validation"]["error"]}),
+        }
     if dedicated_sos_light_v2:
         recovery_state_path = str(
             run_state.get("fixed_v2_lock_recovery_state_path") or ""
@@ -28809,12 +29121,7 @@ def run_v2_integrity_repair_flow(
                 metadata_actions,
             )
             _freeze_generic_v2_operational_context(run_state, env)
-            if dry_run:
-                run_state["official_rdata_timestamp_authority"] = {
-                    "status": "required_before_real_apply",
-                    "contract_version": OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT,
-                }
-            else:
+            if run_state.get("objects") or run_state.get("tombstone_prefixes"):
                 _freeze_official_rdata_timestamp_authority(run_state, env)
             write_run_state(run_state)
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -29051,7 +29358,9 @@ def run_v2_integrity_repair_flow(
                     },
                 }
     elif dry_run:
-        apply_result = {
+        apply_result = run_canonical_apply_executor(
+            run_state=run_state, env=env, log=log, validation_only=True,
+        ) if generic_official_rdata else {
             "status": "planned",
             "reason": "repair_dry_run",
         }
@@ -29522,6 +29831,7 @@ def run_v2_integrity_repair_flow(
         ),
         "dry_run": bool(dry_run),
         "write_enabled": not dry_run,
+        "official_rdata_source_adapter": run_state.get("official_rdata_source_adapter"),
         "r2_write_attempted": bool(not dry_run and apply_result.get("status") in {"succeeded", "failed"}),
         "planned_object_operation_counts": planned_operation_counts,
         "target_authority": observations.get("target_authority"),
@@ -31391,16 +31701,32 @@ def _v2_dry_run_repair_proposal_verified(repair_flow: Mapping[str, Any]) -> bool
     first_value_at = repair_flow.get("first_value_at_reconciliation") or {}
     current_state = repair_flow.get("current_state_reconciliation") or {}
     remaining = final.get("remaining_gap_count")
+    retained_v2 = (
+        repair_flow.get("official_rdata_source_adapter") in OFFICIAL_RDATA_NETWORKS
+        and (apply.get("output") or {}).get("operational_context_mode")
+        == "retained_v2_non_serving_test"
+        and apply.get("final_admission_validated") is True
+    )
     return (
         repair_flow.get("status") == "planned"
         and apply.get("status") == "planned"
+        and (
+            not repair_flow.get("official_rdata_source_adapter")
+            or apply.get("final_admission_validated") is True
+        )
         and final.get("ran") is True
         and final.get("status") == "planned"
         and isinstance(remaining, int)
         and not isinstance(remaining, bool)
         and remaining == 0
-        and first_value_at.get("status") in {"dry_run", "skipped_empty"}
-        and current_state.get("overall_status") in {"planned", "skipped_disabled"}
+        and first_value_at.get("status") in (
+            {"dry_run", "skipped_empty", "skipped_non_serving_retained_v2"}
+            if retained_v2 else {"dry_run", "skipped_empty"}
+        )
+        and current_state.get("overall_status") in (
+            {"planned", "skipped_disabled", "skipped_non_serving_retained_v2"}
+            if retained_v2 else {"planned", "skipped_disabled"}
+        )
         and not any(
             stage.get("status") in {"fail", "failed", "error", "blocked_dependency"}
             for stage in repair_flow.get("stage_results") or []
