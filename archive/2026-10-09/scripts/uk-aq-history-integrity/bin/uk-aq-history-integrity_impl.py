@@ -82,10 +82,8 @@ from integrity.runtime import CANONICAL_REPAIR_STAGE_ORDER
 from integrity.history_cache import freeze_plan, prepare_verified_event, deliver_after_lock
 from integrity.timeseries_binding_provider import binding_backup_view
 from integrity.official_network_rdata import (
-    AuthoritativeSourceArtifactAbsent,
     NETWORKS as OFFICIAL_RDATA_NETWORKS,
     RDATA_COLUMN_TO_POLLUTANT,
-    canonical_unavailable_windows as official_rdata_canonical_unavailable_windows,
     canonical_rows_for_site_year,
     download_pinned as download_official_rdata_pinned,
     extract_metadata as extract_official_rdata_metadata,
@@ -93,7 +91,6 @@ from integrity.official_network_rdata import (
     required_site_years as official_rdata_required_site_years,
     resolve_rscript as resolve_official_rdata_rscript,
     rscript_identity as official_rdata_rscript_identity,
-    source_time_windows_for_year as official_rdata_source_time_windows_for_year,
 )
 
 
@@ -11460,89 +11457,6 @@ def _current_source_counts_for_v2_partition(
             pollutant_code=pollutant_code,
         )
 
-    official_sources = [
-        source_key for source_key in source_keys
-        if source_key in OFFICIAL_RDATA_NETWORKS
-        and OFFICIAL_RDATA_NETWORKS[source_key].connector_id == connector_id
-    ]
-    if official_sources:
-        if len(official_sources) != 1:
-            raise RuntimeError("official RData source scope is ambiguous")
-        official_source = official_sources[0]
-        context = OFFICIAL_RDATA_RUN_CONTEXTS.get(official_source)
-        if context is None:
-            raise RuntimeError("official RData acquisition context is missing")
-        selected_ids = set(
-            context["binding_ids_by_pollutant"].get(pollutant_code, [])
-        )
-        if not selected_ids:
-            raise RuntimeError("selected official RData pollutant has no bound timeseries")
-        required = set(
-            context["required_by_day_pollutant"].get(day_utc, {}).get(
-                pollutant_code, []
-            )
-        )
-        successful = required & set(context["identities_by_key"])
-        absent = required & set(context["absent_keys"])
-        if not required or successful & absent or required != successful | absent:
-            raise RuntimeError("official RData required source coverage is incomplete")
-        unavailable_scopes = [
-            scope for scope in context["unavailable_scopes_by_day"].get(day_utc, [])
-            if scope["pollutant_code"] == pollutant_code
-        ]
-        counts: dict[int, int] = {}
-        for row in context["rows_by_day"].get(day_utc, []):
-            if row["pollutant_code"] != pollutant_code:
-                continue
-            timeseries_id = int(row["timeseries_id"])
-            if timeseries_id not in selected_ids:
-                raise RuntimeError("official RData row is outside selected binding set")
-            counts[timeseries_id] = counts.get(timeseries_id, 0) + 1
-        unavailable_ids = {
-            int(scope["timeseries_id"]) for scope in unavailable_scopes
-        }
-        available_ids = set(
-            context["available_timeseries_by_day"].get(day_utc, [])
-        ) & selected_ids
-        if selected_ids != available_ids | unavailable_ids:
-            raise RuntimeError("official RData selected binding availability is incomplete")
-        state = (
-            "source_unavailable_partial" if available_ids else "source_unavailable_whole"
-        ) if unavailable_ids else (
-            "successful_non_empty" if counts else "successful_empty"
-        )
-        coverage = {
-            "required_source_file_count": len(required),
-            "successful_source_file_count": len(successful),
-            "authoritatively_absent_source_file_count": len(absent),
-            "required_source_file_keys": sorted(required),
-            "successful_source_file_keys": sorted(successful),
-            "authoritatively_absent_source_file_keys": sorted(absent),
-            "source_available_timeseries_ids": sorted(available_ids),
-            "source_unavailable_timeseries_ids": sorted(unavailable_ids),
-            "source_unavailable_scopes": unavailable_scopes,
-            "selected_canonical_row_count": sum(counts.values()),
-        }
-        scoped_evidence = {
-            "state": state,
-            "source_counts_present": bool(counts),
-            "source_counts_available": not unavailable_ids,
-            "source_rows": sum(counts.values()),
-            "source_timeseries_row_counts": {
-                str(key): value for key, value in sorted(counts.items())
-            },
-            "source_file_count": len(successful),
-            "source_file_keys": sorted(required),
-            "source_skip_reason": "official_rdata_source_unavailable" if unavailable_ids else None,
-            "property_identity": property_identity_evidence,
-            **coverage,
-        }
-        return counts, {
-            "source_partition_state": state,
-            **{key: value for key, value in scoped_evidence.items() if key != "state"},
-            "partition": scoped_evidence,
-        }
-
     day = dt.date.fromisoformat(day_utc)
     lookup_rows = conn.execute(
         f"""
@@ -14843,22 +14757,6 @@ def check_official_network_rdata(
             f"{source_key} connector identity mismatch: expected={config.connector_id} "
             f"resolved={sorted(actual_connector_ids)}"
         )
-    binding_ids_by_pollutant: dict[str, set[int]] = {
-        pollutant_code: set() for pollutant_code in selected
-    }
-    for site_bindings in bindings.values():
-        for pollutant_code, binding in site_bindings.items():
-            binding_ids_by_pollutant[pollutant_code].add(
-                int(binding["timeseries_id"])
-            )
-    if any(not ids for ids in binding_ids_by_pollutant.values()):
-        missing = sorted(
-            code for code, ids in binding_ids_by_pollutant.items() if not ids
-        )
-        raise RuntimeError(
-            f"{source_key} selected pollutant has no authoritative bindings: "
-            f"{missing}"
-        )
 
     run_root = (
         Path(env["UK_AQ_HISTORY_INTEGRITY_SOURCE_CACHE_DIR"])
@@ -14867,7 +14765,6 @@ def check_official_network_rdata(
     run_root.mkdir(parents=True, exist_ok=True)
     now_iso = utc_now().isoformat()
     identities_by_key: dict[str, dict[str, Any]] = {}
-    absent_by_key: dict[str, dict[str, Any]] = {}
     downloaded_bytes = 0
 
     def record_acquisition_failure(
@@ -14880,9 +14777,7 @@ def check_official_network_rdata(
         exc: Exception,
     ) -> Path:
         http_status = (
-            int(exc.http_status)
-            if isinstance(exc, AuthoritativeSourceArtifactAbsent)
-            else int(exc.code) if isinstance(exc, urllib.error.HTTPError) else None
+            int(exc.code) if isinstance(exc, urllib.error.HTTPError) else None
         )
         reason = (
             "unexpected_required_source_http_404"
@@ -14920,7 +14815,7 @@ def check_official_network_rdata(
     def acquire(
         *, source_file_key: str, url: str, destination: Path,
         site_code: str | None, year: int | None,
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         nonlocal downloaded_bytes
         if limits.should_stop():
             raise RuntimeError(
@@ -14929,54 +14824,7 @@ def check_official_network_rdata(
         prior = _fetch_prior_state(conn, source_file_key)
         started = time.monotonic()
         try:
-            pinned = download_official_rdata_pinned(
-                url, destination, config=config,
-            )
-        except AuthoritativeSourceArtifactAbsent as exc:
-            if year is None:
-                failure_path = record_acquisition_failure(
-                    source_file_key=source_file_key, url=url,
-                    site_code=site_code, year=year, stage="fetch", exc=exc,
-                )
-                raise RuntimeError(
-                    f"{source_key} required metadata RData is absent; "
-                    f"audit={failure_path}"
-                ) from exc
-            absent_by_key[source_file_key] = {
-                "source_file": source_file_key,
-                "availability": "authoritatively_absent",
-                "canonical_url": exc.canonical_url,
-                "final_url": exc.final_url,
-                "http_status": exc.http_status,
-                "requested_at_utc": exc.requested_at_utc,
-                "site_code": site_code,
-                "source_year": year,
-            }
-            _upsert_source_state(
-                conn=conn, source_key=source_key,
-                remote_scheme="openair_rdata",
-                source_file_key=source_file_key, env_name=env_name,
-                remote_url_or_key=exc.canonical_url,
-                station_ref=site_code, source_location_id=site_code,
-                day=days[0], exists_remote=False,
-                content_length=None, etag=None, last_modified_utc=None,
-                sha256_downloaded=None, sha256_uncompressed=None,
-                local_cached_path=None, now_iso=now_iso,
-                last_changed_at=(
-                    now_iso if prior is None or int(prior.get("exists_remote") or 0)
-                    else None
-                ),
-                last_status="authoritatively_absent",
-                notes=f"canonical provider HTTP 404; year={year}",
-                source_count_mapping_identity="official_network_rdata_v1",
-                source_count_mapping_hash=mapping_hash,
-            )
-            _record_source_file_timeseries_counts(
-                conn, source_file_key, {}, now_iso,
-                source_count_mapping_identity="official_network_rdata_v1",
-                source_count_mapping_hash=mapping_hash,
-            )
-            return None
+            pinned = download_official_rdata_pinned(url, destination)
         except Exception as exc:
             failure_path = record_acquisition_failure(
                 source_file_key=source_file_key,
@@ -15048,10 +14896,6 @@ def check_official_network_rdata(
             "url": url,
             "bytes": int(pinned["bytes"]),
             "sha256": str(pinned["sha256"]),
-            "canonical_url": pinned["canonical_url"],
-            "final_url": pinned["final_url"],
-            "http_status": pinned["http_status"],
-            "requested_at_utc": pinned["requested_at_utc"],
         }
         identities_by_key[source_file_key] = identity
         return identity
@@ -15090,21 +14934,6 @@ def check_official_network_rdata(
     required_by_day: dict[str, set[str]] = {
         day.isoformat(): {metadata_key} for day in days
     }
-    required_by_day_pollutant: dict[str, dict[str, set[str]]] = {
-        day.isoformat(): {
-            pollutant_code: {metadata_key} for pollutant_code in selected
-        }
-        for day in days
-    }
-    available_timeseries_by_day: dict[str, set[int]] = {
-        day.isoformat(): set() for day in days
-    }
-    available_pollutants_by_day: dict[str, set[str]] = {
-        day.isoformat(): set() for day in days
-    }
-    unavailable_scopes_by_day: dict[str, list[dict[str, Any]]] = {
-        day.isoformat(): [] for day in days
-    }
     decoded_files = 0
     for site_code, site_bindings in sorted(bindings.items()):
         for year in official_rdata_required_site_years(days):
@@ -15114,10 +14943,6 @@ def check_official_network_rdata(
             for day in days:
                 if year in official_rdata_required_site_years((day,)):
                     required_by_day[day.isoformat()].add(source_file_key)
-                    for pollutant_code in site_bindings:
-                        required_by_day_pollutant[day.isoformat()][
-                            pollutant_code
-                        ].add(source_file_key)
             filename = f"{site_code}_{year}.RData"
             destination = run_root / f"site={site_code}" / filename
             identity = acquire(
@@ -15127,38 +14952,9 @@ def check_official_network_rdata(
                 site_code=site_code,
                 year=year,
             )
-            if identity is None:
-                absence = absent_by_key[source_file_key]
-                for day in days:
-                    raw_windows = official_rdata_source_time_windows_for_year(
-                        (day,), year,
-                    )
-                    if not raw_windows:
-                        continue
-                    for pollutant_code, binding in sorted(site_bindings.items()):
-                        unavailable_scopes_by_day[day.isoformat()].append({
-                            "day_utc": day.isoformat(),
-                            "site_code": site_code,
-                            "source_year": year,
-                            "source_file_key": source_file_key,
-                            "pollutant_code": pollutant_code,
-                            "station_id": int(binding["station_id"]),
-                            "timeseries_id": int(binding["timeseries_id"]),
-                            "reason": "provider_site_year_artifact_absent",
-                            "canonical_url": absence["canonical_url"],
-                            "final_url": absence["final_url"],
-                            "http_status": 404,
-                            "raw_source_windows": raw_windows,
-                            "canonical_unavailable_windows": (
-                                official_rdata_canonical_unavailable_windows(raw_windows)
-                            ),
-                            "requested_at_utc": absence["requested_at_utc"],
-                        })
-                continue
             try:
                 decoded = extract_official_rdata_site_year(
                     destination, site_code=site_code, year=year,
-                    selected_pollutants=site_bindings,
                 )
             except Exception as exc:
                 failure_path = record_acquisition_failure(
@@ -15195,15 +14991,6 @@ def check_official_network_rdata(
                     f"{source_key} selected RData group mapping failed closed: "
                     f"site={site_code} year={year}; audit={failure_path}"
                 ) from exc
-            for day in days:
-                if official_rdata_source_time_windows_for_year((day,), year):
-                    available_timeseries_by_day[day.isoformat()].update(
-                        int(binding["timeseries_id"])
-                        for binding in site_bindings.values()
-                    )
-                    available_pollutants_by_day[day.isoformat()].update(
-                        site_bindings
-                    )
             counts: dict[tuple[str, int], int] = {}
             for row in canonical:
                 day_utc = str(row["observed_at_utc"])[:10]
@@ -15245,37 +15032,8 @@ def check_official_network_rdata(
         "required_by_day": {
             key: sorted(value) for key, value in required_by_day.items()
         },
-        "required_by_day_pollutant": {
-            day_utc: {
-                pollutant_code: sorted(keys)
-                for pollutant_code, keys in scoped.items()
-            }
-            for day_utc, scoped in required_by_day_pollutant.items()
-        },
-        "successful_by_day": {
-            key: sorted(value & set(identities_by_key))
-            for key, value in required_by_day.items()
-        },
-        "absent_by_day": {
-            key: sorted(value & set(absent_by_key))
-            for key, value in required_by_day.items()
-        },
         "identities_by_key": identities_by_key,
-        "absent_keys": sorted(absent_by_key),
-        "absent_by_key": absent_by_key,
-        "available_timeseries_by_day": {
-            key: sorted(values)
-            for key, values in available_timeseries_by_day.items()
-        },
-        "available_pollutants_by_day": {
-            key: sorted(values)
-            for key, values in available_pollutants_by_day.items()
-        },
-        "binding_ids_by_pollutant": {
-            key: sorted(values)
-            for key, values in binding_ids_by_pollutant.items()
-        },
-        "unavailable_scopes_by_day": unavailable_scopes_by_day,
+        "absent_keys": [],
         "selected_pollutants": selected,
         "authoritative_mapping_sha256": mapping_hash,
         "observed_property_mapping_sha256": observed_property_hash,
@@ -15297,47 +15055,7 @@ def check_official_network_rdata(
         "metadata_files_fetched": 1,
         "site_year_files_fetched": len(identities_by_key) - 1,
         "site_year_files_decoded": decoded_files,
-        "source_files_authoritatively_absent": len(absent_by_key),
-        "source_files_required": len(set().union(*required_by_day.values())),
-        "source_files_successful": len(identities_by_key),
-        "source_files_indeterminate": 0,
-        "selected_source_coverage_by_day": {
-            key: {
-                "required": len(value),
-                "successful": len(value & set(identities_by_key)),
-                "authoritatively_absent": len(value & set(absent_by_key)),
-                "canonical_rows": len(rows_by_day[key]),
-                "unavailable_scopes": len(unavailable_scopes_by_day[key]),
-            }
-            for key, value in required_by_day.items()
-        },
-        "selected_pollutant_outcomes_by_day": {
-            day_utc: {
-                pollutant_code: (
-                    "partially_source_unavailable"
-                    if any(
-                        scope["pollutant_code"] == pollutant_code
-                        for scope in unavailable_scopes_by_day[day_utc]
-                    ) and any(
-                        timeseries_id in available_timeseries_by_day[day_utc]
-                        for timeseries_id in binding_ids_by_pollutant[pollutant_code]
-                    )
-                    else "wholly_source_unavailable"
-                    if any(
-                        scope["pollutant_code"] == pollutant_code
-                        for scope in unavailable_scopes_by_day[day_utc]
-                    )
-                    else "complete_with_observations"
-                    if any(
-                        row["pollutant_code"] == pollutant_code
-                        for row in rows_by_day[day_utc]
-                    )
-                    else "authoritatively_empty"
-                )
-                for pollutant_code in selected
-            }
-            for day_utc in rows_by_day
-        },
+        "source_files_authoritatively_absent": 0,
         "downloaded_bytes": downloaded_bytes,
         "canonical_rows": sum(len(rows) for rows in rows_by_day.values()),
         "selected_day_count": len(days),
@@ -15380,17 +15098,6 @@ def _prepare_official_rdata_proposal(
     absent = sorted(set(required) - set(context["identities_by_key"]))
     if set(absent) - set(context["absent_keys"]):
         raise RuntimeError(f"{source_key} RData source identity set is incomplete")
-    unavailable_scopes = [
-        dict(scope)
-        for scope in context["unavailable_scopes_by_day"].get(day_utc, [])
-        if str(scope.get("pollutant_code") or "") in pollutants
-    ]
-    if unavailable_scopes:
-        raise RuntimeError(
-            f"{source_key} RData source is unavailable for selected "
-            f"{day_utc} scope; pinned baseline preservation authority is "
-            "required before a complete proposal can be built"
-        )
     repo_root = _repo_root_for_integrity_script(env)
     helper = (
         repo_root / "scripts/uk-aq-history-integrity/bin/integrity/"
@@ -15411,15 +15118,6 @@ def _prepare_official_rdata_proposal(
         "source_file_identities": identities,
         "required_source_files": required,
         "authoritatively_absent_source_files": absent,
-        "source_available_timeseries_ids": context[
-            "available_timeseries_by_day"
-        ].get(day_utc, []),
-        "source_available_pollutant_codes": sorted(
-            set(context["available_pollutants_by_day"].get(day_utc, []))
-            & set(pollutants)
-        ),
-        "source_unavailable_timeseries_ids": [],
-        "source_unavailable_scopes": [],
         "authoritative_mapping_sha256": context[
             "authoritative_mapping_sha256"
         ],
@@ -17400,25 +17098,6 @@ def _assert_detector_and_proposal_source_evidence_agree(
         "observed_property_mapping_sha256",
         "source_csv_records_scanned",
     )
-    if detector.get("source_adapter") in OFFICIAL_RDATA_NETWORKS:
-        fields += (
-            "files_required",
-            "files_read",
-            "files_authoritatively_absent",
-            "source_artifact_availability_sha256",
-            "source_available_timeseries_ids",
-            "source_available_pollutant_codes",
-            "source_unavailable_timeseries_ids",
-            "source_unavailable_scopes",
-            "preserved_baseline_dependency_sha256",
-            "preserved_baseline_identity",
-            "preserved_baseline_rows_sha256",
-            "final_target_row_count",
-            "final_target_timeseries_row_counts",
-            "final_target_pollutant_counts",
-            "empty_final_target_pollutant_codes",
-            "final_target_observation_content_hashes",
-        )
     mismatched = [field for field in fields if detector.get(field) != proposal.get(field)]
     if mismatched:
         raise ValueError(
@@ -21633,7 +21312,6 @@ def _validate_v2_timeseries_bindings(
     view_root: Path,
     config: HistoryPathConfig,
     allowed_connector_ids: set[int] | None = None,
-    required_timeseries_ids: set[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Validate stable bindings against the imported v2 core snapshot.
 
@@ -21647,17 +21325,6 @@ def _validate_v2_timeseries_bindings(
         conn,
         allowed_connector_ids=allowed_connector_ids,
     )
-    if required_timeseries_ids is not None:
-        missing_core_ids = required_timeseries_ids - set(expected_by_id)
-        if missing_core_ids:
-            raise ValueError(
-                "selected binding IDs are absent from the imported v2 core snapshot: "
-                + ",".join(map(str, sorted(missing_core_ids)))
-            )
-        expected_by_id = {
-            timeseries_id: expected_by_id[timeseries_id]
-            for timeseries_id in sorted(required_timeseries_ids)
-        }
     if not expected_by_id:
         return []
 
@@ -21740,59 +21407,6 @@ def _validate_v2_timeseries_bindings(
             "gap_type": "timeseries_binding_missing_reconcile_from_core",
         })
     return gaps
-
-
-def run_official_rdata_timeseries_binding_verification(
-    *,
-    conn: sqlite3.Connection,
-    config: HistoryPathConfig,
-    source_key: str,
-    repair_pollutants: Iterable[str],
-    individual_root: Path,
-    backup_mode: str,
-    pack_root: Path | None,
-    stage: str,
-) -> dict[str, Any]:
-    """Authenticate the physical pack, then check only selected official IDs."""
-    network = OFFICIAL_RDATA_NETWORKS[source_key]
-    pollutants = set(_normalise_repair_pollutants(repair_pollutants))
-    if not pollutants:
-        raise ValueError("official RData binding verification needs selected pollutants")
-    core_bindings = _expected_v2_core_timeseries_bindings(
-        conn, allowed_connector_ids={network.connector_id},
-    )
-    required_ids = {
-        timeseries_id for timeseries_id, binding in core_bindings.items()
-        if binding["pollutant_code"] in pollutants
-    }
-    if not required_ids or {core_bindings[value]["pollutant_code"] for value in required_ids} != pollutants:
-        raise ValueError("selected official RData pollutant has no v2 core bindings")
-    with binding_backup_view(
-        mode=backup_mode,
-        individual_root=individual_root,
-        pack_root=pack_root,
-        required_timeseries_ids=required_ids,
-        observation_generation="v2",
-    ) as (view_root, provider_audit):
-        gaps = _validate_v2_timeseries_bindings(
-            conn=conn,
-            view_root=view_root,
-            config=config,
-            allowed_connector_ids={network.connector_id},
-            required_timeseries_ids=required_ids,
-        )
-    return {
-        "stage": stage,
-        "status": "ok" if not gaps else "fail",
-        "source_adapter": source_key,
-        "connector_id": network.connector_id,
-        "pollutant_codes": sorted(pollutants),
-        "required_timeseries_ids": sorted(required_ids),
-        "required_binding_count": len(required_ids),
-        "gap_count": len(gaps),
-        "gaps": gaps,
-        "provider": dict(provider_audit),
-    }
 
 
 def run_sos_timeseries_binding_verification(
@@ -22366,32 +21980,12 @@ def run_v2_final_verification(
                 for value in raw_connector_ids
                 if str(value).strip().isdigit() and int(value) > 0
             }
-    official_binding_result: dict[str, Any] | None = None
-    official_source_key = run_state.get("official_rdata_source_adapter")
-    if official_source_key in OFFICIAL_RDATA_NETWORKS:
-        official_binding_result = run_official_rdata_timeseries_binding_verification(
-            conn=conn,
-            config=config,
-            source_key=official_source_key,
-            repair_pollutants=(
-                repair_pollutants
-                or run_state.get("requested_repair_pollutants")
-                or (run_state.get("timeseries_binding_pre_repair_verification") or {}).get("pollutant_codes")
-                or []
-            ),
-            individual_root=Path(str(run_state["base_dropbox_root"])),
-            backup_mode=str(run_state.get("timeseries_binding_backup_mode") or ""),
-            pack_root=Path(str(run_state["timeseries_binding_pack_root"])),
-            stage="final_verification",
-        )
-        remaining_scopes.extend(official_binding_result["gaps"])
-    else:
-        remaining_scopes.extend(_validate_v2_timeseries_bindings(
-            conn=conn,
-            view_root=view_root,
-            config=config,
-            allowed_connector_ids=binding_connector_ids,
-        ))
+    remaining_scopes.extend(_validate_v2_timeseries_bindings(
+        conn=conn,
+        view_root=view_root,
+        config=config,
+        allowed_connector_ids=binding_connector_ids,
+    ))
     for gap in list((recheck.get("observations") or {}).get("gaps") or []):
         if isinstance(gap, Mapping) and str(gap.get("severity") or "error") == "error":
             remaining_scopes.append({
@@ -22535,7 +22129,6 @@ def run_v2_final_verification(
         "remaining_scopes": remaining_scopes,
         "stage_remaining_counts": stage_counts,
         "recheck": recheck,
-        **({"timeseries_binding": official_binding_result} if official_binding_result is not None else {}),
     }
 
 
@@ -23226,35 +22819,6 @@ def run_canonical_apply_executor(
     env: Mapping[str, str],
     log: logging.Logger,
 ) -> dict[str, Any]:
-    official_connector_ids = {
-        config.connector_id for config in OFFICIAL_RDATA_NETWORKS.values()
-    }
-    official_scope_selected = any(
-        isinstance(scope, Mapping)
-        and str(scope.get("connector_id") or "") in {
-            str(value) for value in official_connector_ids
-        }
-        for scope in list(
-            (run_state.get("changed_scopes") or {}).get("OBSERVS_CHANGED") or []
-        )
-    )
-    if (run_state.get("official_rdata_source_adapter") in OFFICIAL_RDATA_NETWORKS
-            or official_scope_selected):
-        reason = "generic_fixed_v2_official_rdata_apply_authority_unavailable"
-        run_state["proposal_transition_validation"] = {
-            "status": "failed",
-            "stage": reason,
-            "node_apply_launch_permitted": False,
-            "r2_mutation_possible": False,
-            "validated_at_utc": fmt_iso(utc_now()),
-        }
-        write_run_state(run_state)
-        return {
-            "status": "failed",
-            "reason": reason,
-            "node_apply_launched": False,
-            "r2_mutation_possible": False,
-        }
     dedicated_sos_light_v2 = _is_dedicated_sos_light_v2_run_state(run_state)
     if dedicated_sos_light_v2:
         try:
@@ -26369,17 +25933,6 @@ def run_v2_integrity_repair_flow(
         record_integrity_object_operations(
             conn, run_id=run_id, run_state=run_state, log=log,
         )
-
-    if (run_state.get("official_rdata_source_adapter") in OFFICIAL_RDATA_NETWORKS
-            and not dry_run and apply_result.get("status") == "skipped_noop"):
-        # A source-only or metadata-only plan cannot be treated as accepted
-        # generic-v2 authority until the independent transition is complete.
-        apply_result = {
-            "status": "failed",
-            "reason": "generic_fixed_v2_official_rdata_apply_authority_unavailable",
-            "node_apply_launched": False,
-            "r2_mutation_possible": False,
-        }
 
     if proposal_failed or apply_result.get("status") == "failed":
         first_value_at_reconciliation: dict[str, Any] = {
@@ -30938,7 +30491,6 @@ def main(argv: list[str]) -> int:
         saqn_metrics: dict[str, Any] = dict(empty_metrics)
         cross_check_metrics: dict[str, Any] = dict(empty_metrics)
         sos_binding_verification: dict[str, Any] | None = None
-        official_binding_verification: dict[str, Any] | None = None
         verified_first_value_at_connector_days: list[dict[str, Any]] = []
         lookup_source_counts: dict[str, dict[str, int]] = (
             collect_lookup_active_counts_by_source(conn)
@@ -31244,35 +30796,6 @@ def main(argv: list[str]) -> int:
                 cross_check_metrics["discrepancy_total"] = int(
                     cross_check_metrics.get("discrepancy_total") or 0
                 ) + binding_gap_count
-        if args.source in OFFICIAL_RDATA_NETWORKS and snapshot_ok:
-            official_binding_root = Path(str(resolve_r2_history_root(os.environ) or ""))
-            official_binding_verification = run_official_rdata_timeseries_binding_verification(
-                conn=conn,
-                config=history_path_configs["v2"],
-                source_key=args.source,
-                repair_pollutants=(
-                    args.repair_pollutants
-                    or OFFICIAL_RDATA_RUN_CONTEXTS[args.source]["selected_pollutants"]
-                ),
-                individual_root=official_binding_root,
-                backup_mode=args.timeseries_binding_backup_mode,
-                pack_root=Path(args.timeseries_binding_pack_root or str(official_binding_root)),
-                stage="check_only" if effective_mode == "check_only" else "pre_repair",
-            )
-            cross_check_metrics["v2_timeseries_bindings"] = official_binding_verification
-            binding_gap_count = int(official_binding_verification["gap_count"])
-            cross_check_metrics["cross_checks_total"] = int(
-                cross_check_metrics.get("cross_checks_total") or 0
-            ) + official_binding_verification["required_binding_count"]
-            cross_check_metrics["cross_checks_ok"] = int(
-                cross_check_metrics.get("cross_checks_ok") or 0
-            ) + (official_binding_verification["required_binding_count"] if not binding_gap_count else 0)
-            cross_check_metrics["cross_checks_mismatch"] = int(
-                cross_check_metrics.get("cross_checks_mismatch") or 0
-            ) + binding_gap_count
-            cross_check_metrics["discrepancy_total"] = int(
-                cross_check_metrics.get("discrepancy_total") or 0
-            ) + binding_gap_count
         if cross_check_metrics.get("ran"):
             v2_backfill_metrics = run_v2_gap_backfills(
                 conn=conn,
@@ -31308,22 +30831,15 @@ def main(argv: list[str]) -> int:
 
         if (
             mode_creates_repair_overlay(effective_mode)
-            and (
-                (sos_binding_verification is not None and sos_binding_verification.get("status") == "fail")
-                or (official_binding_verification is not None and official_binding_verification.get("status") == "fail")
-            )
+            and sos_binding_verification is not None
+            and sos_binding_verification.get("status") == "fail"
         ):
             repair_flow = {
                 "status": "blocked_dependency",
-                "reason": (
-                    "official_rdata_timeseries_binding_semantic_verification_failed"
-                    if official_binding_verification is not None
-                    and official_binding_verification.get("status") == "fail"
-                    else "sos_timeseries_binding_semantic_verification_failed"
-                ),
+                "reason": "sos_timeseries_binding_semantic_verification_failed",
                 "r2_write_attempted": False,
                 "stage_order": list(CANONICAL_REPAIR_STAGE_ORDER),
-                "timeseries_binding": sos_binding_verification or official_binding_verification,
+                "timeseries_binding": sos_binding_verification,
             }
         elif mode_creates_repair_overlay(effective_mode):
             dropbox_root = resolve_r2_history_root({**os.environ, **env})
@@ -31336,8 +30852,6 @@ def main(argv: list[str]) -> int:
                 base_dropbox_root=dropbox_root,
             )
             repair_overlay["effective_mode"] = effective_mode
-            if args.source in OFFICIAL_RDATA_NETWORKS:
-                repair_overlay["official_rdata_source_adapter"] = args.source
             repair_overlay["dropbox_baseline"] = str(dropbox_root)
             repair_overlay["allow_stale_dropbox"] = bool(args.allow_stale_dropbox)
             if sos_binding_verification is not None:
@@ -31350,14 +30864,6 @@ def main(argv: list[str]) -> int:
                 repair_overlay[
                     "timeseries_binding_pre_repair_verification"
                 ] = sos_binding_verification
-            if official_binding_verification is not None:
-                repair_overlay["timeseries_binding_backup_mode"] = args.timeseries_binding_backup_mode
-                repair_overlay["timeseries_binding_pack_root"] = (
-                    args.timeseries_binding_pack_root or str(dropbox_root)
-                )
-                repair_overlay["timeseries_binding_pre_repair_verification"] = (
-                    official_binding_verification
-                )
             repair_overlay["observations_global_operation_lock"] = dict(
                 global_operation_lock
             )
@@ -31493,7 +30999,6 @@ def main(argv: list[str]) -> int:
         v2_gap_count_for_status = (
             int((cross_check_metrics.get("v2_observations") or {}).get("gap_count", 0) or 0)
             + int((sos_binding_verification or {}).get("gap_count") or 0)
-            + int((official_binding_verification or {}).get("gap_count") or 0)
         )
         coordinator_failed = repair_flow.get("status") in {"failed", "blocked_dependency"}
         final_verification = repair_flow.get("final_verification") or {}
@@ -31877,17 +31382,11 @@ def main(argv: list[str]) -> int:
                     sos_binding_verification is not None
                     and sos_binding_verification.get("status") == "fail"
                 )
-                or (
-                    official_binding_verification is not None
-                    and official_binding_verification.get("status") == "fail"
-                )
             ) else "ok",
             "observations": v2_obs,
         }
         if sos_binding_verification is not None:
             v2_result["timeseries_bindings"] = sos_binding_verification
-        if official_binding_verification is not None:
-            v2_result["timeseries_bindings"] = official_binding_verification
         final_result = repair_flow.get("final_verification") or {}
         if args.run_backfill and not args.dry_run and final_result.get("ran"):
             recheck = final_result.get("recheck") or {}
@@ -31901,7 +31400,6 @@ def main(argv: list[str]) -> int:
             final_binding_result = (
                 final_result.get("timeseries_binding")
                 or sos_binding_verification
-                or official_binding_verification
             )
             if final_binding_result is not None:
                 v2_result["timeseries_bindings"] = final_binding_result
@@ -32069,13 +31567,9 @@ def main(argv: list[str]) -> int:
                     )
                     if key in v2_result
                 })
-        # Diagnostic runs may retain local SQLite evidence, but never export
-        # their optional database copy to Dropbox.
-        db_copy = (
-            {"status": "skipped_diagnostic_mode"}
-            if effective_mode in {"check_only", "repair_dry_run"}
-            else _copy_db_to_dropbox(env, conn, log)
-        )
+        # Dropbox DB copy on any non-error exit. Failures here are warnings,
+        # not run failures — the local DB is the source of truth.
+        db_copy = _copy_db_to_dropbox(env, conn, log)
         summary["dropbox_db_copy"] = db_copy
         if run_id is not None:
             try:

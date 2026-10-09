@@ -40,10 +40,6 @@ function parseArgs(argv) {
     if (!args[key]) throw new Error(`--${key.replaceAll("_", "-")} is required`);
   }
   if (!["v2", "v3"].includes(args.generation)) throw new Error("--generation must be v2 or v3");
-  if (args.require_exact_generation_report != null &&
-      args.require_exact_generation_report !== "true") {
-    throw new Error("--require-exact-generation-report must be true when supplied");
-  }
   args.expected_observations_root = assertSha256(args.expected_observations_root, "expected observations root");
   return args;
 }
@@ -228,16 +224,6 @@ export function verifyLocalBackupMaterialisation(args) {
   const completedAt = parseTimestamp(report.completed_at, "backup report completed_at");
   if (completedAt < startedAt) throw new Error("Backup report interval is reversed");
   const generation = resolveObservationHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: args.generation });
-  if (args.require_exact_generation_report === "true" && (
-    report.observation_generation !== generation.version || report.ok !== true ||
-    report.complete !== true || report.dry_run !== false
-  )) {
-    throw new Error("Exact generation local verification requires a successful complete non-dry matching-generation backup report");
-  }
-  if (report.observation_generation != null &&
-      report.observation_generation !== generation.version) {
-    throw new Error("Backup report observation generation contradicts selected generation");
-  }
   const stateKey = normalizeRelativePath(report.state_root_key);
   if (stateKey !== `${generation.backup_state_prefix}/root.json`) throw new Error("Backup report state_root_key contradicts generation");
   const stateObject = readJson(root, stateKey);

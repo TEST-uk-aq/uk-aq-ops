@@ -2783,13 +2783,6 @@ export async function applyValidatedProposal({
   }
   let sosLightV2CoordinatorFreeze;
   try {
-    if (
-      ["waqn", "saqn"].includes(runState.official_rdata_source_adapter) ||
-      (runState.changed_scopes?.OBSERVS_CHANGED || []).some((scope) =>
-        [9, 10].includes(Number(scope?.connector_id)))
-    ) {
-      throw new Error("Generic fixed-v2 official-RData APPLY authority is unavailable");
-    }
     sosLightV2CoordinatorFreeze = coordinatorFreezeValidator
       ? { dedicated: false, ...coordinatorFreezeValidator(runState) }
       : requireSosLightV2CoordinatorFreeze(runState);

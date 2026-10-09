@@ -691,7 +691,6 @@ async function main() {
 
   const report = {
     ok: true,
-    observation_generation: generation.version,
     started_at: startedAt,
     completed_at: new Date().toISOString(),
     inventory_mode: args.full_scan ? "full_scan" : "hierarchical",

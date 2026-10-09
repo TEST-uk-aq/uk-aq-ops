@@ -1408,7 +1408,6 @@ async function main() {
 
   const report = {
     ok: true,
-    observation_generation: generation.version,
     started_at: startedAt,
     completed_at: null,
     dry_run: args.dry_run,

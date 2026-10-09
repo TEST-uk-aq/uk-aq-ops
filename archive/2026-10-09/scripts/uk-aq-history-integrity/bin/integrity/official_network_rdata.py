@@ -169,13 +169,7 @@ def rscript_identity() -> dict[str, str]:
     return {"executable": executable, "version": version}
 
 
-def _extract_tsv(
-    path: Path,
-    *,
-    mode: str,
-    object_name: str,
-    required_columns: Iterable[str] = (),
-) -> list[dict[str, str]]:
+def _extract_tsv(path: Path, *, mode: str, object_name: str) -> list[dict[str, str]]:
     process = subprocess.run(
         [resolve_rscript(), "--vanilla", "-", mode, str(path), object_name],
         input=_R_EXTRACT_SCRIPT,
@@ -192,35 +186,17 @@ def _extract_tsv(
     reader = csv.DictReader(io.StringIO(process.stdout), delimiter="\t")
     if not reader.fieldnames:
         raise RuntimeError(f"RData extraction returned no columns for {path.name}")
-    missing = sorted(set(required_columns) - set(reader.fieldnames))
-    if missing:
-        raise RuntimeError(
-            f"RData object {object_name} lacks selected columns: {missing}"
-        )
     return [
         {str(key): str(value or "") for key, value in row.items()}
         for row in reader
     ]
 
 
-def extract_site_year(
-    path: Path,
-    *,
-    site_code: str,
-    year: int,
-    selected_pollutants: Iterable[str] = (),
-) -> list[dict[str, str]]:
-    selected = set(selected_pollutants)
-    unknown = selected - set(POLLUTANT_TO_METADATA_PARAMETER)
-    if unknown:
-        raise ValueError(f"unsupported selected RData pollutants: {sorted(unknown)}")
+def extract_site_year(path: Path, *, site_code: str, year: int) -> list[dict[str, str]]:
     return _extract_tsv(
         path,
         mode="site_year",
         object_name=f"{site_code}_{int(year)}",
-        required_columns=(
-            "date", *(POLLUTANT_TO_METADATA_PARAMETER[code] for code in sorted(selected))
-        ),
     )
 
 

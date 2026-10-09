@@ -11,6 +11,11 @@ on:
         required: false
         default: ""
         type: string
+      history_generation:
+        description: "One invocation observation generation (blank = configured default)"
+        required: false
+        default: ""
+        type: string
       dry_run:
         description: "Run without writing Dropbox copy/checkpoint/prune changes"
         required: false
@@ -81,6 +86,7 @@ jobs:
       UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || 'R2_history_backup' }}
 
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      INPUT_HISTORY_GENERATION: ${{ github.event.inputs.history_generation || '' }}
       INPUT_MAX_DAYS_PER_RUN: ${{ github.event.inputs.max_days_per_run || '' }}
       INPUT_FORCE_PRUNE_RECHECK: ${{ github.event.inputs.force_prune_recheck || 'false' }}
       INPUT_FORCE_PRUNE_MAX_DAYS_PER_RUN: ${{ github.event.inputs.force_prune_max_days_per_run || '' }}
@@ -227,6 +233,13 @@ jobs:
               exit 1
               ;;
           esac
+          case "${INPUT_HISTORY_GENERATION:-}" in
+            ''|v2|v3) ;;
+            *)
+              echo "history_generation must be blank, v2 or v3" >&2
+              exit 1
+              ;;
+          esac
 
           max_days="${INPUT_MAX_DAYS_PER_RUN:-}"
           if [ -z "${max_days}" ]; then
@@ -238,6 +251,12 @@ jobs:
               exit 1
               ;;
           esac
+          if [ -n "${INPUT_HISTORY_GENERATION:-}" ] &&
+             [ "${INPUT_HISTORY_GENERATION}" != "${UK_AQ_R2_HISTORY_VERSION}" ] &&
+             [ "${max_days}" != "0" ]; then
+            echo "Non-default history generation backup requires max_days_per_run=0" >&2
+            exit 1
+          fi
 
           force_prune_max_days="${INPUT_FORCE_PRUNE_MAX_DAYS_PER_RUN:-}"
           if [ -z "${force_prune_max_days}" ]; then
@@ -301,6 +320,10 @@ jobs:
             --backup-report-out "tmp/r2_history_dropbox_backup_report.json"
           )
 
+          if [ -n "${INPUT_HISTORY_GENERATION:-}" ]; then
+            cmd+=(--generation "${INPUT_HISTORY_GENERATION}")
+          fi
+
           if [ "${selected_mode}" = "pack" ]; then
             cmd+=(--allow-experimental-pack-only)
           fi
@@ -314,6 +337,24 @@ jobs:
 
           echo "Running: ${cmd[*]}"
           "${cmd[@]}"
+
+          selected_generation="${INPUT_HISTORY_GENERATION:-${UK_AQ_R2_HISTORY_VERSION}}"
+          jq -e --arg generation "${selected_generation}" \
+            '.observation_generation == $generation' \
+            tmp/r2_backup_inventory_report.json >/dev/null
+          jq -e --arg generation "${selected_generation}" \
+            --arg source_root "uk_aq_r2:${CFLARE_R2_BUCKET}" \
+            '.observation_generation == $generation and
+             .source_root == $source_root and
+             .state_root_key == ("_ops/checkpoints/r2_history_backup_state_v2/observation_generation=" + $generation + "/root.json")' \
+            tmp/r2_history_dropbox_backup_report.json >/dev/null
+          if [ -n "${INPUT_HISTORY_GENERATION:-}" ] &&
+             [ "${INPUT_HISTORY_GENERATION}" != "${UK_AQ_R2_HISTORY_VERSION}" ] &&
+             [ "${INPUT_DRY_RUN}" != "true" ]; then
+            jq -e '.ok == true and .complete == true and .dry_run == false and
+                   (.observations.source_root_hash == .observations.processed_source_root_hash)' \
+              tmp/r2_history_dropbox_backup_report.json >/dev/null
+          fi
 
       - name: Upload backup report artifacts
         if: always()
