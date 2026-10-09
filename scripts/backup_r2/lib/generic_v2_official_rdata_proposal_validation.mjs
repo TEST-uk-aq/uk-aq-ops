@@ -13,6 +13,10 @@ import {
   canonicalTransitionFingerprintJson,
   coordinatorTransitionStateCommonFingerprintPayload,
 } from "./sos_light_v3_proposal_validation.mjs";
+import {
+  OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT,
+  requireOfficialRdataTimestampAuthority as requireAcceptedOfficialRdataTimestampAuthority,
+} from "./official_rdata_timestamp_authority_validation.mjs";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const GIT_SHA = /^[a-f0-9]{40}$/;
@@ -25,7 +29,7 @@ const OUTCOMES = new Set([
   "source_artifact_unavailable_preserved",
 ]);
 const POLLUTANT_PREFIX = /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
-const OFFICIAL_RDATA_V7_FIELDS = [
+const OFFICIAL_RDATA_V8_FIELDS = [
   "schema_version", "semantic_evidence_contract", "source_adapter", "day_utc",
   "connector_id", "source_file_identities_sha256", "requested_pollutant_set",
   "contract", "evidence_contract_version", "history_generation",
@@ -60,7 +64,7 @@ const OFFICIAL_RDATA_V7_FIELDS = [
 ];
 
 export const GENERIC_INTEGRITY_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT =
-  "uk_aq_generic_integrity_v2_transition_state_fingerprint_v2";
+  "uk_aq_generic_integrity_v2_transition_state_fingerprint_v3";
 export const GENERIC_INTEGRITY_V2_SELECTED_SCOPE_AUTHORITY_CONTRACT =
   "uk_aq_generic_integrity_v2_selected_scope_authority_v1";
 export const GENERIC_V2_OPERATIONAL_CONTEXT_CONTRACT =
@@ -69,8 +73,7 @@ export const RETAINED_V2_MAINTENANCE_CONTEXT_CONTRACT =
   "uk_aq_retained_v2_official_rdata_maintenance_v1";
 export const SERVING_V2_LIVE_CONTEXT_CONTRACT =
   "uk_aq_serving_v2_official_rdata_integrity_v1";
-export const OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT =
-  "uk_aq_official_rdata_timestamp_authority_v1";
+export { OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT };
 
 function sha256(body) { return createHash("sha256").update(body).digest("hex"); }
 function bytewise(left, right) {
@@ -163,15 +166,15 @@ function authenticatedImplementationRevision(env) {
 
 function officialRdataSemanticEvidenceSha256(evidence) {
   const allowed = new Set([
-    ...OFFICIAL_RDATA_V7_FIELDS,
+    ...OFFICIAL_RDATA_V8_FIELDS,
     "semantic_evidence_sha256", "acquisition_audit", "acquisition_audit_sha256",
   ]);
-  if (OFFICIAL_RDATA_V7_FIELDS.some((field) => !Object.hasOwn(evidence || {}, field))
+  if (OFFICIAL_RDATA_V8_FIELDS.some((field) => !Object.hasOwn(evidence || {}, field))
       || Object.keys(evidence || {}).some((field) => !allowed.has(field))) {
     throw new Error("Generic fixed-v2 official semantic evidence shape is invalid");
   }
   return sha256(Buffer.from(canonicalTransitionFingerprintJson(
-    Object.fromEntries(OFFICIAL_RDATA_V7_FIELDS.map((field) => [field, evidence[field]])),
+    Object.fromEntries(OFFICIAL_RDATA_V8_FIELDS.map((field) => [field, evidence[field]])),
   ), "utf8"));
 }
 
@@ -437,7 +440,7 @@ function canonicalScopeSourceAuthority(raw, {
     throw new Error("Generic fixed-v2 scope source authority changed");
   }
   const authority = JSON.parse(JSON.stringify(raw));
-  if (authority.authority_kind === "persisted_official_rdata_v7_semantic_evidence") {
+  if (authority.authority_kind === "persisted_official_rdata_v8_semantic_evidence") {
     const hashes = [
       "semantic_evidence_sha256", "source_evidence_input_sha256",
       "acquisition_audit_sha256", "source_file_identities_sha256",
@@ -460,7 +463,7 @@ function canonicalScopeSourceAuthority(raw, {
         || [...read].some((key) => absent.has(key) || !required.has(key))
         || [...absent].some((key) => !required.has(key))
         || authority.timestamp_mapping
-          !== "rdata_date_beginning_plus_one_hour_to_observed_at_utc"
+          !== "rdata_posixct_gmt_instant_to_observed_at_utc"
         || !Number.isSafeInteger(authority.final_target_row_count)
         || authority.final_target_row_count < 0
         || !Number.isSafeInteger(selectedCount) || selectedCount < 0
@@ -497,7 +500,7 @@ function canonicalScopeSourceAuthority(raw, {
 
 function validatePersistedScopeSourceEvidence(runState, scope) {
   const authority = scope.source_evidence_authority;
-  if (authority.authority_kind !== "persisted_official_rdata_v7_semantic_evidence") return;
+  if (authority.authority_kind !== "persisted_official_rdata_v8_semantic_evidence") return;
   const source = loadImmutableSourcePartition({
     runState,
     dayUtc: scope.day_utc,
@@ -779,92 +782,7 @@ export function genericV2TransitionStateFingerprintPayload(runState, env = proce
 }
 
 export function requireOfficialRdataTimestampAuthority(runState) {
-  const authority = runState?.official_rdata_timestamp_authority;
-  const artifactPath = String(
-    runState?.official_rdata_timestamp_authority_artifact_path || "",
-  );
-  let body;
-  try {
-    body = fs.readFileSync(artifactPath);
-  } catch {
-    throw new Error("Official RData timestamp authority artifact is unavailable");
-  }
-  let artifact;
-  try {
-    artifact = JSON.parse(body.toString("utf8"));
-  } catch {
-    throw new Error("Official RData timestamp authority artifact is invalid JSON");
-  }
-  const comparisons = artifact?.comparisons;
-  if (!authority || typeof authority !== "object" || Array.isArray(authority)
-      || authority.contract_version !== OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT
-      || authority.status !== "accepted"
-      || authority.source_adapter !== runState?.official_rdata_source_adapter
-      || !["waqn", "saqn"].includes(authority.source_adapter)
-      || authority.timestamp_mapping
-        !== "rdata_date_beginning_plus_one_hour_to_observed_at_utc"
-      || authority.unit_authority !== "accepted_matching_measurement_and_unit"
-      || !Array.isArray(authority.comparisons) || !authority.comparisons.length
-      || authority.artifact_sha256 !== sha256(body)
-      || canonicalTransitionFingerprintJson(authority.comparisons)
-        !== canonicalTransitionFingerprintJson(comparisons)) {
-    throw new Error("Official RData timestamp and unit authority is not accepted");
-  }
-  for (const comparison of authority.comparisons) {
-    const graphLocal = Date.parse(String(comparison?.graph?.interpreted_europe_london || ""));
-    const rdataLocal = Date.parse(String(comparison?.rdata?.interpreted_europe_london || ""));
-    const graphUtc = Date.parse(String(comparison?.graph?.observed_at_utc || ""));
-    const rdataUtc = Date.parse(String(comparison?.rdata?.observed_at_utc || ""));
-    const canonicalUtc = Date.parse(String(comparison?.canonical?.observed_at_utc || ""));
-    if (!comparison || typeof comparison !== "object" || Array.isArray(comparison)
-        || comparison.source_adapter !== authority.source_adapter
-        || !String(comparison.site_code || "")
-        || !POLLUTANTS.has(String(comparison.pollutant_code || ""))
-        || !comparison.graph || !comparison.rdata || !comparison.canonical
-        || !String(comparison.graph.original_timestamp || "")
-        || !String(comparison.rdata.original_timestamp || "")
-        || !String(comparison.graph.interpreted_europe_london || "")
-        || !String(comparison.rdata.interpreted_europe_london || "")
-        || !String(comparison.canonical.observed_at_utc || "")
-        || !Number.isFinite(graphLocal) || !Number.isFinite(rdataLocal)
-        || !Number.isFinite(graphUtc) || !Number.isFinite(rdataUtc)
-        || !Number.isFinite(canonicalUtc)
-        || graphLocal !== canonicalUtc
-        || graphUtc !== canonicalUtc
-        || rdataLocal + 60 * 60 * 1000 !== canonicalUtc
-        || rdataUtc !== canonicalUtc
-        || typeof comparison.graph.value !== "string"
-        || typeof comparison.rdata.value !== "string"
-        || typeof comparison.canonical.value !== "string"
-        || !Number.isFinite(Number(comparison.graph.value))
-        || Number(comparison.graph.value) !== Number(comparison.rdata.value)
-        || Number(comparison.graph.value) !== Number(comparison.canonical.value)
-        || !String(comparison.graph.unit || "")
-        || comparison.graph.unit !== comparison.rdata.unit
-        || comparison.graph.unit !== comparison.canonical.unit
-        || !/^[-+]\d{2}:\d{2}$/.test(String(comparison.europe_london_offset || ""))
-        || !String(comparison.graph.interpreted_europe_london).endsWith(
-          comparison.europe_london_offset,
-        )
-        || comparison.hour_convention
-          !== "rdata_beginning_plus_one_hour_equals_graph_end") {
-      throw new Error("Official RData timestamp comparison is incomplete");
-    }
-  }
-  const projection = {
-    contract_version: OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT,
-    status: "accepted",
-    source_adapter: authority.source_adapter,
-    timestamp_mapping: authority.timestamp_mapping,
-    unit_authority: authority.unit_authority,
-    comparisons: authority.comparisons,
-    artifact_sha256: authority.artifact_sha256,
-  };
-  if (canonicalTransitionFingerprintJson(authority)
-      !== canonicalTransitionFingerprintJson(projection)) {
-    throw new Error("Official RData timestamp authority projection changed");
-  }
-  return projection;
+  return requireAcceptedOfficialRdataTimestampAuthority(runState);
 }
 
 export function requireRetainedV2MaintenanceContext(runState, env = process.env) {

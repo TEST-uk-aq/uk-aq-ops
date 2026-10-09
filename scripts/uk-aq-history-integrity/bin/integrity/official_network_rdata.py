@@ -91,6 +91,7 @@ POLLUTANT_TO_METADATA_PARAMETER = {
 COVERAGE_REQUIRED = "required"
 COVERAGE_AUTHORITATIVE_NO_COVERAGE = "authoritative_no_coverage"
 COVERAGE_INDETERMINATE = "indeterminate"
+TIMESTAMP_MAPPING = "rdata_posixct_gmt_instant_to_observed_at_utc"
 
 
 _R_EXTRACT_SCRIPT = r'''
@@ -107,6 +108,10 @@ if (!is.data.frame(value)) stop(paste("required object is not a data.frame:", ob
 
 if (identical(mode, "site_year")) {
   if (!("date" %in% names(value))) stop("site-year object has no date column")
+  if (!inherits(value$date, "POSIXct")) stop("site-year date is not POSIXct")
+  if (!identical(attr(value$date, "tzone"), "GMT")) {
+    stop("site-year date timezone is not explicitly GMT")
+  }
   keep <- intersect(c("date", "PM2.5", "PM10", "NO2", "O3"), names(value))
   value <- value[, keep, drop=FALSE]
   parsed <- as.POSIXct(value$date, tz="UTC")
@@ -236,30 +241,27 @@ def extract_metadata(
     )
 
 
-def canonical_observed_at(raw_date_beginning: str) -> dt.datetime:
-    """Map proven OpenAir hour-beginning UTC to UK-AQ canonical hour-ending UTC."""
-    parsed = dt.datetime.fromisoformat(raw_date_beginning.replace("Z", "+00:00"))
+def canonical_observed_at(raw_timestamp: str) -> dt.datetime:
+    """Preserve the instant emitted from an explicitly GMT POSIXct RData date."""
+    parsed = dt.datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
-    return parsed.astimezone(dt.timezone.utc) + dt.timedelta(hours=1)
+        raise ValueError("RData timestamp lacks an authenticated timezone")
+    observed = parsed.astimezone(dt.timezone.utc)
+    if observed.minute or observed.second or observed.microsecond:
+        raise ValueError("RData timestamp is not an exact canonical hour")
+    return observed
 
 
 def required_site_years(days: Iterable[dt.date]) -> list[int]:
-    """Include the prior raw year needed for a canonical 1 January 00:00 row."""
-    years: set[int] = set()
-    for day in days:
-        start = dt.datetime.combine(day, dt.time.min, tzinfo=dt.timezone.utc)
-        end = start + dt.timedelta(days=1)
-        years.add((start - dt.timedelta(hours=1)).year)
-        years.add((end - dt.timedelta(hours=1)).year)
-    return sorted(years)
+    """Select only source calendar years containing the requested UTC days."""
+    return sorted({day.year for day in days})
 
 
 def source_time_windows_for_year(
     days: Iterable[dt.date],
     source_year: int,
 ) -> list[dict[str, str]]:
-    """Return raw hour-beginning windows needed for canonical UTC days."""
+    """Return source UTC windows for canonical UTC days, clipped to the file year."""
     year_start = dt.datetime(
         int(source_year), 1, 1, tzinfo=dt.timezone.utc,
     )
@@ -271,8 +273,8 @@ def source_time_windows_for_year(
         canonical_start = dt.datetime.combine(
             day, dt.time.min, tzinfo=dt.timezone.utc,
         )
-        raw_start = canonical_start - dt.timedelta(hours=1)
-        raw_end = canonical_start + dt.timedelta(days=1, hours=-1)
+        raw_start = canonical_start
+        raw_end = canonical_start + dt.timedelta(days=1)
         clipped_start = max(raw_start, year_start)
         clipped_end = min(raw_end, year_end)
         if clipped_start >= clipped_end:
@@ -290,7 +292,7 @@ def source_time_windows_for_year(
 def canonical_unavailable_windows(
     raw_source_windows: Iterable[Mapping[str, Any]],
 ) -> list[dict[str, str]]:
-    """Convert raw hour-beginning windows to canonical hour-ending windows."""
+    """Project unavailable GMT source windows onto identical canonical instants."""
     windows: list[dict[str, str]] = []
     for raw_window in raw_source_windows:
         day_utc = str(raw_window.get("canonical_day_utc") or "").strip()
@@ -309,9 +311,15 @@ def canonical_unavailable_windows(
             raise ValueError("invalid raw RData source window") from exc
         if start.tzinfo is None or end.tzinfo is None or start >= end:
             raise ValueError("invalid raw RData source window")
-        canonical_start = start.astimezone(dt.timezone.utc) + dt.timedelta(hours=1)
-        canonical_end = end.astimezone(dt.timezone.utc) + dt.timedelta(hours=1)
-        if not day_utc or canonical_start.date().isoformat() != day_utc:
+        canonical_start = start.astimezone(dt.timezone.utc)
+        canonical_end = end.astimezone(dt.timezone.utc)
+        try:
+            day = dt.date.fromisoformat(day_utc)
+        except ValueError as exc:
+            raise ValueError("raw RData source window has invalid canonical day") from exc
+        day_start = dt.datetime.combine(day, dt.time.min, tzinfo=dt.timezone.utc)
+        day_end = day_start + dt.timedelta(days=1)
+        if canonical_start < day_start or canonical_end > day_end:
             raise ValueError("raw RData source window escaped its canonical day")
         windows.append({
             "canonical_day_utc": day_utc,

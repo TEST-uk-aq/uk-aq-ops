@@ -110,10 +110,10 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
         }
 
     @staticmethod
-    def refresh_v7_boundaries(evidence: dict[str, object]) -> None:
+    def refresh_v8_boundaries(evidence: dict[str, object]) -> None:
         evidence["semantic_evidence_sha256"] = hashlib.sha256(
             INTEGRITY._canonical_json_utf8_bytes(
-                INTEGRITY._official_rdata_v7_semantic_evidence_projection(
+                INTEGRITY._official_rdata_v8_semantic_evidence_projection(
                     evidence
                 )
             )
@@ -301,7 +301,7 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             )
         return {"metrics": metrics, "downloader": downloader}
 
-    def run_partial_january_proposal(
+    def run_unavailable_january_proposal(
         self,
         *,
         temporary_directory: str,
@@ -313,38 +313,30 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             "history/v3/observations/day_utc=2026-01-01/connector_id=9/"
             "pollutant_code=no2"
         )
-        source_rows = [{
-            "connector_id": 9,
-            "station_id": 101,
-            "timeseries_id": 1001,
-            "pollutant_code": "no2",
-            "observed_at_utc": f"2026-01-01T{hour:02}:00:00.000Z",
-            "value": float(hour),
-            "verification_status": "R",
-        } for hour in range(1, 24)]
+        source_rows: list[dict[str, object]] = []
         unavailable_scope = {
             "day_utc": day_utc,
             "site_code": "SITE1",
-            "source_year": 2025,
-            "source_file_key": "waqn:site_ref=SITE1:year=2025",
+            "source_year": 2026,
+            "source_file_key": "waqn:site_ref=SITE1:year=2026",
             "pollutant_code": "no2",
             "station_id": 101,
             "timeseries_id": 1001,
             "reason": "source_artifact_unavailable",
             "canonical_url": "https://airquality.gov.wales/sites/default/files/"
-            "openair/R_data/SITE1_2025.RData",
+            "openair/R_data/SITE1_2026.RData",
             "final_url": "https://www.airquality.gov.wales/sites/default/files/"
-            "openair/R_data/SITE1_2025.RData",
+            "openair/R_data/SITE1_2026.RData",
             "http_status": 404,
             "raw_source_windows": [{
                 "canonical_day_utc": day_utc,
-                "raw_start_utc": "2025-12-31T23:00:00Z",
-                "raw_end_exclusive_utc": "2026-01-01T00:00:00Z",
+                "raw_start_utc": "2026-01-01T00:00:00Z",
+                "raw_end_exclusive_utc": "2026-01-02T00:00:00Z",
             }],
             "canonical_unavailable_windows": [{
                 "canonical_day_utc": day_utc,
                 "canonical_start_utc": "2026-01-01T00:00:00Z",
-                "canonical_end_exclusive_utc": "2026-01-01T01:00:00Z",
+                "canonical_end_exclusive_utc": "2026-01-02T00:00:00Z",
             }],
         }
         root = Path(temporary_directory)
@@ -372,20 +364,14 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             },
             "rows_by_day": {day_utc: source_rows},
             "source_unavailable_by_day": {day_utc: [unavailable_scope]},
-            "required_by_day": {
-                day_utc: ["waqn:metadata", "waqn:site_ref=SITE1:year=2026"],
-            },
+            "required_by_day": {day_utc: ["waqn:metadata"]},
             "identities_by_key": {
                 "waqn:metadata": {
                     "source_file": "waqn:metadata", "bytes": 1,
                     "sha256": "a" * 64,
                 },
-                "waqn:site_ref=SITE1:year=2026": {
-                    "source_file": "waqn:site_ref=SITE1:year=2026", "bytes": 1,
-                    "sha256": "b" * 64,
-                },
             },
-            "absent_keys": [],
+            "absent_keys": ["waqn:site_ref=SITE1:year=2026"],
             "authoritative_mapping_sha256": "c" * 64,
             "observed_property_mapping_sha256": "d" * 64,
             "audits_by_day": {day_utc: []},
@@ -940,7 +926,7 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             self.run_acquisition(
-                metadata_rows=[self.metadata_row(end_date="2026-09-26")],
+                metadata_rows=[self.metadata_row(end_date="2026-09-27")],
                 download_side_effect=download,
                 temporary_directory=temporary_directory,
                 from_day="2026-09-27",
@@ -1215,14 +1201,11 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
         )
         self.assertIsNone(gap)
 
-    def test_january_split_marks_only_missing_raw_year_artifact(self) -> None:
+    def test_january_identity_mapping_does_not_request_prior_year(self) -> None:
+        calls: list[str] = []
+
         def download(url: str, _destination: Path, **_kwargs):
-            if url.endswith("SITE1_2025.RData"):
-                raise RDATA.AuthoritativeSourceArtifactAbsent(
-                    canonical_url=url,
-                    final_url=url,
-                    requested_at_utc="2026-10-06T00:00:00+00:00",
-                )
+            calls.append(url)
             return {
                 "bytes": 100,
                 "sha256": "1" * 64,
@@ -1239,25 +1222,12 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
                 to_day="2026-01-01",
             )
         self.assertEqual(result["metrics"]["site_year_files_fetched"], 1)
-        [scope] = result["metrics"]["source_unavailable_scopes"]
-        self.assertEqual(scope["source_year"], 2025)
-        self.assertEqual(
-            scope["raw_source_windows"],
-            [{
-                "canonical_day_utc": "2026-01-01",
-                "raw_start_utc": "2025-12-31T23:00:00Z",
-                "raw_end_exclusive_utc": "2026-01-01T00:00:00Z",
-            }],
-        )
+        self.assertEqual(result["metrics"]["source_unavailable_scopes"], [])
+        self.assertFalse(any(url.endswith("SITE1_2025.RData") for url in calls))
+        self.assertEqual(sum(url.endswith("SITE1_2026.RData") for url in calls), 1)
 
-    def test_january_missing_prior_year_keeps_present_year_source_rows(self) -> None:
+    def test_january_present_year_rows_cover_the_full_utc_day(self) -> None:
         def download(url: str, _destination: Path, **_kwargs):
-            if url.endswith("SITE1_2025.RData"):
-                raise RDATA.AuthoritativeSourceArtifactAbsent(
-                    canonical_url=url,
-                    final_url=url,
-                    requested_at_utc="2026-10-06T00:00:00+00:00",
-                )
             return {
                 "bytes": 100,
                 "sha256": "2" * 64,
@@ -1268,7 +1238,7 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
         present_year_rows = [{
             "date": f"2026-01-01T{hour:02}:00:00Z",
             "NO2": str(10 + hour),
-        } for hour in range(23)]
+        } for hour in range(24)]
         with tempfile.TemporaryDirectory() as temporary_directory:
             self.run_acquisition(
                 metadata_rows=[self.metadata_row()],
@@ -1281,26 +1251,21 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
 
         context = INTEGRITY.OFFICIAL_RDATA_RUN_CONTEXTS["waqn"]
         rows = context["rows_by_day"]["2026-01-01"]
-        self.assertEqual(len(rows), 23)
-        self.assertEqual(rows[0]["observed_at_utc"], "2026-01-01T01:00:00.000Z")
+        self.assertEqual(len(rows), 24)
+        self.assertEqual(rows[0]["observed_at_utc"], "2026-01-01T00:00:00.000Z")
         self.assertEqual(rows[-1]["observed_at_utc"], "2026-01-01T23:00:00.000Z")
-        [scope] = context["source_unavailable_by_day"]["2026-01-01"]
-        self.assertEqual(scope["canonical_unavailable_windows"], [{
-            "canonical_day_utc": "2026-01-01",
-            "canonical_start_utc": "2026-01-01T00:00:00Z",
-            "canonical_end_exclusive_utc": "2026-01-01T01:00:00Z",
-        }])
+        self.assertEqual(context["source_unavailable_by_day"]["2026-01-01"], [])
         counts, evidence = INTEGRITY._official_rdata_source_counts_for_partition(
             source_key="waqn",
             day_utc="2026-01-01",
             pollutant_code="no2",
         )
-        self.assertEqual(counts, {1001: 23})
+        self.assertEqual(counts, {1001: 24})
         self.assertEqual(evidence["source_available_timeseries_ids"], [1001])
-        self.assertEqual(evidence["source_unavailable_timeseries_ids"], [1001])
+        self.assertEqual(evidence["source_unavailable_timeseries_ids"], [])
         self.assertEqual(evidence["comparison_scope"], "source_available_timestamp_windows")
 
-    def test_january_proposal_preserves_only_missing_midnight_window(self) -> None:
+    def test_january_unavailable_current_year_preserves_the_full_day(self) -> None:
         midnight = {
             "connector_id": 9,
             "station_id": 101,
@@ -1316,29 +1281,24 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             "value": 99.0,
         }
         with tempfile.TemporaryDirectory() as temporary_directory:
-            result, evidence, preserved = self.run_partial_january_proposal(
+            result, evidence, preserved = self.run_unavailable_january_proposal(
                 temporary_directory=temporary_directory,
                 baseline_rows=[midnight, baseline_present_window],
             )
 
-        self.assertEqual(result["source_timeseries_row_counts"], {"1001": 23})
-        self.assertEqual(result["final_target_timeseries_row_counts"], {"1001": 24})
-        self.assertEqual(preserved, [{
-            "connector_id": 9,
-            "station_id": 101,
-            "timeseries_id": 1001,
-            "pollutant_code": "no2",
-            "observed_at": "2026-01-01T00:00:00.000Z",
-            "value": 5.0,
-            "verification_status": "R",
-        }])
-        self.assertEqual(evidence["total_rows"], 23)
-        self.assertEqual(evidence["preserved_baseline_row_count"], 1)
-        self.assertEqual(evidence["final_target_row_count"], 24)
-        self.assertEqual(evidence["source_available_timeseries_ids"], [1001])
+        self.assertEqual(result["source_timeseries_row_counts"], {})
+        self.assertEqual(result["final_target_timeseries_row_counts"], {"1001": 2})
+        self.assertEqual(
+            [row["observed_at"] for row in preserved],
+            ["2026-01-01T00:00:00.000Z", "2026-01-01T01:00:00.000Z"],
+        )
+        self.assertEqual(evidence["total_rows"], 0)
+        self.assertEqual(evidence["preserved_baseline_row_count"], 2)
+        self.assertEqual(evidence["final_target_row_count"], 2)
+        self.assertEqual(evidence["source_available_timeseries_ids"], [])
         self.assertEqual(evidence["source_unavailable_timeseries_ids"], [1001])
 
-    def test_january_proposal_does_not_manufacture_missing_baseline_row(self) -> None:
+    def test_january_unavailable_current_year_does_not_manufacture_rows(self) -> None:
         baseline_present_window = {
             "connector_id": 9,
             "station_id": 101,
@@ -1349,15 +1309,15 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             "verification_status": "R",
         }
         with tempfile.TemporaryDirectory() as temporary_directory:
-            result, evidence, preserved = self.run_partial_january_proposal(
+            result, evidence, preserved = self.run_unavailable_january_proposal(
                 temporary_directory=temporary_directory,
                 baseline_rows=[baseline_present_window],
             )
 
-        self.assertEqual(preserved, [])
-        self.assertEqual(result["final_target_timeseries_row_counts"], {"1001": 23})
-        self.assertEqual(evidence["preserved_baseline_row_count"], 0)
-        self.assertEqual(evidence["final_target_row_count"], 23)
+        self.assertEqual(len(preserved), 1)
+        self.assertEqual(result["final_target_timeseries_row_counts"], {"1001": 1})
+        self.assertEqual(evidence["preserved_baseline_row_count"], 1)
+        self.assertEqual(evidence["final_target_row_count"], 1)
 
     def test_empty_baseline_comparable_subset_yields_normal_mismatch(self) -> None:
         source_rows = [{
@@ -1934,7 +1894,7 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             self.assertFalse(list(
                 generated.rglob("pollutant_code=pm10/manifest.json")
             ))
-            self.assertEqual(evidence["evidence_contract_version"], 7)
+            self.assertEqual(evidence["evidence_contract_version"], 8)
             self.assertEqual(
                 evidence["source_evidence_input_sha256"],
                 INTEGRITY._source_evidence_input_sha256(evidence),
@@ -2580,6 +2540,10 @@ write(latest.key, latest.body);
                     mock.patch.object(
                         INTEGRITY, "validate_run_state_core_snapshot_identity",
                     ),
+                    mock.patch.object(
+                        INTEGRITY,
+                        "_freeze_generic_v3_official_rdata_authority_for_repair",
+                    ),
                     mock.patch.object(INTEGRITY, "write_run_state"),
                     mock.patch.object(
                         INTEGRITY, "run_v2_gap_backfills", side_effect=capture,
@@ -2611,7 +2575,7 @@ write(latest.key, latest.body);
         args = [
             "--env", "TEST", "--profile", "manual", "--source", "waqn",
             "--from-day", "2026-09-28", "--to-day", "2026-09-28",
-            "--run-backfill", "--repair-pollutants", "no2,pm10,pm25",
+            "--run-backfill", "--repair-pollutants", "no2",
             "--force-replace-selected",
         ]
         self.assertTrue(INTEGRITY.parse_args(args).force_replace_selected)
@@ -2621,6 +2585,19 @@ write(latest.key, latest.body);
                 INTEGRITY.parse_args([
                     after if value == before else value for value in args
                 ])
+        for replacement in (
+            ["--from-day", "2026-09-28", "--to-day", "2026-09-29"],
+            ["--from-day", "2026-09-28", "--to-day", "2026-09-28",
+             "--repair-pollutants", "no2,pm10"],
+        ):
+            scoped = list(args)
+            for option in ("--from-day", "--to-day", "--repair-pollutants"):
+                if option in replacement:
+                    scoped[scoped.index(option) + 1] = replacement[
+                        replacement.index(option) + 1
+                    ]
+            with self.assertRaises(SystemExit):
+                INTEGRITY.parse_args(scoped)
 
     def test_forced_unavailable_pollutant_keeps_empty_deletion_set(self) -> None:
         targets = INTEGRITY.build_explicit_official_rdata_force_partitions(
@@ -2724,6 +2701,10 @@ write(latest.key, latest.body);
         with (
             mock.patch.object(
                 INTEGRITY, "validate_run_state_core_snapshot_identity",
+            ),
+            mock.patch.object(
+                INTEGRITY,
+                "_freeze_generic_v3_official_rdata_authority_for_repair",
             ),
             mock.patch.object(INTEGRITY, "write_run_state"),
             mock.patch.object(
@@ -3040,7 +3021,7 @@ write(latest.key, latest.body);
             tampered_availability["acquisition_audit"][
                 "source_evidence_input_sha256"
             ] = tampered_availability["source_evidence_input_sha256"]
-            self.refresh_v7_boundaries(tampered_availability)
+            self.refresh_v8_boundaries(tampered_availability)
             evidence_b_path.write_text(
                 json.dumps(tampered_availability), encoding="utf-8"
             )
@@ -3061,7 +3042,7 @@ write(latest.key, latest.body);
             )
             tampered = json.loads(evidence_path.read_text(encoding="utf-8"))
             tampered["source_file_identities"][0]["sha256"] = "e" * 64
-            self.refresh_v7_boundaries(tampered)
+            self.refresh_v8_boundaries(tampered)
             evidence_path.write_text(json.dumps(tampered), encoding="utf-8")
             with self.assertRaisesRegex(
                 ValueError,
@@ -3074,8 +3055,8 @@ write(latest.key, latest.body);
                     repair_pollutants=["no2", "pm10"],
                 )
 
-    def test_official_rdata_v7_does_not_advance_sos_contract(self) -> None:
-        self.assertEqual(INTEGRITY.OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION, 7)
+    def test_official_rdata_v8_does_not_advance_sos_contract(self) -> None:
+        self.assertEqual(INTEGRITY.OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION, 8)
         self.assertEqual(INTEGRITY.SOURCE_EVIDENCE_CONTRACT_VERSION, 4)
         v5_payload = INTEGRITY._source_evidence_input_payload({
             "evidence_contract_version": 5,
@@ -3104,7 +3085,7 @@ write(latest.key, latest.body);
         })
         self.assertNotIn("source_artifact_availability_sha256", v4_payload)
 
-    def test_v7_semantic_rerun_reuses_evidence_and_retains_current_audit(self) -> None:
+    def test_v8_semantic_rerun_reuses_evidence_and_retains_current_audit(self) -> None:
         source_row = {
             "connector_id": 9,
             "station_id": 101,
@@ -3211,7 +3192,7 @@ write(latest.key, latest.body);
             ).fetchone()[0])
             self.assertEqual(
                 persisted_semantic,
-                INTEGRITY._official_rdata_v7_semantic_evidence_projection(
+                INTEGRITY._official_rdata_v8_semantic_evidence_projection(
                     loaded_b
                 ),
             )
@@ -3231,14 +3212,14 @@ write(latest.key, latest.body);
                 "2026-10-06T22:31:00Z",
             )
 
-    def test_regular_consumer_loads_and_persists_shared_v7_evidence(self) -> None:
+    def test_regular_consumer_loads_and_persists_shared_v8_evidence(self) -> None:
         regular_path = (
             Path(__file__).resolve().parents[1]
             / "bin"
             / "uk-aq-history-integrity_impl.py"
         )
         regular_spec = importlib.util.spec_from_file_location(
-            "official_rdata_regular_v7", regular_path
+            "official_rdata_regular_v8", regular_path
         )
         assert regular_spec is not None and regular_spec.loader is not None
         regular = importlib.util.module_from_spec(regular_spec)
@@ -3301,7 +3282,7 @@ write(latest.key, latest.body);
                 ).fetchone()[0])
                 self.assertEqual(
                     persisted_semantic,
-                    regular._official_rdata_v7_semantic_evidence_projection(
+                    regular._official_rdata_v8_semantic_evidence_projection(
                         loaded
                     ),
                 )
@@ -3309,7 +3290,7 @@ write(latest.key, latest.body);
             finally:
                 conn.close()
 
-    def test_v7_semantic_input_distinguishes_history_generation(self) -> None:
+    def test_v8_semantic_input_distinguishes_history_generation(self) -> None:
         source_row = {
             "connector_id": 9,
             "station_id": 101,
@@ -3340,7 +3321,7 @@ write(latest.key, latest.body);
                 evidence_v3["source_evidence_input_sha256"],
             )
 
-    def test_v6_row_remains_unchanged_and_does_not_block_v7(self) -> None:
+    def test_v6_row_remains_unchanged_and_does_not_block_v8(self) -> None:
         historical_evidence = {
             "schema_version": 1,
             "evidence_contract_version": 6,
@@ -3379,7 +3360,7 @@ write(latest.key, latest.body);
             ),
         )
         with tempfile.TemporaryDirectory() as temporary_directory:
-            stage_root, evidence_v7 = self.stage_official_proposal(
+            stage_root, evidence_v8 = self.stage_official_proposal(
                 Path(temporary_directory),
                 requested_pollutants=["no2"],
                 rows=[],
@@ -3397,7 +3378,7 @@ write(latest.key, latest.body);
                 evidence=loaded,
                 canonical_rows=rows,
             )
-        self.assertEqual(evidence_v7["evidence_contract_version"], 7)
+        self.assertEqual(evidence_v8["evidence_contract_version"], 8)
         self.assertNotEqual(persisted["evidence_id"], 1)
         self.assertEqual(
             self.conn.execute(
@@ -3407,7 +3388,7 @@ write(latest.key, latest.body);
             (historical_sha, historical_json, "[]"),
         )
 
-    def test_v7_same_semantic_input_with_contradictory_output_fails_closed(self) -> None:
+    def test_v8_same_semantic_input_with_contradictory_output_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             stage_root, evidence = self.stage_official_proposal(
                 Path(temporary_directory),
@@ -3429,7 +3410,7 @@ write(latest.key, latest.body);
             )
             contradictory = json.loads(json.dumps(loaded))
             contradictory["canonical_rows_sha256"] = "f" * 64
-            self.refresh_v7_boundaries(contradictory)
+            self.refresh_v8_boundaries(contradictory)
             with self.assertRaisesRegex(
                 RuntimeError,
                 "conflicts for identical semantic inputs",
@@ -3441,12 +3422,271 @@ write(latest.key, latest.body);
                     canonical_rows=rows,
                 )
 
-    def test_january_first_retains_both_raw_source_year_windows(self) -> None:
+    def test_rdata_gmt_timestamp_is_the_canonical_utc_instant(self) -> None:
+        observed = INTEGRITY.canonical_official_rdata_observed_at(
+            "2026-10-08T18:00:00Z"
+        )
+        self.assertEqual(
+            observed.isoformat(timespec="milliseconds"),
+            "2026-10-08T18:00:00.000+00:00",
+        )
+        with self.assertRaisesRegex(ValueError, "authenticated timezone"):
+            INTEGRITY.canonical_official_rdata_observed_at(
+                "2026-10-08T18:00:00"
+            )
+
+    def test_fixed_v3_freezes_only_v2_identity_mapping_authority(self) -> None:
+        def comparison(
+            *, source_utc: str, graph_local: str, offset: str, value: str,
+        ) -> dict[str, object]:
+            return {
+                "source_adapter": "waqn",
+                "site_code": "CARD",
+                "pollutant_code": "no2",
+                "graph": {
+                    "original_timestamp": graph_local[:16].replace("T", " "),
+                    "interpreted_europe_london": graph_local,
+                    "observed_at_utc": source_utc,
+                    "value": value,
+                    "unit": "ug/m3",
+                },
+                "rdata": {
+                    "source_url": (
+                        "https://airquality.gov.wales/sites/default/files/"
+                        "openair/R_data/CARD_2026.RData"
+                    ),
+                    "source_file_sha256": "8" * 64,
+                    "object_name": "CARD_2026",
+                    "original_timestamp": source_utc.replace("T", " ").replace("Z", ""),
+                    "source_timezone": "GMT",
+                    "observed_at_utc": source_utc,
+                    "value": value,
+                    "unit": "ug/m3",
+                },
+                "canonical": {
+                    "observed_at_utc": source_utc,
+                    "value": value,
+                    "unit": "ug/m3",
+                },
+                "europe_london_offset": offset,
+                "hour_convention": (
+                    "rdata_gmt_instant_equals_graph_canonical_utc"
+                ),
+            }
+
+        artifact = {
+            "contract_version": "uk_aq_official_rdata_timestamp_authority_v2",
+            "status": "accepted",
+            "source_adapter": "waqn",
+            "timestamp_mapping": "rdata_posixct_gmt_instant_to_observed_at_utc",
+            "unit_authority": "accepted_matching_measurement_and_unit",
+            "comparisons": [
+                comparison(
+                    source_utc="2026-01-15T12:00:00Z",
+                    graph_local="2026-01-15T12:00:00+00:00",
+                    offset="+00:00",
+                    value="54.35941",
+                ),
+                comparison(
+                    source_utc="2026-10-08T18:00:00Z",
+                    graph_local="2026-10-08T19:00:00+01:00",
+                    offset="+01:00",
+                    value="1.72125",
+                ),
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            artifact_path = Path(temporary_directory) / "authority.json"
+            artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+            run_state = {"official_rdata_source_adapter": "waqn"}
+            authority = INTEGRITY._freeze_official_rdata_timestamp_authority(
+                run_state,
+                {"UK_AQ_OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_FILE": str(artifact_path)},
+            )
+            self.assertEqual(
+                authority["timestamp_mapping"],
+                "rdata_posixct_gmt_instant_to_observed_at_utc",
+            )
+            old = {**artifact}
+            old["contract_version"] = "uk_aq_official_rdata_timestamp_authority_v1"
+            old["timestamp_mapping"] = (
+                "rdata_date_beginning_plus_one_hour_to_observed_at_utc"
+            )
+            artifact_path.write_text(json.dumps(old), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "not accepted"):
+                INTEGRITY._freeze_official_rdata_timestamp_authority(
+                    {"official_rdata_source_adapter": "waqn"},
+                    {"UK_AQ_OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_FILE": str(artifact_path)},
+                )
+
+    def test_new_official_rdata_evidence_uses_v8_identity_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            _stage, evidence = self.stage_official_proposal(
+                Path(temporary_directory),
+                requested_pollutants=["no2"],
+                rows=[],
+                source_available_pollutants=["no2"],
+            )
+        self.assertEqual(evidence["evidence_contract_version"], 8)
+        self.assertEqual(
+            evidence["timestamp_mapping"],
+            "rdata_posixct_gmt_instant_to_observed_at_utc",
+        )
+        self.assertEqual(
+            INTEGRITY.OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION, 8,
+        )
+
+    def test_fixed_v3_publication_authority_binds_frozen_v8_evidence(self) -> None:
+        def comparison(source_utc: str, graph_local: str, offset: str):
+            return {
+                "source_adapter": "waqn", "site_code": "CARD",
+                "pollutant_code": "no2",
+                "graph": {
+                    "original_timestamp": graph_local[:16].replace("T", " "),
+                    "interpreted_europe_london": graph_local,
+                    "observed_at_utc": source_utc, "value": "1.5", "unit": "ug/m3",
+                },
+                "rdata": {
+                    "source_url": (
+                        "https://airquality.gov.wales/sites/default/files/"
+                        "openair/R_data/CARD_2026.RData"
+                    ),
+                    "source_file_sha256": "8" * 64,
+                    "object_name": "CARD_2026",
+                    "original_timestamp": source_utc.replace("T", " ").replace("Z", ""),
+                    "source_timezone": "GMT", "observed_at_utc": source_utc,
+                    "value": "1.5", "unit": "ug/m3",
+                },
+                "canonical": {
+                    "observed_at_utc": source_utc, "value": "1.5", "unit": "ug/m3",
+                },
+                "europe_london_offset": offset,
+                "hour_convention": "rdata_gmt_instant_equals_graph_canonical_utc",
+            }
+
+        artifact = {
+            "contract_version": "uk_aq_official_rdata_timestamp_authority_v2",
+            "status": "accepted", "source_adapter": "waqn",
+            "timestamp_mapping": "rdata_posixct_gmt_instant_to_observed_at_utc",
+            "unit_authority": "accepted_matching_measurement_and_unit",
+            "comparisons": [
+                comparison(
+                    "2026-01-15T12:00:00Z", "2026-01-15T12:00:00+00:00", "+00:00"
+                ),
+                comparison(
+                    "2026-10-08T18:00:00Z", "2026-10-08T19:00:00+01:00", "+01:00"
+                ),
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            stage_root, _evidence = self.stage_official_proposal(
+                root / "proposal", requested_pollutants=["no2"], rows=[],
+                source_available_pollutants=["no2"],
+            )
+            authority_path = root / "authority.json"
+            authority_body = json.dumps(artifact).encode("utf-8")
+            authority_path.write_bytes(authority_body)
+            run_state = {
+                "execution_path": "generic_integrity",
+                "history_generation": "v3",
+                "official_rdata_source_adapter": "waqn",
+                "official_rdata_timestamp_authority_artifact_path": str(
+                    authority_path.resolve()
+                ),
+                "official_rdata_timestamp_authority": {
+                    **artifact,
+                    "artifact_sha256": hashlib.sha256(authority_body).hexdigest(),
+                },
+                "overlay_root": str(stage_root),
+                "generic_integrity_selected_scope_authority": {
+                    "contract_version": (
+                        "uk_aq_generic_integrity_v3_selected_scope_authority_v3"
+                    ),
+                    "history_generation": "v3",
+                    "selected_scopes": [{
+                        "day_utc": "2026-09-28", "connector_id": 9,
+                        "pollutant_code": "no2",
+                    }],
+                },
+            }
+            authority = INTEGRITY._generic_v3_official_rdata_publication_authority(
+                run_state
+            )
+        self.assertEqual(
+            INTEGRITY.GENERIC_INTEGRITY_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
+            "uk_aq_generic_integrity_v3_transition_state_fingerprint_v4",
+        )
+        self.assertEqual(
+            authority["selected_scope_source_evidence"][0][
+                "evidence_contract_version"
+            ],
+            8,
+        )
+
+    def test_fixed_v3_publication_authority_loads_each_day_as_one_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            stage_root, _evidence = self.stage_official_proposal(
+                Path(temporary_directory),
+                requested_pollutants=["no2", "pm10"],
+                rows=[],
+                source_available_pollutants=["no2", "pm10"],
+            )
+            run_state = {
+                "official_rdata_source_adapter": "waqn",
+                "overlay_root": str(stage_root),
+                "generic_integrity_selected_scope_authority": {
+                    "contract_version": (
+                        "uk_aq_generic_integrity_v3_selected_scope_authority_v3"
+                    ),
+                    "history_generation": "v3",
+                    "selected_scopes": [{
+                        "day_utc": "2026-09-28",
+                        "connector_id": 9,
+                        "pollutant_code": pollutant,
+                    } for pollutant in ("no2", "pm10")],
+                },
+            }
+            with mock.patch.object(
+                INTEGRITY,
+                "_require_official_rdata_timestamp_authority",
+                return_value={"contract_version": "test-only-authority"},
+            ):
+                authority = (
+                    INTEGRITY._generic_v3_official_rdata_publication_authority(
+                        run_state
+                    )
+                )
+        self.assertEqual(
+            [
+                entry["pollutant_code"]
+                for entry in authority["selected_scope_source_evidence"]
+            ],
+            ["no2", "pm10"],
+        )
+        self.assertTrue(all(
+            entry["requested_pollutant_set"] == ["no2", "pm10"]
+            for entry in authority["selected_scope_source_evidence"]
+        ))
+
+    def test_fixed_v3_official_repair_freeze_fails_without_network_artifact(self) -> None:
+        run_state: dict[str, object] = {}
+        with self.assertRaisesRegex(
+            ValueError, "UK_AQ_OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_FILE"
+        ):
+            INTEGRITY._freeze_generic_v3_official_rdata_authority_for_repair(
+                run_state=run_state,
+                source_scope={"source": "waqn"},
+                dedicated_sos_historical_replacement=False,
+                env={},
+            )
+        self.assertEqual(run_state["official_rdata_source_adapter"], "waqn")
+
+    def test_january_first_uses_only_its_utc_source_year_and_full_day(self) -> None:
         day = dt.date(2026, 1, 1)
-        self.assertEqual(INTEGRITY.official_rdata_required_site_years((day,)), [2025, 2026])
+        self.assertEqual(INTEGRITY.official_rdata_required_site_years((day,)), [2026])
         expected_windows = {
-            2025: ("2025-12-31T23:00:00Z", "2026-01-01T00:00:00Z"),
-            2026: ("2026-01-01T00:00:00Z", "2026-01-01T23:00:00Z"),
+            2026: ("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
         }
         for year, expected in expected_windows.items():
             with self.subTest(year=year):
@@ -3460,6 +3700,16 @@ write(latest.key, latest.body);
                 self.assertEqual(
                     (window["raw_start_utc"], window["raw_end_exclusive_utc"]),
                     expected,
+                )
+                self.assertEqual(
+                    INTEGRITY.official_rdata_canonical_unavailable_windows(
+                        [window]
+                    ),
+                    [{
+                        "canonical_day_utc": "2026-01-01",
+                        "canonical_start_utc": "2026-01-01T00:00:00Z",
+                        "canonical_end_exclusive_utc": "2026-01-02T00:00:00Z",
+                    }],
                 )
 
 

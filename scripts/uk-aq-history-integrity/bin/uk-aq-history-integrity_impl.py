@@ -86,6 +86,7 @@ from integrity.official_network_rdata import (
     AuthoritativeSourceArtifactAbsent,
     NETWORKS as OFFICIAL_RDATA_NETWORKS,
     RDATA_COLUMN_TO_POLLUTANT,
+    canonical_observed_at as canonical_official_rdata_observed_at,
     canonical_day_has_available_window as official_rdata_day_has_available_window,
     canonical_timestamp_is_in_windows as official_rdata_timestamp_is_in_windows,
     canonical_unavailable_windows as official_rdata_canonical_unavailable_windows,
@@ -97,6 +98,10 @@ from integrity.official_network_rdata import (
     resolve_rscript as resolve_official_rdata_rscript,
     rscript_identity as official_rdata_rscript_identity,
     source_time_windows_for_year as official_rdata_source_time_windows_for_year,
+)
+from integrity.official_network_rdata_timestamp_authority import (
+    CONTRACT as OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT,
+    freeze_timestamp_authority as _shared_freeze_official_rdata_timestamp_authority,
 )
 
 
@@ -15454,7 +15459,7 @@ def check_official_network_rdata(
         "source_key": source_key,
         "connector_id": config.connector_id,
         "rscript": context["rscript_identity"],
-        "timestamp_mapping": "date_beginning_plus_one_hour",
+        "timestamp_mapping": "posixct_gmt_instant_identity",
         "metadata_files_fetched": 1,
         "site_year_files_fetched": len(identities_by_key) - 1,
         "site_year_files_decoded": decoded_files,
@@ -16066,12 +16071,12 @@ def _v2_observations_index_rebuild_command(
 SOURCE_EVIDENCE_CONTRACT_VERSION = 4
 OFFICIAL_RDATA_SOURCE_AVAILABILITY_CONTRACT_VERSION = 5
 OFFICIAL_RDATA_PRESERVED_BASELINE_EVIDENCE_CONTRACT_VERSION = 6
-OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION = 7
+OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION = 8
 OFFICIAL_RDATA_ACQUISITION_AUDIT_CONTRACT_VERSION = 1
 OFFICIAL_RDATA_PRESERVED_BASELINE_CONTRACT_VERSION = 1
 OFFICIAL_RDATA_DECODER_CONTRACT_VERSION = 1
 OFFICIAL_RDATA_TIMESTAMP_MAPPING = (
-    "rdata_date_beginning_plus_one_hour_to_observed_at_utc"
+    "rdata_posixct_gmt_instant_to_observed_at_utc"
 )
 OBSERVATION_CONTENT_HASH_COLUMNS = [
     "connector_id",
@@ -16142,7 +16147,7 @@ def _canonical_json_utf8_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
-OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS = (
+OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS = (
     "schema_version", "semantic_evidence_contract", "source_adapter",
     "day_utc", "connector_id", "source_file_identities_sha256",
     "requested_pollutant_set", "contract", "evidence_contract_version",
@@ -16187,57 +16192,57 @@ OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS = (
 )
 
 
-def _official_rdata_v7_semantic_evidence_projection(
+def _official_rdata_v8_semantic_evidence_projection(
     evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Return the complete reusable official-RData v7 semantic boundary."""
+    """Return the complete reusable official-RData v8 semantic boundary."""
     if (
         str(evidence.get("source_adapter") or "") not in OFFICIAL_RDATA_NETWORKS
         or evidence.get("evidence_contract_version")
         != OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION
     ):
-        raise ValueError("official RData v7 semantic evidence version is invalid")
+        raise ValueError("official RData v8 semantic evidence version is invalid")
     missing = [
-        field for field in OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS
+        field for field in OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS
         if field not in evidence
     ]
     if missing:
         raise ValueError(
-            "official RData v7 semantic evidence field is missing: " + missing[0]
+            "official RData v8 semantic evidence field is missing: " + missing[0]
         )
-    allowed = set(OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS) | {
+    allowed = set(OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS) | {
         "semantic_evidence_sha256", "acquisition_audit",
         "acquisition_audit_sha256",
     }
     unexpected = sorted(set(evidence) - allowed, key=_canonical_utf8_sort_key)
     if unexpected:
         raise ValueError(
-            "official RData v7 evidence field has no authenticated boundary: "
+            "official RData v8 evidence field has no authenticated boundary: "
             + unexpected[0]
         )
     return {
         field: evidence[field]
-        for field in OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS
+        for field in OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS
     }
 
 
-def _official_rdata_v7_semantic_evidence_sha256(
+def _official_rdata_v8_semantic_evidence_sha256(
     evidence: Mapping[str, Any],
 ) -> str:
     return hashlib.sha256(
         _canonical_json_utf8_bytes(
-            _official_rdata_v7_semantic_evidence_projection(evidence)
+            _official_rdata_v8_semantic_evidence_projection(evidence)
         )
     ).hexdigest()
 
 
-def _official_rdata_v7_acquisition_audit_projection(
+def _official_rdata_v8_acquisition_audit_projection(
     evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Return the separately authenticated current-run acquisition audit."""
     audit = evidence.get("acquisition_audit")
     if not isinstance(audit, Mapping):
-        raise ValueError("official RData v7 acquisition audit is unavailable")
+        raise ValueError("official RData v8 acquisition audit is unavailable")
     fields = (
         "schema_version", "audit_contract", "audit_contract_version",
         "source_adapter", "day_utc", "connector_id", "history_generation",
@@ -16247,7 +16252,7 @@ def _official_rdata_v7_acquisition_audit_projection(
         "rscript_identity", "backed_up_at_utc", "proposal_writer_git_sha",
     )
     if set(audit) != set(fields):
-        raise ValueError("official RData v7 acquisition audit shape is invalid")
+        raise ValueError("official RData v8 acquisition audit shape is invalid")
     projection = {field: audit[field] for field in fields}
     for field in (
         "source_file_acquisition_audit",
@@ -16256,17 +16261,17 @@ def _official_rdata_v7_acquisition_audit_projection(
     ):
         values = projection[field]
         if not isinstance(values, list):
-            raise ValueError("official RData v7 acquisition audit list is invalid")
+            raise ValueError("official RData v8 acquisition audit list is invalid")
         projection[field] = sorted(values, key=_canonical_json_utf8_bytes)
     return projection
 
 
-def _official_rdata_v7_acquisition_audit_sha256(
+def _official_rdata_v8_acquisition_audit_sha256(
     evidence: Mapping[str, Any],
 ) -> str:
     return hashlib.sha256(
         _canonical_json_utf8_bytes(
-            _official_rdata_v7_acquisition_audit_projection(evidence)
+            _official_rdata_v8_acquisition_audit_projection(evidence)
         )
     ).hexdigest()
 
@@ -16405,7 +16410,7 @@ def _immutable_source_evidence_sha256(evidence: Mapping[str, Any]) -> str:
         and evidence.get("evidence_contract_version")
         == OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION
     ):
-        return _official_rdata_v7_semantic_evidence_sha256(evidence)
+        return _official_rdata_v8_semantic_evidence_sha256(evidence)
     payload = dict(evidence)
     payload.pop("source_label_registry_snapshot_file", None)
     payload.pop("source_label_registry_snapshot_file_sha256", None)
@@ -16587,10 +16592,10 @@ def _load_complete_connector_day_source_evidence(
             or evidence.get("observation_content_hash_contract_version") != 1
             or not re.fullmatch(r"[0-9a-f]{64}", semantic_evidence_sha256)
             or semantic_evidence_sha256
-            != _official_rdata_v7_semantic_evidence_sha256(evidence)
+            != _official_rdata_v8_semantic_evidence_sha256(evidence)
             or not re.fullmatch(r"[0-9a-f]{64}", acquisition_audit_sha256)
             or acquisition_audit_sha256
-            != _official_rdata_v7_acquisition_audit_sha256(evidence)
+            != _official_rdata_v8_acquisition_audit_sha256(evidence)
             or not isinstance(acquisition_audit, Mapping)
             or acquisition_audit.get("schema_version") != 1
             or acquisition_audit.get("audit_contract")
@@ -16609,7 +16614,7 @@ def _load_complete_connector_day_source_evidence(
             != semantic_evidence_sha256
         ):
             raise ValueError(
-                "official RData v7 semantic or acquisition evidence identity "
+                "official RData v8 semantic or acquisition evidence identity "
                 "is invalid"
             )
     files_required = {str(value) for value in list(evidence.get("files_required") or [])}
@@ -16880,7 +16885,7 @@ def _persist_complete_connector_day_source_evidence(
     official_preservation_dependency = str(
         evidence.get("preserved_baseline_dependency_sha256") or ""
     )
-    is_official_v7 = (
+    is_official_v8 = (
         source_adapter in OFFICIAL_RDATA_NETWORKS
         and evidence.get("evidence_contract_version")
         == OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION
@@ -16888,15 +16893,15 @@ def _persist_complete_connector_day_source_evidence(
     semantic_evidence: dict[str, Any] | None = None
     acquisition_audit: dict[str, Any] | None = None
     acquisition_audit_sha256: str | None = None
-    if is_official_v7:
-        semantic_evidence = _official_rdata_v7_semantic_evidence_projection(
+    if is_official_v8:
+        semantic_evidence = _official_rdata_v8_semantic_evidence_projection(
             evidence
         )
-        acquisition_audit = _official_rdata_v7_acquisition_audit_projection(
+        acquisition_audit = _official_rdata_v8_acquisition_audit_projection(
             evidence
         )
         acquisition_audit_sha256 = (
-            _official_rdata_v7_acquisition_audit_sha256(evidence)
+            _official_rdata_v8_acquisition_audit_sha256(evidence)
         )
     if (
         not day_utc
@@ -16923,10 +16928,10 @@ def _persist_complete_connector_day_source_evidence(
             )
         )
         or (
-            is_official_v7
+            is_official_v8
             and (
                 str(evidence.get("semantic_evidence_sha256") or "")
-                != _official_rdata_v7_semantic_evidence_sha256(evidence)
+                != _official_rdata_v8_semantic_evidence_sha256(evidence)
                 or str(evidence.get("acquisition_audit_sha256") or "")
                 != acquisition_audit_sha256
                 or acquisition_audit is None
@@ -16969,7 +16974,7 @@ def _persist_complete_connector_day_source_evidence(
             or str(existing[2]) != canonical_rows_sha256
             or int(existing[3]) != canonical_rows_bytes
             or (
-                is_official_v7
+                is_official_v8
                 and (
                     str(existing[4]) != evidence_json
                     or str(existing[5]) != canonical_rows_json
@@ -19823,7 +19828,7 @@ SOS_LIGHT_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
     "uk_aq_sos_light_v2_transition_state_fingerprint_v2"
 )
 GENERIC_INTEGRITY_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
-    "uk_aq_generic_integrity_v2_transition_state_fingerprint_v2"
+    "uk_aq_generic_integrity_v2_transition_state_fingerprint_v3"
 )
 GENERIC_INTEGRITY_V2_SELECTED_SCOPE_AUTHORITY_CONTRACT = (
     "uk_aq_generic_integrity_v2_selected_scope_authority_v1"
@@ -19836,9 +19841,6 @@ RETAINED_V2_MAINTENANCE_CONTEXT_CONTRACT = (
 )
 SERVING_V2_LIVE_CONTEXT_CONTRACT = (
     "uk_aq_serving_v2_official_rdata_integrity_v1"
-)
-OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT = (
-    "uk_aq_official_rdata_timestamp_authority_v1"
 )
 COORDINATOR_PROGRESS_OBJECT_INTERVAL = 250
 COORDINATOR_PROGRESS_SECONDS = 15.0
@@ -20009,10 +20011,10 @@ def _official_rdata_scope_source_evidence_authority(
     pollutant_code: str,
 ) -> dict[str, Any]:
     """Freeze the path-free semantic evidence for one selected pollutant."""
-    projection = _official_rdata_v7_semantic_evidence_projection(source_evidence)
-    semantic_sha256 = _official_rdata_v7_semantic_evidence_sha256(source_evidence)
+    projection = _official_rdata_v8_semantic_evidence_projection(source_evidence)
+    semantic_sha256 = _official_rdata_v8_semantic_evidence_sha256(source_evidence)
     source_input_sha256 = _source_evidence_input_sha256(source_evidence)
-    acquisition_sha256 = _official_rdata_v7_acquisition_audit_sha256(
+    acquisition_sha256 = _official_rdata_v8_acquisition_audit_sha256(
         source_evidence
     )
     if (
@@ -20042,7 +20044,7 @@ def _official_rdata_scope_source_evidence_authority(
     return {
         "contract_version":
             "uk_aq_generic_v2_official_rdata_scope_source_authority_v1",
-        "authority_kind": "persisted_official_rdata_v7_semantic_evidence",
+        "authority_kind": "persisted_official_rdata_v8_semantic_evidence",
         "history_generation": "v2",
         "day_utc": str(projection["day_utc"]),
         "connector_id": int(projection["connector_id"]),
@@ -20429,7 +20431,7 @@ def _canonical_generic_v2_scope_source_authority(
     )
     if not common_valid:
         raise ValueError("generic fixed-v2 scope source authority changed")
-    if kind == "persisted_official_rdata_v7_semantic_evidence":
+    if kind == "persisted_official_rdata_v8_semantic_evidence":
         hashes = (
             "semantic_evidence_sha256", "source_evidence_input_sha256",
             "acquisition_audit_sha256", "source_file_identities_sha256",
@@ -21710,176 +21712,7 @@ def _freeze_official_rdata_timestamp_authority(
     run_state: dict[str, Any], env: Mapping[str, str],
 ) -> dict[str, Any]:
     """Authenticate accepted graph/RData/canonical timestamp and unit evidence."""
-    artifact_path_raw = str(
-        env.get("UK_AQ_OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_FILE") or ""
-    ).strip()
-    if not artifact_path_raw:
-        raise ValueError(
-            "UK_AQ_OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_FILE is required for "
-            "official RData APPLY"
-        )
-    artifact_path = Path(artifact_path_raw)
-    try:
-        body = artifact_path.read_bytes()
-        artifact = json.loads(body)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            "official RData timestamp authority artifact is unavailable or invalid"
-        ) from exc
-    source_adapter = str(run_state.get("official_rdata_source_adapter") or "")
-    comparisons = artifact.get("comparisons") if isinstance(artifact, Mapping) else None
-    if (
-        not isinstance(artifact, Mapping)
-        or artifact.get("contract_version")
-        != OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT
-        or artifact.get("status") != "accepted"
-        or artifact.get("source_adapter") != source_adapter
-        or source_adapter not in OFFICIAL_RDATA_NETWORKS
-        or artifact.get("timestamp_mapping") != OFFICIAL_RDATA_TIMESTAMP_MAPPING
-        or artifact.get("unit_authority")
-        != "accepted_matching_measurement_and_unit"
-        or not isinstance(comparisons, list)
-        or not comparisons
-    ):
-        raise ValueError(
-            "official RData timestamp and unit authority is not accepted"
-        )
-    canonical_comparisons: list[dict[str, Any]] = []
-    for comparison in comparisons:
-        graph = comparison.get("graph") if isinstance(comparison, Mapping) else None
-        rdata = comparison.get("rdata") if isinstance(comparison, Mapping) else None
-        canonical = (
-            comparison.get("canonical")
-            if isinstance(comparison, Mapping) else None
-        )
-        if not all(
-            isinstance(item.get("value"), str)
-            for item in (graph, rdata, canonical)
-            if isinstance(item, Mapping)
-        ) or not all(isinstance(item, Mapping) for item in (graph, rdata, canonical)):
-            raise ValueError(
-                "official RData timestamp comparison values must be strings"
-            )
-        try:
-            values = (
-                float(graph.get("value")),
-                float(rdata.get("value")),
-                float(canonical.get("value")),
-            )
-        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(
-                "official RData timestamp comparison value is invalid"
-            ) from exc
-        try:
-            graph_local = dt.datetime.fromisoformat(
-                str(graph.get("interpreted_europe_london") or "")
-            )
-            rdata_local = dt.datetime.fromisoformat(
-                str(rdata.get("interpreted_europe_london") or "")
-            )
-            graph_utc = dt.datetime.fromisoformat(
-                str(graph.get("observed_at_utc") or "").replace("Z", "+00:00")
-            ).astimezone(dt.timezone.utc)
-            rdata_utc = dt.datetime.fromisoformat(
-                str(rdata.get("observed_at_utc") or "").replace("Z", "+00:00")
-            ).astimezone(dt.timezone.utc)
-            canonical_utc = dt.datetime.fromisoformat(
-                str(canonical.get("observed_at_utc") or "").replace("Z", "+00:00")
-            ).astimezone(dt.timezone.utc)
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise ValueError(
-                "official RData timestamp comparison instant is invalid"
-            ) from exc
-        london_at_canonical = canonical_utc.astimezone(
-            ZoneInfo("Europe/London")
-        )
-        expected_offset = london_at_canonical.strftime("%z")
-        expected_offset = f"{expected_offset[:3]}:{expected_offset[3:]}"
-        if (
-            comparison.get("source_adapter") != source_adapter
-            or not str(comparison.get("site_code") or "")
-            or str(comparison.get("pollutant_code") or "")
-            not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
-            or not str(graph.get("original_timestamp") or "")
-            or not str(rdata.get("original_timestamp") or "")
-            or graph_local.tzinfo is None
-            or rdata_local.tzinfo is None
-            or not str(canonical.get("observed_at_utc") or "")
-            or not all(math.isfinite(value) for value in values)
-            or values[0] != values[1]
-            or values[0] != values[2]
-            or not str(graph.get("unit") or "")
-            or graph.get("unit") != rdata.get("unit")
-            or graph.get("unit") != canonical.get("unit")
-            or comparison.get("europe_london_offset") != expected_offset
-            or comparison.get("hour_convention")
-            != "rdata_beginning_plus_one_hour_equals_graph_end"
-            or graph_local.astimezone(dt.timezone.utc) != canonical_utc
-            or graph_utc != canonical_utc
-            or rdata_local.astimezone(dt.timezone.utc) + dt.timedelta(hours=1)
-            != canonical_utc
-            or rdata_utc != canonical_utc
-        ):
-            raise ValueError(
-                "official RData timestamp comparison is incomplete"
-            )
-        canonical_comparison = {
-            "source_adapter": source_adapter,
-            "site_code": str(comparison["site_code"]),
-            "pollutant_code": str(comparison["pollutant_code"]),
-            "graph": {
-                "original_timestamp": str(graph["original_timestamp"]),
-                "interpreted_europe_london": str(
-                    graph["interpreted_europe_london"]
-                ),
-                "observed_at_utc": str(graph["observed_at_utc"]),
-                "value": str(graph["value"]),
-                "unit": str(graph["unit"]),
-            },
-            "rdata": {
-                "original_timestamp": str(rdata["original_timestamp"]),
-                "interpreted_europe_london": str(
-                    rdata["interpreted_europe_london"]
-                ),
-                "observed_at_utc": str(rdata["observed_at_utc"]),
-                "value": str(rdata["value"]),
-                "unit": str(rdata["unit"]),
-            },
-            "canonical": {
-                "observed_at_utc": str(canonical["observed_at_utc"]),
-                "value": str(canonical["value"]),
-                "unit": str(canonical["unit"]),
-            },
-            "europe_london_offset": str(comparison["europe_london_offset"]),
-            "hour_convention": str(comparison["hour_convention"]),
-        }
-        if dict(comparison) != canonical_comparison:
-            raise ValueError(
-                "official RData timestamp comparison shape is not canonical"
-            )
-        canonical_comparisons.append(canonical_comparison)
-    allowed_fields = {
-        "contract_version", "status", "source_adapter", "timestamp_mapping",
-        "unit_authority", "comparisons",
-    }
-    if set(artifact) != allowed_fields:
-        raise ValueError(
-            "official RData timestamp authority has unexpected fields"
-        )
-    authority = {
-        "contract_version": OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT,
-        "status": "accepted",
-        "source_adapter": source_adapter,
-        "timestamp_mapping": OFFICIAL_RDATA_TIMESTAMP_MAPPING,
-        "unit_authority": "accepted_matching_measurement_and_unit",
-        "comparisons": canonical_comparisons,
-        "artifact_sha256": hashlib.sha256(body).hexdigest(),
-    }
-    run_state["official_rdata_timestamp_authority_artifact_path"] = str(
-        artifact_path.resolve()
-    )
-    run_state["official_rdata_timestamp_authority"] = authority
-    return authority
+    return _shared_freeze_official_rdata_timestamp_authority(run_state, env)
 
 
 def _generic_v2_effective_operational_env(
@@ -26884,7 +26717,7 @@ def _bound_source_evidence_rows(
         or not isinstance(evidence, Mapping)
         or not isinstance(rows, list)
         or evidence.get("history_generation") != "v2"
-        or _official_rdata_v7_semantic_evidence_sha256(evidence)
+        or _official_rdata_v8_semantic_evidence_sha256(evidence)
         != str(evidence_sha or "")
         or _source_evidence_input_sha256(evidence)
         != str(source_input_sha or "")

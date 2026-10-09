@@ -91,7 +91,6 @@ from integrity.official_network_rdata import (
     COVERAGE_REQUIRED,
     NETWORKS as OFFICIAL_RDATA_NETWORKS,
     RDATA_COLUMN_TO_POLLUTANT,
-    canonical_observed_at as canonical_official_rdata_observed_at,
     canonical_day_has_available_window as official_rdata_day_has_available_window,
     canonical_rows_for_site_year,
     canonical_timestamp_is_in_windows as official_rdata_timestamp_is_in_windows,
@@ -103,11 +102,6 @@ from integrity.official_network_rdata import (
     required_site_years as official_rdata_required_site_years,
     resolve_rscript as resolve_official_rdata_rscript,
     rscript_identity as official_rdata_rscript_identity,
-)
-from integrity.official_network_rdata_timestamp_authority import (
-    CONTRACT as OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT,
-    freeze_timestamp_authority as _freeze_official_rdata_timestamp_authority,
-    require_frozen_timestamp_authority as _require_official_rdata_timestamp_authority,
 )
 
 
@@ -15872,7 +15866,7 @@ def check_official_network_rdata(
         "source_key": source_key,
         "connector_id": config.connector_id,
         "rscript": context["rscript_identity"],
-        "timestamp_mapping": "posixct_gmt_instant_identity",
+        "timestamp_mapping": "date_beginning_plus_one_hour",
         "metadata_files_fetched": 1,
         "site_year_files_fetched": len(identities_by_key) - 1,
         "site_year_files_decoded": decoded_files,
@@ -16549,12 +16543,12 @@ def _v2_observations_index_rebuild_command(
 SOURCE_EVIDENCE_CONTRACT_VERSION = 4
 OFFICIAL_RDATA_SOURCE_AVAILABILITY_CONTRACT_VERSION = 5
 OFFICIAL_RDATA_PRESERVED_BASELINE_EVIDENCE_CONTRACT_VERSION = 6
-OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION = 8
+OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION = 7
 OFFICIAL_RDATA_ACQUISITION_AUDIT_CONTRACT_VERSION = 1
 OFFICIAL_RDATA_PRESERVED_BASELINE_CONTRACT_VERSION = 1
 OFFICIAL_RDATA_DECODER_CONTRACT_VERSION = 1
 OFFICIAL_RDATA_TIMESTAMP_MAPPING = (
-    "rdata_posixct_gmt_instant_to_observed_at_utc"
+    "rdata_date_beginning_plus_one_hour_to_observed_at_utc"
 )
 OBSERVATION_CONTENT_HASH_COLUMNS = [
     "connector_id",
@@ -16625,7 +16619,7 @@ def _canonical_json_utf8_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
-OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS = (
+OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS = (
     "schema_version",
     "semantic_evidence_contract",
     "source_adapter",
@@ -16703,26 +16697,26 @@ OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS = (
 )
 
 
-def _official_rdata_v8_semantic_evidence_projection(
+def _official_rdata_v7_semantic_evidence_projection(
     evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Return the complete reusable official-RData v8 semantic boundary."""
+    """Return the complete reusable official-RData v7 semantic boundary."""
     if (
         str(evidence.get("source_adapter") or "") not in OFFICIAL_RDATA_NETWORKS
         or evidence.get("evidence_contract_version")
         != OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION
     ):
-        raise ValueError("official RData v8 semantic evidence version is invalid")
+        raise ValueError("official RData v7 semantic evidence version is invalid")
     missing = [
-        field for field in OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS
+        field for field in OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS
         if field not in evidence
     ]
     if missing:
         raise ValueError(
-            "official RData v8 semantic evidence field is missing: "
+            "official RData v7 semantic evidence field is missing: "
             + missing[0]
         )
-    allowed = set(OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS) | {
+    allowed = set(OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS) | {
         "semantic_evidence_sha256",
         "acquisition_audit",
         "acquisition_audit_sha256",
@@ -16730,32 +16724,32 @@ def _official_rdata_v8_semantic_evidence_projection(
     unexpected = sorted(set(evidence) - allowed, key=_canonical_utf8_sort_key)
     if unexpected:
         raise ValueError(
-            "official RData v8 evidence field has no authenticated boundary: "
+            "official RData v7 evidence field has no authenticated boundary: "
             + unexpected[0]
         )
     return {
         field: evidence[field]
-        for field in OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS
+        for field in OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS
     }
 
 
-def _official_rdata_v8_semantic_evidence_sha256(
+def _official_rdata_v7_semantic_evidence_sha256(
     evidence: Mapping[str, Any],
 ) -> str:
     return hashlib.sha256(
         _canonical_json_utf8_bytes(
-            _official_rdata_v8_semantic_evidence_projection(evidence)
+            _official_rdata_v7_semantic_evidence_projection(evidence)
         )
     ).hexdigest()
 
 
-def _official_rdata_v8_acquisition_audit_projection(
+def _official_rdata_v7_acquisition_audit_projection(
     evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Return the separately authenticated current-run acquisition audit."""
     audit = evidence.get("acquisition_audit")
     if not isinstance(audit, Mapping):
-        raise ValueError("official RData v8 acquisition audit is unavailable")
+        raise ValueError("official RData v7 acquisition audit is unavailable")
     fields = (
         "schema_version",
         "audit_contract",
@@ -16774,7 +16768,7 @@ def _official_rdata_v8_acquisition_audit_projection(
         "proposal_writer_git_sha",
     )
     if set(audit) != set(fields):
-        raise ValueError("official RData v8 acquisition audit shape is invalid")
+        raise ValueError("official RData v7 acquisition audit shape is invalid")
     projection = {field: audit[field] for field in fields}
     for field in (
         "source_file_acquisition_audit",
@@ -16783,17 +16777,17 @@ def _official_rdata_v8_acquisition_audit_projection(
     ):
         values = projection[field]
         if not isinstance(values, list):
-            raise ValueError("official RData v8 acquisition audit list is invalid")
+            raise ValueError("official RData v7 acquisition audit list is invalid")
         projection[field] = sorted(values, key=_canonical_json_utf8_bytes)
     return projection
 
 
-def _official_rdata_v8_acquisition_audit_sha256(
+def _official_rdata_v7_acquisition_audit_sha256(
     evidence: Mapping[str, Any],
 ) -> str:
     return hashlib.sha256(
         _canonical_json_utf8_bytes(
-            _official_rdata_v8_acquisition_audit_projection(evidence)
+            _official_rdata_v7_acquisition_audit_projection(evidence)
         )
     ).hexdigest()
 
@@ -16935,7 +16929,7 @@ def _immutable_source_evidence_sha256(evidence: Mapping[str, Any]) -> str:
         and evidence.get("evidence_contract_version")
         == OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION
     ):
-        return _official_rdata_v8_semantic_evidence_sha256(evidence)
+        return _official_rdata_v7_semantic_evidence_sha256(evidence)
     payload = dict(evidence)
     payload.pop("source_label_registry_snapshot_file", None)
     payload.pop("source_label_registry_snapshot_file_sha256", None)
@@ -17117,10 +17111,10 @@ def _load_complete_connector_day_source_evidence(
             or evidence.get("observation_content_hash_contract_version") != 1
             or not re.fullmatch(r"[0-9a-f]{64}", semantic_evidence_sha256)
             or semantic_evidence_sha256
-            != _official_rdata_v8_semantic_evidence_sha256(evidence)
+            != _official_rdata_v7_semantic_evidence_sha256(evidence)
             or not re.fullmatch(r"[0-9a-f]{64}", acquisition_audit_sha256)
             or acquisition_audit_sha256
-            != _official_rdata_v8_acquisition_audit_sha256(evidence)
+            != _official_rdata_v7_acquisition_audit_sha256(evidence)
             or not isinstance(acquisition_audit, Mapping)
             or acquisition_audit.get("schema_version") != 1
             or acquisition_audit.get("audit_contract")
@@ -17139,7 +17133,7 @@ def _load_complete_connector_day_source_evidence(
             != semantic_evidence_sha256
         ):
             raise ValueError(
-                "official RData v8 semantic or acquisition evidence identity "
+                "official RData v7 semantic or acquisition evidence identity "
                 "is invalid"
             )
     files_required = {str(value) for value in list(evidence.get("files_required") or [])}
@@ -17410,7 +17404,7 @@ def _persist_complete_connector_day_source_evidence(
     official_preservation_dependency = str(
         evidence.get("preserved_baseline_dependency_sha256") or ""
     )
-    is_official_v8 = (
+    is_official_v7 = (
         source_adapter in OFFICIAL_RDATA_NETWORKS
         and evidence.get("evidence_contract_version")
         == OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION
@@ -17418,15 +17412,15 @@ def _persist_complete_connector_day_source_evidence(
     semantic_evidence: dict[str, Any] | None = None
     acquisition_audit: dict[str, Any] | None = None
     acquisition_audit_sha256: str | None = None
-    if is_official_v8:
-        semantic_evidence = _official_rdata_v8_semantic_evidence_projection(
+    if is_official_v7:
+        semantic_evidence = _official_rdata_v7_semantic_evidence_projection(
             evidence
         )
-        acquisition_audit = _official_rdata_v8_acquisition_audit_projection(
+        acquisition_audit = _official_rdata_v7_acquisition_audit_projection(
             evidence
         )
         acquisition_audit_sha256 = (
-            _official_rdata_v8_acquisition_audit_sha256(evidence)
+            _official_rdata_v7_acquisition_audit_sha256(evidence)
         )
     if (
         not day_utc
@@ -17457,10 +17451,10 @@ def _persist_complete_connector_day_source_evidence(
             )
         )
         or (
-            is_official_v8
+            is_official_v7
             and (
                 str(evidence.get("semantic_evidence_sha256") or "")
-                != _official_rdata_v8_semantic_evidence_sha256(evidence)
+                != _official_rdata_v7_semantic_evidence_sha256(evidence)
                 or str(evidence.get("acquisition_audit_sha256") or "")
                 != acquisition_audit_sha256
                 or acquisition_audit is None
@@ -17503,7 +17497,7 @@ def _persist_complete_connector_day_source_evidence(
             or str(existing[2]) != canonical_rows_sha256
             or int(existing[3]) != canonical_rows_bytes
             or (
-                is_official_v8
+                is_official_v7
                 and (
                     str(existing[4]) != evidence_json
                     or str(existing[5]) != canonical_rows_json
@@ -21141,13 +21135,10 @@ SOS_LIGHT_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
     "uk_aq_sos_light_v3_transition_state_fingerprint_v2"
 )
 GENERIC_INTEGRITY_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
-    "uk_aq_generic_integrity_v3_transition_state_fingerprint_v4"
+    "uk_aq_generic_integrity_v3_transition_state_fingerprint_v3"
 )
 GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT = (
     "uk_aq_generic_integrity_v3_selected_scope_authority_v3"
-)
-GENERIC_V3_OFFICIAL_RDATA_PUBLICATION_AUTHORITY_CONTRACT = (
-    "uk_aq_generic_v3_official_rdata_publication_authority_v1"
 )
 COORDINATOR_PROGRESS_OBJECT_INTERVAL = 250
 COORDINATOR_PROGRESS_SECONDS = 15.0
@@ -22125,133 +22116,6 @@ def _canonical_generic_integrity_selected_scope_authority(
     }
 
 
-def _generic_v3_official_rdata_publication_authority(
-    run_state: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Reauthenticate selected v3 official source semantics before APPLY."""
-    source_adapter = str(run_state.get("official_rdata_source_adapter") or "")
-    connector_id = {"waqn": 9, "saqn": 10}.get(source_adapter)
-    raw_authority = run_state.get("generic_integrity_selected_scope_authority")
-    if (
-        connector_id is None
-        or not isinstance(raw_authority, Mapping)
-        or raw_authority.get("contract_version")
-        != GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT
-        or raw_authority.get("history_generation") != "v3"
-        or not isinstance(raw_authority.get("selected_scopes"), list)
-        or not raw_authority["selected_scopes"]
-    ):
-        raise ValueError(
-            "generic fixed-v3 official RData selected authority is unavailable"
-        )
-    timestamp_authority = _require_official_rdata_timestamp_authority(
-        run_state,
-        {"UK_AQ_OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_FILE": str(
-            run_state.get("official_rdata_timestamp_authority_artifact_path") or ""
-        )},
-    )
-    stage_root = Path(str(run_state.get("overlay_root") or ""))
-    pollutants_by_day: dict[str, set[str]] = {}
-    for scope in raw_authority["selected_scopes"]:
-        if not isinstance(scope, Mapping):
-            raise ValueError("generic fixed-v3 official RData selected scope is invalid")
-        day_utc = str(scope.get("day_utc") or "")
-        pollutant_code = str(scope.get("pollutant_code") or "")
-        try:
-            valid_day = dt.date.fromisoformat(day_utc).isoformat() == day_utc
-        except ValueError:
-            valid_day = False
-        if (
-            not valid_day
-            or scope.get("connector_id") != connector_id
-            or pollutant_code not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
-        ):
-            raise ValueError("generic fixed-v3 official RData selected scope is invalid")
-        pollutants_by_day.setdefault(day_utc, set()).add(pollutant_code)
-
-    source_evidence: list[dict[str, Any]] = []
-    for day_utc in sorted(pollutants_by_day, key=lambda value: value.encode("utf-8")):
-        selected_pollutants = sorted(
-            pollutants_by_day[day_utc], key=lambda value: value.encode("utf-8")
-        )
-        evidence, _rows = _load_complete_connector_day_source_evidence(
-            stage_root=stage_root,
-            day_utc=day_utc,
-            connector_id=connector_id,
-            repair_pollutants=selected_pollutants,
-        )
-        semantic_sha256 = _official_rdata_v8_semantic_evidence_sha256(evidence)
-        if (
-            evidence.get("evidence_contract_version") != 8
-            or evidence.get("history_generation") != "v3"
-            or evidence.get("source_adapter") != source_adapter
-            or evidence.get("timestamp_mapping") != OFFICIAL_RDATA_TIMESTAMP_MAPPING
-            or evidence.get("requested_pollutant_set") != selected_pollutants
-            or evidence.get("semantic_evidence_sha256") != semantic_sha256
-        ):
-            raise ValueError(
-                "generic fixed-v3 official RData semantic evidence is invalid"
-            )
-        for pollutant_code in selected_pollutants:
-            source_evidence.append({
-                "day_utc": day_utc,
-                "connector_id": connector_id,
-                "pollutant_code": pollutant_code,
-                "evidence_contract_version": 8,
-                "source_adapter": source_adapter,
-                "timestamp_mapping": OFFICIAL_RDATA_TIMESTAMP_MAPPING,
-                "semantic_evidence_sha256": semantic_sha256,
-                "source_evidence_input_sha256": evidence[
-                    "source_evidence_input_sha256"
-                ],
-                "acquisition_audit_sha256": evidence["acquisition_audit_sha256"],
-                "source_file_identities_sha256": evidence[
-                    "source_file_identities_sha256"
-                ],
-                "source_file_identities": evidence["source_file_identities"],
-                "requested_pollutant_set": evidence["requested_pollutant_set"],
-                "files_required": evidence["files_required"],
-                "files_read": evidence["files_read"],
-                "files_authoritatively_absent": evidence[
-                    "files_authoritatively_absent"
-                ],
-                "canonical_rows_sha256": evidence["canonical_rows_sha256"],
-                "canonical_rows_bytes": evidence["canonical_rows_bytes"],
-                "source_artifact_availability_sha256": evidence[
-                    "source_artifact_availability_sha256"
-                ],
-                "source_unavailable_scopes": evidence["source_unavailable_scopes"],
-                "preserved_baseline_dependency_sha256": evidence[
-                    "preserved_baseline_dependency_sha256"
-                ],
-                "preserved_baseline_identity": evidence[
-                    "preserved_baseline_identity"
-                ],
-                "final_target_row_count": evidence["final_target_row_count"],
-                "final_target_timeseries_row_counts": evidence[
-                    "final_target_timeseries_row_counts"
-                ],
-                "final_target_pollutant_counts": evidence[
-                    "final_target_pollutant_counts"
-                ],
-                "final_target_observation_content_hashes": evidence[
-                    "final_target_observation_content_hashes"
-                ],
-            })
-    source_evidence.sort(key=lambda entry: (
-        entry["day_utc"].encode("utf-8"), entry["connector_id"],
-        entry["pollutant_code"].encode("utf-8"),
-    ))
-    return {
-        "contract_version":
-            GENERIC_V3_OFFICIAL_RDATA_PUBLICATION_AUTHORITY_CONTRACT,
-        "history_generation": "v3",
-        "source_adapter": source_adapter,
-        "timestamp_authority": timestamp_authority,
-        "selected_scope_source_evidence": source_evidence,
-    }
-
-
 def _proposal_transition_state_fingerprint_payload(
     run_state: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -22271,10 +22135,6 @@ def _proposal_transition_state_fingerprint_payload(
                 GENERIC_INTEGRITY_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
             "execution_path": "generic_integrity",
             "history_generation": "v3",
-            "official_rdata_publication_authority": (
-                _generic_v3_official_rdata_publication_authority(run_state)
-                if run_state.get("official_rdata_source_adapter") else None
-            ),
             "generic_selected_scope_authority":
                 _canonical_generic_integrity_selected_scope_authority(run_state),
             **common,
@@ -28997,23 +28857,6 @@ def _canonical_apply_reporting_metrics(
     }
 
 
-def _freeze_generic_v3_official_rdata_authority_for_repair(
-    *,
-    run_state: dict[str, Any],
-    source_scope: Mapping[str, Any] | None,
-    dedicated_sos_historical_replacement: bool,
-    env: Mapping[str, str],
-) -> dict[str, Any] | None:
-    """Freeze the network-specific timestamp authority for a generic v3 repair."""
-    source_adapter = str((source_scope or {}).get("source") or "")
-    if dedicated_sos_historical_replacement or source_adapter not in {
-        "waqn", "saqn",
-    }:
-        return None
-    run_state["official_rdata_source_adapter"] = source_adapter
-    return _freeze_official_rdata_timestamp_authority(run_state, env)
-
-
 def run_v2_integrity_repair_flow(
     *,
     run_state: dict[str, Any],
@@ -29044,12 +28887,6 @@ def run_v2_integrity_repair_flow(
     validate_run_state_core_snapshot_identity(
         run_state,
         stage="proposal_coordinator",
-    )
-    _freeze_generic_v3_official_rdata_authority_for_repair(
-        run_state=run_state,
-        source_scope=source_scope,
-        dedicated_sos_historical_replacement=dedicated_sos_historical_replacement,
-        env=env,
     )
     write_run_state(run_state)
     explicit_selected_partitions: list[dict[str, Any]] | None = None
@@ -29883,10 +29720,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--force-replace-selected",
         action="store_true",
-        help=(
-            "Explicit manual TEST WAQN/SAQN one-day, one-pollutant physical "
-            "replacement. Adjacent days require separately approved runs."
-        ),
+        help="Explicit manual TEST WAQN/SAQN selected-pollutant physical replacement.",
     )
     p.add_argument(
         "--repair-pollutants",
@@ -29992,13 +29826,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parsed.env != "TEST" or parsed.profile != "manual"
         or parsed.source not in {"waqn", "saqn"}
         or not parsed.from_day or not parsed.to_day
-        or parsed.from_day != parsed.to_day
         or not parsed.run_backfill or parsed.check_only or parsed.dry_run
-        or len(parsed.repair_pollutants) != 1
+        or not parsed.repair_pollutants
     ):
         p.error(
             "--force-replace-selected requires a write-enabled manual TEST "
-            "WAQN/SAQN run for exactly one explicit day and one repair pollutant"
+            "WAQN/SAQN run with explicit from/to days and repair pollutants"
         )
     if parsed.env == "LIVE" and parsed.enable_historical_identity_repair:
         p.error("historical identity repair must remain disabled in LIVE")

@@ -68,15 +68,15 @@ function canonicalJson(value) {
   return JSON.stringify(value);
 }
 
-const OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION = 8;
+const OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION = 7;
 const OFFICIAL_RDATA_SOURCE_AVAILABILITY_CONTRACT_VERSION = 5;
 const OFFICIAL_RDATA_PRESERVED_BASELINE_CONTRACT_VERSION = 1;
 const OFFICIAL_RDATA_DECODER_CONTRACT_VERSION = 1;
 const OFFICIAL_RDATA_ACQUISITION_AUDIT_CONTRACT_VERSION = 1;
 const OFFICIAL_RDATA_TIMESTAMP_MAPPING =
-  "rdata_posixct_gmt_instant_to_observed_at_utc";
+  "rdata_date_beginning_plus_one_hour_to_observed_at_utc";
 
-const OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS = Object.freeze([
+const OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS = Object.freeze([
   "schema_version",
   "semantic_evidence_contract",
   "source_adapter",
@@ -153,11 +153,11 @@ const OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS = Object.freeze([
   "source_verification_status_counts",
 ]);
 
-function officialRdataV8SemanticEvidenceProjection(evidence) {
+function officialRdataV7SemanticEvidenceProjection(evidence) {
   const projection = {};
-  for (const field of OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS) {
+  for (const field of OFFICIAL_RDATA_V7_SEMANTIC_EVIDENCE_FIELDS) {
     if (!Object.prototype.hasOwnProperty.call(evidence, field)) {
-      throw new Error(`official RData v8 semantic evidence field is missing: ${field}`);
+      throw new Error(`official RData v7 semantic evidence field is missing: ${field}`);
     }
     projection[field] = evidence[field];
   }
@@ -595,7 +595,7 @@ function main() {
     source_verification_status_counts: verificationStatusCounts,
   };
   const semanticEvidenceSha256 = sha256(Buffer.from(
-    canonicalJson(officialRdataV8SemanticEvidenceProjection(semanticEvidence)),
+    canonicalJson(officialRdataV7SemanticEvidenceProjection(semanticEvidence)),
     "utf8",
   ));
   const acquisitionAudit = {

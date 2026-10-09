@@ -23,7 +23,7 @@ function genericAuthorityFixture() {
     + "/connector_id=9/pollutant_code=no2";
   const sourceAuthority = {
     contract_version: "uk_aq_generic_v2_official_rdata_scope_source_authority_v1",
-    authority_kind: "persisted_official_rdata_v7_semantic_evidence",
+    authority_kind: "persisted_official_rdata_v8_semantic_evidence",
     history_generation: "v2",
     day_utc: "2026-10-01",
     connector_id: 9,
@@ -55,7 +55,7 @@ function genericAuthorityFixture() {
     final_target_observation_content_hashes: {},
     selected_final_target_row_count: 0,
     selected_final_target_authoritatively_empty: true,
-    timestamp_mapping: "rdata_date_beginning_plus_one_hour_to_observed_at_utc",
+    timestamp_mapping: "rdata_posixct_gmt_instant_to_observed_at_utc",
   };
   const scope = {
     day_utc: "2026-10-01",
@@ -222,7 +222,7 @@ test("generic fixed-v2 authority has independent versioned contract identities",
   );
   assert.equal(
     GENERIC_INTEGRITY_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT,
-    "uk_aq_generic_integrity_v2_transition_state_fingerprint_v2",
+    "uk_aq_generic_integrity_v2_transition_state_fingerprint_v3",
   );
 });
 
@@ -320,7 +320,7 @@ test("generic fixed-v2 rejects cross-mode substitution and concealed LIVE v3", (
   }
 });
 
-test("generic fixed-v2 transition fingerprint matches Python UTF-8 canonicalisation", () => {
+test("generic fixed-v2 transition fingerprint matches Python corrected authority", () => {
   const runState = operationalFixture({
     environment: "LIVE", bucket: "configured-live-bucket-fixture", servingGeneration: "v2",
   });
@@ -337,39 +337,51 @@ test("generic fixed-v2 transition fingerprint matches Python UTF-8 canonicalisat
     staged_dependency_edge_count: 0,
     external_dependency_edge_counts: {},
   };
-  const comparison = {
+  const comparison = ({ sourceUtc, graphLocal, offset, value }) => ({
     source_adapter: "waqn",
-    site_code: "fixture",
+    site_code: "CARD",
     pollutant_code: "no2",
     graph: {
-      original_timestamp: "2026-10-01 01:00",
-      interpreted_europe_london: "2026-10-01T01:00:00+01:00",
-      observed_at_utc: "2026-10-01T00:00:00.000Z",
-      value: "12.5",
+      original_timestamp: graphLocal.slice(0, 16).replace("T", " "),
+      interpreted_europe_london: graphLocal,
+      observed_at_utc: sourceUtc,
+      value,
       unit: "ug/m3",
     },
     rdata: {
-      original_timestamp: "2026-10-01 00:00",
-      interpreted_europe_london: "2026-10-01T00:00:00+01:00",
-      observed_at_utc: "2026-10-01T00:00:00.000Z",
-      value: "12.5",
+      source_url: "https://airquality.gov.wales/sites/default/files/openair/R_data/CARD_2026.RData",
+      source_file_sha256: "8".repeat(64),
+      object_name: "CARD_2026",
+      original_timestamp: sourceUtc.replace("T", " ").replace("Z", ""),
+      source_timezone: "GMT",
+      observed_at_utc: sourceUtc,
+      value,
       unit: "ug/m3",
     },
-    canonical: {
-      observed_at_utc: "2026-10-01T00:00:00.000Z",
-      value: "12.5",
-      unit: "ug/m3",
-    },
-    europe_london_offset: "+01:00",
-    hour_convention: "rdata_beginning_plus_one_hour_equals_graph_end",
-  };
+    canonical: { observed_at_utc: sourceUtc, value, unit: "ug/m3" },
+    europe_london_offset: offset,
+    hour_convention: "rdata_gmt_instant_equals_graph_canonical_utc",
+  });
   const artifact = {
-    contract_version: "uk_aq_official_rdata_timestamp_authority_v1",
+    contract_version: "uk_aq_official_rdata_timestamp_authority_v2",
     status: "accepted",
     source_adapter: "waqn",
-    timestamp_mapping: "rdata_date_beginning_plus_one_hour_to_observed_at_utc",
+    timestamp_mapping: "rdata_posixct_gmt_instant_to_observed_at_utc",
     unit_authority: "accepted_matching_measurement_and_unit",
-    comparisons: [comparison],
+    comparisons: [
+      comparison({
+        sourceUtc: "2026-01-15T12:00:00Z",
+        graphLocal: "2026-01-15T12:00:00+00:00",
+        offset: "+00:00",
+        value: "54.35941",
+      }),
+      comparison({
+        sourceUtc: "2026-10-08T18:00:00Z",
+        graphLocal: "2026-10-08T19:00:00+01:00",
+        offset: "+01:00",
+        value: "1.72125",
+      }),
+    ],
   };
   const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-v2-fingerprint-"));
   try {
