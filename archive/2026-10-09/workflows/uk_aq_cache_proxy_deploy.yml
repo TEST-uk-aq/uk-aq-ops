@@ -16,11 +16,6 @@ on:
         required: false
         default: ""
         type: string
-      activate_compressed_chart_history:
-        description: "Opt in to the TEST compressed-chart service binding after its private Worker exists"
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -127,40 +122,6 @@ jobs:
             echo "Unresolved UK_AQ_MEDIA_PUBLIC_URL placeholder."
             exit 1
           fi
-
-      - name: Verify and enable optional compressed-chart service binding
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.activate_compressed_chart_history }}
-        working-directory: workers/uk_aq_cache_proxy
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ env.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-          PILOT_SERVICE="$(sed -n 's/^name = "\([a-z0-9-]*\)"$/\1/p' ../uk_aq_compressed_chart_history/wrangler.toml)"
-          if [[ ! "${PILOT_SERVICE}" =~ ^[a-z0-9][a-z0-9-]*-test$ ]]; then
-            echo "The experimental Worker config has no valid TEST Worker name."
-            exit 1
-          fi
-          if ! npx --yes wrangler@4.130.0 deployments list \
-            --config wrangler.deploy.toml \
-            --name "${PILOT_SERVICE}" \
-            --json > "${RUNNER_TEMP}/uk_aq_compressed_chart_history_deployments.json"; then
-            echo "Prototype activation refused: ${PILOT_SERVICE} is absent from the main TEST Cloudflare account."
-            exit 1
-          fi
-          jq -e 'type == "array" and length > 0' \
-            "${RUNNER_TEMP}/uk_aq_compressed_chart_history_deployments.json" >/dev/null || {
-            echo "Prototype activation refused: ${PILOT_SERVICE} has no deployment."
-            exit 1
-          }
-          cat >> wrangler.deploy.toml <<EOF
-
-          [[services]]
-          binding = "COMPRESSED_CHART_HISTORY"
-          service = "${PILOT_SERVICE}"
-          EOF
-          grep -F "service = \"${PILOT_SERVICE}\"" wrangler.deploy.toml >/dev/null
-          echo "Optional compressed-chart binding verified and enabled for this deployment."
 
       - name: Validate required Worker secrets and vars
         run: |

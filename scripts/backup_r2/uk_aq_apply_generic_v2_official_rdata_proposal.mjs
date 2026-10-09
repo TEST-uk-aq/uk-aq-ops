@@ -31,6 +31,11 @@ export async function applyValidatedGenericV2OfficialRdataProposal({
   adapters = {},
   env = process.env,
 }) {
+  const operationEnv = {
+    ...env,
+    UK_AQ_R2_HISTORY_VERSION: "v2",
+    UK_AQ_R2_HISTORY_INDEX_VERSION: "v2",
+  };
   const coordinatorState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
   if (coordinatorState.execution_path !== "generic_integrity"
       || !["waqn", "saqn"].includes(coordinatorState.official_rdata_source_adapter)) {
@@ -40,7 +45,7 @@ export async function applyValidatedGenericV2OfficialRdataProposal({
     coordinatorState?.observations_global_operation_lock?.run_id || "",
   ).trim();
   requireObservationsGlobalOperationLockContext({
-    env,
+    env: operationEnv,
     expectedOwner: "integrity",
     expectedRunId: lockRunId,
   });
@@ -51,15 +56,15 @@ export async function applyValidatedGenericV2OfficialRdataProposal({
     runStatePath,
     r2,
     adapters,
-    env,
+    env: operationEnv,
     generation: "v2",
     expectedExecutionPath: "generic_integrity",
     generationEligibilityValidator: ({ runState }) =>
-      requireRetainedV2MaintenanceContext(runState, env),
+      requireRetainedV2MaintenanceContext(runState, operationEnv),
     coordinatorFreezeValidator: (runState) =>
-      requireGenericV2CoordinatorFreeze(runState, env),
+      requireGenericV2CoordinatorFreeze(runState, operationEnv),
     localProposalValidator: (runState) =>
-      validateLocalGenericV2Proposal(runState, env),
+      validateLocalGenericV2Proposal(runState, operationEnv),
     finalProposalGraphValidator: validateFinalGenericV2ProposalGraph,
   });
 }

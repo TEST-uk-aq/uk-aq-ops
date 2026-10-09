@@ -67,8 +67,7 @@ function validMonth(month, selected, sample) {
   return rows.every((row) => Array.isArray(row) && row.length === 5
     && typeof row[0] === "string" && Number.isFinite(Date.parse(row[0]))
     && row[0] >= sample.start && row[0] < sample.end
-    && typeof row[1] === "number" && Number.isFinite(row[1])
-    && (row[2] === null || row[2] === 248));
+    && typeof row[1] === "number" && Number.isFinite(row[1]) && row[2] === 248);
 }
 async function aqiFromObject(object, selected, sample, range) {
   const decompressed = new Response(object.body.pipeThrough(new DecompressionStream("gzip")));
@@ -77,7 +76,7 @@ async function aqiFromObject(object, selected, sample, range) {
   const month = JSON.parse(new TextDecoder().decode(raw));
   if (!validMonth(month, selected, sample)) throw new Error("pilot_json_invalid");
   const rows = month.observations.map((row) => ({
-    connector_id: 1, station_id: row[2], timeseries_id: 212, pollutant_code: "pm25",
+    connector_id: 1, station_id: 248, timeseries_id: 212, pollutant_code: "pm25",
     observed_at: row[0], value: row[1], source_status: row[3], verification_status: row[4], source: "json",
   }));
   const result = await buildCalculatedHistory({

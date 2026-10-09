@@ -4,7 +4,6 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
-  loadImmutableSourcePartition,
   validateFinalProposalGraph,
   validateLocalProposal,
 } from "../uk_aq_apply_integrity_proposal.mjs";
@@ -14,49 +13,14 @@ import {
 } from "./sos_light_v3_proposal_validation.mjs";
 
 const SHA256 = /^[a-f0-9]{64}$/;
-const GIT_SHA = /^[a-f0-9]{40}$/;
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const POLLUTANTS = new Set(["pm25", "pm10", "no2", "o3"]);
 const OUTCOMES = new Set([
   "complete_replacement",
-  "partial_source_unavailable_preserved_replacement",
   "authoritative_no_data_replacement",
   "source_artifact_unavailable_preserved",
 ]);
 const POLLUTANT_PREFIX = /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
-const OFFICIAL_RDATA_V7_FIELDS = [
-  "schema_version", "semantic_evidence_contract", "source_adapter", "day_utc",
-  "connector_id", "source_file_identities_sha256", "requested_pollutant_set",
-  "contract", "evidence_contract_version", "history_generation",
-  "source_label_registry_snapshot_content_sha256",
-  "authoritative_station_timeseries_mapping_sha256",
-  "sos_site_ref_bridge_mapping_identity", "sos_site_ref_bridge_artifact_sha256",
-  "observed_property_mapping_sha256", "source_artifact_availability_contract_version",
-  "source_artifact_availability_sha256", "preserved_baseline_dependency_contract_version",
-  "preserved_baseline_dependency_sha256", "rdata_decoder_contract_version",
-  "timestamp_mapping", "observation_content_hash_contract_version",
-  "source_evidence_input_sha256", "enumeration_complete", "files_enumerated",
-  "files_required", "files_read", "files_authoritatively_absent",
-  "source_file_identities", "source_records_examined", "source_csv_records_scanned",
-  "canonical_rows_mapped", "missing_binding_groups", "missing_binding_rows",
-  "canonical_rows_file", "canonical_rows_sha256", "canonical_rows_bytes", "total_rows",
-  "per_timeseries_counts", "per_pollutant_counts", "observation_content_hashes",
-  "pollutant_set", "source_available_timeseries_ids", "source_available_pollutant_codes",
-  "source_unavailable_timeseries_ids", "source_unavailable_scopes",
-  "preserved_baseline_rows_file", "preserved_baseline_rows_sha256",
-  "preserved_baseline_rows_bytes", "preserved_baseline_row_count",
-  "preserved_baseline_identity", "final_target_row_count",
-  "final_target_timeseries_row_counts", "final_target_pollutant_counts",
-  "empty_final_target_pollutant_codes", "final_target_observation_content_hashes",
-  "source_rows_before_canonical_dedupe", "duplicate_rows_removed_by_canonical_normalisation",
-  "duplicate_canonical_row_count", "duplicate_canonical_row_identity_samples",
-  "uncanonicalisable_source_row_count", "source_adapter_blocked_row_count",
-  "source_adapter_blocked_row_samples", "out_of_scope_source_adapter_blocked_row_count",
-  "blocked_row_count", "blocked_row_samples", "skipped_row_count",
-  "inactive_identity_rows_skipped", "source_label_classification_counts",
-  "source_label_target_day_row_counts", "source_label_summary",
-  "source_label_classifications", "mapping_audit", "source_verification_status_counts",
-];
 
 export const GENERIC_INTEGRITY_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT =
   "uk_aq_generic_integrity_v2_transition_state_fingerprint_v1";
@@ -64,8 +28,6 @@ export const GENERIC_INTEGRITY_V2_SELECTED_SCOPE_AUTHORITY_CONTRACT =
   "uk_aq_generic_integrity_v2_selected_scope_authority_v1";
 export const RETAINED_V2_MAINTENANCE_CONTEXT_CONTRACT =
   "uk_aq_retained_v2_official_rdata_maintenance_v1";
-export const OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT =
-  "uk_aq_official_rdata_timestamp_authority_v1";
 
 function sha256(body) { return createHash("sha256").update(body).digest("hex"); }
 function bytewise(left, right) {
@@ -83,20 +45,6 @@ function safeKey(raw) {
     throw new Error(`Unsafe generic fixed-v2 key: ${String(raw)}`);
   }
   return key;
-}
-
-function officialRdataSemanticEvidenceSha256(evidence) {
-  const allowed = new Set([
-    ...OFFICIAL_RDATA_V7_FIELDS,
-    "semantic_evidence_sha256", "acquisition_audit", "acquisition_audit_sha256",
-  ]);
-  if (OFFICIAL_RDATA_V7_FIELDS.some((field) => !Object.hasOwn(evidence || {}, field))
-      || Object.keys(evidence || {}).some((field) => !allowed.has(field))) {
-    throw new Error("Generic fixed-v2 official semantic evidence shape is invalid");
-  }
-  return sha256(Buffer.from(canonicalTransitionFingerprintJson(
-    Object.fromEntries(OFFICIAL_RDATA_V7_FIELDS.map((field) => [field, evidence[field]])),
-  ), "utf8"));
 }
 
 function parsePreservedManifest(body, objectKey) {
@@ -319,152 +267,6 @@ function derivePinnedMetadataDependencies(runState, { dayUtc, connectorId, pollu
   }));
 }
 
-function canonicalBindingVerification(raw) {
-  const provider = raw?.provider || {};
-  const providerProjection = {
-    mode: String(provider.mode || ""),
-    observation_generation: String(provider.observation_generation || "v2"),
-    authenticated_generation_complete:
-      provider.authenticated_generation_complete === true,
-    pack_root_relative_path: provider.pack_root_relative_path ?? null,
-    pack_root_sha256: provider.pack_root_sha256 ?? null,
-    source_root_hash: provider.source_root_hash ?? null,
-    checkpoint_source_root_hash: provider.checkpoint_source_root_hash ?? null,
-    ranges_verified: provider.ranges_verified ?? null,
-    total_pack_members_verified: provider.total_pack_members_verified ?? null,
-    authenticated_members_returned: provider.authenticated_members_returned ?? null,
-  };
-  return {
-    status: String(raw?.status || ""),
-    source_adapter: String(raw?.source_adapter || ""),
-    connector_id: raw?.connector_id,
-    pollutant_codes: [...(raw?.pollutant_codes || [])].sort(bytewise),
-    required_timeseries_ids: [...(raw?.required_timeseries_ids || [])]
-      .map(Number).sort((left, right) => left - right),
-    required_binding_count: raw?.required_binding_count,
-    gap_count: raw?.gap_count,
-    provider: providerProjection,
-  };
-}
-
-function canonicalScopeSourceAuthority(raw, {
-  dayUtc, connectorId, pollutantCode, outcome,
-}) {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)
-      || raw.contract_version
-        !== "uk_aq_generic_v2_official_rdata_scope_source_authority_v1"
-      || raw.history_generation !== "v2"
-      || raw.day_utc !== dayUtc
-      || raw.connector_id !== connectorId
-      || raw.pollutant_code !== pollutantCode
-      || !["waqn", "saqn"].includes(raw.source_adapter)) {
-    throw new Error("Generic fixed-v2 scope source authority changed");
-  }
-  const authority = JSON.parse(JSON.stringify(raw));
-  if (authority.authority_kind === "persisted_official_rdata_v7_semantic_evidence") {
-    const hashes = [
-      "semantic_evidence_sha256", "source_evidence_input_sha256",
-      "acquisition_audit_sha256", "source_file_identities_sha256",
-      "source_artifact_availability_sha256",
-      "authoritative_station_timeseries_mapping_sha256",
-      "observed_property_mapping_sha256", "preserved_baseline_dependency_sha256",
-      "canonical_rows_sha256",
-    ];
-    const required = new Set(authority.files_required || []);
-    const read = new Set(authority.files_read || []);
-    const absent = new Set(authority.files_authoritatively_absent || []);
-    const selectedCount = authority.selected_final_target_row_count;
-    const selectedHasUnavailableScope = (authority.source_unavailable_scopes || [])
-      .some((scope) => scope?.pollutant_code === pollutantCode);
-    if (hashes.some((key) => !SHA256.test(String(authority[key] || "")))
-        || !Number.isSafeInteger(authority.evidence_id) || authority.evidence_id <= 0
-        || !Number.isSafeInteger(authority.acquisition_audit_id)
-        || authority.acquisition_audit_id <= 0
-        || [...required].some((key) => !read.has(key) && !absent.has(key))
-        || [...read].some((key) => absent.has(key) || !required.has(key))
-        || [...absent].some((key) => !required.has(key))
-        || authority.timestamp_mapping
-          !== "rdata_date_beginning_plus_one_hour_to_observed_at_utc"
-        || !Number.isSafeInteger(authority.final_target_row_count)
-        || authority.final_target_row_count < 0
-        || !Number.isSafeInteger(selectedCount) || selectedCount < 0
-        || authority.selected_final_target_authoritatively_empty !== (selectedCount === 0)
-        || (outcome === "authoritative_no_data_replacement") !== (selectedCount === 0)
-        || (outcome === "partial_source_unavailable_preserved_replacement")
-          !== (selectedHasUnavailableScope && selectedCount > 0)
-        || (outcome === "complete_replacement" && selectedHasUnavailableScope)) {
-      throw new Error("Generic fixed-v2 persisted source authority is invalid");
-    }
-  } else if (authority.authority_kind === "authenticated_wholly_source_unavailable") {
-    const semanticSha = String(authority.semantic_authority_sha256 || "");
-    delete authority.semantic_authority_sha256;
-    if (outcome !== "source_artifact_unavailable_preserved"
-        || !SHA256.test(semanticSha)
-        || !exactArray(authority.files_read, [])
-        || !Array.isArray(authority.files_required) || !authority.files_required.length
-        || !exactArray(authority.files_required, authority.files_authoritatively_absent)
-        || !Array.isArray(authority.source_unavailable_timeseries_ids)
-        || !authority.source_unavailable_timeseries_ids.length
-        || !Array.isArray(authority.source_unavailable_scopes)
-        || !authority.source_unavailable_scopes.length
-        || semanticSha !== sha256(Buffer.from(
-          canonicalTransitionFingerprintJson(authority), "utf8",
-        ))) {
-      throw new Error("Generic fixed-v2 unavailable source authority is invalid");
-    }
-    authority.semantic_authority_sha256 = semanticSha;
-  } else {
-    throw new Error("Generic fixed-v2 scope source authority kind is invalid");
-  }
-  return authority;
-}
-
-function validatePersistedScopeSourceEvidence(runState, scope) {
-  const authority = scope.source_evidence_authority;
-  if (authority.authority_kind !== "persisted_official_rdata_v7_semantic_evidence") return;
-  const source = loadImmutableSourcePartition({
-    runState,
-    dayUtc: scope.day_utc,
-    connectorId: scope.connector_id,
-    pollutantCode: scope.pollutant_code,
-  });
-  const evidence = source.evidence;
-  const semanticSha = officialRdataSemanticEvidenceSha256(evidence);
-  const projection = {
-    semantic_evidence_sha256: semanticSha,
-    source_evidence_input_sha256: evidence.source_evidence_input_sha256,
-    source_file_identities_sha256: evidence.source_file_identities_sha256,
-    source_file_identities: evidence.source_file_identities,
-    files_required: evidence.files_required,
-    files_read: evidence.files_read,
-    files_authoritatively_absent: evidence.files_authoritatively_absent,
-    source_available_timeseries_ids: evidence.source_available_timeseries_ids,
-    source_unavailable_timeseries_ids: evidence.source_unavailable_timeseries_ids,
-    source_unavailable_scopes: evidence.source_unavailable_scopes,
-    source_artifact_availability_sha256: evidence.source_artifact_availability_sha256,
-    authoritative_station_timeseries_mapping_sha256:
-      evidence.authoritative_station_timeseries_mapping_sha256,
-    observed_property_mapping_sha256: evidence.observed_property_mapping_sha256,
-    preserved_baseline_dependency_sha256: evidence.preserved_baseline_dependency_sha256,
-    preserved_baseline_identity: evidence.preserved_baseline_identity,
-    canonical_rows_sha256: evidence.canonical_rows_sha256,
-    canonical_rows_bytes: evidence.canonical_rows_bytes,
-    final_target_row_count: evidence.final_target_row_count,
-    final_target_timeseries_row_counts: evidence.final_target_timeseries_row_counts,
-    final_target_pollutant_counts: evidence.final_target_pollutant_counts,
-    final_target_observation_content_hashes: evidence.final_target_observation_content_hashes,
-    timestamp_mapping: evidence.timestamp_mapping,
-  };
-  const expected = Object.fromEntries(Object.keys(projection).map((key) => [key, authority[key]]));
-  if (semanticSha !== evidence.semantic_evidence_sha256
-      || semanticSha !== authority.semantic_evidence_sha256
-      || authority.acquisition_audit_sha256 !== evidence.acquisition_audit_sha256
-      || canonicalTransitionFingerprintJson(projection)
-        !== canonicalTransitionFingerprintJson(expected)) {
-    throw new Error("Generic fixed-v2 persisted source evidence changed before APPLY");
-  }
-}
-
 export function canonicalGenericV2SelectedScopeAuthority(runState) {
   const authority = runState?.generic_integrity_selected_scope_authority;
   if (!authority || typeof authority !== "object" || Array.isArray(authority)
@@ -514,10 +316,7 @@ export function canonicalGenericV2SelectedScopeAuthority(runState) {
         || replacementKeys.some((key) => !key.startsWith(`${expectedPrefix}/`))) {
       throw new Error("Generic fixed-v2 replacement object closure is not canonical");
     }
-    if ([
-      "complete_replacement",
-      "partial_source_unavailable_preserved_replacement",
-    ].includes(outcome)) {
+    if (outcome === "complete_replacement") {
       if (!replacementKeys.some((key) => key.endsWith(".parquet"))
           || !replacementKeys.includes(`${expectedPrefix}/manifest.json`)) {
         throw new Error("Generic fixed-v2 non-empty replacement closure is incomplete");
@@ -540,10 +339,6 @@ export function canonicalGenericV2SelectedScopeAuthority(runState) {
     } else if (preservationEvidence !== null) {
       throw new Error("Generic fixed-v2 replacement scope has preservation evidence");
     }
-    const sourceEvidenceAuthority = canonicalScopeSourceAuthority(
-      scope.source_evidence_authority,
-      { dayUtc, connectorId, pollutantCode, outcome },
-    );
     return {
       day_utc: dayUtc,
       connector_id: connectorId,
@@ -553,7 +348,6 @@ export function canonicalGenericV2SelectedScopeAuthority(runState) {
       authorised_tombstone_prefix: authorisedPrefix,
       replacement_object_keys: replacementKeys,
       preservation_evidence: preservationEvidence,
-      source_evidence_authority: sourceEvidenceAuthority,
     };
   }).sort((left, right) => bytewise(left.day_utc, right.day_utc)
     || left.connector_id - right.connector_id
@@ -693,89 +487,15 @@ export function genericV2TransitionStateFingerprintPayload(runState) {
     contract_version: GENERIC_INTEGRITY_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT,
     execution_path: "generic_integrity",
     history_generation: "v2",
-    official_rdata_timestamp_authority:
-      requireOfficialRdataTimestampAuthority(runState),
-    retained_v2_maintenance_context:
-      requireRetainedV2MaintenanceContext(runState).context,
     generic_selected_scope_authority: canonicalGenericV2SelectedScopeAuthority(runState),
     ...coordinatorTransitionStateCommonFingerprintPayload(runState),
   };
 }
 
-export function requireOfficialRdataTimestampAuthority(runState) {
-  const authority = runState?.official_rdata_timestamp_authority;
-  const artifactPath = String(
-    runState?.official_rdata_timestamp_authority_artifact_path || "",
-  );
-  let body;
-  try {
-    body = fs.readFileSync(artifactPath);
-  } catch {
-    throw new Error("Official RData timestamp authority artifact is unavailable");
-  }
-  let artifact;
-  try {
-    artifact = JSON.parse(body.toString("utf8"));
-  } catch {
-    throw new Error("Official RData timestamp authority artifact is invalid JSON");
-  }
-  const comparisons = artifact?.comparisons;
-  if (!authority || typeof authority !== "object" || Array.isArray(authority)
-      || authority.contract_version !== OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT
-      || authority.status !== "accepted"
-      || authority.source_adapter !== runState?.official_rdata_source_adapter
-      || !["waqn", "saqn"].includes(authority.source_adapter)
-      || authority.timestamp_mapping
-        !== "rdata_date_beginning_plus_one_hour_to_observed_at_utc"
-      || authority.unit_authority !== "accepted_matching_measurement_and_unit"
-      || !Array.isArray(authority.comparisons) || !authority.comparisons.length
-      || authority.artifact_sha256 !== sha256(body)
-      || canonicalTransitionFingerprintJson(authority.comparisons)
-        !== canonicalTransitionFingerprintJson(comparisons)) {
-    throw new Error("Official RData timestamp and unit authority is not accepted");
-  }
-  for (const comparison of authority.comparisons) {
-    if (!comparison || typeof comparison !== "object" || Array.isArray(comparison)
-        || comparison.source_adapter !== authority.source_adapter
-        || !String(comparison.site_code || "")
-        || !POLLUTANTS.has(String(comparison.pollutant_code || ""))
-        || !comparison.graph || !comparison.rdata || !comparison.canonical
-        || !String(comparison.graph.original_timestamp || "")
-        || !String(comparison.rdata.original_timestamp || "")
-        || !String(comparison.canonical.observed_at_utc || "")
-        || typeof comparison.graph.value !== "string"
-        || typeof comparison.rdata.value !== "string"
-        || typeof comparison.canonical.value !== "string"
-        || !Number.isFinite(Number(comparison.graph.value))
-        || Number(comparison.graph.value) !== Number(comparison.rdata.value)
-        || Number(comparison.graph.value) !== Number(comparison.canonical.value)
-        || !String(comparison.graph.unit || "")
-        || comparison.graph.unit !== comparison.rdata.unit
-        || comparison.graph.unit !== comparison.canonical.unit
-        || !String(comparison.europe_london_offset || "")
-        || !String(comparison.hour_convention || "")) {
-      throw new Error("Official RData timestamp comparison is incomplete");
-    }
-  }
-  const projection = {
-    contract_version: OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT,
-    status: "accepted",
-    source_adapter: authority.source_adapter,
-    timestamp_mapping: authority.timestamp_mapping,
-    unit_authority: authority.unit_authority,
-    comparisons: authority.comparisons,
-    artifact_sha256: authority.artifact_sha256,
-  };
-  if (canonicalTransitionFingerprintJson(authority)
-      !== canonicalTransitionFingerprintJson(projection)) {
-    throw new Error("Official RData timestamp authority projection changed");
-  }
-  return projection;
-}
-
 export function requireRetainedV2MaintenanceContext(runState, env = process.env) {
   const context = runState?.retained_v2_maintenance_context;
   const bucket = String(env.CFLARE_R2_BUCKET || env.R2_BUCKET || "").trim();
+  const configuredGeneration = String(env.UK_AQ_R2_HISTORY_VERSION || "").trim();
   const checkpoint = runState?.dropbox_currentness?.checkpoint;
   const liveRoot = runState?.dropbox_currentness?.live_observations_root;
   if (!context || typeof context !== "object" || Array.isArray(context)
@@ -788,18 +508,14 @@ export function requireRetainedV2MaintenanceContext(runState, env = process.env)
       || context.observation_generation !== "v2"
       || context.index_generation !== "v2"
       || context.observations_root !== "history/v2/observations"
+      || configuredGeneration !== "v3"
       || context.serving_generation !== "v3"
       || context.non_serving_downstream_suppressed !== true
-      || !GIT_SHA.test(String(context.implementation_revision || ""))
+      || !SHA256.test(String(context.implementation_revision || ""))
       || !Array.isArray(context.selected_scopes)
       || !context.selected_scopes.length
-      || canonicalTransitionFingerprintJson(context.core_snapshot_identity)
-        !== canonicalTransitionFingerprintJson(runState?.core_snapshot_identity)
+      || context.core_snapshot_identity !== runState?.core_snapshot_identity
       || context.timeseries_binding_verification?.status !== "ok"
-      || canonicalTransitionFingerprintJson(context.timeseries_binding_verification)
-        !== canonicalTransitionFingerprintJson(canonicalBindingVerification(
-          runState?.timeseries_binding_pre_repair_verification,
-        ))
       || runState?.dropbox_currentness?.allowed !== true
       || runState?.dropbox_currentness?.checkpoint_live_root_match !== true
       || !checkpoint || !liveRoot
@@ -824,32 +540,7 @@ export function requireRetainedV2MaintenanceContext(runState, env = process.env)
       !== canonicalTransitionFingerprintJson(selectedScopes)) {
     throw new Error("Retained fixed-v2 TEST maintenance selected scope changed");
   }
-  const projection = {
-    contract_version: RETAINED_V2_MAINTENANCE_CONTEXT_CONTRACT,
-    intent: "retained_v2_official_rdata_maintenance",
-    environment: "TEST",
-    bucket,
-    serving_generation: "v3",
-    observation_generation: "v2",
-    index_generation: "v2",
-    observations_root: "history/v2/observations",
-    implementation_revision: context.implementation_revision,
-    selected_scopes: context.selected_scopes,
-    core_snapshot_identity: context.core_snapshot_identity,
-    timeseries_binding_verification: context.timeseries_binding_verification,
-    dropbox_checkpoint_sha256: context.dropbox_checkpoint_sha256,
-    dropbox_observations_root_hash: context.dropbox_observations_root_hash,
-    live_v2_observations_root_hash: context.live_v2_observations_root_hash,
-    observations_global_operation_lock: context.observations_global_operation_lock,
-    non_serving_downstream_suppressed: true,
-    deliberate_retained_v2_divergence: true,
-    generation_v2_backup_completion_required: true,
-  };
-  if (canonicalTransitionFingerprintJson(context)
-      !== canonicalTransitionFingerprintJson(projection)) {
-    throw new Error("Retained fixed-v2 TEST maintenance context changed");
-  }
-  return { retained_fixed_v2: true, context: projection };
+  return { retained_fixed_v2: true, context };
 }
 
 export function computeGenericV2TransitionStateFingerprint(runState) {
@@ -930,7 +621,6 @@ export function validateLocalGenericV2Proposal(runState, env = process.env) {
     if (!exactArray(actualKeys, scope.replacement_object_keys)) {
       throw new Error(`Generic fixed-v2 selected replacement closure changed: ${prefix}`);
     }
-    validatePersistedScopeSourceEvidence(runState, scope);
     if (scope.outcome === "source_artifact_unavailable_preserved") {
       const evidence = deriveGenericPreservedScopeEvidence(runState, {
         dayUtc: scope.day_utc,

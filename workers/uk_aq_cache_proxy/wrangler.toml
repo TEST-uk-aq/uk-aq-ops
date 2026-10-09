@@ -10,10 +10,6 @@ enabled = true
 binding = "STATION_HISTORY"
 service = "__UK_AQ_STATION_HISTORY_WORKER_NAME__"
 
-[[services]]
-binding = "COMPRESSED_CHART_HISTORY"
-service = "uk-aq-compressed-chart-history-test"
-
 [vars]
 UK_AQ_MEDIA_PUBLIC_URL = "__UK_AQ_MEDIA_PUBLIC_URL__"
 
