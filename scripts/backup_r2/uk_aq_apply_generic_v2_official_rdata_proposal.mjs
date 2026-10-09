@@ -13,7 +13,7 @@ import {
 import { applyValidatedProposal } from "./uk_aq_apply_integrity_proposal.mjs";
 import {
   requireGenericV2CoordinatorFreeze,
-  requireRetainedV2MaintenanceContext,
+  requireGenericV2OperationalContext,
   validateFinalGenericV2ProposalGraph,
   validateLocalGenericV2Proposal,
 } from "./lib/generic_v2_official_rdata_proposal_validation.mjs";
@@ -31,12 +31,13 @@ export async function applyValidatedGenericV2OfficialRdataProposal({
   adapters = {},
   env = process.env,
 }) {
+  const coordinatorState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
+  const operationalContext = requireGenericV2OperationalContext(coordinatorState, env);
   const operationEnv = {
     ...env,
     UK_AQ_R2_HISTORY_VERSION: "v2",
     UK_AQ_R2_HISTORY_INDEX_VERSION: "v2",
   };
-  const coordinatorState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
   if (coordinatorState.execution_path !== "generic_integrity"
       || !["waqn", "saqn"].includes(coordinatorState.official_rdata_source_adapter)) {
     throw new Error("Generic fixed-v2 bridge accepts WAQN/SAQN generic_integrity proposals only");
@@ -60,13 +61,16 @@ export async function applyValidatedGenericV2OfficialRdataProposal({
     generation: "v2",
     expectedExecutionPath: "generic_integrity",
     generationEligibilityValidator: ({ runState }) =>
-      requireRetainedV2MaintenanceContext(runState, operationEnv),
+      requireGenericV2OperationalContext(runState, env),
     coordinatorFreezeValidator: (runState) =>
-      requireGenericV2CoordinatorFreeze(runState, operationEnv),
+      requireGenericV2CoordinatorFreeze(runState, env),
     localProposalValidator: (runState) =>
-      validateLocalGenericV2Proposal(runState, operationEnv),
+      validateLocalGenericV2Proposal(runState, env),
     finalProposalGraphValidator: validateFinalGenericV2ProposalGraph,
-  });
+  }).then((result) => ({
+    ...result,
+    operational_context_mode: operationalContext.mode,
+  }));
 }
 
 async function main() {

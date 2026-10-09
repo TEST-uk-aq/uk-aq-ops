@@ -19823,13 +19823,19 @@ SOS_LIGHT_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
     "uk_aq_sos_light_v2_transition_state_fingerprint_v2"
 )
 GENERIC_INTEGRITY_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
-    "uk_aq_generic_integrity_v2_transition_state_fingerprint_v1"
+    "uk_aq_generic_integrity_v2_transition_state_fingerprint_v2"
 )
 GENERIC_INTEGRITY_V2_SELECTED_SCOPE_AUTHORITY_CONTRACT = (
     "uk_aq_generic_integrity_v2_selected_scope_authority_v1"
 )
+GENERIC_V2_OPERATIONAL_CONTEXT_CONTRACT = (
+    "uk_aq_generic_v2_official_rdata_operational_context_v1"
+)
 RETAINED_V2_MAINTENANCE_CONTEXT_CONTRACT = (
     "uk_aq_retained_v2_official_rdata_maintenance_v1"
+)
+SERVING_V2_LIVE_CONTEXT_CONTRACT = (
+    "uk_aq_serving_v2_official_rdata_integrity_v1"
 )
 OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT = (
     "uk_aq_official_rdata_timestamp_authority_v1"
@@ -21876,46 +21882,95 @@ def _freeze_official_rdata_timestamp_authority(
     return authority
 
 
-def _freeze_retained_v2_maintenance_context(
-    run_state: dict[str, Any], env: Mapping[str, str],
-) -> dict[str, Any]:
-    """Freeze the bounded non-serving TEST v2 maintenance exception."""
-    authority = _canonical_generic_integrity_selected_scope_authority(run_state)
-    dropbox = run_state.get("dropbox_currentness")
-    checkpoint = dropbox.get("checkpoint") if isinstance(dropbox, Mapping) else None
-    live_root = (
-        dropbox.get("live_observations_root")
-        if isinstance(dropbox, Mapping) else None
-    )
-    binding = run_state.get("timeseries_binding_pre_repair_verification")
-    lock = run_state.get("observations_global_operation_lock")
-    bucket = str(env.get("CFLARE_R2_BUCKET") or env.get("R2_BUCKET") or "").strip()
+def _generic_v2_effective_operational_env(
+    env: Mapping[str, str],
+) -> dict[str, str]:
+    return {
+        **{str(key): str(value) for key, value in os.environ.items()},
+        **{str(key): str(value) for key, value in env.items()},
+    }
+
+
+def _generic_v2_configured_identity(
+    run_state: Mapping[str, Any], env: Mapping[str, str],
+) -> tuple[dict[str, str], str, str, str, str, str]:
+    effective = _generic_v2_effective_operational_env(env)
+    config_path = Path(
+        str(effective.get("UK_AQ_BACKFILL_ENV_FILE") or "").strip()
+    ).expanduser()
+    try:
+        normal_config = _load_env_file(config_path)
+    except OSError as exc:
+        raise ValueError(
+            "generic fixed-v2 authoritative environment configuration is unavailable"
+        ) from exc
+    environment = str(
+        normal_config.get("UK_AQ_ENV_NAME")
+        or normal_config.get("UKAQ_ENV_NAME")
+        or normal_config.get("ENVIRONMENT")
+        or ""
+    ).strip()
+    serving_generation = str(
+        normal_config.get("UK_AQ_R2_HISTORY_VERSION") or ""
+    ).strip()
+    configured_index_generation = str(
+        normal_config.get("UK_AQ_R2_HISTORY_INDEX_VERSION")
+        or serving_generation
+    ).strip()
+    bucket = str(
+        normal_config.get("CFLARE_R2_BUCKET")
+        or normal_config.get("R2_BUCKET")
+        or ""
+    ).strip()
+    selected_environment = str(
+        effective.get("UK_AQ_ENV_NAME")
+        or effective.get("UKAQ_ENV_NAME")
+        or effective.get("ENVIRONMENT")
+        or ""
+    ).strip()
+    selected_generation = str(
+        effective.get("UK_AQ_R2_HISTORY_VERSION") or ""
+    ).strip()
+    selected_index_generation = str(
+        effective.get("UK_AQ_R2_HISTORY_INDEX_VERSION")
+        or selected_generation
+    ).strip()
+    selected_bucket = str(
+        effective.get("CFLARE_R2_BUCKET")
+        or effective.get("R2_BUCKET")
+        or ""
+    ).strip()
     if (
-        run_state.get("environment") != "TEST"
-        or bucket != "uk-aq-history-cic-test"
-        or not isinstance(dropbox, Mapping)
-        or dropbox.get("allowed") is not True
-        or dropbox.get("checkpoint_live_root_match") is not True
-        or not isinstance(checkpoint, Mapping)
-        or not isinstance(live_root, Mapping)
-        or checkpoint.get("observations_processed_source_root_hash")
-        != live_root.get("content_hash")
-        or not isinstance(binding, Mapping)
-        or binding.get("status") != "ok"
-        or not isinstance(lock, Mapping)
-        or lock.get("valid") is not True
+        environment not in {"TEST", "LIVE"}
+        or selected_environment != environment
+        or run_state.get("environment") != environment
+        or serving_generation not in {"v2", "v3"}
+        or configured_index_generation != serving_generation
+        or not bucket
+        or selected_generation != "v2"
+        or selected_index_generation != "v2"
+        or selected_bucket != bucket
     ):
         raise ValueError(
-            "retained fixed-v2 TEST maintenance authority is incomplete or contradictory"
+            "generic fixed-v2 configured environment/generation/bucket "
+            "authority is incomplete or contradictory"
         )
-    repo_root = _repo_root_for_integrity_script(env)
-    revision = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=repo_root, check=True,
-        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    ).stdout.strip().lower()
-    if not re.fullmatch(r"[a-f0-9]{40}", revision):
-        raise ValueError("retained fixed-v2 implementation revision is invalid")
-    selected_scopes = sorted(
+    return (
+        effective, environment, serving_generation,
+        configured_index_generation, bucket,
+        hashlib.sha256(json.dumps({
+            "bucket": bucket,
+            "environment": environment,
+            "index_generation": configured_index_generation,
+            "serving_generation": serving_generation,
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+    )
+
+
+def _generic_v2_selected_operational_scopes(
+    authority: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    return sorted(
         ({
             "day_utc": scope["day_utc"],
             "connector_id": scope["connector_id"],
@@ -21929,9 +21984,17 @@ def _freeze_retained_v2_maintenance_context(
             scope["pollutant_code"].encode("utf-8"),
         ),
     )
+
+
+def _generic_v2_binding_projection(
+    run_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    binding = run_state.get("timeseries_binding_pre_repair_verification")
+    if not isinstance(binding, Mapping) or binding.get("status") != "ok":
+        raise ValueError("generic fixed-v2 binding authority is incomplete")
     provider = binding.get("provider")
     provider = provider if isinstance(provider, Mapping) else {}
-    binding_projection = {
+    projection = {
         "status": str(binding.get("status") or ""),
         "source_adapter": str(binding.get("source_adapter") or ""),
         "connector_id": binding.get("connector_id"),
@@ -21969,18 +22032,73 @@ def _freeze_retained_v2_maintenance_context(
             ),
         },
     }
-    context = {
-        "contract_version": RETAINED_V2_MAINTENANCE_CONTEXT_CONTRACT,
-        "intent": "retained_v2_official_rdata_maintenance",
-        "environment": "TEST",
+    if projection["provider"]["observation_generation"] != "v2":
+        raise ValueError("generic fixed-v2 binding generation is not v2")
+    return projection
+
+
+def _generic_v2_common_operational_authority(
+    run_state: Mapping[str, Any], env: Mapping[str, str],
+) -> dict[str, Any]:
+    authority = _canonical_generic_integrity_selected_scope_authority(run_state)
+    dropbox = run_state.get("dropbox_currentness")
+    checkpoint = dropbox.get("checkpoint") if isinstance(dropbox, Mapping) else None
+    live_root = (
+        dropbox.get("live_observations_root")
+        if isinstance(dropbox, Mapping) else None
+    )
+    lock = run_state.get("observations_global_operation_lock")
+    (
+        _effective, environment, serving_generation,
+        configured_index_generation, bucket, normal_configuration_sha256,
+    ) = _generic_v2_configured_identity(run_state, env)
+    core_identity = _normalise_core_snapshot_identity(
+        run_state.get("core_snapshot_identity"),
+        stage="generic_v2_operational_context",
+    )
+    binding_projection = _generic_v2_binding_projection(run_state)
+    if (
+        not isinstance(dropbox, Mapping)
+        or dropbox.get("allowed") is not True
+        or dropbox.get("checkpoint_live_root_match") is not True
+        or not isinstance(checkpoint, Mapping)
+        or not isinstance(live_root, Mapping)
+        or checkpoint.get("relative_key")
+        != "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2/root.json"
+        or live_root.get("key")
+        != "history/v2/observations/_manifests/manifest.json"
+        or not re.fullmatch(r"[a-f0-9]{64}", str(checkpoint.get("sha256") or ""))
+        or not re.fullmatch(
+            r"[a-f0-9]{64}",
+            str(checkpoint.get("observations_processed_source_root_hash") or ""),
+        )
+        or not re.fullmatch(
+            r"[a-f0-9]{64}", str(live_root.get("content_hash") or "")
+        )
+        or checkpoint.get("observations_processed_source_root_hash")
+        != live_root.get("content_hash")
+        or not isinstance(lock, Mapping)
+        or lock.get("valid") is not True
+    ):
+        raise ValueError(
+            "generic fixed-v2 root/checkpoint/lock authority is incomplete or contradictory"
+        )
+    repo_root = _repo_root_for_integrity_script(env)
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root, check=True,
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    ).stdout.strip().lower()
+    if not re.fullmatch(r"[a-f0-9]{40}", revision):
+        raise ValueError("generic fixed-v2 implementation revision is invalid")
+    return {
+        "environment": environment,
+        "serving_generation": serving_generation,
+        "configured_index_generation": configured_index_generation,
         "bucket": bucket,
-        "serving_generation": "v3",
-        "observation_generation": "v2",
-        "index_generation": "v2",
-        "observations_root": R2_HISTORY_V2_OBSERVATIONS_PREFIX,
+        "normal_configuration_sha256": normal_configuration_sha256,
         "implementation_revision": revision,
-        "selected_scopes": selected_scopes,
-        "core_snapshot_identity": dict(run_state["core_snapshot_identity"]),
+        "selected_scopes": _generic_v2_selected_operational_scopes(authority),
+        "core_snapshot_identity": core_identity,
         "timeseries_binding_verification": binding_projection,
         "dropbox_checkpoint_sha256": str(checkpoint.get("sha256") or ""),
         "dropbox_observations_root_hash": str(
@@ -21988,12 +22106,157 @@ def _freeze_retained_v2_maintenance_context(
         ),
         "live_v2_observations_root_hash": str(live_root.get("content_hash") or ""),
         "observations_global_operation_lock": dict(lock),
+    }
+
+
+def _retained_v2_maintenance_context_projection(
+    run_state: Mapping[str, Any], env: Mapping[str, str],
+) -> dict[str, Any]:
+    """Build the bounded non-serving TEST v2 maintenance exception."""
+    common = _generic_v2_common_operational_authority(run_state, env)
+    if (
+        common["environment"] != "TEST"
+        or common["serving_generation"] != "v3"
+        or common["configured_index_generation"] != "v3"
+        or common["bucket"] != "uk-aq-history-cic-test"
+    ):
+        raise ValueError(
+            "retained fixed-v2 TEST maintenance authority is incomplete or contradictory"
+        )
+    context = {
+        "contract_version": RETAINED_V2_MAINTENANCE_CONTEXT_CONTRACT,
+        "intent": "retained_v2_official_rdata_maintenance",
+        "environment": "TEST",
+        "bucket": common["bucket"],
+        "normal_configuration_sha256": common[
+            "normal_configuration_sha256"
+        ],
+        "serving_generation": "v3",
+        "observation_generation": "v2",
+        "index_generation": "v2",
+        "observations_root": R2_HISTORY_V2_OBSERVATIONS_PREFIX,
+        "implementation_revision": common["implementation_revision"],
+        "selected_scopes": common["selected_scopes"],
+        "core_snapshot_identity": common["core_snapshot_identity"],
+        "timeseries_binding_verification": common[
+            "timeseries_binding_verification"
+        ],
+        "dropbox_checkpoint_sha256": common["dropbox_checkpoint_sha256"],
+        "dropbox_observations_root_hash": common[
+            "dropbox_observations_root_hash"
+        ],
+        "live_v2_observations_root_hash": common[
+            "live_v2_observations_root_hash"
+        ],
+        "observations_global_operation_lock": common[
+            "observations_global_operation_lock"
+        ],
         "non_serving_downstream_suppressed": True,
         "deliberate_retained_v2_divergence": True,
         "generation_v2_backup_completion_required": True,
     }
-    run_state["retained_v2_maintenance_context"] = context
     return context
+
+
+def _serving_v2_live_context_projection(
+    run_state: Mapping[str, Any], env: Mapping[str, str],
+) -> dict[str, Any]:
+    """Build normal LIVE serving-v2 official-network authority."""
+    common = _generic_v2_common_operational_authority(run_state, env)
+    if (
+        common["environment"] != "LIVE"
+        or common["serving_generation"] != "v2"
+        or common["configured_index_generation"] != "v2"
+    ):
+        raise ValueError(
+            "serving fixed-v2 LIVE authority is incomplete or contradictory"
+        )
+    return {
+        "contract_version": SERVING_V2_LIVE_CONTEXT_CONTRACT,
+        "intent": "serving_v2_official_rdata_integrity",
+        "environment": "LIVE",
+        "bucket": common["bucket"],
+        "normal_configuration_sha256": common[
+            "normal_configuration_sha256"
+        ],
+        "serving_generation": "v2",
+        "observation_generation": "v2",
+        "index_generation": "v2",
+        "observations_root": R2_HISTORY_V2_OBSERVATIONS_PREFIX,
+        "implementation_revision": common["implementation_revision"],
+        "selected_scopes": common["selected_scopes"],
+        "core_snapshot_identity": common["core_snapshot_identity"],
+        "timeseries_binding_verification": common[
+            "timeseries_binding_verification"
+        ],
+        "dropbox_checkpoint_sha256": common["dropbox_checkpoint_sha256"],
+        "dropbox_observations_root_hash": common[
+            "dropbox_observations_root_hash"
+        ],
+        "live_v2_observations_root_hash": common[
+            "live_v2_observations_root_hash"
+        ],
+        "observations_global_operation_lock": common[
+            "observations_global_operation_lock"
+        ],
+        "non_serving_downstream_suppressed": False,
+        "normal_downstream_eligible_after_final_verification": True,
+        "generation_v2_backup_completion_required": True,
+    }
+
+
+def _build_generic_v2_operational_context(
+    run_state: Mapping[str, Any], env: Mapping[str, str],
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    _effective, environment, serving_generation, _index, _bucket, _config_sha = (
+        _generic_v2_configured_identity(run_state, env)
+    )
+    if environment == "TEST" and serving_generation == "v3":
+        mode = "retained_v2_non_serving_test"
+        field = "retained_v2_maintenance_context"
+        authority = _retained_v2_maintenance_context_projection(run_state, env)
+    elif environment == "LIVE" and serving_generation == "v2":
+        mode = "serving_v2_live"
+        field = "serving_v2_live_context"
+        authority = _serving_v2_live_context_projection(run_state, env)
+    else:
+        raise ValueError(
+            "generic fixed-v2 operation is neither retained-v2 TEST maintenance "
+            "nor serving-v2 LIVE Integrity"
+        )
+    return ({
+        "contract_version": GENERIC_V2_OPERATIONAL_CONTEXT_CONTRACT,
+        "mode": mode,
+        "authority_contract_version": authority["contract_version"],
+        "authority": authority,
+    }, field, authority)
+
+
+def _freeze_generic_v2_operational_context(
+    run_state: dict[str, Any], env: Mapping[str, str],
+) -> dict[str, Any]:
+    operational, field, authority = _build_generic_v2_operational_context(
+        run_state, env
+    )
+    run_state[field] = authority
+    run_state["generic_v2_operational_context"] = operational
+    return operational
+
+
+def _require_generic_v2_operational_context(
+    run_state: Mapping[str, Any], env: Mapping[str, str],
+) -> dict[str, Any]:
+    operational, field, authority = _build_generic_v2_operational_context(
+        run_state, env
+    )
+    if (
+        run_state.get(field) != authority
+        or run_state.get("generic_v2_operational_context") != operational
+    ):
+        raise ValueError(
+            "generic fixed-v2 operational context changed or crossed modes"
+        )
+    return operational
 
 
 
@@ -22011,8 +22274,8 @@ def _proposal_transition_state_fingerprint_payload(
             "history_generation": "v2",
             "official_rdata_timestamp_authority":
                 dict(run_state.get("official_rdata_timestamp_authority") or {}),
-            "retained_v2_maintenance_context":
-                dict(run_state.get("retained_v2_maintenance_context") or {}),
+            "generic_v2_operational_context":
+                dict(run_state.get("generic_v2_operational_context") or {}),
             "generic_selected_scope_authority":
                 _canonical_generic_integrity_selected_scope_authority(run_state),
             **_proposal_transition_state_common_fingerprint_payload(run_state),
@@ -25435,7 +25698,7 @@ def run_canonical_apply_executor(
     if generic_official_v2:
         try:
             _canonical_generic_integrity_selected_scope_authority(run_state)
-            _freeze_retained_v2_maintenance_context(run_state, env)
+            _require_generic_v2_operational_context(run_state, env)
             _freeze_official_rdata_timestamp_authority(run_state, env)
             write_run_state(run_state)
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -28712,7 +28975,7 @@ def run_v2_integrity_repair_flow(
                 observations.get("selected_partition_outcomes") or [],
                 metadata_actions,
             )
-            _freeze_retained_v2_maintenance_context(run_state, env)
+            _freeze_generic_v2_operational_context(run_state, env)
             if dry_run:
                 run_state["official_rdata_timestamp_authority"] = {
                     "status": "required_before_real_apply",
@@ -28767,8 +29030,70 @@ def run_v2_integrity_repair_flow(
     latest_snapshot_capable = bool(
         proposed_observation_pollutants & {"pm25", "pm10", "no2"}
     )
+    generic_v2_operational_context: dict[str, Any] | None = None
+    if (
+        generic_official_rdata
+        and not proposal_failed
+        and isinstance(run_state.get("generic_v2_operational_context"), Mapping)
+    ):
+        try:
+            generic_v2_operational_context = (
+                _require_generic_v2_operational_context(run_state, env)
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            proposal_failed = True
+            record_blocked_scope(run_state, {
+                "stage": "generic_v2_operational_context",
+                "reason": "generic_v2_operational_context_changed",
+                "error": _truncate_text(str(exc), 1200),
+            })
+            write_run_state(run_state)
+    elif generic_official_rdata and not proposal_failed and has_planned_r2_operations:
+        proposal_failed = True
+        record_blocked_scope(run_state, {
+            "stage": "generic_v2_operational_context",
+            "reason": "generic_v2_operational_context_unavailable_for_mutation",
+        })
+        write_run_state(run_state)
+    generic_v2_noop_mode: str | None = None
+    if generic_official_rdata and not has_planned_r2_operations:
+        try:
+            (
+                _effective, configured_environment, configured_serving_generation,
+                _configured_index, _configured_bucket, configuration_sha256,
+            ) = _generic_v2_configured_identity(run_state, env)
+            generic_v2_noop_mode = (
+                "retained_v2_non_serving_test"
+                if configured_environment == "TEST"
+                and configured_serving_generation == "v3"
+                else "serving_v2_live"
+                if configured_environment == "LIVE"
+                and configured_serving_generation == "v2"
+                else None
+            )
+            if generic_v2_noop_mode is None:
+                raise ValueError("generic fixed-v2 no-op mode is not authorised")
+            run_state["generic_v2_noop_operational_evidence"] = {
+                "mode": generic_v2_noop_mode,
+                "normal_configuration_sha256": configuration_sha256,
+                "canonical_mutation_required": False,
+            }
+            write_run_state(run_state)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            proposal_failed = True
+            record_blocked_scope(run_state, {
+                "stage": "generic_v2_noop_operational_evidence",
+                "reason": "generic_v2_noop_operational_authority_incomplete",
+                "error": _truncate_text(str(exc), 1200),
+            })
+            write_run_state(run_state)
     non_serving_retained_v2_requested = bool(
-        generic_official_rdata and env_name == "TEST"
+        (
+            generic_v2_operational_context is not None
+            and generic_v2_operational_context.get("mode")
+            == "retained_v2_non_serving_test"
+        )
+        or generic_v2_noop_mode == "retained_v2_non_serving_test"
     )
     current_state_enabled = (
         False if non_serving_retained_v2_requested else
@@ -28984,6 +29309,25 @@ def run_v2_integrity_repair_flow(
             require_remote_state=not dry_run,
             repair_pollutants=repair_pollutants,
         )
+    if generic_v2_operational_context is not None:
+        authenticated_operational_context = (
+            _require_generic_v2_operational_context(run_state, env)
+        )
+        final_verification["generic_v2_operational_context"] = {
+            "contract_version": authenticated_operational_context[
+                "contract_version"
+            ],
+            "mode": authenticated_operational_context["mode"],
+            "authority_contract_version": authenticated_operational_context[
+                "authority_contract_version"
+            ],
+            "final_verification_required_before_downstream": True,
+        }
+    elif generic_v2_noop_mode is not None:
+        final_verification["generic_v2_noop_operational_evidence"] = {
+            "mode": generic_v2_noop_mode,
+            "canonical_mutation_required": False,
+        }
     non_serving_retained_v2 = non_serving_retained_v2_requested
     if non_serving_retained_v2:
         first_value_at_reconciliation = {
@@ -29049,6 +29393,21 @@ def run_v2_integrity_repair_flow(
             log=log,
             verified_connector_days=verified_first_value_at_connector_days,
         )
+    if generic_v2_operational_context is not None:
+        first_value_at_reconciliation["generic_v2_operational_context"] = {
+            "mode": generic_v2_operational_context["mode"],
+            "authority_contract_version": generic_v2_operational_context[
+                "authority_contract_version"
+            ],
+            "eligible": not non_serving_retained_v2,
+            "final_verification_status": final_verification.get("status"),
+        }
+    elif generic_v2_noop_mode is not None:
+        first_value_at_reconciliation["generic_v2_noop_operational_evidence"] = {
+            "mode": generic_v2_noop_mode,
+            "canonical_mutation_required": False,
+            "eligible": not non_serving_retained_v2,
+        }
 
     # Persist verified publication independently before current-state reconciliation.
     # Network delivery happens only in the outer invocation after the global lock exits.
@@ -29185,6 +29544,28 @@ def run_v2_integrity_repair_flow(
             "canonical apply current-state reconciliation completed status=%s",
             current_state_reconciliation.get("overall_status"),
         )
+    if generic_v2_operational_context is not None:
+        evidence_audit = current_state_reconciliation.setdefault(
+            "evidence_audit", {}
+        )
+        evidence_audit["generic_v2_operational_context"] = {
+            "mode": generic_v2_operational_context["mode"],
+            "authority_contract_version": generic_v2_operational_context[
+                "authority_contract_version"
+            ],
+            "eligible": not non_serving_retained_v2,
+            "final_verification_status": final_verification.get("status"),
+            "exact_persisted_evidence_binding_required": True,
+        }
+    elif generic_v2_noop_mode is not None:
+        evidence_audit = current_state_reconciliation.setdefault(
+            "evidence_audit", {}
+        )
+        evidence_audit["generic_v2_noop_operational_evidence"] = {
+            "mode": generic_v2_noop_mode,
+            "canonical_mutation_required": False,
+            "eligible": not non_serving_retained_v2,
+        }
     current_state_reconciliation["latest_snapshot_auth_preflight"] = dict(
         auth_preflight
     )

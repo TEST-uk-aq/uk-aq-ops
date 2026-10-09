@@ -1,5 +1,6 @@
 /** Generic fixed-v2 selected-scope proposal validation boundary. */
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -59,11 +60,15 @@ const OFFICIAL_RDATA_V7_FIELDS = [
 ];
 
 export const GENERIC_INTEGRITY_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT =
-  "uk_aq_generic_integrity_v2_transition_state_fingerprint_v1";
+  "uk_aq_generic_integrity_v2_transition_state_fingerprint_v2";
 export const GENERIC_INTEGRITY_V2_SELECTED_SCOPE_AUTHORITY_CONTRACT =
   "uk_aq_generic_integrity_v2_selected_scope_authority_v1";
+export const GENERIC_V2_OPERATIONAL_CONTEXT_CONTRACT =
+  "uk_aq_generic_v2_official_rdata_operational_context_v1";
 export const RETAINED_V2_MAINTENANCE_CONTEXT_CONTRACT =
   "uk_aq_retained_v2_official_rdata_maintenance_v1";
+export const SERVING_V2_LIVE_CONTEXT_CONTRACT =
+  "uk_aq_serving_v2_official_rdata_integrity_v1";
 export const OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT =
   "uk_aq_official_rdata_timestamp_authority_v1";
 
@@ -83,6 +88,77 @@ function safeKey(raw) {
     throw new Error(`Unsafe generic fixed-v2 key: ${String(raw)}`);
   }
   return key;
+}
+
+function authoritativeNormalConfiguration(env) {
+  const envPath = String(env.UK_AQ_BACKFILL_ENV_FILE || "").trim();
+  let body;
+  try {
+    body = fs.readFileSync(envPath);
+  } catch {
+    throw new Error("Generic fixed-v2 authoritative environment configuration is unavailable");
+  }
+  const values = {};
+  for (const rawLine of body.toString("utf8").split(/\r?\n/u)) {
+    let line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    if (line.startsWith("export ")) line = line.slice(7).trim();
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/u);
+    if (!match) continue;
+    let value = match[2].trim();
+    if ((value.startsWith('"') && value.endsWith('"'))
+        || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    } else {
+      value = value.replace(/\s+#.*$/u, "").trim();
+    }
+    values[match[1]] = value;
+  }
+  const environment = String(
+    values.UK_AQ_ENV_NAME || values.UKAQ_ENV_NAME || values.ENVIRONMENT || "",
+  ).trim();
+  const servingGeneration = String(values.UK_AQ_R2_HISTORY_VERSION || "").trim();
+  const indexGeneration = String(
+    values.UK_AQ_R2_HISTORY_INDEX_VERSION || servingGeneration,
+  ).trim();
+  const bucket = String(values.CFLARE_R2_BUCKET || values.R2_BUCKET || "").trim();
+  if (!envPath || !["TEST", "LIVE"].includes(environment)
+      || !["v2", "v3"].includes(servingGeneration)
+      || indexGeneration !== servingGeneration || !bucket) {
+    throw new Error("Generic fixed-v2 authoritative environment configuration is contradictory");
+  }
+  const identity = {
+    bucket,
+    environment,
+    index_generation: indexGeneration,
+    serving_generation: servingGeneration,
+  };
+  if (String(env.UK_AQ_R2_HISTORY_VERSION || "").trim() !== "v2"
+      || String(env.UK_AQ_R2_HISTORY_INDEX_VERSION || "v2").trim() !== "v2") {
+    throw new Error("Generic fixed-v2 selected operation generation is not v2");
+  }
+  return {
+    environment,
+    serving_generation: servingGeneration,
+    index_generation: indexGeneration,
+    bucket,
+    sha256: sha256(Buffer.from(canonicalTransitionFingerprintJson(identity), "utf8")),
+  };
+}
+
+function authenticatedImplementationRevision(env) {
+  const repoRoot = String(env.UK_AQ_OPS_REPO_ROOT || process.cwd()).trim();
+  try {
+    const revision = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim().toLowerCase();
+    if (!GIT_SHA.test(revision)) throw new Error("invalid revision");
+    return revision;
+  } catch {
+    throw new Error("Generic fixed-v2 implementation revision cannot be authenticated");
+  }
 }
 
 function officialRdataSemanticEvidenceSha256(evidence) {
@@ -685,7 +761,7 @@ export function canonicalGenericV2SelectedScopeAuthority(runState) {
   };
 }
 
-export function genericV2TransitionStateFingerprintPayload(runState) {
+export function genericV2TransitionStateFingerprintPayload(runState, env = process.env) {
   if (runState?.execution_path !== "generic_integrity") {
     throw new Error("Generic fixed-v2 fingerprint requires execution_path=generic_integrity");
   }
@@ -695,8 +771,8 @@ export function genericV2TransitionStateFingerprintPayload(runState) {
     history_generation: "v2",
     official_rdata_timestamp_authority:
       requireOfficialRdataTimestampAuthority(runState),
-    retained_v2_maintenance_context:
-      requireRetainedV2MaintenanceContext(runState).context,
+    generic_v2_operational_context:
+      requireGenericV2OperationalContext(runState, env).context,
     generic_selected_scope_authority: canonicalGenericV2SelectedScopeAuthority(runState),
     ...coordinatorTransitionStateCommonFingerprintPayload(runState),
   };
@@ -794,39 +870,69 @@ export function requireOfficialRdataTimestampAuthority(runState) {
 export function requireRetainedV2MaintenanceContext(runState, env = process.env) {
   const context = runState?.retained_v2_maintenance_context;
   const bucket = String(env.CFLARE_R2_BUCKET || env.R2_BUCKET || "").trim();
+  const normalConfig = authoritativeNormalConfiguration(env);
+  const implementationRevision = authenticatedImplementationRevision(env);
+  const configuredEnvironment = String(
+    env.UK_AQ_ENV_NAME || env.UKAQ_ENV_NAME || env.ENVIRONMENT || "",
+  ).trim();
+  const configuredGeneration = String(env.UK_AQ_R2_HISTORY_VERSION || "").trim();
+  const configuredIndexGeneration = String(
+    env.UK_AQ_R2_HISTORY_INDEX_VERSION || configuredGeneration,
+  ).trim();
   const checkpoint = runState?.dropbox_currentness?.checkpoint;
   const liveRoot = runState?.dropbox_currentness?.live_observations_root;
+  const binding = canonicalBindingVerification(
+    runState?.timeseries_binding_pre_repair_verification,
+  );
   if (!context || typeof context !== "object" || Array.isArray(context)
       || context.contract_version !== RETAINED_V2_MAINTENANCE_CONTEXT_CONTRACT
       || context.intent !== "retained_v2_official_rdata_maintenance"
       || context.environment !== "TEST"
       || runState?.environment !== "TEST"
+      || configuredEnvironment !== "TEST"
+      || configuredGeneration !== "v2"
+      || configuredIndexGeneration !== "v2"
+      || normalConfig.environment !== "TEST"
+      || normalConfig.serving_generation !== "v3"
+      || normalConfig.index_generation !== "v3"
+      || normalConfig.bucket !== bucket
       || bucket !== "uk-aq-history-cic-test"
       || context.bucket !== bucket
+      || context.normal_configuration_sha256 !== normalConfig.sha256
       || context.observation_generation !== "v2"
       || context.index_generation !== "v2"
       || context.observations_root !== "history/v2/observations"
       || context.serving_generation !== "v3"
       || context.non_serving_downstream_suppressed !== true
       || !GIT_SHA.test(String(context.implementation_revision || ""))
+      || context.implementation_revision !== implementationRevision
       || !Array.isArray(context.selected_scopes)
       || !context.selected_scopes.length
       || canonicalTransitionFingerprintJson(context.core_snapshot_identity)
         !== canonicalTransitionFingerprintJson(runState?.core_snapshot_identity)
+      || !String(context.core_snapshot_identity?.core_snapshot_manifest_key || "")
+        .startsWith("history/v2/core/")
       || context.timeseries_binding_verification?.status !== "ok"
       || canonicalTransitionFingerprintJson(context.timeseries_binding_verification)
-        !== canonicalTransitionFingerprintJson(canonicalBindingVerification(
-          runState?.timeseries_binding_pre_repair_verification,
-        ))
+        !== canonicalTransitionFingerprintJson(binding)
+      || binding.provider.observation_generation !== "v2"
       || runState?.dropbox_currentness?.allowed !== true
       || runState?.dropbox_currentness?.checkpoint_live_root_match !== true
       || !checkpoint || !liveRoot
+      || checkpoint.relative_key
+        !== "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2/root.json"
+      || liveRoot.key !== "history/v2/observations/_manifests/manifest.json"
+      || !SHA256.test(String(checkpoint.sha256 || ""))
+      || !SHA256.test(String(checkpoint.observations_processed_source_root_hash || ""))
+      || !SHA256.test(String(liveRoot.content_hash || ""))
       || context.dropbox_checkpoint_sha256 !== checkpoint.sha256
       || context.dropbox_observations_root_hash
         !== checkpoint.observations_processed_source_root_hash
       || context.live_v2_observations_root_hash !== liveRoot.content_hash
       || context.dropbox_observations_root_hash !== context.live_v2_observations_root_hash
-      || runState?.observations_global_operation_lock?.valid !== true) {
+      || runState?.observations_global_operation_lock?.valid !== true
+      || canonicalTransitionFingerprintJson(context.observations_global_operation_lock)
+        !== canonicalTransitionFingerprintJson(runState.observations_global_operation_lock)) {
     throw new Error("Retained fixed-v2 TEST maintenance authority is incomplete or contradictory");
   }
   const authority = canonicalGenericV2SelectedScopeAuthority(runState);
@@ -847,6 +953,7 @@ export function requireRetainedV2MaintenanceContext(runState, env = process.env)
     intent: "retained_v2_official_rdata_maintenance",
     environment: "TEST",
     bucket,
+    normal_configuration_sha256: normalConfig.sha256,
     serving_generation: "v3",
     observation_generation: "v2",
     index_generation: "v2",
@@ -870,9 +977,142 @@ export function requireRetainedV2MaintenanceContext(runState, env = process.env)
   return { retained_fixed_v2: true, context: projection };
 }
 
-export function computeGenericV2TransitionStateFingerprint(runState) {
+export function requireServingV2LiveContext(runState, env = process.env) {
+  const context = runState?.serving_v2_live_context;
+  const bucket = String(env.CFLARE_R2_BUCKET || env.R2_BUCKET || "").trim();
+  const normalConfig = authoritativeNormalConfiguration(env);
+  const implementationRevision = authenticatedImplementationRevision(env);
+  const configuredEnvironment = String(
+    env.UK_AQ_ENV_NAME || env.UKAQ_ENV_NAME || env.ENVIRONMENT || "",
+  ).trim();
+  const configuredGeneration = String(env.UK_AQ_R2_HISTORY_VERSION || "").trim();
+  const configuredIndexGeneration = String(
+    env.UK_AQ_R2_HISTORY_INDEX_VERSION || configuredGeneration,
+  ).trim();
+  const checkpoint = runState?.dropbox_currentness?.checkpoint;
+  const liveRoot = runState?.dropbox_currentness?.live_observations_root;
+  const binding = canonicalBindingVerification(
+    runState?.timeseries_binding_pre_repair_verification,
+  );
+  if (!context || typeof context !== "object" || Array.isArray(context)
+      || context.contract_version !== SERVING_V2_LIVE_CONTEXT_CONTRACT
+      || context.intent !== "serving_v2_official_rdata_integrity"
+      || context.environment !== "LIVE"
+      || runState?.environment !== "LIVE"
+      || configuredEnvironment !== "LIVE"
+      || configuredGeneration !== "v2"
+      || configuredIndexGeneration !== "v2"
+      || normalConfig.environment !== "LIVE"
+      || normalConfig.serving_generation !== "v2"
+      || normalConfig.index_generation !== "v2"
+      || normalConfig.bucket !== bucket
+      || !bucket || context.bucket !== bucket
+      || context.normal_configuration_sha256 !== normalConfig.sha256
+      || context.serving_generation !== "v2"
+      || context.observation_generation !== "v2"
+      || context.index_generation !== "v2"
+      || context.observations_root !== "history/v2/observations"
+      || !GIT_SHA.test(String(context.implementation_revision || ""))
+      || context.implementation_revision !== implementationRevision
+      || !Array.isArray(context.selected_scopes)
+      || !context.selected_scopes.length
+      || canonicalTransitionFingerprintJson(context.core_snapshot_identity)
+        !== canonicalTransitionFingerprintJson(runState?.core_snapshot_identity)
+      || !String(context.core_snapshot_identity?.core_snapshot_manifest_key || "")
+        .startsWith("history/v2/core/")
+      || context.timeseries_binding_verification?.status !== "ok"
+      || canonicalTransitionFingerprintJson(context.timeseries_binding_verification)
+        !== canonicalTransitionFingerprintJson(binding)
+      || binding.provider.observation_generation !== "v2"
+      || runState?.dropbox_currentness?.allowed !== true
+      || runState?.dropbox_currentness?.checkpoint_live_root_match !== true
+      || !checkpoint || !liveRoot
+      || checkpoint.relative_key
+        !== "_ops/checkpoints/r2_history_backup_state_v2/observation_generation=v2/root.json"
+      || liveRoot.key !== "history/v2/observations/_manifests/manifest.json"
+      || !SHA256.test(String(checkpoint.sha256 || ""))
+      || !SHA256.test(String(checkpoint.observations_processed_source_root_hash || ""))
+      || !SHA256.test(String(liveRoot.content_hash || ""))
+      || context.dropbox_checkpoint_sha256 !== checkpoint.sha256
+      || context.dropbox_observations_root_hash
+        !== checkpoint.observations_processed_source_root_hash
+      || context.live_v2_observations_root_hash !== liveRoot.content_hash
+      || context.dropbox_observations_root_hash !== context.live_v2_observations_root_hash
+      || runState?.observations_global_operation_lock?.valid !== true
+      || canonicalTransitionFingerprintJson(context.observations_global_operation_lock)
+        !== canonicalTransitionFingerprintJson(runState.observations_global_operation_lock)) {
+    throw new Error("Serving fixed-v2 LIVE authority is incomplete or contradictory");
+  }
+  const authority = canonicalGenericV2SelectedScopeAuthority(runState);
+  const selectedScopes = [...authority.selected_scopes, ...authority.metadata_only_scopes]
+    .map((scope) => ({
+      day_utc: scope.day_utc,
+      connector_id: scope.connector_id,
+      pollutant_code: scope.pollutant_code,
+    })).sort((left, right) => bytewise(left.day_utc, right.day_utc)
+      || left.connector_id - right.connector_id
+      || bytewise(left.pollutant_code, right.pollutant_code));
+  if (canonicalTransitionFingerprintJson(context.selected_scopes)
+      !== canonicalTransitionFingerprintJson(selectedScopes)) {
+    throw new Error("Serving fixed-v2 LIVE selected scope changed");
+  }
+  const projection = {
+    contract_version: SERVING_V2_LIVE_CONTEXT_CONTRACT,
+    intent: "serving_v2_official_rdata_integrity",
+    environment: "LIVE",
+    bucket,
+    normal_configuration_sha256: normalConfig.sha256,
+    serving_generation: "v2",
+    observation_generation: "v2",
+    index_generation: "v2",
+    observations_root: "history/v2/observations",
+    implementation_revision: context.implementation_revision,
+    selected_scopes: context.selected_scopes,
+    core_snapshot_identity: context.core_snapshot_identity,
+    timeseries_binding_verification: context.timeseries_binding_verification,
+    dropbox_checkpoint_sha256: context.dropbox_checkpoint_sha256,
+    dropbox_observations_root_hash: context.dropbox_observations_root_hash,
+    live_v2_observations_root_hash: context.live_v2_observations_root_hash,
+    observations_global_operation_lock: context.observations_global_operation_lock,
+    non_serving_downstream_suppressed: false,
+    normal_downstream_eligible_after_final_verification: true,
+    generation_v2_backup_completion_required: true,
+  };
+  if (canonicalTransitionFingerprintJson(context)
+      !== canonicalTransitionFingerprintJson(projection)) {
+    throw new Error("Serving fixed-v2 LIVE context changed");
+  }
+  return { serving_fixed_v2: true, context: projection };
+}
+
+export function requireGenericV2OperationalContext(runState, env = process.env) {
+  const operational = runState?.generic_v2_operational_context;
+  if (!operational || typeof operational !== "object" || Array.isArray(operational)
+      || operational.contract_version !== GENERIC_V2_OPERATIONAL_CONTEXT_CONTRACT
+      || !["retained_v2_non_serving_test", "serving_v2_live"].includes(
+        operational.mode,
+      )) {
+    throw new Error("Generic fixed-v2 operational context is unavailable");
+  }
+  const selected = operational.mode === "retained_v2_non_serving_test"
+    ? requireRetainedV2MaintenanceContext(runState, env).context
+    : requireServingV2LiveContext(runState, env).context;
+  const projection = {
+    contract_version: GENERIC_V2_OPERATIONAL_CONTEXT_CONTRACT,
+    mode: operational.mode,
+    authority_contract_version: selected.contract_version,
+    authority: selected,
+  };
+  if (canonicalTransitionFingerprintJson(operational)
+      !== canonicalTransitionFingerprintJson(projection)) {
+    throw new Error("Generic fixed-v2 operational context changed or crossed modes");
+  }
+  return { mode: operational.mode, context: projection };
+}
+
+export function computeGenericV2TransitionStateFingerprint(runState, env = process.env) {
   return sha256(Buffer.from(
-    canonicalTransitionFingerprintJson(genericV2TransitionStateFingerprintPayload(runState)),
+    canonicalTransitionFingerprintJson(genericV2TransitionStateFingerprintPayload(runState, env)),
     "utf8",
   ));
 }
@@ -916,7 +1156,8 @@ export function requireGenericV2CoordinatorFreeze(runState, env = process.env) {
       || !SHA256.test(String(transition?.state_fingerprint_sha256 || ""))) {
     throw new Error("Generic fixed-v2 coordinator transition validation is not frozen");
   }
-  const actual = computeGenericV2TransitionStateFingerprint(runState);
+  requireGenericV2OperationalContext(runState, env);
+  const actual = computeGenericV2TransitionStateFingerprint(runState, env);
   if (actual !== transition.state_fingerprint_sha256) {
     throw new Error("Generic fixed-v2 coordinator transition evidence is stale or changed");
   }

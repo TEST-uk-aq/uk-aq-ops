@@ -5386,5 +5386,158 @@ class RepoRootTests(unittest.TestCase):
         self.assertEqual(diag, "ops_repo_root_inferred")
 
 
+class GenericV2OperationalContextTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _run_state(self, environment: str) -> dict[str, object]:
+        root_hash = "a" * 64
+        return {
+            "environment": environment,
+            "core_snapshot_identity": {
+                "core_snapshot_day_utc": "2026-10-01",
+                "core_snapshot_manifest_key": (
+                    "history/v2/core/day_utc=2026-10-01/manifest.json"
+                ),
+                "core_snapshot_manifest_hash": "b" * 64,
+                "core_snapshot_manifest_sha256": "c" * 64,
+            },
+            "timeseries_binding_pre_repair_verification": {
+                "status": "ok",
+                "source_adapter": "waqn",
+                "connector_id": 9,
+                "pollutant_codes": ["no2"],
+                "required_timeseries_ids": [9001],
+                "required_binding_count": 1,
+                "gap_count": 0,
+                "provider": {
+                    "mode": "individual",
+                    "observation_generation": "v2",
+                },
+            },
+            "dropbox_currentness": {
+                "allowed": True,
+                "checkpoint_live_root_match": True,
+                "checkpoint": {
+                    "relative_key": (
+                        "_ops/checkpoints/r2_history_backup_state_v2/"
+                        "observation_generation=v2/root.json"
+                    ),
+                    "sha256": "d" * 64,
+                    "observations_processed_source_root_hash": root_hash,
+                },
+                "live_observations_root": {
+                    "key": "history/v2/observations/_manifests/manifest.json",
+                    "content_hash": root_hash,
+                },
+            },
+            "observations_global_operation_lock": {
+                "valid": True,
+                "owner": "integrity",
+                "run_id": f"integrity:{environment}:fixture",
+            },
+        }
+
+    def _env(
+        self, environment: str, generation: str, bucket: str,
+    ) -> dict[str, str]:
+        env_path = self.root / f"{environment}-{generation}.env"
+        env_path.write_text(
+            "\n".join((
+                f"UKAQ_ENV_NAME={environment}",
+                f"UK_AQ_R2_HISTORY_VERSION={generation}",
+                f"UK_AQ_R2_HISTORY_INDEX_VERSION={generation}",
+                f"CFLARE_R2_BUCKET={bucket}",
+                "",
+            )),
+            encoding="utf-8",
+        )
+        return {
+            "UK_AQ_ENV_NAME": environment,
+            "UK_AQ_R2_HISTORY_VERSION": "v2",
+            "UK_AQ_R2_HISTORY_INDEX_VERSION": "v2",
+            "CFLARE_R2_BUCKET": bucket,
+            "UK_AQ_BACKFILL_ENV_FILE": str(env_path),
+            "UK_AQ_OPS_REPO_ROOT": str(Path(__file__).resolve().parents[3]),
+        }
+
+    def _selected_authority(self) -> dict[str, object]:
+        return {
+            "selected_scopes": [{
+                "day_utc": "2026-10-01",
+                "connector_id": 9,
+                "pollutant_code": "no2",
+            }],
+            "metadata_only_scopes": [],
+        }
+
+    def test_python_freezes_distinct_test_and_live_contexts(self) -> None:
+        with mock.patch.object(
+            MODULE,
+            "_canonical_generic_integrity_selected_scope_authority",
+            return_value=self._selected_authority(),
+        ):
+            test_state = self._run_state("TEST")
+            test_context = MODULE._freeze_generic_v2_operational_context(
+                test_state,
+                self._env("TEST", "v3", "uk-aq-history-cic-test"),
+            )
+            self.assertEqual(
+                test_context["mode"], "retained_v2_non_serving_test"
+            )
+            self.assertTrue(
+                test_context["authority"]["non_serving_downstream_suppressed"]
+            )
+
+            live_state = self._run_state("LIVE")
+            live_context = MODULE._freeze_generic_v2_operational_context(
+                live_state,
+                self._env("LIVE", "v2", "configured-live-bucket-fixture"),
+            )
+            self.assertEqual(live_context["mode"], "serving_v2_live")
+            self.assertEqual(
+                live_context["authority"]["bucket"],
+                "configured-live-bucket-fixture",
+            )
+            self.assertTrue(
+                live_context["authority"]
+                ["normal_downstream_eligible_after_final_verification"]
+            )
+
+    def test_python_rejects_cross_mode_and_incompatible_live_generation(self) -> None:
+        with mock.patch.object(
+            MODULE,
+            "_canonical_generic_integrity_selected_scope_authority",
+            return_value=self._selected_authority(),
+        ):
+            live_state = self._run_state("LIVE")
+            live_env = self._env(
+                "LIVE", "v2", "configured-live-bucket-fixture"
+            )
+            MODULE._freeze_generic_v2_operational_context(live_state, live_env)
+            live_state["generic_v2_operational_context"]["mode"] = (
+                "retained_v2_non_serving_test"
+            )
+            with self.assertRaisesRegex(ValueError, "changed or crossed modes"):
+                MODULE._require_generic_v2_operational_context(
+                    live_state, live_env
+                )
+
+            incompatible = self._run_state("LIVE")
+            with self.assertRaisesRegex(
+                ValueError, "neither retained-v2 TEST maintenance"
+            ):
+                MODULE._freeze_generic_v2_operational_context(
+                    incompatible,
+                    self._env(
+                        "LIVE", "v3", "configured-live-bucket-fixture"
+                    ),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
