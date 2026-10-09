@@ -2949,7 +2949,7 @@ export default {
       try { origin = new URL(upstreamOrigin); } catch {
         return makeErrorResponse(503, "prototype_origin_invalid", requestOrigin, allowedOrigins);
       }
-      if (origin.protocol !== "https:" || !/^[a-z0-9-]+\\.sleepercar\\.co\\.uk$/.test(origin.hostname)
+      if (origin.protocol !== "https:" || !/^[a-z0-9-]+\.sleepercar\.co\.uk$/.test(origin.hostname)
         || origin.port || origin.pathname !== "/" || origin.search || origin.hash
         || origin.username || origin.password) {
         return makeErrorResponse(503, "prototype_origin_invalid", requestOrigin, allowedOrigins);
