@@ -12,6 +12,9 @@ service = "__UK_AQ_STATION_HISTORY_WORKER_NAME__"
 
 [vars]
 UK_AQ_MEDIA_PUBLIC_URL = "__UK_AQ_MEDIA_PUBLIC_URL__"
+# The optional cross-account Sleepercar prototype is disabled on every normal deploy.
+# Explicit workflow dispatch enables it in the generated wrangler.deploy.toml only.
+UK_AQ_COMPRESSED_CHART_ENABLED = "false"
 
 # Current-reading route policy:
 # - /api/aq/latest is retired.
@@ -25,7 +28,7 @@ UK_AQ_MEDIA_PUBLIC_URL = "__UK_AQ_MEDIA_PUBLIC_URL__"
 # - OBS_AQIDB_SECRET_KEY
 # - UK_AQ_CACHE_ALLOWED_ORIGINS
 # - UK_AQ_EDGE_ACCESS_TOKEN_SECRET
-# - UK_AQ_EDGE_UPSTREAM_SECRET
+# - UK_AQ_EDGE_UPSTREAM_SECRET\n# Optional TEST prototype only (explicit opt-in workflow):\n# - UK_AQ_COMPRESSED_CHART_UPSTREAM_URL: Sleepercar Access-protected HTTPS origin\n# - UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_ID / UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_SECRET\n# - UK_AQ_COMPRESSED_CHART_ENABLED: default false, enabled only by workflow dispatch
 # - UK_AQ_CACHE_BYPASS_SECRET
 # - UK_AQ_TURNSTILE_SECRET_KEY
 # - UK_AQ_OBSERVS_HISTORY_R2_API_URL
