@@ -16,4 +16,5 @@ bucket_name = "uk-aq-chart-history-json-test"
 [vars]
 UK_AQ_ENV_NAME = "TEST"
 
-# Runtime secret: UK_AQ_EDGE_UPSTREAM_SECRET (same authenticated upstream secret as TEST proxy).\n# External Access policy/service token is enforced at the Sleepercar hostname.
+# Runtime secret: UK_AQ_EDGE_UPSTREAM_SECRET (same authenticated upstream secret as TEST proxy).
+# External Access policy/service token is enforced at the Sleepercar hostname.
