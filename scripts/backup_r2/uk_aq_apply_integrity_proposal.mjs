@@ -1866,12 +1866,19 @@ export function loadImmutableSourcePartition({ runState, dayUtc, connectorId, po
   if (!sameJson(reconstructedCounts, recordedCounts)) {
     throw new Error(`Immutable source evidence per-pollutant counts changed: day=${dayUtc} connector=${connectorId}`);
   }
+  const officialRdata = ["waqn", "saqn"].includes(evidence.source_adapter)
+    && evidence.semantic_evidence_contract === "official_rdata_semantic_evidence";
   const recordedHashCodes = Object.keys(evidence?.observation_content_hashes || {}).sort();
-  if (!sameJson(Object.keys(reconstructedCounts), recordedHashCodes)) {
+  const sourceHashCodes = officialRdata
+    ? [...new Set([...Object.keys(reconstructedCounts), ...(evidence.source_available_pollutant_codes || [])])].sort()
+    : Object.keys(reconstructedCounts);
+  if (!sameJson(sourceHashCodes, recordedHashCodes)) {
     throw new Error(`Immutable source evidence content-hash partitions changed: day=${dayUtc} connector=${connectorId}`);
   }
-  for (const [code, partitionRows] of reconstructedByPollutant) {
-    const computedPartition = computeObservationContentHash(partitionRows);
+  for (const code of sourceHashCodes) {
+    const partitionRows = reconstructedByPollutant.get(code) || [];
+    const computedPartition = partitionRows.length
+      ? computeObservationContentHash(partitionRows) : computeEmptyObservationContentHash();
     const recordedPartition = evidence?.observation_content_hashes?.[code];
     validateObservationContentHashMetadata(recordedPartition, { rowCount: partitionRows.length });
     const partitionDifferences = semanticDifferences(computedPartition, recordedPartition);
@@ -1927,7 +1934,10 @@ export function loadImmutableSourcePartition({ runState, dayUtc, connectorId, po
     const requestedPollutants = [...new Set(
       (evidence.requested_pollutant_set || []).map(String),
     )].sort();
-    const targetCounts = Object.fromEntries(requestedPollutants.map((code) => [
+    // Wholly unavailable empty scopes have no target authority or synthetic hash.
+    const targetCodes = requestedPollutants.filter((code) => targetByPollutant.has(code)
+      || (evidence.source_available_pollutant_codes || []).includes(code));
+    const targetCounts = Object.fromEntries(targetCodes.map((code) => [
       code, (targetByPollutant.get(code) || []).length,
     ]));
     const recordedTargetCounts = Object.fromEntries(Object.entries(
@@ -1947,7 +1957,7 @@ export function loadImmutableSourcePartition({ runState, dayUtc, connectorId, po
     if (!sameJson(targetTimeseriesCounts, recordedTargetTimeseriesCounts)) {
       throw new Error(`Immutable final target timeseries counts changed: ${identity}`);
     }
-    for (const code of requestedPollutants) {
+    for (const code of targetCodes) {
       const partitionRows = targetByPollutant.get(code) || [];
       const targetHash = partitionRows.length
         ? computeObservationContentHash(partitionRows)
@@ -2513,15 +2523,27 @@ export async function verifyLiveObservationPartition({
   const liveMetadata = canonicalRows.length
     ? computeObservationContentHash(canonicalRows)
     : computeEmptyObservationContentHash();
-  const liveSourceDifferences = semanticDifferences(source.metadata, liveMetadata);
+  const officialRdata = source.evidence.semantic_evidence_contract === "official_rdata_semantic_evidence"
+    && ["waqn", "saqn"].includes(source.evidence.source_adapter);
+  const expectedMetadata = officialRdata ? source.finalTargetMetadata : source.metadata;
+  const targetDifferences = semanticDifferences(expectedMetadata, liveMetadata);
   Object.assign(object.entry, {
     live_observation_body_sources: bodySources,
     live_observation_content_hash: liveMetadata.observation_content_hash,
     live_verification_status_counts: liveMetadata.verification_status_counts,
     live_observation_source_evidence_hash: source.metadata.observation_content_hash,
-    live_observation_content_verified_against_source: liveSourceDifferences.length === 0,
+    live_observation_content_verified_against_source:
+      semanticDifferences(source.metadata, liveMetadata).length === 0,
+    ...(officialRdata ? {
+      live_observation_final_target_evidence_hash: expectedMetadata.observation_content_hash,
+      live_observation_content_verified_against_final_target: targetDifferences.length === 0,
+    } : {}),
   });
-  if (liveSourceDifferences.length) {
+  const authorityLabel = officialRdata ? "immutable_final_target" : "immutable_source";
+  const targetAudit = officialRdata ? {
+    immutable_final_target_content_hash: expectedMetadata.observation_content_hash,
+  } : {};
+  if (targetDifferences.length) {
     object.entry.live_observation_failure_classification = "live_observation_content_mismatch";
     persistence?.appendEvent({
       event_type: "semantic_verification_failed",
@@ -2530,13 +2552,14 @@ export async function verifyLiveObservationPartition({
       bytes: object.body.byteLength,
       sha256: object.entry.sha256,
       status: "failed",
-      failure_message: `immutable_source_mismatch:${liveSourceDifferences.join(",")}`,
+      failure_message: `${authorityLabel}_mismatch:${targetDifferences.join(",")}`,
       live_observation_content_hash: liveMetadata.observation_content_hash,
       immutable_source_content_hash: source.metadata.observation_content_hash,
+      ...targetAudit,
     });
     persistence?.flush();
     throw new Error(
-      `Live repaired observation content does not match immutable source evidence: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode} differing_fields=${liveSourceDifferences.join(",")}`,
+      `Live repaired observation content does not match ${authorityLabel} evidence: day=${dayUtc} connector=${connectorId} pollutant=${pollutantCode} differing_fields=${targetDifferences.join(",")}`,
     );
   }
   const manifestDifferences = semanticDifferences(liveMetadata, manifest);
@@ -2561,6 +2584,7 @@ export async function verifyLiveObservationPartition({
       failure_message: `proposal_manifest_mismatch:${[...new Set(manifestDifferences)].join(",")}`,
       live_observation_content_hash: liveMetadata.observation_content_hash,
       immutable_source_content_hash: source.metadata.observation_content_hash,
+      ...targetAudit,
     });
     persistence?.flush();
     throw new Error(
@@ -2585,6 +2609,7 @@ export async function verifyLiveObservationPartition({
     status: "verified",
     live_observation_content_hash: liveMetadata.observation_content_hash,
     immutable_source_content_hash: source.metadata.observation_content_hash,
+    ...targetAudit,
     proposed_manifest_matches_live_observation: true,
     body_sources: bodySources,
   });
@@ -2838,6 +2863,7 @@ export async function applyValidatedProposal({
   coordinatorFreezeValidator = null,
   localProposalValidator = null,
   finalProposalGraphValidator = null,
+  proposalAdmissionPlanner = null,
 }) {
   const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
   if (generation === "v3") {
@@ -2927,7 +2953,23 @@ export async function applyValidatedProposal({
     atomicWriteJson(runStatePath, runState);
     throw error;
   }
-  const proposal = localProposalValidator
+  // The official-network planner is local-only and returns the exact admitted
+  // bodies and schedule used below. Other callers retain their existing path.
+  let admittedPlan = null;
+  if (proposalAdmissionPlanner) {
+    try {
+      admittedPlan = await proposalAdmissionPlanner({ runState, env });
+    } catch (error) {
+      runState.apply = {
+        status: "failed", generation, error: error.message,
+        r2_mutation_possible: false, final_admission_validation_failed: true,
+        finished_at_utc: new Date().toISOString(),
+      };
+      atomicWriteJson(runStatePath, runState);
+      throw error;
+    }
+  }
+  const proposal = admittedPlan ? admittedPlan.proposal : localProposalValidator
     ? localProposalValidator(runState)
     : validateLocalProposal(runState, { generation });
   const dedicatedSosProposal = validateDedicatedSosHistoricalProposal({
@@ -2935,7 +2977,11 @@ export async function applyValidatedProposal({
     proposal,
   });
   try {
-    if (finalProposalGraphValidator) {
+    if (admittedPlan) {
+      if (admittedPlan.final_proposal_graph_validation?.status !== "succeeded") {
+        throw new Error("Canonical APPLY received an unvalidated admission plan");
+      }
+    } else if (finalProposalGraphValidator) {
       await finalProposalGraphValidator({ runState, proposal });
     } else {
       await validateFinalProposalGraph({ runState, proposal });
@@ -2969,7 +3015,7 @@ export async function applyValidatedProposal({
   let publicationSchedule;
   let sosLightPublicationScheduleValidation = null;
   try {
-    publicationSchedule = buildFrozenPublicationSchedule({
+    publicationSchedule = admittedPlan ? admittedPlan.publication_schedule : buildFrozenPublicationSchedule({
       proposal,
       selectedDays,
       publicationMode: dedicatedSosProposal.dedicated ? "sos_light" : "generic",

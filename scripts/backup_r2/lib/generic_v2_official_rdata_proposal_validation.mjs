@@ -6,9 +6,13 @@ import path from "node:path";
 
 import {
   loadImmutableSourcePartition,
+  buildFrozenPublicationSchedule,
   validateFinalProposalGraph,
   validateLocalProposal,
 } from "../uk_aq_apply_integrity_proposal.mjs";
+import { validateIntegrityCoreSnapshotIdentity } from "./uk_aq_integrity_core_snapshot_identity.mjs";
+import { requireObservationsGlobalOperationLockContext } from "../../../workers/shared/uk_aq_r2_history_writer.mjs";
+import { validateOfficialRdataPreservationDependencies } from "./official_rdata_evidence_validation.mjs";
 import {
   canonicalTransitionFingerprintJson,
   coordinatorTransitionStateCommonFingerprintPayload,
@@ -29,39 +33,9 @@ const OUTCOMES = new Set([
   "source_artifact_unavailable_preserved",
 ]);
 const POLLUTANT_PREFIX = /^history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
-const OFFICIAL_RDATA_V8_FIELDS = [
-  "schema_version", "semantic_evidence_contract", "source_adapter", "day_utc",
-  "connector_id", "source_file_identities_sha256", "requested_pollutant_set",
-  "contract", "evidence_contract_version", "history_generation",
-  "source_label_registry_snapshot_content_sha256",
-  "authoritative_station_timeseries_mapping_sha256",
-  "sos_site_ref_bridge_mapping_identity", "sos_site_ref_bridge_artifact_sha256",
-  "observed_property_mapping_sha256", "source_artifact_availability_contract_version",
-  "source_artifact_availability_sha256", "preserved_baseline_dependency_contract_version",
-  "preserved_baseline_dependency_sha256", "rdata_decoder_contract_version",
-  "timestamp_mapping", "observation_content_hash_contract_version",
-  "source_evidence_input_sha256", "enumeration_complete", "files_enumerated",
-  "files_required", "files_read", "files_authoritatively_absent",
-  "source_file_identities", "source_records_examined", "source_csv_records_scanned",
-  "canonical_rows_mapped", "missing_binding_groups", "missing_binding_rows",
-  "canonical_rows_file", "canonical_rows_sha256", "canonical_rows_bytes", "total_rows",
-  "per_timeseries_counts", "per_pollutant_counts", "observation_content_hashes",
-  "pollutant_set", "source_available_timeseries_ids", "source_available_pollutant_codes",
-  "source_unavailable_timeseries_ids", "source_unavailable_scopes",
-  "preserved_baseline_rows_file", "preserved_baseline_rows_sha256",
-  "preserved_baseline_rows_bytes", "preserved_baseline_row_count",
-  "preserved_baseline_identity", "final_target_row_count",
-  "final_target_timeseries_row_counts", "final_target_pollutant_counts",
-  "empty_final_target_pollutant_codes", "final_target_observation_content_hashes",
-  "source_rows_before_canonical_dedupe", "duplicate_rows_removed_by_canonical_normalisation",
-  "duplicate_canonical_row_count", "duplicate_canonical_row_identity_samples",
-  "uncanonicalisable_source_row_count", "source_adapter_blocked_row_count",
-  "source_adapter_blocked_row_samples", "out_of_scope_source_adapter_blocked_row_count",
-  "blocked_row_count", "blocked_row_samples", "skipped_row_count",
-  "inactive_identity_rows_skipped", "source_label_classification_counts",
-  "source_label_target_day_row_counts", "source_label_summary",
-  "source_label_classifications", "mapping_audit", "source_verification_status_counts",
-];
+import {
+  OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS as OFFICIAL_RDATA_V8_FIELDS,
+} from "./official_rdata_semantic_projection.mjs";
 
 export const GENERIC_INTEGRITY_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT =
   "uk_aq_generic_integrity_v2_transition_state_fingerprint_v3";
@@ -1125,9 +1099,48 @@ export function validateLocalGenericV2Proposal(runState, env = process.env) {
 
 export async function validateFinalGenericV2ProposalGraph({ runState, proposal }) {
   const authority = canonicalGenericV2SelectedScopeAuthority(runState);
+  const validatedEvidence = new Set();
+  for (const scope of authority.selected_scopes) {
+    if (scope.source_evidence_authority.authority_kind !== "persisted_official_rdata_v8_semantic_evidence") continue;
+    const identity = `${scope.day_utc}|${scope.connector_id}`;
+    if (validatedEvidence.has(identity)) continue;
+    const source = loadImmutableSourcePartition({ runState,
+      dayUtc: scope.day_utc, connectorId: scope.connector_id, pollutantCode: scope.pollutant_code });
+    await validateOfficialRdataPreservationDependencies({ runState, source });
+    validatedEvidence.add(identity);
+  }
   return await validateFinalProposalGraph({
     runState,
     proposal,
     genericSelectedScopeAuthority: authority,
   });
+}
+
+/** Local admission only: no remote adapters, writer session, persistence or mutation. */
+export async function validateAndPlanGenericV2OfficialRdataProposal({ runState, env }) {
+  if (runState.execution_path !== "generic_integrity"
+      || !["waqn", "saqn"].includes(runState.official_rdata_source_adapter)) {
+    throw new Error("Generic fixed-v2 admission accepts WAQN/SAQN only");
+  }
+  const operational = requireGenericV2OperationalContext(runState, env);
+  requireObservationsGlobalOperationLockContext({ env, expectedOwner: "integrity",
+    expectedRunId: String(runState.observations_global_operation_lock?.run_id || "") });
+  requireGenericV2CoordinatorFreeze(runState, env);
+  const core = validateIntegrityCoreSnapshotIdentity({ env, runState,
+    dropboxRoot: runState.base_dropbox_root, stage: "canonical_apply_child" });
+  const proposal = validateLocalGenericV2Proposal(runState, env);
+  const graph = await validateFinalGenericV2ProposalGraph({ runState, proposal });
+  const selectedDays = [...new Set([
+    ...proposal.prefixes.map(({ prefix }) => prefix.match(/day_utc=(\d{4}-\d{2}-\d{2})/)?.[1]),
+    ...proposal.objects.map(({ key }) => key.match(/day_utc=(\d{4}-\d{2}-\d{2})/)?.[1]),
+  ].filter(Boolean))].sort(bytewise);
+  const schedule = buildFrozenPublicationSchedule({ proposal, selectedDays,
+    publicationMode: "generic", runState });
+  // Graph ownership annotations are outside the fingerprint. Any authority
+  // change during validation is still rejected before returning the schedule.
+  requireGenericV2CoordinatorFreeze(runState, env);
+  return { proposal, selected_days: selectedDays, publication_schedule: schedule,
+    core_snapshot_identity_validation: core, final_proposal_graph_validation: graph,
+    operational_context_mode: operational.mode,
+    state_fingerprint_sha256: computeGenericV2TransitionStateFingerprint(runState, env) };
 }

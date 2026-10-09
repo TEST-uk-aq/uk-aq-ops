@@ -16,6 +16,7 @@ import {
   requireGenericV2OperationalContext,
   validateFinalGenericV2ProposalGraph,
   validateLocalGenericV2Proposal,
+  validateAndPlanGenericV2OfficialRdataProposal,
 } from "./lib/generic_v2_official_rdata_proposal_validation.mjs";
 
 function parseArgs(argv) {
@@ -32,6 +33,9 @@ export async function applyValidatedGenericV2OfficialRdataProposal({
   env = process.env,
 }) {
   const coordinatorState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
+  if (coordinatorState.dry_run === true) {
+    throw new Error("A dry-run proposal cannot enter the write-enabled APPLY bridge");
+  }
   const operationalContext = requireGenericV2OperationalContext(coordinatorState, env);
   const operationEnv = {
     ...env,
@@ -67,6 +71,8 @@ export async function applyValidatedGenericV2OfficialRdataProposal({
     localProposalValidator: (runState) =>
       validateLocalGenericV2Proposal(runState, env),
     finalProposalGraphValidator: validateFinalGenericV2ProposalGraph,
+    proposalAdmissionPlanner: ({ runState }) =>
+      validateAndPlanGenericV2OfficialRdataProposal({ runState, env }),
   }).then((result) => ({
     ...result,
     operational_context_mode: operationalContext.mode,
