@@ -6,8 +6,13 @@ import { gzipSync, gunzipSync } from "node:zlib";
 import { performance } from "node:perf_hooks";
 import { extractGeneration } from "./extract.mjs";
 import { sha256, requireCondition as check } from "./source_reader.mjs";
+import { buildCalculatedHistory } from "../../workers/uk_aq_station_history/src/calculated_history.mjs";
+import { AQI_ALGORITHM_VERSION } from "../../lib/aqi/aqi_levels.mjs";
 
-const HELP = `Bounded offline TEST AURN observation export (GET only).
+const HOUR = 3_600_000;
+const DAY = 86_400_000;
+
+const HELP = `Bounded offline TEST AURN observation and precomputed AQI export (GET only).
 Usage, from TEST ops with its existing .env:
   node --env-file=.env scripts/compressed_chart_history/export.mjs \\
     --connector-id 1 --timeseries-id 212 --pollutant pm25 \\
@@ -19,6 +24,7 @@ Optional: --max-source-mib 128 (default; integer 1..512 per generation).
 Only AURN connector 1 is admitted; WAQN/SAQN are excluded.
 Existing UK_AQ_ENV_NAME=TEST and CFLARE_R2_* credentials are used privately.
 Output directory must be new and outside the multi-repository workspace.
+Reads the preceding UTC day as PM context when available; unresolved context is marked incomplete.
 No publication, source changes, runtime routing changes or retries.
 `;
 export function canonicalJson(value) {
@@ -52,6 +58,71 @@ function parseOptions(args) {
   check(Number.isSafeInteger(mib) && mib >= 1 && mib <= 512, "Source budget must be 1..512 MiB per generation");
   check(path.isAbsolute(supplied["output-dir"] || ""), "Absolute output directory required");
   return { timeseriesId, pollutant: supplied.pollutant, start, end, generations, maxBytes: mib * 1024 ** 2, output: path.resolve(supplied["output-dir"]) };
+}
+function aqiInputRows(result) {
+  return [...result.contextRows, ...result.rows].map((row) => ({
+    connector_id: 1, station_id: row[2], timeseries_id: result.binding.timeseries_id,
+    pollutant_code: result.binding.pollutant_code, observed_at: row[0], value: row[1],
+    source_status: row[3], verification_status: row[4], source: "json",
+  }));
+}
+export async function calculateMonthAqi(result, month, options) {
+  const allRows = aqiInputRows(result);
+  const continuity = { enabled: false, continuityKey: null, siteRef: null, ukAirRef: null,
+    pollutant: options.pollutant, members: [{ connectorId: 1, stationId: result.binding.station_id,
+      timeseriesId: options.timeseriesId, pollutant: options.pollutant,
+      validFromDayUtc: null, validToDayUtc: null }] };
+  const request = { connectorId: 1, stationId: result.binding.station_id,
+    timeseriesId: options.timeseriesId, pollutant: options.pollutant,
+    includeObservations: false, includeAqi: true };
+  const batches = [], rows = [], gapRanges = [], reasons = new Set(), seen = new Set();
+  for (let dayMs = Date.parse(month.requested_start_utc); dayMs < Date.parse(month.requested_end_exclusive_utc); dayMs += DAY) {
+    const endExclusive = Math.min(dayMs + DAY, Date.parse(month.requested_end_exclusive_utc));
+    const outputStartMs = dayMs - HOUR, outputEndMs = endExclusive - HOUR;
+    const inputStart = outputStartMs - (options.pollutant === "no2" ? 0 : 23 * HOUR);
+    const inputEnd = outputEndMs + 1;
+    const scoped = allRows.filter((row) => { const t = Date.parse(row.observed_at); return t >= inputStart && t < inputEnd; });
+    const requiredDays = [...result.contextDays, ...result.days].filter((day) => {
+      const t = Date.parse(`${day.day_utc}T00:00:00.000Z`);
+      return t < inputEnd && t + DAY > inputStart;
+    });
+    const expectedDayCount = Math.ceil(inputEnd / DAY) - Math.floor(inputStart / DAY);
+    const contextComplete = requiredDays.length === expectedDayCount
+      && requiredDays.every((day) => ["exported", "authoritative_absence"].includes(day.state))
+      && inputStart >= Date.parse(options.contextStart);
+    const calculated = await buildCalculatedHistory({ request, continuity, outputStartMs, outputEndMs,
+      observationProvider: async () => ({ rows: scoped, response_complete: result.state === "complete",
+        partial_reasons: [], fetch_count: 0, context_complete: contextComplete }) });
+    for (const row of calculated.aqi.rows) {
+      check(!seen.has(row.timestamp_hour_utc), "Overlapping daily AQI output");
+      seen.add(row.timestamp_hour_utc);
+      rows.push(row);
+    }
+    gapRanges.push(...calculated.aqi.gap_ranges);
+    calculated.aqi.partial_reasons.forEach((reason) => reasons.add(reason));
+    batches.push({ day_utc: new Date(dayMs).toISOString().slice(0, 10),
+      output_start_utc: new Date(dayMs).toISOString(), output_end_exclusive_utc: new Date(endExclusive).toISOString(),
+      required_context_start_utc: new Date(inputStart).toISOString(), context_complete: contextComplete,
+      response_complete: calculated.aqi.response_complete, has_gap: calculated.aqi.has_gap,
+      partial_reasons: calculated.aqi.partial_reasons, row_count: calculated.aqi.rows.length });
+  }
+  rows.sort((a, b) => a.timestamp_hour_utc.localeCompare(b.timestamp_hour_utc));
+  const complete = batches.every((batch) => batch.response_complete);
+  return { schema_version: 2, kind: "uk_aq_compressed_chart_aqi_month",
+    identity: { connector_id: 1, timeseries_id: options.timeseriesId,
+      station_id: result.binding.station_id, pollutant_code: options.pollutant },
+    source: { generation: result.generation, bucket: result.bucket,
+      source_evidence: result.evidence, algorithm_version: AQI_ALGORITHM_VERSION },
+    coverage: { ...month, response_complete: complete, daily_batches: batches,
+      context_days: result.contextDays, row_count: rows.length },
+    aqi: { enabled: true, calculation_source: "calculated_from_observations",
+      publication_source: "precomputed_compressed_json", response_contract: "aqi_hour_interval_v2",
+      algorithm_version: AQI_ALGORITHM_VERSION, rows, response_complete: complete,
+      has_gap: batches.some((batch) => batch.has_gap), gap_ranges: gapRanges,
+      partial_reasons: [...reasons].sort(), required_context_start_utc: batches[0]?.required_context_start_utc,
+      output_start_utc: month.requested_start_utc,
+      output_end_utc: new Date(Date.parse(month.requested_end_exclusive_utc) - HOUR).toISOString(),
+      source_counts: { calculated_from_observations: rows.length } } };
 }
 function monthsBetween(start, end) {
   const months = [];
@@ -99,7 +170,7 @@ async function prepareFiles(result, options) {
   const started = performance.now(), cpuStarted = process.cpuUsage();
   const objects = [];
   if (result.state === "failed") return objects;
-  const evidence = { schema_version: 1, kind: "uk_aq_chart_history_source_evidence", source_generation: result.generation, bucket: result.bucket, binding: result.binding, verification: result.verification, source_objects: result.source_objects };
+  const evidence = { schema_version: 1, kind: "uk_aq_chart_history_source_evidence", source_generation: result.generation, bucket: result.bucket, binding: result.binding, verification: result.verification, source_objects: result.source_objects, context_days: result.contextDays };
   const evidenceBody = canonicalJson(evidence);
   const evidenceSha = sha256(evidenceBody);
   const evidencePath = `${result.generation}/source-evidence.${evidenceSha}.json`;
@@ -128,6 +199,22 @@ async function prepareFiles(result, options) {
     // Read written bytes back before proposing any manifest references.
     check(sha256(await fs.readFile(path.join(options.output, gzipPath))) === compressedSha && sha256(await fs.readFile(path.join(options.output, jsonPath))) === rawSha, "Local file verification failed");
     objects.push({ ...month, state: payload.coverage.state, row_count: rows.length, json_path: jsonPath, path: gzipPath, json_byte_size: json.length, byte_size: compressed.length, json_sha256: rawSha, sha256: compressedSha, content_type: "application/json", content_encoding: "gzip", source_evidence: result.evidence, publication_eligible: complete });
+    if (complete) {
+      const aqi = await calculateMonthAqi(result, month, options);
+      const aqiJson = canonicalJson(aqi), aqiGzip = gzipSync(aqiJson, { level: 9 });
+      check(gunzipSync(aqiGzip).equals(aqiJson), "AQI gzip round-trip failed");
+      const aqiSha = sha256(aqiJson), aqiGzipSha = sha256(aqiGzip);
+      const aqiJsonPath = `${prefix}/aqi.${aqiSha}.json`, aqiGzipPath = `${prefix}/aqi.${aqiSha}.json.gz`;
+      await writeNew(options.output, aqiJsonPath, aqiJson);
+      await writeNew(options.output, aqiGzipPath, aqiGzip);
+      check(sha256(await fs.readFile(path.join(options.output, aqiGzipPath))) === aqiGzipSha,
+        "Local AQI file verification failed");
+      objects.at(-1).aqi = { path: aqiGzipPath, json_path: aqiJsonPath,
+        byte_size: aqiGzip.length, json_byte_size: aqiJson.length,
+        sha256: aqiGzipSha, json_sha256: aqiSha, row_count: aqi.aqi.rows.length,
+        response_complete: aqi.aqi.response_complete, algorithm_version: AQI_ALGORITHM_VERSION,
+        source_evidence: result.evidence };
+    }
   }
   const cpu = process.cpuUsage(cpuStarted);
   Object.assign(result.metrics, { output_object_count: objects.length, json_bytes: objects.reduce((sum, o) => sum + o.json_byte_size, 0), gzip_bytes: objects.reduce((sum, o) => sum + o.byte_size, 0), source_evidence_bytes: evidenceBody.length, encoding_and_local_write_wall_ms: performance.now() - started, encoding_and_local_write_cpu_ms: (cpu.user + cpu.system) / 1000 });
@@ -142,6 +229,7 @@ async function main() {
   if (process.argv.slice(2).includes("--help")) { console.log(HELP); return; }
   const started = performance.now(), cpuStarted = process.cpuUsage();
   const options = parseOptions(process.argv.slice(2));
+  options.contextStart = new Date(Date.parse(options.start) - 24 * HOUR).toISOString();
   const workspace = await fs.realpath(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../.."));
   let existingParent = path.dirname(options.output);
   const missingParts = [];
@@ -172,14 +260,14 @@ async function main() {
     console.log(`${version}: ${result.state}, ${result.metrics.row_count} rows, ${result.metrics.source_bytes_read} source bytes`);
   }
   const comparison = compareSources(results);
-  const manifest = { schema_version: 1, kind: "uk_aq_chart_history_candidate_manifest", publication_state: "local_only_not_published", export_schema_version: 1, environment: "TEST", requested_interval: { start_utc: options.start, end_exclusive_utc: options.end }, identity: { connector_id: 1, timeseries_id: options.timeseriesId, pollutant_code: options.pollutant }, complete: results.every((r) => r.state === "complete"), sources: results.map((r) => ({ generation: r.generation, state: r.state, binding: r.binding || null, source_evidence: r.evidence || null, days: r.days, error: r.error || null })), objects, publication_rule: "Verify every newly referenced immutable gzip and evidence object before publishing a new complete manifest; retain prior complete selection on failure." };
+  const manifest = { schema_version: 2, kind: "uk_aq_chart_history_candidate_manifest", publication_state: "local_only_not_published", export_schema_version: 2, environment: "TEST", requested_interval: { start_utc: options.start, end_exclusive_utc: options.end }, identity: { connector_id: 1, timeseries_id: options.timeseriesId, pollutant_code: options.pollutant }, complete: results.every((r) => r.state === "complete"), sources: results.map((r) => ({ generation: r.generation, state: r.state, binding: r.binding || null, source_evidence: r.evidence || null, days: r.days, context_days: r.contextDays, error: r.error || null })), objects, publication_rule: "Verify paired observation/AQI gzip and evidence objects before publishing a new complete manifest; retain prior complete selection on failure." };
   const manifestBody = canonicalJson(manifest);
   const manifestPath = `candidate-manifest.${sha256(manifestBody)}.json`;
   // Manifest last, only after referenced local outputs pass checks. State never
   // claims remote publication or completeness for a failed/unexported period.
   await writeNew(options.output, manifestPath, manifestBody);
   const cpu = process.cpuUsage(cpuStarted);
-  const report = { schema_version: 1, captured_at_utc: new Date().toISOString(), selection: { timeseriesId: options.timeseriesId, pollutant: options.pollutant, start: options.start, end: options.end }, runtime: { node: process.version, zlib: process.versions.zlib, gzip_level: 9 }, r2_write_operations: 0, manifest: { path: manifestPath, sha256: sha256(manifestBody), byte_size: manifestBody.length }, export_wall_ms: performance.now() - started, export_cpu_ms: (cpu.user + cpu.system) / 1000, sources: results.map(({ rows: _rows, ...r }) => r), comparison };
+  const report = { schema_version: 2, captured_at_utc: new Date().toISOString(), selection: { timeseriesId: options.timeseriesId, pollutant: options.pollutant, start: options.start, end: options.end }, runtime: { node: process.version, zlib: process.versions.zlib, gzip_level: 9 }, r2_write_operations: 0, manifest: { path: manifestPath, sha256: sha256(manifestBody), byte_size: manifestBody.length }, export_wall_ms: performance.now() - started, export_cpu_ms: (cpu.user + cpu.system) / 1000, sources: results.map(({ rows: _rows, contextRows: _contextRows, ...r }) => r), comparison };
   await writeNew(options.output, "comparison.json", canonicalJson(report));
   await writeNew(options.output, "comparison.md", markdownReport(report));
   console.log(`Local comparison: ${path.join(options.output, "comparison.md")}`);

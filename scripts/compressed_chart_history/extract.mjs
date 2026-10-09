@@ -118,11 +118,14 @@ export async function extractGeneration(version, options) {
   const stats = { rows_decoded: 0, row_groups_decoded: 0, selected_timestamp_value_column_bytes: 0, decode_wall_ms: 0, physical_schemas: new Map() };
   const days = [];
   const rows = [];
+  const contextRows = [];
+  const contextDays = [];
   try {
     const bindingKey = `${generation.timeseries_binding_index_prefix}/timeseries_id=${options.timeseriesId}.json`;
     const binding = await reader.json(bindingKey);
     check(binding, `${version} authoritative binding unavailable`);
     check([1, 2].includes(binding.schema_version) && binding.index_kind === "timeseries_binding" && binding.connector_id === 1 && binding.timeseries_id === options.timeseriesId && binding.pollutant_code === options.pollutant && integer(binding.station_id), "Binding does not identify selected physical AURN timeseries");
+    check(!binding.continuity, "Pilot physical sample has a continuity binding; logical member export is required before publication");
     // The current overlay applies only to v3. Retained v2 keeps its own legacy
     // semantics; this difference is evidence, not something to harmonise away.
     const bucket = { get: async (key) => {
@@ -130,7 +133,9 @@ export async function extractGeneration(version, options) {
       return object ? { arrayBuffer: async () => new Uint8Array(object.body).slice().buffer } : null;
     } };
     const authority = version === "v3" ? await loadObservationVerificationAuthority({ bucket, connectorId: 1 }) : null;
-    for (const day of daysBetween(options.start, options.end)) {
+    for (const day of daysBetween(options.contextStart || options.start, options.end)) {
+      const isContextDay = `${day}T00:00:00.000Z` < options.start;
+      const dayList = isContextDay ? contextDays : days;
       const suffix = `day_utc=${day}/connector_id=1/pollutant_code=${options.pollutant}`;
       const indexKey = `${generation.observations_timeseries_index_prefix}/${suffix}/manifest.json`;
       const canonicalKey = `${generation.observations_prefix}/${suffix}/manifest.json`;
@@ -138,7 +143,7 @@ export async function extractGeneration(version, options) {
       const canonical = await reader.json(canonicalKey);
       if (!index || !canonical) {
         const state = index ? "unknown_missing_source_scope" : await proveMissingScope(reader, generation, day, options.pollutant, canonical);
-        days.push({ day_utc: day, state, row_count: 0 });
+        dayList.push({ day_utc: day, state, row_count: 0 });
         continue;
       }
       validateScope(index, day, options.pollutant);
@@ -152,7 +157,7 @@ export async function extractGeneration(version, options) {
         const expectedCount = canonical.timeseries_row_counts?.[String(options.timeseriesId)];
         if (!descriptor) {
           check(expectedCount === undefined || Number(expectedCount) === 0, "Index omits canonical timeseries");
-          days.push({ day_utc: day, state: "authoritative_absence", row_count: 0 });
+          dayList.push({ day_utc: day, state: "authoritative_absence", row_count: 0 });
           continue;
         }
         const leafKey = `${generation.observations_timeseries_index_prefix}/${suffix}/timeseries_id=${String(options.timeseriesId).padStart(9, "0")}.json`;
@@ -174,20 +179,21 @@ export async function extractGeneration(version, options) {
       }
       const canonicalCount = canonical.timeseries_row_counts?.[String(options.timeseriesId)];
       if (canonicalCount !== undefined) check(dayRows.length === Number(canonicalCount), "Canonical timeseries row count mismatch");
-      const selected = dayRows.filter(([timestamp]) => timestamp >= options.start && timestamp < options.end);
-      rows.push(...selected);
-      check(rows.length <= 100_000, "Selected observation row budget exceeded");
-      days.push({ day_utc: day, state: dayRows.length ? "exported" : "authoritative_absence", row_count: selected.length });
+      const selected = dayRows.filter(([timestamp]) => timestamp >= (isContextDay ? options.contextStart : options.start) && timestamp < options.end);
+      (isContextDay ? contextRows : rows).push(...selected);
+      check(rows.length + contextRows.length <= 100_000, "Selected observation row budget exceeded");
+      dayList.push({ day_utc: day, state: dayRows.length ? "exported" : "authoritative_absence", row_count: selected.length });
     }
     await reader.checkStability();
     const compareText = (left, right) => left < right ? -1 : left > right ? 1 : 0;
     rows.sort((a, b) => compareText(a[0], b[0]) || a[1] - b[1] || compareText(JSON.stringify(a), JSON.stringify(b)));
+    contextRows.sort((a, b) => compareText(a[0], b[0]) || a[1] - b[1] || compareText(JSON.stringify(a), JSON.stringify(b)));
     const verificationEntry = authority?.manifest?.timeseries.find((entry) => entry.timeseries_id === options.timeseriesId) || null;
-    return finish({ state: days.every((day) => ["exported", "authoritative_absence"].includes(day.state)) ? "complete" : "incomplete", binding, rows, days, verification: { overlay_authoritative: authority?.overlay_authoritative || false, latest_identity: authority?.latest_identity || null, manifest_identity: authority?.manifest_identity || null, timeseries_entry: verificationEntry, legacy_status_rule: "existing AURN resolveLegacyVerificationStatus (persisted null remains null)" } });
+    return finish({ state: days.every((day) => ["exported", "authoritative_absence"].includes(day.state)) ? "complete" : "incomplete", binding, rows, days, contextRows, contextDays, verification: { overlay_authoritative: authority?.overlay_authoritative || false, latest_identity: authority?.latest_identity || null, manifest_identity: authority?.manifest_identity || null, timeseries_entry: verificationEntry, legacy_status_rule: "existing AURN resolveLegacyVerificationStatus (persisted null remains null)" } });
   } catch (error) {
     // Source errors contain only admitted keys/local validation messages. Never
     // serialize signed requests, upstream response bodies, env or error causes.
-    return finish({ state: "failed", error: error.message, rows: [], days });
+    return finish({ state: "failed", error: error.message, rows: [], days, contextRows: [], contextDays });
   }
   function finish(result) {
     const cpu = process.cpuUsage(cpuStarted);

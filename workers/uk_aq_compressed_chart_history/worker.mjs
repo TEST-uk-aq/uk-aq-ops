@@ -113,25 +113,39 @@ export default {
     if (route !== "/v1/manifest" && !range) return error(400, "pilot_range_invalid");
     const selectedPublication = await selected(env.UK_AQ_COMPRESSED_CHART_BUCKET, sampleId);
     if (!selectedPublication) return error(404, "pilot_publication_unavailable");
-    const { entry, object: descriptor } = selectedPublication;
+    const { entry } = selectedPublication;
+    const precomputed = selectedPublication.publication.schema_version === 2;
+    const descriptor = route === "/v1/aqi" && precomputed
+      ? selectedPublication.publication.aqi_object : selectedPublication.object;
     if (route !== "/v1/manifest" && url.searchParams.get("publication") !== entry.manifest_sha256) return error(409, "pilot_publication_changed");
     const id = requestId(request);
     console.log(JSON.stringify({ event: "compressed_chart_pilot_request", request_id: id,
       route, sample_id: sampleId, generation: sample.generation,
-      publication_sha256: entry.manifest_sha256, r2_reads: route === "/v1/manifest" ? 2 : 3 }));
+      publication_sha256: entry.manifest_sha256, aqi_source: precomputed ? "precomputed_compressed_json" : "request_time_calculated",
+      r2_reads: route === "/v1/manifest" ? 2 : 3 }));
     if (route === "/v1/manifest") return Response.json({ schema_version: 1, sample_id: sampleId,
       source_generation: sample.generation, publication_sha256: entry.manifest_sha256,
       identity: selectedPublication.publication.identity, interval: selectedPublication.publication.requested_interval,
+      source_evidence_sha256: selectedPublication.publication.evidence.sha256,
       object: { sha256: descriptor.sha256, json_sha256: descriptor.json_sha256,
-        byte_size: descriptor.byte_size, row_count: descriptor.row_count, coverage_days: descriptor.coverage_days } },
+        byte_size: descriptor.byte_size, row_count: descriptor.row_count, coverage_days: descriptor.coverage_days },
+      aqi_source: precomputed ? "precomputed_compressed_json" : "request_time_calculated",
+      aqi_object: precomputed ? { sha256: selectedPublication.publication.aqi_object.sha256,
+        json_sha256: selectedPublication.publication.aqi_object.json_sha256,
+        byte_size: selectedPublication.publication.aqi_object.byte_size,
+        row_count: selectedPublication.publication.aqi_object.row_count,
+        response_complete: selectedPublication.publication.aqi_object.response_complete,
+        algorithm_version: selectedPublication.publication.algorithm_version } : null },
     { headers: { ...jsonHeaders, "X-UK-AQ-Prototype-Request-ID": id,
       "X-UK-AQ-Prototype-R2-Reads": "2", "X-UK-AQ-Prototype-Cache": "BYPASS" } });
     const object = await env.UK_AQ_COMPRESSED_CHART_BUCKET.get(descriptor.key);
     if (!object || object.size !== descriptor.byte_size) return error(502, "pilot_object_unavailable");
-    if (route === "/v1/month") return new Response(object.body, { encodeBody: "manual", headers: {
+    if (route === "/v1/month" || precomputed) return new Response(object.body, { encodeBody: "manual", headers: {
       "Content-Type": "application/json", "Content-Encoding": "gzip", "Content-Length": String(object.size),
       "Cache-Control": "no-store", "X-UK-AQ-Prototype-Request-ID": id,
       "X-UK-AQ-Prototype-Publication": entry.manifest_sha256,
+      "X-UK-AQ-Prototype-Object-SHA256": descriptor.sha256,
+      "X-UK-AQ-Prototype-AQI-Source": precomputed ? "precomputed_compressed_json" : "request_time_calculated",
       "X-UK-AQ-Prototype-Compressed-Bytes": String(object.size), "X-UK-AQ-Prototype-R2-Reads": "3",
       "X-UK-AQ-Prototype-Cache": "BYPASS",
     } });

@@ -1,5 +1,21 @@
 # Stage 2B: Sleepercar TEST compressed chart-history pilot
 
+## Precomputed-AQI extension (repository preparation)
+
+The current code can publish paired schema-v2 observation/AQI gzip objects from
+a freshly exported, complete v3 September candidate. AQI completeness is
+independent of observation coverage; missing preceding PM context remains
+partial. The Worker streams the selected AQI gzip object for schema v2 and
+keeps the legacy request-time route for existing schema-v1 publications. The
+experimental viewer labels both modes. No remote export, publication, Worker
+deployment, Pages deployment or proxy activation follows from this code change.
+
+The original Stage 2B account below records the deployed observation-only
+pilot and its earlier operator setup. For this extension, regenerate the v3
+September candidate with the current exporter; do not reuse the earlier
+observation-only candidate if precomputed AQI is intended. Retain the current
+selector bytes before an authorised `--publish` so rollback can restore them.
+
 Status: **code prepared, not an operational deployment**. This is a TEST-only
 experiment. Authoritative requirements remain in
 `TEST-uk-aq/uk-aq-system-docs/system_docs/station_charts/compressed_history_json_test_prototype_contract.md`.

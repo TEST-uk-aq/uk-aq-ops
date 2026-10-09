@@ -7,7 +7,6 @@ export const COMPRESSED_CHART_SAMPLES = Object.freeze({
   "v2-2026-09-01": Object.freeze({ generation: "v2", start: "2026-09-01T00:00:00.000Z", end: "2026-09-02T00:00:00.000Z" }),
 });
 export const COMPRESSED_CHART_SHA256 = /^[0-9a-f]{64}$/;
-export const COMPRESSED_CHART_AQI_ALGORITHM = "aqilevels_hourly_v2";
 
 export function validateCompressedChartSelector(selector) {
   if (selector?.schema_version !== 1 || selector?.kind !== "uk_aq_compressed_chart_selector"
@@ -26,7 +25,7 @@ export function validateCompressedChartSelector(selector) {
 
 export function validateCompressedChartPublication(publication, sampleId) {
   const sample = Object.hasOwn(COMPRESSED_CHART_SAMPLES, sampleId) ? COMPRESSED_CHART_SAMPLES[sampleId] : null;
-  if (!sample || ![1, 2].includes(publication?.schema_version)
+  if (!sample || publication?.schema_version !== 1
     || publication?.kind !== "uk_aq_compressed_chart_publication"
     || publication?.publication_state !== "published_complete"
     || publication?.sample_id !== sampleId
@@ -39,7 +38,7 @@ export function validateCompressedChartPublication(publication, sampleId) {
     || publication?.requested_interval?.end_exclusive_utc !== sample.end
     || !Array.isArray(publication.objects) || publication.objects.length !== 1) return false;
   const object = publication.objects[0];
-  const observationValid = object.key === `${COMPRESSED_CHART_ROOT}/objects/connector_id=1/timeseries_id=212/generation=${sample.generation}/month_utc=2026-09/${object.sha256}.json.gz`
+  return object.key === `${COMPRESSED_CHART_ROOT}/objects/connector_id=1/timeseries_id=212/generation=${sample.generation}/month_utc=2026-09/${object.sha256}.json.gz`
     && COMPRESSED_CHART_SHA256.test(object.sha256 || "")
     && COMPRESSED_CHART_SHA256.test(object.json_sha256 || "")
     && Number.isSafeInteger(object.byte_size) && object.byte_size > 0 && object.byte_size <= 2 * 1024 * 1024
@@ -54,20 +53,4 @@ export function validateCompressedChartPublication(publication, sampleId) {
       return day?.day_utc === expected && ["exported", "authoritative_absence"].includes(day.state)
         && Number.isSafeInteger(day.row_count) && day.row_count >= 0 ? sum + day.row_count : NaN;
     }, 0) === object.row_count;
-  if (!observationValid) return false;
-  if (publication.schema_version === 1) return publication.aqi_object === undefined;
-  const aqi = publication.aqi_object;
-  return publication.algorithm_version === COMPRESSED_CHART_AQI_ALGORITHM
-    && COMPRESSED_CHART_SHA256.test(publication.evidence?.sha256 || "")
-    && aqi?.key === `${COMPRESSED_CHART_ROOT}/objects/connector_id=1/timeseries_id=212/generation=${sample.generation}/month_utc=2026-09/aqi.${aqi.sha256}.json.gz`
-    && COMPRESSED_CHART_SHA256.test(aqi.sha256 || "")
-    && COMPRESSED_CHART_SHA256.test(aqi.json_sha256 || "")
-    && Number.isSafeInteger(aqi.byte_size) && aqi.byte_size > 0 && aqi.byte_size <= 2 * 1024 * 1024
-    && Number.isSafeInteger(aqi.row_count) && aqi.row_count > 0 && aqi.row_count <= 744
-    && aqi.algorithm_version === COMPRESSED_CHART_AQI_ALGORITHM
-    && aqi.source_evidence_sha256 === publication.evidence.sha256
-    && aqi.month_utc === object.month_utc
-    && aqi.requested_start_utc === sample.start
-    && aqi.requested_end_exclusive_utc === sample.end
-    && typeof aqi.response_complete === "boolean";
 }

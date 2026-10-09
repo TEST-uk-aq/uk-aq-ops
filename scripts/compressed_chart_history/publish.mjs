@@ -12,6 +12,7 @@ import {
   COMPRESSED_CHART_SELECTOR_KEY as SELECTOR_KEY,
   COMPRESSED_CHART_SAMPLES as SAMPLES,
   COMPRESSED_CHART_SHA256 as DIGEST,
+  COMPRESSED_CHART_AQI_ALGORITHM as AQI_ALGORITHM,
   validateCompressedChartSelector,
   validateCompressedChartPublication,
 } from "../../workers/shared/uk_aq_compressed_chart_pilot.mjs";
@@ -78,9 +79,9 @@ export async function preparePublication({ candidatePath, sampleId }) {
   const candidateBytes = await fs.readFile(candidatePath);
   check(candidateBytes.length <= 64 * 1024 && new RegExp(`^candidate-manifest\\.${sha256(candidateBytes)}\\.json$`).test(path.basename(candidatePath)), "Candidate digest/path invalid");
   const candidate = JSON.parse(candidateBytes);
-  check(candidate.schema_version === 1 && candidate.kind === "uk_aq_chart_history_candidate_manifest"
+  check([1, 2].includes(candidate.schema_version) && candidate.kind === "uk_aq_chart_history_candidate_manifest"
     && candidate.publication_state === "local_only_not_published" && candidate.complete === true
-    && candidate.environment === "TEST" && candidate.export_schema_version === 1, "Candidate is not complete local TEST export");
+    && candidate.environment === "TEST" && candidate.export_schema_version === candidate.schema_version, "Candidate is not complete local TEST export");
   same(candidate.identity?.connector_id, 1, "Candidate connector");
   same(candidate.identity?.timeseries_id, 212, "Candidate timeseries");
   same(candidate.identity?.pollutant_code, "pm25", "Candidate pollutant");
@@ -119,8 +120,80 @@ export async function preparePublication({ candidatePath, sampleId }) {
   validateDays(source.days, sample, object.row_count);
   const gzipKey = `${ROOT}/objects/connector_id=1/timeseries_id=212/generation=${sample.generation}/month_utc=2026-09/${object.sha256}.json.gz`;
   const evidenceKey = `${ROOT}/evidence/${source.source_evidence.sha256}.json`;
+  let aqiObject = null, aqiUpload = null;
+  if (candidate.schema_version === 2) {
+    const descriptor = object.aqi;
+    check(safeObject(descriptor) && DIGEST.test(descriptor.sha256) && DIGEST.test(descriptor.json_sha256)
+      && descriptor.algorithm_version === AQI_ALGORITHM
+      && descriptor.source_evidence?.sha256 === source.source_evidence.sha256
+      && typeof descriptor.response_complete === "boolean", "Paired AQI descriptor invalid");
+    const aqiGzip = await fs.readFile(localPath(root, descriptor.path));
+    const aqiRaw = await fs.readFile(localPath(root, descriptor.json_path));
+    check(aqiGzip.length === descriptor.byte_size && aqiGzip.length <= 2 * 1024 * 1024
+      && sha256(aqiGzip) === descriptor.sha256 && aqiRaw.length === descriptor.json_byte_size
+      && sha256(aqiRaw) === descriptor.json_sha256 && gunzipSync(aqiGzip).equals(aqiRaw),
+    "Paired AQI bytes/digests invalid");
+    const aqi = JSON.parse(aqiRaw);
+    check(canonicalJson(aqi).equals(aqiRaw) && aqi.schema_version === 2
+      && aqi.kind === "uk_aq_compressed_chart_aqi_month"
+      && JSON.stringify(aqi.identity) === JSON.stringify(month.identity)
+      && aqi.source?.generation === sample.generation
+      && aqi.source?.bucket === month.source.bucket
+      && aqi.source?.source_evidence?.sha256 === source.source_evidence.sha256
+      && aqi.source?.algorithm_version === AQI_ALGORITHM
+      && aqi.coverage?.requested_start_utc === sample.start
+      && aqi.coverage?.requested_end_exclusive_utc === sample.end
+      && aqi.coverage?.response_complete === descriptor.response_complete
+      && JSON.stringify(aqi.coverage?.context_days) === JSON.stringify(evidenceJson.context_days || [])
+      && JSON.stringify(source.context_days || []) === JSON.stringify(evidenceJson.context_days || [])
+      && aqi.aqi?.algorithm_version === AQI_ALGORITHM
+      && aqi.aqi?.calculation_source === "calculated_from_observations"
+      && aqi.aqi?.publication_source === "precomputed_compressed_json"
+      && aqi.aqi?.response_complete === descriptor.response_complete
+      && Array.isArray(aqi.aqi?.rows) && aqi.aqi.rows.length === descriptor.row_count
+      && Array.isArray(aqi.coverage?.daily_batches)
+      && aqi.coverage.daily_batches.length === month.coverage.days.length
+      && aqi.coverage.daily_batches.every((batch, index) => batch.day_utc === month.coverage.days[index].day_utc
+        && batch.output_start_utc === new Date(Date.parse(sample.start) + index * 86_400_000).toISOString()
+        && batch.output_end_exclusive_utc === new Date(Math.min(Date.parse(sample.start) + (index + 1) * 86_400_000, Date.parse(sample.end))).toISOString()
+        && typeof batch.context_complete === "boolean" && typeof batch.response_complete === "boolean"
+        && (!batch.response_complete || (batch.context_complete && batch.has_gap === false
+          && Array.isArray(batch.partial_reasons) && batch.partial_reasons.length === 0))
+        && Number.isSafeInteger(batch.row_count) && batch.row_count >= 0)
+      && aqi.coverage.daily_batches.reduce((sum, batch) => sum + batch.row_count, 0) === descriptor.row_count
+      && aqi.coverage.daily_batches.every((batch) => batch.response_complete) === descriptor.response_complete
+      && (!descriptor.response_complete || (aqi.aqi.has_gap === false
+        && Array.isArray(aqi.aqi.partial_reasons) && aqi.aqi.partial_reasons.length === 0)),
+    "Paired AQI source, identity or completeness invalid");
+    let previousHour = "";
+    for (const row of aqi.aqi.rows) {
+      check(row && row.connector_id === 1 && row.station_id === 248 && row.timeseries_id === 212
+        && row.pollutant_code === "pm25" && row.timestamp_hour_utc > previousHour
+        && row.timestamp_hour_utc >= sample.start && row.timestamp_hour_utc < sample.end
+        && row.period_end_utc === row.timestamp_hour_utc
+        && Date.parse(row.period_start_utc) === Date.parse(row.timestamp_hour_utc) - 3_600_000
+        && typeof row.daqi_calculation_status === "string"
+        && typeof row.eaqi_calculation_status === "string", "Paired AQI row invalid");
+      previousHour = row.timestamp_hour_utc;
+    }
+    for (const batch of aqi.coverage.daily_batches) {
+      const batchRows = aqi.aqi.rows.filter((row) => row.timestamp_hour_utc >= batch.output_start_utc
+        && row.timestamp_hour_utc < batch.output_end_exclusive_utc);
+      check(batchRows.length === batch.row_count && (!batch.response_complete ||
+        (batchRows.length === (Date.parse(batch.output_end_exclusive_utc) - Date.parse(batch.output_start_utc)) / 3_600_000
+          && batchRows.every((row) => row.daqi_calculation_status === "ok"
+            && row.eaqi_calculation_status === "ok"))), "Paired AQI daily completeness contradiction");
+    }
+    const aqiKey = `${ROOT}/objects/connector_id=1/timeseries_id=212/generation=${sample.generation}/month_utc=2026-09/aqi.${descriptor.sha256}.json.gz`;
+    aqiObject = { key: aqiKey, byte_size: aqiGzip.length, sha256: descriptor.sha256,
+      json_sha256: descriptor.json_sha256, row_count: descriptor.row_count,
+      algorithm_version: AQI_ALGORITHM, source_evidence_sha256: source.source_evidence.sha256,
+      month_utc: "2026-09", requested_start_utc: sample.start,
+      requested_end_exclusive_utc: sample.end, response_complete: descriptor.response_complete };
+    aqiUpload = { key: aqiKey, body: aqiGzip, sha256: descriptor.sha256, contentType: "application/gzip" };
+  }
   const publication = {
-    schema_version: 1, kind: "uk_aq_compressed_chart_publication",
+    schema_version: candidate.schema_version, kind: "uk_aq_compressed_chart_publication",
     publication_state: "published_complete", sample_id: sampleId,
     identity: { connector_id: 1, timeseries_id: 212, station_id: 248, pollutant_code: "pm25" },
     source_generation: sample.generation,
@@ -131,12 +204,14 @@ export async function preparePublication({ candidatePath, sampleId }) {
       json_sha256: sha256(raw), row_count: object.row_count,
       month_utc: "2026-09", requested_start_utc: sample.start,
       requested_end_exclusive_utc: sample.end, coverage_days: month.coverage.days }],
+    ...(aqiObject ? { algorithm_version: AQI_ALGORITHM, aqi_object: aqiObject } : {}),
   };
   check(validateCompressedChartPublication(publication, sampleId), "Prepared publication shape invalid");
   const manifestBytes = canonicalJson(publication);
   const manifestKey = `${ROOT}/manifests/${sha256(manifestBytes)}.json`;
   return { sampleId, sample, publication, manifestBytes, manifestKey,
     upload: [{ key: gzipKey, body: gzip, sha256: sha256(gzip), contentType: "application/gzip" },
+      ...(aqiUpload ? [aqiUpload] : []),
       { key: evidenceKey, body: evidence, sha256: sha256(evidence), contentType: "application/json" },
       { key: manifestKey, body: manifestBytes, sha256: sha256(manifestBytes), contentType: "application/json" }] };
 }

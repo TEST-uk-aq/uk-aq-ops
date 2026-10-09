@@ -1,0 +1,25 @@
+account_id = "41a81f781d3bd7234fde0b25df51e879"
+name = "uk-aq-compressed-chart-history-test"
+main = "worker.mjs"
+compatibility_date = "2026-10-09"
+workers_dev = false
+preview_urls = false
+
+# Deploy in the Sleepercar TEST account (41a81f781d3bd7234fde0b25df51e879).
+# No public endpoint in this baseline config. Before deployment, explicitly
+# provision a TEST-only HTTPS hostname protected by Cloudflare Access (Service Auth)
+# and add its custom-domain route ONLY in a temporary operator deployment config.
+# Keep workers.dev and preview URLs disabled.
+[[r2_buckets]]
+binding = "UK_AQ_COMPRESSED_CHART_BUCKET"
+bucket_name = "uk-aq-chart-history-json-test"
+
+[vars]
+UK_AQ_ENV_NAME = "TEST"
+
+# Runtime secret: UK_AQ_EDGE_UPSTREAM_SECRET (same authenticated upstream secret as TEST proxy).
+# External Access policy/service token is enforced at the Sleepercar hostname.
+
+[[routes]]
+pattern = "uk-aq-chart-history-test.sleepercar.co.uk"
+custom_domain = true

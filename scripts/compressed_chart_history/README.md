@@ -1,5 +1,24 @@
 # Stage 2A: bounded offline compressed chart-history export
 
+## Current precomputed-AQI extension (code prepared; deployment separate)
+
+The exporter now writes a schema-v2 candidate containing paired observation and
+precomputed AQI gzip JSON. It reads the preceding UTC day once from the same
+canonical generation, runs the shared station-history AQI implementation in
+non-overlapping UTC-day output batches, and records unresolved PM context as
+incomplete AQI. Observation export completeness remains independent. The
+publisher verifies both objects, evidence, source identity, daily status and
+digests before moving the existing publish-last selector. Published schema-v1
+single-object references remain readable and retain request-time AQI.
+
+The Stage 2A account below describes the original observation-only pilot and
+its historical measurements. Its statements that AQI is not exported and that
+the candidate is schema v1 apply to that earlier implementation only. For the
+current bounded September operation use `--generations v3` and a fresh output
+directory, then run `publish.mjs` first without `--publish` for local preflight.
+The retained v2 one-day sample remains diagnostic; do not export or publish a
+fabricated full September v2 month. No automatic publication is configured.
+
 This is a manually invoked, read-only TEST experiment. It creates local JSON,
 gzip, pinned-source evidence, a candidate manifest and a comparison report. It
 does not publish anything, modify canonical history/indexes/bindings, acquire
