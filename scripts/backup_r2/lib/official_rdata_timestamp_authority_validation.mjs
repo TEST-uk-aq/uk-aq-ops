@@ -8,6 +8,28 @@ const BASE_URLS = Object.freeze({
   waqn: "https://airquality.gov.wales/sites/default/files/openair/R_data/",
   saqn: "https://www.scottishairquality.scot/openair/R_data/",
 });
+const COMPARISON_FIELDS = [
+  "source_adapter", "site_code", "pollutant_code", "graph", "rdata",
+  "canonical", "europe_london_offset", "hour_convention",
+];
+const GRAPH_FIELDS = [
+  "original_timestamp", "interpreted_europe_london", "observed_at_utc", "value", "unit",
+];
+const RDATA_FIELDS = [
+  "source_url", "source_file_sha256", "object_name", "original_timestamp",
+  "source_timezone", "observed_at_utc", "value", "unit",
+];
+const CANONICAL_FIELDS = ["observed_at_utc", "value", "unit"];
+const TIMESTAMP_WITH_OFFSET =
+  /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2})$/u;
+const GMT_TIMESTAMP_WITHOUT_OFFSET =
+  /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?$/u;
+
+function hasExactFields(value, fields) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).length === fields.length
+    && fields.every((field) => Object.hasOwn(value, field));
+}
 
 export const OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT =
   "uk_aq_official_rdata_timestamp_authority_v2";
@@ -31,8 +53,15 @@ function canonical(value) {
 }
 
 function instant(value, { sourceGmt = false } = {}) {
-  let text = String(value || "");
-  if (sourceGmt && !/(?:Z|[+-]\d{2}:\d{2})$/u.test(text)) text += "Z";
+  if (typeof value !== "string" || !value) {
+    throw new Error("Official RData comparison timestamp is invalid or not hourly");
+  }
+  // Only an authenticated RData GMT source timestamp may omit its UTC offset.
+  const text = sourceGmt && GMT_TIMESTAMP_WITHOUT_OFFSET.test(value)
+    ? value + "Z" : value;
+  if (!TIMESTAMP_WITH_OFFSET.test(text)) {
+    throw new Error("Official RData comparison timestamp lacks an explicit timezone");
+  }
   const parsed = Date.parse(text);
   if (!Number.isFinite(parsed) || new Date(parsed).toISOString().slice(14) !== "00:00.000Z") {
     throw new Error("Official RData comparison timestamp is invalid or not hourly");
@@ -89,18 +118,24 @@ export function requireOfficialRdataTimestampAuthority(runState) {
     const graph = comparison?.graph;
     const rdata = comparison?.rdata;
     const target = comparison?.canonical;
-    const sourceUtc = instant(rdata?.observed_at_utc);
-    const canonicalUtc = instant(target?.observed_at_utc);
+    if (!hasExactFields(comparison, COMPARISON_FIELDS)
+        || !hasExactFields(graph, GRAPH_FIELDS)
+        || !hasExactFields(rdata, RDATA_FIELDS)
+        || !hasExactFields(target, CANONICAL_FIELDS)
+        || typeof graph.original_timestamp !== "string"
+        || !graph.original_timestamp) {
+      throw new Error("Official RData timestamp comparison shape is invalid");
+    }
+    const sourceUtc = instant(rdata.observed_at_utc);
+    const canonicalUtc = instant(target.observed_at_utc);
     const siteCode = String(comparison?.site_code || "");
     const year = new Date(sourceUtc).getUTCFullYear();
     const sourceFile = `${siteCode}_${year}.RData`;
     const offset = londonOffset(canonicalUtc);
-    if (!comparison || typeof comparison !== "object" || Array.isArray(comparison)
-        || comparison.source_adapter !== sourceAdapter
+    if (comparison.source_adapter !== sourceAdapter
         || !/^[A-Za-z0-9]+$/u.test(siteCode)
         || !POLLUTANTS.has(String(comparison.pollutant_code || ""))
         || comparison.hour_convention !== OFFICIAL_RDATA_HOUR_CONVENTION
-        || !graph || !rdata || !target
         || rdata.source_url !== BASE_URLS[sourceAdapter] + sourceFile
         || rdata.object_name !== sourceFile.replace(/\.RData$/u, "")
         || !SHA256.test(String(rdata.source_file_sha256 || ""))
