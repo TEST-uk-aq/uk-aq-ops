@@ -50,7 +50,7 @@ function mergePhysicalObservations(r2Rows, ingestRows, continuity) {
       };
       const existing = rows.get(normalized.observed_at);
       if (existing && (existing.timeseries_id !== normalized.timeseries_id || existing.value !== normalized.value)) throw new Error("station_history_continuity_observation_conflict");
-      if (!existing || normalized.source === "r2" || normalized.source === "json") rows.set(normalized.observed_at, normalized);
+      if (!existing || normalized.source === "r2") rows.set(normalized.observed_at, normalized);
     }
   }
   return [...rows.values()].sort((left, right) => left.observed_at.localeCompare(right.observed_at));
@@ -157,7 +157,7 @@ function missingRanges(expected, present) {
   }));
 }
 
-export async function buildCalculatedHistory({ request, continuity, env, outputStartMs, outputEndMs, ingestRows = [], ingestComplete = false, ingestFetchCount = 0, guideline = null, observationReadBudget = null, observationProvider = null } = {}) {
+export async function buildCalculatedHistory({ request, continuity, env, outputStartMs, outputEndMs, ingestRows = [], ingestComplete = false, ingestFetchCount = 0, guideline = null, observationReadBudget = null } = {}) {
   const includeObservations = request.includeObservations !== false;
   const contextHours = request.includeAqi && ["pm25", "pm10"].includes(request.pollutant) ? 23 : 0;
   const requiredStartMs = outputStartMs - contextHours * HOUR_MS;
@@ -166,22 +166,7 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
   const visibleSelection = selectContinuitySegments(continuity, outputStartMs, requiredEndExclusiveMs);
   if (!selection.segments.length) throw new Error("station_history_continuity_member_missing");
   let reads;
-  if (observationProvider) {
-    if (typeof observationProvider !== "function") throw new Error("station_history_observation_provider_invalid");
-    reads = [];
-    for (const segment of selection.segments) {
-      const result = await observationProvider({
-        identity: identityForSegment(segment),
-        startMs: segment.startMs,
-        endMs: segment.endMs,
-      });
-      if (!result || !Array.isArray(result.rows) || typeof result.response_complete !== "boolean"
-        || !Array.isArray(result.partial_reasons) || !Number.isSafeInteger(result.fetch_count)) {
-        throw new Error("station_history_observation_provider_result_invalid");
-      }
-      reads.push({ segment, result });
-    }
-  } else if (usesV3PhysicalObservationPages(env)) {
+  if (usesV3PhysicalObservationPages(env)) {
     const readBudget = observationReadBudget || createStationHistoryV3ReadBudget();
     reads = [];
     for (const segment of selection.segments) {
@@ -242,8 +227,7 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
   const sourceComplete = !readBudgetExceeded && (r2Complete || ingestComplete === true);
   const observationsComplete = includeObservations && sourceComplete && observationGaps.length === 0;
   const aqiStatusesComplete = !request.includeAqi || aqiRows.every((row) => row.daqi_calculation_status === "ok" && row.eaqi_calculation_status === "ok");
-  const aqiContextComplete = selection.gaps.length === 0
-    && (!observationProvider || reads.every((entry) => entry.result.context_complete !== false));
+  const aqiContextComplete = selection.gaps.length === 0;
   const aqiComplete = request.includeAqi && sourceComplete && aqiContextComplete && aqiGaps.length === 0 && aqiStatusesComplete;
   const observationPartialReasons = observationsComplete ? [] : Array.from(new Set([
     ...r2PartialReasons,
@@ -287,7 +271,7 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
       gap_ranges: observationGaps,
       partial_reasons: includeObservations ? observationPartialReasons : [],
       source_segments: sourceSegments,
-      source_counts: { r2: visibleRows.filter((row) => row.source === "r2").length, ingest: visibleRows.filter((row) => row.source === "ingest").length, ...(observationProvider ? { json: visibleRows.filter((row) => row.source === "json").length } : {}) },
+      source_counts: { r2: visibleRows.filter((row) => row.source === "r2").length, ingest: visibleRows.filter((row) => row.source === "ingest").length },
     },
     aqi: request.includeAqi ? {
       enabled: true,
@@ -305,10 +289,9 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
       source_counts: { calculated_from_observations: aqiRows.length },
     } : { enabled: false, calculation_source: null, rows: [], response_complete: false, has_gap: false, gap_ranges: [], partial_reasons: [] },
     source: {
-      mode: observationProvider ? "experimental_compressed_json_calculated_observations" : "continuity_calculated_observations",
+      mode: "continuity_calculated_observations",
       ingest_fetch_count: ingestFetchCount,
-      r2_observation_fetch_count: observationProvider ? 0 : reads.reduce((sum, entry) => sum + entry.result.fetch_count, 0),
-      ...(observationProvider ? { json_observation_fetch_count: reads.reduce((sum, entry) => sum + entry.result.fetch_count, 0) } : {}),
+      r2_observation_fetch_count: reads.reduce((sum, entry) => sum + entry.result.fetch_count, 0),
       required_context_start_utc: new Date(requiredStartMs).toISOString(),
       output_start_utc: new Date(outputStartMs).toISOString(),
       output_end_utc: new Date(outputEndMs).toISOString(),

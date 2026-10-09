@@ -19,7 +19,6 @@ export interface Env {
   UK_AQ_R2_HISTORY_VERSION: unknown;
   UK_AQ_ENV_NAME: unknown;
   STATION_HISTORY?: { fetch(input: Request | string, init?: RequestInit): Promise<Response> };
-  COMPRESSED_CHART_HISTORY?: { fetch(input: Request | string, init?: RequestInit): Promise<Response> };
   SUPABASE_URL: unknown;
   SB_PUBLISHABLE_DEFAULT_KEY: unknown;
   SB_SECRET_KEY: unknown;
@@ -539,12 +538,12 @@ export function addCorsHeaders(headers: Headers, requestOrigin: string | null, a
   headers.set("Access-Control-Allow-Methods", "GET,HEAD,POST,OPTIONS");
   headers.set(
     "Access-Control-Allow-Headers",
-    "Content-Type,If-None-Match,If-Modified-Since,X-UK-AQ-Bypass-Token,X-UK-AQ-Session-Init,X-UK-AQ-Prototype-Request-ID,CF-Turnstile-Token",
+    "Content-Type,If-None-Match,If-Modified-Since,X-UK-AQ-Bypass-Token,X-UK-AQ-Session-Init,CF-Turnstile-Token",
   );
   headers.set("Access-Control-Max-Age", "86400");
   headers.set(
     "Access-Control-Expose-Headers",
-    "CF-Cache-Status,ETag,X-UK-AQ-Cache,X-UK-AQ-Cache-Profile,X-UK-AQ-Timeseries-Source-Mode,X-UK-AQ-Has-Gap,X-UK-AQ-R2-Coverage-End,X-UK-AQ-Ingest-Tail-Start,X-UK-AQ-R2-Rows,X-UK-AQ-Ingest-Rows,X-UK-AQ-Cache-Key-Version,X-UK-AQ-Station-History-Cache-Key-Version,X-UK-AQ-Station-History-Cache-State,X-UK-AQ-Station-History-Cached-At,X-UK-AQ-Station-History-Fresh-Until,X-UK-AQ-Station-History-Stale-Until,X-UK-AQ-Station-History-Stale-Reason,X-UK-AQ-Prototype-Request-ID,X-UK-AQ-Prototype-Publication,X-UK-AQ-Prototype-Compressed-Bytes,X-UK-AQ-Prototype-R2-Reads,X-UK-AQ-Prototype-Cache,X-UK-AQ-Prototype-AQI-Wall-MS",
+    "CF-Cache-Status,ETag,X-UK-AQ-Cache,X-UK-AQ-Cache-Profile,X-UK-AQ-Timeseries-Source-Mode,X-UK-AQ-Has-Gap,X-UK-AQ-R2-Coverage-End,X-UK-AQ-Ingest-Tail-Start,X-UK-AQ-R2-Rows,X-UK-AQ-Ingest-Rows,X-UK-AQ-Cache-Key-Version,X-UK-AQ-Station-History-Cache-Key-Version,X-UK-AQ-Station-History-Cache-State,X-UK-AQ-Station-History-Cached-At,X-UK-AQ-Station-History-Fresh-Until,X-UK-AQ-Station-History-Stale-Until,X-UK-AQ-Station-History-Stale-Reason",
   );
   appendVary(headers, "Origin");
 }
@@ -2912,39 +2911,9 @@ export default {
       return makeErrorResponse(405, "method_not_allowed", requestOrigin, allowedOrigins);
     }
 
-    const prototypeMatch = /^\/api\/aq\/chart-history-prototype\/(manifest|month|aqi)$/.exec(url.pathname);
-    const upstreamFunction = prototypeMatch ? null : resolveUpstreamFunction(url.pathname);
-    if (!upstreamFunction && !prototypeMatch) {
+    const upstreamFunction = resolveUpstreamFunction(url.pathname);
+    if (!upstreamFunction) {
       return makeErrorResponse(404, "route_not_found", requestOrigin, allowedOrigins);
-    }
-
-    // This experimental endpoint always requires the real session cookie. The
-    // usual local-dev bypass and session-free read policies do not apply.
-    if (prototypeMatch) {
-      if (request.method !== "GET") return makeErrorResponse(405, "method_not_allowed", requestOrigin, allowedOrigins);
-      if (requestOrigin === null) return makeErrorResponse(400, "origin_required", requestOrigin, allowedOrigins);
-      if (!isOriginAllowed(requestOrigin, allowedOrigins)) return makeErrorResponse(403, "origin_not_allowed", requestOrigin, allowedOrigins);
-      const sessionToken = getCookieValue(request.headers.get("Cookie"), SESSION_COOKIE_NAME);
-      if (!sessionToken) return makeErrorResponse(401, "missing_session_cookie", requestOrigin, allowedOrigins);
-      const authCheck = await verifyAccessToken(sessionToken, tokenSecret, requestOrigin);
-      if (!authCheck.ok) return makeErrorResponse(401, authCheck.error, requestOrigin, allowedOrigins);
-      if (!env.COMPRESSED_CHART_HISTORY) return makeErrorResponse(503, "prototype_binding_unavailable", requestOrigin, allowedOrigins);
-      const secret = await readSecret(env.UK_AQ_EDGE_UPSTREAM_SECRET);
-      if (!secret) return makeErrorResponse(503, "prototype_auth_unavailable", requestOrigin, allowedOrigins);
-      const upstreamUrl = new URL(request.url);
-      upstreamUrl.pathname = `/v1/${prototypeMatch[1]}`;
-      const prototypeHeaders = new Headers({ "X-UK-AQ-Upstream-Auth": secret, Accept: "application/json" });
-      const requestId = request.headers.get("X-UK-AQ-Prototype-Request-ID");
-      if (requestId && /^[a-zA-Z0-9-]{1,64}$/.test(requestId)) prototypeHeaders.set("X-UK-AQ-Prototype-Request-ID", requestId);
-      let upstream: Response;
-      try { upstream = await env.COMPRESSED_CHART_HISTORY.fetch(new Request(upstreamUrl.toString(), { method: "GET", headers: prototypeHeaders })); }
-      catch { return makeErrorResponse(502, "prototype_upstream_unavailable", requestOrigin, allowedOrigins); }
-      const headers = new Headers(upstream.headers);
-      headers.delete("Set-Cookie");
-      headers.set("Cache-Control", "no-store");
-      addCorsHeaders(headers, requestOrigin, allowedOrigins);
-      const init = { status: upstream.status, headers, ...(headers.get("Content-Encoding") === "gzip" ? { encodeBody: "manual" as const } : {}) };
-      return new Response(upstream.body, init);
     }
 
     if (!isLocalDevRequest) {

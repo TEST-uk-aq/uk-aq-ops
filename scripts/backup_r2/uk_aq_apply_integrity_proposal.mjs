@@ -2746,15 +2746,19 @@ export async function applyValidatedProposal({
   env = process.env,
   generation = "v2",
   expectedExecutionPath = null,
+  generationEligibilityValidator = null,
   coordinatorFreezeValidator = null,
   localProposalValidator = null,
   finalProposalGraphValidator = null,
 }) {
+  const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
   if (generation === "v3") {
     if (env.UK_AQ_R2_HISTORY_VERSION !== "v3"
         || env.UK_AQ_R2_HISTORY_INDEX_VERSION !== "v3") {
       throw new Error("Generic fixed-v3 APPLY requires fixed v3 history and index authority");
     }
+  } else if (generationEligibilityValidator) {
+    generationEligibilityValidator({ runState, env, generation });
   } else {
     assertIntegrityApplyGenerationEligible(env);
   }
@@ -2777,17 +2781,16 @@ export async function applyValidatedProposal({
     putObject: adapters.putObject || r2PutObject,
   };
   const indexConfig = resolveR2HistoryIndexConfig(env);
-  const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
   if (expectedExecutionPath && runState.execution_path !== expectedExecutionPath) {
     throw new Error(`Canonical apply execution path mismatch: ${String(runState.execution_path)}`);
   }
   let sosLightV2CoordinatorFreeze;
   try {
-    if (
+    if (!coordinatorFreezeValidator && (
       ["waqn", "saqn"].includes(runState.official_rdata_source_adapter) ||
       (runState.changed_scopes?.OBSERVS_CHANGED || []).some((scope) =>
         [9, 10].includes(Number(scope?.connector_id)))
-    ) {
+    )) {
       throw new Error("Generic fixed-v2 official-RData APPLY authority is unavailable");
     }
     sosLightV2CoordinatorFreeze = coordinatorFreezeValidator

@@ -143,24 +143,9 @@ async function main() {
   const started = performance.now(), cpuStarted = process.cpuUsage();
   const options = parseOptions(process.argv.slice(2));
   const workspace = await fs.realpath(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../.."));
-  let existingParent = path.dirname(options.output);
-  const missingParts = [];
-  for (;;) {
-    try {
-      const resolved = await fs.realpath(existingParent);
-      existingParent = path.join(resolved, ...missingParts.reverse());
-      break;
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-      const parent = path.dirname(existingParent);
-      if (parent === existingParent) throw error;
-      missingParts.push(path.basename(existingParent));
-      existingParent = parent;
-    }
-  }
-  const outputParent = existingParent;
+  await fs.mkdir(path.dirname(options.output), { recursive: true });
+  const outputParent = await fs.realpath(path.dirname(options.output));
   check(outputParent !== workspace && !outputParent.startsWith(`${workspace}${path.sep}`), "Output must be outside repository workspace");
-  await fs.mkdir(outputParent, { recursive: true });
   options.output = path.join(outputParent, path.basename(options.output));
   await fs.mkdir(options.output, { mode: 0o700 }); // refuses reuse/overwrite
   const results = [], objects = [];
