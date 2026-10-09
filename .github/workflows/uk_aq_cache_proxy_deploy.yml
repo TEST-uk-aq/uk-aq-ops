@@ -21,6 +21,11 @@ on:
         required: false
         default: false
         type: boolean
+      diagnose_sleepercar_only:
+        description: "Check Sleepercar HTTP authentication only; deliberately abort before any Worker deployment"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -129,7 +134,7 @@ jobs:
           fi
 
       - name: Verify and enable optional Sleepercar compressed-chart HTTPS upstream
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.activate_compressed_chart_history }}
+        if: ${{ github.event_name == 'workflow_dispatch' && (inputs.activate_compressed_chart_history || inputs.diagnose_sleepercar_only) }}
         working-directory: workers/uk_aq_cache_proxy
         env:
           PILOT_ORIGIN: ${{ vars.UK_AQ_COMPRESSED_CHART_UPSTREAM_URL || '' }}
@@ -193,6 +198,10 @@ jobs:
             echo "Sleepercar pilot returned unexpected manifest identity."
             exit 1
           }
+          if [ "${{ inputs.diagnose_sleepercar_only }}" = "true" ]; then
+            echo "Sleepercar preflight succeeded; diagnostic-only run stops before any deployment."
+            exit 1
+          fi
           sed -i 's/^UK_AQ_COMPRESSED_CHART_ENABLED = "false"$/UK_AQ_COMPRESSED_CHART_ENABLED = "true"/' wrangler.deploy.toml
           grep -Fx 'UK_AQ_COMPRESSED_CHART_ENABLED = "true"' wrangler.deploy.toml >/dev/null
           echo "Validated Sleepercar pilot; HTTPS proxy enabled for this explicit deployment."
