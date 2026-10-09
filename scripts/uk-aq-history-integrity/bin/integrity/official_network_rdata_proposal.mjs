@@ -32,6 +32,12 @@ import {
   buildHistoryV2PollutantManifestKey,
 } from "../../../../workers/shared/uk_aq_r2_history_canonical.mjs";
 
+import {
+  OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS,
+  officialRdataAvailabilitySemanticIdentity,
+  officialRdataPreservedBaselineSemanticIdentity,
+} from "../../../../scripts/backup_r2/lib/official_rdata_semantic_projection.mjs";
+
 function sha256(body) {
   return crypto.createHash("sha256").update(body).digest("hex");
 }
@@ -76,82 +82,6 @@ const OFFICIAL_RDATA_ACQUISITION_AUDIT_CONTRACT_VERSION = 1;
 const OFFICIAL_RDATA_TIMESTAMP_MAPPING =
   "rdata_posixct_gmt_instant_to_observed_at_utc";
 
-const OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS = Object.freeze([
-  "schema_version",
-  "semantic_evidence_contract",
-  "source_adapter",
-  "day_utc",
-  "connector_id",
-  "source_file_identities_sha256",
-  "requested_pollutant_set",
-  "contract",
-  "evidence_contract_version",
-  "history_generation",
-  "source_label_registry_snapshot_content_sha256",
-  "authoritative_station_timeseries_mapping_sha256",
-  "sos_site_ref_bridge_mapping_identity",
-  "sos_site_ref_bridge_artifact_sha256",
-  "observed_property_mapping_sha256",
-  "source_artifact_availability_contract_version",
-  "source_artifact_availability_sha256",
-  "preserved_baseline_dependency_contract_version",
-  "preserved_baseline_dependency_sha256",
-  "rdata_decoder_contract_version",
-  "timestamp_mapping",
-  "observation_content_hash_contract_version",
-  "source_evidence_input_sha256",
-  "enumeration_complete",
-  "files_enumerated",
-  "files_required",
-  "files_read",
-  "files_authoritatively_absent",
-  "source_file_identities",
-  "source_records_examined",
-  "source_csv_records_scanned",
-  "canonical_rows_mapped",
-  "missing_binding_groups",
-  "missing_binding_rows",
-  "canonical_rows_file",
-  "canonical_rows_sha256",
-  "canonical_rows_bytes",
-  "total_rows",
-  "per_timeseries_counts",
-  "per_pollutant_counts",
-  "observation_content_hashes",
-  "pollutant_set",
-  "source_available_timeseries_ids",
-  "source_available_pollutant_codes",
-  "source_unavailable_timeseries_ids",
-  "source_unavailable_scopes",
-  "preserved_baseline_rows_file",
-  "preserved_baseline_rows_sha256",
-  "preserved_baseline_rows_bytes",
-  "preserved_baseline_row_count",
-  "preserved_baseline_identity",
-  "final_target_row_count",
-  "final_target_timeseries_row_counts",
-  "final_target_pollutant_counts",
-  "empty_final_target_pollutant_codes",
-  "final_target_observation_content_hashes",
-  "source_rows_before_canonical_dedupe",
-  "duplicate_rows_removed_by_canonical_normalisation",
-  "duplicate_canonical_row_count",
-  "duplicate_canonical_row_identity_samples",
-  "uncanonicalisable_source_row_count",
-  "source_adapter_blocked_row_count",
-  "source_adapter_blocked_row_samples",
-  "out_of_scope_source_adapter_blocked_row_count",
-  "blocked_row_count",
-  "blocked_row_samples",
-  "skipped_row_count",
-  "inactive_identity_rows_skipped",
-  "source_label_classification_counts",
-  "source_label_target_day_row_counts",
-  "source_label_summary",
-  "source_label_classifications",
-  "mapping_audit",
-  "source_verification_status_counts",
-]);
 
 function officialRdataV8SemanticEvidenceProjection(evidence) {
   const projection = {};
@@ -340,6 +270,14 @@ function main() {
       }
       continue;
     }
+    if (!sourceAvailablePollutantCodes.has(pollutantCode)) {
+      // A wholly unavailable selected pollutant remains pinned baseline content.
+      // It has no replacement object or deletion authority.
+      finalTargetObservationContentHashes[pollutantCode] = contentHashMetadata(
+        computeObservationContentHash(pollutantRows),
+      );
+      continue;
+    }
     let targetMetadata;
     let manifest;
     let manifestKey;
@@ -480,27 +418,14 @@ function main() {
     finalTargetPerPollutant[pollutantCode] = 0;
   }
   const contract = "pollutant_scoped_authoritative_connector_day_source_rows";
-  const sourceArtifactAvailabilityIdentity = (input.source_unavailable_scopes || [])
-    .map((scope) => ({
-      day_utc: String(scope.day_utc || ""),
-      site_code: String(scope.site_code || ""),
-      source_year: Number(scope.source_year || 0),
-      source_file_key: String(scope.source_file_key || ""),
-      pollutant_code: String(scope.pollutant_code || ""),
-      station_id: Number(scope.station_id || 0),
-      timeseries_id: Number(scope.timeseries_id || 0),
-      reason: String(scope.reason || ""),
-      canonical_url: String(scope.canonical_url || ""),
-      final_url: String(scope.final_url || ""),
-      http_status: Number(scope.http_status || 0),
-      raw_source_windows: scope.raw_source_windows || [],
-      canonical_unavailable_windows: scope.canonical_unavailable_windows || [],
-    }))
-    .sort((left, right) => compareCanonicalUtf8(canonicalJson(left), canonicalJson(right)));
-  const preservedBaselineIdentity = input.preserved_baseline_identity || {
-    source: "dropbox",
-    partition_identities: [],
-  };
+  // Build a semantic record before hashing; never change the projection of a
+  // previously persisted v8 record. Full request diagnostics remain in the audit.
+  const sourceArtifactAvailabilityIdentity = officialRdataAvailabilitySemanticIdentity(
+    input.source_unavailable_scopes || [],
+  );
+  const preservedBaselineIdentity = officialRdataPreservedBaselineSemanticIdentity(
+    input.preserved_baseline_identity || { source: "dropbox", partition_identities: [] },
+  );
   const preservedBaselineDependencySha256 = sha256(Buffer.from(canonicalJson({
     preserved_baseline_identity: preservedBaselineIdentity,
     preserved_baseline_rows_sha256: sha256(preservedRowsBody),
