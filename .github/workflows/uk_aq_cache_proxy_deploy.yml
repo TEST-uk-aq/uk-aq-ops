@@ -201,7 +201,7 @@ jobs:
                 else
                   origin_category="unclassified_html"
                 fi
-                ray="$(awk 'tolower($1) == "cf-ray:" {gsub(/\\r/, "", $2); print $2; exit}' "${header_file}")"
+                ray="$(awk 'tolower($1) == "cf-ray:" {print $2; exit}' "${header_file}" | tr -d '\r')"
                 echo "Sleepercar preflight rejected: HTTP ${http_status}; response type ${content_type:-unknown}; category ${origin_category}; CF-Ray ${ray:-unavailable}."
                 ;;
             esac
