@@ -11408,6 +11408,36 @@ def _sos_source_counts_for_v2_partition(
     )
 
 
+def _v2_detector_pollutants_for_connector(
+    source_scope: Mapping[str, Any] | None,
+    connector_id: int,
+) -> frozenset[str]:
+    """Use the acquired RData scope; other v2 sources retain generic coverage."""
+    official_sources = [
+        source_key for source_key in _source_keys_for_scope(source_scope)
+        if source_key in OFFICIAL_RDATA_NETWORKS
+        and OFFICIAL_RDATA_NETWORKS[source_key].connector_id == connector_id
+    ]
+    if not official_sources:
+        return V2_OBSERVATION_INTEGRITY_POLLUTANTS
+    if len(official_sources) != 1:
+        raise RuntimeError("official RData source scope is ambiguous")
+    context = OFFICIAL_RDATA_RUN_CONTEXTS.get(official_sources[0])
+    if context is None:
+        raise RuntimeError("official RData acquisition context is missing")
+    if (
+        context.get("source_key") != official_sources[0]
+        or int(context.get("connector_id") or 0) != connector_id
+    ):
+        raise RuntimeError("official RData acquisition context scope changed")
+    selected = frozenset(_normalise_repair_pollutants(
+        context.get("selected_pollutants")
+    ))
+    if not selected:
+        raise RuntimeError("official RData acquisition selected pollutant set is empty")
+    return selected
+
+
 def _current_source_counts_for_v2_partition(
     conn: sqlite3.Connection | None,
     *,
@@ -11477,6 +11507,10 @@ def _current_source_counts_for_v2_partition(
         if len(official_sources) != 1:
             raise RuntimeError("official RData source scope is ambiguous")
         official_source = official_sources[0]
+        if pollutant_code not in _v2_detector_pollutants_for_connector(
+            source_scope, connector_id
+        ):
+            raise RuntimeError("official RData pollutant is outside selected run scope")
         context = OFFICIAL_RDATA_RUN_CONTEXTS.get(official_source)
         if context is None:
             raise RuntimeError("official RData acquisition context is missing")
@@ -12342,7 +12376,9 @@ def run_v2_observations_integrity_checks(
         if cached is not None:
             return cached
         resolved: dict[str, dict[str, Any]] = {}
-        for pollutant_code in sorted(V2_OBSERVATION_INTEGRITY_POLLUTANTS):
+        for pollutant_code in sorted(_v2_detector_pollutants_for_connector(
+            source_scope, connector_id
+        )):
             _, evidence = _current_source_counts_for_v2_partition(
                 conn,
                 env_name=env_name,
@@ -12458,6 +12494,16 @@ def run_v2_observations_integrity_checks(
             continue
         for connector_dir in connector_dirs:
             connector_raw = connector_dir.name.split("=", 1)[1]
+            connector_id_for_detector = _connector_id_from_dirname(
+                connector_dir.name
+            )
+            detector_pollutants = (
+                _v2_detector_pollutants_for_connector(
+                    source_scope, connector_id_for_detector
+                )
+                if connector_id_for_detector is not None
+                else V2_OBSERVATION_INTEGRITY_POLLUTANTS
+            )
             pollutant_dirs = sorted(p for p in connector_dir.glob("pollutant_code=*") if p.is_dir())
             connector_level_parts = sorted(p for p in connector_dir.glob("part-*.parquet") if p.is_file())
             if connector_level_parts:
@@ -12485,7 +12531,7 @@ def run_v2_observations_integrity_checks(
                 continue
             for pollutant_dir in pollutant_dirs:
                 pollutant = pollutant_dir.name.split("=", 1)[1].strip().lower()
-                if pollutant not in V2_OBSERVATION_INTEGRITY_POLLUTANTS:
+                if pollutant not in detector_pollutants:
                     continue
                 checked += 1
                 partition_gap_start = len(gaps)
