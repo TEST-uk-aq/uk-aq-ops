@@ -9,6 +9,7 @@ import {
   officialRdataAvailabilitySemanticIdentity,
   officialRdataSha256,
 } from "./official_rdata_semantic_projection.mjs";
+import { authenticateOfficialRdataPinnedHierarchy } from "./official_rdata_pinned_hierarchy.mjs";
 
 const digest = (body) => createHash("sha256").update(body).digest("hex");
 const equal = (a, b) => canonical(a) === canonical(b);
@@ -69,46 +70,6 @@ function pinnedPath(root, key) {
     throw new Error("Official RData pinned object key is invalid");
   }
   return path.join(root, ...key.split("/"));
-}
-
-function authenticatePinnedHierarchy(runState, partition) {
-  const base = `history/${runState.history_generation || "v2"}/observations`;
-  const day = partition.day_utc;
-  const keys = [`${base}/_manifests/manifest.json`,
-    `${base}/_manifests/year=${day.slice(0, 4)}/manifest.json`,
-    `${base}/_manifests/year=${day.slice(0, 4)}/month=${day.slice(5, 7)}/manifest.json`,
-    `${base}/day_utc=${day}/manifest.json`,
-    `${base}/day_utc=${day}/connector_id=${partition.connector_id}/manifest.json`,
-    partition.manifest_key];
-  let parent = null;
-  for (let index = 0; index < keys.length; index += 1) {
-    const local = pinnedPath(runState.base_dropbox_root, keys[index]);
-    const fields = index <= 3 ? ["children"] : index === 4
-      ? ["connector_manifests", "child_manifests"] : ["pollutant_manifests", "child_manifests"];
-    const references = parent ? fields.flatMap((field) => parent[field] || [])
-      .filter((entry) => entry.manifest_key === keys[index]) : [];
-    if (!fs.existsSync(local)) {
-      if (!parent || references.length || partition.baseline_state !== "partition_absent"
-          || keys.slice(index).some((key) => fs.existsSync(pinnedPath(runState.base_dropbox_root, key)))) {
-        throw new Error("Official RData pinned hierarchy does not prove baseline absence");
-      }
-      return;
-    }
-    const payload = JSON.parse(fs.readFileSync(local, "utf8"));
-    if (parent) {
-      const field = index < 3 ? "content_hash" : "manifest_hash";
-      if (references.length !== 1 || references[0][field] !== payload[field]
-          || !/^[a-f0-9]{64}$/.test(String(payload[field] || ""))) {
-        throw new Error("Official RData pinned hierarchy identity changed");
-      }
-    } else if (payload.content_hash !== runState.dropbox_currentness?.checkpoint?.observations_processed_source_root_hash) {
-      throw new Error("Official RData preservation root differs from accepted checkpoint");
-    }
-    parent = payload;
-  }
-  if (partition.baseline_state !== "partition_present") {
-    throw new Error("Official RData baseline absence contradicts pinned hierarchy");
-  }
 }
 
 export async function validateOfficialRdataPreservationDependencies({ runState, source }) {
@@ -206,7 +167,7 @@ export async function validateOfficialRdataPreservationDependencies({ runState, 
           [...new Set(partitionScopes.map((scope) => scope.timeseries_id))].sort((a, b) => a - b))) {
       throw new Error("Official RData preservation partition escaped authority");
     }
-    authenticatePinnedHierarchy(runState, partition);
+    authenticateOfficialRdataPinnedHierarchy(runState, partition);
     const baselineRows = [];
     const objects = new Map(partition.object_identities.map((item) => [item.object_key, item]));
     if (objects.size !== partition.object_identities.length) throw new Error("Duplicate preserved baseline object");
@@ -232,6 +193,58 @@ export async function validateOfficialRdataPreservationDependencies({ runState, 
     if (selectedBaseline.length !== partition.preserved_row_count
         || !equal(encoded(selectedBaseline), encoded(preserved.filter((row) => row.pollutant_code === partition.pollutant_code)))) {
       throw new Error("Official RData preserved rows differ from authenticated baseline");
+    }
+  }
+  const targetStatus = new Map();
+  for (const row of [...sourceRows, ...preserved]) {
+    const identity = `${row.timeseries_id}|${new Date(row.observed_at_utc).toISOString()}`;
+    if (targetStatus.has(identity)) throw new Error("Official RData final target has duplicate observation identity");
+    targetStatus.set(identity, row.verification_status);
+  }
+  for (const pollutantCode of evidence.source_available_pollutant_codes) {
+    const prefix = `history/v2/observations/day_utc=${evidence.day_utc}`
+      + `/connector_id=${evidence.connector_id}/pollutant_code=${pollutantCode}`;
+    const manifestKey = `${prefix}/manifest.json`;
+    const manifestPath = pinnedPath(runState.base_dropbox_root, manifestKey);
+    const exists = fs.statSync(manifestPath, { throwIfNoEntry: false })?.isFile() === true;
+    authenticateOfficialRdataPinnedHierarchy(runState, {
+      day_utc: evidence.day_utc, connector_id: evidence.connector_id,
+      pollutant_code: pollutantCode, manifest_key: manifestKey,
+      baseline_state: exists ? "partition_present" : "partition_absent",
+    });
+    if (!exists) continue;
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    if (!Array.isArray(manifest.files)) throw new Error("Official RData ratification baseline files are invalid");
+    const expected = new Set();
+    const baselineRows = [];
+    for (const file of manifest.files) {
+      if (typeof file?.key !== "string" || !/^part-\d+\.parquet$/.test(file.key.slice(prefix.length + 1))
+          || !file.key.startsWith(`${prefix}/`) || expected.has(file.key)) {
+        throw new Error("Official RData ratification baseline file closure is invalid");
+      }
+      expected.add(file.key);
+      const body = fs.readFileSync(pinnedPath(runState.base_dropbox_root, file.key));
+      if (body.byteLength !== file.bytes || digest(body) !== file.etag_or_hash) {
+        throw new Error("Official RData ratification baseline bytes changed");
+      }
+      baselineRows.push(...await readCanonicalObservationRows({ body, connectorId: evidence.connector_id }));
+    }
+    const actual = new Set(fs.readdirSync(pinnedPath(runState.base_dropbox_root, prefix))
+      .filter((name) => name.startsWith("part-") && name.endsWith(".parquet"))
+      .map((name) => `${prefix}/${name}`));
+    if (!equal([...expected].sort(), [...actual].sort())) {
+      throw new Error("Official RData ratification baseline file closure changed");
+    }
+    for (const row of baselineRows) {
+      if (row.connector_id !== evidence.connector_id || row.pollutant_code !== pollutantCode
+          || String(row.observed_at_utc).slice(0, 10) !== evidence.day_utc) {
+        throw new Error("Official RData ratification baseline row escaped scope");
+      }
+      const identity = `${row.timeseries_id}|${new Date(row.observed_at_utc).toISOString()}`;
+      if (row.verification_status === "R" && targetStatus.has(identity)
+          && targetStatus.get(identity) !== "R") {
+        throw new Error("Official RData ratification boundary regressed");
+      }
     }
   }
 }

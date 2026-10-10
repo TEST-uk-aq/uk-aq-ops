@@ -13,6 +13,7 @@ import {
 import { validateIntegrityCoreSnapshotIdentity } from "./uk_aq_integrity_core_snapshot_identity.mjs";
 import { requireObservationsGlobalOperationLockContext } from "../../../workers/shared/uk_aq_r2_history_writer.mjs";
 import { validateOfficialRdataPreservationDependencies } from "./official_rdata_evidence_validation.mjs";
+import { authenticateOfficialRdataPinnedHierarchy } from "./official_rdata_pinned_hierarchy.mjs";
 import {
   canonicalTransitionFingerprintJson,
   coordinatorTransitionStateCommonFingerprintPayload,
@@ -166,28 +167,39 @@ function parsePreservedManifest(body, objectKey) {
 }
 
 function exactManifestReference(payload, fields, parentKey, childKey) {
-  const references = new Map();
+  const collections = [];
   for (const field of fields) {
-    const rawReferences = payload[field] || [];
+    const rawReferences = payload[field];
     if (!Array.isArray(rawReferences)) {
       throw new Error(`Generic fixed-v2 preserved parent references are invalid: ${parentKey}`);
     }
+    const references = new Map();
     for (const reference of rawReferences) {
       if (!reference || typeof reference !== "object" || Array.isArray(reference)) {
         throw new Error(`Generic fixed-v2 preserved parent reference is invalid: ${parentKey}`);
       }
       const manifestKey = String(reference.manifest_key || "");
       const manifestHash = String(reference.manifest_hash || "");
-      if (!manifestKey) continue;
-      if (references.has(manifestKey) && references.get(manifestKey) !== manifestHash) {
+      const parentPrefix = parentKey.slice(0, -"/manifest.json".length);
+      const expected = fields.includes("pollutant_manifests")
+        ? new RegExp(`^${parentPrefix}/pollutant_code=[a-z0-9_]+/manifest\\.json$`)
+        : new RegExp(`^${parentPrefix}/connector_id=[1-9]\\d*/manifest\\.json$`);
+      if (!expected.test(manifestKey) || !SHA256.test(manifestHash)
+          || references.has(manifestKey)) {
         throw new Error(
-          `Generic fixed-v2 preserved parent has contradictory child identity: ${parentKey} -> ${manifestKey}`,
+          `Generic fixed-v2 preserved parent has invalid child identity: ${parentKey} -> ${manifestKey}`,
         );
       }
-      references.set(manifestKey, manifestHash);
+      references.set(manifestKey, reference);
     }
+    collections.push(references);
   }
-  const manifestHash = references.get(childKey);
+  const canonicalEntries = (entries) => [...entries.entries()].sort(([a], [b]) => bytewise(a, b));
+  if (collections.slice(1).some((entries) => canonicalTransitionFingerprintJson(canonicalEntries(entries))
+      !== canonicalTransitionFingerprintJson(canonicalEntries(collections[0])))) {
+    throw new Error(`Generic fixed-v2 preserved parent child aliases disagree: ${parentKey}`);
+  }
+  const manifestHash = collections[0].get(childKey)?.manifest_hash;
   if (!SHA256.test(String(manifestHash || ""))) {
     throw new Error(
       `Generic fixed-v2 preserved parent lacks exact child reference: ${parentKey} -> ${childKey}`,
@@ -349,21 +361,14 @@ function derivePinnedMetadataDependencies(runState, { dayUtc, connectorId, pollu
   if (!fs.statSync(root, { throwIfNoEntry: false })?.isDirectory()) {
     throw new Error("Generic metadata-only pinned Dropbox root is unavailable");
   }
+  authenticateOfficialRdataPinnedHierarchy(runState, {
+    day_utc: dayUtc,
+    connector_id: connectorId,
+    pollutant_code: pollutantCode,
+    manifest_key: keys[5],
+    baseline_state: "partition_present",
+  });
   const bodies = keys.map((key) => fs.readFileSync(path.join(root, ...key.split("/"))));
-  const payloads = bodies.map((body, index) => parsePreservedManifest(body, keys[index]));
-  for (let index = 0; index < 5; index += 1) {
-    const field = index < 2 ? "content_hash" : "manifest_hash";
-    const referenceFields = index < 3 ? ["children"]
-      : index === 3 ? ["connector_manifests", "child_manifests"]
-        : ["pollutant_manifests", "child_manifests"];
-    const references = referenceFields.flatMap((name) => payloads[index][name] || [])
-      .filter((entry) => entry?.manifest_key === keys[index + 1]);
-    if (references.length !== 1
-        || !SHA256.test(String(payloads[index + 1][field] || ""))
-        || references[0][field] !== payloads[index + 1][field]) {
-      throw new Error(`Generic metadata-only pinned hierarchy disagrees: ${keys[index]} -> ${keys[index + 1]}`);
-    }
-  }
   return keys.map((key, index) => ({
     object_key: key,
     sha256: sha256(bodies[index]),
@@ -451,11 +456,19 @@ function canonicalScopeSourceAuthority(raw, {
   } else if (authority.authority_kind === "authenticated_wholly_source_unavailable") {
     const semanticSha = String(authority.semantic_authority_sha256 || "");
     delete authority.semantic_authority_sha256;
+    const metadataKey = `${authority.source_adapter}:metadata`;
+    const required = new Set(authority.files_required || []);
+    const read = new Set(authority.files_read || []);
+    const absent = new Set(authority.files_authoritatively_absent || []);
     if (outcome !== "source_artifact_unavailable_preserved"
         || !SHA256.test(semanticSha)
-        || !exactArray(authority.files_read, [])
-        || !Array.isArray(authority.files_required) || !authority.files_required.length
-        || !exactArray(authority.files_required, authority.files_authoritatively_absent)
+        || !Array.isArray(authority.files_required) || required.size !== authority.files_required.length
+        || !Array.isArray(authority.files_read) || !exactArray(authority.files_read, [metadataKey])
+        || read.size !== 1 || !required.has(metadataKey)
+        || !Array.isArray(authority.files_authoritatively_absent)
+        || absent.size !== authority.files_authoritatively_absent.length || !absent.size
+        || absent.has(metadataKey) || required.size !== read.size + absent.size
+        || [...required].some((key) => !read.has(key) && !absent.has(key))
         || !Array.isArray(authority.source_unavailable_timeseries_ids)
         || !authority.source_unavailable_timeseries_ids.length
         || !Array.isArray(authority.source_unavailable_scopes)
