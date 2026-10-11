@@ -294,6 +294,8 @@ test("candidate and connector gate completion persist identical source identity"
     sourceIdentity.source_content_hash_row_count,
   ]);
   assert.deepEqual(gateWrite.params.slice(8, 11), candidateWrite.params.slice(7, 10));
+  assert.equal(candidateWrite.params[10], "PRUNE_FIRST_DELETE_READY:v1");
+  assert.match(candidateWrite.sql, /last_error = \$11/);
 
   const completedGateCallCount = calls.length;
   const aqiResult = await runCandidateAqilevelsStageForTest({
@@ -346,6 +348,7 @@ function completeCandidate(dayUtc, connectorId, expectedRowCount, minObservedAt,
     max_observed_at: maxObservedAt,
     status: "complete",
     run_id: "previous-run",
+    last_error: "PRUNE_FIRST_DELETE_READY:v1",
     manifest_key: canonicalObservationConnectorManifestKey(dayUtc, connectorId),
     history_row_count: String(expectedRowCount),
     history_file_count: 1,
@@ -453,6 +456,38 @@ test("real candidate population invalidates only the connector gate whose comple
   assert.equal(gates.get(connectorDayGateKey(dayUtc, 1)), false);
 });
 
+test("identical legacy completed source is blocked when first-deletion state is unknown", async () => {
+  const dayUtc = "2026-07-21";
+  const candidate = completeCandidate(dayUtc, 7, 2, `${dayUtc}T00:00:00.000Z`, `${dayUtc}T01:00:00.000Z`);
+  candidate.last_error = null;
+  const queries = [];
+  const client = {
+    async query(sql, params = []) {
+      queries.push({ sql, params });
+      if (/select distinct op\.code/i.test(sql)) return { rows: [] };
+      if (/source_aggregates as/i.test(sql)) return { rows: [{
+        ...candidate, source_row_count: "2", excluded_row_count: "0", excluded_pollutant_counts: {},
+      }] };
+      if (/^begin isolation level repeatable read$|^commit$|^rollback$/i.test(sql.trim())) return { rows: [] };
+      if (/from uk_aq_ops\.history_candidates[\s\S]+for update/i.test(sql)) return { rows: [candidate] };
+      if (/select history_manifest_hash/i.test(sql)) return { rows: [{ history_manifest_hash: "a".repeat(64) }] };
+      if (/^update uk_aq_ops\.history_candidates/im.test(sql)) return { rows: [], rowCount: 1 };
+      if (/insert into uk_aq_ops\.prune_connector_day_gates/i.test(sql)) return { rows: [], rowCount: 1 };
+      throw new Error(`Unexpected candidate query: ${sql.slice(0, 80)}`);
+    },
+  };
+  const [blocked] = await populateBackupCandidatesForTest({
+    client, latestEligibleWindowEndIso: "2026-07-27T00:00:00.000Z",
+    runtime: { history_write_version: "v2" },
+  });
+  assert.equal(blocked.status, "failed");
+  assert.match(blocked.last_error, /^PRUNE_FIRST_DELETE_UNPROVEN:/);
+  assert.equal(JSON.parse(blocked.last_error.split("PRUNE_FIRST_DELETE_UNPROVEN:")[1]).previous_authority,
+    `${candidate.manifest_key}#${"a".repeat(64)}`);
+  assert.equal(queries.some(({ sql }) => /uk_aq_phase_b_history_rows_v2/i.test(sql)), false);
+  assert.equal(queries.some(({ sql }) => /insert into uk_aq_ops\.prune_connector_day_gates/i.test(sql)), true);
+});
+
 test("v3 candidate population reopens an old complete v2 row only when current source exists", async () => {
   const dayUtc = "2026-08-31";
   const connectorId = 2;
@@ -465,6 +500,7 @@ test("v3 candidate population reopens an old complete v2 row only when current s
     max_observed_at: `${dayUtc}T01:00:00.000Z`,
     status: "complete",
     run_id: "historical-v2-run",
+    last_error: "PRUNE_FIRST_DELETE_READY:v1",
     manifest_key: canonicalObservationConnectorManifestKey(dayUtc, connectorId, "v2"),
     history_row_count: "2",
     history_file_count: 1,
@@ -534,6 +570,42 @@ test("v3 candidate population reopens an old complete v2 row only when current s
   assert.equal(historicalOnlyQueries.length, 2);
   assert.match(historicalOnlyQueries[1], /from source_aggregates sa/i);
   assert.doesNotMatch(historicalOnlyQueries[1], /existing_complete\.day_utc is null/i);
+});
+
+test("v3 rediscovery reports a completed deletion when identical historical rows reappear", async () => {
+  const marker = "PRUNE_FIRST_DELETE_CONSUMED:" + JSON.stringify({
+    previous_authority: "history/v3/observations/connector-manifest#hash",
+    reason: "Original connector-day source was already deleted",
+    next_action: "review_reappeared_historical_rows_before_authorising_deletion",
+  });
+  const replayed = {
+    day_utc: "2026-08-31", connector_id: 2, expected_row_count: "2",
+    min_observed_at: "2026-08-31T00:00:00.000Z",
+    max_observed_at: "2026-08-31T01:00:00.000Z",
+    status: "failed", run_id: "original-v3-run", last_error: marker,
+    source_row_count: "2", excluded_row_count: "0", excluded_pollutant_counts: {},
+    resume_part_index: 0, resume_exported_row_count: "0", resume_parts_json: [],
+  };
+  const client = {
+    async query(sql) {
+      if (/select distinct op\.code/i.test(sql)) return { rows: [] };
+      if (/source_aggregates as/i.test(sql)) {
+        assert.match(sql, /from source_aggregates sa/);
+        assert.doesNotMatch(sql, /existing_complete\.day_utc is null/);
+        assert.match(sql, /status = 'complete'[\s\S]*PRUNE_FIRST_DELETE_CONSUMED/);
+        assert.match(sql, /when \([\s\S]*PRUNE_FIRST_DELETE_CONSUMED[\s\S]*then 'failed'/);
+        return { rows: [replayed] };
+      }
+      throw new Error(`Unexpected fake PostgreSQL query: ${sql.slice(0, 80)}`);
+    },
+  };
+  const [candidate] = await populateBackupCandidatesForTest({
+    client,
+    latestEligibleWindowEndIso: "2026-09-02T00:00:00.000Z",
+    runtime: { history_write_version: "v3" },
+  });
+  assert.equal(candidate.status, "failed");
+  assert.equal(candidate.last_error, marker);
 });
 
 test("v3 day finalization excludes only exact historical v2 completions", () => {
@@ -1465,55 +1537,62 @@ function phaseBConfig() {
 
 test("persisted historical block remains visible on rediscovery without a pending writer claim", async () => {
   for (const generation of ["v2", "v3"]) {
-    const blocked = {
-      day_utc: "2026-07-21", connector_id: 1, expected_row_count: "1",
-      min_observed_at: "2026-07-21T00:00:00.000Z",
-      max_observed_at: "2026-07-21T00:00:00.000Z",
-      status: "failed", run_id: "original-run",
-      last_error: "PRUNE_HISTORY_AUTHORITY_BLOCKED:" + JSON.stringify({
-        previous_authority: "canonical-connector#hash",
-        reason: "later IngestDB row conflicts with committed history",
-        next_action: "authorised_canonical_reconciliation_required",
-      }),
-      source_row_count: "1", excluded_row_count: "0", excluded_pollutant_counts: {},
-      resume_part_index: 0, resume_exported_row_count: "0", resume_parts_json: [],
-    };
-    let pendingFetches = 0;
-    let writerClaims = 0;
-    const client = {
-      async connect() {}, async end() {},
-      async query(sql) {
-        if (/^set (timezone|statement_timeout)/i.test(sql.trim())) return { rows: [] };
-        if (/select distinct op\.code/i.test(sql)) return { rows: [] };
-        if (/source_aggregates as/i.test(sql)) {
-          assert.match(sql, /last_error = case[\s\S]*PRUNE_HISTORY_AUTHORITY_BLOCKED/);
-          return { rows: [blocked] };
-        }
-        if (/insert into uk_aq_ops\.prune_day_gates/i.test(sql)) return { rows: [] };
-        if (/where c\.status = 'pending'/i.test(sql)) {
-          pendingFetches++;
-          return { rows: [] };
-        }
-        if (/set status = 'in_progress'/i.test(sql)) writerClaims++;
-        throw new Error(`Unexpected fake PostgreSQL query: ${sql.slice(0, 80)}`);
-      },
-    };
-    const phaseB = {
-      ...phaseBConfig(), history_write_version: generation,
-      committed_prefix: `history/${generation}/observations`,
-      runs_prefix: `history/${generation}/_ops/observations/runs`,
-    };
-    const summary = await runPhaseBBackup({
-      dryRun: true, phaseB, ingestRetentionDays: 5, logStructured: () => {},
-      runId: `rediscovery-${generation}`, nowUtc: "2026-07-27T12:00:00.000Z",
-      createPgClient: () => client,
-    });
-    assert.equal(summary.status, "partial_attention_required");
-    assert.equal(summary.blocked_scope_count, 1);
-    assert.equal(summary.blocked_scopes_preview[0].previous_authority, "canonical-connector#hash");
-    assert.equal(summary.pending_candidates, 0);
-    assert.equal(pendingFetches, 1);
-    assert.equal(writerClaims, 0);
+    for (const marker of [
+      "PRUNE_HISTORY_AUTHORITY_BLOCKED:",
+      "PRUNE_FIRST_DELETE_CONSUMED:",
+      "PRUNE_FIRST_DELETE_UNPROVEN:",
+    ]) {
+      const blocked = {
+        day_utc: "2026-07-21", connector_id: 1, expected_row_count: "1",
+        min_observed_at: "2026-07-21T00:00:00.000Z",
+        max_observed_at: "2026-07-21T00:00:00.000Z",
+        status: "failed", run_id: "original-run",
+        last_error: marker + JSON.stringify({
+          previous_authority: "canonical-connector#hash",
+          reason: "later IngestDB row conflicts with committed history",
+          next_action: "authorised_canonical_reconciliation_required",
+        }),
+        source_row_count: "1", excluded_row_count: "0", excluded_pollutant_counts: {},
+        resume_part_index: 0, resume_exported_row_count: "0", resume_parts_json: [],
+      };
+      let pendingFetches = 0;
+      let writerClaims = 0;
+      const client = {
+        async connect() {}, async end() {},
+        async query(sql) {
+          if (/^set (timezone|statement_timeout)/i.test(sql.trim())) return { rows: [] };
+          if (/select distinct op\.code/i.test(sql)) return { rows: [] };
+          if (/source_aggregates as/i.test(sql)) {
+            assert.match(sql, /last_error = case[\s\S]*PRUNE_HISTORY_AUTHORITY_BLOCKED/);
+            assert.match(sql, /status = 'complete'[\s\S]*PRUNE_FIRST_DELETE_CONSUMED/);
+            return { rows: [blocked] };
+          }
+          if (/insert into uk_aq_ops\.prune_day_gates/i.test(sql)) return { rows: [] };
+          if (/where c\.status = 'pending'/i.test(sql)) {
+            pendingFetches++;
+            return { rows: [] };
+          }
+          if (/set status = 'in_progress'/i.test(sql)) writerClaims++;
+          throw new Error(`Unexpected fake PostgreSQL query: ${sql.slice(0, 80)}`);
+        },
+      };
+      const phaseB = {
+        ...phaseBConfig(), history_write_version: generation,
+        committed_prefix: `history/${generation}/observations`,
+        runs_prefix: `history/${generation}/_ops/observations/runs`,
+      };
+      const summary = await runPhaseBBackup({
+        dryRun: true, phaseB, ingestRetentionDays: 5, logStructured: () => {},
+        runId: `rediscovery-${generation}`, nowUtc: "2026-07-27T12:00:00.000Z",
+        createPgClient: () => client,
+      });
+      assert.equal(summary.status, "partial_attention_required");
+      assert.equal(summary.blocked_scope_count, 1);
+      assert.equal(summary.blocked_scopes_preview[0].previous_authority, "canonical-connector#hash");
+      assert.equal(summary.pending_candidates, 0);
+      assert.equal(pendingFetches, 1);
+      assert.equal(writerClaims, 0);
+    }
   }
 });
 

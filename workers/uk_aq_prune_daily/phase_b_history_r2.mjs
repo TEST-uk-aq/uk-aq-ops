@@ -3,6 +3,7 @@ import {
   runOperationalPruneDailyObservationHistoryV3RunFinalization,
 } from "../shared/uk_aq_observation_history_operational_writer_v3.mjs";
 import { admitPruneFrozenConnectorSnapshot, PruneCommittedHistoryGuardError } from "./committed_history_guard.mjs";
+import { FIRST_DELETE_READY, FIRST_DELETE_CONSUMED, FIRST_DELETE_UNPROVEN } from "./deletion_attempt_state.mjs";
 import { getObservationHistoryGeneration, resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes, assertObservationHistoryGenerationKey } from "../shared/uk_aq_observation_history_generation.mjs";
 import fs from "node:fs";
 import path from "node:path";
@@ -104,11 +105,21 @@ import {
 
 const ISOLATED_HISTORY_BLOCK = "PRUNE_HISTORY_AUTHORITY_BLOCKED:";
 const UNPROVEN_GATE_RECOVERY = "PRUNE_GATE_ONLY_RECOVERY_UNPROVEN:";
-const PERSISTENT_BLOCK_SQL = "(uk_aq_ops.history_candidates.status = 'failed' and (uk_aq_ops.history_candidates.last_error like 'PRUNE_HISTORY_AUTHORITY_BLOCKED:%' or uk_aq_ops.history_candidates.last_error like 'PRUNE_GATE_ONLY_RECOVERY_UNPROVEN:%'))";
+const PERSISTENT_BLOCK_SQL = `(
+  (uk_aq_ops.history_candidates.status = 'failed' and (
+    uk_aq_ops.history_candidates.last_error like '${ISOLATED_HISTORY_BLOCK}%'
+    or uk_aq_ops.history_candidates.last_error like '${UNPROVEN_GATE_RECOVERY}%'
+    or uk_aq_ops.history_candidates.last_error like '${FIRST_DELETE_CONSUMED}%'
+    or uk_aq_ops.history_candidates.last_error like '${FIRST_DELETE_UNPROVEN}%'
+  ))
+  or (uk_aq_ops.history_candidates.status = 'complete'
+      and uk_aq_ops.history_candidates.last_error like '${FIRST_DELETE_CONSUMED}%')
+)`;
 
 function blockedCandidateEvidence(candidate) {
   const value = String(candidate?.last_error || "");
-  const marker = [ISOLATED_HISTORY_BLOCK, UNPROVEN_GATE_RECOVERY].find((prefix) => value.startsWith(prefix));
+  const marker = [ISOLATED_HISTORY_BLOCK, UNPROVEN_GATE_RECOVERY, FIRST_DELETE_CONSUMED, FIRST_DELETE_UNPROVEN]
+    .find((prefix) => value.startsWith(prefix));
   if (!marker) return null;
   let evidence;
   try {
@@ -1386,6 +1397,35 @@ where day_utc = $1::date
   });
 }
 
+async function blockCompleteCandidateWithoutFirstDeleteProof(client, candidate) {
+  let marker = candidate.last_error;
+  if (!String(marker || "").startsWith(FIRST_DELETE_CONSUMED)) {
+    const gate = await client.query(`
+select history_manifest_hash
+from uk_aq_ops.prune_connector_day_gates
+where day_utc = $1::date and connector_id = $2::integer
+for update
+`, [candidate.day_utc, candidate.connector_id]);
+    const recordedHash = String(gate.rows[0]?.history_manifest_hash || "");
+    marker = `${FIRST_DELETE_UNPROVEN}${JSON.stringify({
+      previous_authority: `${candidate.manifest_key || "candidate_manifest_unavailable"}#${/^[0-9a-f]{64}$/.test(recordedHash) ? recordedHash : "unverified"}`,
+      reason: "Completed candidate has no durable first-deletion state; original rows and an identical later replay cannot be distinguished",
+      next_action: "review_original_deletion_evidence_before_authorising_historical_rows",
+    })}`;
+  }
+  const result = await client.query(`
+update uk_aq_ops.history_candidates
+set status = 'failed', last_error = $3, updated_at = now()
+where day_utc = $1::date and connector_id = $2::integer and status = 'complete'
+`, [candidate.day_utc, candidate.connector_id, marker]);
+  if (result.rowCount !== 1) throw new Error("Completed Prune candidate could not retain first-deletion block");
+  await setConnectorDayGateIncomplete(client, {
+    day_utc: candidate.day_utc,
+    connector_id: candidate.connector_id,
+  });
+  return { ...candidate, status: "failed", last_error: marker };
+}
+
 async function revalidateCompleteCandidateSourceIdentity(client, candidate, generation = "v2") {
   if (candidate.status !== "complete") return candidate;
   await client.query("begin isolation level repeatable read");
@@ -1400,6 +1440,7 @@ select
   max_observed_at,
   status,
   run_id,
+  last_error,
   manifest_key,
   history_row_count,
   history_file_count,
@@ -1423,6 +1464,11 @@ for update
     if (currentCandidate.status !== "complete") {
       await client.query("commit");
       return currentCandidate;
+    }
+    if (currentCandidate.last_error !== FIRST_DELETE_READY) {
+      const blocked = await blockCompleteCandidateWithoutFirstDeleteProof(client, currentCandidate);
+      await client.query("commit");
+      return blocked;
     }
     let currentIdentity;
     let failureReason = currentCandidate.manifest_key === canonicalObservationConnectorManifestKey(
@@ -2190,7 +2236,7 @@ update uk_aq_ops.history_candidates
 set
   status = 'complete',
   run_id = $3,
-  last_error = null,
+  last_error = $11,
   manifest_key = $4,
   history_row_count = $5,
   history_file_count = $6,
@@ -2219,6 +2265,7 @@ where day_utc = $1::date
       sourceIdentity.source_content_hash,
       sourceIdentity.source_content_hash_contract_version,
       sourceIdentity.source_content_hash_row_count,
+      FIRST_DELETE_READY,
     ],
   );
 }
