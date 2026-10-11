@@ -12332,6 +12332,7 @@ def run_v2_observations_integrity_checks(
     observation_total_pollutants: Iterable[str] | None = None,
     authenticated_empty_scopes: set[tuple[str, int, str]] | None = None,
     parent_authority_root: str | Path | None = None,
+    parent_authority_currentness: Mapping[str, Any] | None = None,
     removed_metadata_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     if not r2_history_root:
@@ -12478,55 +12479,47 @@ def run_v2_observations_integrity_checks(
                 return False
         return True
 
-    def parent_proves_absence(day_utc: str, connector_id: int | None) -> bool:
-        """Use committed parent references, never directory absence alone."""
+    def parent_proves_absence(
+        day_utc: str, connector_id: int, *, day_absence: bool = False,
+    ) -> bool:
+        """Authenticate the accepted pinned ancestor before accepting absence."""
         day_key = f"{data_prefix}/day_utc={day_utc}/manifest.json"
         connector_key = (
             f"{data_prefix}/day_utc={day_utc}/connector_id={connector_id}/manifest.json"
-            if connector_id is not None else None
         )
-        if day_key in removed_metadata_keys or connector_key in removed_metadata_keys:
-            return True
-        day_path = parent_root / day_key
+        target_key = day_key if day_absence else connector_key
+        selected = sorted(_v2_detector_pollutants_for_connector(
+            source_scope, connector_id
+        ))
+        if (not selected or not _official_rdata_source_for_connector(connector_id)
+                or not isinstance(parent_authority_currentness, Mapping)):
+            return False
+        pollutant_code = selected[0]
+        pollutant_key = (
+            f"{data_prefix}/day_utc={day_utc}/connector_id={connector_id}/"
+            f"pollutant_code={pollutant_code}/manifest.json"
+        )
+        removed = target_key in removed_metadata_keys
         try:
-            if day_path.is_file():
-                if connector_id is None:
-                    return False
-                payload = json.loads(day_path.read_text(encoding="utf-8"))
-                refs = payload.get("connector_manifests")
-                if not isinstance(refs, list) or refs != payload.get("child_manifests"):
-                    return False
-                expected = (
-                    f"{data_prefix}/day_utc={day_utc}/"
-                    f"connector_id={connector_id}/manifest.json"
-                )
-                return all(ref.get("manifest_key") != expected for ref in refs)
-            base = f"{data_prefix}/_manifests"
-            keys = [
-                f"{base}/manifest.json",
-                f"{base}/year={day_utc[:4]}/manifest.json",
-                f"{base}/year={day_utc[:4]}/month={day_utc[5:7]}/manifest.json",
-                day_key,
-            ]
-            previous = None
-            for index, key in enumerate(keys[:-1]):
-                path = parent_root / key
-                if previous is not None and not any(
-                    ref.get("manifest_key") == key
-                    for ref in previous["children"]
-                ):
-                    return all(not (parent_root / later).exists() for later in keys[index:])
-                if not path.is_file():
-                    return False
-                payload = json.loads(path.read_text(encoding="utf-8"))
-                if not isinstance(payload, dict) or not isinstance(payload.get("children"), list):
-                    return False
-                previous = payload
-            return previous is not None and not any(
-                ref.get("manifest_key") == day_key
-                for ref in previous["children"]
-            )
-        except (OSError, TypeError, ValueError, KeyError, AttributeError):
+            if (parent_root / target_key).is_file() != removed:
+                return False
+            _authenticate_official_rdata_pinned_hierarchy({
+                "history_generation": "v2",
+                "base_dropbox_root": str(parent_root),
+                "dropbox_currentness": parent_authority_currentness,
+            }, {
+                "day_utc": day_utc,
+                "connector_id": connector_id,
+                "pollutant_code": pollutant_code,
+                "manifest_key": pollutant_key,
+                "baseline_state": (
+                    "partition_present"
+                    if (parent_root / pollutant_key).is_file()
+                    else "partition_absent"
+                ) if removed else "partition_absent",
+            })
+            return True
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError, AttributeError):
             return False
 
     latest_path = root / latest_key
@@ -12555,6 +12548,23 @@ def run_v2_observations_integrity_checks(
                 if not _official_rdata_source_for_connector(connector_id):
                     continue
                 connector_rel = f"{day_rel}/connector_id={connector_id}"
+                index_day_rel = f"{index_prefix}/day_utc={day_utc}"
+                index_connector_rel = (
+                    f"{index_day_rel}/connector_id={connector_id}"
+                )
+                if (not day_dir.exists() and (root / index_day_rel).exists()):
+                    gaps.append(_v2_obs_gap(
+                        "orphan_index_day", day_utc=day_utc,
+                        connector_id=connector_id,
+                        expected_path=index_day_rel,
+                    ))
+                elif (not (root / connector_rel).exists()
+                      and (root / index_connector_rel).exists()):
+                    gaps.append(_v2_obs_gap(
+                        "orphan_index_connector", day_utc=day_utc,
+                        connector_id=connector_id,
+                        expected_path=index_connector_rel,
+                    ))
                 for code in _v2_detector_pollutants_for_connector(source_scope, connector_id):
                     data_manifest = root / connector_rel / f"pollutant_code={code}" / "manifest.json"
                     index_manifest_rel = (
@@ -12580,7 +12590,9 @@ def run_v2_observations_integrity_checks(
             else:
                 for connector_id in _expected_connector_ids(allowed_connector_ids):
                     if (source_proves_empty_connector(day_utc, connector_id)
-                            and parent_proves_absence(day_utc, None)):
+                            and parent_proves_absence(
+                                day_utc, connector_id, day_absence=True
+                            )):
                         continue
                     gaps.append(connector_scoped_gap(
                         "day_dir_missing",
@@ -13639,6 +13651,7 @@ def run_v2_post_repair_integrity_rechecks(
     observation_total_pollutants: Iterable[str] | None = None,
     authenticated_empty_scopes: set[tuple[str, int, str]] | None = None,
     parent_authority_root: str | Path | None = None,
+    parent_authority_currentness: Mapping[str, Any] | None = None,
     removed_metadata_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     """Re-run observation Integrity after repair."""
@@ -13658,6 +13671,7 @@ def run_v2_post_repair_integrity_rechecks(
         observation_total_pollutants=observation_total_pollutants,
         authenticated_empty_scopes=authenticated_empty_scopes,
         parent_authority_root=parent_authority_root,
+        parent_authority_currentness=parent_authority_currentness,
         removed_metadata_keys=removed_metadata_keys,
     )
     obs_status = str(post_obs.get("status") or "fail")
@@ -25792,17 +25806,37 @@ def run_v2_final_verification(
         observation_total_pollutants=repair_pollutants,
         authenticated_empty_scopes=admitted_empty_scopes,
         parent_authority_root=run_state.get("base_dropbox_root"),
+        parent_authority_currentness=run_state.get("dropbox_currentness"),
         removed_metadata_keys=admitted_removed_metadata_keys,
     )
     remaining_scopes: list[dict[str, Any]] = []
-    try:
-        apply_persistence_artifacts = verify_apply_persistence_artifacts(run_state)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    no_mutation_noop = bool(
+        run_state.get("execution_path") == "generic_integrity"
+        and run_state.get("official_rdata_source_adapter")
+        in OFFICIAL_RDATA_NETWORKS
+        and (run_state.get("generic_v2_noop_evidence") or {}).get("status")
+        == "converged_noop"
+        and (run_state.get("generic_v2_noop_evidence") or {}).get(
+            "canonical_mutation_required") is False
+        and not run_state.get("objects")
+        and not run_state.get("tombstone_prefixes")
+        and not (run_state.get("apply") or {}).get("persistence")
+    )
+    if no_mutation_noop:
         apply_persistence_artifacts = {
-            "status": "failed",
-            "error": str(exc),
+            "status": "verified_no_mutation",
+            "reason": "no_canonical_apply_or_mutation_journal_required",
         }
-    if require_remote_state and apply_persistence_artifacts.get("status") != "verified":
+    else:
+        try:
+            apply_persistence_artifacts = verify_apply_persistence_artifacts(run_state)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            apply_persistence_artifacts = {
+                "status": "failed",
+                "error": str(exc),
+            }
+    if (require_remote_state and apply_persistence_artifacts.get("status")
+            not in {"verified", "verified_no_mutation"}):
         remaining_scopes.append({
             "stage": "canonical_apply_persistence",
             "gap_type": "apply_persistence_artifact_verification_failed",
@@ -29818,6 +29852,138 @@ def _merge_preserved_observation_metadata_actions(
 
 
 
+def _admit_official_rdata_absent_empty_noop(
+    *, run_state: dict[str, Any], conn: sqlite3.Connection,
+    env_name: str, env: Mapping[str, str],
+    v2_observations: Mapping[str, Any], observations: dict[str, Any],
+    from_day: str, to_day: str, selected_days: Iterable[str] | None,
+    allowed_connector_ids: set[int] | None,
+    source_scope: Mapping[str, Any] | None,
+    repair_pollutants: Iterable[str] | None,
+) -> None:
+    """Build source-backed selected outcomes for an already empty pinned target."""
+    source_key = str(run_state.get("official_rdata_source_adapter") or "")
+    if source_key not in OFFICIAL_RDATA_NETWORKS or observations.get(
+        "selected_partition_outcomes"
+    ) or (v2_observations.get("gaps") or []) or v2_observations.get(
+        "repair_plan"
+    ) or v2_observations.get("status") != "ok" or run_state.get(
+        "objects"
+    ) or run_state.get("tombstone_prefixes") or run_state.get("blocked_scopes"):
+        return
+    hash_checks = v2_observations.get("observation_content_hash_checks") or {}
+    if (hash_checks.get("verified_partitions")
+            or hash_checks.get("zero_hash_checks_reason")
+            != "no_count_matching_readable_partitions"
+            or v2_observations.get("hash_check_candidates")):
+        return
+    context = OFFICIAL_RDATA_RUN_CONTEXTS.get(source_key)
+    if context is None:
+        return
+    connector_id = int(context["connector_id"])
+    selected = sorted(_v2_detector_pollutants_for_connector(
+        source_scope, connector_id
+    ))
+    requested = _normalise_repair_pollutants(repair_pollutants)
+    if (allowed_connector_ids != {connector_id}
+            or not selected or (requested and requested != selected)):
+        return
+    days = [day.isoformat() for day in _selected_dates_or_range(
+        from_day, to_day, selected_days
+    )]
+    if not days:
+        return
+    baseline = Path(str(run_state["base_dropbox_root"]))
+    index_prefix = "history/_index_v2/observations_timeseries"
+    for day_utc in days:
+        day_rel = f"day_utc={day_utc}"
+        connector_rel = f"{day_rel}/connector_id={connector_id}"
+        data_day = baseline / R2_HISTORY_V2_OBSERVATIONS_PREFIX / day_rel
+        data_connector = baseline / R2_HISTORY_V2_OBSERVATIONS_PREFIX / connector_rel
+        index_day = baseline / index_prefix / day_rel
+        index_connector = baseline / index_prefix / connector_rel
+        if ((not data_day.exists() and index_day.exists())
+                or (not data_connector.exists() and index_connector.exists())):
+            return
+        for code in selected:
+            _, source_evidence = _current_source_counts_for_v2_partition(
+                conn, env_name=env_name, source_scope=source_scope,
+                day_utc=day_utc, connector_id=connector_id,
+                pollutant_code=code,
+            )
+            eligible, _ = _official_rdata_observation_repair_eligibility(
+                source_evidence, day_utc=day_utc,
+                connector_id=connector_id, pollutant_code=code,
+            )
+            pollutant_prefix = (
+                f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
+                f"connector_id={connector_id}/pollutant_code={code}"
+            )
+            index_path = index_connector / f"pollutant_code={code}"
+            if (not eligible or source_evidence.get("source_partition_state")
+                    != "successful_empty" or source_evidence.get("source_rows") != 0
+                    or source_evidence.get("source_unavailable_scopes")
+                    or source_evidence.get("source_unavailable_timeseries_ids")
+                    or index_path.exists()):
+                return
+            _authenticate_official_rdata_pinned_hierarchy(run_state, {
+                "day_utc": day_utc, "connector_id": connector_id,
+                "pollutant_code": code,
+                "manifest_key": f"{pollutant_prefix}/manifest.json",
+                "baseline_state": "partition_absent",
+            })
+    stage_root = Path(str(run_state["overlay_root"]))
+    outcomes: list[dict[str, Any]] = []
+    for day_utc in days:
+        result = _prepare_official_rdata_proposal(
+            source_key=source_key, day_utc=day_utc,
+            connector_id=connector_id, selected_pollutants=selected,
+            stage_root=stage_root, env=env,
+        )
+        if result.get("status") != "ok":
+            raise ValueError("official RData empty no-op source worker failed")
+        evidence, rows = _load_complete_connector_day_source_evidence(
+            stage_root=stage_root, day_utc=day_utc,
+            connector_id=connector_id, repair_pollutants=selected,
+        )
+        target = _authenticate_official_rdata_final_target(
+            run_state=run_state, stage_root=stage_root,
+            evidence=evidence, source_rows=rows,
+        )
+        generated = stage_root / "generated-objects" / (
+            f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
+            f"connector_id={connector_id}"
+        )
+        if (target or rows or evidence.get("source_unavailable_scopes")
+                or evidence.get("source_unavailable_timeseries_ids")
+                or sorted(evidence.get("source_available_pollutant_codes") or [])
+                != selected
+                or sorted(evidence.get("empty_final_target_pollutant_codes") or [])
+                != selected
+                or (generated.exists() and any(
+                    path.is_file() for path in generated.rglob("*")
+                ))):
+            raise ValueError("official RData empty no-op target is incomplete")
+        persisted = _persist_complete_connector_day_source_evidence(
+            conn=conn, env_name=env_name,
+            evidence=evidence, canonical_rows=rows,
+        )
+        conn.commit()
+        outcomes.extend(_official_rdata_selected_partition_outcomes(
+            day_utc=day_utc, connector_id=connector_id,
+            pollutant_codes=selected, empty_pollutant_codes=selected,
+            validated_overlay_keys=[], created_tombstones=[],
+            source_evidence=evidence,
+            source_evidence_persistence=persisted,
+        ))
+    generated_root = stage_root / "generated-objects"
+    if (any(path.is_file() for path in generated_root.rglob("*"))
+            or run_state.get("objects") or run_state.get("tombstone_prefixes")):
+        raise ValueError("official RData empty no-op produced canonical mutations")
+    observations["selected_partition_outcomes"] = outcomes
+    observations["authoritative_no_data_replacements"] = len(outcomes)
+
+
 def run_v2_integrity_repair_flow(
     *,
     run_state: dict[str, Any],
@@ -29911,6 +30077,23 @@ def run_v2_integrity_repair_flow(
         explicit_selected_partitions=explicit_selected_partitions,
         proposal_staging=proposal_staging,
     )
+    if not dedicated_sos_historical_replacement:
+        try:
+            _admit_official_rdata_absent_empty_noop(
+                run_state=run_state, conn=conn, env_name=env_name, env=env,
+                v2_observations=v2_observations, observations=observations,
+                from_day=from_day, to_day=to_day, selected_days=selected_days,
+                allowed_connector_ids=allowed_connector_ids,
+                source_scope=source_scope, repair_pollutants=repair_pollutants,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+            observations["v2_observation_repairs_guard_failed"] = 1
+            record_blocked_scope(run_state, {
+                "stage": "generic_v2_empty_noop_evidence",
+                "reason": "authenticated_empty_noop_evidence_unavailable",
+                "error": _truncate_text(str(exc), 1200),
+            })
+            write_run_state(run_state)
     if proposal_staging is not None:
         proposal_staging.persist_checkpoint(
             phase="proposal_worker_complete",
@@ -35262,6 +35445,11 @@ def main(argv: list[str]) -> int:
                         v2_source_scope.get("connector_ids") or []
                     ),
                     observation_total_pollutants=args.repair_pollutants,
+                    parent_authority_root=r2_history_root,
+                    parent_authority_currentness=(
+                        dropbox_currentness
+                        if args.source in OFFICIAL_RDATA_NETWORKS else None
+                    ),
                 )
                 observation_hash_metrics = (
                     run_v2_observation_content_hash_checks(
