@@ -1,9 +1,97 @@
-# Managed JSONgen Stage 1 foundations
+# Managed JSONgen Stage 1 and read-only Stage 2 foundations
 
 This directory is an **inactive Node ESM library**, independent of the experimental
 `scripts/compressed_chart_history` publisher and its selector. There is no CLI,
 workflow, writer trigger, regeneration, bootstrap, deployment or serving integration.
 Do not invoke its R2 operations without separate operational authorisation.
+
+## Stage 2 read-only interfaces (code checks only)
+
+`inputs.mjs` reads exact immutable managed receipt and gzip NDJSON bundle keys
+from the private derived bucket. It enforces body, compression-output, row,
+record and scope limits, verifies compressed and plain SHA-256/lengths, rejects
+invalid UTF-8/NDJSON and uses the Stage 1 complete-scope validator. It preserves
+the original row values, millisecond UTC timestamps, multiplicity, physical
+identity, source status and effective P/R/null status. It does not average,
+round, fill gaps or infer an empty source. Receipt JSON must exactly equal the
+canonical Stage 1 JSON encoding. A checksum proves byte identity only.
+
+`canonical.mjs` performs a bounded read-only walk of the explicitly identified
+committed `history/v2/observations` or `history/v3/observations` root, year, month, day, connector and
+pollutant hierarchy. It reuses the existing aggregate and canonical child
+validators, checks immediate parent child hashes and alias agreement, and
+checks the index_v3 scoped manifest's canonical pollutant link and timeseries
+membership. The physical observations prefix is selected from the explicit
+**current** root reference and independently supplied current generation,
+then checked against the shared generation helper. The current root byte
+identity is verified; a receipt's historical root is never silently used as
+the current root. The prefix is never inferred
+from the v3 index label. It rereads pinned metadata before reporting a stable observation
+membership or parent-proven absence. A missing referenced child, root 404,
+GET failure, changed metadata or unsupported physical layout is unresolved.
+`index_v3` latest is never an authentication parent. This inspection is not a
+transactionally locked snapshot. It does not authenticate the separate
+verification/status or physical binding authority, so it cannot establish
+complete physical scope authority.
+The v3 physical route uses the shared exact-leaf metadata reader and verifies
+its scoped/leaf/aligned-manifest/shard chain back to the current canonical
+pollutant manifest. A missing selected root/generation remains unresolved.
+
+`reconcile.mjs` returns per-scope diagnostics for immutable input checks,
+metadata state, a parent-proven removal, scope dominance, PM following-month
+dependencies, missing registration from supplied retained writer outbox
+references after reading their immutable receipt bytes, and missing proof.
+Those receipts remain attestations, not independent writer proof. It can mark a populated publication superseded
+when current committed parents prove absence, or an empty publication superseded
+when current parents and v3 metadata prove presence. A changed pollutant hash
+alone does not prove that the particular physical timeseries was superseded.
+Independent scopes are reported separately and kept in the register. A current
+manifest identity match is only a diagnostic; it is not
+`CURRENT_AND_AUTHENTICATED`. No positive writer adapter exists, and all
+non-superseded scopes remain `RECONCILIATION_REQUIRED`. Complete registration
+coverage stays unknown without a durable complete writer outbox/frontier.
+Neither a CAS revision nor the set of registered receipts proves freshness.
+`registered_changes` remains intake, and no applied dependency or selection is
+advanced.
+
+The current writer boundary is unproven:
+
+- Prune creates the complete frozen source during the candidate write, uses it
+  for publication and connector verification, then deletes it in the candidate
+  loop before `finalizePublishedPhaseBConnectors()` validates final parent and
+  v3 index authority and completes candidate/gate state. The remaining compact
+  evidence is insufficient to authenticate a complete replacement bundle.
+  A later narrow writer change must retain and authenticate that exact complete
+  source through successful finalization before issuing a handover.
+- Integrity's final VERIFY checks source cache, resolved Dropbox/overlay,
+  upload/deletion, binding and final canonical state. The report alone is not
+  a byte-level complete replacement handover. The installed Pro runner and
+  original retained evidence need targeted inspection before an adapter can
+  bind complete final rows, removal/status/binding identity and bundle bytes.
+  Normal JSONgen readers never inspect SQLite, mutation journals or overlays.
+- The stable binding contract names
+  `history/_index_v2/timeseries_binding`, while the shared generation helper
+  routes the v3 generation to `history/_index_v3/timeseries_binding`. This
+  contract/runtime authority discrepancy needs an authoritative resolution.
+  Object existence at either prefix is not sufficient, and Stage 2 reports
+  binding authentication unresolved. No index_v2 observation fallback exists.
+
+Protective per-read limits: 256 KiB receipt, 16 MiB compressed bundle, 64 MiB
+uncompressed bundle, 128 scope records, 500,000 observation rows and 30 seconds
+per GET. Per inspection: 2 MiB per metadata object, 24 GETs and 60 seconds.
+Per reconciliation call: 16 retained receipts, eight scopes and 192 metadata
+GETs. These are provisional safety caps, not accepted throughput or retention
+policy. The Stage 1 control admission cap remains 4 MiB. Bundle sizing,
+receipt and unresolved handoff retention, immutable evidence retention,
+control growth and reconciliation batch scheduling still need an operational
+decision; unresolved evidence must not be deleted to fit a cap.
+
+The existing `selectManagedPublications()` remains disabled. No monthly JSON
+generation, selector transition, writer trigger, remote TEST operation, chart
+source change or deployment is part of Stage 2. Real TEST acceptance after a
+separately authorised deployment must exercise real final writer evidence,
+removals, overlapping writes, missing handoffs and metadata changes; the local
+deterministic checks are not that acceptance.
 
 ## Implemented and deliberately blocked
 
