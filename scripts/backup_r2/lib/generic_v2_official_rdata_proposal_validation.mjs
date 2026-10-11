@@ -685,9 +685,12 @@ function validatePersistedScopeSourceEvidence(runState, scope) {
     timestamp_mapping: evidence.timestamp_mapping,
   };
   const expected = Object.fromEntries(Object.keys(projection).map((key) => [key, authority[key]]));
+  // The current proposal audit is authenticated independently by
+  // validateOfficialRdataPreservationDependencies(). The authority ID/hash
+  // pair identifies the separately persisted detector audit and may differ
+  // when only run-scoped acquisition facts changed.
   if (semanticSha !== evidence.semantic_evidence_sha256
       || semanticSha !== authority.semantic_evidence_sha256
-      || authority.acquisition_audit_sha256 !== evidence.acquisition_audit_sha256
       || canonicalTransitionFingerprintJson(projection)
         !== canonicalTransitionFingerprintJson(expected)) {
     throw new Error("Generic fixed-v2 persisted source evidence changed before APPLY");

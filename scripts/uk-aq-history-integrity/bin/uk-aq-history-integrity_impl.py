@@ -15239,12 +15239,18 @@ def _official_rdata_bindings(
     dict[str, list[dict[str, Any]]],
 ]:
     """Resolve one authoritative active timeseries per site/pollutant."""
+    network = OFFICIAL_RDATA_NETWORKS.get(source_key)
+    if network is None:
+        raise ValueError(f"unsupported official RData source: {source_key}")
+    expected_connector_id = int(network.connector_id)
     rows = conn.execute(
         """
         SELECT
           UPPER(TRIM(l.source_location_id)),
           l.station_id,
           l.timeseries_id,
+          l.connector_id,
+          t.connector_id,
           LOWER(TRIM(m.observed_property_code)),
           m.observed_property_code_count,
           m.observed_property_codes,
@@ -15288,9 +15294,10 @@ def _official_rdata_bindings(
     excluded_rows: list[dict[str, Any]] = []
     mapping_defects: list[dict[str, Any]] = []
     for (
-        site_code, station_id, timeseries_id, pollutant_code, code_count,
-        observed_property_codes, phenomenon_label, phenomenon_source_label,
-        phenomenon_pollutant_label,
+        site_code, station_id, timeseries_id, lookup_connector_id,
+        timeseries_connector_id, pollutant_code, code_count,
+        observed_property_codes, phenomenon_label,
+        phenomenon_source_label, phenomenon_pollutant_label,
     ) in rows:
         code = str(pollutant_code or "").strip().lower()
         mapped_codes = sorted({
@@ -15307,6 +15314,20 @@ def _official_rdata_bindings(
             )
             if normalized in supported
         })
+        represented_codes = set(mapped_codes) | set(label_codes)
+        if code:
+            represented_codes.add(code)
+        if selected.intersection(represented_codes) and (
+            int(lookup_connector_id) != expected_connector_id
+            or int(timeseries_connector_id) != expected_connector_id
+        ):
+            raise RuntimeError(
+                f"{source_key} selected authoritative binding connector mismatch: "
+                f"site={site_code} timeseries={timeseries_id} "
+                f"expected={expected_connector_id} "
+                f"lookup={int(lookup_connector_id)} "
+                f"timeseries={int(timeseries_connector_id)}"
+            )
         identity = {
             "site_code": str(site_code),
             "station_id": int(station_id),
@@ -20595,8 +20616,12 @@ def _official_rdata_scope_source_evidence_authority(
     projection = _official_rdata_v8_semantic_evidence_projection(source_evidence)
     semantic_sha256 = _official_rdata_v8_semantic_evidence_sha256(source_evidence)
     source_input_sha256 = _source_evidence_input_sha256(source_evidence)
-    acquisition_sha256 = _official_rdata_v8_acquisition_audit_sha256(
+    proposal_acquisition_sha256 = _official_rdata_v8_acquisition_audit_sha256(
         source_evidence
+    )
+    persisted_acquisition_audit_id = persistence.get("acquisition_audit_id")
+    persisted_acquisition_sha256 = str(
+        persistence.get("acquisition_audit_sha256") or ""
     )
     if (
         str(source_evidence.get("semantic_evidence_sha256") or "")
@@ -20604,12 +20629,14 @@ def _official_rdata_scope_source_evidence_authority(
         or str(source_evidence.get("source_evidence_input_sha256") or "")
         != source_input_sha256
         or str(source_evidence.get("acquisition_audit_sha256") or "")
-        != acquisition_sha256
+        != proposal_acquisition_sha256
         or str(persistence.get("evidence_sha256") or "") != semantic_sha256
         or str(persistence.get("source_evidence_input_sha256") or "")
         != source_input_sha256
-        or str(persistence.get("acquisition_audit_sha256") or "")
-        != acquisition_sha256
+        or not isinstance(persisted_acquisition_audit_id, int)
+        or isinstance(persisted_acquisition_audit_id, bool)
+        or persisted_acquisition_audit_id <= 0
+        or not re.fullmatch(r"[0-9a-f]{64}", persisted_acquisition_sha256)
     ):
         raise ValueError("official RData persisted semantic evidence changed")
     pollutant_code = str(pollutant_code or "").strip().lower()
@@ -20634,8 +20661,8 @@ def _official_rdata_scope_source_evidence_authority(
         "evidence_id": int(persistence["evidence_id"]),
         "semantic_evidence_sha256": semantic_sha256,
         "source_evidence_input_sha256": source_input_sha256,
-        "acquisition_audit_id": int(persistence["acquisition_audit_id"]),
-        "acquisition_audit_sha256": acquisition_sha256,
+        "acquisition_audit_id": persisted_acquisition_audit_id,
+        "acquisition_audit_sha256": persisted_acquisition_sha256,
         "source_file_identities_sha256": str(
             projection["source_file_identities_sha256"]
         ),
