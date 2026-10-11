@@ -2,6 +2,7 @@ import {
   runOperationalPruneDailyObservationHistoryV3ConnectorPublication,
   runOperationalPruneDailyObservationHistoryV3RunFinalization,
 } from "../shared/uk_aq_observation_history_operational_writer_v3.mjs";
+import { admitPruneFrozenConnectorSnapshot, PruneCommittedHistoryGuardError } from "./committed_history_guard.mjs";
 import { getObservationHistoryGeneration, resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes, assertObservationHistoryGenerationKey } from "../shared/uk_aq_observation_history_generation.mjs";
 import fs from "node:fs";
 import path from "node:path";
@@ -3880,6 +3881,7 @@ async function writeFrozenCandidateObservationsToV2({
   candidate, runtime, streamClient, frozen, backedUpAtUtc = nowIso(),
   readFrozenRows = readFrozenSourceRows,
   connectorPublisher = runtime.history_write_version === "v3" ? publishFrozenV3Observations : publishFrozenV2Observations,
+  admitSnapshot = admitPruneFrozenConnectorSnapshot,
   cleanupFrozenSource = cleanupPhaseBTargetDaySourceTemp,
 }) {
   try {
@@ -3907,6 +3909,20 @@ async function writeFrozenCandidateObservationsToV2({
     }
     if (BigInt(rows.length) !== candidate.expected_row_count || rows.length === 0) {
       throw new Error(`Frozen source replay row count mismatch for day=${candidate.day_utc} connector=${candidate.connector_id}`);
+    }
+    if (runtime.history_write_version === "v3") {
+      const admission = await admitSnapshot({
+        r2: runtime.r2,
+        observationsPrefix: runtime.committed_prefix,
+        dayUtc: candidate.day_utc,
+        connectorId: candidate.connector_id,
+        rows,
+      });
+      logPhaseB(runtime, "INFO", "phase_b_history_v3_frozen_source_admitted", {
+        day_utc: candidate.day_utc,
+        connector_id: candidate.connector_id,
+        ...admission,
+      });
     }
     if (emitV3Diagnostics) {
       logPhaseB(runtime, "INFO", "phase_b_history_v3_frozen_source_replay_complete", {
@@ -6899,7 +6915,9 @@ export async function runPhaseBBackup({
           connector_id: candidate.connector_id,
           run_id: runId,
           error: message,
-          next_action: "retry_safe",
+          next_action: error instanceof PruneCommittedHistoryGuardError
+            ? "reconstruct_complete_connector_day_or_authorised_reconciliation"
+            : "retry_safe",
         });
         logStructured("ERROR", "phase_b_history_candidate_failed", {
           run_id: runId,
@@ -6913,7 +6931,9 @@ export async function runPhaseBBackup({
           error: message,
           ...errorLogFields(error),
           ...budgetSnapshot(runtime),
-          next_action: "retry_safe",
+          next_action: error instanceof PruneCommittedHistoryGuardError
+            ? "reconstruct_complete_connector_day_or_authorised_reconciliation"
+            : "retry_safe",
           prune_blocked_for_day: true,
         });
       }
