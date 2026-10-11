@@ -12330,10 +12330,16 @@ def run_v2_observations_integrity_checks(
     dedicated_sos_historical_replacement: bool = False,
     observation_total_connector_ids: Iterable[int] | None = None,
     observation_total_pollutants: Iterable[str] | None = None,
+    authenticated_empty_scopes: set[tuple[str, int, str]] | None = None,
+    parent_authority_root: str | Path | None = None,
+    removed_metadata_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     if not r2_history_root:
         raise RuntimeError("UK_AQ_R2_HISTORY_DROPBOX_ROOT is not set")
     root = Path(r2_history_root)
+    parent_root = Path(parent_authority_root) if parent_authority_root else root
+    authenticated_empty_scopes = authenticated_empty_scopes or set()
+    removed_metadata_keys = removed_metadata_keys or set()
     if not root.is_dir():
         raise RuntimeError(f"UK_AQ_R2_HISTORY_DROPBOX_ROOT is not a directory: {root}")
     if selected_days is None and (not from_day or not to_day):
@@ -12449,12 +12455,87 @@ def run_v2_observations_integrity_checks(
         )
         return gap
 
+    def source_proves_empty_connector(day_utc: str, connector_id: int) -> bool:
+        if not _official_rdata_source_for_connector(connector_id):
+            return False
+        selected = _v2_detector_pollutants_for_connector(source_scope, connector_id)
+        if not selected:
+            return False
+        if all((day_utc, connector_id, code) in authenticated_empty_scopes
+               for code in selected):
+            return True
+        evidence_by_code = source_evidence_for_connector_day(day_utc, connector_id)
+        for code in selected:
+            evidence = evidence_by_code.get(code)
+            eligible, _ = _official_rdata_observation_repair_eligibility(
+                evidence, day_utc=day_utc,
+                connector_id=connector_id, pollutant_code=code,
+            )
+            if (not eligible or evidence.get("source_partition_state")
+                    != "successful_empty"
+                    or evidence.get("source_rows") != 0
+                    or evidence.get("source_unavailable_timeseries_ids")):
+                return False
+        return True
+
+    def parent_proves_absence(day_utc: str, connector_id: int | None) -> bool:
+        """Use committed parent references, never directory absence alone."""
+        day_key = f"{data_prefix}/day_utc={day_utc}/manifest.json"
+        connector_key = (
+            f"{data_prefix}/day_utc={day_utc}/connector_id={connector_id}/manifest.json"
+            if connector_id is not None else None
+        )
+        if day_key in removed_metadata_keys or connector_key in removed_metadata_keys:
+            return True
+        day_path = parent_root / day_key
+        try:
+            if day_path.is_file():
+                if connector_id is None:
+                    return False
+                payload = json.loads(day_path.read_text(encoding="utf-8"))
+                refs = payload.get("connector_manifests")
+                if not isinstance(refs, list) or refs != payload.get("child_manifests"):
+                    return False
+                expected = (
+                    f"{data_prefix}/day_utc={day_utc}/"
+                    f"connector_id={connector_id}/manifest.json"
+                )
+                return all(ref.get("manifest_key") != expected for ref in refs)
+            base = f"{data_prefix}/_manifests"
+            keys = [
+                f"{base}/manifest.json",
+                f"{base}/year={day_utc[:4]}/manifest.json",
+                f"{base}/year={day_utc[:4]}/month={day_utc[5:7]}/manifest.json",
+                day_key,
+            ]
+            previous = None
+            for index, key in enumerate(keys[:-1]):
+                path = parent_root / key
+                if previous is not None and not any(
+                    ref.get("manifest_key") == key
+                    for ref in previous["children"]
+                ):
+                    return all(not (parent_root / later).exists() for later in keys[index:])
+                if not path.is_file():
+                    return False
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict) or not isinstance(payload.get("children"), list):
+                    return False
+                previous = payload
+            return previous is not None and not any(
+                ref.get("manifest_key") == day_key
+                for ref in previous["children"]
+            )
+        except (OSError, TypeError, ValueError, KeyError, AttributeError):
+            return False
+
     latest_path = root / latest_key
+    latest_payload: Any = None
     if not latest_path.is_file():
         gaps.append(_v2_obs_gap("latest_index_missing", expected_path=latest_key))
     else:
         try:
-            json.loads(latest_path.read_text(encoding="utf-8"))
+            latest_payload = json.loads(latest_path.read_text(encoding="utf-8"))
         except Exception:
             gaps.append(_v2_obs_gap("latest_index_invalid_json", expected_path=latest_key))
 
@@ -12462,11 +12543,45 @@ def run_v2_observations_integrity_checks(
         day_utc = day.isoformat()
         day_rel = f"{data_prefix}/day_utc={day_utc}"
         day_dir = root / day_rel
+        if allowed_connector_ids is not None:
+            latest_summary = next((
+                entry for entry in (
+                    latest_payload.get("day_summaries") or []
+                    if isinstance(latest_payload, Mapping) else []
+                )
+                if isinstance(entry, Mapping) and entry.get("day_utc") == day_utc
+            ), None)
+            for connector_id in _expected_connector_ids(allowed_connector_ids):
+                if not _official_rdata_source_for_connector(connector_id):
+                    continue
+                connector_rel = f"{day_rel}/connector_id={connector_id}"
+                for code in _v2_detector_pollutants_for_connector(source_scope, connector_id):
+                    data_manifest = root / connector_rel / f"pollutant_code={code}" / "manifest.json"
+                    index_manifest_rel = (
+                        f"{index_prefix}/day_utc={day_utc}/connector_id={connector_id}/"
+                        f"pollutant_code={code}/manifest.json"
+                    )
+                    if (root / index_manifest_rel).is_file() and not data_manifest.is_file():
+                        gaps.append(_v2_obs_gap(
+                            "orphan_index_manifest", day_utc=day_utc,
+                            connector_id=connector_id, pollutant_code=code,
+                            expected_path=index_manifest_rel,
+                        ))
+                if (isinstance(latest_summary, Mapping)
+                        and not (root / connector_rel / "manifest.json").is_file()
+                        and connector_id in (latest_summary.get("connector_ids") or [])):
+                    gaps.append(_v2_obs_gap(
+                        "latest_index_stale_connector", day_utc=day_utc,
+                        connector_id=connector_id, expected_path=latest_key,
+                    ))
         if not day_dir.is_dir():
             if allowed_connector_ids is None:
                 gaps.append(_v2_obs_gap("day_dir_missing", day_utc=day_utc, expected_path=day_rel))
             else:
                 for connector_id in _expected_connector_ids(allowed_connector_ids):
+                    if (source_proves_empty_connector(day_utc, connector_id)
+                            and parent_proves_absence(day_utc, None)):
+                        continue
                     gaps.append(connector_scoped_gap(
                         "day_dir_missing",
                         day_utc=day_utc,
@@ -12484,6 +12599,9 @@ def run_v2_observations_integrity_checks(
             }
             for connector_id in _expected_connector_ids(allowed_connector_ids):
                 if connector_id not in existing_allowed_ids:
+                    if (source_proves_empty_connector(day_utc, connector_id)
+                            and parent_proves_absence(day_utc, connector_id)):
+                        continue
                     gaps.append(connector_scoped_gap(
                         "connector_dir_missing",
                         day_utc=day_utc,
@@ -13519,6 +13637,9 @@ def run_v2_post_repair_integrity_rechecks(
     allowed_real_roots: Iterable[Path] = (),
     observation_total_connector_ids: Iterable[int] | None = None,
     observation_total_pollutants: Iterable[str] | None = None,
+    authenticated_empty_scopes: set[tuple[str, int, str]] | None = None,
+    parent_authority_root: str | Path | None = None,
+    removed_metadata_keys: set[str] | None = None,
 ) -> dict[str, Any]:
     """Re-run observation Integrity after repair."""
     post_obs = run_v2_observations_integrity_checks(
@@ -13535,6 +13656,9 @@ def run_v2_post_repair_integrity_rechecks(
         allowed_real_roots=allowed_real_roots,
         observation_total_connector_ids=observation_total_connector_ids,
         observation_total_pollutants=observation_total_pollutants,
+        authenticated_empty_scopes=authenticated_empty_scopes,
+        parent_authority_root=parent_authority_root,
+        removed_metadata_keys=removed_metadata_keys,
     )
     obs_status = str(post_obs.get("status") or "fail")
     message = "v2 observations fixed" if obs_status == "ok" else "v2 observations still failing"
@@ -19905,14 +20029,38 @@ def run_v2_gap_backfills(
                     changed_scope["source_evidence_input_sha256"] = str(
                         source_evidence.get("source_evidence_input_sha256") or ""
                     )
-                if proposal_staging is not None:
-                    proposal_staging.record_changed_scope(
-                        "OBSERVS_CHANGED", changed_scope,
+                    index_root = Path(str(run_state["base_dropbox_root"])) / (
+                        "history/_index_v2/observations_timeseries/"
+                        f"day_utc={day_iso}/connector_id={connector_id}"
                     )
-                else:
-                    record_changed_scope(
-                        run_state, "OBSERVS_CHANGED", changed_scope,
+                    current_tombstones = {
+                        str(entry.get("prefix") or "")
+                        for entry in list(run_state.get("tombstone_prefixes") or [])
+                        if isinstance(entry, Mapping) and entry.get("proposed")
+                    }
+                    mutation_pollutants = sorted(
+                        code for code in proposal_pollutants
+                        if code not in empty_pollutants
+                        or (
+                            f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/"
+                            f"day_utc={day_iso}/connector_id={connector_id}/"
+                            f"pollutant_code={code}"
+                        ) in current_tombstones
+                        or (index_root / f"pollutant_code={code}").exists()
                     )
+                    changed_scope["pollutant_codes"] = mutation_pollutants
+                    changed_scope["empty_pollutant_codes"] = sorted(
+                        set(empty_pollutants) & set(mutation_pollutants)
+                    )
+                if not proposal_is_official_rdata or changed_scope["pollutant_codes"]:
+                    if proposal_staging is not None:
+                        proposal_staging.record_changed_scope(
+                            "OBSERVS_CHANGED", changed_scope,
+                        )
+                    else:
+                        record_changed_scope(
+                            run_state, "OBSERVS_CHANGED", changed_scope,
+                        )
                 tombstones_after = {
                     str(entry.get("prefix") or "")
                     for entry in list(
@@ -20086,7 +20234,7 @@ GENERIC_INTEGRITY_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
     "uk_aq_generic_integrity_v2_transition_state_fingerprint_v3"
 )
 GENERIC_INTEGRITY_V2_SELECTED_SCOPE_AUTHORITY_CONTRACT = (
-    "uk_aq_generic_integrity_v2_selected_scope_authority_v1"
+    "uk_aq_generic_integrity_v2_selected_scope_authority_v2"
 )
 GENERIC_V2_OPERATIONAL_CONTEXT_CONTRACT = (
     "uk_aq_generic_v2_official_rdata_operational_context_v1"
@@ -20770,6 +20918,197 @@ def _canonical_generic_v2_scope_source_authority(
     return authority
 
 
+def _derive_generic_v2_empty_metadata_removals(
+    run_state: Mapping[str, Any],
+    selected_scopes: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Derive exact parent/index removals from the accepted pinned child set."""
+    scopes = list(selected_scopes)
+    base = R2_HISTORY_V2_OBSERVATIONS_PREFIX
+    index_base = "history/_index_v2/observations_timeseries"
+    baseline = Path(str(run_state["base_dropbox_root"]))
+    objects = dict(run_state.get("objects") or {})
+    expected: dict[str, str] = {}
+    by_connector: dict[tuple[str, int], list[Mapping[str, Any]]] = {}
+    for scope in scopes:
+        day = str(scope["day_utc"])
+        connector = int(scope["connector_id"])
+        code = str(scope["pollutant_code"])
+        by_connector.setdefault((day, connector), []).append(scope)
+        if scope["outcome"] != "authoritative_no_data_replacement":
+            continue
+        pollutant_key = (
+            f"{base}/day_utc={day}/connector_id={connector}/"
+            f"pollutant_code={code}/manifest.json"
+        )
+        _authenticate_official_rdata_pinned_hierarchy(run_state, {
+            "day_utc": day, "connector_id": connector,
+            "pollutant_code": code, "manifest_key": pollutant_key,
+            "baseline_state": (
+                "partition_present" if (baseline / pollutant_key).is_file()
+                else "partition_absent"
+            ),
+        })
+        index_key = (
+            f"{index_base}/day_utc={day}/connector_id={connector}/"
+            f"pollutant_code={code}/manifest.json"
+        )
+        if (baseline / index_key).is_file():
+            expected[index_key] = "generic_v2_authenticated_empty_pollutant_index"
+    removed_connectors: dict[str, set[int]] = {}
+    for (day, connector), selected in by_connector.items():
+        empty = {
+            str(scope["pollutant_code"]) for scope in selected
+            if scope["outcome"] == "authoritative_no_data_replacement"
+        }
+        if not empty or len(empty) != len(selected):
+            continue
+        key = f"{base}/day_utc={day}/connector_id={connector}/manifest.json"
+        path = baseline / key
+        if not path.is_file():
+            continue
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        references = payload.get("pollutant_manifests")
+        aliases = payload.get("child_manifests")
+        if not isinstance(references, list) or references != aliases or not references:
+            raise ValueError(f"empty connector baseline child set is invalid: {key}")
+        codes = {str(ref.get("pollutant_code") or "") for ref in references}
+        if not codes.issubset(empty):
+            continue
+        prefix = key.removesuffix("/manifest.json")
+        for file in (baseline / prefix).rglob("*"):
+            if not file.is_file():
+                continue
+            relative = file.relative_to(baseline).as_posix()
+            if relative != key and not any(
+                relative.startswith(f"{prefix}/pollutant_code={code}/")
+                for code in empty
+            ):
+                raise ValueError(f"empty connector has unselected baseline object: {relative}")
+        if key in objects:
+            raise ValueError(f"empty connector has a proposed manifest: {key}")
+        index_dir = (
+            baseline / index_base / f"day_utc={day}" /
+            f"connector_id={connector}"
+        )
+        for file in index_dir.rglob("*") if index_dir.is_dir() else ():
+            if file.is_file() and file.relative_to(baseline).as_posix() not in expected:
+                raise ValueError(f"empty connector has an unselected index: {key}")
+        expected[key] = "generic_v2_authenticated_empty_connector"
+        removed_connectors.setdefault(day, set()).add(connector)
+    for day, connector_ids in removed_connectors.items():
+        key = f"{base}/day_utc={day}/manifest.json"
+        path = baseline / key
+        if not path.is_file():
+            continue
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        references = payload.get("connector_manifests")
+        aliases = payload.get("child_manifests")
+        if not isinstance(references, list) or references != aliases or not references:
+            raise ValueError(f"empty day baseline child set is invalid: {key}")
+        remaining = {
+            int(ref.get("connector_id") or 0) for ref in references
+        } - connector_ids
+        if remaining:
+            continue
+        prefix = key.removesuffix("/manifest.json")
+        for file in (baseline / prefix).rglob("*"):
+            if not file.is_file():
+                continue
+            relative = file.relative_to(baseline).as_posix()
+            if relative != key and not any(
+                relative.startswith(f"{prefix}/connector_id={connector}/")
+                for connector in connector_ids
+            ):
+                raise ValueError(f"empty day has unrelated baseline object: {relative}")
+        if key in objects:
+            raise ValueError(f"empty day has a proposed manifest: {key}")
+        index_dir = baseline / index_base / f"day_utc={day}"
+        for file in index_dir.rglob("*") if index_dir.is_dir() else ():
+            if file.is_file() and file.relative_to(baseline).as_posix() not in expected:
+                raise ValueError(f"empty day has an unrelated index: {key}")
+        expected[key] = "generic_v2_authenticated_empty_day"
+    removed_days = {
+        key for key, authority in expected.items()
+        if authority == "generic_v2_authenticated_empty_day"
+    }
+    if removed_days:
+        def pinned_child_key(value: Any, pattern: str) -> str:
+            key = str(value or "")
+            if not re.fullmatch(pattern, key):
+                raise ValueError("empty-root preflight has an invalid child key")
+            return key
+
+        root_key = f"{base}/_manifests/manifest.json"
+        root_payload = json.loads((baseline / root_key).read_text(encoding="utf-8"))
+        committed_days: set[str] = set()
+        for year_ref in root_payload.get("children") or []:
+            year_key = pinned_child_key(
+                year_ref["manifest_key"],
+                re.escape(base) + r"/_manifests/year=\d{4}/manifest\.json",
+            )
+            year_payload = json.loads(
+                (baseline / year_key).read_text(encoding="utf-8")
+            )
+            for month_ref in year_payload.get("children") or []:
+                month_key = pinned_child_key(
+                    month_ref["manifest_key"],
+                    re.escape(base) + r"/_manifests/year=\d{4}/month=\d{2}/manifest\.json",
+                )
+                month_payload = json.loads(
+                    (baseline / month_key).read_text(encoding="utf-8")
+                )
+                committed_days.update(
+                    pinned_child_key(
+                        day_ref["manifest_key"],
+                        re.escape(base) + r"/day_utc=\d{4}-\d{2}-\d{2}/manifest\.json",
+                    )
+                    for day_ref in month_payload.get("children") or []
+                )
+        if not committed_days or not committed_days - removed_days:
+            raise ValueError("empty observations root is outside the accepted schema")
+    if removed_days or removed_connectors:
+        latest_key = "history/_index_v2/observations_timeseries_latest.json"
+        latest_entry = objects.get(latest_key)
+        latest_path = (Path(str(latest_entry["local_path"]))
+                       if isinstance(latest_entry, Mapping)
+                       else baseline / latest_key)
+        latest_body = latest_path.read_bytes()
+        if (isinstance(latest_entry, Mapping) and
+                (latest_entry.get("structurally_validated") is not True
+                 or latest_entry.get("bytes") != len(latest_body)
+                 or latest_entry.get("sha256") != hashlib.sha256(latest_body).hexdigest())):
+            raise ValueError("empty metadata latest proposal identity changed")
+        latest = json.loads(latest_body.decode("utf-8"))
+        summaries = latest.get("day_summaries")
+        if not isinstance(summaries, list):
+            raise ValueError("empty metadata latest summary is invalid")
+        removed_day_dates = {
+            key.split("/day_utc=", 1)[1].split("/", 1)[0]
+            for key in removed_days
+        }
+        if any(day in (latest.get("days") or []) for day in removed_day_dates):
+            raise ValueError("empty day remains in the v2 latest index")
+        for summary in summaries:
+            if not isinstance(summary, Mapping):
+                raise ValueError("empty metadata latest day summary is invalid")
+            day = str(summary.get("day_utc") or "")
+            if day in removed_day_dates or any(
+                connector in (summary.get("connector_ids") or [])
+                for connector in removed_connectors.get(day, set())
+            ):
+                raise ValueError("removed observation remains in the v2 latest index")
+    result = []
+    for key, authority in sorted(expected.items(), key=lambda item: item[0].encode("utf-8")):
+        body = (baseline / key).read_bytes()
+        result.append({
+            "key": key, "authority": authority,
+            "baseline_source": "dropbox", "baseline_bytes": len(body),
+            "baseline_sha256": hashlib.sha256(body).hexdigest(),
+        })
+    return result
+
+
 def _finalise_generic_integrity_selected_scope_authority(
     run_state: dict[str, Any],
     selected_partition_outcomes: Iterable[Mapping[str, Any]],
@@ -20842,20 +21181,35 @@ def _finalise_generic_integrity_selected_scope_authority(
             "partial_source_unavailable_preserved_replacement",
             "authoritative_no_data_replacement",
         }:
-            if len(matching_tombstones) != 1:
+            absent_empty_noop = (
+                outcome == "authoritative_no_data_replacement"
+                and not matching_tombstones
+            )
+            if absent_empty_noop:
+                manifest_key = f"{prefix}/manifest.json"
+                _authenticate_official_rdata_pinned_hierarchy(run_state, {
+                    "day_utc": day_utc, "connector_id": connector_id,
+                    "pollutant_code": pollutant_code,
+                    "manifest_key": manifest_key,
+                    "baseline_state": "partition_absent",
+                })
+            elif len(matching_tombstones) != 1:
                 raise ValueError(
                     "generic selected replacement requires one exact tombstone: "
                     f"{prefix}"
                 )
-            matching_tombstones[0].update({
-                "authority_outcome": outcome,
-                "authority_scope": {
-                    "day_utc": day_utc,
-                    "connector_id": connector_id,
-                    "pollutant_code": pollutant_code,
-                },
-            })
-            authorised_prefix: str | None = prefix
+            if not absent_empty_noop:
+                matching_tombstones[0].update({
+                    "authority_outcome": outcome,
+                    "authority_scope": {
+                        "day_utc": day_utc,
+                        "connector_id": connector_id,
+                        "pollutant_code": pollutant_code,
+                    },
+                })
+            authorised_prefix: str | None = (
+                None if absent_empty_noop else prefix
+            )
         elif outcome == "source_artifact_unavailable_preserved":
             if matching_tombstones:
                 raise ValueError(
@@ -21042,6 +21396,8 @@ def _finalise_generic_integrity_selected_scope_authority(
             },
             key=lambda value: value.encode("utf-8"),
         ),
+        "authorised_exact_metadata_removals":
+            _derive_generic_v2_empty_metadata_removals(run_state, scopes),
     }
     run_state["generic_integrity_selected_scope_authority"] = authority
     _canonical_generic_integrity_selected_scope_authority(run_state)
@@ -21670,12 +22026,14 @@ def _canonical_generic_integrity_selected_scope_authority(
         or not isinstance(
             authority.get("authorised_pollutant_tombstone_prefixes"), list
         )
+        or not isinstance(authority.get("authorised_exact_metadata_removals"), list)
     ):
         raise ValueError(
             "generic fixed-v2 selected-scope authority is unavailable"
         )
     allowed_outcomes = {
         "complete_replacement",
+        "partial_source_unavailable_preserved_replacement",
         "authoritative_no_data_replacement",
         "source_artifact_unavailable_preserved",
     }
@@ -21731,9 +22089,17 @@ def _canonical_generic_integrity_selected_scope_authority(
                     "generic fixed-v2 source-unavailable scope has proposed deletion"
                 )
         elif authorised_prefix != expected_prefix:
-            raise ValueError(
-                "generic fixed-v2 selected scope tombstone is invalid"
-            )
+            if (outcome != "authoritative_no_data_replacement"
+                    or authorised_prefix is not None):
+                raise ValueError(
+                    "generic fixed-v2 selected scope tombstone is invalid"
+                )
+            _authenticate_official_rdata_pinned_hierarchy(run_state, {
+                "day_utc": day_utc, "connector_id": connector_id,
+                "pollutant_code": pollutant_code,
+                "manifest_key": f"{expected_prefix}/manifest.json",
+                "baseline_state": "partition_absent",
+            })
         replacement_keys_raw = raw_scope.get("replacement_object_keys")
         if not isinstance(replacement_keys_raw, list):
             raise ValueError(
@@ -21840,15 +22206,45 @@ def _canonical_generic_integrity_selected_scope_authority(
         raise ValueError(
             "generic fixed-v2 authorised tombstone set is not exact"
         )
-    proposed_prefixes = sorted({
+    proposed_prefixes = sorted([
         _normalise_overlay_object_key(str(entry.get("prefix") or "")).rstrip("/")
         for entry in list(run_state.get("tombstone_prefixes") or [])
         if isinstance(entry, Mapping) and entry.get("proposed")
-    }, key=lambda value: value.encode("utf-8"))
+        and entry.get("exact_object") is not True
+    ], key=lambda value: value.encode("utf-8"))
     if proposed_prefixes != authorised_prefixes:
         raise ValueError(
             "generic fixed-v2 proposed tombstones exceed selected authority"
         )
+    expected_removals = _derive_generic_v2_empty_metadata_removals(
+        run_state, scopes,
+    )
+    proposed_removals = []
+    for entry in list(run_state.get("tombstone_prefixes") or []):
+        if not isinstance(entry, Mapping) or not entry.get("proposed"):
+            continue
+        if entry.get("exact_object") is not True:
+            continue
+        if entry.get("stage") != "generic_v2_empty_metadata":
+            raise ValueError("generic fixed-v2 exact deletion stage is invalid")
+        snapshot = entry.get("local_dependency_snapshot")
+        if entry.get("authority") in {
+            "generic_v2_authenticated_empty_connector",
+            "generic_v2_authenticated_empty_day",
+        } and (not isinstance(snapshot, Mapping)
+               or snapshot.get("expected_children") != []):
+            raise ValueError("generic fixed-v2 removed parent child set is not empty")
+        proposed_removals.append({
+            "key": str(entry.get("prefix") or ""),
+            "authority": entry.get("authority"),
+            "baseline_source": entry.get("baseline_source"),
+            "baseline_bytes": entry.get("baseline_bytes"),
+            "baseline_sha256": entry.get("baseline_sha256"),
+        })
+    proposed_removals.sort(key=lambda entry: entry["key"].encode("utf-8"))
+    if (authority["authorised_exact_metadata_removals"] != expected_removals
+            or proposed_removals != expected_removals):
+        raise ValueError("generic fixed-v2 exact metadata removals exceed authority")
     metadata_scopes: list[dict[str, Any]] = []
     data_identities = {
         (scope["day_utc"], scope["connector_id"], scope["pollutant_code"])
@@ -21973,6 +22369,7 @@ def _canonical_generic_integrity_selected_scope_authority(
         "explicit_force_targets": canonical_targets,
         "forced_republication_parquet_keys": forced_parquet_keys,
         "authorised_pollutant_tombstone_prefixes": authorised_prefixes,
+        "authorised_exact_metadata_removals": expected_removals,
     }
 
 
@@ -22668,7 +23065,8 @@ def resolve_combined_local_path(
         if not isinstance(prefix_entry, Mapping) or not prefix_entry.get("proposed"):
             continue
         prefix = _normalise_overlay_object_key(str(prefix_entry.get("prefix") or "")).rstrip("/")
-        if normalized_key.startswith(f"{prefix}/"):
+        if (normalized_key == prefix if prefix_entry.get("exact_object") is True
+                else normalized_key.startswith(f"{prefix}/")):
             return None
 
     backup_path = Path(str(run_state["base_dropbox_root"])) / normalized_key
@@ -22977,6 +23375,7 @@ def _run_v2_observation_metadata_executor(
     log: logging.Logger,
     run_state: Mapping[str, Any] | None = None,
     conn: sqlite3.Connection | None = None,
+    selected_partition_outcomes: Iterable[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Run the metadata/index specialist once, after all observation repairs.
 
@@ -23005,6 +23404,8 @@ def _run_v2_observation_metadata_executor(
         "repair_plan": actions,
         "authoritative_core_timeseries": _authoritative_v2_core_timeseries_bindings(conn),
     }
+    if (run_state is not None and run_state.get("execution_path") == "generic_integrity"):
+        plan["selected_partition_outcomes"] = list(selected_partition_outcomes)
     proc = subprocess.Popen(
         command,
         cwd=repo_root,
@@ -23109,6 +23510,61 @@ def _record_metadata_executor_overlay(
     for blocked in list(planning.get("blocked_scopes") or []):
         if isinstance(blocked, Mapping):
             record_blocked_scope(run_state, {"stage": manifest_stage, **dict(blocked)})
+    removals = list(planning.get("removals") or [])
+    if removals:
+        if (run_state.get("execution_path") != "generic_integrity"
+                or run_state.get("official_rdata_source_adapter")
+                not in OFFICIAL_RDATA_NETWORKS):
+            raise ValueError("exact metadata removals require generic official fixed-v2 authority")
+        existing_removals = {
+            str(entry.get("prefix") or "") for entry in
+            run_state.get("tombstone_prefixes") or []
+            if isinstance(entry, Mapping)
+        }
+        for removal in sorted(removals, key=lambda entry: str(entry.get("key") or "")):
+            if not isinstance(removal, Mapping):
+                raise ValueError("exact metadata removal is invalid")
+            key = _normalise_overlay_object_key(str(removal.get("key") or ""))
+            kind = str(removal.get("kind") or "")
+            authority = str(removal.get("authority") or "")
+            expected = {
+                "connector_manifest": "generic_v2_authenticated_empty_connector",
+                "day_manifest": "generic_v2_authenticated_empty_day",
+                "pollutant_timeseries_index":
+                    "generic_v2_authenticated_empty_pollutant_index",
+            }
+            if (kind not in expected or authority != expected[kind]
+                    or not key.endswith("/manifest.json")
+                    or key in existing_removals
+                    or removal.get("baseline_source") != "dropbox"):
+                raise ValueError(f"exact metadata removal authority is invalid: {key}")
+            baseline_path = Path(str(run_state["base_dropbox_root"])) / key
+            if not baseline_path.is_file():
+                raise ValueError(f"exact metadata removal baseline is missing: {key}")
+            baseline_body = baseline_path.read_bytes()
+            if (len(baseline_body) != removal.get("baseline_bytes")
+                    or hashlib.sha256(baseline_body).hexdigest()
+                    != removal.get("baseline_sha256")):
+                raise ValueError(f"exact metadata removal baseline changed: {key}")
+            entry = {
+                "prefix": key, "exact_object": True, "proposed": True,
+                "stage": "generic_v2_empty_metadata", "authority": authority,
+                "baseline_source": "dropbox",
+                "baseline_sha256": removal["baseline_sha256"],
+                "baseline_bytes": removal["baseline_bytes"],
+                "local_dependency_snapshot": removal.get("local_dependency_snapshot"),
+            }
+            run_state.setdefault("tombstone_prefixes", []).append(entry)
+            existing_removals.add(key)
+            scope_set = (index_scope_set if kind == "pollutant_timeseries_index"
+                         else manifest_scope_set)
+            scope = {"object_key": key, "stage": entry["stage"],
+                     "provenance": authority, "removed": True}
+            if proposal_staging is not None:
+                proposal_staging.record_changed_scope(scope_set, scope)
+            else:
+                record_changed_scope(run_state, scope_set, scope)
+        run_state["tombstone_prefixes"].sort(key=lambda entry: str(entry.get("prefix") or ""))
     planner_unchanged_keys = {
         _normalise_overlay_object_key(str(value))
         for value in list(
@@ -23266,6 +23722,7 @@ def _finalise_staged_write_set_provenance(
         _normalise_overlay_object_key(str(entry.get("prefix") or "")).rstrip("/")
         for entry in list(run_state.get("tombstone_prefixes") or [])
         if isinstance(entry, Mapping) and entry.get("proposed")
+        and entry.get("exact_object") is not True
     ]
 
     forced_republication_keys: list[str] = []
@@ -24181,13 +24638,33 @@ def _capture_official_rdata_v2_observation_scope(
         raise ValueError("official RData all-empty target has synthetic connector child")
     # Parents and indexes are rebuilt by the existing complete-child metadata
     # finaliser, including when no generated connector manifest exists.
+    mutation_codes: list[str] = []
+    new_tombstones: list[dict[str, Any]] = []
     for code in repairable:
         prefix = f"{connector_prefix}/pollutant_code={code}"
-        run_state.setdefault("tombstone_prefixes", []).append({
+        if code in empty:
+            baseline_root = Path(str(run_state["base_dropbox_root"]))
+            manifest_key = f"{prefix}/manifest.json"
+            baseline_present = (baseline_root / manifest_key).is_file()
+            _authenticate_official_rdata_pinned_hierarchy(run_state, {
+                "day_utc": day_utc, "connector_id": connector_id,
+                "pollutant_code": code, "manifest_key": manifest_key,
+                "baseline_state": (
+                    "partition_present" if baseline_present else "partition_absent"
+                ),
+            })
+            if not baseline_present:
+                continue
+        mutation_codes.append(code)
+        entry = {
             "prefix": prefix, "proposed": True, "deleted": False,
             "deletion_verified": False, "stage": "observations_data",
-            "repair_pollutants": repairable,
-        })
+            "repair_pollutants": mutation_codes,
+        }
+        new_tombstones.append(entry)
+        run_state.setdefault("tombstone_prefixes", []).append(entry)
+    for entry in new_tombstones:
+        entry["repair_pollutants"] = list(mutation_codes)
     run_state["tombstone_prefixes"] = sorted(
         {entry["prefix"]: entry for entry in run_state.get("tombstone_prefixes", [])}.values(),
         key=lambda entry: entry["prefix"],
@@ -24468,6 +24945,13 @@ def _create_final_verification_view(
         f"{_normalise_overlay_object_key(str(entry.get('prefix') or '')).rstrip('/')}/"
         for entry in list(run_state.get("tombstone_prefixes") or [])
         if isinstance(entry, Mapping) and entry.get("proposed") and entry.get("prefix")
+        and entry.get("exact_object") is not True
+    )
+    tombstones.update(
+        _normalise_overlay_object_key(str(entry.get("prefix") or ""))
+        for entry in list(run_state.get("tombstone_prefixes") or [])
+        if isinstance(entry, Mapping) and entry.get("proposed")
+        and entry.get("exact_object") is True
     )
 
     # The verification checks need directory discovery and parquet paths. Use
@@ -24860,9 +25344,12 @@ def _verified_deleted_object_keys(
         ):
             raise ValueError(f"deleted-key sidecar payload is invalid: {sidecar_path}")
         keys = list(payload)
-        prefix = str(prefix_entry.get("prefix") or "").rstrip("/") + "/"
+        raw_prefix = str(prefix_entry.get("prefix") or "").rstrip("/")
+        prefix = (raw_prefix if prefix_entry.get("exact_object") is True
+                  else raw_prefix + "/")
         if keys != sorted(keys) or len(keys) != len(set(keys)) or any(
-            not key.startswith(prefix) for key in keys
+            (key != prefix if prefix_entry.get("exact_object") is True
+             else not key.startswith(prefix)) for key in keys
         ):
             raise ValueError(f"deleted-key sidecar key scope is invalid: {sidecar_path}")
         if len(keys) != int(prefix_entry.get("deleted_object_count") or 0):
@@ -25263,6 +25750,25 @@ def run_v2_final_verification(
         run_state, config=config, from_day=from_day, to_day=to_day,
         selected_days=selected_days,
     )
+    admitted_empty_scopes: set[tuple[str, int, str]] = set()
+    admitted_removed_metadata_keys: set[str] = set()
+    if (run_state.get("execution_path") == "generic_integrity"
+            and run_state.get("official_rdata_source_adapter")
+            in OFFICIAL_RDATA_NETWORKS
+            and isinstance(run_state.get("generic_integrity_selected_scope_authority"), Mapping)):
+        selected_authority = _canonical_generic_integrity_selected_scope_authority(
+            run_state,
+        )
+        admitted_empty_scopes = {
+            (str(scope["day_utc"]), int(scope["connector_id"]),
+             str(scope["pollutant_code"]))
+            for scope in selected_authority["selected_scopes"]
+            if scope["outcome"] == "authoritative_no_data_replacement"
+        }
+        admitted_removed_metadata_keys = {
+            str(entry["key"])
+            for entry in selected_authority["authorised_exact_metadata_removals"]
+        }
     recheck = run_v2_post_repair_integrity_rechecks(
         conn=conn,
         env_name=env_name,
@@ -25284,6 +25790,9 @@ def run_v2_final_verification(
             else (allowed_connector_ids or [])
         ),
         observation_total_pollutants=repair_pollutants,
+        authenticated_empty_scopes=admitted_empty_scopes,
+        parent_authority_root=run_state.get("base_dropbox_root"),
+        removed_metadata_keys=admitted_removed_metadata_keys,
     )
     remaining_scopes: list[dict[str, Any]] = []
     try:
@@ -25561,6 +26070,7 @@ def record_integrity_object_operations(
         if not isinstance(prefix_entry, Mapping) or not prefix_entry.get("prefix"):
             continue
         prefix = str(prefix_entry["prefix"]).rstrip("/")
+        exact_object = prefix_entry.get("exact_object") is True
         remote_completed = bool(prefix_entry.get("remote_completed") or prefix_entry.get("deletion_verified"))
         counts["planned_deletions"] += 1
         counts["completed_deletions"] += int(remote_completed)
@@ -25570,7 +26080,7 @@ def record_integrity_object_operations(
               run_id, object_key, domain, operation_kind, planned,
               structurally_validated, remote_attempted, remote_completed,
               get_verified, delete_verified, status, error, updated_at_utc
-            ) VALUES (?, ?, ?, 'delete_prefix', 1, 1, ?, ?, 0, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, 1, 1, ?, ?, 0, ?, ?, ?, ?)
             ON CONFLICT(run_id, object_key, operation_kind) DO UPDATE SET
               remote_attempted=excluded.remote_attempted,
               remote_completed=excluded.remote_completed,
@@ -25580,7 +26090,9 @@ def record_integrity_object_operations(
               updated_at_utc=excluded.updated_at_utc
             """,
             (
-                int(run_id), f"{prefix}/", _object_operation_domain(prefix),
+                int(run_id), prefix if exact_object else f"{prefix}/",
+                _object_operation_domain(prefix),
+                "delete" if exact_object else "delete_prefix",
                 int(bool(prefix_entry.get("remote_attempted"))), int(remote_completed),
                 int(bool(prefix_entry.get("deletion_verified"))),
                 str(prefix_entry.get("status") or "planned"), prefix_entry.get("error"), now_iso,
@@ -29465,6 +29977,9 @@ def run_v2_integrity_repair_flow(
         _run_v2_observation_metadata_executor(
             env=env, actions=metadata_actions, dry_run=dry_run, log=log,
             run_state=run_state, conn=conn,
+            selected_partition_outcomes=(
+                observations.get("selected_partition_outcomes") or []
+            ),
         )
     )
     if observation_failed:
@@ -29765,6 +30280,24 @@ def run_v2_integrity_repair_flow(
                         "completed_deletions": 0,
                     },
                 }
+                if dry_run:
+                    node_noop = run_canonical_apply_executor(
+                        run_state=run_state, env=env, log=log,
+                        validation_only=True,
+                    )
+                    if (node_noop.get("status") != "planned"
+                            or node_noop.get("final_admission_validated") is not True
+                            or int((node_noop.get("output") or {}).get(
+                                "planned_writes") or 0) != 0
+                            or int((node_noop.get("output") or {}).get(
+                                "planned_deletions") or 0) != 0):
+                        apply_result = {
+                            **node_noop, "status": "failed",
+                            "reason": "generic_v2_noop_final_node_admission_failed",
+                        }
+                    else:
+                        apply_result["final_admission_validated"] = True
+                        apply_result["node_admission"] = node_noop
     elif dry_run:
         apply_result = run_canonical_apply_executor(
             run_state=run_state, env=env, log=log, validation_only=True,

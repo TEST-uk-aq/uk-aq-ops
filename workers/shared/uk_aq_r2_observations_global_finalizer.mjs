@@ -39,6 +39,7 @@ export async function runCanonicalObservationsGlobalFinalizer({
   r2,
   observationsPrefix,
   affectedDaysUtc,
+  absentAffectedDaysUtc = [],
   maxKeys = 1000,
   writeR2 = true,
   finalizeExistingIndexes,
@@ -90,6 +91,7 @@ export async function runCanonicalObservationsGlobalFinalizer({
         r2,
         observationsPrefix,
         affectedDaysUtc: days,
+        absentAffectedDaysUtc,
         maxKeys,
         writeR2,
       });

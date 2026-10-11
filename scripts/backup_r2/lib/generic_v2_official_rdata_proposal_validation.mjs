@@ -41,7 +41,7 @@ import {
 export const GENERIC_INTEGRITY_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT =
   "uk_aq_generic_integrity_v2_transition_state_fingerprint_v3";
 export const GENERIC_INTEGRITY_V2_SELECTED_SCOPE_AUTHORITY_CONTRACT =
-  "uk_aq_generic_integrity_v2_selected_scope_authority_v1";
+  "uk_aq_generic_integrity_v2_selected_scope_authority_v2";
 export const GENERIC_V2_OPERATIONAL_CONTEXT_CONTRACT =
   "uk_aq_generic_v2_official_rdata_operational_context_v1";
 export const RETAINED_V2_MAINTENANCE_CONTEXT_CONTRACT =
@@ -66,6 +66,169 @@ function safeKey(raw) {
     throw new Error(`Unsafe generic fixed-v2 key: ${String(raw)}`);
   }
   return key;
+}
+
+function deriveGenericV2EmptyMetadataRemovals(runState, scopes) {
+  const root = String(runState?.base_dropbox_root || "");
+  if (!root || !fs.statSync(root, { throwIfNoEntry: false })?.isDirectory()) {
+    throw new Error("Generic fixed-v2 pinned metadata root is unavailable");
+  }
+  const base = "history/v2/observations";
+  const indexBase = "history/_index_v2/observations_timeseries";
+  const objects = runState?.objects || {};
+  const fileFor = (key) => path.join(root, ...safeKey(key).split("/"));
+  const exists = (key) => fs.statSync(fileFor(key), { throwIfNoEntry: false })?.isFile() === true;
+  const filesBelow = (prefix) => {
+    const directory = fileFor(prefix);
+    if (!fs.statSync(directory, { throwIfNoEntry: false })?.isDirectory()) return [];
+    const pending = [directory];
+    const files = [];
+    while (pending.length) {
+      const current = pending.pop();
+      for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+        const child = path.join(current, entry.name);
+        if (entry.isDirectory()) pending.push(child);
+        else if (entry.isFile()) files.push(path.relative(root, child).split(path.sep).join("/"));
+        else throw new Error(`Generic fixed-v2 pinned metadata has an unsupported path: ${child}`);
+      }
+    }
+    return files.sort(bytewise);
+  };
+  const expected = new Map();
+  const byConnector = new Map();
+  for (const scope of scopes) {
+    const { day_utc: day, connector_id: connector, pollutant_code: code } = scope;
+    const identity = `${day}|${connector}`;
+    byConnector.set(identity, [...(byConnector.get(identity) || []), scope]);
+    if (scope.outcome !== "authoritative_no_data_replacement") continue;
+    const pollutantKey = `${base}/day_utc=${day}/connector_id=${connector}/pollutant_code=${code}/manifest.json`;
+    authenticateOfficialRdataPinnedHierarchy(runState, {
+      day_utc: day, connector_id: connector, pollutant_code: code,
+      manifest_key: pollutantKey,
+      baseline_state: exists(pollutantKey) ? "partition_present" : "partition_absent",
+    });
+    const indexKey = `${indexBase}/day_utc=${day}/connector_id=${connector}/pollutant_code=${code}/manifest.json`;
+    if (exists(indexKey)) expected.set(indexKey, "generic_v2_authenticated_empty_pollutant_index");
+  }
+  const removedConnectors = new Map();
+  for (const [identity, selected] of byConnector) {
+    const [day, connectorRaw] = identity.split("|");
+    const connector = Number(connectorRaw);
+    const empty = new Set(selected.filter((scope) => scope.outcome === "authoritative_no_data_replacement")
+      .map((scope) => scope.pollutant_code));
+    if (!empty.size || empty.size !== selected.length) continue;
+    const key = `${base}/day_utc=${day}/connector_id=${connector}/manifest.json`;
+    if (!exists(key)) continue;
+    const payload = JSON.parse(fs.readFileSync(fileFor(key), "utf8"));
+    const refs = payload.pollutant_manifests;
+    if (!Array.isArray(refs) || !refs.length
+      || !exactArray(refs, payload.child_manifests)) {
+      throw new Error(`Generic fixed-v2 empty connector baseline child set is invalid: ${key}`);
+    }
+    if (refs.some((ref) => !empty.has(String(ref?.pollutant_code || "")))) continue;
+    const prefix = key.slice(0, -"/manifest.json".length);
+    if (filesBelow(prefix).some((candidate) => candidate !== key
+      && ![...empty].some((code) => candidate.startsWith(`${prefix}/pollutant_code=${code}/`)))) {
+      throw new Error(`Generic fixed-v2 empty connector contains an unselected object: ${key}`);
+    }
+    if (Object.hasOwn(objects, key)) throw new Error(`Generic fixed-v2 empty connector has a proposed manifest: ${key}`);
+    if (filesBelow(`${indexBase}/day_utc=${day}/connector_id=${connector}`)
+      .some((candidate) => !expected.has(candidate))) {
+      throw new Error(`Generic fixed-v2 empty connector has an unselected index: ${key}`);
+    }
+    expected.set(key, "generic_v2_authenticated_empty_connector");
+    const removed = removedConnectors.get(day) || new Set();
+    removed.add(connector);
+    removedConnectors.set(day, removed);
+  }
+  for (const [day, connectorIds] of removedConnectors) {
+    const key = `${base}/day_utc=${day}/manifest.json`;
+    if (!exists(key)) continue;
+    const payload = JSON.parse(fs.readFileSync(fileFor(key), "utf8"));
+    const refs = payload.connector_manifests;
+    if (!Array.isArray(refs) || !refs.length
+      || !exactArray(refs, payload.child_manifests)) {
+      throw new Error(`Generic fixed-v2 empty day baseline child set is invalid: ${key}`);
+    }
+    if (refs.some((ref) => !connectorIds.has(Number(ref?.connector_id)))) continue;
+    const prefix = key.slice(0, -"/manifest.json".length);
+    if (filesBelow(prefix).some((candidate) => candidate !== key
+      && ![...connectorIds].some((connector) => candidate.startsWith(`${prefix}/connector_id=${connector}/`)))) {
+      throw new Error(`Generic fixed-v2 empty day contains an unrelated object: ${key}`);
+    }
+    if (Object.hasOwn(objects, key)) throw new Error(`Generic fixed-v2 empty day has a proposed manifest: ${key}`);
+    if (filesBelow(`${indexBase}/day_utc=${day}`)
+      .some((candidate) => !expected.has(candidate))) {
+      throw new Error(`Generic fixed-v2 empty day has an unrelated index: ${key}`);
+    }
+    expected.set(key, "generic_v2_authenticated_empty_day");
+  }
+  const removedDays = new Set([...expected.entries()]
+    .filter(([, authority]) => authority === "generic_v2_authenticated_empty_day")
+    .map(([key]) => key));
+  if (removedDays.size) {
+    const pinnedChildKey = (raw, pattern) => {
+      const key = safeKey(raw);
+      if (!pattern.test(key)) throw new Error("Generic fixed-v2 empty-root child key is invalid");
+      return key;
+    };
+    const rootPayload = JSON.parse(fs.readFileSync(fileFor(`${base}/_manifests/manifest.json`), "utf8"));
+    const committedDays = new Set();
+    for (const yearRef of rootPayload.children || []) {
+      const yearKey = pinnedChildKey(yearRef.manifest_key,
+        /^history\/v2\/observations\/_manifests\/year=\d{4}\/manifest\.json$/);
+      const yearPayload = JSON.parse(fs.readFileSync(fileFor(yearKey), "utf8"));
+      for (const monthRef of yearPayload.children || []) {
+        const monthKey = pinnedChildKey(monthRef.manifest_key,
+          /^history\/v2\/observations\/_manifests\/year=\d{4}\/month=\d{2}\/manifest\.json$/);
+        const monthPayload = JSON.parse(fs.readFileSync(fileFor(monthKey), "utf8"));
+        for (const dayRef of monthPayload.children || []) {
+          committedDays.add(pinnedChildKey(dayRef.manifest_key,
+            /^history\/v2\/observations\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/));
+        }
+      }
+    }
+    if (!committedDays.size || ![...committedDays].some((key) => !removedDays.has(key))) {
+      throw new Error("An empty observations root is outside the accepted canonical schema");
+    }
+  }
+  if (removedDays.size || removedConnectors.size) {
+    const latestKey = "history/_index_v2/observations_timeseries_latest.json";
+    const latestEntry = objects[latestKey];
+    const latestPath = latestEntry?.local_path || fileFor(latestKey);
+    const latestBody = fs.readFileSync(latestPath);
+    if (latestEntry && (!latestEntry.structurally_validated
+      || latestBody.byteLength !== latestEntry.bytes
+      || sha256(latestBody) !== latestEntry.sha256)) {
+      throw new Error("Generic fixed-v2 latest index proposal identity changed");
+    }
+    const latest = JSON.parse(latestBody.toString("utf8"));
+    if (!Array.isArray(latest.day_summaries) || !Array.isArray(latest.days)) {
+      throw new Error("Generic fixed-v2 empty metadata latest summary is invalid");
+    }
+    const removedDayDates = new Set([...removedDays]
+      .map((key) => key.match(/\/day_utc=(\d{4}-\d{2}-\d{2})\/manifest\.json$/)?.[1]));
+    if (latest.days.some((day) => removedDayDates.has(day))) {
+      throw new Error("Generic fixed-v2 empty day remains in the latest index");
+    }
+    for (const summary of latest.day_summaries) {
+      if (!summary || typeof summary !== "object" || Array.isArray(summary)) {
+        throw new Error("Generic fixed-v2 latest day summary is invalid");
+      }
+      const day = String(summary.day_utc || "");
+      if (removedDayDates.has(day)
+        || [...(removedConnectors.get(day) || [])].some((connector) =>
+          (summary.connector_ids || []).includes(connector))) {
+        throw new Error("Generic fixed-v2 removed observation remains in the latest index");
+      }
+    }
+  }
+  return [...expected.entries()].sort(([left], [right]) => bytewise(left, right))
+    .map(([key, authority]) => {
+      const body = fs.readFileSync(fileFor(key));
+      return { key, authority, baseline_source: "dropbox", baseline_bytes: body.byteLength,
+        baseline_sha256: sha256(body) };
+    });
 }
 
 function authoritativeNormalConfiguration(env) {
@@ -539,7 +702,8 @@ export function canonicalGenericV2SelectedScopeAuthority(runState) {
       || !Array.isArray(authority.selected_scopes)
       || !Array.isArray(authority.metadata_only_scopes)
       || !(authority.selected_scopes.length || authority.metadata_only_scopes.length)
-      || !Array.isArray(authority.authorised_pollutant_tombstone_prefixes)) {
+      || !Array.isArray(authority.authorised_pollutant_tombstone_prefixes)
+      || !Array.isArray(authority.authorised_exact_metadata_removals)) {
     throw new Error("Generic fixed-v2 selected-scope authority is unavailable");
   }
   const seen = new Set();
@@ -570,7 +734,15 @@ export function canonicalGenericV2SelectedScopeAuthority(runState) {
         throw new Error("Generic fixed-v2 source-unavailable scope has proposed deletion");
       }
     } else if (authorisedPrefix !== expectedPrefix) {
-      throw new Error("Generic fixed-v2 selected scope tombstone is invalid");
+      if (outcome !== "authoritative_no_data_replacement" || authorisedPrefix !== null) {
+        throw new Error("Generic fixed-v2 selected scope tombstone is invalid");
+      }
+      authenticateOfficialRdataPinnedHierarchy(runState, {
+        day_utc: dayUtc, connector_id: connectorId,
+        pollutant_code: pollutantCode,
+        manifest_key: `${expectedPrefix}/manifest.json`,
+        baseline_state: "partition_absent",
+      });
     }
     if (!Array.isArray(scope.replacement_object_keys)) {
       throw new Error("Generic fixed-v2 replacement object closure is invalid");
@@ -639,10 +811,31 @@ export function canonicalGenericV2SelectedScopeAuthority(runState) {
     throw new Error("Generic fixed-v2 authorised tombstone set is not exact");
   }
   const proposed = (runState?.tombstone_prefixes || [])
-    .filter((entry) => entry?.proposed)
+    .filter((entry) => entry?.proposed && entry?.exact_object !== true)
     .map((entry) => safeKey(entry.prefix)).sort(bytewise);
   if (!exactArray(proposed, authorisedPrefixes)) {
     throw new Error("Generic fixed-v2 proposed tombstones exceed selected authority");
+  }
+  const expectedRemovals = deriveGenericV2EmptyMetadataRemovals(runState, scopes);
+  const proposedRemovals = (runState?.tombstone_prefixes || [])
+    .filter((entry) => entry?.proposed && entry?.exact_object === true)
+    .map((entry) => {
+      if (entry.stage !== "generic_v2_empty_metadata") {
+        throw new Error("Generic fixed-v2 exact deletion stage is invalid");
+      }
+      if (["generic_v2_authenticated_empty_connector", "generic_v2_authenticated_empty_day"]
+        .includes(entry.authority)
+        && (!entry.local_dependency_snapshot
+          || !exactArray(entry.local_dependency_snapshot.expected_children, []))) {
+        throw new Error("Generic fixed-v2 removed parent child set is not empty");
+      }
+      return { key: safeKey(entry.prefix), authority: entry.authority,
+        baseline_source: entry.baseline_source, baseline_bytes: entry.baseline_bytes,
+        baseline_sha256: entry.baseline_sha256 };
+    }).sort((left, right) => bytewise(left.key, right.key));
+  if (!exactArray(authority.authorised_exact_metadata_removals, expectedRemovals)
+      || !exactArray(proposedRemovals, expectedRemovals)) {
+    throw new Error("Generic fixed-v2 exact metadata removals exceed selected authority");
   }
   const dataIdentities = new Set(scopes.map((scope) =>
     `${scope.day_utc}|${scope.connector_id}|${scope.pollutant_code}`));
@@ -748,6 +941,7 @@ export function canonicalGenericV2SelectedScopeAuthority(runState) {
     explicit_force_targets: expectedTargets,
     forced_republication_parquet_keys: forcedParquetKeys,
     authorised_pollutant_tombstone_prefixes: authorisedPrefixes,
+    authorised_exact_metadata_removals: expectedRemovals,
   };
 }
 
@@ -1072,13 +1266,14 @@ export function requireGenericV2CoordinatorFreeze(runState, env = process.env) {
 export function validateLocalGenericV2Proposal(runState, env = process.env) {
   requireGenericV2CoordinatorFreeze(runState, env);
   const authority = canonicalGenericV2SelectedScopeAuthority(runState);
-  const proposal = validateLocalProposal(runState, { generation: "v2" });
+  const proposal = validateLocalProposal(runState, { generation: "v2", allowEmpty: true });
   const byPrefix = new Map(authority.selected_scopes.map((scope) => [
     `history/v2/observations/day_utc=${scope.day_utc}`
       + `/connector_id=${scope.connector_id}/pollutant_code=${scope.pollutant_code}`,
     scope,
   ]));
   for (const { prefix, entry } of proposal.prefixes) {
+    if (entry?.exact_object === true) continue;
     const scope = byPrefix.get(prefix);
     if (!scope || !POLLUTANT_PREFIX.test(prefix)
         || entry?.authority_outcome !== scope.outcome

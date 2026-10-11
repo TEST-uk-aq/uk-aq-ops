@@ -1,4 +1,5 @@
 import {
+  r2DeleteObjects,
   r2GetObject,
   r2ListAllCommonPrefixes,
   r2PutObject,
@@ -185,7 +186,7 @@ async function planAndWrite({ io, r2, prefix, level, key, manifest, identity, wr
   };
 }
 
-async function loadMonthChildrenFromYear({ io, r2, prefix, year, overlays }) {
+async function loadMonthChildrenFromYear({ io, r2, prefix, year, overlays, allowEmpty = false }) {
   const yearKey = buildR2HistoryV2ObservationsYearManifestKey(prefix, year);
   const existingYear = await readAggregate({
     io,
@@ -215,9 +216,11 @@ async function loadMonthChildrenFromYear({ io, r2, prefix, year, overlays }) {
     children.set(key, { ...month.canonical, manifest_key: key });
   }
   for (const [key, manifest] of overlays) {
-    if (String(manifest.year) === String(year)) children.set(key, manifest);
+    if (manifest && String(manifest.year) === String(year)) children.set(key, manifest);
   }
-  if (children.size === 0) throw new Error(`No observations month manifests found for year ${year}`);
+  if (!children.size && !allowEmpty) {
+    throw new Error(`No observations month manifests found for year ${year}`);
+  }
   return [...children.values()];
 }
 
@@ -241,7 +244,9 @@ async function loadYearChildrenFromRoot({ io, r2, prefix, overlays }) {
     }
     children.set(key, { ...year.canonical, manifest_key: key });
   }
-  for (const [key, manifest] of overlays) children.set(key, manifest);
+  for (const [key, manifest] of overlays) {
+    if (manifest) children.set(key, manifest);
+  }
   return [...children.values()];
 }
 
@@ -251,11 +256,17 @@ export async function finalizeR2HistoryV2ObservationsManifestHierarchy({
   affectedDaysUtc,
   maxKeys = 1000,
   writeR2 = true,
+  absentAffectedDaysUtc = [],
   adapters = {},
 }) {
   if (!r2 || typeof r2 !== "object") throw new Error("Observations hierarchy finaliser requires R2 configuration");
   const prefix = normalizePrefix(observationsPrefix);
   const days = normalizeAffectedDays(affectedDaysUtc);
+  const absentDays = normalizeAffectedDays(absentAffectedDaysUtc);
+  if (absentDays.some((day) => !days.includes(day))) {
+    throw new Error("Approved absent observation days must be affected days");
+  }
+  const allowMissingAffectedDays = absentDays.length > 0;
   if (!Number.isSafeInteger(Number(maxKeys)) || Number(maxKeys) <= 0) throw new Error("maxKeys must be a positive integer");
   if (typeof writeR2 !== "boolean") throw new Error("writeR2 must be boolean");
   if (days.length === 0) {
@@ -274,6 +285,7 @@ export async function finalizeR2HistoryV2ObservationsManifestHierarchy({
     getObject: adapters.getObject || r2GetObject,
     listAllCommonPrefixes: adapters.listAllCommonPrefixes || r2ListAllCommonPrefixes,
     putObject: adapters.putObject || r2PutObject,
+    deleteObjects: adapters.deleteObjects || r2DeleteObjects,
   };
   const affectedMonths = [...new Set(days.map((day) => day.slice(0, 7)))].sort();
   const affectedYears = [...new Set(affectedMonths.map((value) => value.slice(0, 4)))].sort();
@@ -289,6 +301,7 @@ export async function finalizeR2HistoryV2ObservationsManifestHierarchy({
   }).sort();
   const objects = [];
   const writes = [];
+  const deferred = [];
   const monthOverlays = new Map();
   for (const yearMonth of affectedMonths) {
     const [year, month] = yearMonth.split("-");
@@ -302,6 +315,15 @@ export async function finalizeR2HistoryV2ObservationsManifestHierarchy({
       ...days.filter((day) => day.startsWith(`${yearMonth}-`))
         .map((day) => `${prefix}/day_utc=${day}/manifest.json`),
     ]);
+    const approvedAbsentDayKeys = new Set(absentDays.filter((day) => day.startsWith(`${yearMonth}-`))
+      .map((day) => `${prefix}/day_utc=${day}/manifest.json`));
+    if (allowMissingAffectedDays) {
+      const unexpectedDays = dayKeys.filter((value) => value.includes(`/day_utc=${yearMonth}-`)
+        && !requiredDayKeys.has(value));
+      if (unexpectedDays.length) {
+        throw new Error(`Uncommitted observation day cannot enter an empty-day finalisation: ${unexpectedDays[0]}`);
+      }
+    }
     const candidateDayKeys = [...new Set([
       ...requiredDayKeys,
       ...dayKeys.filter((value) => value.includes(`/day_utc=${yearMonth}-`)),
@@ -312,11 +334,22 @@ export async function finalizeR2HistoryV2ObservationsManifestHierarchy({
       try {
         object = await io.getObject({ r2, key: dayKey });
       } catch (error) {
+        if (allowMissingAffectedDays && approvedAbsentDayKeys.has(dayKey) && isMissing(error)) continue;
         // Interrupted publication can leave an uncommitted, discovery-only prefix.
         if (!requiredDayKeys.has(dayKey) && isMissing(error)) continue;
         throw error;
       }
       references.push(dayReference(parseJson(object, dayKey), dayKey, prefix));
+    }
+    if (references.length === 0 && approvedAbsentDayKeys.size) {
+      if (existingMonth) {
+        objects.push({ level: "month", key, action: "remove", existing_found: true,
+          existing_content_hash: existingMonth.canonical.content_hash,
+          desired_content_hash: null });
+        deferred.push({ level: "month", key, action: "remove" });
+      }
+      monthOverlays.set(key, null);
+      continue;
     }
     if (references.length === 0) throw new Error(`No committed observation day manifests found for ${yearMonth}`);
     const manifest = buildR2HistoryV2ObservationsMonthManifest({
@@ -333,9 +366,12 @@ export async function finalizeR2HistoryV2ObservationsManifestHierarchy({
       key,
       manifest,
       identity: { year, month },
-      writeR2,
+      writeR2: writeR2 && !allowMissingAffectedDays,
     });
     objects.push(result.public);
+    if (allowMissingAffectedDays && result.public.action !== "unchanged") {
+      deferred.push({ level: "month", key, action: "put", manifest, identity: { year, month } });
+    }
     monthOverlays.set(key, result.child);
     if (result.write) writes.push(result.write);
   }
@@ -348,13 +384,25 @@ export async function finalizeR2HistoryV2ObservationsManifestHierarchy({
       prefix,
       year,
       overlays: monthOverlays,
+      allowEmpty: allowMissingAffectedDays,
     });
+    const key = buildR2HistoryV2ObservationsYearManifestKey(prefix, year);
+    if (allowMissingAffectedDays && !monthManifests.length) {
+      const existingYear = await readAggregate({ io, r2, key, prefix, level: "year", year, allowMissing: true });
+      if (existingYear) {
+        objects.push({ level: "year", key, action: "remove", existing_found: true,
+          existing_content_hash: existingYear.canonical.content_hash,
+          desired_content_hash: null });
+        deferred.push({ level: "year", key, action: "remove" });
+      }
+      yearOverlays.set(key, null);
+      continue;
+    }
     const manifest = buildR2HistoryV2ObservationsYearManifest({
       basePrefix: prefix,
       year,
       monthManifests,
     });
-    const key = buildR2HistoryV2ObservationsYearManifestKey(prefix, year);
     const result = await planAndWrite({
       io,
       r2,
@@ -363,9 +411,12 @@ export async function finalizeR2HistoryV2ObservationsManifestHierarchy({
       key,
       manifest,
       identity: { year },
-      writeR2,
+      writeR2: writeR2 && !allowMissingAffectedDays,
     });
     objects.push(result.public);
+    if (allowMissingAffectedDays && result.public.action !== "unchanged") {
+      deferred.push({ level: "year", key, action: "put", manifest, identity: { year } });
+    }
     yearOverlays.set(key, result.child);
     if (result.write) writes.push(result.write);
   }
@@ -376,6 +427,9 @@ export async function finalizeR2HistoryV2ObservationsManifestHierarchy({
     prefix,
     overlays: yearOverlays,
   });
+  if (allowMissingAffectedDays && !yearManifests.length) {
+    throw new Error("An empty observations root is outside the accepted canonical schema");
+  }
   const rootManifest = buildR2HistoryV2ObservationsRootManifest({
     basePrefix: prefix,
     yearManifests,
@@ -389,10 +443,39 @@ export async function finalizeR2HistoryV2ObservationsManifestHierarchy({
     key: rootKey,
     manifest: rootManifest,
     identity: {},
-    writeR2,
+    writeR2: writeR2 && !allowMissingAffectedDays,
   });
   objects.push(root.public);
+  if (allowMissingAffectedDays && root.public.action !== "unchanged") {
+    deferred.push({ level: "root", key: rootKey, action: "put", manifest: rootManifest, identity: {} });
+  }
   if (root.write) writes.push(root.write);
+
+  // Empty-day finalisation is planned through the root before its first
+  // aggregate mutation. The accepted root schema cannot express zero years.
+  if (allowMissingAffectedDays && writeR2) {
+    for (const job of deferred) {
+      if (job.action === "remove") {
+        const result = await io.deleteObjects({ r2, keys: [job.key] });
+        if (result?.errors?.length) throw new Error(`Observations aggregate deletion failed: ${job.key}`);
+        const remaining = await readAggregate({ io, r2, key: job.key, prefix,
+          level: job.level, ...job.identity, allowMissing: true });
+        if (remaining) throw new Error(`Observations aggregate deletion read-back failed: ${job.key}`);
+        writes.push({ level: job.level, key: job.key, action: "remove", verified: true });
+      } else {
+        const body = serializeR2HistoryV2ObservationsAggregateManifest(job.manifest, { basePrefix: prefix });
+        const put = await io.putObject({ r2, key: job.key, body,
+          content_type: "application/json; charset=utf-8" });
+        const verified = await readAggregate({ io, r2, key: job.key, prefix,
+          level: job.level, ...job.identity });
+        if (Buffer.compare(verified.body, body) !== 0) {
+          throw new Error(`Observations aggregate read-back verification failed: ${job.key}`);
+        }
+        writes.push({ level: job.level, key: job.key, action: "put", bytes: verified.bytes,
+          etag: put?.etag ?? null, verified: true });
+      }
+    }
+  }
 
   const planning = {
     create: objects.filter((entry) => entry.action === "create").length,
@@ -400,7 +483,11 @@ export async function finalizeR2HistoryV2ObservationsManifestHierarchy({
     replace_invalid: objects.filter((entry) => entry.action === "replace_invalid").length,
     unchanged: objects.filter((entry) => entry.action === "unchanged").length,
   };
-  planning.change_count = planning.create + planning.update + planning.replace_invalid;
+  if (allowMissingAffectedDays) {
+    planning.remove = objects.filter((entry) => entry.action === "remove").length;
+  }
+  planning.change_count = planning.create + planning.update + planning.replace_invalid
+    + (planning.remove || 0);
   planning.expected_object_count = objects.length;
   return {
     ok: true,

@@ -1030,12 +1030,18 @@ const CANONICAL_OBSERVATION_DAY_PREFIX_PATTERN =
   /^history\/v(?:2|3)\/observations\/day_utc=(\d{4}-\d{2}-\d{2})$/;
 const CANONICAL_OBSERVATION_POLLUTANT_MANIFEST_PATTERN =
   /^history\/v(?:2|3)\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)\/manifest\.json$/;
+const GENERIC_V2_EMPTY_METADATA_KEY =
+  /^(?:history\/v2\/observations\/day_utc=(\d{4}-\d{2}-\d{2})(?:\/connector_id=([1-9]\d*))?|history\/_index_v2\/observations_timeseries\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=(pm25|pm10|no2|o3))\/manifest\.json$/;
 
-function validateDeletionDayConnector({ prefix, dayUtc, connectorIdRaw }) {
+function validateDeletionDay({ prefix, dayUtc }) {
   const parsedDay = new Date(`${dayUtc}T00:00:00.000Z`);
   if (Number.isNaN(parsedDay.getTime()) || parsedDay.toISOString().slice(0, 10) !== dayUtc) {
     throw new Error(`Deletion prefix has an invalid UTC day: ${prefix}`);
   }
+}
+
+function validateDeletionDayConnector({ prefix, dayUtc, connectorIdRaw }) {
+  validateDeletionDay({ prefix, dayUtc });
   const connectorId = Number(connectorIdRaw);
   if (!Number.isSafeInteger(connectorId) || connectorId <= 0 || String(connectorId) !== connectorIdRaw) {
     throw new Error(`Deletion prefix has an invalid connector ID: ${prefix}`);
@@ -1043,6 +1049,23 @@ function validateDeletionDayConnector({ prefix, dayUtc, connectorIdRaw }) {
 }
 
 function assertCanonicalDeletionPrefix(prefix, entry) {
+  if (entry?.exact_object === true) {
+    const match = prefix.match(GENERIC_V2_EMPTY_METADATA_KEY);
+    if (!match || entry.stage !== "generic_v2_empty_metadata"
+      || (match[2] && ![9, 10].includes(Number(match[2])))
+      || (match[4] && ![9, 10].includes(Number(match[4])))
+      || !/^[a-f0-9]{64}$/.test(String(entry.baseline_sha256 || ""))
+      || !Number.isSafeInteger(entry.baseline_bytes) || entry.baseline_bytes < 0
+      || !["dropbox", "overlay"].includes(entry.baseline_source)) {
+      throw new Error(`Generic fixed-v2 exact metadata deletion evidence is invalid: ${prefix}`);
+    }
+    if (match[2] || match[4]) {
+      validateDeletionDayConnector({ prefix, dayUtc: match[1] || match[3], connectorIdRaw: match[2] || match[4] });
+    } else {
+      validateDeletionDay({ prefix, dayUtc: match[1] });
+    }
+    return;
+  }
   const observationDayMatch = prefix.match(CANONICAL_OBSERVATION_DAY_PREFIX_PATTERN);
   if (observationDayMatch) {
     const dayUtc = observationDayMatch[1];
@@ -1160,7 +1183,7 @@ function changedScopeDeclaresKey(runState, dependencyKey) {
 
 function proposedDeletionPrefixes(runState) {
   return (runState?.tombstone_prefixes || [])
-    .filter((entry) => entry?.proposed)
+    .filter((entry) => entry?.proposed && entry?.exact_object !== true)
     .map((entry) => `${safeKey(entry.prefix).replace(/\/+$/, "")}/`);
 }
 
@@ -1189,6 +1212,10 @@ export function validateExternalDependencyRoot({
   if (proposedDeletionPrefixes(runState).some((prefix) => key.startsWith(prefix))) {
     throw new Error(`Proposed deletion would remove an unstaged dependency: ${objectKey} -> ${key}`);
   }
+  if ((runState.tombstone_prefixes || []).some((entry) =>
+    entry?.proposed && entry?.exact_object === true && safeKey(entry.prefix) === key)) {
+    throw new Error(`Exact metadata deletion would remove an unstaged dependency: ${objectKey} -> ${key}`);
+  }
   const root = identity.source === "dropbox"
     ? String(runState.base_dropbox_root || "")
     : String(runState.overlay_root || "");
@@ -1208,11 +1235,13 @@ export function validateExternalDependencyRoot({
   return { key, local_path: localPath, ...identity };
 }
 
-export function validateLocalProposal(runState, { generation = "v2" } = {}) {
+export function validateLocalProposal(runState, { generation = "v2", allowEmpty = false } = {}) {
   if (!runState || typeof runState !== "object") throw new Error("run state must be an object");
   const objects = Object.entries(runState.objects || {}).sort(([left], [right]) => bytewiseKeyCompare(left, right));
   const prefixes = Array.isArray(runState.tombstone_prefixes) ? runState.tombstone_prefixes : [];
-  if (!objects.length && !prefixes.length) throw new Error("canonical proposal has no planned operations");
+  if (!objects.length && !prefixes.length && !allowEmpty) {
+    throw new Error("canonical proposal has no planned operations");
+  }
   const normalizedObjects = [];
   for (const [rawKey, entry] of objects) {
     const key = safeKey(rawKey);
@@ -1356,12 +1385,29 @@ export async function deleteAndVerifyPrefix({
   checkpoint,
   verifiedBodyCache = null,
 }) {
-  const prefix = `${prefixEntry.prefix}/`;
+  const exactObject = prefixEntry.entry?.exact_object === true;
+  const prefix = exactObject ? prefixEntry.prefix : `${prefixEntry.prefix}/`;
   const context = mutationContext(prefixEntry.prefix, prefixEntry.entry?.stage || "prefix_deletion");
   verifiedBodyCache?.invalidatePrefix(prefixEntry.prefix, "delete_prefix");
   try {
-    const entries = await adapters.listAllObjects({ r2, prefix, max_keys: 1000 });
-    const keys = entries.map((entry) => safeKey(entry.key)).filter((key) => key.startsWith(prefix)).sort();
+    let keys;
+    if (exactObject) {
+      const head = await adapters.headObject({ r2, key: prefix });
+      if (!head?.exists && !prefixEntry.entry.remote_attempted) {
+        throw new Error(`Exact metadata deletion baseline is absent before APPLY: ${prefix}`);
+      }
+      if (head?.exists) {
+        const object = await adapters.getObject({ r2, key: prefix });
+        if (Number(object.bytes) !== prefixEntry.entry.baseline_bytes
+          || sha256Hex(object.body) !== prefixEntry.entry.baseline_sha256) {
+          throw new Error(`Exact metadata deletion baseline identity changed: ${prefix}`);
+        }
+      }
+      keys = head?.exists ? [prefix] : [];
+    } else {
+      const entries = await adapters.listAllObjects({ r2, prefix, max_keys: 1000 });
+      keys = entries.map((entry) => safeKey(entry.key)).filter((key) => key.startsWith(prefix)).sort();
+    }
     const sidecar = persistence.writeDeletedKeysSidecar({ prefix: prefixEntry.prefix, keys });
     delete prefixEntry.entry.deleted_object_keys;
     const startedAt = new Date().toISOString();
@@ -1405,8 +1451,13 @@ export async function deleteAndVerifyPrefix({
       deleted_object_count: keys.length,
       deleted_keys_sidecar_path: prefixEntry.entry.deleted_keys_sidecar_path,
     });
-    const remaining = await adapters.listAllObjects({ r2, prefix, max_keys: 1000 });
-    if (remaining.length) throw new Error(`R2 prefix deletion verification failed: ${prefixEntry.prefix}`);
+    if (exactObject) {
+      const remaining = await adapters.headObject({ r2, key: prefix });
+      if (remaining?.exists) throw new Error(`R2 exact metadata deletion verification failed: ${prefix}`);
+    } else {
+      const remaining = await adapters.listAllObjects({ r2, prefix, max_keys: 1000 });
+      if (remaining.length) throw new Error(`R2 prefix deletion verification failed: ${prefixEntry.prefix}`);
+    }
     Object.assign(prefixEntry.entry, {
       deleted: true,
       deletion_verified: true,
@@ -2196,13 +2247,17 @@ export async function validateFinalProposalGraph({
   try {
     const sosLight = runState.execution_path === "sos_light";
     const authorityByPrefix = new Map((genericSelectedScopeAuthority?.selected_scopes || [])
-      .filter((scope) => scope?.authorised_tombstone_prefix)
-      .map((scope) => [String(scope.authorised_tombstone_prefix), scope]));
+      .filter((scope) => scope?.pollutant_prefix)
+      .map((scope) => [String(scope.pollutant_prefix), scope]));
     const selectedPrefixes = sosLight
       ? Object.keys(runState.source_evidence_partitions || {}).map((identity) => ({
         prefix: `history/v2/observations/${identity}`,
       }))
-      : proposal.prefixes.filter((item) =>
+      : genericSelectedScopeAuthority
+        ? genericSelectedScopeAuthority.selected_scopes
+          .filter((scope) => scope.outcome !== "source_artifact_unavailable_preserved")
+          .map((scope) => ({ prefix: scope.pollutant_prefix, authority_scope: scope }))
+        : proposal.prefixes.filter((item) =>
         CANONICAL_OBSERVATION_POLLUTANT_PREFIX_PATTERN.test(item.prefix))
         .map((item) => ({ ...item, authority_scope: authorityByPrefix.get(item.prefix) || null }));
     audit.selected_partition_count = selectedPrefixes.length;
@@ -3403,9 +3458,15 @@ export async function applyValidatedProposal({
         },
       });
     };
+    const absentAffectedDays = proposal.prefixes
+      .filter((entry) => entry.entry?.exact_object === true
+        && entry.entry?.authority === "generic_v2_authenticated_empty_day")
+      .map((entry) => entry.prefix.match(/\/day_utc=(\d{4}-\d{2}-\d{2})\/manifest\.json$/)?.[1])
+      .filter(Boolean);
     const affectedDays = Array.from(new Set([
       ...Array.from(connectorGroups.values()).map((group) => group.day_utc),
       ...dayGroups.keys(),
+      ...absentAffectedDays,
     ])).sort();
     const publishAffectedIndexes = async () => {
       if (!globalOperations.length && !affectedDays.length) return;
@@ -3431,6 +3492,7 @@ export async function applyValidatedProposal({
           ? "history/v3/observations"
           : indexConfig.observations_prefix_v2,
         affectedDaysUtc: affectedDays,
+        absentAffectedDaysUtc: absentAffectedDays,
         maxKeys: indexConfig.max_keys || 1000,
         hierarchyFinalizerAdapter: adapters.observationsHierarchyFinalizer,
         finalizeExistingIndexes: async () => {
@@ -3459,8 +3521,13 @@ export async function applyValidatedProposal({
       report({ message: progressMessage("index publication completed"), completedObjects: counts.completed_writes, force: true });
     };
     if (!dedicatedSosProposal.dedicated) {
+      const deletionRank = (operation) => operation.prefixEntry.entry?.exact_object === true
+        ? operation.key.startsWith("history/_index_v2/") ? 0
+          : /\/connector_id=[1-9]\d*\/manifest\.json$/.test(operation.key) ? 20 : 30
+        : 10;
       for (const operation of genericDeletionOperations.sort((left, right) =>
-        bytewiseKeyCompare(left.key, right.key))) {
+        deletionRank(left) - deletionRank(right)
+          || bytewiseKeyCompare(left.key, right.key))) {
         await executeOperation(operation);
       }
     }
