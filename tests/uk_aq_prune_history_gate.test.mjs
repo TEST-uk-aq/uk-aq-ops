@@ -1396,6 +1396,41 @@ test("a stopped candidate loop still finalizes published v3 work and establishes
   assert.ok(events.indexOf("connector_gate") < events.indexOf("aggregate_day_gate"));
 });
 
+test("failed PostgreSQL gate completion retains an explicit unproven-recovery marker", async () => {
+  const published = publishedCandidateForFinalizationTest("2026-08-28", 1);
+  published.exportResult.source_identity = {
+    source_content_hash: "a".repeat(64),
+    source_content_hash_contract_version: 1,
+    source_content_hash_row_count: 1,
+  };
+  const summary = {
+    status: "completed", stopped_for_budget: false,
+    completed_candidates: 0, failed_candidates: 0, failures: [], aggregate_day_failures: [],
+  };
+  let failureEvidence = null;
+  const result = await phaseBHistoryModule.finalizeAndRecordPublishedPhaseBBatchForTest({
+    client: {},
+    runtime: { history_write_version: "v3" },
+    runId: "original-prune-run",
+    publishedCandidates: [published], summary, dayResults: new Map(),
+    logStructured: () => {}, batchTrigger: "candidate_loop_complete",
+    finalizePublished: async () => ({
+      completed: [], gate_failures: [{ published, error: new Error("gate transaction interrupted") }],
+      result: { affected_days_utc: ["2026-08-28"] }, lock_diagnostics: [],
+    }),
+    markFailed: async (_client, value) => { failureEvidence = value; },
+    finalizeDayGate: async () => ({ day_utc: "2026-08-28", history_done: false }),
+  });
+  assert.equal(result.attempted, true);
+  assert.equal(summary.failed_candidates, 1);
+  assert.equal(summary.failures[0].next_action, "review_original_publication_evidence_before_gate_only_recovery");
+  assert.match(failureEvidence.errorText, /^PRUNE_GATE_ONLY_RECOVERY_UNPROVEN:/);
+  const evidence = JSON.parse(failureEvidence.errorText.slice("PRUNE_GATE_ONLY_RECOVERY_UNPROVEN:".length));
+  assert.equal(evidence.original_run_id, "original-prune-run");
+  assert.equal(evidence.original_source_identity.source_content_hash, "a".repeat(64));
+  assert.match(evidence.reason, /gate transaction interrupted/);
+});
+
 function phaseBConfig() {
   return {
     enabled: true,
@@ -1427,6 +1462,60 @@ function phaseBConfig() {
     prune_check_dropbox: { enabled: false, required: false },
   };
 }
+
+test("persisted historical block remains visible on rediscovery without a pending writer claim", async () => {
+  for (const generation of ["v2", "v3"]) {
+    const blocked = {
+      day_utc: "2026-07-21", connector_id: 1, expected_row_count: "1",
+      min_observed_at: "2026-07-21T00:00:00.000Z",
+      max_observed_at: "2026-07-21T00:00:00.000Z",
+      status: "failed", run_id: "original-run",
+      last_error: "PRUNE_HISTORY_AUTHORITY_BLOCKED:" + JSON.stringify({
+        previous_authority: "canonical-connector#hash",
+        reason: "later IngestDB row conflicts with committed history",
+        next_action: "authorised_canonical_reconciliation_required",
+      }),
+      source_row_count: "1", excluded_row_count: "0", excluded_pollutant_counts: {},
+      resume_part_index: 0, resume_exported_row_count: "0", resume_parts_json: [],
+    };
+    let pendingFetches = 0;
+    let writerClaims = 0;
+    const client = {
+      async connect() {}, async end() {},
+      async query(sql) {
+        if (/^set (timezone|statement_timeout)/i.test(sql.trim())) return { rows: [] };
+        if (/select distinct op\.code/i.test(sql)) return { rows: [] };
+        if (/source_aggregates as/i.test(sql)) {
+          assert.match(sql, /last_error = case[\s\S]*PRUNE_HISTORY_AUTHORITY_BLOCKED/);
+          return { rows: [blocked] };
+        }
+        if (/insert into uk_aq_ops\.prune_day_gates/i.test(sql)) return { rows: [] };
+        if (/where c\.status = 'pending'/i.test(sql)) {
+          pendingFetches++;
+          return { rows: [] };
+        }
+        if (/set status = 'in_progress'/i.test(sql)) writerClaims++;
+        throw new Error(`Unexpected fake PostgreSQL query: ${sql.slice(0, 80)}`);
+      },
+    };
+    const phaseB = {
+      ...phaseBConfig(), history_write_version: generation,
+      committed_prefix: `history/${generation}/observations`,
+      runs_prefix: `history/${generation}/_ops/observations/runs`,
+    };
+    const summary = await runPhaseBBackup({
+      dryRun: true, phaseB, ingestRetentionDays: 5, logStructured: () => {},
+      runId: `rediscovery-${generation}`, nowUtc: "2026-07-27T12:00:00.000Z",
+      createPgClient: () => client,
+    });
+    assert.equal(summary.status, "partial_attention_required");
+    assert.equal(summary.blocked_scope_count, 1);
+    assert.equal(summary.blocked_scopes_preview[0].previous_authority, "canonical-connector#hash");
+    assert.equal(summary.pending_candidates, 0);
+    assert.equal(pendingFetches, 1);
+    assert.equal(writerClaims, 0);
+  }
+});
 
 test("source-change invalidation survives a real Phase B candidate-start budget stop without R2 candidate work", async () => {
   const dayUtc = "2026-07-21";
@@ -1673,6 +1762,79 @@ test("completed Phase B proceeds directly to normal prune and late-arrival stage
   assert.deepEqual(calls, ["prune", "late"]);
   assert.equal(summary.deletion_attempted, true);
   assert.equal(summary.phase_b_history.status, "completed");
+});
+
+test("isolated historical scope permits both deletion stages but finishes attention-required", async () => {
+  const calls = [];
+  const blocked = {
+    day_utc: "2026-08-27", connector_id: 1,
+    previous_authority: "history/v2/observations/day_utc=2026-08-27/connector_id=1/manifest.json#abc",
+    reason: "frozen observations differ from committed pollutant=pm25",
+    next_action: "authorised_canonical_reconciliation_required",
+  };
+  const config = { dryRun: false, maxHoursPerRun: 24, ingestDbRetentionDays: 5, phaseB: { enabled: true } };
+  await assert.rejects(runPruneForTest(config, {
+    runPhaseARecent: async () => ({ enabled: true }),
+    runPhaseBBackup: async () => ({
+      enabled: true, status: "partial_attention_required", failed_candidates: 0,
+      failures: [], aggregate_day_failures: [], blocked_scope_count: 1,
+      blocked_scopes_preview: [blocked],
+    }),
+    runPruneSingleWindow: async () => {
+      calls.push("normal_connector_2_day_D");
+      return { deletion_attempted: true, deleted_bucket_count: 1 };
+    },
+    runLateArrivalCleanup: async () => {
+      calls.push("late_connector_3_day_D_minus_1");
+      return { enabled: true, deleted_bucket_count: 1 };
+    },
+  }), (error) => {
+    assert.equal(error.code, "UK_AQ_PRUNE_PARTIAL_ATTENTION_REQUIRED");
+    assert.equal(error.prune_summary.status, "partial_attention_required");
+    assert.equal(error.prune_summary.blocked_scope_count, 1);
+    assert.deepEqual(error.prune_summary.blocked_scopes_preview, [blocked]);
+    return true;
+  });
+  assert.deepEqual(calls, ["normal_connector_2_day_D", "late_connector_3_day_D_minus_1"]);
+});
+
+test("blocked historical day does not grant its own gate or veto another day of the same connector", () => {
+  const buckets = [
+    { connector_id: 1, hour_start: "2026-08-27T00:00:00.000Z", observation_count: 1n },
+    { connector_id: 1, hour_start: "2026-08-26T00:00:00.000Z", observation_count: 10n },
+    { connector_id: 2, hour_start: "2026-08-27T00:00:00.000Z", observation_count: 20n },
+  ];
+  const gates = new Map([
+    [connectorDayGateKey("2026-08-27", 1), false],
+    [connectorDayGateKey("2026-08-26", 1), true],
+    [connectorDayGateKey("2026-08-27", 2), true],
+  ]);
+  const result = filterBucketsByConnectorHistoryGate(buckets, gates);
+  assert.deepEqual(result.allowedBuckets, [buckets[1], buckets[2]]);
+  assert.equal(result.blockedBuckets.length, 1);
+  assert.equal(result.blockedBuckets[0].day_utc, "2026-08-27");
+  assert.equal(result.blockedBuckets[0].connector_id, 1);
+});
+
+test("budget stop with retained blocked scope reports attention without entering deletion", async () => {
+  let deletionCalls = 0;
+  const config = { dryRun: false, maxHoursPerRun: 24, ingestDbRetentionDays: 5, phaseB: { enabled: true } };
+  await assert.rejects(runPruneForTest(config, {
+    runPhaseARecent: async () => ({ enabled: true }),
+    runPhaseBBackup: async () => ({
+      enabled: true, status: "stopped_budget", failed_candidates: 0,
+      failures: [], aggregate_day_failures: [], blocked_scope_count: 1,
+      blocked_scopes_preview: [{ day_utc: "2026-08-27", connector_id: 1 }],
+    }),
+    runPruneSingleWindow: async () => { deletionCalls++; },
+    runLateArrivalCleanup: async () => { deletionCalls++; },
+  }), (error) => {
+    assert.equal(error.code, "UK_AQ_PRUNE_PARTIAL_ATTENTION_REQUIRED");
+    assert.equal(error.prune_summary.normal_prune.deletion_attempted, false);
+    assert.equal(error.prune_summary.late_arrival.skipped, true);
+    return true;
+  });
+  assert.equal(deletionCalls, 0);
 });
 
 test("Phase B control PostgreSQL timeout is deadline-bounded and only deadline cancellation becomes stopped_budget", async () => {

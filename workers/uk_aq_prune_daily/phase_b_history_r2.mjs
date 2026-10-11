@@ -102,6 +102,27 @@ import {
   sourceObservationsToNarrowRows,
 } from "../../lib/aqi/aqi_levels.mjs";
 
+const ISOLATED_HISTORY_BLOCK = "PRUNE_HISTORY_AUTHORITY_BLOCKED:";
+const UNPROVEN_GATE_RECOVERY = "PRUNE_GATE_ONLY_RECOVERY_UNPROVEN:";
+const PERSISTENT_BLOCK_SQL = "(uk_aq_ops.history_candidates.status = 'failed' and (uk_aq_ops.history_candidates.last_error like 'PRUNE_HISTORY_AUTHORITY_BLOCKED:%' or uk_aq_ops.history_candidates.last_error like 'PRUNE_GATE_ONLY_RECOVERY_UNPROVEN:%'))";
+
+function blockedCandidateEvidence(candidate) {
+  const value = String(candidate?.last_error || "");
+  const marker = [ISOLATED_HISTORY_BLOCK, UNPROVEN_GATE_RECOVERY].find((prefix) => value.startsWith(prefix));
+  if (!marker) return null;
+  let evidence;
+  try {
+    evidence = JSON.parse(value.slice(marker.length));
+  } catch {
+    throw new Error(`Persisted Prune historical block evidence is malformed for day=${candidate.day_utc} connector=${candidate.connector_id}`);
+  }
+  if (!evidence || typeof evidence.previous_authority !== "string" ||
+      typeof evidence.reason !== "string" || typeof evidence.next_action !== "string") {
+    throw new Error(`Persisted Prune historical block evidence is incomplete for day=${candidate.day_utc} connector=${candidate.connector_id}`);
+  }
+  return { ...evidence, day_utc: candidate.day_utc, connector_id: candidate.connector_id };
+}
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_PART_MAX_ROWS = 1_000_000;
 const DEFAULT_OBSERVATIONS_PART_MAX_ROWS = 500_000;
@@ -1265,6 +1286,7 @@ function toConnectorDayRow(row) {
     max_observed_at: row.max_observed_at ? new Date(row.max_observed_at).toISOString() : null,
     status: String(row.status || "pending"),
     run_id: row.run_id ? String(row.run_id) : null,
+    last_error: row.last_error ? String(row.last_error) : null,
     manifest_key: row.manifest_key ? String(row.manifest_key) : null,
     history_row_count: row.history_row_count === null || row.history_row_count === undefined
       ? null
@@ -1596,6 +1618,7 @@ upserted as (
     min_observed_at = excluded.min_observed_at,
     max_observed_at = excluded.max_observed_at,
     status = case
+      when ${PERSISTENT_BLOCK_SQL} then 'failed'
       when uk_aq_ops.history_candidates.status = 'complete'
        and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
        and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
@@ -1604,6 +1627,7 @@ upserted as (
       else 'pending'
     end,
     run_id = case
+      when ${PERSISTENT_BLOCK_SQL} then uk_aq_ops.history_candidates.run_id
       when uk_aq_ops.history_candidates.status = 'complete'
        and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
        and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
@@ -1612,6 +1636,7 @@ upserted as (
       else null
     end,
     last_error = case
+      when ${PERSISTENT_BLOCK_SQL} then uk_aq_ops.history_candidates.last_error
       when uk_aq_ops.history_candidates.status = 'complete'
        and uk_aq_ops.history_candidates.expected_row_count = excluded.expected_row_count
        and uk_aq_ops.history_candidates.min_observed_at is not distinct from excluded.min_observed_at
@@ -1727,6 +1752,7 @@ upserted as (
     max_observed_at,
     status,
     run_id,
+    last_error,
     manifest_key,
     history_row_count,
     history_file_count,
@@ -1778,6 +1804,7 @@ select
   u.max_observed_at,
   u.status,
   u.run_id,
+  u.last_error,
   u.manifest_key,
   u.history_row_count,
   u.history_file_count,
@@ -1916,9 +1943,9 @@ upserted as (
     expected_row_count = excluded.expected_row_count,
     min_observed_at = excluded.min_observed_at,
     max_observed_at = excluded.max_observed_at,
-    status = 'pending',
-    run_id = null,
-    last_error = null,
+    status = case when ${PERSISTENT_BLOCK_SQL} then 'failed' else 'pending' end,
+    run_id = case when ${PERSISTENT_BLOCK_SQL} then uk_aq_ops.history_candidates.run_id else null end,
+    last_error = case when ${PERSISTENT_BLOCK_SQL} then uk_aq_ops.history_candidates.last_error else null end,
     manifest_key = null,
     history_row_count = null,
     history_file_count = null,
@@ -1972,6 +1999,7 @@ upserted as (
     max_observed_at,
     status,
     run_id,
+    last_error,
     manifest_key,
     history_row_count,
     history_file_count,
@@ -1990,6 +2018,7 @@ select
   max_observed_at,
   status,
   run_id,
+  last_error,
   manifest_key,
   history_row_count,
   history_file_count,
@@ -2278,7 +2307,7 @@ where day_utc = $1::date
 }
 
 async function markCandidateFailed(client, { dayUtc, connectorId, runId, errorText }) {
-  await client.query(
+  const result = await client.query(
     `
 update uk_aq_ops.history_candidates
 set
@@ -2294,6 +2323,9 @@ where day_utc = $1::date
 `,
     [dayUtc, connectorId, runId, errorText],
   );
+  if (result.rowCount === 0) {
+    throw new Error(`Phase B candidate failure evidence could not be retained for day=${dayUtc} connector=${connectorId}`);
+  }
 }
 
 async function markCandidateStoppedForBudget(client, {
@@ -4227,7 +4259,13 @@ async function finalizeAndRecordPublishedPhaseBBatch({
         dayUtc: candidate.day_utc,
         connectorId: candidate.connector_id,
         runId,
-        errorText: message,
+        errorText: `${UNPROVEN_GATE_RECOVERY}${JSON.stringify({
+          original_run_id: runId,
+          previous_authority: `${published.connectorGateEvidence.history_manifest_key}#${published.connectorGateEvidence.history_manifest_hash}`,
+          original_source_identity: published.exportResult.source_identity,
+          reason: `Final R2 authority completed but PostgreSQL gate transaction failed: ${message.slice(0, 800)}`,
+          next_action: "review_original_publication_evidence_before_gate_only_recovery",
+        })}`,
       });
       summary.failed_candidates += 1;
       summary.failures.push({
@@ -4235,7 +4273,7 @@ async function finalizeAndRecordPublishedPhaseBBatch({
         connector_id: candidate.connector_id,
         run_id: runId,
         error: message,
-        next_action: "retry_gate_completion",
+        next_action: "review_original_publication_evidence_before_gate_only_recovery",
       });
     }
     logStructured("INFO", `phase_b_history_${runtime.history_write_version}_run_finalization_complete`, {
@@ -6537,6 +6575,8 @@ export async function runPhaseBBackup({
     processed_candidates: 0,
     completed_candidates: 0,
     failed_candidates: 0,
+    blocked_scope_count: 0,
+    blocked_scopes_preview: [],
     source_changed_connector_gate_invalidated_count: 0,
     source_changed_connector_gate_invalidated_preview: [],
     source_identity_invalidated_connector_days: 0,
@@ -6580,6 +6620,10 @@ export async function runPhaseBBackup({
   });
 
   const dayResults = new Map();
+  const blockedScopes = new Map();
+  const recordBlocked = (value) => {
+    if (value) blockedScopes.set(`${value.day_utc}:${value.connector_id}`, value);
+  };
   const publishedCandidates = [];
   let totalWrittenRows = 0n;
   let totalWrittenBytes = 0n;
@@ -6597,6 +6641,9 @@ export async function runPhaseBBackup({
       runtime,
     );
     summary.populated_candidates = upsertedCandidates.length;
+    for (const candidate of upsertedCandidates) {
+      if (candidate.status === "failed") recordBlocked(blockedCandidateEvidence(candidate));
+    }
     const sourceChangedInvalidations = upsertedCandidates
       .filter((candidate) => candidate.source_changed_connector_gate_invalidated === true)
       .map((candidate) => candidate.source_change_invalidation);
@@ -6650,6 +6697,9 @@ export async function runPhaseBBackup({
     summary.pending_candidates = pendingCandidates.length;
 
     if (dryRun) {
+      summary.blocked_scope_count = blockedScopes.size;
+      summary.blocked_scopes_preview = [...blockedScopes.values()].slice(0, 25);
+      if (blockedScopes.size) summary.status = "partial_attention_required";
       const planned = pendingCandidates.map((candidate) => ({
         day_utc: candidate.day_utc,
         connector_id: candidate.connector_id,
@@ -6896,11 +6946,21 @@ export async function runPhaseBBackup({
             ...errorLogFields(cleanupError),
           });
         }
+        const isolatedAdmission = error instanceof PruneCommittedHistoryGuardError && error.isolatable === true;
+        const blockedEvidence = isolatedAdmission ? {
+          day_utc: candidate.day_utc,
+          connector_id: candidate.connector_id,
+          previous_authority: error.previous_authority,
+          reason: error.reason,
+          next_action: error.next_action,
+        } : null;
         await markCandidateFailed(controlClient, {
           dayUtc: candidate.day_utc,
           connectorId: candidate.connector_id,
           runId,
-          errorText: message,
+          errorText: isolatedAdmission
+            ? `${ISOLATED_HISTORY_BLOCK}${JSON.stringify(blockedEvidence)}`
+            : message,
         });
         await updateDayGateBlocked(controlClient, candidate.day_utc);
         dayResults.set(candidate.day_utc, {
@@ -6909,8 +6969,9 @@ export async function runPhaseBBackup({
           pending_connectors: 1,
           reason: "connector_publication_failed",
         });
-        summary.failed_candidates += 1;
-        summary.failures.push({
+        if (isolatedAdmission) recordBlocked(blockedEvidence);
+        else summary.failed_candidates += 1;
+        if (!isolatedAdmission) summary.failures.push({
           day_utc: candidate.day_utc,
           connector_id: candidate.connector_id,
           run_id: runId,
@@ -6935,6 +6996,7 @@ export async function runPhaseBBackup({
             ? error.next_action
             : "retry_safe",
           prune_blocked_for_day: true,
+          isolated_admission_block: isolatedAdmission,
         });
       }
     }
@@ -6976,6 +7038,9 @@ export async function runPhaseBBackup({
 
   summary.total_written_rows = totalWrittenRows.toString();
   summary.total_written_bytes = totalWrittenBytes.toString();
+  summary.blocked_scope_count = blockedScopes.size;
+  summary.blocked_scopes_preview = [...blockedScopes.values()].slice(0, 25);
+  if (blockedScopes.size && summary.status === "completed") summary.status = "partial_attention_required";
 
   const dayStates = Array.from(dayResults.values());
   summary.completed_days = dayStates.filter((state) => state.history_done === true).length;

@@ -169,6 +169,7 @@ test("a prior committed 100-row connector blocks a one-row late snapshot before 
   let writes = 0;
   await assert.rejects(admit(old.objects, [row("pm25", 101, 101)]), (error) => {
     assert.ok(error instanceof PruneCommittedHistoryGuardError);
+    assert.equal(error.isolatable, true);
     assert.match(error.message, /connector=7 day_utc=2026-07-21/);
     assert.match(error.previous_authority, new RegExp(old.connector.manifest_hash));
     return true;
@@ -192,10 +193,14 @@ test("pollutant omission and same-count changed content block; identical committ
   const prior = [row("pm25", 101), row("no2", 201)];
   const old = history(prior);
   await assert.rejects(admit(old.objects, [row("pm25", 101, 13)]), /pollutant child set differs/);
-  await assert.rejects(admit(old.objects, [row("pm25", 101, 13), row("no2", 201)]), /frozen observations differ/);
+  await assert.rejects(admit(old.objects, [row("pm25", 101, 13), row("no2", 201)]), (error) => {
+    assert.match(error.reason, /frozen observations differ/);
+    assert.equal(error.isolatable, true);
+    return true;
+  });
   await assert.rejects(admit(old.objects, prior), (error) => {
     assert.match(error.reason, /verified already-committed identical history/);
-    assert.equal(error.next_action, "review_duplicate_historical_ingestdb_rows");
+    assert.equal(error.next_action, "review_original_publication_evidence_or_duplicate_historical_rows");
     return true;
   });
   let writes = 0;
@@ -233,7 +238,11 @@ test("overwritten parent and child objects fail closed; unreferenced child does 
 test("missing or contradictory index_v3 authority blocks before publication", async () => {
   const old = history([row("pm25", 101)]);
   old.objects.delete(DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY);
-  await assert.rejects(admit(old.objects, [row("pm25", 101)]), /index_v3 latest authority is missing/);
+  await assert.rejects(admit(old.objects, [row("pm25", 101)]), (error) => {
+    assert.match(error.message, /index_v3 latest authority is missing/);
+    assert.equal(error.isolatable, false);
+    return true;
+  });
   const contradictory = history([row("pm25", 101)]);
   const latestKey = DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY;
   const latest = JSON.parse(contradictory.objects.get(latestKey).toString("utf8"));

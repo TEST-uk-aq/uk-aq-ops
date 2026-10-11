@@ -141,13 +141,14 @@ async function verifyCommittedIndexBinding(getObject, r2, root, pollutant, pollu
 }
 
 export class PruneCommittedHistoryGuardError extends Error {
-  constructor({ dayUtc, connectorId, previousAuthority, reason, nextAction = "authorised_canonical_reconciliation_required" }) {
+  constructor({ dayUtc, connectorId, previousAuthority, reason, nextAction = "authorised_canonical_reconciliation_required", isolatable = false }) {
     super(`Prune Daily canonical replacement blocked for connector=${connectorId} day_utc=${dayUtc}: previous_authority=${previousAuthority}; reason=${reason}; next_action=${nextAction}; retain IngestDB rows`);
     this.name = "PruneCommittedHistoryGuardError";
     this.code = "PRUNE_COMMITTED_HISTORY_REPLACEMENT_BLOCKED";
     this.previous_authority = previousAuthority;
     this.reason = reason;
     this.next_action = nextAction;
+    this.isolatable = isolatable;
   }
 }
 
@@ -196,8 +197,7 @@ async function inspectPruneFrozenConnectorSnapshot({
   const connectorKey = buildHistoryV2ConnectorManifestKey(prefix, dayUtc, connectorId);
   if (connectorRef.manifest_key !== connectorKey) throw new Error(`Committed observation connector key disagrees: ${dayKey}`);
   const authority = `${connectorKey}#${connectorRef.manifest_hash}`;
-  const block = (reason) => { throw new PruneCommittedHistoryGuardError({ dayUtc, connectorId, previousAuthority: authority, reason }); };
-  if (!indexRoots.length) block("committed connector has no final index_v3 scope; original unfinished attempt identity is unavailable");
+  if (!indexRoots.length) throw new Error("Committed connector has no final index_v3 scope; original unfinished attempt identity is unavailable");
   let connector;
   try {
     connector = await manifest(getObject, r2, connectorKey, { manifest_kind: "connector", day_utc: dayUtc, connector_id: connectorId }, connectorRef.manifest_hash);
@@ -208,37 +208,48 @@ async function inspectPruneFrozenConnectorSnapshot({
       if (!byCode.has(code)) byCode.set(code, []);
       byCode.get(code).push(row);
     }
-    if (children.length !== byCode.size) block("frozen pollutant child set differs from committed history");
-    if (indexRoots.length !== children.length) block("committed pollutant set and final index_v3 scopes disagree");
+    if (indexRoots.length !== children.length || new Set(indexRoots.map((entry) => entry.pollutant_code)).size !== children.length) {
+      throw new Error("Committed pollutant set and final index_v3 scopes disagree");
+    }
+    const sourceDifferences = [];
     for (const child of children) {
       const code = child.pollutant_code;
       const partition = byCode.get(code);
-      if (!partition) block(`frozen source omits committed pollutant=${code}`);
       const childKey = buildHistoryV2PollutantManifestKey(prefix, dayUtc, connectorId, code);
-      if (child.manifest_key !== childKey) block(`committed pollutant key disagrees for pollutant=${code}`);
+      if (child.manifest_key !== childKey) throw new Error(`Committed pollutant key disagrees for pollutant=${code}`);
       const indexRoot = indexRoots.find((entry) => entry.pollutant_code === code);
-      if (!indexRoot) block(`committed pollutant=${code} has no final index_v3 scope`);
+      if (!indexRoot) throw new Error(`Committed pollutant=${code} has no final index_v3 scope`);
       const pollutantBody = await readOptional(getObject, r2, childKey);
-      if (!pollutantBody) block(`committed pollutant manifest is missing: ${childKey}`);
+      if (!pollutantBody) throw new Error(`Committed pollutant manifest is missing: ${childKey}`);
       const pollutant = parse(pollutantBody, childKey);
       validateCanonicalHistoryV2Manifest(pollutant, { history_version: "v2", domain: "observations", manifest_kind: "pollutant", day_utc: dayUtc, connector_id: connectorId, pollutant_code: code, manifest_key: childKey });
-      if (pollutant.manifest_hash !== child.manifest_hash) block(`original complete publication identity cannot be proved after same-key child advance: ${childKey}`);
+      if (pollutant.manifest_hash !== child.manifest_hash) throw new Error(`original complete publication identity cannot be proved after same-key child advance: ${childKey}`);
       validateObservationContentHashMetadata(pollutant, { rowCount: pollutant.row_count });
       await verifyCommittedIndexBinding(getObject, r2, indexRoot, pollutant, pollutantBody);
-      if (pollutant.observation_content_hash_contract_version !== 1 ||
-          pollutant.observation_content_hash !== computeObservationContentHash(partition).observation_content_hash ||
-          pollutant.observation_content_hash_row_count !== partition.length) {
-        block(`frozen observations differ from committed pollutant=${code}`);
+      if (!partition) {
+        sourceDifferences.push(`frozen source omits committed pollutant=${code}`);
+      } else if (pollutant.observation_content_hash_contract_version !== 1 ||
+                 pollutant.observation_content_hash !== computeObservationContentHash(partition).observation_content_hash ||
+                 pollutant.observation_content_hash_row_count !== partition.length) {
+        sourceDifferences.push(`frozen observations differ from committed pollutant=${code}`);
       }
+    }
+    if (children.length !== byCode.size) sourceDifferences.unshift("frozen pollutant child set differs from committed history");
+    if (sourceDifferences.length) {
+      throw new PruneCommittedHistoryGuardError({
+        dayUtc, connectorId, previousAuthority: authority,
+        reason: sourceDifferences.join("; ").slice(0, 1800), isolatable: true,
+      });
     }
   } catch (error) {
     if (error instanceof PruneCommittedHistoryGuardError) throw error;
-    block(`complete replacement authority cannot be authenticated: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(`complete replacement authority cannot be authenticated: ${error instanceof Error ? error.message : String(error)}`);
   }
   throw new PruneCommittedHistoryGuardError({
     dayUtc, connectorId, previousAuthority: authority,
-    reason: "verified already-committed identical history; canonical publication is a no-op and newly present IngestDB rows remain ineligible for deletion",
-    nextAction: "review_duplicate_historical_ingestdb_rows",
+    reason: "verified already-committed identical history; original Prune attempt and complete source identity cannot be proved from canonical content alone",
+    nextAction: "review_original_publication_evidence_or_duplicate_historical_rows",
+    isolatable: true,
   });
 }
 
