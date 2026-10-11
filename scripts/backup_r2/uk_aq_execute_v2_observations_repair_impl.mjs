@@ -38,6 +38,10 @@ import {
 import {
   getObservationHistoryGeneration,
 } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
+import {
+  inspectPinnedSosLightConnectorGate,
+  UNREFERENCED_CONNECTOR_BLOCK,
+} from "./lib/sos_light_unreferenced_connector_gate.mjs";
 
 const SUPPORTED_ACTIONS = new Set([
   "observation_pollutant_manifest_repair",
@@ -535,11 +539,11 @@ export async function assembleSosLightDayParents({
     prefix: `${base}/connector_id=`,
     source: "dropbox",
   });
-  const physicalConnectorKeys = [...new Set(physicalEntries
-    .map((entry) => entry.key)
-    .filter((key) => /\/connector_id=\d+\/manifest\.json$/.test(key)))].sort();
-  const physicalConnectorIds = physicalConnectorKeys.map((key) =>
-    Number(key.match(/\/connector_id=(\d+)\/manifest\.json$/)?.[1]))
+  const physicalConnectorIds = [...new Set(physicalEntries.map((entry) => {
+    const relative = entry.key.slice(`${base}/`.length);
+    const match = relative.match(/^connector_id=([1-9]\d*)\/(?:manifest\.json|pollutant_code=[a-z0-9_]+\/(?:manifest\.json|[^/]+\.parquet))$/);
+    return match ? Number(match[1]) : null;
+  }))]
     .filter((value) => Number.isSafeInteger(value) && value > 0)
     .sort((left, right) => left - right);
   const baselineConnectorIds = baselineReferences.map((reference) => reference.connector_id);
@@ -623,15 +627,9 @@ export async function assembleSosLightDayParents({
 
   const unreferencedPhysicalConnectorPrefixes = unreferencedPhysicalConnectorIds
     .map((connectorId) => `${base}/connector_id=${connectorId}`);
-  for (const connectorId of unreferencedPhysicalConnectorIds) {
-    addSosLightDropboxWarning(audit, {
-      day_utc: dayUtc,
-      connector_id: connectorId,
-      object_key: `${base}/connector_id=${connectorId}/manifest.json`,
-      classification: "dropbox_unreferenced_physical_connector",
-      reason: "physical connector parent is not declared by the pinned authoritative day manifest",
-      omitted: true,
-    });
+  if (unreferencedPhysicalConnectorIds.length) {
+    throw new Error(`Blocked dependency: ${UNREFERENCED_CONNECTOR_BLOCK} `
+      + `day=${dayUtc} connector_ids=${unreferencedPhysicalConnectorIds.join(",")}`);
   }
   const unreferencedPhysicalObservationObjectKeys = physicalEntries
     .map((entry) => entry.key)
@@ -2085,6 +2083,33 @@ export async function runV2ObservationsRepair({
   const sosLightAudit = sosLightReplacement
     ? newSosLightAudit({ protectedConnectorIds, selectedMutationConnectorIds })
     : null;
+  const pinnedConnectorGate = sosLightReplacement
+    ? inspectPinnedSosLightConnectorGate({
+      runState, generation: storageGeneration, selectedDays: [...byDay.keys()],
+      dropboxRoot: args.dropboxRoot,
+    })
+    : null;
+  if (pinnedConnectorGate?.blocked.length) {
+    const blockedScopes = pinnedConnectorGate.blocked.map((entry) => ({
+      ...entry, stage: "observs_manifests",
+    }));
+    return {
+      ok: false, status: "blocked_dependency", dry_run: true, write_r2: false,
+      manifest_status: "blocked_dependency", index_status: "blocked_dependency",
+      planning: {
+        status: "blocked_dependency", input_kind: inputKind, domain, scopes,
+        days: [], proposals: [], removals: [], blocked_scopes: blockedScopes,
+        sos_light: { ...sosLightAudit, physical_connector_gate: pinnedConnectorGate.days },
+      },
+      execution: { status: "not_run" }, verification: { status: "not_run" },
+      r2_operation_counts: { r2_get_before_put_count: 0, r2_head_before_put_count: 0,
+        r2_list_before_put_count: 0, r2_put_count: 0, r2_get_after_put_verification_count: 0 },
+      results: blockedScopes,
+    };
+  }
+  const pinnedConnectorGateByDay = new Map(
+    (pinnedConnectorGate?.days || []).map((entry) => [entry.day_utc, entry]),
+  );
   const manifestStageStatus = (proposalKeys) => proposalKeys.some((key) =>
     String(staged.proposals.get(key)?.kind || "").endsWith("manifest")
   ) ? plannedStageStatus : "not_run";
@@ -2419,6 +2444,9 @@ export async function runV2ObservationsRepair({
         }),
       });
       proposalKeys.push(dayManifestKey);
+      if (sosLightReplacement) {
+        child.dayAudit.unreferenced_physical_connector_gate = pinnedConnectorGateByDay.get(dayUtc);
+      }
       }
     } else {
       const existingDay = localStore.getObjectIfExists(dayManifestKey);

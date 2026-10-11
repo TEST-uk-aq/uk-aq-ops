@@ -51,7 +51,8 @@ function reduce(current, command, now) {
   const next = structuredClone(current);
   if (command.type === 'retain_receipt') {
     // Receipt is a final-verification ATTESTATION, not yet authenticated by a
-    // writer adapter. Retention cannot establish ordering or select a candidate.
+    // writer adapter. Retention cannot establish current canonical-scope
+    // dominance, complete receipt coverage, or select a candidate.
     assertReceipt(command.receipt);
     assertReference(command.receipt_object, { managed: true });
     const bytes = canonicalJson(command.receipt);
@@ -75,7 +76,7 @@ function reduce(current, command, now) {
       entry.desired_change_ids = [...entry.desired_change_ids, eventId].sort();
       entry.state = 'reconcile_required';
       entry.failure = { code: ORDERING_BLOCKER, state: 'reconcile_required', at_utc: now,
-        detail: 'Receipt retained without cross-writer precedence or final-authority adapter authentication' };
+        detail: 'Receipt retained; current canonical scope precedence, receipt coverage and final-authority bundle authentication remain unverified' };
     }
     next.freshness.state = 'reconcile_required';
   } else if (command.type === 'record_failure') {
@@ -95,10 +96,11 @@ function reduce(current, command, now) {
   return next;
 }
 // Selection has no unsafe substitute. Even a valid/readback-verified descriptor
-// cannot bypass the absent durable verified-event order and final-authority seam.
+// cannot bypass unauthenticated canonical-scope precedence/receipt coverage or
+// the unresolved final-authority-to-bundle seam. No global counter is required.
 export function selectManagedPublications() {
   throw new JSONgenControlError(ORDERING_BLOCKER,
-    'Managed selection is disabled until durable canonical event ordering and writer authentication are contracted');
+    'Managed selection is disabled until canonical scope dominance, complete receipt coverage and final-authority bundle authentication are established');
 }
 export async function updateManagedControl({ r2, command, maxConflicts = 3 }) {
   admit(r2);

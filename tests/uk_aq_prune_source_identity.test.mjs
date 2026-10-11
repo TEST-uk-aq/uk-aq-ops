@@ -80,12 +80,16 @@ function transactionEvidence(sourceRows) {
     day_utc: "2026-07-21",
     connector_id: connectorId,
     status: "complete",
+    run_id: "original-run",
+    manifest_key: `history/v2/observations/day_utc=2026-07-21/connector_id=${connectorId}/manifest.json`,
+    last_error: "PRUNE_FIRST_DELETE_READY:v1",
     ...identity,
   };
   const gate = {
     day_utc: "2026-07-21",
     connector_id: connectorId,
     history_done: true,
+    history_run_id: "original-run",
     history_manifest_key: `history/v2/observations/day_utc=2026-07-21/connector_id=${connectorId}/manifest.json`,
     history_manifest_hash: "a".repeat(64),
     history_row_count: sourceRows.length,
@@ -105,16 +109,25 @@ function transactionClient({
   deleteCounts = null,
   remainingCounts = null,
   rawCounts = null,
+  failGateConsume = false,
 }) {
   const queries = [];
   const pendingDeleteCounts = deleteCounts ? [...deleteCounts] : null;
   const pendingRemainingCounts = remainingCounts ? [...remainingCounts] : null;
   const pendingRawCounts = rawCounts ? [...rawCounts] : null;
   let rawCountReads = 0;
+  let transactionSnapshot = null;
   return {
     queries,
-    async query(sql) {
+    async query(sql, params = []) {
       queries.push(sql);
+      if (/^begin isolation level repeatable read$/i.test(sql.trim())) {
+        transactionSnapshot = structuredClone(evidenceRows);
+      }
+      if (/^rollback$/i.test(sql.trim()) && transactionSnapshot) {
+        evidenceRows.candidate = transactionSnapshot.candidate;
+        evidenceRows.gate = transactionSnapshot.gate;
+      }
       if (/from uk_aq_ops\.history_candidates\s+where[\s\S]*for update/i.test(sql)) {
         return { rows: [evidenceRows.candidate] };
       }
@@ -136,6 +149,15 @@ function transactionClient({
           throw error;
         }
         return { rows: [{ deleted_count: pendingDeleteCounts?.shift() ?? currentRows.length }] };
+      }
+      if (/^update uk_aq_ops\.history_candidates\s+set\s+last_error =/im.test(sql)) {
+        evidenceRows.candidate.last_error = params[2];
+        return { rows: [], rowCount: 1 };
+      }
+      if (/^update uk_aq_ops\.prune_connector_day_gates\s+set\s+history_done = false/im.test(sql)) {
+        if (failGateConsume && /history_run_id = \$3/i.test(sql)) throw new Error("gate consume failed");
+        if (evidenceRows.gate) evidenceRows.gate.history_done = false;
+        return { rows: [], rowCount: 1 };
       }
       if (/uk_aq_phase_b_history_rows_v2/i.test(sql)) return { rows: currentRows };
       return { rows: [], rowCount: 1 };
@@ -169,6 +191,42 @@ test("source-identity deletion reads evidence/current rows and deletes in one re
   const sourceIndex = client.queries.findIndex((sql) => /uk_aq_phase_b_history_rows_v2/i.test(sql));
   assert.equal(sourceIndex > 0 && deleteIndex > sourceIndex, true);
   assert.match(client.queries.at(-1), /commit/i);
+  assert.match(client.queries.at(-2), /prune_connector_day_gates/i);
+});
+
+test("an identical replay after a committed drain cannot reuse its original gate", async () => {
+  const sourceRows = [row()];
+  const evidenceRows = transactionEvidence(sourceRows);
+  const first = transactionClient({ evidenceRows, currentRows: sourceRows });
+  assert.equal((await runTransaction(first)).ok, true);
+  assert.match(evidenceRows.candidate.last_error, /^PRUNE_FIRST_DELETE_CONSUMED:/);
+  assert.equal(evidenceRows.gate.history_done, false);
+  const replay = transactionClient({ evidenceRows, currentRows: sourceRows });
+  const result = await runTransaction(replay);
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics.source_identity_failure_reason, "first_deletion_already_committed");
+  assert.equal(replay.queries.some((sql) => /^with target_rows as/im.test(sql)), false);
+});
+
+test("a matching legacy completed candidate without first-deletion proof remains undeleted", async () => {
+  const sourceRows = [row()];
+  const evidenceRows = transactionEvidence(sourceRows);
+  evidenceRows.candidate.last_error = null;
+  const client = transactionClient({ evidenceRows, currentRows: sourceRows });
+  const result = await runTransaction(client);
+  assert.equal(result.ok, false);
+  assert.equal(result.diagnostics.source_identity_failure_reason, "first_deletion_authority_unproven");
+  assert.equal(client.queries.some((sql) => /^with target_rows as/im.test(sql)), false);
+});
+
+test("failed gate consumption rolls back deletion and keeps first-deletion authority available", async () => {
+  const sourceRows = [row()];
+  const evidenceRows = transactionEvidence(sourceRows);
+  const client = transactionClient({ evidenceRows, currentRows: sourceRows, failGateConsume: true });
+  await assert.rejects(runTransaction(client), /gate consume failed/);
+  assert.equal(evidenceRows.candidate.last_error, "PRUNE_FIRST_DELETE_READY:v1");
+  assert.equal(evidenceRows.gate.history_done, true);
+  assert.match(client.queries.at(-1), /^rollback$/i);
 });
 
 test("locked candidate and gate evidence use explicit canonical date projections", () => {

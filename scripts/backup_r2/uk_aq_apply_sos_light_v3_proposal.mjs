@@ -26,6 +26,9 @@ import {
   validateLocalSosLightV3Proposal,
 } from "./lib/sos_light_v3_proposal_validation.mjs";
 import {
+  requirePinnedSosLightConnectorGate,
+} from "./lib/sos_light_unreferenced_connector_gate.mjs";
+import {
   runPersistedSosLightV3Apply,
   writeSosLightV3RunState,
 } from "./lib/sos_light_v3_apply_persistence.mjs";
@@ -78,8 +81,31 @@ export async function applyValidatedSosLightV3Proposal({
     writeSosLightV3RunState(runStatePath, runState);
     throw error;
   }
-  const proposal = validateLocalSosLightV3Proposal(runState);
-  await validateFinalSosLightV3ProposalGraph({ runState, proposal });
+  let proposal;
+  try {
+    proposal = validateLocalSosLightV3Proposal(runState);
+    await validateFinalSosLightV3ProposalGraph({ runState, proposal });
+    requirePinnedSosLightConnectorGate({
+      runState, generation: "v3",
+      selectedDays: runState.sos_light.days.map((entry) => entry.day_utc),
+    });
+  } catch (error) {
+    runState.apply = {
+      ...(runState.apply || {}),
+      status: "failed",
+      current_phase: "final_proposal_validation",
+      r2_mutation_possible: false,
+      error: error instanceof Error ? error.message : String(error),
+      ...(error?.classification ? {
+        classification: error.classification,
+        blocked_connectors: error.evidence,
+        r2_observation_index_mutation_count: 0,
+      } : {}),
+      finished_at_utc: new Date().toISOString(),
+    };
+    writeSosLightV3RunState(runStatePath, runState);
+    throw error;
+  }
   return await runPersistedSosLightV3Apply({
     runStatePath,
     runState,

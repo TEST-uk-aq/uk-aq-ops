@@ -154,7 +154,8 @@ export function validateV2ObservationsChildManifest(payload, {
     );
     pushFailure(
       failures,
-      payload.timeseries_row_counts === null || isPlainObject(payload.timeseries_row_counts),
+      (kind === "day" && !Object.hasOwn(payload, "timeseries_row_counts")) ||
+        payload.timeseries_row_counts === null || isPlainObject(payload.timeseries_row_counts),
       "timeseries_row_counts_not_object_or_null",
     );
     pushFailure(

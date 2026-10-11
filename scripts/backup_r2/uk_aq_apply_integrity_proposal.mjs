@@ -63,6 +63,9 @@ import {
   requireSosLightV2CoordinatorFreeze,
 } from "./lib/sos_light_v2_coordinator_validation.mjs";
 import {
+  requirePinnedSosLightConnectorGate,
+} from "./lib/sos_light_unreferenced_connector_gate.mjs";
+import {
   FIXED_V2_SOS_LIGHT_RECOVERY_STATE_ENV,
   markR2MutationStarted,
 } from "../operations/lib/uk_aq_sos_light_v2_lock_recovery.mjs";
@@ -3027,11 +3030,17 @@ export async function applyValidatedProposal({
   const proposal = admittedPlan ? admittedPlan.proposal : localProposalValidator
     ? localProposalValidator(runState)
     : validateLocalProposal(runState, { generation });
-  const dedicatedSosProposal = validateDedicatedSosHistoricalProposal({
-    runState,
-    proposal,
-  });
+  let dedicatedSosProposal;
   try {
+    dedicatedSosProposal = validateDedicatedSosHistoricalProposal({
+      runState,
+      proposal,
+    });
+    if (dedicatedSosProposal.dedicated) {
+      requirePinnedSosLightConnectorGate({
+        runState, generation: "v2", selectedDays: dedicatedSosProposal.selected_days,
+      });
+    }
     if (admittedPlan) {
       if (admittedPlan.final_proposal_graph_validation?.status !== "succeeded") {
         throw new Error("Canonical APPLY received an unvalidated admission plan");
@@ -3045,7 +3054,13 @@ export async function applyValidatedProposal({
     runState.apply = {
       status: "failed",
       current_phase: "final_proposal_validation",
+      r2_mutation_possible: false,
       error: error instanceof Error ? error.message : String(error),
+      ...(error?.classification ? {
+        classification: error.classification,
+        blocked_connectors: error.evidence,
+        r2_observation_index_mutation_count: 0,
+      } : {}),
       finished_at_utc: new Date().toISOString(),
       persistence: {
         compact_checkpoint_count: 0,

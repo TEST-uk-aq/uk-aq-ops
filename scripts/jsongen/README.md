@@ -14,18 +14,21 @@ and failure reporting. These modules import only Node built-ins, the existing R2
 helper and existing AQI constants. They never read canonical Parquet, Integrity
 SQLite/journals or index_v2 observations. They never write canonical history.
 
-**Verified event ordering and final-source authentication remain unresolved.**
+**Authenticated canonical-scope precedence, complete receipt coverage and
+final-source authentication remain unresolved.**
 `selectManagedPublications()` always fails with
 `verified_event_ordering_unavailable`. No public mutator can set a selection,
-change an applied dependency set, resolve ordering, or declare absolute freshness.
+change an applied dependency set, resolve canonical precedence, or declare absolute freshness.
 This is an intentional Stage 1 boundary, not an operational publisher.
+The retained error identifier denotes unverified canonical precedence/receipt
+coverage; it does not require a numeric cross-writer event sequence.
 
 `retain_receipt` retains a writer's syntactically valid final-verification attestation
 and readback-authenticated immutable receipt bytes. It does **not** authenticate that
 the bundle represents the writer's final canonical publication. Entries explicitly
 carry `authentication_state: pending_writer_adapter`, `ordering_state: unresolved`
 and `state: reconcile_required`. The field `registered_changes` is a durable intake
-register, not an approved ordered event frontier. No event becomes eligible for
+register, not an approved current-canonical dependency frontier. No event becomes eligible for
 publication merely by entering it. Unknown/missing final evidence requires later
 reconciliation, never a reconstructed empty source or Parquet fallback.
 
@@ -45,17 +48,30 @@ managed/jsongen/v1/receipts/<SHA256>.json
 managed/jsongen/v1/bundles/<compressed-SHA256>.ndjson.gz
 managed/jsongen/v1/evidence/<SHA256>.json
 managed/jsongen/v1/manifests/<SHA256>.json
-managed/jsongen/v1/publications/<connector:timeseries:station:pollutant:month>/<UUIDv4>/observations.<SHA256>.json.gz
-managed/jsongen/v1/publications/<connector:timeseries:station:pollutant:month>/<UUIDv4>/aqi.<SHA256>.json.gz
+managed/jsongen/v1/publications/connector_id=<N>/timeseries_id=<N>/station_id=<N>/pollutant=<code>/month_utc=<YYYY-MM>/<UUIDv4>/observations.<compressed-SHA256>.json.gz
+managed/jsongen/v1/publications/connector_id=<N>/timeseries_id=<N>/station_id=<N>/pollutant=<code>/month_utc=<YYYY-MM>/<UUIDv4>/aqi.<compressed-SHA256>.json.gz
 ```
+
+`N` is a canonical positive decimal ID; `<code>` is `pm25`, `pm10` or `no2`.
+`publicationPrefix()` validates and constructs the shared immutable pair path.
+`monthKey()` retains the separate colon-separated **in-control map key**; it is
+never used as an R2 publication path.
 
 Canonical JSON for managed control/receipt/manifest metadata sorts object keys,
 preserves array order, uses compact UTF-8 JSON and one trailing newline.
-`canonicalJson` produces these bytes. Bundle observations retain original finite
-binary64 values, millisecond UTC timestamps, physical identity, multiplicity,
-source status and effective P/R/null verification status. Validation does not
-sort, deduplicate, interpolate or aggregate rows. The standard JSON negative-zero
+`canonicalJson` produces these bytes. The current canonical observation hash
+helper requires exact `YYYY-MM-DDTHH:mm:ss.SSSZ` strings for `observed_at_utc`.
+Bundle rows must preserve those exact accepted canonical strings: never round,
+truncate or regenerate a timestamp from a less precise input. Original finite
+binary64 values, physical identity, multiplicity, source status and effective
+P/R/null verification status remain unchanged. Validation does not sort,
+deduplicate, interpolate or aggregate rows. The standard JSON negative-zero
 representation follows the existing prototype. No observation schema is renamed.
+Metadata timestamps also use canonical UTC milliseconds in this schema, but are
+separate from observation identity; PM's 23-hour context is an AQI dependency
+window, not an observation timestamp precision rule. If accepted canonical
+observation precision later becomes finer, the bundle format must preserve it
+through an authorised update or fail closed until it can.
 
 `managedR2Config()` reuses the existing dedicated variables:
 
@@ -172,38 +188,43 @@ record its own failure through an unconditional replacement.
 Explicit failure codes cover missing authenticated baseline, corrupt monthly JSON,
 missing preceding context, invalid provenance, missing verified replacement bundle,
 incomplete registration, conditional conflict, ambiguous write, superseded candidate
-and the ordering blocker. Failure states do not invoke recovery or reverse canonical
+and the unresolved-precedence blocker. Failure states do not invoke recovery or reverse canonical
 success. No automatic canonical GET or reconstruction exists in these modules.
 
-## Ordering and final-authority blockers
+## Canonical-state dominance and final-authority blockers
 
 Inspected authority and code:
 
-- `observations_run_exclusion_contract.md`: one session-level advisory lock,
-  explicitly no durable lease/lock row; canonical operation and verification are
-  serialized, but the lock has no durable event sequence.
+- `observations_run_exclusion_contract.md`: one session-level advisory lock
+  serializes canonical operations and verification. Lock acquisition order is
+  not a source-precedence rule.
 - `workers/shared/uk_aq_r2_history_writer.mjs`: lock identity, owner/run/nonce,
   session lifetime, health checks and release. These identify ownership, not
-  cross-run publication precedence or a replayable monotonic event frontier.
+  a replayable source-precedence frontier.
 - `finalizePublishedPhaseBConnectors` and its v3 result validator in
   `workers/uk_aq_prune_daily/phase_b_history_r2.mjs`: verified canonical aggregates,
   exact scopes and latest index, followed by existing prune gate completion.
 - Current v3 Integrity APPLY persistence and final VERIFY/report paths: final
-  object evidence and run-local progress exist, but are not a shared durable
-  canonical event ordering authority or an implemented complete-bundle handoff.
+  object evidence and run-local progress exist, but the common authenticated
+  complete-bundle handoff has not been implemented.
 
-If A publishes canonically during a derived outage, B later registers, and A's
-receipt arrives last, assigning order at JSONgen registration would incorrectly
-make A newer. Hashes, generation labels, timestamps, random IDs, local journals
-and the derived control revision cannot repair that ambiguity. Registering under
-the canonical lock when available is insufficient for this delayed-outage case.
+If A publishes during a derived outage, B later publishes the same scope and
+registers first, A's delayed receipt must not override B. The future selector
+must authenticate currently committed observation root/day/connector/pollutant
+membership, including authoritative absence; applicable index_v3 exact/scoped
+physical membership; and verification/status/binding authority. It must bind
+each retained complete-scope bundle to its writer's final verified canonical
+publication, reject superseded or unauthenticated receipts, preserve independent
+still-current changes, and detect missing registrations. Missing or uncertain
+coverage remains reconciliation-required. Index-v3 `latest` is discovery
+metadata, not an authentication parent.
 
-Required contract decision: a durable, authenticated cross-writer ordering and
-missing-event/replay authority established at final canonical verification, with
-retained receipts that survive derived outages. Define sequence/frontier scope,
-replay/supersession, same-scope conflicts and missing receipt behaviour without
-making JSONgen a canonical success condition or adding a pre-mutation fence.
-This stage adds neither a sequence database nor a guessed precedence rule.
+Receipt arrival order, workflow completion, control revision/CAS order, pubID,
+timestamp, source hash and advisory-lock ownership do not establish canonical
+precedence. **A new durable numeric cross-writer sequence is not required.**
+The unresolved Stage 1 gate is the exact final-authority-to-bundle authentication
+and current-scope/complete-receipt reconciliation seam. The retained ordering
+error identifier means those proofs are missing; selection stays disabled.
 
 Writer-specific adapters must also prove that complete bundle rows match final
 verified publication, source/status/binding and absence authority. This stage
@@ -218,9 +239,10 @@ simulated integration programme are required. Actual credentials, conditional
 R2 operations, overlaps, lost events, PM month boundaries and final source parity
 still require separately authorised real TEST acceptance.
 
-Before Stage 2: resolve the ordering/final-bundle authentication contracts; approve
+Before Stage 2: implement canonical-scope dominance, complete receipt reconciliation
+and final-bundle authentication; approve
 practical bundle/control limits and retention; implement authenticated immutable
-pair/payload readback and ordered all-month selection; then implement the bounded
+pair/payload readback and current-scope-checked all-month selection; then implement the bounded
 baseline/context regeneration path. Keep canonical writers non-blocking and
 metadata-only reconciliation fail-closed. Workflow, triggers, bootstrap/rebuild,
 identity allowlists and website/Refresh/open-month integration remain later work.
@@ -236,9 +258,9 @@ JSONgen artefact enters Dropbox backup.
 
 Update the future JSONgen implementation status to distinguish these inactive
 foundations from a working publisher. Record the managed field/path definitions,
-conditional adapter/result protocol, explicit unresolved-ordering and pending
-writer-authentication states, and disabled selection. Resolve the durable event
-order and final-authority-to-bundle seam before describing registration as
+conditional adapter/result protocol, explicit unresolved canonical precedence and pending
+writer-authentication states, and disabled selection. Implement canonical-state
+dominance, complete receipt coverage and the final-authority-to-bundle seam before describing registration as
 publication-eligible. Record actual remote conditional-write acceptance only after
 its separately authorised check. No workflow/deployment/default serving status
 should change. Authoritative `uk-aq-system-docs` was not edited.

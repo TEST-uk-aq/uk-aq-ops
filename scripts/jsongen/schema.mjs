@@ -1,5 +1,5 @@
 // Managed JSONgen wire contracts. Validation checks shape/relationships, not the
-// truth of writer attestations. No canonical reader or event sequencer lives here.
+// truth of writer attestations. No canonical reader or scope-dominance checker lives here.
 import { createHash, randomUUID } from 'node:crypto';
 import { AQI_ALGORITHM_VERSION, DAQI_PM_ROLLING24H_WINDOW_HOURS,
   DAQI_PM_ROLLING24H_REQUIRED_HOURS } from '../../lib/aqi/aqi_levels.mjs';
@@ -8,6 +8,8 @@ export const ROOT = 'managed/jsongen/v1';
 export const CONTROL_KEY = `${ROOT}/control/current.json`;
 export const BUCKET = 'uk-aq-chart-history-json-test';
 export const ALGORITHM = AQI_ALGORITHM_VERSION;
+// Retained identifier for Stage 1 control compatibility. It denotes unverified
+// canonical scope precedence/receipt coverage, not a missing global event counter.
 export const ORDERING_BLOCKER = 'verified_event_ordering_unavailable';
 export const FAILURE_CODES = Object.freeze([
   'missing_authenticated_baseline', 'corrupt_monthly_json',
@@ -66,6 +68,15 @@ export function monthKey(identity, monthUtc) {
   assertIdentity(identity);
   requireValid(month(monthUtc), 'invalid month');
   return `${identity.connector_id}:${identity.timeseries_id}:${identity.station_id}:${identity.pollutant_code}:${monthUtc}`;
+}
+// Immutable R2 keys use explicit path components. monthKey() is only the
+// private control-map key and must never appear in a publication object path.
+export function publicationPrefix(identity, monthUtc, pubID) {
+  assertIdentity(identity);
+  requireValid(month(monthUtc) && uuid(pubID), 'invalid publication month/UUIDv4');
+  return `${ROOT}/publications/connector_id=${identity.connector_id}`
+    + `/timeseries_id=${identity.timeseries_id}/station_id=${identity.station_id}`
+    + `/pollutant=${identity.pollutant_code}/month_utc=${monthUtc}/${pubID}`;
 }
 export function assertReference(value, { managed = false, gzip = false } = {}) {
   fields(value, ['bucket', 'key', 'sha256', 'byte_size'], gzip ? ['json_sha256', 'json_byte_size'] : []);
@@ -205,7 +216,7 @@ export function assertPublication(value) {
   requireValid(!value.applied_change_ids.includes(value.pub_id), 'pubID must be separate from verified change IDs');
   requireValid(value.algorithm_version === ALGORITHM, 'AQI algorithm mismatch');
   coverage(value.coverage);
-  const prefix = `${ROOT}/publications/${monthKey(value.identity, value.month_utc)}/${value.pub_id}`;
+  const prefix = publicationPrefix(value.identity, value.month_utc, value.pub_id);
   for (const product of ['observations', 'aqi']) {
     const descriptor = value[product];
     fields(descriptor, ['pub_id', 'object']);
@@ -227,7 +238,7 @@ export function assertPublication(value) {
       && c.start_utc === new Date(start - 23 * 3600000).toISOString()
       && c.end_exclusive_utc === new Date(start).toISOString(), 'PM preceding 23-hour context mismatch');
     assertManifestReference(c.manifest); assertReference(c.observations, { managed: true, gzip: true }); ids(c.applied_change_ids);
-    requireValid(c.observations.key === `${ROOT}/publications/${monthKey(c.identity, c.month_utc)}/${c.pub_id}/observations.${c.observations.sha256}.json.gz`, 'context publication identity mismatch');
+    requireValid(c.observations.key === `${publicationPrefix(c.identity, c.month_utc, c.pub_id)}/observations.${c.observations.sha256}.json.gz`, 'context publication identity mismatch');
   }
   return value;
 }
@@ -253,7 +264,7 @@ export function assertControl(value) {
     requireValid(value.previous.revision === value.revision - 1 && uuid(value.previous.operation_id)
       && value.previous.operation_id !== value.operation_id && sha(value.previous.sha256), 'invalid revision evidence');
   }
-  requireValid(same(value.ordering, { state: 'unresolved', reason: ORDERING_BLOCKER }), 'no implemented verified-event ordering authority');
+  requireValid(same(value.ordering, { state: 'unresolved', reason: ORDERING_BLOCKER }), 'canonical scope precedence and receipt coverage are not yet authenticated');
   fields(value.freshness, ['state', 'source_as_of']);
   requireValid(['unknown', 'pending', 'reconcile_required'].includes(value.freshness.state), 'absolute currentness is not established');
   if (value.freshness.source_as_of !== null) assertSource(value.freshness.source_as_of);
@@ -267,7 +278,7 @@ export function assertControl(value) {
       && entry.receipt_object.byte_size === canonicalJson(entry.receipt).length, 'receipt evidence mismatch');
     requireValid(eventId === entry.receipt.change_id && instant(entry.registered_at_utc)
       && LIFECYCLE_STATES.includes(entry.state) && entry.state !== 'selected'
-      && entry.ordering_state === 'unresolved' && entry.authentication_state === 'pending_writer_adapter', 'invalid unsequenced registered change');
+      && entry.ordering_state === 'unresolved' && entry.authentication_state === 'pending_writer_adapter', 'invalid unresolved-scope registered change');
     requireValid(entry.receipt_object.key === `${ROOT}/receipts/${entry.receipt_object.sha256}.json`, 'immutable receipt reference required');
     for (const m of entry.receipt.affected_months) {
       const k = monthKey(m.identity, m.month_utc);
