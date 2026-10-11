@@ -23113,6 +23113,7 @@ def _load_authenticated_v3_proposal_result(
     envelope: Mapping[str, Any],
     expected_result_path: Path,
     log: logging.Logger | None = None,
+    allow_blocked: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     envelope_proposal_count = (
         envelope.get("proposal_count") if isinstance(envelope, Mapping) else None
@@ -23136,7 +23137,9 @@ def _load_authenticated_v3_proposal_result(
         or envelope.get("transport_contract_version")
         != SOS_LIGHT_V3_PROPOSAL_TRANSPORT_CONTRACT
         or envelope.get("transport_mode") != "file_backed_compact_proposal"
-        or envelope.get("status") != "planned"
+        or envelope.get("status") != (
+            "blocked_dependency" if allow_blocked else "planned"
+        )
     ):
         raise ValueError("fixed-v3 proposal transport envelope is invalid")
     artifact_identity = envelope.get("proposal_artifact")
@@ -23183,12 +23186,28 @@ def _load_authenticated_v3_proposal_result(
     ):
         raise ValueError("fixed-v3 compact proposal artifact is invalid")
     output = dict(artifact["output"])
-    if output.get("ok") is not True:
+    if allow_blocked:
+        blocked_planning = output.get("planning")
+        blocked = (blocked_planning.get("blocked_scopes")
+                   if isinstance(blocked_planning, Mapping) else None)
+        if (output.get("ok") is not False
+                or output.get("status") != "blocked_dependency"
+                or not isinstance(blocked, list) or not blocked
+                or any(not isinstance(entry, Mapping)
+                       or entry.get("classification")
+                       != "dropbox_unreferenced_physical_connector_blocked"
+                       or entry.get("status") != "blocked_dependency"
+                       or entry.get("r2_observation_index_mutation_count") != 0
+                       for entry in blocked)):
+            raise ValueError("fixed-v3 blocked proposal evidence is invalid")
+    elif output.get("ok") is not True:
         raise ValueError("fixed-v3 compact proposal did not complete successfully")
     planning = output.get("planning")
     proposals = planning.get("proposals") if isinstance(planning, Mapping) else None
     if not isinstance(proposals, list):
         raise ValueError("fixed-v3 compact proposal graph is unavailable")
+    if allow_blocked and proposals:
+        raise ValueError("fixed-v3 blocked proposal contains planned objects")
     progress.total_objects = len(proposals)
     file_backed_count = 0
     file_backed_bytes = 0
@@ -23346,6 +23365,24 @@ def _run_v3_observation_metadata_proposal(
     except json.JSONDecodeError:
         envelope = {}
     if proc.returncode != 0:
+        if isinstance(envelope, Mapping) and envelope.get("status") == "blocked_dependency":
+            try:
+                output, transport_audit = _load_authenticated_v3_proposal_result(
+                    run_state=run_state,
+                    envelope=envelope,
+                    expected_result_path=proposal_result_path,
+                    log=log,
+                    allow_blocked=True,
+                )
+                return {
+                    "status": "blocked_dependency",
+                    "exit_code": proc.returncode,
+                    "output": output,
+                    "results": output.get("results") or [],
+                    "transport": transport_audit,
+                }
+            except (OSError, TypeError, ValueError) as exc:
+                stderr = f"{stderr}; blocked artifact authentication failed: {exc}"
         log.warning(
             "v3 observation metadata proposal failed exit_code=%s stderr=%s",
             proc.returncode,

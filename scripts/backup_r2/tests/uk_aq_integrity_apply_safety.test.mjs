@@ -2218,7 +2218,7 @@ test("SOS-light fails when a day-declared non-selected connector cannot be prese
   );
 });
 
-test("SOS-light excludes and warns about an unreferenced physical Dropbox connector", async () => {
+test("SOS-light blocks an unreferenced physical Dropbox connector", async () => {
   const dayUtc = "2026-07-12";
   const base = `history/v2/observations/day_utc=${dayUtc}`;
   const contentHash = computeEmptyObservationContentHash();
@@ -2280,29 +2280,15 @@ test("SOS-light excludes and warns about an unreferenced physical Dropbox connec
     days: [], dropbox_warnings: [], dropbox_warning_count: 0,
     dropbox_omission_count: 0,
   };
-  const assembled = await assembleSosLightDayParents({
-    staged, base, dayUtc, protectedConnectorIds: [1],
-    selectedMutationConnectorIds: [1], audit,
-  });
-  assert.deepEqual(
-    assembled.children[0].pollutant_codes,
-    ["no2", "o3", "pm10", "pm25"],
+  await assert.rejects(
+    assembleSosLightDayParents({
+      staged, base, dayUtc, protectedConnectorIds: [1],
+      selectedMutationConnectorIds: [1], audit,
+    }),
+    /dropbox_unreferenced_physical_connector_blocked day=2026-07-12 connector_ids=7/,
   );
-  assert.deepEqual(
-    staged.proposals.get(connectorKey).dependencies,
-    pollutants.map((payload) => payload.manifest_key).sort(),
-  );
-  assert.deepEqual(audit.days[0].final_connector_1_child_set,
-    pollutants.map((payload) => payload.manifest_key).sort());
-  assert.deepEqual(audit.days[0].final_assembled_connector_ids, [1]);
-  assert.deepEqual(audit.days[0].expected_preserved_connector_ids, []);
-  assert.deepEqual(audit.days[0].unreferenced_physical_connector_ids, [7]);
-  assert.deepEqual(audit.days[0].omitted_dropbox_connector_ids, [7]);
-  assert.equal(audit.dropbox_warning_count, 1);
-  assert.equal(
-    audit.dropbox_warnings[0].classification,
-    "dropbox_unreferenced_physical_connector",
-  );
+  assert.equal(audit.dropbox_warning_count, 0);
+  assert.deepEqual(audit.days, []);
 });
 
 test("day finalizer can retain an exact validated connector set for generic callers", async () => {
