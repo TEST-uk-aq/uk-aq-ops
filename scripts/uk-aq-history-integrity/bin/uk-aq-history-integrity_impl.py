@@ -12665,7 +12665,7 @@ def run_v2_observations_integrity_checks(
                        for entry in connectors)
                 or type(summary.get("connector_count")) is not int
                 or summary["connector_count"] < 0
-                or (connector_ids and summary["connector_count"] != len(connector_ids))
+                or summary["connector_count"] != len(connector_ids)
                 or type(summary.get("total_rows")) is not int
                 or summary["total_rows"] < 0):
             gaps.append(_v2_obs_gap(
@@ -12673,6 +12673,20 @@ def run_v2_observations_integrity_checks(
                 expected_path=latest_key,
             ))
             return None
+        if day_manifest_exists:
+            day_dir = root / data_prefix / f"day_utc={day_utc}"
+            retained_connector_ids = {
+                connector_id
+                for connector_dir in day_dir.glob("connector_id=*")
+                for connector_id in [_connector_id_from_dirname(connector_dir.name)]
+                if connector_id is not None
+                and (connector_dir / "manifest.json").is_file()
+            }
+            if retained_connector_ids and not retained_connector_ids.intersection(connector_ids):
+                gaps.append(_v2_obs_gap(
+                    "latest_index_missing_retained_connector", day_utc=day_utc,
+                    expected_path=latest_key,
+                ))
         return summary
 
     for day in selected_date_values:
