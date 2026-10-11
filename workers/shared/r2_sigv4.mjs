@@ -488,6 +488,86 @@ export async function r2PutObject({
   };
 }
 
+// Separate from r2PutObject: a conditional attempt must NEVER enter its retry
+// loop or fall through to an adapter's unconditional putObject method.
+export class R2ConditionalWriteError extends Error {
+  constructor(code, message, { status = null, cause } = {}) {
+    super(message, { cause });
+    this.name = "R2ConditionalWriteError";
+    this.code = code;
+    this.status = status;
+  }
+}
+
+export function isStrongR2Etag(value) {
+  return typeof value === "string" && /^"[^"\s\x00-\x1f\x7f]+"$/.test(value);
+}
+
+export async function r2PutObjectConditional({
+  r2, key, body, if_match = null, if_none_match = null,
+  content_type = "application/octet-stream", sha256 = null,
+}) {
+  if (!((isStrongR2Etag(if_match) && if_none_match === null)
+    || (if_match === null && if_none_match === "*"))) {
+    throw new TypeError("Conditional PUT requires one strong quoted ETag or If-None-Match: *");
+  }
+  const bufferBody = body instanceof Uint8Array ? body : Buffer.from(body);
+  const payloadHash = awsSha256Hex(bufferBody);
+  if (sha256 !== null && normalizeR2Sha256Checksum(sha256) !== payloadHash) {
+    throw new TypeError("Conditional PUT body SHA-256 mismatch");
+  }
+  if (r2?.adapter && typeof r2.adapter.putObjectConditional !== "function") {
+    throw new TypeError("R2 adapter does not implement atomic putObjectConditional");
+  }
+  let request;
+  if (!r2?.adapter) {
+    request = buildAwsSignedRequest({
+      method: "PUT", endpoint: r2.endpoint, region: r2.region,
+      accessKeyId: r2.access_key_id, secretAccessKey: r2.secret_access_key,
+      bucket: r2.bucket, objectKey: key, payloadHash,
+      headers: {
+        "content-type": content_type, "content-length": String(bufferBody.byteLength),
+        "x-amz-checksum-sha256": sha256HexToBase64(payloadHash),
+        ...(if_match !== null ? { "if-match": if_match } : { "if-none-match": "*" }),
+      },
+    });
+  }
+  let result;
+  try {
+    // Adapter contract: one attempt, {status, etag}; thrown errors are ambiguous.
+    result = r2?.adapter
+      ? await r2.adapter.putObjectConditional({ key, body: bufferBody,
+        content_type, sha256: payloadHash, if_match, if_none_match })
+      : await fetchWithTimeout(request.url,
+        { method: "PUT", headers: request.headers, body: bufferBody },
+        R2_REQUEST_TIMEOUT_MS, globalThis.fetch, async (response) => {
+          const outcome = { status: response.status, etag: response.headers.get("etag") };
+          cancelResponseBody(response);
+          return outcome;
+        });
+  } catch (cause) {
+    throw new R2ConditionalWriteError("R2_WRITE_AMBIGUOUS",
+      "Conditional PUT transport failure; inspect authoritative object before retry", { cause });
+  }
+  const status = result?.status;
+  if (status === 412) {
+    throw new R2ConditionalWriteError("R2_PRECONDITION_FAILED",
+      "Conditional PUT precondition failed; reread current state", { status });
+  }
+  // 409 includes concurrent-operation conflicts. Treat conservatively, as with
+  // timeout/service failures and malformed/missing success evidence.
+  if (status === 409 || isRetryableR2Status(status) || status >= 500
+    || !Number.isInteger(status) || status < 100 || status > 599
+    || (status >= 200 && status < 300 && !isStrongR2Etag(result.etag))) {
+    throw new R2ConditionalWriteError("R2_WRITE_AMBIGUOUS",
+      "Conditional PUT outcome unknown; inspect authoritative object before retry", { status });
+  }
+  if (status < 200 || status >= 300) {
+    throw new R2ConditionalWriteError("R2_SERVICE_FAILURE", "Conditional PUT rejected", { status });
+  }
+  return { key, bytes: bufferBody.byteLength, etag: result.etag, sha256: payloadHash };
+}
+
 export async function r2CopyObject({ r2, source_key, dest_key }) {
   const copySource = `/${r2.bucket}/${source_key.split("/").map((part) => encodeRfc3986(part)).join("/")}`;
   const { response, errorText } = await fetchR2WithRetry({
