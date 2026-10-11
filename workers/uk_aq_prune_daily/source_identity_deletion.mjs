@@ -10,6 +10,7 @@ import {
   pruneConnectorSourceIdentityFailureReason,
   PRUNE_CONNECTOR_SOURCE_CONTENT_HASH_CONTRACT_VERSION,
 } from "../shared/uk_aq_prune_connector_source_identity.mjs";
+import { FIRST_DELETE_READY, FIRST_DELETE_CONSUMED } from "./deletion_attempt_state.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
 const TRANSACTION_CONFLICT_CODES = new Set(["40001", "40P01"]);
@@ -205,6 +206,9 @@ select
   day_utc::text as day_utc,
   connector_id,
   status,
+  run_id,
+  last_error,
+  manifest_key,
   source_content_hash,
   source_content_hash_contract_version,
   source_content_hash_row_count
@@ -221,6 +225,7 @@ select
   day_utc::text as day_utc,
   connector_id,
   history_done,
+  history_run_id,
   history_manifest_key,
   history_manifest_hash,
   history_row_count,
@@ -272,6 +277,16 @@ function classifyLockedEvidence(candidate, gate, pair) {
   }
   if (candidate.status !== "complete") {
     return { failureReason: "candidate_not_complete", preserveEvidence: false };
+  }
+  if (String(candidate.last_error || "").startsWith(FIRST_DELETE_CONSUMED)) {
+    return { failureReason: "first_deletion_already_committed", preserveEvidence: true };
+  }
+  if (candidate.last_error !== FIRST_DELETE_READY) {
+    return { failureReason: "first_deletion_authority_unproven", preserveEvidence: true };
+  }
+  if (!candidate.run_id || candidate.run_id !== gate.history_run_id ||
+      candidate.manifest_key !== gate.history_manifest_key) {
+    return { failureReason: "candidate_gate_publication_identity_mismatch", preserveEvidence: false };
   }
 
   let candidateIdentity;
@@ -394,6 +409,30 @@ function deletionPlanCoversCurrentConnectorDay(pair, buckets, currentRows) {
       left.hour_start.localeCompare(right.hour_start)
     )),
   };
+}
+
+async function consumeFirstDeletionAuthority(client, pair, candidate, gate, deletedRows) {
+  const marker = `${FIRST_DELETE_CONSUMED}${JSON.stringify({
+    previous_authority: `${gate.history_manifest_key}#${gate.history_manifest_hash}`,
+    original_run_id: candidate.run_id,
+    deleted_row_count: deletedRows.toString(),
+    reason: "Original complete connector-day source was fully drained by a committed atomic deletion; later historical rows require separate authorisation",
+    next_action: "review_reappeared_historical_rows_before_authorising_deletion",
+  })}`;
+  const candidateResult = await client.query(`
+update uk_aq_ops.history_candidates
+set last_error = $3, updated_at = now()
+where day_utc = $1::date and connector_id = $2::integer
+  and status = 'complete' and last_error = $4 and run_id = $5
+`, [pair.dayUtc, pair.connectorId, marker, FIRST_DELETE_READY, candidate.run_id]);
+  if (candidateResult.rowCount !== 1) throw new Error("Original Prune first-deletion marker could not be consumed");
+  const gateResult = await client.query(`
+update uk_aq_ops.prune_connector_day_gates
+set history_done = false, updated_at = now()
+where day_utc = $1::date and connector_id = $2::integer
+  and history_done = true and history_run_id = $3 and history_manifest_hash = $4
+`, [pair.dayUtc, pair.connectorId, candidate.run_id, gate.history_manifest_hash]);
+  if (gateResult.rowCount !== 1) throw new Error("Original Prune deletion gate could not be consumed");
 }
 
 async function deleteOneHour(client, pair, bucket, deleteBatchSize, maxDeleteBatchesPerHour) {
@@ -720,6 +759,7 @@ export async function runPruneConnectorDayDeletionTransaction({
       });
     }
 
+    await consumeFirstDeletionAuthority(client, pair, candidate, gate, transactionDeletedRows);
     await client.query("commit");
     transactionStarted = false;
     const committedDeletedRows = transactionDeletedRows;

@@ -196,6 +196,8 @@ function compactPruneHealthSummary(summary = {}) {
         status: summary.phase_b_history.status,
         stopped_for_budget: summary.phase_b_history.stopped_for_budget,
         error_count: summary.phase_b_history.error_count,
+        blocked_scope_count: summary.phase_b_history.blocked_scope_count,
+        blocked_scopes_preview: summary.phase_b_history.blocked_scopes_preview,
       }
       : undefined,
     late_arrival: summary.late_arrival
@@ -2914,6 +2916,16 @@ async function runPrune(config, adapters = {}) {
       phase_b_history: phaseBHistorySummary,
       late_arrival: skipped(),
     };
+    if (Number(phaseBHistorySummary.blocked_scope_count || 0) > 0) {
+      summary.status = "partial_attention_required";
+      summary.attention_required = true;
+      summary.blocked_scope_count = phaseBHistorySummary.blocked_scope_count;
+      summary.blocked_scopes_preview = phaseBHistorySummary.blocked_scopes_preview;
+      const error = new Error(`Prune Daily stopped for budget with ${summary.blocked_scope_count} historical connector/day scopes requiring attention`);
+      error.code = "UK_AQ_PRUNE_PARTIAL_ATTENTION_REQUIRED";
+      error.prune_summary = summary;
+      throw error;
+    }
     logStructured("WARNING", "ingestdb_prune_stopped_after_phase_b_budget", {
       phase_b_history_run_id: phaseBHistorySummary.run_id || phaseBRunId,
       phase_b_history_status: phaseBHistorySummary.status,
@@ -3016,12 +3028,33 @@ async function runPrune(config, adapters = {}) {
     phase_b_history: phaseBHistorySummary,
     late_arrival: lateArrivalSummary,
   };
+  if (Number(phaseBHistorySummary?.blocked_scope_count || 0) > 0) {
+    combinedSummary.status = "partial_attention_required";
+    combinedSummary.attention_required = true;
+    combinedSummary.blocked_scope_count = phaseBHistorySummary.blocked_scope_count;
+    combinedSummary.blocked_scopes_preview = phaseBHistorySummary.blocked_scopes_preview;
+    combinedSummary.alert_condition_count = toSafeInt(combinedSummary.alert_condition_count)
+      + phaseBHistorySummary.blocked_scope_count;
+  }
   if (batches.length > 1) {
     logStructured(
       "INFO",
       config.dryRun ? "ingestdb_prune_dry_run_batched_summary" : "ingestdb_prune_delete_batched_summary",
       combinedSummary,
     );
+  }
+  if (combinedSummary.attention_required) {
+    logStructured("WARNING", "ingestdb_prune_partial_attention_required", {
+      phase_b_history_run_id: phaseBHistorySummary.run_id || phaseBRunId,
+      blocked_scope_count: combinedSummary.blocked_scope_count,
+      blocked_scopes_preview: combinedSummary.blocked_scopes_preview,
+      normal_deletion_attempted: Boolean(pruneWindowSummary.deletion_attempted),
+      late_arrival_enabled: lateArrivalSummary.enabled === true,
+    });
+    const error = new Error(`Prune Daily partially completed: ${combinedSummary.blocked_scope_count} historical connector/day scopes require attention`);
+    error.code = "UK_AQ_PRUNE_PARTIAL_ATTENTION_REQUIRED";
+    error.prune_summary = combinedSummary;
+    throw error;
   }
   return combinedSummary;
 }
