@@ -8,7 +8,13 @@ import {
 } from "../shared/uk_aq_r2_observations_manifest_hierarchy.mjs";
 import { validateCanonicalHistoryV2Manifest } from "../shared/uk_aq_r2_history_manifest_validation.mjs";
 import { buildHistoryV2ConnectorManifestKey, buildHistoryV2DayManifestKey, buildHistoryV2PollutantManifestKey } from "../shared/uk_aq_r2_history_canonical.mjs";
-import { r2GetObject } from "../shared/r2_sigv4.mjs";
+import {
+  DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY,
+  DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT,
+  validateObservationHistoryExactLeafIndexV3LatestRegistry,
+} from "../shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
+import { encodeObservationHistoryIndexV3Json } from "../shared/uk_aq_observation_history_index_v3.mjs";
+import { r2GetObject, sha256Hex } from "../shared/r2_sigv4.mjs";
 
 function isNotFound(error) {
   const status = error?.status ?? error?.statusCode ?? error?.response?.status;
@@ -73,13 +79,75 @@ function matchingReferences(parent, primary, alias, field, expectedKey) {
   return children;
 }
 
+async function currentIndexAuthority(getObject, r2, dayUtc, connectorId) {
+  const key = DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY;
+  const body = await readOptional(getObject, r2, key);
+  if (!body) throw new Error(`Current index_v3 latest authority is missing: ${key}`);
+  const payload = parse(body, key);
+  if (body.toString("utf8") !== encodeObservationHistoryIndexV3Json(payload)) {
+    throw new Error(`Current index_v3 latest authority is not canonical: ${key}`);
+  }
+  const { roots } = validateObservationHistoryExactLeafIndexV3LatestRegistry({
+    artifact: {
+      kind: "observation_history_index_v3_latest_global",
+      publication_stage: "latest_global", key, payload,
+      body: body.toString("utf8"), byte_size: body.length, sha256: sha256Hex(body),
+    },
+  });
+  return roots.filter((root) => root.day_utc === dayUtc && root.connector_id === connectorId);
+}
+
+async function pinnedIndexJson(getObject, r2, reference, expectedKey) {
+  if (reference?.key !== expectedKey || !Number.isSafeInteger(reference?.byte_size) ||
+      !/^[0-9a-f]{64}$/.test(String(reference?.sha256 || ""))) {
+    throw new Error(`Current index_v3 reference is invalid: ${expectedKey}`);
+  }
+  const body = await readOptional(getObject, r2, expectedKey);
+  if (!body || body.length !== reference.byte_size || sha256Hex(body) !== reference.sha256) {
+    throw new Error(`Current index_v3 pinned identity disagrees: ${expectedKey}`);
+  }
+  const payload = parse(body, expectedKey);
+  if (body.toString("utf8") !== encodeObservationHistoryIndexV3Json(payload)) {
+    throw new Error(`Current index_v3 object is not canonical: ${expectedKey}`);
+  }
+  return payload;
+}
+
+async function verifyCommittedIndexBinding(getObject, r2, root, pollutant, pollutantBody) {
+  const indexRoot = DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT;
+  const scope = `day_utc=${root.day_utc}/connector_id=${root.connector_id}/pollutant_code=${root.pollutant_code}`;
+  const scoped = await pinnedIndexJson(getObject, r2, root, `${indexRoot}/${scope}/manifest.json`);
+  if (scoped.kind !== "observation_timeseries_physical_leaf_scoped_manifest" ||
+      scoped.index_generation !== "v3" || scoped.history_version !== "v2" ||
+      scoped.day_utc !== root.day_utc || scoped.connector_id !== root.connector_id ||
+      scoped.pollutant_code !== root.pollutant_code || scoped.coverage?.row_count !== root.row_count ||
+      root.row_count !== pollutant.row_count) {
+    throw new Error(`Current index_v3 scoped coverage disagrees: ${root.key}`);
+  }
+  const alignedKey = `${indexRoot}/_aligned/${scope}/manifest.json`;
+  const aligned = await pinnedIndexJson(getObject, r2, scoped.source_aligned_scoped_manifest, alignedKey);
+  const canonical = aligned.canonical_source_manifest;
+  if (aligned.kind !== "observation_timeseries_aligned_source_manifest" ||
+      aligned.index_generation !== "v3" || aligned.history_version !== "v2" ||
+      aligned.day_utc !== root.day_utc || aligned.connector_id !== root.connector_id ||
+      aligned.pollutant_code !== root.pollutant_code ||
+      canonical?.key !== pollutant.manifest_key || canonical?.byte_size !== pollutantBody.length ||
+      canonical?.sha256 !== sha256Hex(pollutantBody) ||
+      canonical?.manifest_hash !== pollutant.manifest_hash ||
+      canonical?.observation_content_hash !== pollutant.observation_content_hash ||
+      canonical?.row_count !== pollutant.row_count) {
+    throw new Error(`Current index_v3 canonical binding disagrees: ${alignedKey}`);
+  }
+}
+
 export class PruneCommittedHistoryGuardError extends Error {
-  constructor({ dayUtc, connectorId, previousAuthority, reason }) {
-    super(`Prune Daily canonical replacement blocked for connector=${connectorId} day_utc=${dayUtc}: previous_authority=${previousAuthority}; reason=${reason}; action=reconstruct a complete authoritative connector/day or use separately authorised reconciliation; retain IngestDB rows`);
+  constructor({ dayUtc, connectorId, previousAuthority, reason, nextAction = "authorised_canonical_reconciliation_required" }) {
+    super(`Prune Daily canonical replacement blocked for connector=${connectorId} day_utc=${dayUtc}: previous_authority=${previousAuthority}; reason=${reason}; next_action=${nextAction}; retain IngestDB rows`);
     this.name = "PruneCommittedHistoryGuardError";
     this.code = "PRUNE_COMMITTED_HISTORY_REPLACEMENT_BLOCKED";
     this.previous_authority = previousAuthority;
     this.reason = reason;
+    this.next_action = nextAction;
   }
 }
 
@@ -92,38 +160,44 @@ async function inspectPruneFrozenConnectorSnapshot({
   const prefix = observationsPrefix;
   const rootKey = buildR2HistoryV2ObservationsRootManifestKey(prefix);
   const rootBody = await readOptional(getObject, r2, rootKey);
-  if (!rootBody) return { admission: "first_publication", previous_authority: null };
+  if (!rootBody) throw new Error(`Current observations root is missing; absence of committed history is unproven: ${rootKey}`);
   const root = validateR2HistoryV2ObservationsAggregateManifest(parse(rootBody, rootKey), { basePrefix: prefix });
   if (root.kind !== "uk_aq_observations_root_manifest" ||
       !rootBody.equals(serializeR2HistoryV2ObservationsAggregateManifest(root, { basePrefix: prefix }))) {
     throw new Error(`Committed observation root identity disagrees: ${rootKey}`);
   }
+  const indexRoots = await currentIndexAuthority(getObject, r2, dayUtc, connectorId);
+  const firstPublication = () => {
+    if (indexRoots.length) throw new Error(`Current index_v3 authority contradicts absent connector hierarchy: ${dayUtc}/${connectorId}`);
+    return { admission: "first_publication", previous_authority: null };
+  };
   const year = Number(dayUtc.slice(0, 4));
   const month = dayUtc.slice(5, 7);
   const yearKey = buildR2HistoryV2ObservationsYearManifestKey(prefix, year);
   const yearRef = oneChild(root.children, "year", year, rootKey);
-  if (!yearRef) return { admission: "first_publication", previous_authority: null };
+  if (!yearRef) return firstPublication();
   if (yearRef.manifest_key !== yearKey) throw new Error(`Committed observation year key disagrees: ${rootKey}`);
   const yearManifest = await aggregate(getObject, r2, prefix, yearKey, "uk_aq_observations_year_manifest");
   if (yearManifest.year !== year || yearManifest.content_hash !== yearRef.content_hash) throw new Error(`Committed observation year identity disagrees: ${yearKey}`);
   const monthKey = buildR2HistoryV2ObservationsMonthManifestKey(prefix, year, month);
   const monthRef = oneChild(yearManifest.children, "month", month, yearKey);
-  if (!monthRef) return { admission: "first_publication", previous_authority: null };
+  if (!monthRef) return firstPublication();
   if (monthRef.manifest_key !== monthKey) throw new Error(`Committed observation month key disagrees: ${yearKey}`);
   const monthManifest = await aggregate(getObject, r2, prefix, monthKey, "uk_aq_observations_month_manifest");
   if (monthManifest.year !== year || monthManifest.month !== month || monthManifest.content_hash !== monthRef.content_hash) throw new Error(`Committed observation month identity disagrees: ${monthKey}`);
   const dayKey = buildHistoryV2DayManifestKey(prefix, dayUtc);
   const dayRef = oneChild(monthManifest.children, "day_utc", dayUtc, monthKey);
-  if (!dayRef) return { admission: "first_publication", previous_authority: null };
+  if (!dayRef) return firstPublication();
   if (dayRef.manifest_key !== dayKey) throw new Error(`Committed observation day key disagrees: ${monthKey}`);
   const day = await manifest(getObject, r2, dayKey, { manifest_kind: "day", day_utc: dayUtc }, dayRef.manifest_hash);
   const connectors = matchingReferences(day, "connector_manifests", "child_manifests", "connector_id", dayKey);
   const connectorRef = oneChild(connectors, "connector_id", connectorId, dayKey);
-  if (!connectorRef) return { admission: "first_publication", previous_authority: null };
+  if (!connectorRef) return firstPublication();
   const connectorKey = buildHistoryV2ConnectorManifestKey(prefix, dayUtc, connectorId);
   if (connectorRef.manifest_key !== connectorKey) throw new Error(`Committed observation connector key disagrees: ${dayKey}`);
   const authority = `${connectorKey}#${connectorRef.manifest_hash}`;
   const block = (reason) => { throw new PruneCommittedHistoryGuardError({ dayUtc, connectorId, previousAuthority: authority, reason }); };
+  if (!indexRoots.length) block("committed connector has no final index_v3 scope; original unfinished attempt identity is unavailable");
   let connector;
   try {
     connector = await manifest(getObject, r2, connectorKey, { manifest_kind: "connector", day_utc: dayUtc, connector_id: connectorId }, connectorRef.manifest_hash);
@@ -135,14 +209,22 @@ async function inspectPruneFrozenConnectorSnapshot({
       byCode.get(code).push(row);
     }
     if (children.length !== byCode.size) block("frozen pollutant child set differs from committed history");
+    if (indexRoots.length !== children.length) block("committed pollutant set and final index_v3 scopes disagree");
     for (const child of children) {
       const code = child.pollutant_code;
       const partition = byCode.get(code);
       if (!partition) block(`frozen source omits committed pollutant=${code}`);
       const childKey = buildHistoryV2PollutantManifestKey(prefix, dayUtc, connectorId, code);
       if (child.manifest_key !== childKey) block(`committed pollutant key disagrees for pollutant=${code}`);
-      const pollutant = await manifest(getObject, r2, childKey, { manifest_kind: "pollutant", day_utc: dayUtc, connector_id: connectorId, pollutant_code: code }, child.manifest_hash);
+      const indexRoot = indexRoots.find((entry) => entry.pollutant_code === code);
+      if (!indexRoot) block(`committed pollutant=${code} has no final index_v3 scope`);
+      const pollutantBody = await readOptional(getObject, r2, childKey);
+      if (!pollutantBody) block(`committed pollutant manifest is missing: ${childKey}`);
+      const pollutant = parse(pollutantBody, childKey);
+      validateCanonicalHistoryV2Manifest(pollutant, { history_version: "v2", domain: "observations", manifest_kind: "pollutant", day_utc: dayUtc, connector_id: connectorId, pollutant_code: code, manifest_key: childKey });
+      if (pollutant.manifest_hash !== child.manifest_hash) block(`original complete publication identity cannot be proved after same-key child advance: ${childKey}`);
       validateObservationContentHashMetadata(pollutant, { rowCount: pollutant.row_count });
+      await verifyCommittedIndexBinding(getObject, r2, indexRoot, pollutant, pollutantBody);
       if (pollutant.observation_content_hash_contract_version !== 1 ||
           pollutant.observation_content_hash !== computeObservationContentHash(partition).observation_content_hash ||
           pollutant.observation_content_hash_row_count !== partition.length) {
@@ -153,7 +235,11 @@ async function inspectPruneFrozenConnectorSnapshot({
     if (error instanceof PruneCommittedHistoryGuardError) throw error;
     block(`complete replacement authority cannot be authenticated: ${error instanceof Error ? error.message : String(error)}`);
   }
-  return { admission: "identical_committed_content_retry", previous_authority: authority };
+  throw new PruneCommittedHistoryGuardError({
+    dayUtc, connectorId, previousAuthority: authority,
+    reason: "verified already-committed identical history; canonical publication is a no-op and newly present IngestDB rows remain ineligible for deletion",
+    nextAction: "review_duplicate_historical_ingestdb_rows",
+  });
 }
 
 export async function admitPruneFrozenConnectorSnapshot(args) {
@@ -166,6 +252,7 @@ export async function admitPruneFrozenConnectorSnapshot(args) {
       connectorId: args.connectorId,
       previousAuthority: `${buildR2HistoryV2ObservationsRootManifestKey(args.observationsPrefix)} (connector authority unverified)`,
       reason: `committed hierarchy could not be authenticated: ${error instanceof Error ? error.message : String(error)}`,
+      nextAction: "repair_or_authenticate_canonical_root_and_index_before_prune",
     });
   }
 }

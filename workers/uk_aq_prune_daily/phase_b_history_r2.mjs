@@ -6916,7 +6916,7 @@ export async function runPhaseBBackup({
           run_id: runId,
           error: message,
           next_action: error instanceof PruneCommittedHistoryGuardError
-            ? "reconstruct_complete_connector_day_or_authorised_reconciliation"
+            ? error.next_action
             : "retry_safe",
         });
         logStructured("ERROR", "phase_b_history_candidate_failed", {
@@ -6932,7 +6932,7 @@ export async function runPhaseBBackup({
           ...errorLogFields(error),
           ...budgetSnapshot(runtime),
           next_action: error instanceof PruneCommittedHistoryGuardError
-            ? "reconstruct_complete_connector_day_or_authorised_reconciliation"
+            ? error.next_action
             : "retry_safe",
           prune_blocked_for_day: true,
         });
