@@ -15109,12 +15109,15 @@ def _official_rdata_partition_availability(
     day_utc: str,
     pollutant_code: str,
 ) -> tuple[set[int], set[int], list[dict[str, Any]]]:
-    binding_ids = {
-        int(binding["timeseries_id"])
-        for site_bindings in dict(context.get("bindings") or {}).values()
-        for code, binding in dict(site_bindings).items()
-        if str(code) == pollutant_code
-    }
+    binding_map = context.get("binding_ids_by_pollutant")
+    if not isinstance(binding_map, Mapping) or pollutant_code not in binding_map:
+        raise ValueError("official RData selected pollutant binding authority is missing")
+    raw_binding_ids = binding_map[pollutant_code]
+    if not isinstance(raw_binding_ids, list) or not raw_binding_ids:
+        raise ValueError("official RData selected pollutant binding authority is empty or malformed")
+    if any(type(value) is not int or value <= 0 for value in raw_binding_ids):
+        raise ValueError("official RData selected pollutant binding authority has invalid timeseries IDs")
+    binding_ids = set(raw_binding_ids)
     unavailable_scopes = [
         dict(scope)
         for scope in list(
