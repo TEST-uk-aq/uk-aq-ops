@@ -12524,26 +12524,167 @@ def run_v2_observations_integrity_checks(
 
     latest_path = root / latest_key
     latest_payload: Any = None
+    latest_parsed = False
     if not latest_path.is_file():
         gaps.append(_v2_obs_gap("latest_index_missing", expected_path=latest_key))
     else:
         try:
             latest_payload = json.loads(latest_path.read_text(encoding="utf-8"))
+            latest_parsed = True
         except Exception:
             gaps.append(_v2_obs_gap("latest_index_invalid_json", expected_path=latest_key))
+
+    official_connector_ids = (
+        [connector_id for connector_id in _expected_connector_ids(allowed_connector_ids)
+         if _official_rdata_source_for_connector(connector_id)]
+        if allowed_connector_ids is not None else []
+    )
+    latest_days: list[Any] | None = None
+    latest_summaries: list[Any] | None = None
+    def canonical_latest_day(value: Any) -> bool:
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+            return False
+        try:
+            return dt.date.fromisoformat(value).isoformat() == value
+        except ValueError:
+            return False
+
+    if official_connector_ids and latest_parsed:
+        if not isinstance(latest_payload, Mapping):
+            gaps.append(_v2_obs_gap(
+                "latest_index_invalid_structure", expected_path=latest_key,
+            ))
+        else:
+            raw_days = latest_payload.get("days")
+            raw_summaries = latest_payload.get("day_summaries")
+            if isinstance(raw_days, list):
+                latest_days = raw_days
+                if any(not canonical_latest_day(entry) for entry in raw_days):
+                    gaps.append(_v2_obs_gap(
+                        "latest_index_day_entry_invalid",
+                        expected_path=latest_key,
+                    ))
+            else:
+                gaps.append(_v2_obs_gap(
+                    "latest_index_days_invalid", expected_path=latest_key,
+                ))
+            if isinstance(raw_summaries, list):
+                latest_summaries = raw_summaries
+                if any(not isinstance(entry, Mapping)
+                       or not canonical_latest_day(entry.get("day_utc"))
+                       for entry in raw_summaries):
+                    gaps.append(_v2_obs_gap(
+                        "latest_index_day_summary_entry_invalid",
+                        expected_path=latest_key,
+                    ))
+            else:
+                gaps.append(_v2_obs_gap(
+                    "latest_index_day_summaries_invalid",
+                    expected_path=latest_key,
+                ))
+
+    def selected_latest_summary(day_utc: str, day_manifest_exists: bool) -> Mapping[str, Any] | None:
+        day_entries = [
+            entry for entry in (latest_days or []) if entry == day_utc
+        ]
+        summary_entries = [
+            entry for entry in (latest_summaries or [])
+            if isinstance(entry, Mapping) and entry.get("day_utc") == day_utc
+        ]
+        if latest_days is not None and any(
+            isinstance(entry, Mapping) and entry.get("day_utc") == day_utc
+            for entry in latest_days
+        ):
+            gaps.append(_v2_obs_gap(
+                "latest_index_day_entry_invalid", day_utc=day_utc,
+                expected_path=latest_key,
+            ))
+        if len(day_entries) > 1:
+            gaps.append(_v2_obs_gap(
+                "latest_index_day_duplicated", day_utc=day_utc,
+                expected_path=latest_key,
+            ))
+        if len(summary_entries) > 1:
+            gaps.append(_v2_obs_gap(
+                "latest_index_day_summary_duplicated", day_utc=day_utc,
+                expected_path=latest_key,
+            ))
+        if (latest_days is not None and latest_summaries is not None
+                and bool(day_entries) != bool(summary_entries)):
+            gaps.append(_v2_obs_gap(
+                "latest_index_day_collections_mismatch", day_utc=day_utc,
+                expected_path=latest_key,
+            ))
+        if day_manifest_exists:
+            if latest_days is not None and not day_entries:
+                gaps.append(_v2_obs_gap(
+                    "latest_index_day_missing_from_days", day_utc=day_utc,
+                    expected_path=latest_key,
+                ))
+            if latest_summaries is not None and not summary_entries:
+                gaps.append(_v2_obs_gap(
+                    "latest_index_day_missing_from_summaries", day_utc=day_utc,
+                    expected_path=latest_key,
+                ))
+        else:
+            if day_entries:
+                gaps.append(_v2_obs_gap(
+                    "latest_index_stale_day_in_days", day_utc=day_utc,
+                    expected_path=latest_key,
+                ))
+            if summary_entries:
+                gaps.append(_v2_obs_gap(
+                    "latest_index_stale_day_in_summaries", day_utc=day_utc,
+                    expected_path=latest_key,
+                ))
+        if len(summary_entries) != 1:
+            return None
+        summary = summary_entries[0]
+        connector_ids = summary.get("connector_ids")
+        connectors = summary.get("connectors")
+        valid_ids = (
+            isinstance(connector_ids, list)
+            and all(type(value) is int and value > 0 for value in connector_ids)
+            and connector_ids == sorted(set(connector_ids))
+        )
+        valid_connectors = (
+            isinstance(connectors, list)
+            and all(
+                isinstance(entry, Mapping)
+                and type(entry.get("connector_id")) is int
+                and entry["connector_id"] > 0
+                and type(entry.get("row_count")) is int
+                and entry["row_count"] >= 0
+                for entry in connectors
+            )
+        )
+        if (not valid_ids or not valid_connectors
+                or [entry["connector_id"] for entry in connectors]
+                != sorted({entry["connector_id"] for entry in connectors})
+                or any(entry["connector_id"] not in connector_ids
+                       for entry in connectors)
+                or type(summary.get("connector_count")) is not int
+                or summary["connector_count"] < 0
+                or (connector_ids and summary["connector_count"] != len(connector_ids))
+                or type(summary.get("total_rows")) is not int
+                or summary["total_rows"] < 0):
+            gaps.append(_v2_obs_gap(
+                "latest_index_day_summary_invalid", day_utc=day_utc,
+                expected_path=latest_key,
+            ))
+            return None
+        return summary
 
     for day in selected_date_values:
         day_utc = day.isoformat()
         day_rel = f"{data_prefix}/day_utc={day_utc}"
         day_dir = root / day_rel
+        latest_summary = (
+            selected_latest_summary(
+                day_utc, (day_dir / "manifest.json").is_file()
+            ) if official_connector_ids else None
+        )
         if allowed_connector_ids is not None:
-            latest_summary = next((
-                entry for entry in (
-                    latest_payload.get("day_summaries") or []
-                    if isinstance(latest_payload, Mapping) else []
-                )
-                if isinstance(entry, Mapping) and entry.get("day_utc") == day_utc
-            ), None)
             for connector_id in _expected_connector_ids(allowed_connector_ids):
                 if not _official_rdata_source_for_connector(connector_id):
                     continue
@@ -12577,13 +12718,19 @@ def run_v2_observations_integrity_checks(
                             connector_id=connector_id, pollutant_code=code,
                             expected_path=index_manifest_rel,
                         ))
-                if (isinstance(latest_summary, Mapping)
-                        and not (root / connector_rel / "manifest.json").is_file()
-                        and connector_id in (latest_summary.get("connector_ids") or [])):
-                    gaps.append(_v2_obs_gap(
-                        "latest_index_stale_connector", day_utc=day_utc,
-                        connector_id=connector_id, expected_path=latest_key,
-                    ))
+                if isinstance(latest_summary, Mapping):
+                    indexed_connector = connector_id in latest_summary["connector_ids"]
+                    present_connector = (root / connector_rel / "manifest.json").is_file()
+                    if indexed_connector and not present_connector:
+                        gaps.append(_v2_obs_gap(
+                            "latest_index_stale_connector", day_utc=day_utc,
+                            connector_id=connector_id, expected_path=latest_key,
+                        ))
+                    elif present_connector and not indexed_connector:
+                        gaps.append(_v2_obs_gap(
+                            "latest_index_missing_connector", day_utc=day_utc,
+                            connector_id=connector_id, expected_path=latest_key,
+                        ))
         if not day_dir.is_dir():
             if allowed_connector_ids is None:
                 gaps.append(_v2_obs_gap("day_dir_missing", day_utc=day_utc, expected_path=day_rel))
