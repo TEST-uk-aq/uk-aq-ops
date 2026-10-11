@@ -3054,6 +3054,7 @@ export async function applyValidatedProposal({
     runState.apply = {
       status: "failed",
       current_phase: "final_proposal_validation",
+      r2_mutation_possible: false,
       error: error instanceof Error ? error.message : String(error),
       ...(error?.classification ? {
         classification: error.classification,
