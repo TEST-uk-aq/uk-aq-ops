@@ -1,0 +1,18 @@
+name = "uk-aq-jsongen-signer-test"
+main = "worker.mjs"
+compatibility_date = "2026-10-12"
+workers_dev = false
+preview_urls = false
+
+# No route, custom domain, deployment workflow or schedule is configured.
+[vars]
+UK_AQ_ENV_NAME = "TEST"
+UK_AQ_JSONGEN_SIGNER_ENABLED = "false"
+# Set only in a separately reviewed operator deployment config.
+UK_AQ_JSONGEN_PRUNE_CONNECTOR_IDS = ""
+
+[[unsafe.bindings]]
+name = "UK_AQ_JSONGEN_SIGNER_RATE_LIMIT"
+type = "ratelimit"
+namespace_id = "1001"
+simple = { limit = 10, period = 10 }
