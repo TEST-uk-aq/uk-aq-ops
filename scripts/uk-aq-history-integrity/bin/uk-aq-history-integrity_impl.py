@@ -23214,6 +23214,7 @@ def create_run_overlay(
     run_id: str,
     environment: str,
     base_dropbox_root: str | Path,
+    dedicated_sos_historical_replacement: bool = False,
 ) -> dict[str, Any]:
     run_root = Path(tmp_dir) / f"run-{run_id}"
     if run_root.exists():
@@ -23224,6 +23225,7 @@ def create_run_overlay(
         "schema_version": 1,
         "run_id": run_id,
         "environment": environment,
+        "dedicated_sos_historical_replacement": dedicated_sos_historical_replacement,
         "created_at_utc": fmt_iso(utc_now()),
         "base_dropbox_root": str(Path(base_dropbox_root)),
         "run_root": str(run_root),
@@ -35788,6 +35790,9 @@ def main(argv: list[str]) -> int:
                 run_id=run_compact,
                 environment=args.env,
                 base_dropbox_root=dropbox_root,
+                dedicated_sos_historical_replacement=(
+                    dedicated_sos_historical_replacement
+                ),
             )
             repair_overlay["effective_mode"] = effective_mode
             if args.source in OFFICIAL_RDATA_NETWORKS:
