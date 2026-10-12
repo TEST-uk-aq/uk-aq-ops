@@ -28508,6 +28508,35 @@ def _official_rdata_verified_repair_pollutants(
     return sorted(admitted, key=_canonical_utf8_sort_key)
 
 
+def _bound_official_rdata_acquisition_audit_sha256(
+    audit: Any,
+    *,
+    day_utc: str,
+    connector_id: int,
+    source_adapter: str,
+    source_input_sha256: str,
+    semantic_evidence_sha256: str,
+) -> str:
+    """Authenticate one v10 audit against its immutable semantic evidence."""
+    if (
+        not isinstance(audit, Mapping)
+        or audit.get("schema_version") != 1
+        or audit.get("audit_contract") != "official_rdata_run_acquisition_audit"
+        or audit.get("audit_contract_version") != 2
+        or audit.get("source_adapter") != source_adapter
+        or audit.get("day_utc") != day_utc
+        or audit.get("connector_id") != connector_id
+        or audit.get("history_generation") != "v2"
+        or audit.get("source_evidence_input_sha256") != source_input_sha256
+        or audit.get("semantic_evidence_sha256") != semantic_evidence_sha256
+    ):
+        raise ValueError("bound official RData acquisition audit identity changed")
+    return _official_rdata_acquisition_audit_sha256({
+        "evidence_contract_version": 10,
+        "acquisition_audit": audit,
+    })
+
+
 def _bound_source_evidence_rows(
     conn: sqlite3.Connection,
     *,
@@ -28586,15 +28615,6 @@ def _bound_source_evidence_rows(
             r"[0-9a-f]{64}",
             str(persistence.get("acquisition_audit_sha256") or ""),
         )
-        or str(persistence.get("acquisition_audit_sha256") or "")
-        != str(complete.get("acquisition_audit_sha256") or "")
-        or not isinstance(complete.get("acquisition_audit"), Mapping)
-        or complete["acquisition_audit"].get("source_evidence_input_sha256")
-        != str(source_input_sha or "")
-        or complete["acquisition_audit"].get("semantic_evidence_sha256")
-        != str(evidence_sha or "")
-        or _official_rdata_acquisition_audit_sha256(complete)
-        != str(persistence.get("acquisition_audit_sha256") or "")
         or str(rows_sha or "") != hashlib.sha256(encoded_rows).hexdigest()
         or int(rows_bytes if rows_bytes is not None else -1) != len(encoded_rows)
         or not isinstance(evidence, Mapping)
@@ -28616,6 +28636,54 @@ def _bound_source_evidence_rows(
         != str(source_input_sha or "")
     ):
         raise ValueError("bound canonical source evidence identity changed")
+    proposal_audit_sha256 = _bound_official_rdata_acquisition_audit_sha256(
+        complete.get("acquisition_audit"),
+        day_utc=day_utc,
+        connector_id=connector_id,
+        source_adapter=source_adapter,
+        source_input_sha256=str(source_input_sha),
+        semantic_evidence_sha256=str(evidence_sha),
+    )
+    if proposal_audit_sha256 != complete.get("acquisition_audit_sha256"):
+        raise ValueError("bound proposal acquisition audit hash changed")
+    audit_row = conn.execute(
+        """
+        SELECT source_evidence_id, env_name, day_utc, connector_id,
+               source_adapter, acquisition_audit_sha256, acquisition_audit_json
+        FROM source_connector_day_acquisition_audits
+        WHERE id = ?
+        """,
+        (persistence["acquisition_audit_id"],),
+    ).fetchone()
+    if audit_row is None:
+        raise ValueError("bound detector acquisition audit is unavailable")
+    (
+        audit_evidence_id, audit_env, audit_day, audit_connector,
+        audit_adapter, stored_audit_sha256, audit_json,
+    ) = audit_row
+    try:
+        detector_audit = json.loads(audit_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("bound detector acquisition audit JSON is invalid") from exc
+    if (
+        audit_evidence_id != evidence_id
+        or audit_env != env_name
+        or audit_day != day_utc
+        or audit_connector != connector_id
+        or audit_adapter != source_adapter
+        or stored_audit_sha256 != persistence["acquisition_audit_sha256"]
+        or audit_json != _canonical_json_utf8_bytes(detector_audit).decode("utf-8")
+        or stored_audit_sha256
+        != _bound_official_rdata_acquisition_audit_sha256(
+            detector_audit,
+            day_utc=day_utc,
+            connector_id=connector_id,
+            source_adapter=source_adapter,
+            source_input_sha256=str(source_input_sha),
+            semantic_evidence_sha256=str(evidence_sha),
+        )
+    ):
+        raise ValueError("bound detector acquisition audit identity changed")
     verified_codes = scope_entry.get("verified_pollutant_codes")
     admitted_codes = _official_rdata_verified_repair_pollutants(
         scope_entry, selected_scopes,
