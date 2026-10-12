@@ -14,8 +14,8 @@ from zoneinfo import ZoneInfo
 from .official_network_rdata import NETWORKS, TIMESTAMP_MAPPING
 
 
-CONTRACT = "uk_aq_official_rdata_timestamp_authority_v2"
-HOUR_CONVENTION = "rdata_gmt_instant_equals_graph_canonical_utc"
+CONTRACT = "uk_aq_official_rdata_timestamp_authority_v3"
+HOUR_CONVENTION = "rdata_gmt_date_beginning_plus_one_hour_equals_graph_canonical_utc"
 UNIT_AUTHORITY = "accepted_matching_measurement_and_unit"
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _SITE = re.compile(r"[A-Za-z0-9]+\Z")
@@ -102,8 +102,8 @@ def load_timestamp_authority(
             }
         ):
             raise ValueError("official RData comparison identity is invalid")
-        source_utc = _instant(rdata["observed_at_utc"])
-        source_file = f"{site}_{source_utc.year}.RData"
+        source_gmt = _instant(rdata["original_timestamp"], source_gmt=True)
+        source_file = f"{site}_{source_gmt.year}.RData"
         if (
             rdata["source_url"] != NETWORKS[source_adapter].base_url + source_file
             or rdata["object_name"] != source_file.removesuffix(".RData")
@@ -128,8 +128,8 @@ def load_timestamp_authority(
         if (
             _instant(graph["observed_at_utc"]) != canonical_utc
             or _instant(graph["interpreted_europe_london"]) != canonical_utc
-            or _instant(rdata["original_timestamp"], source_gmt=True) != source_utc
-            or source_utc != canonical_utc
+            or _instant(rdata["observed_at_utc"]) != canonical_utc
+            or source_gmt + dt.timedelta(hours=1) != canonical_utc
         ):
             raise ValueError("official RData comparison timestamps disagree")
         offset = canonical_utc.astimezone(ZoneInfo("Europe/London")).utcoffset()

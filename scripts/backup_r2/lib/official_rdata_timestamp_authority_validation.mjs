@@ -32,11 +32,11 @@ function hasExactFields(value, fields) {
 }
 
 export const OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT =
-  "uk_aq_official_rdata_timestamp_authority_v2";
+  "uk_aq_official_rdata_timestamp_authority_v3";
 export const OFFICIAL_RDATA_TIMESTAMP_MAPPING =
-  "rdata_posixct_gmt_instant_to_observed_at_utc";
+  "rdata_date_beginning_plus_one_hour_to_observed_at_utc";
 export const OFFICIAL_RDATA_HOUR_CONVENTION =
-  "rdata_gmt_instant_equals_graph_canonical_utc";
+  "rdata_gmt_date_beginning_plus_one_hour_equals_graph_canonical_utc";
 
 function sha256(body) {
   return createHash("sha256").update(body).digest("hex");
@@ -126,10 +126,10 @@ export function requireOfficialRdataTimestampAuthority(runState) {
         || !graph.original_timestamp) {
       throw new Error("Official RData timestamp comparison shape is invalid");
     }
-    const sourceUtc = instant(rdata.observed_at_utc);
+    const sourceGmt = instant(rdata.original_timestamp, { sourceGmt: true });
     const canonicalUtc = instant(target.observed_at_utc);
     const siteCode = String(comparison?.site_code || "");
-    const year = new Date(sourceUtc).getUTCFullYear();
+    const year = new Date(sourceGmt).getUTCFullYear();
     const sourceFile = `${siteCode}_${year}.RData`;
     const offset = londonOffset(canonicalUtc);
     if (comparison.source_adapter !== sourceAdapter
@@ -140,10 +140,10 @@ export function requireOfficialRdataTimestampAuthority(runState) {
         || rdata.object_name !== sourceFile.replace(/\.RData$/u, "")
         || !SHA256.test(String(rdata.source_file_sha256 || ""))
         || rdata.source_timezone !== "GMT"
-        || instant(rdata.original_timestamp, { sourceGmt: true }) !== sourceUtc
+        || instant(rdata.observed_at_utc) !== canonicalUtc
         || instant(graph.observed_at_utc) !== canonicalUtc
         || instant(graph.interpreted_europe_london) !== canonicalUtc
-        || sourceUtc !== canonicalUtc
+        || sourceGmt + 60 * 60 * 1000 !== canonicalUtc
         || comparison.europe_london_offset !== offset
         || !String(graph.interpreted_europe_london || "").endsWith(offset)
         || typeof graph.value !== "string" || typeof rdata.value !== "string"

@@ -74,13 +74,13 @@ function canonicalJson(value) {
   return JSON.stringify(value);
 }
 
-const OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION = 8;
+const OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION = 9;
 const OFFICIAL_RDATA_SOURCE_AVAILABILITY_CONTRACT_VERSION = 5;
 const OFFICIAL_RDATA_PRESERVED_BASELINE_CONTRACT_VERSION = 1;
 const OFFICIAL_RDATA_DECODER_CONTRACT_VERSION = 1;
 const OFFICIAL_RDATA_ACQUISITION_AUDIT_CONTRACT_VERSION = 1;
 const OFFICIAL_RDATA_TIMESTAMP_MAPPING =
-  "rdata_posixct_gmt_instant_to_observed_at_utc";
+  "rdata_date_beginning_plus_one_hour_to_observed_at_utc";
 
 
 function officialRdataV8SemanticEvidenceProjection(evidence) {

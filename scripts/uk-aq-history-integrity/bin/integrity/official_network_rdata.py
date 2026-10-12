@@ -91,7 +91,7 @@ POLLUTANT_TO_METADATA_PARAMETER = {
 COVERAGE_REQUIRED = "required"
 COVERAGE_AUTHORITATIVE_NO_COVERAGE = "authoritative_no_coverage"
 COVERAGE_INDETERMINATE = "indeterminate"
-TIMESTAMP_MAPPING = "rdata_posixct_gmt_instant_to_observed_at_utc"
+TIMESTAMP_MAPPING = "rdata_date_beginning_plus_one_hour_to_observed_at_utc"
 
 
 _R_EXTRACT_SCRIPT = r'''
@@ -242,26 +242,32 @@ def extract_metadata(
 
 
 def canonical_observed_at(raw_timestamp: str) -> dt.datetime:
-    """Preserve the instant emitted from an explicitly GMT POSIXct RData date."""
+    """Map authenticated GMT hour-beginning to canonical hour-ending UTC."""
     parsed = dt.datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         raise ValueError("RData timestamp lacks an authenticated timezone")
-    observed = parsed.astimezone(dt.timezone.utc)
-    if observed.minute or observed.second or observed.microsecond:
-        raise ValueError("RData timestamp is not an exact canonical hour")
-    return observed
+    source_gmt = parsed.astimezone(dt.timezone.utc)
+    if source_gmt.minute or source_gmt.second or source_gmt.microsecond:
+        raise ValueError("RData timestamp is not an exact source hour")
+    return source_gmt + dt.timedelta(hours=1)
 
 
 def required_site_years(days: Iterable[dt.date]) -> list[int]:
-    """Select only source calendar years containing the requested UTC days."""
-    return sorted({day.year for day in days})
+    """Include the preceding source year for canonical 1 January 00:00."""
+    years: set[int] = set()
+    for day in days:
+        start = dt.datetime.combine(day, dt.time.min, tzinfo=dt.timezone.utc)
+        end = start + dt.timedelta(days=1)
+        years.add((start - dt.timedelta(hours=1)).year)
+        years.add((end - dt.timedelta(hours=1)).year)
+    return sorted(years)
 
 
 def source_time_windows_for_year(
     days: Iterable[dt.date],
     source_year: int,
 ) -> list[dict[str, str]]:
-    """Return source UTC windows for canonical UTC days, clipped to the file year."""
+    """Return GMT hour-beginning windows for canonical days, clipped to file year."""
     year_start = dt.datetime(
         int(source_year), 1, 1, tzinfo=dt.timezone.utc,
     )
@@ -273,8 +279,8 @@ def source_time_windows_for_year(
         canonical_start = dt.datetime.combine(
             day, dt.time.min, tzinfo=dt.timezone.utc,
         )
-        raw_start = canonical_start
-        raw_end = canonical_start + dt.timedelta(days=1)
+        raw_start = canonical_start - dt.timedelta(hours=1)
+        raw_end = canonical_start + dt.timedelta(days=1, hours=-1)
         clipped_start = max(raw_start, year_start)
         clipped_end = min(raw_end, year_end)
         if clipped_start >= clipped_end:
@@ -292,7 +298,7 @@ def source_time_windows_for_year(
 def canonical_unavailable_windows(
     raw_source_windows: Iterable[Mapping[str, Any]],
 ) -> list[dict[str, str]]:
-    """Project unavailable GMT source windows onto identical canonical instants."""
+    """Project unavailable GMT source windows one hour into canonical UTC."""
     windows: list[dict[str, str]] = []
     for raw_window in raw_source_windows:
         day_utc = str(raw_window.get("canonical_day_utc") or "").strip()
@@ -311,8 +317,8 @@ def canonical_unavailable_windows(
             raise ValueError("invalid raw RData source window") from exc
         if start.tzinfo is None or end.tzinfo is None or start >= end:
             raise ValueError("invalid raw RData source window")
-        canonical_start = start.astimezone(dt.timezone.utc)
-        canonical_end = end.astimezone(dt.timezone.utc)
+        canonical_start = start.astimezone(dt.timezone.utc) + dt.timedelta(hours=1)
+        canonical_end = end.astimezone(dt.timezone.utc) + dt.timedelta(hours=1)
         try:
             day = dt.date.fromisoformat(day_utc)
         except ValueError as exc:

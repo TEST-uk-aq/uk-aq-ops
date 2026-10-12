@@ -15455,7 +15455,7 @@ def check_official_network_rdata(
                     "canonical provider site-year artifact unavailable; "
                     f"HTTP 404; year={year}; final_url={exc.final_url}"
                 ),
-                source_count_mapping_identity="official_network_rdata_v1",
+                source_count_mapping_identity="official_network_rdata_plus_one_hour_v2",
                 source_count_mapping_hash=mapping_hash,
             )
             acquisition_records.append(record)
@@ -15512,7 +15512,7 @@ def check_official_network_rdata(
             last_changed_at=now_iso if event_type != "unchanged" else None,
             last_status=event_type,
             notes=f"base R load(); year={year}" if year else "base R load(); current metadata",
-            source_count_mapping_identity="official_network_rdata_v1",
+            source_count_mapping_identity="official_network_rdata_plus_one_hour_v2",
             source_count_mapping_hash=mapping_hash,
         )
         if event_type != "unchanged":
@@ -15797,7 +15797,7 @@ def check_official_network_rdata(
                 audits_by_day[day_utc].extend(audits)
             _record_source_file_timeseries_counts(
                 conn, source_file_key, counts, now_iso,
-                source_count_mapping_identity="official_network_rdata_v1",
+                source_count_mapping_identity="official_network_rdata_plus_one_hour_v2",
                 source_count_mapping_hash=mapping_hash,
             )
             decoded_files += 1
@@ -15872,7 +15872,7 @@ def check_official_network_rdata(
         "source_key": source_key,
         "connector_id": config.connector_id,
         "rscript": context["rscript_identity"],
-        "timestamp_mapping": "posixct_gmt_instant_identity",
+        "timestamp_mapping": OFFICIAL_RDATA_TIMESTAMP_MAPPING,
         "metadata_files_fetched": 1,
         "site_year_files_fetched": len(identities_by_key) - 1,
         "site_year_files_decoded": decoded_files,
@@ -16549,12 +16549,12 @@ def _v2_observations_index_rebuild_command(
 SOURCE_EVIDENCE_CONTRACT_VERSION = 4
 OFFICIAL_RDATA_SOURCE_AVAILABILITY_CONTRACT_VERSION = 5
 OFFICIAL_RDATA_PRESERVED_BASELINE_EVIDENCE_CONTRACT_VERSION = 6
-OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION = 8
+OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION = 9
 OFFICIAL_RDATA_ACQUISITION_AUDIT_CONTRACT_VERSION = 1
 OFFICIAL_RDATA_PRESERVED_BASELINE_CONTRACT_VERSION = 1
 OFFICIAL_RDATA_DECODER_CONTRACT_VERSION = 1
 OFFICIAL_RDATA_TIMESTAMP_MAPPING = (
-    "rdata_posixct_gmt_instant_to_observed_at_utc"
+    "rdata_date_beginning_plus_one_hour_to_observed_at_utc"
 )
 OBSERVATION_CONTENT_HASH_COLUMNS = [
     "connector_id",
@@ -16709,10 +16709,12 @@ def _official_rdata_v8_semantic_evidence_projection(
     """Return the complete reusable official-RData v8 semantic boundary."""
     if (
         str(evidence.get("source_adapter") or "") not in OFFICIAL_RDATA_NETWORKS
-        or evidence.get("evidence_contract_version")
-        != OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION
+        or evidence.get("evidence_contract_version") not in (8, 9)
+        or (evidence.get("evidence_contract_version") == 9
+            and evidence.get("timestamp_mapping")
+            != OFFICIAL_RDATA_TIMESTAMP_MAPPING)
     ):
-        raise ValueError("official RData v8 semantic evidence version is invalid")
+        raise ValueError("official RData semantic evidence version or mapping is invalid")
     missing = [
         field for field in OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS
         if field not in evidence
@@ -16845,7 +16847,7 @@ def _source_evidence_input_payload(evidence: Mapping[str, Any]) -> dict[str, Any
         payload["preserved_baseline_dependency_sha256"] = evidence.get(
             "preserved_baseline_dependency_sha256"
         )
-    if evidence_contract_version >= OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION:
+    if evidence_contract_version >= 8:
         payload.update({
             "history_generation": str(evidence.get("history_generation") or ""),
             "source_artifact_availability_contract_version": evidence.get(
@@ -16932,8 +16934,7 @@ def _official_rdata_preserved_baseline_dependency_sha256(
 def _immutable_source_evidence_sha256(evidence: Mapping[str, Any]) -> str:
     if (
         str(evidence.get("source_adapter") or "") in OFFICIAL_RDATA_NETWORKS
-        and evidence.get("evidence_contract_version")
-        == OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION
+        and evidence.get("evidence_contract_version") in (8, 9)
     ):
         return _official_rdata_v8_semantic_evidence_sha256(evidence)
     payload = dict(evidence)
@@ -17139,7 +17140,7 @@ def _load_complete_connector_day_source_evidence(
             != semantic_evidence_sha256
         ):
             raise ValueError(
-                "official RData v8 semantic or acquisition evidence identity "
+                "official RData v9 semantic or acquisition evidence identity "
                 "is invalid"
             )
     files_required = {str(value) for value in list(evidence.get("files_required") or [])}
@@ -22182,7 +22183,7 @@ def _generic_v3_official_rdata_publication_authority(
         )
         semantic_sha256 = _official_rdata_v8_semantic_evidence_sha256(evidence)
         if (
-            evidence.get("evidence_contract_version") != 8
+            evidence.get("evidence_contract_version") != 9
             or evidence.get("history_generation") != "v3"
             or evidence.get("source_adapter") != source_adapter
             or evidence.get("timestamp_mapping") != OFFICIAL_RDATA_TIMESTAMP_MAPPING
@@ -22197,7 +22198,7 @@ def _generic_v3_official_rdata_publication_authority(
                 "day_utc": day_utc,
                 "connector_id": connector_id,
                 "pollutant_code": pollutant_code,
-                "evidence_contract_version": 8,
+                "evidence_contract_version": 9,
                 "source_adapter": source_adapter,
                 "timestamp_mapping": OFFICIAL_RDATA_TIMESTAMP_MAPPING,
                 "semantic_evidence_sha256": semantic_sha256,
