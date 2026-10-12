@@ -307,7 +307,10 @@ function officialRdataSemanticEvidenceSha256(evidence) {
     ...OFFICIAL_RDATA_V8_FIELDS,
     "semantic_evidence_sha256", "acquisition_audit", "acquisition_audit_sha256",
   ]);
-  if (OFFICIAL_RDATA_V8_FIELDS.some((field) => !Object.hasOwn(evidence || {}, field))
+  if (evidence?.evidence_contract_version !== 9
+      || evidence?.timestamp_mapping
+        !== "rdata_date_beginning_plus_one_hour_to_observed_at_utc"
+      || OFFICIAL_RDATA_V8_FIELDS.some((field) => !Object.hasOwn(evidence || {}, field))
       || Object.keys(evidence || {}).some((field) => !allowed.has(field))) {
     throw new Error("Generic fixed-v2 official semantic evidence shape is invalid");
   }
@@ -582,7 +585,7 @@ function canonicalScopeSourceAuthority(raw, {
     throw new Error("Generic fixed-v2 scope source authority changed");
   }
   const authority = JSON.parse(JSON.stringify(raw));
-  if (authority.authority_kind === "persisted_official_rdata_v8_semantic_evidence") {
+  if (authority.authority_kind === "persisted_official_rdata_v9_semantic_evidence") {
     const hashes = [
       "semantic_evidence_sha256", "source_evidence_input_sha256",
       "acquisition_audit_sha256", "source_file_identities_sha256",
@@ -605,7 +608,7 @@ function canonicalScopeSourceAuthority(raw, {
         || [...read].some((key) => absent.has(key) || !required.has(key))
         || [...absent].some((key) => !required.has(key))
         || authority.timestamp_mapping
-          !== "rdata_posixct_gmt_instant_to_observed_at_utc"
+          !== "rdata_date_beginning_plus_one_hour_to_observed_at_utc"
         || !Number.isSafeInteger(authority.final_target_row_count)
         || authority.final_target_row_count < 0
         || !Number.isSafeInteger(selectedCount) || selectedCount < 0
@@ -650,7 +653,7 @@ function canonicalScopeSourceAuthority(raw, {
 
 function validatePersistedScopeSourceEvidence(runState, scope) {
   const authority = scope.source_evidence_authority;
-  if (authority.authority_kind !== "persisted_official_rdata_v8_semantic_evidence") return;
+  if (authority.authority_kind !== "persisted_official_rdata_v9_semantic_evidence") return;
   const source = loadImmutableSourcePartition({
     runState,
     dayUtc: scope.day_utc,
@@ -1312,7 +1315,7 @@ export async function validateFinalGenericV2ProposalGraph({ runState, proposal }
   const authority = canonicalGenericV2SelectedScopeAuthority(runState);
   const validatedEvidence = new Set();
   for (const scope of authority.selected_scopes) {
-    if (scope.source_evidence_authority.authority_kind !== "persisted_official_rdata_v8_semantic_evidence") continue;
+    if (scope.source_evidence_authority.authority_kind !== "persisted_official_rdata_v9_semantic_evidence") continue;
     const identity = `${scope.day_utc}|${scope.connector_id}`;
     if (validatedEvidence.has(identity)) continue;
     const source = loadImmutableSourcePartition({ runState,

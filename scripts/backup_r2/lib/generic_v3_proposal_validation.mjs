@@ -122,7 +122,7 @@ export function requireGenericV3OfficialRdataAuthority(runState) {
       runState, dayUtc, connectorId, pollutantCode,
     });
     const semanticSha256 = officialRdataSemanticEvidenceSha256(evidence);
-    if (evidence.evidence_contract_version !== 8
+    if (evidence.evidence_contract_version !== 9
         || evidence.history_generation !== "v3"
         || evidence.source_adapter !== sourceAdapter
         || evidence.day_utc !== dayUtc
@@ -139,7 +139,7 @@ export function requireGenericV3OfficialRdataAuthority(runState) {
       day_utc: dayUtc,
       connector_id: connectorId,
       pollutant_code: pollutantCode,
-      evidence_contract_version: 8,
+      evidence_contract_version: 9,
       source_adapter: sourceAdapter,
       timestamp_mapping: OFFICIAL_RDATA_TIMESTAMP_MAPPING,
       semantic_evidence_sha256: semanticSha256,
