@@ -340,6 +340,12 @@ export async function readDirectIngestObservations({ env, identity, startMs, end
       httpAttemptCount: 1,
     }), loggingContext);
   }
+  const rpcWindowStartUtc = normalizeTimestamp(rpcResult.start);
+  // The label is only a requested window. The server's returned start must
+  // actually cover the eligible recent seam before this read is complete.
+  const rpcWindowCoversRequiredStart = rpcWindowCoversRequestedStart
+    && rpcWindowStartUtc !== null
+    && Date.parse(rpcWindowStartUtc) <= rpcWindowStartMs;
   let normalized;
   try {
     normalized = normalizeDirectIngestRows(rpcResult.data, identity, source);
@@ -361,7 +367,7 @@ export async function readDirectIngestObservations({ env, identity, startMs, end
   return {
     rows: boundedRows,
     guideline: rpcResult.guideline ?? null,
-    response_complete: rpcWindowCoversRequestedStart,
+    response_complete: rpcWindowCoversRequiredStart,
     source_path: `${source.schema}.${RPC_PATH}`,
     requested_start_utc: startUtc,
     requested_end_utc: endUtc,
@@ -369,9 +375,9 @@ export async function readDirectIngestObservations({ env, identity, startMs, end
     actual_start_utc: actualStartUtc,
     actual_end_utc: actualEndUtc,
     rpc_window_label: windowLabel,
-    rpc_window_covers_requested_start: rpcWindowCoversRequestedStart,
-    rpc_window_covers_required_start: rpcWindowCoversRequestedStart,
-    rpc_window_start_utc: normalizeTimestamp(rpcResult.start),
+    rpc_window_covers_requested_start: rpcWindowCoversRequiredStart,
+    rpc_window_covers_required_start: rpcWindowCoversRequiredStart,
+    rpc_window_start_utc: rpcWindowStartUtc,
     rpc_window_end_utc: normalizeTimestamp(rpcResult.end),
     fetch_count: 1,
     logical_fetch_count: 1,
