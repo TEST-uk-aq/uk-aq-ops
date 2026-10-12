@@ -143,10 +143,9 @@ function calculateLogicalAqi(observationRows, request, segments, outputStartMs, 
     return endpoint > outputStartMs && endpoint <= outputEndMs;
   }).map((row) => {
     const endpoint = Date.parse(row.timestamp_hour_utc);
-    // AQI timestamps are hour-ending endpoints. Attribute the interval to
-    // the physical member that supplied the observation immediately before
-    // that endpoint, including at a midnight continuity boundary.
-    const physical = memberAt(segments, endpoint - 1);
+    // The AQI row belongs to the physical member valid at its canonical
+    // hour-ending timestamp, including at a midnight continuity boundary.
+    const physical = memberAt(segments, endpoint);
     if (!physical) throw new Error("station_history_continuity_aqi_identity_missing");
     return {
       ...row,
