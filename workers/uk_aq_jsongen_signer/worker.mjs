@@ -112,7 +112,19 @@ export default {
       const signed = await presignPut({ accountId: ACCOUNT_ID, accessKeyId, secretAccessKey,
         bucket: BUCKET, key, checksumBase64: checksumBase64(input.compressed_sha256),
         contentType: 'application/gzip', now: issuedAt });
-      const intentId = hex(await crypto.subtle.digest('SHA-256', encoder.encode(`${BUCKET}/${key}`)));
+      // JSON array positions and JSON string escaping make this complete,
+      // validated identity deterministic and unambiguous. The key remains the
+      // existing digest-scoped pending key; an intent is never proof of bytes.
+      const intentIdentity = [
+        'uk_aq_jsongen_upload_intent_v1', BUCKET, key,
+        input.writer_identity, input.invocation_id, input.index_generation,
+        input.connector_id, input.day_utc, input.object_type,
+        input.compressed_byte_size, input.compressed_sha256,
+        input.uncompressed_byte_size, input.uncompressed_sha256,
+        input.scope.kind, input.scope.connector_id, input.scope.day_utc,
+      ];
+      const intentId = hex(await crypto.subtle.digest('SHA-256',
+        encoder.encode(JSON.stringify(intentIdentity))));
       return Response.json({ intent_id: intentId, object: { bucket: BUCKET, key,
         sha256: input.compressed_sha256, byte_size: input.compressed_byte_size,
         json_sha256: input.uncompressed_sha256, json_byte_size: input.uncompressed_byte_size },

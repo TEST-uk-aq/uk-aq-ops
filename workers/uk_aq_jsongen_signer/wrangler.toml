@@ -11,8 +11,7 @@ UK_AQ_JSONGEN_SIGNER_ENABLED = "false"
 # Set only in a separately reviewed operator deployment config.
 UK_AQ_JSONGEN_PRUNE_CONNECTOR_IDS = ""
 
-[[unsafe.bindings]]
-name = "UK_AQ_JSONGEN_SIGNER_RATE_LIMIT"
-type = "ratelimit"
-namespace_id = "1001"
-simple = { limit = 10, period = 10 }
+# A native [[ratelimits]] binding is required before enablement. Its numeric
+# namespace_id must first be allocated by the owning Cloudflare account;
+# "1001" was an unverified example and is deliberately not reserved here.
+# The Worker fails closed while the binding is absent. See README.md.
