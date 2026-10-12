@@ -127,6 +127,7 @@ These are contract structures, not authenticated proof by themselves.
 | `assertIdentity` | Positive connector/timeseries/station IDs plus `pm25`, `pm10` or `no2`; physical identity only |
 | `assertReference` | Explicit bucket/key, SHA-256, positive byte size; gzip also has uncompressed SHA-256 and size |
 | `assertSource` | `index_generation: v3`, logical `history_version: v2`, separately pinned generation authority, observation root, v3 index authority, final publication, verification and binding authority, verification timestamp |
+| `inspectSourceGeneration` | Separate selected-v3 namespace check for already retained Stage 1 receipts; a matching namespace is not current selector or final-writer proof |
 | `assertReceipt` | Stable change ID, generic writer/invocation identity, source, complete-day scopes, before/after authenticated membership references, affected months, rolling implications, immutable bundle, final-verification/provenance/completeness references, retained writer receipt authority |
 | `assertBundleRecord(s)` | One complete-day NDJSON record per declared scope, exact identity/day, original rows and declared final row count; explicit `authoritative_empty` requires zero rows and an absence authority; omitted/duplicate scopes fail |
 | `assertPublication` | One UUIDv4, physical identity/month, source, applied change-ID set, shared algorithm, coverage, immutable observation/AQI pair, evidence and PM context |
@@ -262,6 +263,29 @@ repair publication. A writer-owned adapter must retain the complete final source
 and prove its relationship to the bundle, original verified publication,
 source/status/binding evidence and removals. No adapter claims to do so today.
 
+The selected complete generation is the exact immutable shared
+`getObservationHistoryGeneration('v3')` descriptor. Its canonical observations,
+Core, exact observation index and binding roots are respectively
+`history/v3/observations`, `history/v3/core`,
+`history/_index_v3/observations_timeseries` and
+`history/_index_v3/timeseries_binding`. Logical observation and binding payload
+`history_version=v2`, binding object schemas 1/2, physical
+`timeseries-aligned-v2`, and physical writer/schema 3 or future 4 retain separate
+meanings. A supplied prefix that contradicts the shared descriptor fails closed;
+the binding prefix defaults to that descriptor. No v2 binding or observation
+prefix is a selected-v3 fallback.
+
+Stage 1 receipt wire schema version 1 is unchanged. `assertSource` validates its
+declared shape, while `inspectSourceGeneration` separately reports matching,
+contradictory or unresolved v3 namespaces without rewriting retained receipts.
+The immutable receipt and bundle readers authenticate exact bytes, size and SHA;
+they do not prove that a supplied descriptor is the deployed current generation.
+Current canonical authority needs an independently resolved accepted selector;
+historical receipt identity, object existence and a stable metadata reread do not
+provide it. Final writer publication and complete replacement/status evidence
+need the still missing writer adapters. Reconciliation keeps each distinction
+explicit and never promotes a consistent namespace to authenticated source.
+
 `authority.mjs` follows the committed observation root through year, month, day,
 connector and pollutant, using existing shared validators and hash/alias rules.
 It distinguishes root-proven absence from failed or ambiguous metadata reads.
@@ -284,9 +308,32 @@ sets `authority_complete: false` even for a consistent metadata read. The select
 v3 generation, verified identity of the root bytes read, internally linked
 metadata, and an unchanged bounded reread are distinct facts. They do not prove
 that this root was the latest committed canonical authority or create a locked
-snapshot. Verification-overlay metadata does not authenticate bundle status
-values. Binding-prefix selection remains explicit and unresolved between the
-stable `_index_v2` contract and current v3 runtime routing.
+snapshot. The inspector retains each present scope's independently checked
+physical schema/writer identity, so schema 3 and 4 may coexist across scopes.
+It does not reconstruct status from Parquet or equate the distinct observation
+and measurement content-hash versions.
+
+Verification mode is connector scoped. An independently accepted pre-overlay
+mode with physical schema 3 reports `embedded_status_requires_writer_evidence`;
+the embedded P/R/null values still require the original writer's final proof.
+An accepted overlay mode requires a validated current `verification/latest.json`
+selection and its exact immutable connector manifest, including physical
+timeseries membership. It supersedes embedded schema-3 status. Schema 4 cannot
+use embedded status and remains unresolved without selected accepted overlay
+authority. A valid pointer or manifest alone is metadata, not operational
+cut-over acceptance or bundle status authentication. Missing, failed, malformed,
+contradictory or changed overlay authority fails closed. Without independently
+established connector transition mode, the inspector reports unknown or
+overlay-authoritative unresolved state, never silent embedded/null fallback.
+`acceptedVerificationModes` is an explicit input for a later trusted acceptance
+source; no such provider is wired into this inactive stage. Its caller must
+establish that evidence outside JSONgen before supplying a mode.
+
+Report schema remains version 1 with existing diagnostic objects and an optional
+per-scope physical identity. Historical receipts are not changed. Old reports
+that claim an `_index_v2` binding prefix as selected-v3 authority now fail
+validation; they remain immutable historical evidence. Metadata drift and
+writer-authentication gaps remain unresolved diagnostics, not supersession.
 
 `reconcile.mjs` compares a bounded control snapshot, registered receipt references,
 explicit retained references and requested canonical scopes. It preserves evidence
@@ -355,7 +402,10 @@ and conditional PUT/readback checks; retained final Prune and Integrity/SOS writ
 evidence; a writer-owned complete-source-to-bundle adapter verified against real
 final publications and authoritative removals; overlapping/delayed and independent
 scope checks; a missing-registration/outbox interruption; PM late-month and
-following-month context checks; bounded large inputs and ambiguous writes. Keep
+following-month context checks; bounded large inputs and ambiguous writes. The
+selected complete-v3 serving generation and each connector's accepted pre-overlay
+or overlay cut-over mode also need independent operational evidence. A valid overlay
+pointer, repository support or missing pointer does not supply that evidence. Keep
 the selector disabled until those proofs, complete coverage, selected baseline and
 all-month dependencies are independently authenticated.
 
@@ -367,27 +417,19 @@ canonical writers non-blocking and metadata-only reconciliation fail-closed.
 Workflow, triggers, bootstrap/rebuild,
 identity allowlists and website/Refresh/open-month integration remain later work.
 
-Rollback before deployment is to revert this code change. The original shared R2
-module is preserved exactly under `archive/2026-10-11/workers/shared/r2_sigv4.mjs`.
-Active code does not import it. Nothing was deployed or operationally accepted.
+Rollback before deployment is to revert this code change. Existing same-day
+JSONgen archive copies were reused and the exact immediate pre-change source
+remains in the parent commit; active code does not import archive paths. Nothing
+was deployed or operationally accepted.
 Normal station history, R2-first/ingestdb gap filling, the experimental selector,
 canonical writers, deletion gates, backups and LIVE remain unchanged. No managed
 JSONgen artefact enters Dropbox backup.
 
 ## ChatGPT system-documentation handover (do not apply from this repository)
 
-Update the JSONgen implementation status to distinguish bounded read-only Stage 2
-evidence inspection from authenticated current-source classification or a working
-publisher. Record that no production writer adapter or complete receipt outbox has
-been accepted and that selection remains disabled. Record actual remote
-conditional-write acceptance only after its separately authorised check. No
-workflow/deployment/default serving status should change. Authoritative
-`uk-aq-system-docs` was not edited.
-
-There are existing routing conflicts to resolve in Chat mode: `r2_history/contract.md`
-states the binding root is `_index_v2/timeseries_binding`, while the current shared
-`getObservationHistoryGeneration('v3')` selects `_index_v3/timeseries_binding`.
-The observation schema/current shared helper identify selected physical v3
-observation storage, while older backup/prune text retains logical-v2 path wording.
-This implementation chooses neither conflicting path by guess; callers must supply
-the explicit generation/binding paths and unresolved reads fail closed.
+The authoritative 12 October contracts already resolve complete-v3 observations,
+index and binding paths; no further contract edit was needed for this correction.
+Record Stage 2.6 as a bounded, inactive diagnostic implementation after code review.
+Its connector mode input still lacks an accepted runtime provider, final writer
+adapters and complete receipt outbox; current selector and operational acceptance
+remain unproven. Authoritative `uk-aq-system-docs` was not edited.

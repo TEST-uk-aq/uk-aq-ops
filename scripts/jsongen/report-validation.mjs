@@ -160,8 +160,7 @@ export function assertReconciliationReport(report, { controlRead = null } = {}) 
     evidence(c.schema_version === 1 && c.kind === 'uk_aq_jsongen_canonical_inspection'
       && c.generation.version === 'v3' && c.authority_complete === false
       && c.freshness === 'source_as_of_only' && typeof c.read_consistent === 'boolean'
-      && (c.binding_prefix === null || ['history/_index_v2/timeseries_binding',
-        c.generation.timeseries_binding_index_prefix].includes(c.binding_prefix))
+      && c.binding_prefix === c.generation.timeseries_binding_index_prefix
       && Array.isArray(c.scopes) && c.scopes.length <= LIMITS.scopes
       && Array.isArray(c.provenance) && c.provenance.length <= LIMITS.metadata_gets
       && c.provenance.every(r => (canonicalReference(r), true))
@@ -195,10 +194,18 @@ export function assertReconciliationReport(report, { controlRead = null } = {}) 
         }
       }
       if (item.physical !== undefined) {
-        keys(item.physical, ['membership', 'row_count'], ['index', 'leaf', 'aligned_shard']);
+        keys(item.physical, ['membership', 'row_count'], ['index', 'leaf', 'aligned_shard', 'physical_identity']);
         evidence(safe(item.physical.row_count)
           && (item.physical.membership === 'present') === (item.physical.row_count > 0),
         'invalid_report', 'invalid physical row count');
+        if (item.physical.physical_identity !== undefined) {
+          const p = item.physical.physical_identity;
+          keys(p, ['history_schema_version', 'writer_version', 'physical_layout_version']);
+          evidence(item.physical.membership === 'present' && [3, 4].includes(p.history_schema_version)
+            && p.writer_version === `parquet-wasm-zstd-v${p.history_schema_version}`
+            && p.physical_layout_version === 'timeseries-aligned-v2',
+          'invalid_report', 'unsupported scoped physical identity');
+        }
         for (const field of ['index', 'leaf', 'aligned_shard']) {
           if (item.physical[field] !== undefined) canonicalReference(item.physical[field]);
         }
@@ -206,7 +213,12 @@ export function assertReconciliationReport(report, { controlRead = null } = {}) 
       if (item.binding !== undefined) canonicalReference(item.binding);
       if (item.verification !== undefined) {
         keys(item.verification, ['state'], ['manifest', 'entry', 'scope_sha256']);
-        evidence(['embedded_status_requires_writer_evidence', 'overlay_metadata_verified'].includes(item.verification.state),
+        evidence(['embedded_status_requires_writer_evidence', 'overlay_metadata_verified',
+          'overlay_authoritative_connector_unresolved', 'unknown_verification_transition_state'].includes(item.verification.state)
+          && !(item.physical?.physical_identity?.history_schema_version === 4
+            && item.verification.state === 'embedded_status_requires_writer_evidence')
+          && (item.verification.state !== 'overlay_metadata_verified' ||
+            (item.verification.manifest && item.verification.entry && item.verification.scope_sha256)),
           'invalid_report', 'verification metadata is not writer status authentication');
         if (item.verification.manifest !== undefined) canonicalReference(item.verification.manifest);
         if (item.verification.scope_sha256 !== undefined) evidence(sha.test(item.verification.scope_sha256),
