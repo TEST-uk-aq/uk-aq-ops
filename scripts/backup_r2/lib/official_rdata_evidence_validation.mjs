@@ -14,6 +14,7 @@ import { authenticateOfficialRdataPinnedHierarchy } from "./official_rdata_pinne
 const digest = (body) => createHash("sha256").update(body).digest("hex");
 const equal = (a, b) => canonical(a) === canonical(b);
 const encoded = (rows) => rows.map(encodeCanonicalObservationRow).sort();
+const V9_TIMESTAMP_MAPPING = "rdata_date_beginning_plus_one_hour_to_observed_at_utc";
 const INPUT_FIELDS = [
   "source_adapter", "day_utc", "connector_id", "source_file_identities_sha256",
   "requested_pollutant_set", "contract", "evidence_contract_version",
@@ -75,17 +76,33 @@ function pinnedPath(root, key) {
 export async function validateOfficialRdataPreservationDependencies({ runState, source }) {
   const evidence = source.evidence;
   const audit = evidence.acquisition_audit;
-  if (evidence.evidence_contract_version !== 8
-      || !["waqn", "saqn"].includes(evidence.source_adapter)
-      || evidence.history_generation !== "v2"
-      || !audit || !equal(Object.keys(audit).sort(), [...AUDIT_FIELDS].sort())
-      || officialRdataSha256(audit) !== evidence.acquisition_audit_sha256
-      || audit.source_evidence_input_sha256 !== evidence.source_evidence_input_sha256
-      || audit.semantic_evidence_sha256 !== evidence.semantic_evidence_sha256
-      || INPUT_FIELDS.some((field) => !Object.hasOwn(evidence, field))
-      || officialRdataSha256(Object.fromEntries(INPUT_FIELDS.map((field) => [field, evidence[field]])))
-        !== evidence.source_evidence_input_sha256) {
-    throw new Error("Official RData source/audit authentication failed");
+  if (![8, 9].includes(evidence.evidence_contract_version)) {
+    throw new Error("Official RData evidence contract version is unsupported");
+  }
+  if (evidence.evidence_contract_version === 9
+      && evidence.timestamp_mapping !== V9_TIMESTAMP_MAPPING) {
+    throw new Error("Official RData v9 timestamp mapping is invalid");
+  }
+  if (!["waqn", "saqn"].includes(evidence.source_adapter)
+      || evidence.history_generation !== "v2") {
+    throw new Error("Official RData source scope is invalid");
+  }
+  if (!audit || !equal(Object.keys(audit).sort(), [...AUDIT_FIELDS].sort())) {
+    throw new Error("Official RData acquisition audit shape is invalid");
+  }
+  if (officialRdataSha256(audit) !== evidence.acquisition_audit_sha256) {
+    throw new Error("Official RData acquisition audit hash changed");
+  }
+  if (audit.source_evidence_input_sha256 !== evidence.source_evidence_input_sha256
+      || audit.semantic_evidence_sha256 !== evidence.semantic_evidence_sha256) {
+    throw new Error("Official RData acquisition audit linkage changed");
+  }
+  if (INPUT_FIELDS.some((field) => !Object.hasOwn(evidence, field))) {
+    throw new Error("Official RData source-input fields are incomplete");
+  }
+  if (officialRdataSha256(Object.fromEntries(INPUT_FIELDS.map((field) => [field, evidence[field]])))
+      !== evidence.source_evidence_input_sha256) {
+    throw new Error("Official RData source-input hash changed");
   }
   for (const field of ["source_adapter", "day_utc", "connector_id", "history_generation"]) {
     if (audit[field] !== evidence[field]) throw new Error("Official RData acquisition scope changed");
