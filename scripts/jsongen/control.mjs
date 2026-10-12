@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { r2GetObject, r2PutObjectConditional, sha256Hex, isStrongR2Etag } from '../../workers/shared/r2_sigv4.mjs';
 import { ROOT, CONTROL_KEY, BUCKET, ORDERING_BLOCKER, assertControl, createControl,
   assertReceipt, assertReference, assertFailure, canonicalJson, same, monthKey, requireValid } from './schema.mjs';
+import { assertControlSnapshot } from './control-snapshot.mjs';
 
 export const MAX_CONTROL_BYTES = 4 * 1024 ** 2; // Admission cap, not an accepted operational scale.
 export class JSONgenControlError extends Error {
@@ -109,6 +110,13 @@ export async function updateManagedControl({ r2, command, maxConflicts = 3 }) {
   // between verification and a CAS retry.
   command = structuredClone(command);
   requireValid(['initialize', 'retain_receipt', 'record_failure'].includes(command?.type), 'unsupported control command');
+  if (command.expected_control_snapshot !== undefined) {
+    requireValid(command.type === 'record_failure' && command.month_key === undefined,
+      'exact control snapshot precondition is only supported for global failure reporting');
+    assertControlSnapshot(command.expected_control_snapshot);
+    requireValid(command.expected_control_snapshot.byte_provenance === 'exact_read',
+      'global reconciliation failure requires original control bytes');
+  }
   if (command.type === 'retain_receipt') {
     assertReceipt(command.receipt); assertReference(command.receipt_object, { managed: true });
     const ref = command.receipt_object;
@@ -129,6 +137,16 @@ export async function updateManagedControl({ r2, command, maxConflicts = 3 }) {
       next = createControl();
     } else {
       if (!latest) throw new JSONgenControlError('missing_authenticated_baseline', 'Managed control is absent; explicit initialization required');
+      // This check is inside the CAS loop: a 412 rereads and must not reapply a
+      // diagnostic prepared for the former control revision or original bytes.
+      const expected = command.expected_control_snapshot;
+      if (expected && (latest.control.control_id !== expected.control_id ||
+          latest.control.revision !== expected.revision ||
+          latest.control.operation_id !== expected.operation_id ||
+          latest.sha256 !== expected.sha256)) {
+        return { outcome: 'stale_reconciliation_inspection', latest,
+          expected_control_snapshot: expected, new_inspection_required: true };
+      }
       next = reduce(latest.control, command, new Date().toISOString());
       if (!next) return { outcome: 'already_retained', latest };
       next.revision++;
