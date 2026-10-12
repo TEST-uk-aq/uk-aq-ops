@@ -15,6 +15,10 @@ import { publicContinuity, selectContinuitySegments } from "./continuity.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
 
+function hourEndingEndpoint(timestampMs) {
+  return Math.ceil(timestampMs / HOUR_MS) * HOUR_MS;
+}
+
 function hourEndpoints(startMs, endMs) {
   const endpoints = [];
   let cursor = Math.floor(startMs / HOUR_MS) * HOUR_MS + HOUR_MS;
@@ -87,7 +91,7 @@ function sourceObservationsToHourEndingNarrowRows(rows, request, outputEndMs, ex
     // on the hour keeps that timestamp as its endpoint; an observation inside
     // the hour belongs to the next clock-hour endpoint. This makes the bucket
     // represent (previous endpoint, endpoint] without collapsing raw readings.
-    const endpointMs = Math.ceil(observedMs / HOUR_MS) * HOUR_MS;
+    const endpointMs = hourEndingEndpoint(observedMs);
     if (endpointMs > outputEndMs) continue;
     const endpointIso = new Date(endpointMs).toISOString();
     const current = grouped.get(endpointMs) || {
@@ -168,7 +172,9 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
   const includeObservations = request.includeObservations !== false;
   const contextHours = request.includeAqi && ["pm25", "pm10"].includes(request.pollutant) ? 23 : 0;
   const requiredStartMs = outputStartMs - contextHours * HOUR_MS;
-  const requiredEndExclusiveMs = request.includeAqi ? outputEndMs + 1 : outputEndMs;
+  // Both parts include an observation exactly at the requested end. Readers
+  // and continuity selection use exclusive end bounds.
+  const requiredEndExclusiveMs = outputEndMs + 1;
   const selection = selectContinuitySegments(continuity, requiredStartMs, requiredEndExclusiveMs);
   const visibleSelection = selectContinuitySegments(continuity, outputStartMs, requiredEndExclusiveMs);
   if (!selection.segments.length) throw new Error("station_history_continuity_member_missing");
@@ -225,7 +231,7 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
     const timestamp = Date.parse(row.observed_at);
     if (timestamp < outputStartMs || timestamp > outputEndMs) continue;
     visibleRows.push(row);
-    observationPresent.add(Math.floor(timestamp / HOUR_MS) * HOUR_MS + HOUR_MS);
+    observationPresent.add(hourEndingEndpoint(timestamp));
     if (Object.hasOwn(sourceCounts, row.source)) sourceCounts[row.source] += 1;
   }
   const expected = hourEndpoints(outputStartMs, outputEndMs);
