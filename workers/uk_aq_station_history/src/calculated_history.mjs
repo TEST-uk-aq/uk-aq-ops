@@ -78,7 +78,7 @@ function mergePhysicalObservations(r2Rows, ingestRows, segments, requiredStartMs
     || left.timeseries_id - right.timeseries_id);
 }
 
-function sourceObservationsToHourEndingNarrowRows(rows, request, outputStartMs, outputEndMs) {
+function sourceObservationsToHourEndingNarrowRows(rows, request, outputEndMs, expectedEndpoints) {
   const grouped = new Map();
   for (const row of rows) {
     const observedMs = Date.parse(row.observed_at);
@@ -106,7 +106,7 @@ function sourceObservationsToHourEndingNarrowRows(rows, request, outputStartMs, 
   // A complete source read can legitimately have no observation in a visible
   // hour. Give the shared helper that hour so it evaluates a blank band (or a
   // valid PM rolling band) instead of leaving the endpoint unevaluated.
-  for (const endpointMs of hourEndpoints(outputStartMs, outputEndMs)) {
+  for (const endpointMs of expectedEndpoints) {
     if (!grouped.has(endpointMs)) grouped.set(endpointMs, {
       timeseries_id: request.timeseriesId, station_id: request.stationId,
       connector_id: request.connectorId, pollutant_code: request.pollutant,
@@ -124,10 +124,10 @@ function sourceObservationsToHourEndingNarrowRows(rows, request, outputStartMs, 
   })).sort((left, right) => left.timestamp_hour_utc.localeCompare(right.timestamp_hour_utc));
 }
 
-function calculateLogicalAqi(observationRows, request, segments, outputStartMs, outputEndMs) {
+function calculateLogicalAqi(observationRows, request, segments, outputStartMs, outputEndMs, expectedEndpoints) {
   return helperRowsToNormalizedAqiV1Rows(
     pivotNarrowRowsToHelperRows(
-      sourceObservationsToHourEndingNarrowRows(observationRows, request, outputStartMs, outputEndMs),
+      sourceObservationsToHourEndingNarrowRows(observationRows, request, outputEndMs, expectedEndpoints),
       {
         rangeStartUtc: new Date(outputStartMs + HOUR_MS).toISOString(),
         rangeEndUtc: new Date(outputEndMs + HOUR_MS).toISOString(),
@@ -228,8 +228,8 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
     observationPresent.add(Math.floor(timestamp / HOUR_MS) * HOUR_MS + HOUR_MS);
     if (Object.hasOwn(sourceCounts, row.source)) sourceCounts[row.source] += 1;
   }
-  const aqiRows = request.includeAqi ? calculateLogicalAqi(rows, request, selection.segments, outputStartMs, outputEndMs) : [];
   const expected = hourEndpoints(outputStartMs, outputEndMs);
+  const aqiRows = request.includeAqi ? calculateLogicalAqi(rows, request, selection.segments, outputStartMs, outputEndMs, expected) : [];
   // Raw-observation completeness uses containing half-open hourly intervals:
   // exact-hour and sub-hour readings both cover the interval's next endpoint.
   const aqiPresent = new Set(aqiRows.map((row) => Date.parse(row.timestamp_hour_utc)));
@@ -247,8 +247,12 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
     STATION_HISTORY_V3_OBSERVATION_ROW_BUDGET_REASON,
   ].includes(reason));
   const r2Complete = reads.length === selection.segments.length
-    && reads.every((entry) => entry.result.response_complete === true);
-  const sourceComplete = !readBudgetExceeded && (r2Complete || ingestComplete === true);
+    && reads.every((entry) => entry.result.response_complete === true
+      && entry.result.has_gap !== true && entry.result.partial_reasons.length === 0);
+  // IngestDB can fill only timestamps proven absent from committed R2. A
+  // completed ingest window cannot certify unread canonical pages or context.
+  const sourceComplete = !readBudgetExceeded && r2Complete
+    && (ingestFetchCount === 0 || ingestComplete === true);
   const observationsComplete = includeObservations && sourceComplete && visibleSelection.gaps.length === 0;
   const evaluatedStatus = (status, reason) => status === "ok"
     || (status === "insufficient_samples" && reason === "insufficient_rolling_24h_hours")
