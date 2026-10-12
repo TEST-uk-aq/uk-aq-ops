@@ -16817,6 +16817,40 @@ def _official_rdata_semantic_evidence_sha256(evidence: Mapping[str, Any]) -> str
     )).hexdigest()
 
 
+def _official_rdata_v10_persisted_semantic_evidence_sha256(
+    evidence: Mapping[str, Any],
+) -> str:
+    """Hash an exact persisted semantic projection, without envelope/audit fields."""
+    if (
+        evidence.get("source_adapter") not in OFFICIAL_RDATA_NETWORKS
+        or evidence.get("schema_version") != 1
+        or evidence.get("semantic_evidence_contract")
+        != "official_rdata_semantic_evidence"
+        or evidence.get("evidence_contract_version") != 10
+        or evidence.get("history_generation") not in ("v2", "v3")
+        or evidence.get("source_artifact_availability_contract_version")
+        != OFFICIAL_RDATA_SOURCE_AVAILABILITY_CONTRACT_VERSION
+        or evidence.get("preserved_baseline_dependency_contract_version")
+        != OFFICIAL_RDATA_PRESERVED_BASELINE_CONTRACT_VERSION
+        or evidence.get("rdata_decoder_contract_version")
+        != OFFICIAL_RDATA_DECODER_CONTRACT_VERSION
+        or evidence.get("observation_content_hash_contract_version") != 1
+        or evidence.get("timestamp_mapping") != OFFICIAL_RDATA_TIMESTAMP_MAPPING
+    ):
+        raise ValueError("official RData persisted v10 semantic contract is invalid")
+    fields = set(OFFICIAL_RDATA_V10_SEMANTIC_EVIDENCE_FIELDS)
+    if set(evidence) != fields:
+        raise ValueError(
+            "official RData persisted v10 semantic evidence shape is invalid: "
+            f"missing={sorted(fields - set(evidence))} "
+            f"unexpected={sorted(set(evidence) - fields)}"
+        )
+    return hashlib.sha256(_canonical_json_utf8_bytes({
+        field: evidence[field]
+        for field in OFFICIAL_RDATA_V10_SEMANTIC_EVIDENCE_FIELDS
+    })).hexdigest()
+
+
 def _official_rdata_acquisition_audit_sha256(evidence: Mapping[str, Any]) -> str:
     if evidence.get("evidence_contract_version") in (8, 9):
         return _official_rdata_v8_acquisition_audit_sha256(evidence)
@@ -28429,6 +28463,8 @@ def _bound_source_evidence_rows(
         evidence_id = int(persistence.get("evidence_id"))
     except (TypeError, ValueError) as exc:
         raise ValueError("bound canonical source evidence ID is invalid") from exc
+    if evidence_id <= 0:
+        raise ValueError("bound canonical source evidence ID is invalid")
     row = conn.execute(
         """
         SELECT env_name, day_utc, connector_id, source_adapter,
@@ -28462,6 +28498,13 @@ def _bound_source_evidence_rows(
         or int(stored_connector or 0) != connector_id
         or source_adapter != complete.get("source_adapter")
         or source_adapter not in OFFICIAL_RDATA_NETWORKS
+        or OFFICIAL_RDATA_NETWORKS[source_adapter].connector_id != connector_id
+        or complete.get("day_utc") != day_utc
+        or complete.get("connector_id") != connector_id
+        or complete.get("evidence_contract_version") != 10
+        or complete.get("history_generation") != "v2"
+        or _official_rdata_semantic_evidence_sha256(complete)
+        != str(evidence_sha or "")
         or str(source_file_sha or "")
         != str(complete.get("source_file_identities_sha256") or "")
         or str(source_input_sha or "")
@@ -28470,17 +28513,54 @@ def _bound_source_evidence_rows(
         != str(persistence.get("evidence_sha256") or "")
         or str(evidence_sha or "")
         != str(complete.get("semantic_evidence_sha256") or "")
+        or str(source_input_sha or "")
+        != str(persistence.get("source_evidence_input_sha256") or "")
+        or not isinstance(persistence.get("acquisition_audit_id"), int)
+        or isinstance(persistence.get("acquisition_audit_id"), bool)
+        or persistence["acquisition_audit_id"] <= 0
+        or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(persistence.get("acquisition_audit_sha256") or ""),
+        )
+        or str(persistence.get("acquisition_audit_sha256") or "")
+        != str(complete.get("acquisition_audit_sha256") or "")
+        or not isinstance(complete.get("acquisition_audit"), Mapping)
+        or complete["acquisition_audit"].get("source_evidence_input_sha256")
+        != str(source_input_sha or "")
+        or complete["acquisition_audit"].get("semantic_evidence_sha256")
+        != str(evidence_sha or "")
+        or _official_rdata_acquisition_audit_sha256(complete)
+        != str(persistence.get("acquisition_audit_sha256") or "")
         or str(rows_sha or "") != hashlib.sha256(encoded_rows).hexdigest()
-        or int(rows_bytes or -1) != len(encoded_rows)
+        or int(rows_bytes if rows_bytes is not None else -1) != len(encoded_rows)
         or not isinstance(evidence, Mapping)
         or not isinstance(rows, list)
+        or evidence.get("day_utc") != day_utc
+        or evidence.get("connector_id") != connector_id
+        or evidence.get("source_adapter") != source_adapter
+        or evidence.get("evidence_contract_version") != 10
         or evidence.get("history_generation") != "v2"
-        or _official_rdata_semantic_evidence_sha256(evidence)
+        or evidence.get("source_file_identities_sha256") != str(source_file_sha or "")
+        or evidence.get("source_evidence_input_sha256") != str(source_input_sha or "")
+        or evidence.get("canonical_rows_sha256") != str(rows_sha or "")
+        or evidence.get("canonical_rows_bytes") != len(encoded_rows)
+        or evidence.get("canonical_rows_sha256") != complete.get("canonical_rows_sha256")
+        or evidence.get("canonical_rows_bytes") != complete.get("canonical_rows_bytes")
+        or _official_rdata_v10_persisted_semantic_evidence_sha256(evidence)
         != str(evidence_sha or "")
         or _source_evidence_input_sha256(evidence)
         != str(source_input_sha or "")
     ):
         raise ValueError("bound canonical source evidence identity changed")
+    verified_codes = scope_entry.get("verified_pollutant_codes")
+    if verified_codes is None:
+        verified_codes = [scope_entry.get("pollutant_code")]
+    if (not isinstance(verified_codes, list) or not verified_codes
+            or any(not isinstance(code, str) or not code for code in verified_codes)
+            or not set(verified_codes).issubset(
+                set(evidence.get("requested_pollutant_set") or [])
+            )):
+        raise ValueError("bound official source verified pollutant membership changed")
     final_pollutant_counts = dict(
         evidence.get("final_target_pollutant_counts") or {}
     )
@@ -28493,7 +28573,9 @@ def _bound_source_evidence_rows(
     eligible_pollutants = {
         pollutant_code
         for pollutant_code, count in final_pollutant_counts.items()
-        if pollutant_code in source_available_pollutants and int(count or 0) > 0
+        if pollutant_code in verified_codes
+        and pollutant_code in source_available_pollutants
+        and int(count or 0) > 0
     }
     source_rows = _official_rdata_source_available_rows(
         rows,
@@ -29267,23 +29349,48 @@ def run_current_state_reconciliation(
             )
         }
     else:
+        source_scope_entries = [
+            dict(entry) for entry in scope_entries if isinstance(entry, Mapping)
+        ]
         selected_scope = {
             "scopes": sorted({
                 (
                     str(entry.get("day_utc") or "").strip(),
                     int(entry.get("connector_id") or 0),
                 )
-                for entry in scope_entries
-                if isinstance(entry, Mapping)
+                for entry in source_scope_entries
             })
         }
+        bound_official_scopes: dict[tuple[str, int, str], dict[str, Any]] = {}
+        for entry in source_scope_entries:
+            key = (str(entry.get("day_utc") or "").strip(),
+                   int(entry.get("connector_id") or 0),
+                   str(entry.get("pollutant_code") or ""))
+            binding = entry.get("immutable_detector_source_evidence_persistence")
+            if key[1] not in {9, 10} or not isinstance(binding, Mapping):
+                continue
+            previous = bound_official_scopes.get(key)
+            if previous is not None and (
+                previous["immutable_detector_source_evidence_persistence"] != binding
+                or previous.get("complete_source_evidence")
+                != entry.get("complete_source_evidence")
+            ):
+                raise ValueError("conflicting bound official source evidence for current state")
+            bound_official_scopes[key] = entry
+        candidate_scope_entries: list[dict[str, Any]] = []
+        for day_utc, connector_id in selected_scope["scopes"]:
+            bound = [
+                entry for (bound_day, bound_connector, _), entry
+                in sorted(bound_official_scopes.items())
+                if (bound_day, bound_connector) == (day_utc, connector_id)
+            ]
+            candidate_scope_entries.extend(
+                bound or [{"day_utc": day_utc, "connector_id": connector_id}]
+            )
         derived = _current_state_candidates_from_verified_evidence(
             conn=conn,
             env_name=env_name,
-            scope_entries=[
-                {"day_utc": day_utc, "connector_id": connector_id}
-                for day_utc, connector_id in selected_scope["scopes"]
-            ],
+            scope_entries=candidate_scope_entries,
         )
     raw_candidates = list(derived["raw_candidates"])
     snapshot_candidates = list(derived["latest_snapshot_candidates"])
