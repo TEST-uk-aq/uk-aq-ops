@@ -70,7 +70,6 @@ function deriveGenericV2EmptyMetadataRemovals(runState, scopes) {
     throw new Error("Generic fixed-v2 pinned metadata root is unavailable");
   }
   const base = "history/v2/observations";
-  const indexBase = "history/_index_v2/observations_timeseries";
   const objects = runState?.objects || {};
   const fileFor = (key) => path.join(root, ...safeKey(key).split("/"));
   const exists = (key) => fs.statSync(fileFor(key), { throwIfNoEntry: false })?.isFile() === true;
@@ -103,8 +102,11 @@ function deriveGenericV2EmptyMetadataRemovals(runState, scopes) {
       manifest_key: pollutantKey,
       baseline_state: exists(pollutantKey) ? "partition_present" : "partition_absent",
     });
-    const indexKey = `${indexBase}/day_utc=${day}/connector_id=${connector}/pollutant_code=${code}/manifest.json`;
-    if (exists(indexKey)) expected.set(indexKey, "generic_v2_authenticated_empty_pollutant_index");
+    if (exists(pollutantKey)) {
+      // Deleting canonical rows may also require removal of a live derived
+      // index. Dropbox cannot authenticate that excluded R2 object.
+      throw new Error(`Generic fixed-v2 empty pollutant requires independent R2 index-removal authority: ${pollutantKey}`);
+    }
   }
   const removedConnectors = new Map();
   for (const [identity, selected] of byConnector) {
@@ -128,10 +130,6 @@ function deriveGenericV2EmptyMetadataRemovals(runState, scopes) {
       throw new Error(`Generic fixed-v2 empty connector contains an unselected object: ${key}`);
     }
     if (Object.hasOwn(objects, key)) throw new Error(`Generic fixed-v2 empty connector has a proposed manifest: ${key}`);
-    if (filesBelow(`${indexBase}/day_utc=${day}/connector_id=${connector}`)
-      .some((candidate) => !expected.has(candidate))) {
-      throw new Error(`Generic fixed-v2 empty connector has an unselected index: ${key}`);
-    }
     expected.set(key, "generic_v2_authenticated_empty_connector");
     const removed = removedConnectors.get(day) || new Set();
     removed.add(connector);
@@ -153,10 +151,6 @@ function deriveGenericV2EmptyMetadataRemovals(runState, scopes) {
       throw new Error(`Generic fixed-v2 empty day contains an unrelated object: ${key}`);
     }
     if (Object.hasOwn(objects, key)) throw new Error(`Generic fixed-v2 empty day has a proposed manifest: ${key}`);
-    if (filesBelow(`${indexBase}/day_utc=${day}`)
-      .some((candidate) => !expected.has(candidate))) {
-      throw new Error(`Generic fixed-v2 empty day has an unrelated index: ${key}`);
-    }
     expected.set(key, "generic_v2_authenticated_empty_day");
   }
   const removedDays = new Set([...expected.entries()]

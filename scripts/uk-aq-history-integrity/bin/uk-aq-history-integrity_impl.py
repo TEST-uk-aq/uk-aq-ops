@@ -12700,35 +12700,6 @@ def run_v2_observations_integrity_checks(
                 if not _official_rdata_source_for_connector(connector_id):
                     continue
                 connector_rel = f"{day_rel}/connector_id={connector_id}"
-                index_day_rel = f"{index_prefix}/day_utc={day_utc}"
-                index_connector_rel = (
-                    f"{index_day_rel}/connector_id={connector_id}"
-                )
-                if (not day_dir.exists() and (root / index_day_rel).exists()):
-                    gaps.append(_v2_obs_gap(
-                        "orphan_index_day", day_utc=day_utc,
-                        connector_id=connector_id,
-                        expected_path=index_day_rel,
-                    ))
-                elif (not (root / connector_rel).exists()
-                      and (root / index_connector_rel).exists()):
-                    gaps.append(_v2_obs_gap(
-                        "orphan_index_connector", day_utc=day_utc,
-                        connector_id=connector_id,
-                        expected_path=index_connector_rel,
-                    ))
-                for code in _v2_detector_pollutants_for_connector(source_scope, connector_id):
-                    data_manifest = root / connector_rel / f"pollutant_code={code}" / "manifest.json"
-                    index_manifest_rel = (
-                        f"{index_prefix}/day_utc={day_utc}/connector_id={connector_id}/"
-                        f"pollutant_code={code}/manifest.json"
-                    )
-                    if (root / index_manifest_rel).is_file() and not data_manifest.is_file():
-                        gaps.append(_v2_obs_gap(
-                            "orphan_index_manifest", day_utc=day_utc,
-                            connector_id=connector_id, pollutant_code=code,
-                            expected_path=index_manifest_rel,
-                        ))
                 if isinstance(latest_summary, Mapping):
                     indexed_connector = connector_id in latest_summary["connector_ids"]
                     present_connector = (root / connector_rel / "manifest.json").is_file()
@@ -13113,19 +13084,25 @@ def run_v2_observations_integrity_checks(
                 for partition_gap in gaps[partition_gap_start:]:
                     if str(partition_gap.get("gap_type") or "").startswith("data_manifest_") or partition_gap.get("gap_type") == "orphan_parquet_without_manifest":
                         partition_gap["parquet_readable"] = parquet_readable
-                idx_rel = f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}/{pollutant_dir.name}/manifest.json"
-                idx_path = root / idx_rel
-                if not idx_path.is_file():
-                    gaps.append(_v2_obs_gap("index_manifest_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
-                else:
-                    try:
-                        idx_payload = json.loads(idx_path.read_text(encoding="utf-8"))
-                        if "timeseries_row_counts" not in idx_payload:
-                            gaps.append(_v2_obs_gap("index_manifest_missing_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
-                        elif not idx_payload.get("timeseries_row_counts"):
-                            gaps.append(_v2_obs_gap("index_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
-                    except Exception:
-                        gaps.append(_v2_obs_gap("index_manifest_invalid_json", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                # Official RData uses a Dropbox baseline that deliberately omits
+                # the derived per-pollutant index tree. Its local absence (or a
+                # stray local copy) cannot establish the actual R2 index state.
+                if (connector_id_for_detector is None
+                        or not _official_rdata_source_for_connector(
+                            connector_id_for_detector)):
+                    idx_rel = f"{index_prefix}/day_utc={day_utc}/{connector_dir.name}/{pollutant_dir.name}/manifest.json"
+                    idx_path = root / idx_rel
+                    if not idx_path.is_file():
+                        gaps.append(_v2_obs_gap("index_manifest_missing", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                    else:
+                        try:
+                            idx_payload = json.loads(idx_path.read_text(encoding="utf-8"))
+                            if "timeseries_row_counts" not in idx_payload:
+                                gaps.append(_v2_obs_gap("index_manifest_missing_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                            elif not idx_payload.get("timeseries_row_counts"):
+                                gaps.append(_v2_obs_gap("index_manifest_empty_timeseries_counts", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
+                        except Exception:
+                            gaps.append(_v2_obs_gap("index_manifest_invalid_json", day_utc=day_utc, connector_id=connector_raw, pollutant_code=pollutant, expected_path=idx_rel))
                 if source_partition_evidence is not None:
                     for partition_gap in gaps[partition_gap_start:]:
                         partition_gap.setdefault("source_evidence", {}).update(source_partition_evidence)
@@ -20544,10 +20521,6 @@ def run_v2_gap_backfills(
                     changed_scope["source_evidence_input_sha256"] = str(
                         source_evidence.get("source_evidence_input_sha256") or ""
                     )
-                    index_root = Path(str(run_state["base_dropbox_root"])) / (
-                        "history/_index_v2/observations_timeseries/"
-                        f"day_utc={day_iso}/connector_id={connector_id}"
-                    )
                     current_tombstones = {
                         str(entry.get("prefix") or "")
                         for entry in list(run_state.get("tombstone_prefixes") or [])
@@ -20561,7 +20534,6 @@ def run_v2_gap_backfills(
                             f"day_utc={day_iso}/connector_id={connector_id}/"
                             f"pollutant_code={code}"
                         ) in current_tombstones
-                        or (index_root / f"pollutant_code={code}").exists()
                     )
                     changed_scope["pollutant_codes"] = mutation_pollutants
                     changed_scope["empty_pollutant_codes"] = sorted(
@@ -21301,6 +21273,11 @@ def _derive_generic_pinned_metadata_dependencies(
     root = Path(str(run_state.get("base_dropbox_root") or ""))
     if not root.is_dir():
         raise ValueError("generic metadata-only pinned Dropbox root is unavailable")
+    _authenticate_official_rdata_pinned_hierarchy(run_state, {
+        "day_utc": day_utc, "connector_id": connector_id,
+        "pollutant_code": pollutant_code, "manifest_key": keys[-1],
+        "baseline_state": "partition_present",
+    })
     for key in keys:
         body = (root / key).read_bytes()
         payload = json.loads(body)
@@ -21322,15 +21299,29 @@ def _derive_generic_pinned_metadata_dependencies(
             ["connector_manifests", "child_manifests"] if index == 3 else
             ["pollutant_manifests", "child_manifests"]
         )
-        references = [
-            ref for name in reference_fields
-            for ref in list(parent.get(name) or [])
-            if isinstance(ref, Mapping) and ref.get("manifest_key") == keys[index + 1]
-        ]
+        collections: list[dict[str, dict[str, Any]]] = []
+        for name in reference_fields:
+            entries = parent.get(name)
+            if not isinstance(entries, list):
+                raise ValueError(f"generic metadata-only child collection is invalid: {keys[index]}:{name}")
+            by_key: dict[str, dict[str, Any]] = {}
+            for ref in entries:
+                if not isinstance(ref, Mapping):
+                    raise ValueError(f"generic metadata-only child reference is invalid: {keys[index]}:{name}")
+                manifest_key = ref.get("manifest_key")
+                if (not isinstance(manifest_key, str) or not manifest_key
+                        or manifest_key in by_key
+                        or not re.fullmatch(r"[a-f0-9]{64}", str(ref.get(field) or ""))):
+                    raise ValueError(f"generic metadata-only child reference is invalid or duplicated: {keys[index]}:{name}")
+                by_key[manifest_key] = dict(ref)
+            collections.append(by_key)
+        if any(collection != collections[0] for collection in collections[1:]):
+            raise ValueError(f"generic metadata-only pinned aliases disagree: {keys[index]}")
+        reference = collections[0].get(keys[index + 1])
         if (
-            len(references) != 1
+            reference is None
             or not re.fullmatch(r"[a-f0-9]{64}", str(child.get(field) or ""))
-            or references[0].get(field) != child.get(field)
+            or reference.get(field) != child.get(field)
         ):
             raise ValueError(
                 "generic metadata-only pinned hierarchy disagrees: "
@@ -21483,10 +21474,9 @@ def _derive_generic_v2_empty_metadata_removals(
     run_state: Mapping[str, Any],
     selected_scopes: Iterable[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Derive exact parent/index removals from the accepted pinned child set."""
+    """Derive exact canonical parent removals from the accepted pinned child set."""
     scopes = list(selected_scopes)
     base = R2_HISTORY_V2_OBSERVATIONS_PREFIX
-    index_base = "history/_index_v2/observations_timeseries"
     baseline = Path(str(run_state["base_dropbox_root"]))
     objects = dict(run_state.get("objects") or {})
     expected: dict[str, str] = {}
@@ -21510,12 +21500,13 @@ def _derive_generic_v2_empty_metadata_removals(
                 else "partition_absent"
             ),
         })
-        index_key = (
-            f"{index_base}/day_utc={day}/connector_id={connector}/"
-            f"pollutant_code={code}/manifest.json"
-        )
-        if (baseline / index_key).is_file():
-            expected[index_key] = "generic_v2_authenticated_empty_pollutant_index"
+        if (baseline / pollutant_key).is_file():
+            # Canonical deletion can leave a live derived index behind. The
+            # excluded Dropbox index tree cannot authenticate its removal.
+            raise ValueError(
+                "generic fixed-v2 empty pollutant requires independent R2 "
+                f"index-removal authority: {pollutant_key}"
+            )
     removed_connectors: dict[str, set[int]] = {}
     for (day, connector), selected in by_connector.items():
         empty = {
@@ -21548,13 +21539,6 @@ def _derive_generic_v2_empty_metadata_removals(
                 raise ValueError(f"empty connector has unselected baseline object: {relative}")
         if key in objects:
             raise ValueError(f"empty connector has a proposed manifest: {key}")
-        index_dir = (
-            baseline / index_base / f"day_utc={day}" /
-            f"connector_id={connector}"
-        )
-        for file in index_dir.rglob("*") if index_dir.is_dir() else ():
-            if file.is_file() and file.relative_to(baseline).as_posix() not in expected:
-                raise ValueError(f"empty connector has an unselected index: {key}")
         expected[key] = "generic_v2_authenticated_empty_connector"
         removed_connectors.setdefault(day, set()).add(connector)
     for day, connector_ids in removed_connectors.items():
@@ -21584,10 +21568,6 @@ def _derive_generic_v2_empty_metadata_removals(
                 raise ValueError(f"empty day has unrelated baseline object: {relative}")
         if key in objects:
             raise ValueError(f"empty day has a proposed manifest: {key}")
-        index_dir = baseline / index_base / f"day_utc={day}"
-        for file in index_dir.rglob("*") if index_dir.is_dir() else ():
-            if file.is_file() and file.relative_to(baseline).as_posix() not in expected:
-                raise ValueError(f"empty day has an unrelated index: {key}")
         expected[key] = "generic_v2_authenticated_empty_day"
     removed_days = {
         key for key, authority in expected.items()
@@ -30667,18 +30647,7 @@ def _admit_official_rdata_absent_empty_noop(
     )]
     if not days:
         return
-    baseline = Path(str(run_state["base_dropbox_root"]))
-    index_prefix = "history/_index_v2/observations_timeseries"
     for day_utc in days:
-        day_rel = f"day_utc={day_utc}"
-        connector_rel = f"{day_rel}/connector_id={connector_id}"
-        data_day = baseline / R2_HISTORY_V2_OBSERVATIONS_PREFIX / day_rel
-        data_connector = baseline / R2_HISTORY_V2_OBSERVATIONS_PREFIX / connector_rel
-        index_day = baseline / index_prefix / day_rel
-        index_connector = baseline / index_prefix / connector_rel
-        if ((not data_day.exists() and index_day.exists())
-                or (not data_connector.exists() and index_connector.exists())):
-            return
         for code in selected:
             _, source_evidence = _current_source_counts_for_v2_partition(
                 conn, env_name=env_name, source_scope=source_scope,
@@ -30693,12 +30662,10 @@ def _admit_official_rdata_absent_empty_noop(
                 f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
                 f"connector_id={connector_id}/pollutant_code={code}"
             )
-            index_path = index_connector / f"pollutant_code={code}"
             if (not eligible or source_evidence.get("source_partition_state")
                     != "successful_empty" or source_evidence.get("source_rows") != 0
                     or source_evidence.get("source_unavailable_scopes")
-                    or source_evidence.get("source_unavailable_timeseries_ids")
-                    or index_path.exists()):
+                    or source_evidence.get("source_unavailable_timeseries_ids")):
                 return
             _authenticate_official_rdata_pinned_hierarchy(run_state, {
                 "day_utc": day_utc, "connector_id": connector_id,
