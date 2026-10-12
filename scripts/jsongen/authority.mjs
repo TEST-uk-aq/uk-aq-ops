@@ -7,7 +7,10 @@ import { validateR2HistoryV2ObservationsAggregateManifest, OBSERVATIONS_AGGREGAT
 import { validateCanonicalHistoryV2Manifest } from '../../workers/shared/uk_aq_r2_history_manifest_validation.mjs';
 import { assertV2ObservationsChildManifest } from '../backup_r2/lib/uk_aq_v2_observations_manifest_validation.mjs';
 import { readObservationHistoryExactLeafDailyMetadataV3 } from '../../workers/shared/uk_aq_observation_history_exact_leaf_reader_v3.mjs';
-import { encodeObservationHistoryIndexV3Json } from '../../workers/shared/uk_aq_observation_history_index_v3.mjs';
+import { encodeObservationHistoryIndexV3Json, observationHistoryIndexV3RangeForTimeseriesId } from '../../workers/shared/uk_aq_observation_history_index_v3.mjs';
+import { OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION, OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
+  OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE_ID, OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION }
+  from '../../workers/shared/uk_aq_observation_history_target_writer.mjs';
 import { validateTimeseriesBindingSourceRootManifest, validateTimeseriesBindingSourceRangeManifest,
   timeseriesBindingSourceRootKey } from '../backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs';
 import { OBSERVATION_VERIFICATION_LATEST_KEY, validateObservationVerificationLatest,
@@ -129,9 +132,12 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
       timeseriesId: id.timeseries_id, connectorId: id.connector_id, pollutantCode: id.pollutant_code,
       startUtc: `${scope.day_utc}T00:00:00.000Z`, endUtc: new Date(Date.parse(`${scope.day_utc}T00:00:00.000Z`) + 86400000).toISOString(),
       index: { root: indexRoot, alignedIndexRoot: `${indexRoot}/_aligned`, alignedDataRoot: base,
-        indexGeneration: 'v3', historyVersion: 'v2', physicalLayoutVersion: 'timeseries-aligned-v2', alignedRowCap: 1024,
-        decodeProfileId: 'hyparquet-direct-column-v1', manifestKind: 'observation_timeseries_physical_leaf_scoped_manifest',
-        leafKind: 'observation_timeseries_physical_leaf', additionalCommonFields: { exact_leaf_index_version: 'exact-timeseries-leaf-v1' } },
+        indexGeneration: 'v3', historyVersion: 'v2', physicalLayoutVersion: OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
+        alignedRowCap: OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
+        decodeProfileId: OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE_ID,
+        manifestKind: 'observation_timeseries_physical_leaf_scoped_manifest',
+        leafKind: 'observation_timeseries_physical_leaf',
+        additionalCommonFields: { exact_leaf_index_version: OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION } },
     });
     evidence(metadata.coverage_complete, 'invalid_canonical_metadata', 'incomplete exact physical membership');
     const counts = h.pollutant.timeseries_row_counts;
@@ -147,9 +153,45 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
     evidence(metadata.rows.length === 1 && metadata.rows[0].row_count === counts[String(id.timeseries_id)],
       'invalid_canonical_metadata', 'exact/canonical row count mismatch');
     const alignedChild = leaf.value.source_aligned_child;
-    evidence(Array.isArray(aligned.value.children) && aligned.value.children.some(c => c.key === alignedChild.key
-      && c.sha256 === alignedChild.sha256 && c.byte_size === alignedChild.byte_size),
-    'invalid_canonical_metadata', 'leaf is not a member of its aligned scope');
+    const range = observationHistoryIndexV3RangeForTimeseriesId(id.timeseries_id);
+    const rangeName = `${String(range.range_start).padStart(6, '0')}-${String(range.range_end).padStart(6, '0')}`;
+    evidence(alignedChild?.key === `${indexRoot}/_aligned/${suffix}/range=${rangeName}.json`,
+      'invalid_canonical_metadata', 'leaf aligned shard key/range is contradictory');
+    const children = aligned.value.children;
+    const descriptor = Array.isArray(children) && children.find(c => c.key === alignedChild.key);
+    evidence(descriptor && children.filter(c => c.key === alignedChild.key).length === 1
+      && descriptor.sha256 === alignedChild.sha256 && descriptor.byte_size === alignedChild.byte_size
+      && descriptor.range_start === range.range_start && descriptor.range_end === range.range_end,
+    'invalid_canonical_metadata', 'leaf is not an exact member of its aligned scope');
+    const shard = await pinned(alignedChild); canonicalIndex(shard);
+    const payload = shard.value;
+    evidence(payload.kind === 'observation_timeseries_aligned_source_shard'
+      && payload.key === alignedChild.key && payload.day_utc === scope.day_utc
+      && payload.connector_id === id.connector_id && payload.pollutant_code === id.pollutant_code
+      && payload.index_generation === 'v3' && payload.history_version === 'v2'
+      && payload.physical_layout_version === OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION
+      && payload.range_start === range.range_start && payload.range_end === range.range_end
+      && same(payload.canonical_source_manifest, source),
+    'invalid_canonical_metadata', 'aligned shard contradicts canonical pollutant source or scope');
+    const expectedIds = Object.keys(counts).map(Number)
+      .filter(n => n >= range.range_start && n <= range.range_end).sort((a, b) => a - b);
+    const shardFileKeys = new Set(Array.isArray(payload.files) ? payload.files.map(f => f.key) : []);
+    evidence(Array.isArray(payload.timeseries)
+      && same(payload.timeseries.map(t => t.timeseries_id), expectedIds)
+      && payload.timeseries.every(t => Number.isSafeInteger(t.row_count) && t.row_count > 0
+        && t.row_count === counts[String(t.timeseries_id)] && Array.isArray(t.segments)
+        && t.segments.length > 0 && t.segments.every(s => Number.isSafeInteger(s.row_count)
+          && s.row_count > 0 && shardFileKeys.has(s.file_key))
+        && t.segments.reduce((n, s) => n + s.row_count, 0) === t.row_count)
+      && payload.timeseries.find(t => t.timeseries_id === id.timeseries_id)?.row_count === leaf.value.row_count,
+    'invalid_canonical_metadata', 'aligned shard timeseries membership or row counts disagree');
+    evidence(Array.isArray(payload.files) && leaf.value.files.every(f => payload.files.some(s =>
+      s.key === f.key && s.sha256 === f.sha256 && s.byte_size === f.byte_size))
+      && payload.files.every(f => h.pollutant.files.some(s => {
+        const identity = classifyManifestFileIdentity(s.etag_or_hash, { objectKey: f.key });
+        return s.key === f.key && s.bytes === f.byte_size
+          && identity.type === 'sha256' && identity.value === f.sha256;
+      })), 'invalid_canonical_metadata', 'aligned shard file identity disagrees with exact/canonical files');
     // Check file identity membership without ever fetching Parquet.
     for (const file of leaf.value.files) {
       const canonical = h.pollutant.files.find(f => f.key === file.key);
@@ -157,7 +199,8 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
       evidence(canonical && canonical.bytes === file.byte_size && fileIdentity.type === 'sha256' && fileIdentity.value === file.sha256,
         'invalid_canonical_metadata', 'exact file not pinned by canonical pollutant');
     }
-    return { membership: 'present', row_count: metadata.rows[0].row_count, index: manifest.reference, leaf: leaf.reference };
+    return { membership: 'present', row_count: metadata.rows[0].row_count,
+      index: manifest.reference, leaf: leaf.reference, aligned_shard: shard.reference };
   };
   const binding = async identity => {
     evidence(['history/_index_v2/timeseries_binding', generation.timeseries_binding_index_prefix].includes(bindingPrefix),

@@ -6,8 +6,10 @@ import { readReceipt, readBundle, readImmutable, admitDerived } from './inputs.m
 import { readCanonicalScopes } from './authority.mjs';
 import { authenticateFinalPublication } from './writer-authentication.mjs';
 import { createBudget, evidence, freeze, JSONgenEvidenceError } from './limits.mjs';
+import { controlSnapshot } from './control-snapshot.mjs';
+import { assertReconciliationReport } from './report-validation.mjs';
 
-export async function reconcileManagedInputs({ derivedR2, control, retainedReceipts = [],
+export async function reconcileManagedInputs({ derivedR2, control, controlRead = null, retainedReceipts = [],
   canonical, requestedScopes = [], writerKinds = {}, budget = createBudget() }) {
   control = structuredClone(control); assertControl(control);
   const controlBytes = canonicalJson(control);
@@ -45,7 +47,7 @@ export async function reconcileManagedInputs({ derivedR2, control, retainedRecei
       const registeredEntry = control.registered_changes[receipt.change_id];
       evidence(!registeredEntry || same(registeredEntry.receipt_object, ref), 'stable_change_identity_mismatch', 'retained change conflicts with registered receipt');
       ids.set(receipt.change_id, ref);
-      change.scopes = receipt.scopes.map(s => ({ scope_key: scopeKey(s), declared_state: s.after.state,
+      change.scopes = receipt.scopes.map(s => ({ scope_key: scopeKey(s), declared_scope: s, declared_state: s.after.state,
         declared_authority: s.after.authority, state: 'reconciliation_required' }));
       receipt.scopes.forEach(addScope);
       change.affected_months = receipt.affected_months;
@@ -102,22 +104,22 @@ export async function reconcileManagedInputs({ derivedR2, control, retainedRecei
       selected_source: null, context: [], retained_change_ids: [], state: 'reconciliation_required', context_authentication: 'not_established' });
     months.get(k).retained_change_ids.push(c.change_id);
   }
-  return freeze({ schema_version: 1, kind: 'uk_aq_jsongen_reconciliation', inspected_at_utc: new Date().toISOString(),
-    control_snapshot: { control_id: control.control_id, revision: control.revision, operation_id: control.operation_id, sha256: sha256Hex(controlBytes) },
+  const report = { schema_version: 1, kind: 'uk_aq_jsongen_reconciliation', inspected_at_utc: new Date().toISOString(),
+    control_snapshot: controlSnapshot(control, controlRead),
     state: 'reconciliation_required', publication_selection: 'disabled', complete_change_coverage: false,
     freshness: 'unknown', changes, canonical: current, uncovered_scopes: uncovered,
     months: [...months.values()].map(m => ({ ...m, retained_change_ids: [...new Set(m.retained_change_ids)].sort() })),
     diagnostics, resources: budget.snapshot(),
     actions: ['Retain unresolved receipts, bundles and this report; do not garbage-collect them on metadata drift.',
       'Obtain writer-owned final-source authentication and durable outbox coverage before classifying authenticated current/superseded scopes.',
-      'Authenticate selected baseline and all adjacent-month PM context separately; never rebuild from Parquet automatically.'] });
+      'Authenticate selected baseline and all adjacent-month PM context separately; never rebuild from Parquet automatically.'] };
+  assertReconciliationReport(report, { controlRead });
+  return freeze(report);
 }
 
 // Durable immutable diagnostics, with no new mutable state or Stage 1 schema.
 export function reconciliationArtifact(report, budget = createBudget()) {
-  evidence(report?.schema_version === 1 && report.kind === 'uk_aq_jsongen_reconciliation'
-    && report.state === 'reconciliation_required' && report.publication_selection === 'disabled'
-    && report.complete_change_coverage === false && report.freshness === 'unknown', 'invalid_report', 'expected fail-closed Stage 2 report');
+  assertReconciliationReport(report);
   const body = canonicalJson(report);
   evidence(body.length <= budget.limits.report_bytes, 'resource_limit', 'reconciliation report admission exceeded');
   const hash = sha256Hex(body);
@@ -146,10 +148,17 @@ export async function retainReconciliationReport({ r2, report, budget = createBu
 export async function recordReconciliationRequired({ r2, report, budget = createBudget() }) {
   // If retention fails or is ambiguous, there is no control update. If control
   // CAS fails, the immutable report survives. Neither outcome marks work complete.
+  assertReconciliationReport(report);
+  evidence(report.control_snapshot.byte_provenance === 'exact_read', 'invalid_control_snapshot',
+    'failure recording requires an original-byte control inspection');
   const retained = await retainReconciliationReport({ r2, report, budget });
   const result = await updateManagedControl({ r2, command: { type: 'record_failure', failure: {
     code: 'incomplete_source_change_registration', state: 'reconcile_required', at_utc: new Date().toISOString(),
     detail: `Stage 2 evidence ${retained.reference.key}; writer authentication/coverage unresolved; inspected control revision ${report.control_snapshot.revision}`,
-  } } });
+  }, expected_control_snapshot: report.control_snapshot } });
+  if (result.outcome === 'stale_reconciliation_inspection') return {
+    outcome: 'stale_reconciliation_inspection', report_retention: retained.outcome,
+    reference: retained.reference, control: result, new_inspection_required: true,
+  };
   return { ...retained, control: result };
 }

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 import { sha256Hex, r2GetObjectBounded } from '../workers/shared/r2_sigv4.mjs';
 import { buildObservationHistoryV3SteadyStatePartition } from '../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs';
@@ -9,13 +10,14 @@ import { buildR2HistoryV2ObservationsRootManifest, buildR2HistoryV2ObservationsY
 import { buildTimeseriesBindingSourceRangeManifest, buildTimeseriesBindingSourceRootManifest,
   timeseriesBindingSourceRootKey, timeseriesBindingSourceRangeManifestKey } from '../scripts/backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs';
 import { getObservationHistoryGeneration } from '../workers/shared/uk_aq_observation_history_generation.mjs';
+import { encodeObservationHistoryIndexV3Json } from '../workers/shared/uk_aq_observation_history_index_v3.mjs';
 import { buildObservationVerificationLatest, encodeObservationVerificationJson, OBSERVATION_VERIFICATION_LATEST_KEY } from '../workers/shared/uk_aq_observation_verification_overlay.mjs';
-import { ROOT, BUCKET, ALGORITHM, canonicalJson, affectedMonths, createControl, monthKey, scopeKey } from '../scripts/jsongen/schema.mjs';
-import { selectManagedPublications } from '../scripts/jsongen/control.mjs';
+import { ROOT, CONTROL_KEY, BUCKET, ALGORITHM, canonicalJson, affectedMonths, createControl, monthKey, scopeKey } from '../scripts/jsongen/schema.mjs';
+import { selectManagedPublications, readManagedControl, updateManagedControl } from '../scripts/jsongen/control.mjs';
 import { readWriterInput, readBundle } from '../scripts/jsongen/inputs.mjs';
 import { readCanonicalScopes, compareScopeMetadata } from '../scripts/jsongen/authority.mjs';
 import { authenticateFinalPublication } from '../scripts/jsongen/writer-authentication.mjs';
-import { reconcileManagedInputs, reconciliationArtifact, retainReconciliationReport } from '../scripts/jsongen/reconcile.mjs';
+import { reconcileManagedInputs, reconciliationArtifact, retainReconciliationReport, recordReconciliationRequired } from '../scripts/jsongen/reconcile.mjs';
 import { createBudget } from '../scripts/jsongen/limits.mjs';
 
 const identity = { connector_id: 1, timeseries_id: 212, station_id: 42, pollutant_code: 'pm25' };
@@ -102,6 +104,57 @@ function canonicalFixture(days = ['2026-09-15'], value = 1, conflictingAliases =
     ranges: [{ range_start: 0, range_end: 999, manifest_key: rangeKey, source_range_hash: range.source_range_hash, unit_count: 1 }] }));
   b.set(OBSERVATION_VERIFICATION_LATEST_KEY, Buffer.from(encodeObservationVerificationJson(buildObservationVerificationLatest())));
   return { ...storage, generation: V3, bindingPrefix };
+}
+function controlStore() {
+  const s = store(); const control = createControl();
+  let controlBody = canonicalJson(control); let etag = `"${sha256Hex(controlBody)}"`;
+  let controlPuts = 0; let reportPuts = 0; let onControlPut = null;
+  s.r2.adapter.getObject = async ({ key }) => {
+    if (key !== CONTROL_KEY) throw Object.assign(new Error('missing'), { status: 404 });
+    return { body: Buffer.from(controlBody), bytes: controlBody.length, etag };
+  };
+  s.r2.adapter.putObjectConditional = async ({ key, body, if_match, if_none_match }) => {
+    if (key === CONTROL_KEY) {
+      controlPuts++;
+      if (onControlPut) { const callback = onControlPut; onControlPut = null; callback(); }
+      if (if_match !== etag) return { status: 412 };
+      controlBody = Buffer.from(body); etag = `"${sha256Hex(controlBody)}"`;
+      return { status: 200, etag };
+    }
+    reportPuts++;
+    if (if_none_match !== '*' || s.bodies.has(key)) return { status: 412 };
+    s.bodies.set(key, Buffer.from(body)); return { status: 200, etag: `"${sha256Hex(body)}"` };
+  };
+  const advance = () => {
+    const old = JSON.parse(controlBody.toString('utf8'));
+    const newer = { ...old, revision: old.revision + 1, operation_id: randomUUID(),
+      previous: { revision: old.revision, operation_id: old.operation_id, sha256: sha256Hex(controlBody) },
+      updated_at_utc: '2026-10-12T00:00:00.000Z',
+      failure: { code: 'invalid_provenance', state: 'reconcile_required', at_utc: '2026-10-12T00:00:00.000Z', detail: 'newer diagnostic' } };
+    controlBody = canonicalJson(newer); etag = `"${sha256Hex(controlBody)}"`;
+  };
+  return { ...s, advance, injectConflict(callback) { onControlPut = callback; },
+    get controlPuts() { return controlPuts; }, get reportPuts() { return reportPuts; } };
+}
+function repinAlignedShard(c, changeShard) {
+  const b = c.bodies; const shardKey = [...b.keys()].find(k => k.includes('/_aligned/') && k.includes('/range='));
+  const shard = JSON.parse(b.get(shardKey)); changeShard(shard);
+  const put = (key, value) => { const bytes = Buffer.from(encodeObservationHistoryIndexV3Json(value)); b.set(key, bytes); return ref(c.r2.bucket, key, bytes); };
+  const shardRef = put(shardKey, shard);
+  const alignedKey = shardKey.replace(/\/range=[^/]+\.json$/, '/manifest.json');
+  const aligned = JSON.parse(b.get(alignedKey));
+  Object.assign(aligned.children.find(x => x.key === shardKey), { sha256: shardRef.sha256, byte_size: shardRef.byte_size });
+  const alignedRef = put(alignedKey, aligned);
+  const leafKey = [...b.keys()].find(k => k.includes('/timeseries_id=') && k.endsWith('.json') && k.includes('observations_timeseries/'));
+  const leaf = JSON.parse(b.get(leafKey));
+  Object.assign(leaf.source_aligned_child, { sha256: shardRef.sha256, byte_size: shardRef.byte_size });
+  const leafRef = put(leafKey, leaf);
+  const exactKey = leafKey.replace(/\/timeseries_id=[^/]+\.json$/, '/manifest.json');
+  const exact = JSON.parse(b.get(exactKey));
+  exact.leaves_by_timeseries_id['212'] = [leafKey, leafRef.byte_size, leafRef.sha256];
+  Object.assign(exact.source_aligned_scoped_manifest, { sha256: alignedRef.sha256, byte_size: alignedRef.byte_size });
+  put(exactKey, exact);
+  return shardKey;
 }
 
 test('receipt and gzip identities preserve precision, timestamps, duplicates and statuses, without authenticating writer', async () => {
@@ -249,4 +302,106 @@ test('requested uncovered canonical scope, unavailable status, and mid-read drif
   const changed = await readCanonicalScopes({ ...d, scopes: [scope('2026-09-15')] });
   assert.equal(changed.read_consistent, false);
   assert.equal(changed.diagnostics[0].code, 'canonical_metadata_changed_during_read');
+});
+
+test('reconciliation failure is fenced to exact inspected control bytes and survives a stale inspection', async () => {
+  const s = controlStore(); const controlRead = await readManagedControl(s.r2);
+  const report = await reconcileManagedInputs({ derivedR2: s.r2, control: controlRead.control, controlRead });
+  assert.equal(report.control_snapshot.byte_provenance, 'exact_read');
+  assert.equal(report.control_snapshot.sha256, controlRead.sha256);
+  s.advance();
+  const result = await recordReconciliationRequired({ r2: s.r2, report });
+  assert.equal(result.outcome, 'stale_reconciliation_inspection');
+  assert.equal(result.new_inspection_required, true);
+  assert.equal(s.controlPuts, 0);
+  assert.equal(s.reportPuts, 1);
+  assert.equal((await readManagedControl(s.r2)).control.failure.detail, 'newer diagnostic');
+  assert.ok(s.bodies.has(result.reference.key));
+});
+
+test('CAS conflict rereads the expected snapshot instead of applying an old diagnostic', async () => {
+  const s = controlStore(); const controlRead = await readManagedControl(s.r2);
+  const report = await reconcileManagedInputs({ derivedR2: s.r2, control: controlRead.control, controlRead });
+  s.injectConflict(() => s.advance());
+  const result = await recordReconciliationRequired({ r2: s.r2, report });
+  assert.equal(result.outcome, 'stale_reconciliation_inspection');
+  assert.equal(s.controlPuts, 1);
+  assert.equal((await readManagedControl(s.r2)).control.failure.detail, 'newer diagnostic');
+  assert.ok(s.bodies.has(result.reference.key));
+});
+
+test('valid original-byte report retains and records a diagnostic while projection-only reports cannot record', async () => {
+  const s = controlStore(); const controlRead = await readManagedControl(s.r2);
+  const report = await reconcileManagedInputs({ derivedR2: s.r2, control: controlRead.control, controlRead });
+  const result = await recordReconciliationRequired({ r2: s.r2, report });
+  assert.equal(result.control.outcome, 'written');
+  assert.equal((await readManagedControl(s.r2)).control.revision, controlRead.control.revision + 1);
+  assert.match((await readManagedControl(s.r2)).control.failure.detail, /Stage 2 evidence/);
+  const projection = await reconcileManagedInputs({ derivedR2: s.r2, control: (await readManagedControl(s.r2)).control });
+  await assert.rejects(recordReconciliationRequired({ r2: s.r2, report: projection }), /original-byte control inspection/);
+});
+
+test('existing Stage 1 global failure transition remains valid without a Stage 2 snapshot', async () => {
+  const s = controlStore();
+  const result = await updateManagedControl({ r2: s.r2, command: { type: 'record_failure', failure: {
+    code: 'invalid_provenance', state: 'reconcile_required',
+    at_utc: '2026-10-12T00:00:00.000Z', detail: 'legacy diagnostic',
+  } } });
+  assert.equal(result.outcome, 'written');
+  assert.equal((await readManagedControl(s.r2)).control.failure.detail, 'legacy diagnostic');
+});
+
+test('malformed provenance, contradictory scope evidence and positive authentication fail before retention', async () => {
+  const f = inputFixture(); const c = createControl(); register(c, f);
+  const report = await reconcileManagedInputs({ derivedR2: f.r2, control: c, canonical: canonicalFixture(),
+    requestedScopes: [scope('2026-09-15')] });
+  const badProvenance = structuredClone(report); badProvenance.control_snapshot.registered_change_ids = [];
+  assert.throws(() => reconciliationArtifact(badProvenance), /registered receipt|registered change coverage/);
+  const badScope = structuredClone(report); badScope.changes[0].scopes[0].declared_state = 'authoritative_empty';
+  assert.throws(() => reconciliationArtifact(badScope), /scope evidence/);
+  const badAuthentication = structuredClone(report); badAuthentication.changes[0].authentication.authenticated = true;
+  assert.throws(() => reconciliationArtifact(badAuthentication), /writer authentication/);
+  const s = controlStore();
+  await assert.rejects(retainReconciliationReport({ r2: s.r2, report: badAuthentication }), /writer authentication/);
+  assert.equal(s.reportPuts, 0);
+});
+
+test('aligned shard must be present with exact bytes, canonical source and timeseries membership', async () => {
+  const c = canonicalFixture(); const key = [...c.bodies.keys()].find(k => k.includes('/_aligned/') && k.includes('/range='));
+  assert.ok(key);
+  c.bodies.delete(key);
+  let result = await readCanonicalScopes({ ...c, scopes: [scope('2026-09-15')] });
+  assert.equal(result.scopes[0].physical, undefined);
+  assert.ok(result.scopes[0].diagnostics.length);
+
+  const digest = canonicalFixture(); const digestKey = [...digest.bodies.keys()].find(k => k.includes('/_aligned/') && k.includes('/range='));
+  const original = digest.bodies.get(digestKey);
+  const sameSizeDifferentDigest = Buffer.from(original.toString('utf8').replace('"range_start": 0', '"range_start": 1'));
+  assert.notDeepEqual(sameSizeDifferentDigest, original);
+  assert.equal(sameSizeDifferentDigest.length, original.length);
+  digest.bodies.set(digestKey, sameSizeDifferentDigest);
+  result = await readCanonicalScopes({ ...digest, scopes: [scope('2026-09-15')] });
+  assert.equal(result.scopes[0].physical, undefined);
+  assert.ok(result.scopes[0].diagnostics.some(d => d.detail.includes('identity mismatch')));
+
+  const size = canonicalFixture(); const sizeKey = [...size.bodies.keys()].find(k => k.includes('/_aligned/') && k.includes('/range='));
+  size.bodies.set(sizeKey, Buffer.concat([size.bodies.get(sizeKey), Buffer.from('\n')]));
+  result = await readCanonicalScopes({ ...size, scopes: [scope('2026-09-15')] });
+  assert.equal(result.scopes[0].physical, undefined);
+  assert.ok(result.scopes[0].diagnostics.some(d => d.detail.includes('identity mismatch')));
+
+  const source = canonicalFixture(); repinAlignedShard(source, shard => { shard.canonical_source_manifest.sha256 = '0'.repeat(64); });
+  result = await readCanonicalScopes({ ...source, scopes: [scope('2026-09-15')] });
+  assert.equal(result.scopes[0].physical, undefined);
+  assert.ok(result.scopes[0].diagnostics.some(d => d.detail.includes('canonical pollutant source')));
+
+  const count = canonicalFixture(); repinAlignedShard(count, shard => { shard.timeseries[0].row_count++; });
+  result = await readCanonicalScopes({ ...count, scopes: [scope('2026-09-15')] });
+  assert.equal(result.scopes[0].physical, undefined);
+  assert.ok(result.scopes[0].diagnostics.some(d => d.detail.includes('row counts')));
+
+  const membership = canonicalFixture(); repinAlignedShard(membership, shard => { shard.timeseries[0].timeseries_id = 999; });
+  result = await readCanonicalScopes({ ...membership, scopes: [scope('2026-09-15')] });
+  assert.equal(result.scopes[0].physical, undefined);
+  assert.ok(result.scopes[0].diagnostics.some(d => d.detail.includes('membership')));
 });

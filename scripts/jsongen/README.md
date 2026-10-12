@@ -266,14 +266,27 @@ source/status/binding evidence and removals. No adapter claims to do so today.
 connector and pollutant, using existing shared validators and hash/alias rules.
 It distinguishes root-proven absence from failed or ambiguous metadata reads.
 It inspects actual index_v3 exact/scoped/leaf metadata and aligned source
-references, verification latest/manifest and physical binding metadata. It uses
+references, verification latest/manifest and physical binding metadata. It now
+reads the selected aligned shard itself and checks its exact key, byte size,
+SHA-256, canonical encoding, kind, source pollutant identity, range, timeseries
+membership, row counts, segment file references and physical file identities.
+The shared exact-leaf reader validates the leaf and its own segment coverage;
+it does not read the aligned shard. This bounded shard link check adapts the
+useful part of PR #95's `canonical.mjs`. Its v2 inspection fallback and positive
+`SUPERSEDED` claim from supplied root metadata were not adopted. It uses
 the caller's explicit canonical bucket and generation paths, not index_v3 latest
 as a parent or a guessed physical storage path. Every metadata GET is size and
 time bounded and its digest is rechecked before returning. `compareScopeMetadata`
 can say two inspected scope snapshots match or differ, including an independent
 scope; it cannot call a later snapshot an authenticated supersession without
 writer origin, final rows and complete coverage. The authority reader therefore
-sets `authority_complete: false` even for a consistent metadata read.
+sets `authority_complete: false` even for a consistent metadata read. The selected
+v3 generation, verified identity of the root bytes read, internally linked
+metadata, and an unchanged bounded reread are distinct facts. They do not prove
+that this root was the latest committed canonical authority or create a locked
+snapshot. Verification-overlay metadata does not authenticate bundle status
+values. Binding-prefix selection remains explicit and unresolved between the
+stable `_index_v2` contract and current v3 runtime routing.
 
 `reconcile.mjs` compares a bounded control snapshot, registered receipt references,
 explicit retained references and requested canonical scopes. It preserves evidence
@@ -295,10 +308,29 @@ and reads it back, and an explicitly invoked `recordReconciliationRequired` can
 record its reference via the existing CAS `record_failure` transition. There is
 no schedule, dispatcher, or automatic remote operation.
 
+`control-snapshot.mjs` captures exact original-byte control identity, while
+`report-validation.mjs` validates the version-1 reconciliation report before
+any immutable retention or control mutation. It checks fail-closed states,
+physical scopes, receipt references, registered/retained distinctions, canonical
+metadata state, logical hash metadata, PM/NO2 affected months, selected/desired/
+applied dependencies, resource counters and internally checkable links. Unknown
+or positive authenticated claims fail. A report remains diagnostic evidence;
+its SHA-256 and structural validity do not authenticate a writer or canonical
+currentness. `reconcileManagedInputs` can accept the exact `readManagedControl`
+result as `controlRead`; its raw body and digest are checked against the control
+being inspected. Without that result, the report marks its control hash as a
+`canonical_projection` and may be retained but cannot record a global failure.
+For an exact read, `recordReconciliationRequired` retains the immutable report,
+then supplies its control ID, revision, operation ID and original-byte SHA-256
+as a precondition to Stage 1 `record_failure`. That precondition is rechecked
+inside every CAS attempt. If control changed before or during recording, the
+report survives, no stale failure is applied, and the result is
+`stale_reconciliation_inspection` with `new_inspection_required: true`.
+
 The provisional per-operation admission bounds in `limits.mjs` are 1 MiB for a
 receipt, 8 MiB compressed and 32 MiB uncompressed per bundle, 8 MiB per NDJSON
 record, 128 scopes, 100,000 rows per bundle, 32 receipt references, 256 canonical
-metadata GETs of at most 8 MiB each, 64 MiB cumulative metadata bytes, 200,000
+metadata GETs of at most 8 MiB each, 64 MiB cumulative derived/metadata/decompressed bytes, 200,000
 cumulative rows, 4 MiB per report and 60 seconds. Bounded GET uses one attempt
 and a deadline; gzip output is capped before full materialisation. Exceeding a
 bound fails closed; operations must be explicitly partitioned. These are safety
@@ -313,8 +345,10 @@ policies before live use.
 Run `node --test --test-isolation=none tests/jsongen_stage2.test.mjs
 tests/r2_sigv4.test.mjs`, syntax checks and `git diff --check`. The narrow Stage 2
 tests exercise bounded byte identity, complete scope membership, absence rules,
-metadata comparisons, registration gaps, unavailable writer evidence and the
-disabled selector. They do not simulate a verified production writer.
+aligned-shard defects, metadata comparisons and drift, registration gaps,
+stale-control/CAS fencing, report rejection and ambiguous retention readback,
+unavailable writer evidence and the disabled selector. They do not simulate a
+verified production writer.
 
 Real TEST acceptance after separate deployment requires approved scoped credentials
 and conditional PUT/readback checks; retained final Prune and Integrity/SOS writer
