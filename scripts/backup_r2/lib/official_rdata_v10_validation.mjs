@@ -30,7 +30,7 @@ if (!is.data.frame(value) || anyDuplicated(names(value))) stop("v10 RData frame/
 safe <- function(values) {
   values <- as.character(values)
   values[is.na(values)] <- ""
-  if (any(grepl("[\\t\\r\\n]", values))) stop("v10 RData identity has control characters")
+  if (any(grepl("[[:cntrl:]]", values))) stop("v10 RData identity has control characters")
   values
 }
 if (identical(args[[1L]], "site")) {
