@@ -1,4 +1,55 @@
-# Managed JSONgen Stage 1 control and Stage 2 read-only evidence foundations
+# Managed JSONgen foundations and pending Prune source
+
+## Stage 3A pending Prune source (code only; default off)
+
+Selected-v3 Prune can retain its exact frozen connector-day NDJSON before
+canonical connector publication. `UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED`
+defaults to false and is locally targeted; it must be separately authorised
+and configured for TEST. The path reuses the existing dedicated
+`UK_AQ_COMPRESSED_CHART_R2_*` credentials through `managedR2Config()` and
+never uses canonical R2 credentials for private derived writes.
+
+The private bucket stores immutable gzip bytes at
+`managed/jsongen/v1/prune/pending/run_id=<UUID>/day_utc=<day>/connector_id=<id>/<SHA256>.ndjson.gz`
+and an immutable `descriptor.<SHA256>.json` alongside them. The descriptor
+records the Prune invocation, frozen connector/day source identity, compressed
+and original byte sizes and SHA-256 values. Conditional writes are read back
+byte for byte; an existing different object is rejected. Ambiguous writes are
+resolved by readback. A pending descriptor explicitly contains no final
+publication, gate completion or receipt. It is private source evidence, never
+a selectable or registered JSONgen change. There is no automatic expiration;
+pending objects remain for later reviewed recovery and lifecycle design.
+
+The pending source is prepared after original Prune prior-authority admission
+and before canonical connector publication. The local frozen file is still
+cleaned up at its existing connector verification/failure boundary. A process
+restart therefore preserves only successfully readback-retained private bytes.
+An interrupted upload can leave an orphan source object; its deterministic
+invocation/day/connector prefix and logged reference support later review.
+Missing credentials, oversized source (100,000 rows, 32 MiB original, 8 MiB
+gzip), a failed upload or ambiguous readback produce a warning and unavailable
+JSONgen handover. They cannot block canonical Prune or complete a deletion gate.
+
+**Verified Stage 3A receipt creation is blocked.** The frozen representation
+currently collapses source `status` into `verification_status`; the canonical
+source/content hash does not separately authenticate `source_status`. The
+Stage 1 receipt additionally requires independently meaningful before/after,
+binding, provenance, scope-completeness and retained-receipt authority
+references. Current Prune finalisation returns verified aggregate/index/latest
+control-flow evidence but does not retain a byte-pinned, complete
+source-to-final-publication proof across interruption. PostgreSQL gate-only
+recovery remains disabled by its own contract. This code therefore does not
+produce a bundle or receipt, promote `authenticateFinalPublication()`, mutate
+managed control, dispatch JSONgen, or select monthly publication. Stage 3B
+must define durable final writer evidence, gate-recovery ownership, missing
+registration detection and an outbox/inventory before complete coverage can
+be claimed. The existing `selectManagedPublications()` blocker remains.
+
+The v2 Prune path does not enter this handover. Before any TEST activation,
+perform a separately authorised controlled Prune run to verify dedicated
+bucket permission, conditional PUT/readback, byte and row limits, source
+cleanup, canonical finalisation, PostgreSQL gate behavior and restart review.
+No such operational acceptance is implied by local checks.
 
 This directory is an **inactive Node ESM library**, independent of the experimental
 `scripts/compressed_chart_history` publisher and its selector. There is no CLI,

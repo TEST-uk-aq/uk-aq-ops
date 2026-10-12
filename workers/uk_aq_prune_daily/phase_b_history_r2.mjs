@@ -10,6 +10,8 @@ import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
 import { randomUUID } from "node:crypto";
+import { managedR2Config } from "../../scripts/jsongen/control.mjs";
+import { retainPrunePendingSource } from "../../scripts/jsongen/prune-pending-source.mjs";
 import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import Cursor from "pg-cursor";
@@ -3962,6 +3964,7 @@ async function writeFrozenCandidateObservationsToV2({
   connectorPublisher = runtime.history_write_version === "v3" ? publishFrozenV3Observations : publishFrozenV2Observations,
   admitSnapshot = admitPruneFrozenConnectorSnapshot,
   cleanupFrozenSource = cleanupPhaseBTargetDaySourceTemp,
+  retainPendingSource = retainPrunePendingSource,
 }) {
   try {
     resolvePruneHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version });
@@ -4011,6 +4014,34 @@ async function writeFrozenCandidateObservationsToV2({
         duration_ms: Math.max(0, Date.now() - replayStartedAtMs),
       });
     }
+    let jsongenPendingSource = null;
+    if (emitV3Diagnostics && runtime.jsongen_pending_source?.enabled === true) {
+      try {
+        if (runtime.jsongen_pending_source.config_error) {
+          throw new Error(runtime.jsongen_pending_source.config_error);
+        }
+        jsongenPendingSource = await retainPendingSource({
+          r2: runtime.jsongen_pending_source.r2,
+          path: frozen.temp.ndjsonPath,
+          runId: runtime.run_id,
+          dayUtc: candidate.day_utc,
+          connectorId: candidate.connector_id,
+          expectedRowCount: rows.length,
+          sourceIdentity: frozen.sourceIdentity,
+        });
+        logPhaseB(runtime, "INFO", "phase_b_jsongen_pending_source_retained", {
+          run_id: runtime.run_id, day_utc: candidate.day_utc, connector_id: candidate.connector_id,
+          source: jsongenPendingSource.source, descriptor: jsongenPendingSource.descriptor,
+          eligibility: "pending_unverified",
+        });
+      } catch (error) {
+        logPhaseB(runtime, "WARNING", "phase_b_jsongen_pending_source_unavailable", {
+          run_id: runtime.run_id, day_utc: candidate.day_utc, connector_id: candidate.connector_id,
+          reason: error.code || "retention_failed", detail: error.message,
+          recoverable_reference: error.reference || null,
+        });
+      }
+    }
     assertBudget(runtime, "observation_connector_publication", {
       day_utc: candidate.day_utc, connector_id: candidate.connector_id,
       replayed_row_count: rows.length,
@@ -4032,6 +4063,7 @@ async function writeFrozenCandidateObservationsToV2({
       source_row_count: candidate.expected_row_count,
       frozen_source_temp: frozen.temp, frozen_source_counts: frozen.counts,
       source_identity: frozen.sourceIdentity,
+      ...(emitV3Diagnostics ? { jsongen_pending_source: jsongenPendingSource } : {}),
       observation_history_writer_generation: runtime.history_write_version,
       observation_history_index_generation: runtime.history_write_version,
     };
@@ -6413,9 +6445,20 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
     rpc_schema: String(env.UK_AQ_PUBLIC_SCHEMA || DEFAULT_RPC_SCHEMA).trim() || DEFAULT_RPC_SCHEMA,
     pm_context_rpc: String(env.UK_AQ_PHASE_B_PM_CONTEXT_RPC || DEFAULT_PHASE_B_PM_CONTEXT_RPC).trim(),
   };
+  const jsongenPendingSource = { enabled: historyWriteVersion === "v3" &&
+    parseBoolean(env.UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED, false) };
+  if (jsongenPendingSource.enabled) {
+    try {
+      jsongenPendingSource.r2 = managedR2Config(env);
+    } catch (error) {
+      // Missing derived credentials must never disable canonical Prune.
+      jsongenPendingSource.config_error = error.message;
+    }
+  }
 
   return {
     enabled: String(env.UK_AQ_R2_HISTORY_PHASE_B_ENABLED || "true").trim().toLowerCase() !== "false",
+    jsongen_pending_source: jsongenPendingSource,
     supabase_db_url: String(env.SUPABASE_DB_URL || "").trim(),
     r2: {
       endpoint: String(env.CFLARE_R2_ENDPOINT || env.R2_ENDPOINT || "").trim(),
