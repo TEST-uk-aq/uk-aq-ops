@@ -1,6 +1,7 @@
 // Explicitly invoked library only: no CLI, scheduling, canonical writes or dispatch.
 import { sha256Hex, r2PutObjectConditional } from '../../workers/shared/r2_sigv4.mjs';
-import { assertControl, canonicalJson, same, scopeKey, monthKey, ROOT, BUCKET } from './schema.mjs';
+import { assertControl, canonicalJson, inspectSourceGeneration, same, scopeKey, monthKey, ROOT, BUCKET } from './schema.mjs';
+import { getObservationHistoryGeneration } from '../../workers/shared/uk_aq_observation_history_generation.mjs';
 import { MAX_CONTROL_BYTES, updateManagedControl } from './control.mjs';
 import { readReceipt, readBundle, readImmutable, admitDerived } from './inputs.mjs';
 import { readCanonicalScopes } from './authority.mjs';
@@ -42,6 +43,8 @@ export async function reconcileManagedInputs({ derivedR2, control, controlRead =
     try {
       const receipt = await readReceipt({ r2: derivedR2, reference: ref, expected: entry?.[1].receipt, budget });
       change.change_id = receipt.change_id;
+      const sourceGeneration = inspectSourceGeneration(receipt.source, getObservationHistoryGeneration('v3'));
+      change.diagnostics.push({ code: sourceGeneration.state, detail: sourceGeneration.detail });
       const prior = ids.get(receipt.change_id);
       evidence(!prior || same(prior, ref), 'stable_change_identity_mismatch', 'change ID reused across retained receipts');
       const registeredEntry = control.registered_changes[receipt.change_id];
@@ -63,6 +66,8 @@ export async function reconcileManagedInputs({ derivedR2, control, controlRead =
       change.bundle_integrity = 'verified';
       change.logical_identities = bundle.logical;
       change.authentication = authenticateFinalPublication({ input: { receipt, receipt_object: ref, bundle }, writerKind: writerKinds[receipt.writer.identity] });
+      change.diagnostics.push({ code: 'writer_authentication_unavailable',
+        detail: 'Immutable bundle bytes do not authenticate the original final writer publication or effective status.' });
     } catch (error) {
       change.diagnostics.push({ code: error.status === 404 ? 'missing_retained_receipt' : error.code || 'invalid_receipt', detail: error.message });
     }

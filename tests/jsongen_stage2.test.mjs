@@ -11,14 +11,18 @@ import { buildTimeseriesBindingSourceRangeManifest, buildTimeseriesBindingSource
   timeseriesBindingSourceRootKey, timeseriesBindingSourceRangeManifestKey } from '../scripts/backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs';
 import { getObservationHistoryGeneration } from '../workers/shared/uk_aq_observation_history_generation.mjs';
 import { encodeObservationHistoryIndexV3Json } from '../workers/shared/uk_aq_observation_history_index_v3.mjs';
-import { buildObservationVerificationLatest, encodeObservationVerificationJson, OBSERVATION_VERIFICATION_LATEST_KEY } from '../workers/shared/uk_aq_observation_verification_overlay.mjs';
-import { ROOT, CONTROL_KEY, BUCKET, ALGORITHM, canonicalJson, affectedMonths, createControl, monthKey, scopeKey } from '../scripts/jsongen/schema.mjs';
+import { buildObservationVerificationLatest, buildObservationVerificationConnectorManifest,
+  observationVerificationConnectorManifestKey, encodeObservationVerificationJson,
+  OBSERVATION_VERIFICATION_LATEST_KEY } from '../workers/shared/uk_aq_observation_verification_overlay.mjs';
+import { ROOT, CONTROL_KEY, BUCKET, ALGORITHM, canonicalJson, affectedMonths, createControl,
+  inspectSourceGeneration, monthKey, scopeKey } from '../scripts/jsongen/schema.mjs';
 import { selectManagedPublications, readManagedControl, updateManagedControl } from '../scripts/jsongen/control.mjs';
 import { readWriterInput, readBundle } from '../scripts/jsongen/inputs.mjs';
-import { readCanonicalScopes, compareScopeMetadata } from '../scripts/jsongen/authority.mjs';
+import { readCanonicalScopes, compareScopeMetadata, selectVerificationStatusAuthority } from '../scripts/jsongen/authority.mjs';
 import { authenticateFinalPublication } from '../scripts/jsongen/writer-authentication.mjs';
 import { reconcileManagedInputs, reconciliationArtifact, retainReconciliationReport, recordReconciliationRequired } from '../scripts/jsongen/reconcile.mjs';
 import { createBudget } from '../scripts/jsongen/limits.mjs';
+import { assertReconciliationReport } from '../scripts/jsongen/report-validation.mjs';
 
 const identity = { connector_id: 1, timeseries_id: 212, station_id: 42, pollutant_code: 'pm25' };
 const V3 = getObservationHistoryGeneration('v3');
@@ -72,7 +76,7 @@ function register(control, fixture) {
 }
 // Tiny canonical metadata is produced by the real shared builders. This is not
 // a simulated production writer handover; writer authentication always fails.
-function canonicalFixture(days = ['2026-09-15'], value = 1, conflictingAliases = false) {
+function canonicalFixture(days = ['2026-09-15'], value = 1, conflictingAliases = false, bindingSchema = 1) {
   const storage = store('canonical-test'); const b = storage.bodies;
   const put = (key, payload) => b.set(key, Buffer.from(JSON.stringify(payload)));
   const dayManifests = [];
@@ -95,7 +99,14 @@ function canonicalFixture(days = ['2026-09-15'], value = 1, conflictingAliases =
   const yearKey = `${basePrefix}/_manifests/year=2026/manifest.json`; put(yearKey, year);
   put(V3.observations_root_key, buildR2HistoryV2ObservationsRootManifest({ basePrefix, yearManifests: [{ ...year, manifest_key: yearKey }] }));
   const bindingKey = `${bindingPrefix}/timeseries_id=212.json`;
-  put(bindingKey, { ...identity, schema_version: 1, history_version: 'v2', index_kind: 'timeseries_binding' });
+  const continuity = bindingSchema === 2 ? { schema_version: 1, source: 'sos_station_timeseries_site_refs',
+    continuity_key: '1:UKA00001:pm25', site_ref: 'UKA00001', uk_air_ref: 'UKA00001', pollutant_code: 'pm25',
+    members: [{ station_id: 42, station_ref: 'old', timeseries_id: 212, timeseries_ref: 'old',
+      valid_from_day_utc: '2020-01-01', valid_to_day_utc: '2022-12-31' },
+    { station_id: 43, station_ref: 'new', timeseries_id: 213, timeseries_ref: 'new',
+      valid_from_day_utc: '2023-01-01', valid_to_day_utc: null }] } : null;
+  put(bindingKey, { ...identity, schema_version: bindingSchema, history_version: 'v2', index_kind: 'timeseries_binding',
+    ...(continuity ? { continuity } : {}) });
   const bytes = b.get(bindingKey);
   const range = buildTimeseriesBindingSourceRangeManifest({ bindingPrefix, rangeStart: 0, rangeEnd: 999,
     units: [{ timeseries_id: 212, relative_path: bindingKey, size: bytes.length, sha256: sha256Hex(bytes), r2_md5: null }] });
@@ -104,6 +115,19 @@ function canonicalFixture(days = ['2026-09-15'], value = 1, conflictingAliases =
     ranges: [{ range_start: 0, range_end: 999, manifest_key: rangeKey, source_range_hash: range.source_range_hash, unit_count: 1 }] }));
   b.set(OBSERVATION_VERIFICATION_LATEST_KEY, Buffer.from(encodeObservationVerificationJson(buildObservationVerificationLatest())));
   return { ...storage, generation: V3, bindingPrefix };
+}
+function selectOverlay(c, { status = 'R', omitManifest = false } = {}) {
+  const manifest = buildObservationVerificationConnectorManifest({ connectorId: 1,
+    semanticSourceIdentity: { fixture: 'accepted-source' },
+    timeseries: [{ ...identity, source_verification_model: 'per-observation-status-v1',
+      semantic_source_provenance: { fixture: 'accepted-source' }, default_status: status, periods: [] }] });
+  const body = Buffer.from(encodeObservationVerificationJson(manifest));
+  const key = observationVerificationConnectorManifestKey(1, sha256Hex(body));
+  if (!omitManifest) c.bodies.set(key, body);
+  c.bodies.set(OBSERVATION_VERIFICATION_LATEST_KEY, Buffer.from(encodeObservationVerificationJson(
+    buildObservationVerificationLatest({ connectorManifests: [{ connector_id: 1, key,
+      byte_size: body.length, sha256: sha256Hex(body) }] }))));
+  return key;
 }
 function controlStore() {
   const s = store(); const control = createControl();
@@ -155,6 +179,18 @@ function repinAlignedShard(c, changeShard) {
   Object.assign(exact.source_aligned_scoped_manifest, { sha256: alignedRef.sha256, byte_size: alignedRef.byte_size });
   put(exactKey, exact);
   return shardKey;
+}
+function repinBinding(c, changeBinding) {
+  const b = c.bodies; const bindingKey = `${bindingPrefix}/timeseries_id=212.json`;
+  const binding = JSON.parse(b.get(bindingKey)); changeBinding(binding);
+  const bytes = Buffer.from(JSON.stringify(binding)); b.set(bindingKey, bytes);
+  const range = buildTimeseriesBindingSourceRangeManifest({ bindingPrefix, rangeStart: 0, rangeEnd: 999,
+    units: [{ timeseries_id: 212, relative_path: bindingKey, size: bytes.length, sha256: sha256Hex(bytes), r2_md5: null }] });
+  const rangeKey = timeseriesBindingSourceRangeManifestKey(bindingPrefix, 0, 999);
+  b.set(rangeKey, Buffer.from(JSON.stringify(range)));
+  b.set(timeseriesBindingSourceRootKey(bindingPrefix), Buffer.from(JSON.stringify(
+    buildTimeseriesBindingSourceRootManifest({ bindingPrefix, ranges: [{ range_start: 0, range_end: 999,
+      manifest_key: rangeKey, source_range_hash: range.source_range_hash, unit_count: 1 }] }))));
 }
 
 test('receipt and gzip identities preserve precision, timestamps, duplicates and statuses, without authenticating writer', async () => {
@@ -215,18 +251,209 @@ test('root-to-exact metadata and binding are inspected without Parquet or observ
   assert.equal(c.gets.includes(V3.observations_timeseries_latest_key), false);
 });
 
+test('selected complete-v3 source namespaces are distinct from immutable receipt and writer proof', () => {
+  const source = structuredClone(inputFixture().receipt.source);
+  const key = (path) => ({ ...declared, key: path });
+  source.generation_authority = key(`${V3.observations_runs_prefix}/run/final.json`);
+  source.observations_root = key(V3.observations_root_key);
+  source.index_authority = key(`${V3.observations_timeseries_index_prefix}/day_utc=2026-09-15/manifest.json`);
+  source.final_publication = key(`${V3.observations_runs_prefix}/run/verified.json`);
+  source.verification_authority = key(OBSERVATION_VERIFICATION_LATEST_KEY);
+  source.binding_authority = key(timeseriesBindingSourceRootKey(bindingPrefix));
+  assert.equal(inspectSourceGeneration(source, V3).state, 'selected_v3_source_namespace_consistent');
+  assert.equal(inspectSourceGeneration({ ...source, observations_root: key('history/v2/observations/_manifests/manifest.json') }, V3).state,
+    'selected_v3_source_generation_mismatch');
+  assert.equal(inspectSourceGeneration({ ...source, binding_authority: key('history/_index_v2/timeseries_binding/_manifests/root.json') }, V3).state,
+    'selected_v3_source_generation_mismatch');
+  assert.equal(inspectSourceGeneration(inputFixture().receipt.source, V3).state,
+    'selected_v3_source_generation_mismatch');
+  assert.equal(inspectSourceGeneration({ ...source, binding_authority: { ...source.binding_authority,
+    bucket: 'another-canonical-bucket' } }, V3).state, 'selected_v3_source_generation_mismatch');
+});
+
+test('selected-v3 binding rejects v2 prefix but keeps logical v2 schema-1 and schema-2 payloads', async () => {
+  for (const schema of [1, 2]) {
+    const c = canonicalFixture(['2026-09-15'], 1, false, schema);
+    const result = await readCanonicalScopes({ ...c, bindingPrefix: null, scopes: [scope('2026-09-15')],
+      acceptedVerificationModes: { 1: 'pre_overlay_accepted' } });
+    assert.equal(result.binding_prefix, bindingPrefix);
+    assert.equal(result.scopes[0].diagnostics.length, 0);
+    assert.equal(result.scopes[0].physical.physical_identity.history_schema_version, 3);
+    assert.equal(result.scopes[0].verification.state, 'embedded_status_requires_writer_evidence');
+  }
+  await assert.rejects(readCanonicalScopes({ ...canonicalFixture(),
+    bindingPrefix: 'history/_index_v2/timeseries_binding', scopes: [scope('2026-09-15')] }),
+  error => error.code === 'incorrect_binding_prefix_generation');
+});
+
+test('schema-2 continuity accepts sorted inclusive intervals, gaps, and nullable site reference', async () => {
+  for (const change of [() => {}, c => { c.members[1].valid_from_day_utc = '2023-01-02'; },
+    c => { c.site_ref = null; },
+    c => { c.members[0].valid_from_day_utc = '2020-02-29'; }]) {
+    const f = canonicalFixture(['2026-09-15'], 1, false, 2);
+    repinBinding(f, b => change(b.continuity));
+    const bindingBytes = Buffer.from(f.bodies.get(`${bindingPrefix}/timeseries_id=212.json`));
+    const result = await readCanonicalScopes({ ...f, scopes: [scope('2026-09-15')],
+      acceptedVerificationModes: { 1: 'pre_overlay_accepted' } });
+    assert.deepEqual(result.scopes[0].diagnostics, []);
+    assert.ok(result.scopes[0].binding);
+    assert.deepEqual(f.bodies.get(`${bindingPrefix}/timeseries_id=212.json`), bindingBytes);
+    assert.equal(JSON.parse(f.bodies.get(`${bindingPrefix}/timeseries_id=212.json`)).history_version, 'v2');
+  }
+});
+
+test('schema-2 continuity rejects contradictory physical families', async t => {
+  const invalid = [
+    ['member order', c => c.members.reverse()],
+    ['closed overlap', c => { c.members[0].valid_to_day_utc = '2023-01-01'; }],
+    ['two open members', c => { c.members[0].valid_to_day_utc = null; }],
+    ['invalid calendar day', c => { c.members[0].valid_from_day_utc = '2020-02-30'; }],
+    ['invalid end calendar day', c => { c.members[0].valid_to_day_utc = '2022-02-30'; }],
+    ['reversed interval', c => { c.members[0].valid_to_day_utc = '2019-12-31'; }],
+    ['duplicate physical ID', c => { c.members[1].timeseries_id = 212; }],
+    ['missing top-level member', c => { c.members[0].timeseries_id = 214; }],
+    ['wrong top-level station', c => { c.members[0].station_id = 99; }],
+    ['invalid member station', c => { c.members[1].station_id = 0; }],
+    ['wrong continuity key', c => { c.continuity_key = '9:UKA00001:pm25'; }],
+    ['nonstable station reference', c => { c.members[1].station_ref = { id: 'new' }; }],
+    ['nonstable timeseries reference', c => { c.members[1].timeseries_ref = ['new']; }],
+  ];
+  for (const [name, change] of invalid) await t.test(name, async () => {
+    const f = canonicalFixture(['2026-09-15'], 1, false, 2);
+    repinBinding(f, b => change(b.continuity));
+    const result = await readCanonicalScopes({ ...f, scopes: [scope('2026-09-15')],
+      acceptedVerificationModes: { 1: 'pre_overlay_accepted' } });
+    assert.equal(result.scopes[0].binding, undefined);
+    assert.ok(result.scopes[0].diagnostics.some(d => d.code === 'invalid_binding_authority'));
+  });
+});
+
+test('connector-selected overlay supersedes schema-3 embedded status only with accepted transition evidence', async () => {
+  const c = canonicalFixture(); selectOverlay(c, { status: 'R' });
+  const selected = await readCanonicalScopes({ ...c, scopes: [scope('2026-09-15')],
+    acceptedVerificationModes: { 1: 'overlay_accepted' } });
+  assert.equal(row('2026-09-15').verification_status, 'P');
+  assert.equal(selected.scopes[0].verification.state, 'overlay_metadata_verified');
+  assert.equal(selected.scopes[0].verification.entry.default_status, 'R');
+  assert.equal(selected.scopes[0].diagnostics.length, 0);
+  const unaccepted = await readCanonicalScopes({ ...c, scopes: [scope('2026-09-15')] });
+  assert.equal(unaccepted.scopes[0].verification.state, 'overlay_authoritative_connector_unresolved');
+  const contradictory = await readCanonicalScopes({ ...c, scopes: [scope('2026-09-15')],
+    acceptedVerificationModes: { 1: 'pre_overlay_accepted' } });
+  assert.ok(contradictory.scopes[0].diagnostics.some(d => d.code === 'invalid_verification_authority'));
+});
+
+test('unknown and failed overlay selection never invent embedded or null schema-4 status', async () => {
+  const schema3 = { history_schema_version: 3, writer_version: 'parquet-wasm-zstd-v3' };
+  const schema4 = { history_schema_version: 4, writer_version: 'parquet-wasm-zstd-v4' };
+  assert.equal(selectVerificationStatusAuthority({ physicalIdentity: schema3, acceptedMode: 'pre_overlay_accepted' }),
+    'embedded_status_requires_writer_evidence');
+  assert.equal(selectVerificationStatusAuthority({ physicalIdentity: schema3, acceptedMode: 'overlay_accepted', selectedOverlay: true }),
+    'overlay_metadata_verified');
+  assert.equal(selectVerificationStatusAuthority({ physicalIdentity: schema4 }), 'overlay_authoritative_connector_unresolved');
+  assert.equal(selectVerificationStatusAuthority({ physicalIdentity: schema4, acceptedMode: 'overlay_accepted' }),
+    'overlay_authoritative_connector_unresolved');
+  assert.equal(selectVerificationStatusAuthority({ physicalIdentity: schema4, acceptedMode: 'overlay_accepted', selectedOverlay: true }),
+    'overlay_metadata_verified');
+  assert.equal(selectVerificationStatusAuthority({ physicalIdentity: schema3 }), 'unknown_verification_transition_state');
+  const c = canonicalFixture(); c.bodies.delete(OBSERVATION_VERIFICATION_LATEST_KEY);
+  const unknown = await readCanonicalScopes({ ...c, scopes: [scope('2026-09-15')] });
+  assert.equal(unknown.scopes[0].verification.state, 'unknown_verification_transition_state');
+  assert.ok(unknown.scopes[0].diagnostics.some(d => d.code === 'verification_metadata_unavailable'));
+  const known = await readCanonicalScopes({ ...c, scopes: [scope('2026-09-15')],
+    acceptedVerificationModes: { 1: 'pre_overlay_accepted' } });
+  assert.equal(known.scopes[0].verification.state, 'embedded_status_requires_writer_evidence');
+  const activated = await readCanonicalScopes({ ...c, scopes: [scope('2026-09-15')],
+    acceptedVerificationModes: { 1: 'overlay_accepted' } });
+  assert.equal(activated.scopes[0].verification.state, 'overlay_authoritative_connector_unresolved');
+  selectOverlay(c, { omitManifest: true });
+  const missing = await readCanonicalScopes({ ...c, scopes: [scope('2026-09-15')],
+    acceptedVerificationModes: { 1: 'overlay_accepted' } });
+  assert.equal(missing.scopes[0].verification.state, 'overlay_authoritative_connector_unresolved');
+  c.bodies.set(OBSERVATION_VERIFICATION_LATEST_KEY, Buffer.from('{}'));
+  const malformed = await readCanonicalScopes({ ...c, scopes: [scope('2026-09-15')],
+    acceptedVerificationModes: { 1: 'overlay_accepted' } });
+  assert.equal(malformed.scopes[0].verification.state, 'overlay_authoritative_connector_unresolved');
+  assert.ok(malformed.scopes[0].diagnostics.length);
+  const drift = canonicalFixture(); selectOverlay(drift);
+  const get = drift.r2.adapter.getObjectBounded; let latestReads = 0;
+  drift.r2.adapter.getObjectBounded = async args => {
+    if (args.key === OBSERVATION_VERIFICATION_LATEST_KEY && ++latestReads === 2)
+      drift.bodies.set(args.key, Buffer.from('{}'));
+    return get(args);
+  };
+  const changed = await readCanonicalScopes({ ...drift, scopes: [scope('2026-09-15')],
+    acceptedVerificationModes: { 1: 'overlay_accepted' } });
+  assert.equal(changed.read_consistent, false);
+  assert.equal(changed.diagnostics[0].code, 'canonical_metadata_changed_during_read');
+});
+
 test('only complete parent membership proves absence; a referenced 404 and contradictory aliases fail closed', async () => {
   const c = canonicalFixture();
-  let result = await readCanonicalScopes({ ...c, scopes: [scope('2026-09-16', 0)] });
+  let result = await readCanonicalScopes({ ...c, scopes: [scope('2026-09-16', 0)],
+    acceptedVerificationModes: { 1: 'overlay_accepted' } });
   assert.equal(result.scopes[0].physical.membership, 'authoritative_absent');
+  assert.equal(result.scopes[0].verification.state, 'not_applicable_to_absent_scope');
+  assert.ok(result.scopes[0].binding);
+  assert.deepEqual(result.scopes[0].diagnostics, []);
+  assert.equal(c.gets.includes(OBSERVATION_VERIFICATION_LATEST_KEY), false);
   c.bodies.delete(`${V3.observations_prefix}/day_utc=2026-09-15/manifest.json`);
   result = await readCanonicalScopes({ ...c, scopes: [scope('2026-09-15')] });
   assert.equal(result.scopes[0].physical, undefined);
-  assert.ok(result.scopes[0].diagnostics.length);
+  assert.ok(result.scopes[0].diagnostics.some(d => d.code === 'canonical_metadata_unavailable'));
   const d = canonicalFixture(['2026-09-15'], 1, true);
   result = await readCanonicalScopes({ ...d, scopes: [scope('2026-09-15')] });
   assert.equal(result.scopes[0].physical, undefined);
   assert.ok(result.scopes[0].diagnostics.some(d => d.detail.includes('contradictory complete child aliases')));
+  const e = canonicalFixture();
+  const exactKey = [...e.bodies.keys()].find(key => key.startsWith(V3.observations_timeseries_index_prefix)
+    && key.endsWith('/manifest.json') && !key.includes('/_aligned/'));
+  const exact = JSON.parse(e.bodies.get(exactKey)); exact.leaves_by_timeseries_id = {};
+  e.bodies.set(exactKey, Buffer.from(encodeObservationHistoryIndexV3Json(exact)));
+  result = await readCanonicalScopes({ ...e, scopes: [scope('2026-09-15')] });
+  assert.notEqual(result.scopes[0].physical?.membership, 'authoritative_absent');
+  assert.ok(result.scopes[0].diagnostics.length);
+});
+
+test('root-proven absence keeps independent binding contradictions and never authenticates writer removal', async () => {
+  const f = inputFixture({ days: ['2026-09-16'], empty: true });
+  const control = createControl(); register(control, f);
+  const c = canonicalFixture(); repinBinding(c, b => { b.station_id = 99; });
+  const report = await reconcileManagedInputs({ derivedR2: f.r2, control, canonical: c });
+  assert.equal(report.canonical.scopes[0].physical.membership, 'authoritative_absent');
+  assert.equal(report.canonical.scopes[0].verification.state, 'not_applicable_to_absent_scope');
+  assert.ok(report.canonical.scopes[0].diagnostics.some(d => d.code === 'invalid_binding_authority'));
+  assert.equal(report.changes[0].scopes[0].empty_replacement,
+    'current_absence_proven_original_writer_absence_unproven');
+  assert.equal(report.changes[0].scopes[0].authenticated_supersession, 'unproven');
+  assert.equal(report.changes[0].authentication.authenticated, false);
+  assert.equal(report.complete_change_coverage, false);
+});
+
+test('report accepts absence-only verification and rejects absent status or present not-applicable claims', async () => {
+  const f = canonicalFixture(); const derived = store();
+  const report = structuredClone(await reconcileManagedInputs({ derivedR2: derived.r2,
+    control: createControl(), canonical: f, requestedScopes: [scope('2026-09-16', 0)] }));
+  assertReconciliationReport(report);
+  const present = structuredClone(report);
+  present.canonical.scopes[0].physical = { membership: 'present', row_count: 2,
+    physical_identity: { history_schema_version: 3, writer_version: 'parquet-wasm-zstd-v3', physical_layout_version: 'timeseries-aligned-v2' } };
+  assert.throws(() => assertReconciliationReport(present));
+  for (const state of ['embedded_status_requires_writer_evidence', 'overlay_metadata_verified']) {
+    const absent = structuredClone(report); absent.canonical.scopes[0].verification = { state };
+    assert.throws(() => assertReconciliationReport(absent));
+  }
+  const selected = canonicalFixture(); selectOverlay(selected);
+  const selectedInspection = await readCanonicalScopes({ ...selected, scopes: [scope('2026-09-15')],
+    acceptedVerificationModes: { 1: 'overlay_accepted' } });
+  const selectedOnAbsent = structuredClone(report);
+  selectedOnAbsent.canonical.scopes[0].verification = selectedInspection.scopes[0].verification;
+  assert.throws(() => assertReconciliationReport(selectedOnAbsent));
+  const historical = structuredClone(report);
+  historical.canonical.scopes[0].verification = { state: 'unknown_verification_transition_state' };
+  historical.canonical.scopes[0].diagnostics.push({ code: 'unknown_verification_transition_state',
+    detail: 'physical schema identity is unavailable' });
+  assertReconciliationReport(historical);
 });
 
 test('per-scope drift keeps independent days and mixed receipts distinct; does not assert authenticated supersession', async () => {
@@ -249,6 +476,9 @@ test('reconciliation preserves delayed/independent changes and PM months, detect
   assert.equal(report.complete_change_coverage, false); assert.equal(report.freshness, 'unknown');
   assert.equal(report.changes.find(c => c.change_id === 'A').scopes.length, 2);
   assert.ok(report.changes.every(c => c.state === 'reconciliation_required'));
+  assert.ok(report.changes.find(c => c.change_id === 'A').diagnostics.some(d =>
+    d.code === 'selected_v3_source_generation_mismatch'));
+  assert.equal(report.changes.find(c => c.change_id === 'A').authentication.authenticated, false);
   assert.ok(report.changes.find(c => c.change_id === 'C').diagnostics.some(d => d.code === 'retained_receipt_missing_registration'));
   assert.deepEqual(report.months.find(m => m.month_key.endsWith('2026-10')).desired_change_ids, ['A']);
   assert.deepEqual(report.months.find(m => m.month_key.endsWith('2026-09')).desired_change_ids, ['A', 'B']);
@@ -258,6 +488,26 @@ test('reconciliation preserves delayed/independent changes and PM months, detect
   const missing = await reconcileManagedInputs({ derivedR2: a.r2, control, canonical: canonicalFixture() });
   assert.ok(missing.changes.find(c => c.change_id === 'A').diagnostics.some(d => d.code === 'missing_retained_bundle'));
   assert.equal(reconciliationArtifact(report).reference.key.startsWith(`${ROOT}/evidence/`), true);
+});
+
+test('report accepts independent scoped schema identities and unresolved status, rejects false embedded/authenticated claims', async () => {
+  const derived = store(); const report = structuredClone(await reconcileManagedInputs({ derivedR2: derived.r2,
+    control: createControl(), canonical: canonicalFixture(['2026-09-15', '2026-09-16']),
+    requestedScopes: [scope('2026-09-15'), scope('2026-09-16')] }));
+  assert.deepEqual(report.canonical.scopes.map(s => s.physical.physical_identity.history_schema_version), [3, 3]);
+  report.canonical.scopes[1].physical.physical_identity = {
+    history_schema_version: 4, writer_version: 'parquet-wasm-zstd-v4', physical_layout_version: 'timeseries-aligned-v2' };
+  report.canonical.scopes[1].verification = { state: 'overlay_authoritative_connector_unresolved' };
+  assertReconciliationReport(report);
+  const wrongPrefix = structuredClone(report);
+  wrongPrefix.canonical.binding_prefix = 'history/_index_v2/timeseries_binding';
+  assert.throws(() => assertReconciliationReport(wrongPrefix));
+  const falseEmbedded = structuredClone(report);
+  falseEmbedded.canonical.scopes[1].verification = { state: 'embedded_status_requires_writer_evidence' };
+  assert.throws(() => assertReconciliationReport(falseEmbedded));
+  const falseAuth = structuredClone(report);
+  falseAuth.canonical.authority_complete = true;
+  assert.throws(() => assertReconciliationReport(falseAuth));
 });
 
 test('immutable reconciliation retention resolves duplicate/ambiguous PUT by exact readback', async () => {

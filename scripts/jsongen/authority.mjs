@@ -2,7 +2,7 @@
 // used as current authority. This does not authenticate historical writer output.
 import { r2GetObjectBounded, sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
 import { classifyManifestFileIdentity } from '../../workers/shared/uk_aq_r2_file_identity.mjs';
-import { assertObservationHistoryGeneration } from '../../workers/shared/uk_aq_observation_history_generation.mjs';
+import { assertObservationHistoryGeneration, getObservationHistoryGeneration } from '../../workers/shared/uk_aq_observation_history_generation.mjs';
 import { validateR2HistoryV2ObservationsAggregateManifest, OBSERVATIONS_AGGREGATE_MANIFEST_KINDS } from '../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs';
 import { validateCanonicalHistoryV2Manifest } from '../../workers/shared/uk_aq_r2_history_manifest_validation.mjs';
 import { assertV2ObservationsChildManifest } from '../backup_r2/lib/uk_aq_v2_observations_manifest_validation.mjs';
@@ -20,6 +20,48 @@ import { createBudget, evidence, parseJson, freeze } from './limits.mjs';
 
 const sha = /^[a-f0-9]{64}$/;
 const descriptor = (bucket, key, body) => ({ bucket, key, byte_size: body.length, sha256: sha256Hex(body) });
+const validUtcDay = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)
+  && Number.isFinite(Date.parse(`${value}T00:00:00.000Z`))
+  && new Date(`${value}T00:00:00.000Z`).toISOString().slice(0, 10) === value;
+function validContinuity(continuity, identity) {
+  const c = continuity;
+  if (!c || typeof c !== 'object' || Array.isArray(c)
+    || c.schema_version !== 1 || c.source !== 'sos_station_timeseries_site_refs'
+    || typeof c.uk_air_ref !== 'string' || !c.uk_air_ref.trim()
+    || !(c.site_ref === null || (typeof c.site_ref === 'string' && c.site_ref.trim()))
+    || c.pollutant_code !== identity.pollutant_code
+    || c.continuity_key !== `${identity.connector_id}:${c.uk_air_ref}:${identity.pollutant_code}`
+    || !Array.isArray(c.members) || c.members.length < 2) return false;
+  const allowed = ['schema_version', 'source', 'continuity_key', 'site_ref', 'uk_air_ref', 'pollutant_code', 'members'];
+  if (Object.keys(c).some(key => !allowed.includes(key))) return false;
+  const ids = new Set(); let topLevelCount = 0; let openEndedCount = 0; let previous = null;
+  for (const member of c.members) {
+    if (!member || typeof member !== 'object' || Array.isArray(member)
+      || Object.keys(member).some(key => !['station_id', 'station_ref', 'timeseries_id', 'timeseries_ref',
+        'valid_from_day_utc', 'valid_to_day_utc'].includes(key))
+      || !Number.isSafeInteger(member.station_id) || member.station_id <= 0
+      || !Number.isSafeInteger(member.timeseries_id) || member.timeseries_id <= 0
+      || ![member.station_ref, member.timeseries_ref].every(ref => ref === undefined || ref === null
+        || (typeof ref === 'string' && ref.trim().length > 0))
+      || !validUtcDay(member.valid_from_day_utc)
+      || !(member.valid_to_day_utc === null || validUtcDay(member.valid_to_day_utc))
+      || (member.valid_to_day_utc !== null && member.valid_to_day_utc < member.valid_from_day_utc)
+      || ids.has(member.timeseries_id)) return false;
+    ids.add(member.timeseries_id);
+    if (member.timeseries_id === identity.timeseries_id) {
+      topLevelCount++;
+      if (member.station_id !== identity.station_id) return false;
+    }
+    if (member.valid_to_day_utc === null) openEndedCount++;
+    if (previous && (previous.valid_from_day_utc > member.valid_from_day_utc
+      || (previous.valid_from_day_utc === member.valid_from_day_utc
+        && previous.timeseries_id >= member.timeseries_id)
+      || previous.valid_to_day_utc === null
+      || member.valid_from_day_utc <= previous.valid_to_day_utc)) return false;
+    previous = member;
+  }
+  return topLevelCount === 1 && openEndedCount <= 1;
+}
 function child(parent, fields, parentKey, expectedKey, kind) {
   const lists = fields.map(field => {
     evidence(Array.isArray(parent[field]), 'invalid_canonical_metadata', `missing complete ${field}: ${parentKey}`);
@@ -42,11 +84,39 @@ function canonicalIndex(object) {
   evidence(Buffer.from(encodeObservationHistoryIndexV3Json(object.value)).equals(object.body),
     'invalid_canonical_metadata', 'index object is not canonical JSON');
 }
+// The caller may supply only independently accepted connector transition modes.
+// A selected pointer without that acceptance remains diagnostic metadata.
+export function selectVerificationStatusAuthority({ physicalIdentity, acceptedMode = null, selectedOverlay = false }) {
+  const schema = physicalIdentity?.history_schema_version;
+  evidence([3, 4].includes(schema)
+    && physicalIdentity.writer_version === `parquet-wasm-zstd-v${schema}`,
+  'unknown_verification_transition_state', 'verified scoped physical schema/writer identity required');
+  evidence(acceptedMode === null || ['pre_overlay_accepted', 'overlay_accepted'].includes(acceptedMode),
+    'invalid_verification_configuration', 'invalid accepted connector transition mode');
+  if (acceptedMode === 'pre_overlay_accepted') {
+    evidence(!selectedOverlay, 'invalid_verification_authority', 'pre-overlay mode contradicts selected overlay');
+    return schema === 3 ? 'embedded_status_requires_writer_evidence' : 'overlay_authoritative_connector_unresolved';
+  }
+  if (acceptedMode === 'overlay_accepted')
+    return selectedOverlay ? 'overlay_metadata_verified' : 'overlay_authoritative_connector_unresolved';
+  return selectedOverlay || schema === 4
+    ? 'overlay_authoritative_connector_unresolved' : 'unknown_verification_transition_state';
+}
 
-export async function readCanonicalScopes({ r2, generation, bindingPrefix = null, scopes, budget = createBudget() }) {
+export async function readCanonicalScopes({ r2, generation, bindingPrefix = null, scopes,
+  acceptedVerificationModes = null, budget = createBudget() }) {
   assertObservationHistoryGeneration(generation);
-  evidence(generation.version === 'v3' && r2?.bucket && r2.bucket !== BUCKET,
+  evidence(generation === getObservationHistoryGeneration('v3') && r2?.bucket && r2.bucket !== BUCKET,
     'invalid_canonical_configuration', 'explicit canonical v3 generation and separate canonical bucket required');
+  bindingPrefix ??= generation.timeseries_binding_index_prefix;
+  evidence(bindingPrefix === generation.timeseries_binding_index_prefix,
+    'incorrect_binding_prefix_generation', 'selected v3 requires its own physical binding namespace');
+  // A mode is supplied only by a separately accepted runtime transition source.
+  // This inactive inspector cannot infer acceptance from pointer presence or 404.
+  evidence(acceptedVerificationModes === null || (typeof acceptedVerificationModes === 'object'
+    && !Array.isArray(acceptedVerificationModes) && Object.entries(acceptedVerificationModes).every(([id, mode]) =>
+      /^[1-9]\d*$/.test(id) && ['pre_overlay_accepted', 'overlay_accepted'].includes(mode))),
+  'invalid_verification_configuration', 'accepted connector modes are invalid');
   evidence(Array.isArray(scopes) && scopes.length > 0 && scopes.length <= budget.limits.scopes,
     'resource_limit', 'canonical scope budget exceeded');
   scopes = structuredClone(scopes); scopes.forEach(assertScope);
@@ -199,12 +269,19 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
       evidence(canonical && canonical.bytes === file.byte_size && fileIdentity.type === 'sha256' && fileIdentity.value === file.sha256,
         'invalid_canonical_metadata', 'exact file not pinned by canonical pollutant');
     }
+    const physicalIdentity = Object.fromEntries(['history_schema_version', 'writer_version',
+      'physical_layout_version'].map(field => [field, manifest.value[field]]));
+    evidence([3, 4].includes(physicalIdentity.history_schema_version)
+      && physicalIdentity.writer_version === `parquet-wasm-zstd-v${physicalIdentity.history_schema_version}`
+      && physicalIdentity.physical_layout_version === OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION
+      && [aligned.value, leaf.value, payload].every(value =>
+        Object.entries(physicalIdentity).every(([field, expected]) => value[field] === expected)),
+    'invalid_canonical_metadata', 'scoped physical schema/writer identity is contradictory');
     return { membership: 'present', row_count: metadata.rows[0].row_count,
+      physical_identity: physicalIdentity,
       index: manifest.reference, leaf: leaf.reference, aligned_shard: shard.reference };
   };
   const binding = async identity => {
-    evidence(['history/_index_v2/timeseries_binding', generation.timeseries_binding_index_prefix].includes(bindingPrefix),
-      'binding_authority_unresolved', 'explicit accepted binding-prefix selection required; documentation/runtime routing differs');
     const root = validateTimeseriesBindingSourceRootManifest((await read(timeseriesBindingSourceRootKey(bindingPrefix))).value);
     evidence(root.source_prefix === bindingPrefix, 'invalid_binding_authority', 'wrong binding root');
     const rangeRef = root.ranges.find(r => r.range_start <= identity.timeseries_id && r.range_end >= identity.timeseries_id);
@@ -219,21 +296,46 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
     const value = object.value;
     evidence([1, 2].includes(value.schema_version) && value.history_version === 'v2' && value.index_kind === 'timeseries_binding'
       && Object.entries(identity).every(([k, v]) => value[k] === v), 'invalid_binding_authority', 'physical binding identity mismatch');
+    if (value.schema_version === 1) evidence(!Object.hasOwn(value, 'continuity'),
+      'invalid_binding_authority', 'schema-1 binding cannot carry continuity');
+    if (value.schema_version === 2) evidence(validContinuity(value.continuity, identity),
+      'invalid_binding_authority', 'schema-2 continuity identity is contradictory');
     return object.reference;
   };
-  const verification = async identity => {
-    const latestObject = await read(OBSERVATION_VERIFICATION_LATEST_KEY);
+  const verification = async (identity, physical) => {
+    const schemaVersion = physical?.physical_identity?.history_schema_version;
+    const mode = acceptedVerificationModes?.[String(identity.connector_id)] || null;
+    evidence(schemaVersion === 3 || schemaVersion === 4,
+      'unknown_verification_transition_state', 'physical schema identity is unavailable');
+    // A known overlay cut-over must resolve its selected latest and exact manifest.
+    // Only independently accepted pre-overlay mode can tolerate a missing pointer.
+    let latestObject;
+    try { latestObject = await read(OBSERVATION_VERIFICATION_LATEST_KEY); }
+    catch (error) {
+      if (error.status === 404 && mode === 'pre_overlay_accepted')
+        return { state: selectVerificationStatusAuthority({ physicalIdentity: physical.physical_identity,
+          acceptedMode: mode }) };
+      throw error;
+    }
     const latest = validateObservationVerificationLatest(latestObject.value);
     evidence(Buffer.from(encodeObservationVerificationJson(latest)).equals(latestObject.body), 'invalid_verification_authority', 'verification selector encoding mismatch');
     const ref = latest.connectors.find(c => c.connector_id === identity.connector_id);
-    if (!ref) return { state: 'embedded_status_requires_writer_evidence' };
+    if (!ref) {
+      return { state: selectVerificationStatusAuthority({ physicalIdentity: physical.physical_identity,
+        acceptedMode: mode }) };
+    }
+    // A selected overlay contradicts a stale pre-overlay mode even for schema 3.
+    if (mode === 'pre_overlay_accepted')
+      selectVerificationStatusAuthority({ physicalIdentity: physical.physical_identity,
+        acceptedMode: mode, selectedOverlay: true });
     const object = await pinned(ref); const manifest = validateObservationVerificationConnectorManifest(object.value);
     evidence(Buffer.from(encodeObservationVerificationJson(manifest)).equals(object.body), 'invalid_verification_authority', 'verification manifest encoding mismatch');
     evidence(manifest.connector_id === identity.connector_id, 'invalid_verification_authority', 'verification connector mismatch');
     const entry = manifest.timeseries.find(t => t.timeseries_id === identity.timeseries_id);
     evidence(entry && entry.station_id === identity.station_id && entry.pollutant_code === identity.pollutant_code,
       'invalid_verification_authority', 'verification physical membership missing or contradictory');
-    return { state: 'overlay_metadata_verified', manifest: object.reference, entry,
+    return { state: selectVerificationStatusAuthority({ physicalIdentity: physical.physical_identity,
+      acceptedMode: mode, selectedOverlay: true }), manifest: object.reference, entry,
       scope_sha256: sha256Hex(canonicalJson(entry)) };
   };
   const results = [];
@@ -244,8 +346,17 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
       result.physical = h.membership === 'authoritative_absent' ? { membership: 'authoritative_absent', row_count: 0 } : await exact(scope, h);
     } catch (error) { result.diagnostics.push({ code: error.code || 'canonical_metadata_unavailable', detail: error.message }); }
     for (const [name, inspect] of [['binding', binding], ['verification', verification]]) {
-      try { result[name] = await inspect(scope.identity); }
-      catch (error) { result.diagnostics.push({ code: error.code || `${name}_metadata_unavailable`, detail: error.message }); }
+      if (name === 'verification' && result.physical?.membership === 'authoritative_absent') {
+        result.verification = { state: 'not_applicable_to_absent_scope' }; continue;
+      }
+      try { result[name] = await inspect(scope.identity, result.physical); }
+      catch (error) {
+        result.diagnostics.push({ code: error.code || `${name}_metadata_unavailable`, detail: error.message });
+        if (name === 'verification') result.verification = { state:
+          acceptedVerificationModes?.[String(scope.identity.connector_id)] === 'overlay_accepted'
+            || result.physical?.physical_identity?.history_schema_version === 4
+            ? 'overlay_authoritative_connector_unresolved' : 'unknown_verification_transition_state' };
+      }
     }
     result.state = 'metadata_only'; results.push(result);
   }
