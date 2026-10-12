@@ -104,11 +104,6 @@ from integrity.official_network_rdata import (
     resolve_rscript as resolve_official_rdata_rscript,
     rscript_identity as official_rdata_rscript_identity,
 )
-from integrity.official_network_rdata_timestamp_authority import (
-    CONTRACT as OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT,
-    freeze_timestamp_authority as _freeze_official_rdata_timestamp_authority,
-    require_frozen_timestamp_authority as _require_official_rdata_timestamp_authority,
-)
 
 
 REQUIRED_ENV_VARS = (
@@ -21148,7 +21143,7 @@ GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT = (
     "uk_aq_generic_integrity_v3_selected_scope_authority_v3"
 )
 GENERIC_V3_OFFICIAL_RDATA_PUBLICATION_AUTHORITY_CONTRACT = (
-    "uk_aq_generic_v3_official_rdata_publication_authority_v1"
+    "uk_aq_generic_v3_official_rdata_publication_authority_v2"
 )
 COORDINATOR_PROGRESS_OBJECT_INTERVAL = 250
 COORDINATOR_PROGRESS_SECONDS = 15.0
@@ -22145,12 +22140,6 @@ def _generic_v3_official_rdata_publication_authority(
         raise ValueError(
             "generic fixed-v3 official RData selected authority is unavailable"
         )
-    timestamp_authority = _require_official_rdata_timestamp_authority(
-        run_state,
-        {"UK_AQ_OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_FILE": str(
-            run_state.get("official_rdata_timestamp_authority_artifact_path") or ""
-        )},
-    )
     stage_root = Path(str(run_state.get("overlay_root") or ""))
     pollutants_by_day: dict[str, set[str]] = {}
     for scope in raw_authority["selected_scopes"]:
@@ -22248,7 +22237,6 @@ def _generic_v3_official_rdata_publication_authority(
             GENERIC_V3_OFFICIAL_RDATA_PUBLICATION_AUTHORITY_CONTRACT,
         "history_generation": "v3",
         "source_adapter": source_adapter,
-        "timestamp_authority": timestamp_authority,
         "selected_scope_source_evidence": source_evidence,
     }
 
@@ -29035,21 +29023,19 @@ def _canonical_apply_reporting_metrics(
     }
 
 
-def _freeze_generic_v3_official_rdata_authority_for_repair(
+def _select_generic_v3_official_rdata_source_for_repair(
     *,
     run_state: dict[str, Any],
     source_scope: Mapping[str, Any] | None,
     dedicated_sos_historical_replacement: bool,
-    env: Mapping[str, str],
-) -> dict[str, Any] | None:
-    """Freeze the network-specific timestamp authority for a generic v3 repair."""
+) -> None:
+    """Set the selected WAQN/SAQN adapter for generic v3 source validation."""
     source_adapter = str((source_scope or {}).get("source") or "")
     if dedicated_sos_historical_replacement or source_adapter not in {
         "waqn", "saqn",
     }:
-        return None
+        return
     run_state["official_rdata_source_adapter"] = source_adapter
-    return _freeze_official_rdata_timestamp_authority(run_state, env)
 
 
 def run_v2_integrity_repair_flow(
@@ -29083,11 +29069,10 @@ def run_v2_integrity_repair_flow(
         run_state,
         stage="proposal_coordinator",
     )
-    _freeze_generic_v3_official_rdata_authority_for_repair(
+    _select_generic_v3_official_rdata_source_for_repair(
         run_state=run_state,
         source_scope=source_scope,
         dedicated_sos_historical_replacement=dedicated_sos_historical_replacement,
-        env=env,
     )
     write_run_state(run_state)
     explicit_selected_partitions: list[dict[str, Any]] | None = None

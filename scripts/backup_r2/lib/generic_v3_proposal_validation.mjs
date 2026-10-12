@@ -12,10 +12,9 @@ import {
   canonicalTransitionFingerprintJson,
   coordinatorTransitionStateCommonFingerprintPayload,
 } from "./sos_light_v3_proposal_validation.mjs";
-import {
-  OFFICIAL_RDATA_TIMESTAMP_MAPPING,
-  requireOfficialRdataTimestampAuthority,
-} from "./official_rdata_timestamp_authority_validation.mjs";
+
+const OFFICIAL_RDATA_TIMESTAMP_MAPPING =
+  "rdata_date_beginning_plus_one_hour_to_observed_at_utc";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -32,7 +31,7 @@ export const GENERIC_INTEGRITY_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT =
 export const GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT =
   "uk_aq_generic_integrity_v3_selected_scope_authority_v3";
 export const GENERIC_V3_OFFICIAL_RDATA_PUBLICATION_AUTHORITY_CONTRACT =
-  "uk_aq_generic_v3_official_rdata_publication_authority_v1";
+  "uk_aq_generic_v3_official_rdata_publication_authority_v2";
 
 const OFFICIAL_RDATA_V8_FIELDS = [
   "schema_version", "semantic_evidence_contract", "source_adapter", "day_utc",
@@ -110,7 +109,6 @@ export function requireGenericV3OfficialRdataAuthority(runState) {
       || !Array.isArray(authority?.selected_scopes) || !authority.selected_scopes.length) {
     throw new Error("Generic fixed-v3 official RData selected authority is unavailable");
   }
-  const timestampAuthority = requireOfficialRdataTimestampAuthority(runState);
   const selectedScopeSourceEvidence = authority.selected_scopes.map((scope) => {
     const dayUtc = String(scope?.day_utc || "");
     const pollutantCode = String(scope?.pollutant_code || "");
@@ -172,7 +170,6 @@ export function requireGenericV3OfficialRdataAuthority(runState) {
     contract_version: GENERIC_V3_OFFICIAL_RDATA_PUBLICATION_AUTHORITY_CONTRACT,
     history_generation: "v3",
     source_adapter: sourceAdapter,
-    timestamp_authority: timestampAuthority,
     selected_scope_source_evidence: selectedScopeSourceEvidence,
   };
 }

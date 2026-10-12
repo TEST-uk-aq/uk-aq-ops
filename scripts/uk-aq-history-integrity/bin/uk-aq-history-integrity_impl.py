@@ -99,10 +99,6 @@ from integrity.official_network_rdata import (
     rscript_identity as official_rdata_rscript_identity,
     source_time_windows_for_year as official_rdata_source_time_windows_for_year,
 )
-from integrity.official_network_rdata_timestamp_authority import (
-    CONTRACT as OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT,
-    freeze_timestamp_authority as _shared_freeze_official_rdata_timestamp_authority,
-)
 
 
 REQUIRED_ENV_VARS = (
@@ -20431,7 +20427,7 @@ SOS_LIGHT_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
     "uk_aq_sos_light_v2_transition_state_fingerprint_v2"
 )
 GENERIC_INTEGRITY_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
-    "uk_aq_generic_integrity_v2_transition_state_fingerprint_v3"
+    "uk_aq_generic_integrity_v2_transition_state_fingerprint_v4"
 )
 GENERIC_INTEGRITY_V2_SELECTED_SCOPE_AUTHORITY_CONTRACT = (
     "uk_aq_generic_integrity_v2_selected_scope_authority_v2"
@@ -22579,13 +22575,6 @@ def _canonical_generic_integrity_selected_scope_authority(
     }
 
 
-def _freeze_official_rdata_timestamp_authority(
-    run_state: dict[str, Any], env: Mapping[str, str],
-) -> dict[str, Any]:
-    """Authenticate accepted graph/RData/canonical timestamp and unit evidence."""
-    return _shared_freeze_official_rdata_timestamp_authority(run_state, env)
-
-
 def _generic_v2_effective_operational_env(
     env: Mapping[str, str],
 ) -> dict[str, str]:
@@ -22976,8 +22965,6 @@ def _proposal_transition_state_fingerprint_payload(
                 GENERIC_INTEGRITY_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT,
             "execution_path": "generic_integrity",
             "history_generation": "v2",
-            "official_rdata_timestamp_authority":
-                dict(run_state.get("official_rdata_timestamp_authority") or {}),
             "generic_v2_operational_context":
                 dict(run_state.get("generic_v2_operational_context") or {}),
             "generic_selected_scope_authority":
@@ -26922,7 +26909,6 @@ def run_canonical_apply_executor(
         try:
             _canonical_generic_integrity_selected_scope_authority(run_state)
             _require_generic_v2_operational_context(run_state, env)
-            _freeze_official_rdata_timestamp_authority(run_state, env)
             write_run_state(run_state)
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             error = str(exc)
@@ -30390,8 +30376,6 @@ def run_v2_integrity_repair_flow(
                 metadata_actions,
             )
             _freeze_generic_v2_operational_context(run_state, env)
-            if run_state.get("objects") or run_state.get("tombstone_prefixes"):
-                _freeze_official_rdata_timestamp_authority(run_state, env)
             write_run_state(run_state)
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             observation_failed = True

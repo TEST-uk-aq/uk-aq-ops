@@ -18,10 +18,6 @@ import {
   canonicalTransitionFingerprintJson,
   coordinatorTransitionStateCommonFingerprintPayload,
 } from "./sos_light_v3_proposal_validation.mjs";
-import {
-  OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT,
-  requireOfficialRdataTimestampAuthority as requireAcceptedOfficialRdataTimestampAuthority,
-} from "./official_rdata_timestamp_authority_validation.mjs";
 
 const SHA256 = /^[a-f0-9]{64}$/;
 const GIT_SHA = /^[a-f0-9]{40}$/;
@@ -39,7 +35,7 @@ import {
 } from "./official_rdata_semantic_projection.mjs";
 
 export const GENERIC_INTEGRITY_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT =
-  "uk_aq_generic_integrity_v2_transition_state_fingerprint_v3";
+  "uk_aq_generic_integrity_v2_transition_state_fingerprint_v4";
 export const GENERIC_INTEGRITY_V2_SELECTED_SCOPE_AUTHORITY_CONTRACT =
   "uk_aq_generic_integrity_v2_selected_scope_authority_v2";
 export const GENERIC_V2_OPERATIONAL_CONTEXT_CONTRACT =
@@ -48,7 +44,6 @@ export const RETAINED_V2_MAINTENANCE_CONTEXT_CONTRACT =
   "uk_aq_retained_v2_official_rdata_maintenance_v1";
 export const SERVING_V2_LIVE_CONTEXT_CONTRACT =
   "uk_aq_serving_v2_official_rdata_integrity_v1";
-export { OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_CONTRACT };
 
 function sha256(body) { return createHash("sha256").update(body).digest("hex"); }
 function bytewise(left, right) {
@@ -959,17 +954,11 @@ export function genericV2TransitionStateFingerprintPayload(runState, env = proce
     contract_version: GENERIC_INTEGRITY_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT,
     execution_path: "generic_integrity",
     history_generation: "v2",
-    official_rdata_timestamp_authority:
-      requireOfficialRdataTimestampAuthority(runState),
     generic_v2_operational_context:
       requireGenericV2OperationalContext(runState, env).context,
     generic_selected_scope_authority: canonicalGenericV2SelectedScopeAuthority(runState),
     ...coordinatorTransitionStateCommonFingerprintPayload(runState),
   };
-}
-
-export function requireOfficialRdataTimestampAuthority(runState) {
-  return requireAcceptedOfficialRdataTimestampAuthority(runState);
 }
 
 export function requireRetainedV2MaintenanceContext(runState, env = process.env) {

@@ -1894,7 +1894,7 @@ class OfficialRDataBindingsV3Tests(unittest.TestCase):
             self.assertFalse(list(
                 generated.rglob("pollutant_code=pm10/manifest.json")
             ))
-            self.assertEqual(evidence["evidence_contract_version"], 8)
+            self.assertEqual(evidence["evidence_contract_version"], 9)
             self.assertEqual(
                 evidence["source_evidence_input_sha256"],
                 INTEGRITY._source_evidence_input_sha256(evidence),
@@ -3056,7 +3056,7 @@ write(latest.key, latest.body);
                 )
 
     def test_official_rdata_v8_does_not_advance_sos_contract(self) -> None:
-        self.assertEqual(INTEGRITY.OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION, 8)
+        self.assertEqual(INTEGRITY.OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION, 9)
         self.assertEqual(INTEGRITY.SOURCE_EVIDENCE_CONTRACT_VERSION, 4)
         v5_payload = INTEGRITY._source_evidence_input_payload({
             "evidence_contract_version": 5,
@@ -3378,7 +3378,7 @@ write(latest.key, latest.body);
                 evidence=loaded,
                 canonical_rows=rows,
             )
-        self.assertEqual(evidence_v8["evidence_contract_version"], 8)
+        self.assertEqual(evidence_v8["evidence_contract_version"], 9)
         self.assertNotEqual(persisted["evidence_id"], 1)
         self.assertEqual(
             self.conn.execute(
@@ -3422,104 +3422,20 @@ write(latest.key, latest.body);
                     canonical_rows=rows,
                 )
 
-    def test_rdata_gmt_timestamp_is_the_canonical_utc_instant(self) -> None:
+    def test_rdata_gmt_timestamp_maps_to_next_canonical_hour(self) -> None:
         observed = INTEGRITY.canonical_official_rdata_observed_at(
             "2026-10-08T18:00:00Z"
         )
         self.assertEqual(
             observed.isoformat(timespec="milliseconds"),
-            "2026-10-08T18:00:00.000+00:00",
+            "2026-10-08T19:00:00.000+00:00",
         )
         with self.assertRaisesRegex(ValueError, "authenticated timezone"):
             INTEGRITY.canonical_official_rdata_observed_at(
                 "2026-10-08T18:00:00"
             )
 
-    def test_fixed_v3_freezes_only_v2_identity_mapping_authority(self) -> None:
-        def comparison(
-            *, source_utc: str, graph_local: str, offset: str, value: str,
-        ) -> dict[str, object]:
-            return {
-                "source_adapter": "waqn",
-                "site_code": "CARD",
-                "pollutant_code": "no2",
-                "graph": {
-                    "original_timestamp": graph_local[:16].replace("T", " "),
-                    "interpreted_europe_london": graph_local,
-                    "observed_at_utc": source_utc,
-                    "value": value,
-                    "unit": "ug/m3",
-                },
-                "rdata": {
-                    "source_url": (
-                        "https://airquality.gov.wales/sites/default/files/"
-                        "openair/R_data/CARD_2026.RData"
-                    ),
-                    "source_file_sha256": "8" * 64,
-                    "object_name": "CARD_2026",
-                    "original_timestamp": source_utc.replace("T", " ").replace("Z", ""),
-                    "source_timezone": "GMT",
-                    "observed_at_utc": source_utc,
-                    "value": value,
-                    "unit": "ug/m3",
-                },
-                "canonical": {
-                    "observed_at_utc": source_utc,
-                    "value": value,
-                    "unit": "ug/m3",
-                },
-                "europe_london_offset": offset,
-                "hour_convention": (
-                    "rdata_gmt_instant_equals_graph_canonical_utc"
-                ),
-            }
-
-        artifact = {
-            "contract_version": "uk_aq_official_rdata_timestamp_authority_v2",
-            "status": "accepted",
-            "source_adapter": "waqn",
-            "timestamp_mapping": "rdata_posixct_gmt_instant_to_observed_at_utc",
-            "unit_authority": "accepted_matching_measurement_and_unit",
-            "comparisons": [
-                comparison(
-                    source_utc="2026-01-15T12:00:00Z",
-                    graph_local="2026-01-15T12:00:00+00:00",
-                    offset="+00:00",
-                    value="54.35941",
-                ),
-                comparison(
-                    source_utc="2026-10-08T18:00:00Z",
-                    graph_local="2026-10-08T19:00:00+01:00",
-                    offset="+01:00",
-                    value="1.72125",
-                ),
-            ],
-        }
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            artifact_path = Path(temporary_directory) / "authority.json"
-            artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
-            run_state = {"official_rdata_source_adapter": "waqn"}
-            authority = INTEGRITY._freeze_official_rdata_timestamp_authority(
-                run_state,
-                {"UK_AQ_OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_FILE": str(artifact_path)},
-            )
-            self.assertEqual(
-                authority["timestamp_mapping"],
-                "rdata_posixct_gmt_instant_to_observed_at_utc",
-            )
-            old = {**artifact}
-            old["contract_version"] = "uk_aq_official_rdata_timestamp_authority_v1"
-            old["timestamp_mapping"] = (
-                "rdata_date_beginning_plus_one_hour_to_observed_at_utc"
-            )
-            artifact_path.write_text(json.dumps(old), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "not accepted"):
-                INTEGRITY._freeze_official_rdata_timestamp_authority(
-                    {"official_rdata_source_adapter": "waqn"},
-                    {"UK_AQ_OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_FILE": str(artifact_path)},
-                )
-
-    def test_new_official_rdata_evidence_uses_v8_identity_mapping(self) -> None:
+    def test_new_official_rdata_evidence_uses_v9_shifted_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             _stage, evidence = self.stage_official_proposal(
                 Path(temporary_directory),
@@ -3527,82 +3443,26 @@ write(latest.key, latest.body);
                 rows=[],
                 source_available_pollutants=["no2"],
             )
-        self.assertEqual(evidence["evidence_contract_version"], 8)
+        self.assertEqual(evidence["evidence_contract_version"], 9)
         self.assertEqual(
             evidence["timestamp_mapping"],
-            "rdata_posixct_gmt_instant_to_observed_at_utc",
+            "rdata_date_beginning_plus_one_hour_to_observed_at_utc",
         )
         self.assertEqual(
-            INTEGRITY.OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION, 8,
+            INTEGRITY.OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION, 9,
         )
 
-    def test_fixed_v3_publication_authority_binds_frozen_v8_evidence(self) -> None:
-        def comparison(source_utc: str, graph_local: str, offset: str):
-            return {
-                "source_adapter": "waqn", "site_code": "CARD",
-                "pollutant_code": "no2",
-                "graph": {
-                    "original_timestamp": graph_local[:16].replace("T", " "),
-                    "interpreted_europe_london": graph_local,
-                    "observed_at_utc": source_utc, "value": "1.5", "unit": "ug/m3",
-                },
-                "rdata": {
-                    "source_url": (
-                        "https://airquality.gov.wales/sites/default/files/"
-                        "openair/R_data/CARD_2026.RData"
-                    ),
-                    "source_file_sha256": "8" * 64,
-                    "object_name": "CARD_2026",
-                    "original_timestamp": source_utc.replace("T", " ").replace("Z", ""),
-                    "source_timezone": "GMT", "observed_at_utc": source_utc,
-                    "value": "1.5", "unit": "ug/m3",
-                },
-                "canonical": {
-                    "observed_at_utc": source_utc, "value": "1.5", "unit": "ug/m3",
-                },
-                "europe_london_offset": offset,
-                "hour_convention": "rdata_gmt_instant_equals_graph_canonical_utc",
-            }
-
-        artifact = {
-            "contract_version": "uk_aq_official_rdata_timestamp_authority_v2",
-            "status": "accepted", "source_adapter": "waqn",
-            "timestamp_mapping": "rdata_posixct_gmt_instant_to_observed_at_utc",
-            "unit_authority": "accepted_matching_measurement_and_unit",
-            "comparisons": [
-                comparison(
-                    "2026-01-15T12:00:00Z", "2026-01-15T12:00:00+00:00", "+00:00"
-                ),
-                comparison(
-                    "2026-10-08T18:00:00Z", "2026-10-08T19:00:00+01:00", "+01:00"
-                ),
-            ],
-        }
+    def test_fixed_v3_publication_authority_binds_v9_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
             stage_root, _evidence = self.stage_official_proposal(
-                root / "proposal", requested_pollutants=["no2"], rows=[],
+                Path(temporary_directory), requested_pollutants=["no2"], rows=[],
                 source_available_pollutants=["no2"],
             )
-            authority_path = root / "authority.json"
-            authority_body = json.dumps(artifact).encode("utf-8")
-            authority_path.write_bytes(authority_body)
             run_state = {
-                "execution_path": "generic_integrity",
-                "history_generation": "v3",
                 "official_rdata_source_adapter": "waqn",
-                "official_rdata_timestamp_authority_artifact_path": str(
-                    authority_path.resolve()
-                ),
-                "official_rdata_timestamp_authority": {
-                    **artifact,
-                    "artifact_sha256": hashlib.sha256(authority_body).hexdigest(),
-                },
                 "overlay_root": str(stage_root),
                 "generic_integrity_selected_scope_authority": {
-                    "contract_version": (
-                        "uk_aq_generic_integrity_v3_selected_scope_authority_v3"
-                    ),
+                    "contract_version": "uk_aq_generic_integrity_v3_selected_scope_authority_v3",
                     "history_generation": "v3",
                     "selected_scopes": [{
                         "day_utc": "2026-09-28", "connector_id": 9,
@@ -3614,15 +3474,14 @@ write(latest.key, latest.body);
                 run_state
             )
         self.assertEqual(
-            INTEGRITY.GENERIC_INTEGRITY_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT,
-            "uk_aq_generic_integrity_v3_transition_state_fingerprint_v4",
+            authority["contract_version"],
+            "uk_aq_generic_v3_official_rdata_publication_authority_v2",
         )
         self.assertEqual(
-            authority["selected_scope_source_evidence"][0][
-                "evidence_contract_version"
-            ],
-            8,
+            authority["selected_scope_source_evidence"][0]["evidence_contract_version"],
+            9,
         )
+        self.assertNotIn("timestamp_authority", authority)
 
     def test_fixed_v3_publication_authority_loads_each_day_as_one_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -3647,16 +3506,9 @@ write(latest.key, latest.body);
                     } for pollutant in ("no2", "pm10")],
                 },
             }
-            with mock.patch.object(
-                INTEGRITY,
-                "_require_official_rdata_timestamp_authority",
-                return_value={"contract_version": "test-only-authority"},
-            ):
-                authority = (
-                    INTEGRITY._generic_v3_official_rdata_publication_authority(
-                        run_state
-                    )
-                )
+            authority = INTEGRITY._generic_v3_official_rdata_publication_authority(
+                run_state
+            )
         self.assertEqual(
             [
                 entry["pollutant_code"]
@@ -3669,24 +3521,21 @@ write(latest.key, latest.body);
             for entry in authority["selected_scope_source_evidence"]
         ))
 
-    def test_fixed_v3_official_repair_freeze_fails_without_network_artifact(self) -> None:
+    def test_fixed_v3_official_repair_selects_network_without_certificate(self) -> None:
         run_state: dict[str, object] = {}
-        with self.assertRaisesRegex(
-            ValueError, "UK_AQ_OFFICIAL_RDATA_TIMESTAMP_AUTHORITY_FILE"
-        ):
-            INTEGRITY._freeze_generic_v3_official_rdata_authority_for_repair(
-                run_state=run_state,
-                source_scope={"source": "waqn"},
-                dedicated_sos_historical_replacement=False,
-                env={},
-            )
+        INTEGRITY._select_generic_v3_official_rdata_source_for_repair(
+            run_state=run_state,
+            source_scope={"source": "waqn"},
+            dedicated_sos_historical_replacement=False,
+        )
         self.assertEqual(run_state["official_rdata_source_adapter"], "waqn")
 
-    def test_january_first_uses_only_its_utc_source_year_and_full_day(self) -> None:
+    def test_january_first_includes_previous_gmt_source_year(self) -> None:
         day = dt.date(2026, 1, 1)
-        self.assertEqual(INTEGRITY.official_rdata_required_site_years((day,)), [2026])
+        self.assertEqual(INTEGRITY.official_rdata_required_site_years((day,)), [2025, 2026])
         expected_windows = {
-            2026: ("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
+            2025: ("2025-12-31T23:00:00Z", "2026-01-01T00:00:00Z"),
+            2026: ("2026-01-01T00:00:00Z", "2026-01-01T23:00:00Z"),
         }
         for year, expected in expected_windows.items():
             with self.subTest(year=year):
@@ -3707,8 +3556,14 @@ write(latest.key, latest.body);
                     ),
                     [{
                         "canonical_day_utc": "2026-01-01",
-                        "canonical_start_utc": "2026-01-01T00:00:00Z",
-                        "canonical_end_exclusive_utc": "2026-01-02T00:00:00Z",
+                        "canonical_start_utc": (
+                            "2026-01-01T00:00:00Z" if year == 2025
+                            else "2026-01-01T01:00:00Z"
+                        ),
+                        "canonical_end_exclusive_utc": (
+                            "2026-01-01T01:00:00Z" if year == 2025
+                            else "2026-01-02T00:00:00Z"
+                        ),
                     }],
                 )
 
