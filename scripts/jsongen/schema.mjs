@@ -3,6 +3,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { AQI_ALGORITHM_VERSION, DAQI_PM_ROLLING24H_WINDOW_HOURS,
   DAQI_PM_ROLLING24H_REQUIRED_HOURS } from '../../lib/aqi/aqi_levels.mjs';
+import { assertObservationHistoryGeneration, getObservationHistoryGeneration }
+  from '../../workers/shared/uk_aq_observation_history_generation.mjs';
 
 export const ROOT = 'managed/jsongen/v1';
 export const CONTROL_KEY = `${ROOT}/control/current.json`;
@@ -98,6 +100,33 @@ export function assertSource(value) {
   // Canonical physical paths are explicitly pinned by the writer, never derived
   // from index generation, and never fetched by these foundations.
   return value;
+}
+// Stage 1 receipts deliberately did not encode a complete generation descriptor.
+// Keep their immutable wire format readable. This checks only namespace coupling;
+// it never authenticates the writer, the current selector, or the referenced bytes.
+export function inspectSourceGeneration(value, generation) {
+  assertSource(value);
+  assertObservationHistoryGeneration(generation);
+  requireValid(generation === getObservationHistoryGeneration('v3'), 'selected complete-v3 generation required');
+  const under = (reference, prefix) => reference.key.startsWith(`${prefix}/`);
+  const coupled = reference => [generation.observations_prefix, generation.core_prefix,
+    generation.observations_runs_prefix, generation.index_root_prefix].some(prefix => under(reference, prefix));
+  const references = [value.generation_authority, value.observations_root, value.index_authority,
+    value.final_publication, value.verification_authority, value.binding_authority];
+  const mismatch = value.observations_root.key !== generation.observations_root_key
+    || !under(value.index_authority, generation.observations_timeseries_index_prefix)
+    || !under(value.binding_authority, generation.timeseries_binding_index_prefix)
+    || references.some(reference => reference.bucket !== value.observations_root.bucket
+      || reference.bucket === BUCKET)
+    || [value.generation_authority, value.final_publication, value.verification_authority]
+      .some(reference => reference.key.startsWith('history/v2/') || reference.key.startsWith('history/_index_v2/'));
+  if (mismatch) return { state: 'selected_v3_source_generation_mismatch',
+    detail: 'Declared observation root, index, binding or generation-coupled authority contradicts selected complete v3.' };
+  if (![value.generation_authority, value.final_publication, value.verification_authority].every(coupled))
+    return { state: 'selected_v3_source_authority_unresolved',
+      detail: 'A declared authority has no provable selected-v3 namespace; retain the receipt as historical evidence.' };
+  return { state: 'selected_v3_source_namespace_consistent',
+    detail: 'Declared references use one selected-v3 namespace; currentness and final writer publication remain unproven.' };
 }
 function membership(value) {
   fields(value, ['state', 'row_count', 'authority']);
