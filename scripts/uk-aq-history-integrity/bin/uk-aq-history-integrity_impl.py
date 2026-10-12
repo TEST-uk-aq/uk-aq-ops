@@ -23289,10 +23289,6 @@ def stage_overlay_object(
     else:
         raise ValueError("refusing to copy a Dropbox backup object into the overlay")
 
-    target = Path(str(run_state["overlay_root"])) / normalized_key
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source, target)
-    payload = target.read_bytes()
     objects = run_state["objects"]
     if not isinstance(objects, dict):
         raise ValueError("overlay run state has no objects mapping")
@@ -23312,6 +23308,15 @@ def stage_overlay_object(
             dependency_key=dependency,
             identity=identity,
         )
+    target = Path(str(run_state["overlay_root"])) / normalized_key
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+    payload = target.read_bytes()
+    ingestion = run_state.get("proposal_ingestion")
+    if isinstance(ingestion, dict) and ingestion.get("status") == "in_progress":
+        previous = objects.get(normalized_key)
+        if isinstance(previous, Mapping) and previous.get("structurally_validated") is True:
+            ingestion["completed_object_count"] -= 1
     objects[normalized_key] = {
         "object_key": normalized_key,
         "local_path": str(target),
@@ -23338,6 +23343,11 @@ def mark_overlay_structurally_validated(
     run_state: dict[str, Any], object_key: str, *, persist: bool = True,
 ) -> None:
     entry = _overlay_object_entry(run_state, object_key)
+    ingestion = run_state.get("proposal_ingestion")
+    if (isinstance(ingestion, dict)
+            and ingestion.get("status") == "in_progress"
+            and entry.get("structurally_validated") is not True):
+        ingestion["completed_object_count"] += 1
     entry["structurally_validated"] = True
     entry["structurally_validated_at_utc"] = fmt_iso(utc_now())
     if persist:
@@ -30197,6 +30207,21 @@ def run_v2_integrity_repair_flow(
     write_run_state(run_state)
     explicit_selected_partitions: list[dict[str, Any]] | None = None
     proposal_staging: _SosLightV2ProposalStaging | None = None
+    generic_official_rdata = bool(
+        not dedicated_sos_historical_replacement
+        and run_state.get("execution_path") == "generic_integrity"
+        and run_state.get("official_rdata_source_adapter")
+        in OFFICIAL_RDATA_NETWORKS
+    )
+    if generic_official_rdata:
+        run_state["proposal_ingestion"] = {
+            "status": "in_progress",
+            "transport_mode": "file_backed_compact_proposal",
+            "completed_object_count": 0,
+            "total_object_count": None,
+            "node_apply_launch_permitted": False,
+        }
+        write_run_state(run_state)
     if dedicated_sos_historical_replacement:
         if dry_run:
             raise RuntimeError(
@@ -30359,11 +30384,6 @@ def run_v2_integrity_repair_flow(
             phase="observation_metadata_staging_complete",
             final=False,
         )
-    generic_official_rdata = bool(
-        not dedicated_sos_historical_replacement
-        and run_state.get("official_rdata_source_adapter")
-        in OFFICIAL_RDATA_NETWORKS
-    )
     if generic_official_rdata and not observation_failed and str(
         metadata.get("status") or ""
     ) not in {"failed", "blocked_dependency"} and (
@@ -30378,6 +30398,26 @@ def run_v2_integrity_repair_flow(
                 metadata_actions,
             )
             _freeze_generic_v2_operational_context(run_state, env)
+            objects = run_state.get("objects")
+            if not isinstance(objects, dict):
+                raise ValueError("generic fixed-v2 staged objects mapping is invalid")
+            completed_count = sum(
+                isinstance(entry, Mapping)
+                and entry.get("proposed") is True
+                and entry.get("built") is True
+                and entry.get("structurally_validated") is True
+                for entry in objects.values()
+            )
+            total_count = len(objects)
+            if (completed_count != total_count
+                    or run_state["proposal_ingestion"]["completed_object_count"]
+                    != completed_count):
+                raise ValueError("generic fixed-v2 proposal ingestion is incomplete")
+            run_state["proposal_ingestion"].update({
+                "status": "complete",
+                "completed_object_count": completed_count,
+                "total_object_count": total_count,
+            })
             write_run_state(run_state)
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             observation_failed = True
@@ -30403,6 +30443,10 @@ def run_v2_integrity_repair_flow(
         or observation_index_status in {"failed", "blocked_dependency"}
         or bool(run_state.get("blocked_scopes"))
     )
+    if (generic_official_rdata and proposal_failed
+            and run_state["proposal_ingestion"]["status"] == "in_progress"):
+        run_state["proposal_ingestion"]["status"] = "failed"
+        write_run_state(run_state)
     planned_operation_counts = record_integrity_object_operations(
         conn, run_id=run_id, run_state=run_state, log=log,
     )

@@ -1230,17 +1230,40 @@ export function requireGenericV2CoordinatorFreeze(runState, env = process.env) {
     throw new Error("Generic fixed-v2 configured environment disagrees with run state");
   }
   const ingestion = runState?.proposal_ingestion;
-  if (ingestion?.status !== "complete"
-      || ingestion?.transport_mode !== "file_backed_compact_proposal"
-      || ingestion?.node_apply_launch_permitted !== false
-      || !Number.isSafeInteger(Number(ingestion?.completed_object_count))
-      || Number(ingestion.completed_object_count) !== Number(ingestion.total_object_count)) {
-    throw new Error("Generic fixed-v2 proposal ingestion checkpoint is incomplete");
+  const ingestionError = (reason) => {
+    throw new Error(`Generic fixed-v2 proposal ingestion checkpoint: ${reason}`);
+  };
+  if (!ingestion || typeof ingestion !== "object" || Array.isArray(ingestion)) {
+    ingestionError("missing");
+  }
+  if (ingestion.status !== "complete") ingestionError("status is not complete");
+  if (ingestion.transport_mode !== "file_backed_compact_proposal") {
+    ingestionError("transport mode is invalid");
+  }
+  if (ingestion.node_apply_launch_permitted !== false) {
+    ingestionError("launch permission is invalid");
+  }
+  if (!Number.isSafeInteger(ingestion.completed_object_count)
+      || ingestion.completed_object_count < 0
+      || !Number.isSafeInteger(ingestion.total_object_count)
+      || ingestion.total_object_count < 0) {
+    ingestionError("object count is missing or invalid");
+  }
+  if (ingestion.completed_object_count !== ingestion.total_object_count) {
+    ingestionError("completed object count differs from total object count");
+  }
+  if (!runState.objects || typeof runState.objects !== "object"
+      || Array.isArray(runState.objects)) {
+    ingestionError("final staged object set is invalid");
+  }
+  const stagedObjectCount = Object.keys(runState.objects).length;
+  if (ingestion.total_object_count !== stagedObjectCount) {
+    ingestionError("object count differs from final staged object count");
   }
   const provenance = runState?.final_staged_write_set_provenance;
   if (provenance?.status !== "finalised"
       || Number(provenance.final_staged_object_count)
-        !== Object.keys(runState?.objects || {}).length) {
+        !== stagedObjectCount) {
     throw new Error("Generic fixed-v2 final staged write-set provenance is incomplete");
   }
   const transition = runState?.proposal_transition_validation;
