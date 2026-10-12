@@ -106,17 +106,22 @@ if (!(object_name %in% loaded)) stop(paste("required object missing:", object_na
 value <- workspace[[object_name]]
 if (!is.data.frame(value)) stop(paste("required object is not a data.frame:", object_name))
 
-if (identical(mode, "site_year")) {
+if (mode %in% c("site_year", "inventory")) {
   if (!("date" %in% names(value))) stop("site-year object has no date column")
+  if (anyDuplicated(names(value))) stop("site-year object has duplicate column names")
   if (!inherits(value$date, "POSIXct")) stop("site-year date is not POSIXct")
   if (!identical(attr(value$date, "tzone"), "GMT")) {
     stop("site-year date timezone is not explicitly GMT")
   }
-  keep <- intersect(c("date", "PM2.5", "PM10", "NO2", "O3"), names(value))
-  value <- value[, keep, drop=FALSE]
   parsed <- as.POSIXct(value$date, tz="UTC")
   if (any(is.na(parsed))) stop("site-year object has an invalid date value")
-  value$date <- format(parsed, "%Y-%m-%dT%H:%M:%SZ", tz="UTC", usetz=FALSE)
+  if (identical(mode, "inventory")) {
+    value <- data.frame(column_name=names(value), stringsAsFactors=FALSE)
+  } else {
+    keep <- intersect(c("date", "PM2.5", "PM10", "NO2", "O3"), names(value))
+    value <- value[, keep, drop=FALSE]
+    value$date <- format(parsed, "%Y-%m-%dT%H:%M:%SZ", tz="UTC", usetz=FALSE)
+  }
 } else if (identical(mode, "metadata")) {
   required <- c("site_id", "parameter", "start_date", "end_date", "ratified_to")
   if (!all(required %in% names(value))) stop("metadata object lacks required columns")
@@ -227,6 +232,100 @@ def extract_site_year(
             "date", *(POLLUTANT_TO_METADATA_PARAMETER[code] for code in sorted(selected))
         ),
     )
+
+
+def inspect_site_year_columns(path: Path, *, site_code: str, year: int) -> list[str]:
+    """Inspect the full native-R hourly column inventory before selected decoding."""
+    rows = _extract_tsv(
+        path, mode="inventory", object_name=f"{site_code}_{int(year)}",
+        required_columns=("column_name",),
+    )
+    names = [row["column_name"] for row in rows]
+    if not names or len(names) != len(set(names)) or "date" not in names:
+        raise ValueError("site-year RData column inventory is invalid")
+    if any(not name or any(char in name for char in "\t\r\n") for name in names):
+        raise ValueError("site-year RData column name is ambiguous")
+    return sorted(names, key=lambda value: value.encode("utf-8"))
+
+
+def classify_present_site_year_columns(
+    *, path: Path, site_code: str, year: int,
+    bindings_by_pollutant: Mapping[str, Mapping[str, Any]],
+    metadata_rows: Iterable[Mapping[str, Any]],
+    selected_days: Iterable[dt.date],
+) -> list[dict[str, Any]]:
+    """Bind each selected column to native R bytes, metadata and shifted windows."""
+    columns = inspect_site_year_columns(path, site_code=site_code, year=year)
+    metadata = list(metadata_rows)
+    result: list[dict[str, Any]] = []
+    for day in sorted(set(selected_days)):
+        windows = source_time_windows_for_year((day,), year)
+        if not windows:
+            continue
+        coverage = classify_site_year_coverage(
+            metadata, site_code=site_code,
+            bindings_by_pollutant=bindings_by_pollutant,
+            selected_days=(day,), source_year=year,
+        )
+        by_pollutant = {
+            item["pollutant_code"]: item
+            for item in coverage["selected_bindings"]
+        }
+        for pollutant, binding in sorted(bindings_by_pollutant.items()):
+            source_column = POLLUTANT_TO_METADATA_PARAMETER[pollutant]
+            normalised_column = "".join(char for char in source_column.upper()
+                                        if char.isascii() and char.isalnum())
+            aliases = [name for name in columns if name != source_column and
+                       "".join(char for char in name.upper()
+                               if char.isascii() and char.isalnum())
+                       == normalised_column]
+            if aliases:
+                raise ValueError(
+                    f"RData selected source column is ambiguous: site={site_code} "
+                    f"column={source_column} aliases={aliases}"
+                )
+            matches = [row for row in metadata
+                       if str(row.get("site_id") or "").strip().upper() == site_code.upper()
+                       and str(row.get("parameter") or "").strip().upper() == source_column.upper()]
+            if len(matches) != 1:
+                raise ValueError(
+                    f"RData metadata row is missing or ambiguous: site={site_code} column={source_column}"
+                )
+            lifecycle = by_pollutant[pollutant]
+            if lifecycle["classification"] == COVERAGE_INDETERMINATE:
+                raise ValueError(
+                    f"RData metadata lifecycle is indeterminate: site={site_code} column={source_column}"
+                )
+            metadata_row = {key: str(matches[0].get(key) or "")
+                            for key in ("site_id", "parameter", "start_date", "end_date", "ratified_to")}
+            parse_ratified_to(metadata_row["ratified_to"])
+            result.append({
+                "day_utc": day.isoformat(),
+                "site_code": site_code,
+                "source_year": int(year),
+                "object_name": f"{site_code}_{int(year)}",
+                "pollutant_code": pollutant,
+                "source_column": source_column,
+                "station_id": int(binding["station_id"]),
+                "timeseries_id": int(binding["timeseries_id"]),
+                "classification": (
+                    "source_column_present" if source_column in columns
+                    else "source_column_unavailable"
+                ),
+                "actual_columns": columns,
+                "metadata_row": metadata_row,
+                "lifecycle_classification": lifecycle["classification"],
+                "lifecycle_reason": lifecycle["reason"],
+                "metadata_source_discrepancy": (
+                    "metadata_coverage_without_source_column"
+                    if source_column not in columns
+                    and lifecycle["classification"] == COVERAGE_REQUIRED
+                    else None
+                ),
+                "raw_source_windows": windows,
+                "canonical_windows": canonical_unavailable_windows(windows),
+            })
+    return result
 
 
 def extract_metadata(

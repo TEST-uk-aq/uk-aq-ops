@@ -13,6 +13,7 @@ import {
 import { validateIntegrityCoreSnapshotIdentity } from "./uk_aq_integrity_core_snapshot_identity.mjs";
 import { requireObservationsGlobalOperationLockContext } from "../../../workers/shared/uk_aq_r2_history_writer.mjs";
 import { validateOfficialRdataPreservationDependencies } from "./official_rdata_evidence_validation.mjs";
+import { validateOfficialRdataV10PreservedOnlyAuthority } from "./official_rdata_v10_validation.mjs";
 import { authenticateOfficialRdataPinnedHierarchy } from "./official_rdata_pinned_hierarchy.mjs";
 import {
   canonicalTransitionFingerprintJson,
@@ -35,9 +36,9 @@ import {
 } from "./official_rdata_semantic_projection.mjs";
 
 export const GENERIC_INTEGRITY_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT =
-  "uk_aq_generic_integrity_v2_transition_state_fingerprint_v4";
+  "uk_aq_generic_integrity_v2_transition_state_fingerprint_v5";
 export const GENERIC_INTEGRITY_V2_SELECTED_SCOPE_AUTHORITY_CONTRACT =
-  "uk_aq_generic_integrity_v2_selected_scope_authority_v2";
+  "uk_aq_generic_integrity_v2_selected_scope_authority_v3";
 export const GENERIC_V2_OPERATIONAL_CONTEXT_CONTRACT =
   "uk_aq_generic_v2_official_rdata_operational_context_v1";
 export const RETAINED_V2_MAINTENANCE_CONTEXT_CONTRACT =
@@ -299,18 +300,18 @@ function authenticatedImplementationRevision(env) {
 
 function officialRdataSemanticEvidenceSha256(evidence) {
   const allowed = new Set([
-    ...OFFICIAL_RDATA_V8_FIELDS,
+    ...OFFICIAL_RDATA_V8_FIELDS, "source_column_classifications_sha256", "source_column_classifications",
     "semantic_evidence_sha256", "acquisition_audit", "acquisition_audit_sha256",
   ]);
-  if (evidence?.evidence_contract_version !== 9
+  if (evidence?.evidence_contract_version !== 10
       || evidence?.timestamp_mapping
         !== "rdata_date_beginning_plus_one_hour_to_observed_at_utc"
-      || OFFICIAL_RDATA_V8_FIELDS.some((field) => !Object.hasOwn(evidence || {}, field))
+      || [...OFFICIAL_RDATA_V8_FIELDS, "source_column_classifications_sha256", "source_column_classifications"].some((field) => !Object.hasOwn(evidence || {}, field))
       || Object.keys(evidence || {}).some((field) => !allowed.has(field))) {
     throw new Error("Generic fixed-v2 official semantic evidence shape is invalid");
   }
   return sha256(Buffer.from(canonicalTransitionFingerprintJson(
-    Object.fromEntries(OFFICIAL_RDATA_V8_FIELDS.map((field) => [field, evidence[field]])),
+    Object.fromEntries([...OFFICIAL_RDATA_V8_FIELDS, "source_column_classifications_sha256", "source_column_classifications"].map((field) => [field, evidence[field]])),
   ), "utf8"));
 }
 
@@ -580,7 +581,7 @@ function canonicalScopeSourceAuthority(raw, {
     throw new Error("Generic fixed-v2 scope source authority changed");
   }
   const authority = JSON.parse(JSON.stringify(raw));
-  if (authority.authority_kind === "persisted_official_rdata_v9_semantic_evidence") {
+  if (authority.authority_kind === "persisted_official_rdata_v10_semantic_evidence") {
     const hashes = [
       "semantic_evidence_sha256", "source_evidence_input_sha256",
       "acquisition_audit_sha256", "source_file_identities_sha256",
@@ -614,6 +615,34 @@ function canonicalScopeSourceAuthority(raw, {
         || (outcome === "complete_replacement" && selectedHasUnavailableScope)) {
       throw new Error("Generic fixed-v2 persisted source authority is invalid");
     }
+  } else if (authority.authority_kind === "authenticated_wholly_source_unavailable_v10") {
+    const semanticSha = String(authority.semantic_authority_sha256 || "");
+    delete authority.semantic_authority_sha256;
+    const auditSha = String(authority.acquisition_audit_sha256 || "");
+    delete authority.acquisition_audit_sha256;
+    const audit = authority.acquisition_audit;
+    delete authority.acquisition_audit;
+    const files = audit?.source_file_acquisition_audit || [];
+    if (outcome !== "source_artifact_unavailable_preserved"
+        || authority.evidence_contract_version !== 10
+        || !Array.isArray(files) || files.length !== authority.files_read?.length
+        || !Array.isArray(authority.source_file_identities)
+        || authority.source_file_identities.length !== files.length
+        || !Array.isArray(authority.source_column_classifications)
+        || !Array.isArray(authority.source_unavailable_scopes)
+        || !authority.source_unavailable_scopes.length
+        || sha256(Buffer.from(canonicalTransitionFingerprintJson(
+          authority.source_column_classifications), "utf8"))
+          !== authority.source_column_classifications_sha256
+        || audit?.audit_contract_version !== 2
+        || audit?.semantic_authority_sha256 !== semanticSha
+        || auditSha !== sha256(Buffer.from(canonicalTransitionFingerprintJson(audit), "utf8"))
+        || semanticSha !== sha256(Buffer.from(canonicalTransitionFingerprintJson(authority), "utf8"))) {
+      throw new Error("Generic fixed-v2 v10 preserved source authority is invalid");
+    }
+    authority.semantic_authority_sha256 = semanticSha;
+    authority.acquisition_audit = audit;
+    authority.acquisition_audit_sha256 = auditSha;
   } else if (authority.authority_kind === "authenticated_wholly_source_unavailable") {
     const semanticSha = String(authority.semantic_authority_sha256 || "");
     delete authority.semantic_authority_sha256;
@@ -648,7 +677,7 @@ function canonicalScopeSourceAuthority(raw, {
 
 function validatePersistedScopeSourceEvidence(runState, scope) {
   const authority = scope.source_evidence_authority;
-  if (authority.authority_kind !== "persisted_official_rdata_v9_semantic_evidence") return;
+  if (authority.authority_kind !== "persisted_official_rdata_v10_semantic_evidence") return;
   const source = loadImmutableSourcePartition({
     runState,
     dayUtc: scope.day_utc,
@@ -1327,7 +1356,12 @@ export async function validateFinalGenericV2ProposalGraph({ runState, proposal }
   const authority = canonicalGenericV2SelectedScopeAuthority(runState);
   const validatedEvidence = new Set();
   for (const scope of authority.selected_scopes) {
-    if (scope.source_evidence_authority.authority_kind !== "persisted_official_rdata_v9_semantic_evidence") continue;
+    if (scope.source_evidence_authority.authority_kind
+        === "authenticated_wholly_source_unavailable_v10") {
+      validateOfficialRdataV10PreservedOnlyAuthority(scope.source_evidence_authority);
+      continue;
+    }
+    if (scope.source_evidence_authority.authority_kind !== "persisted_official_rdata_v10_semantic_evidence") continue;
     const identity = `${scope.day_utc}|${scope.connector_id}`;
     if (validatedEvidence.has(identity)) continue;
     const source = loadImmutableSourcePartition({ runState,

@@ -34,8 +34,10 @@ import {
 
 import {
   OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS,
+  OFFICIAL_RDATA_V10_SEMANTIC_EVIDENCE_FIELDS,
   officialRdataAvailabilitySemanticIdentity,
   officialRdataPreservedBaselineSemanticIdentity,
+  officialRdataV10ColumnClassifications,
 } from "../../../../scripts/backup_r2/lib/official_rdata_semantic_projection.mjs";
 
 function sha256(body) {
@@ -74,11 +76,11 @@ function canonicalJson(value) {
   return JSON.stringify(value);
 }
 
-const OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION = 9;
-const OFFICIAL_RDATA_SOURCE_AVAILABILITY_CONTRACT_VERSION = 5;
-const OFFICIAL_RDATA_PRESERVED_BASELINE_CONTRACT_VERSION = 1;
+const OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION = 10;
+const OFFICIAL_RDATA_SOURCE_AVAILABILITY_CONTRACT_VERSION = 10;
+const OFFICIAL_RDATA_PRESERVED_BASELINE_CONTRACT_VERSION = 2;
 const OFFICIAL_RDATA_DECODER_CONTRACT_VERSION = 1;
-const OFFICIAL_RDATA_ACQUISITION_AUDIT_CONTRACT_VERSION = 1;
+const OFFICIAL_RDATA_ACQUISITION_AUDIT_CONTRACT_VERSION = 2;
 const OFFICIAL_RDATA_TIMESTAMP_MAPPING =
   "rdata_date_beginning_plus_one_hour_to_observed_at_utc";
 
@@ -92,6 +94,15 @@ function officialRdataV8SemanticEvidenceProjection(evidence) {
     projection[field] = evidence[field];
   }
   return projection;
+}
+
+function officialRdataV10SemanticEvidenceProjection(evidence) {
+  return Object.fromEntries(OFFICIAL_RDATA_V10_SEMANTIC_EVIDENCE_FIELDS.map((field) => {
+    if (!Object.hasOwn(evidence, field)) {
+      throw new Error(`official RData v10 semantic evidence field is missing: ${field}`);
+    }
+    return [field, evidence[field]];
+  }));
 }
 
 function canonicalAuditEntries(values) {
@@ -262,6 +273,11 @@ function main() {
       );
     }
     if (pollutantRows.length === 0) {
+      if (unavailableScopes.some((scope) => scope.pollutant_code === pollutantCode)) {
+        throw new Error(
+          `source-unavailable ${pollutantCode} has no authenticated complete final target; empty replacement is blocked`,
+        );
+      }
       if (sourceAvailablePollutantCodes.has(pollutantCode)) {
         finalTargetObservationContentHashes[pollutantCode] = contentHashMetadata(
           computeEmptyObservationContentHash(),
@@ -423,6 +439,12 @@ function main() {
   const sourceArtifactAvailabilityIdentity = officialRdataAvailabilitySemanticIdentity(
     input.source_unavailable_scopes || [],
   );
+  const sourceColumnClassifications = officialRdataV10ColumnClassifications(
+    input.source_column_classifications || [],
+  );
+  const sourceColumnClassificationsSha256 = sha256(Buffer.from(
+    canonicalJson(sourceColumnClassifications), "utf8",
+  ));
   const preservedBaselineIdentity = officialRdataPreservedBaselineSemanticIdentity(
     input.preserved_baseline_identity || { source: "dropbox", partition_identities: [] },
   );
@@ -448,6 +470,7 @@ function main() {
     source_artifact_availability_sha256: sha256(Buffer.from(
       canonicalJson(sourceArtifactAvailabilityIdentity), "utf8",
     )),
+    source_column_classifications_sha256: sourceColumnClassificationsSha256,
     source_artifact_availability_contract_version:
       OFFICIAL_RDATA_SOURCE_AVAILABILITY_CONTRACT_VERSION,
     preserved_baseline_dependency_sha256: preservedBaselineDependencySha256,
@@ -487,6 +510,7 @@ function main() {
     source_available_pollutant_codes: [...sourceAvailablePollutantCodes].sort(compareCanonicalUtf8),
     source_unavailable_timeseries_ids: [...unavailableTimeseriesIds].sort((a, b) => a - b),
     source_unavailable_scopes: sourceArtifactAvailabilityIdentity,
+    source_column_classifications: sourceColumnClassifications,
     preserved_baseline_rows_file: "preserved_baseline_rows.json",
     preserved_baseline_rows_sha256: sha256(preservedRowsBody),
     preserved_baseline_rows_bytes: preservedRowsBody.byteLength,
@@ -520,7 +544,7 @@ function main() {
     source_verification_status_counts: verificationStatusCounts,
   };
   const semanticEvidenceSha256 = sha256(Buffer.from(
-    canonicalJson(officialRdataV8SemanticEvidenceProjection(semanticEvidence)),
+    canonicalJson(officialRdataV10SemanticEvidenceProjection(semanticEvidence)),
     "utf8",
   ));
   const acquisitionAudit = {
@@ -537,7 +561,18 @@ function main() {
       input.source_file_identities || [],
     ),
     source_unavailable_scope_acquisition_audit: canonicalAuditEntries(
-      input.source_unavailable_scopes || [],
+      input.source_unavailable_scope_acquisition_audit || input.source_unavailable_scopes || [],
+    ),
+    source_column_classification_acquisition_audit: canonicalAuditEntries(
+      sourceColumnClassifications.map((item) => ({
+        source_file_key: item.source_file_key,
+        day_utc: item.day_utc,
+        pollutant_code: item.pollutant_code,
+        classification: item.classification,
+        requested_at_utc: (input.source_file_identities || []).find(
+          (identity) => identity.source_file === item.source_file_key,
+        )?.requested_at_utc || null,
+      })),
     ),
     ratification_audit: canonicalAuditEntries(input.ratification_audit || []),
     rscript_identity: input.rscript_identity || null,

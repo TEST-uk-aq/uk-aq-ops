@@ -91,6 +91,7 @@ from integrity.official_network_rdata import (
     canonical_timestamp_is_in_windows as official_rdata_timestamp_is_in_windows,
     canonical_unavailable_windows as official_rdata_canonical_unavailable_windows,
     canonical_rows_for_site_year,
+    classify_present_site_year_columns,
     download_pinned as download_official_rdata_pinned,
     extract_metadata as extract_official_rdata_metadata,
     extract_site_year as extract_official_rdata_site_year,
@@ -15155,7 +15156,7 @@ def _official_rdata_wholly_unavailable_scope_authority(
     day_utc: str,
     pollutant_code: str,
 ) -> dict[str, Any]:
-    """Freeze current-run authenticated 404 coverage without local paths."""
+    """Freeze v10 present-column or 404 preservation without replacement authority."""
     available_ids, unavailable_ids, unavailable_scopes = (
         _official_rdata_partition_availability(
             context=context,
@@ -15184,7 +15185,7 @@ def _official_rdata_wholly_unavailable_scope_authority(
         key=_canonical_utf8_sort_key,
     )
     metadata_key = f"{context.get('source_key')}:metadata"
-    if (not required or set(successful) != {metadata_key}
+    if (not required or metadata_key not in successful
             or metadata_key in absent
             or set(required) != set(successful) | set(absent)
             or set(successful) & set(absent)):
@@ -15196,31 +15197,77 @@ def _official_rdata_wholly_unavailable_scope_authority(
             "source_unavailable_scopes": unavailable_scopes,
         })
     )
-    projection = {
+    acquired = [
+        dict(context["identities_by_key"][key]) for key in successful
+    ]
+    classifications = sorted((
+        dict(item)
+        for item in context["column_classifications_by_day"].get(day_utc, [])
+        if item["pollutant_code"] == pollutant_code
+    ), key=_canonical_json_utf8_bytes)
+    if any(
+        item["classification"] != "source_column_unavailable"
+        and item["lifecycle_classification"] != "authoritative_no_coverage"
+        for item in classifications
+    ):
+        raise ValueError("official RData wholly-unavailable column classification is contradictory")
+    classification_audit = sorted(({
+        "source_file_key": item["source_file_key"],
+        "day_utc": item["day_utc"],
+        "pollutant_code": item["pollutant_code"],
+        "classification": item["classification"],
+        "requested_at_utc": context["identities_by_key"][item["source_file_key"]]["requested_at_utc"],
+    } for item in classifications), key=_canonical_json_utf8_bytes)
+    authority = {
         "contract_version":
             "uk_aq_generic_v2_official_rdata_scope_source_authority_v1",
-        "authority_kind": "authenticated_wholly_source_unavailable",
+        "authority_kind": "authenticated_wholly_source_unavailable_v10",
+        "evidence_contract_version": 10,
         "history_generation": "v2",
         "day_utc": day_utc,
-        "connector_id": int(context.get("connector_id") or 0),
-        "source_adapter": str(context.get("source_key") or ""),
+        "connector_id": int(context["connector_id"]),
+        "source_adapter": str(context["source_key"]),
         "pollutant_code": pollutant_code,
+        "requested_pollutant_set": [pollutant_code],
+        "mapping_audit": dict(context["mapping_audit"]),
         "files_required": required,
         "files_read": successful,
         "files_authoritatively_absent": absent,
+        "source_file_identities": [{
+            "source_file": item["source_file"],
+            "bytes": item["bytes"],
+            "sha256": item["sha256"],
+        } for item in acquired],
+        "source_column_classifications": classifications,
+        "source_column_classifications_sha256": hashlib.sha256(
+            _canonical_json_utf8_bytes(classifications)
+        ).hexdigest(),
         "source_unavailable_timeseries_ids": sorted(unavailable_ids),
         "source_unavailable_scopes": canonical_unavailable_scopes,
         "authoritative_station_timeseries_mapping_sha256": str(
-            context.get("authoritative_mapping_sha256") or ""
+            context["authoritative_mapping_sha256"]
         ),
         "observed_property_mapping_sha256": str(
-            context.get("observed_property_mapping_sha256") or ""
+            context["observed_property_mapping_sha256"]
         ),
     }
-    projection["semantic_authority_sha256"] = hashlib.sha256(
-        _canonical_json_utf8_bytes(projection)
+    authority["semantic_authority_sha256"] = hashlib.sha256(
+        _canonical_json_utf8_bytes(authority)
     ).hexdigest()
-    return projection
+    authority["acquisition_audit"] = {
+        "audit_contract_version": 2,
+        "semantic_authority_sha256": authority["semantic_authority_sha256"],
+        "source_file_acquisition_audit": acquired,
+        "source_column_classification_acquisition_audit": classification_audit,
+        "source_unavailable_scope_acquisition_audit": sorted(
+            (dict(scope) for scope in unavailable_scopes),
+            key=_canonical_json_utf8_bytes,
+        ),
+    }
+    authority["acquisition_audit_sha256"] = hashlib.sha256(
+        _canonical_json_utf8_bytes(authority["acquisition_audit"])
+    ).hexdigest()
+    return authority
 
 
 def _official_rdata_bindings(
@@ -15727,6 +15774,9 @@ def check_official_network_rdata(
     unavailable_scopes_by_day: dict[str, list[dict[str, Any]]] = {
         day.isoformat(): [] for day in days
     }
+    column_classifications_by_day: dict[str, list[dict[str, Any]]] = {
+        day.isoformat(): [] for day in days
+    }
     decoded_files = 0
     for site_code, site_bindings in sorted(bindings.items()):
         for year in official_rdata_required_site_years(days):
@@ -15778,9 +15828,45 @@ def check_official_network_rdata(
                         })
                 continue
             try:
+                classifications = classify_present_site_year_columns(
+                    path=destination, site_code=site_code, year=year,
+                    bindings_by_pollutant=site_bindings,
+                    metadata_rows=metadata_rows, selected_days=days,
+                )
+                for classification in classifications:
+                    day_utc = classification["day_utc"]
+                    column_classifications_by_day[day_utc].append({
+                        **classification, "source_file_key": source_file_key,
+                    })
+                    if classification["classification"] != "source_column_unavailable":
+                        continue
+                    if classification["lifecycle_classification"] == "authoritative_no_coverage":
+                        continue
+                    unavailable_scopes_by_day[day_utc].append({
+                        "day_utc": day_utc,
+                        "site_code": site_code,
+                        "source_year": year,
+                        "source_file_key": source_file_key,
+                        "pollutant_code": classification["pollutant_code"],
+                        "station_id": classification["station_id"],
+                        "timeseries_id": classification["timeseries_id"],
+                        "reason": "provider_site_year_pollutant_column_absent",
+                        "canonical_url": identity["canonical_url"],
+                        "final_url": identity["final_url"],
+                        "http_status": 200,
+                        "raw_source_windows": classification["raw_source_windows"],
+                        "canonical_unavailable_windows": classification["canonical_windows"],
+                        "requested_at_utc": identity["requested_at_utc"],
+                    })
+                present_bindings = {
+                    code: binding for code, binding in site_bindings.items()
+                    if any(item["pollutant_code"] == code
+                           and item["classification"] == "source_column_present"
+                           for item in classifications)
+                }
                 decoded = extract_official_rdata_site_year(
                     destination, site_code=site_code, year=year,
-                    selected_pollutants=site_bindings,
+                    selected_pollutants=present_bindings,
                 )
             except Exception as exc:
                 failure_path = record_acquisition_failure(
@@ -15800,7 +15886,7 @@ def check_official_network_rdata(
                     decoded,
                     connector_id=config.connector_id,
                     site_code=site_code,
-                    bindings_by_pollutant=site_bindings,
+                    bindings_by_pollutant=present_bindings,
                     metadata_rows=metadata_rows,
                     selected_days=day_set,
                 )
@@ -15821,10 +15907,10 @@ def check_official_network_rdata(
                 if official_rdata_source_time_windows_for_year((day,), year):
                     available_timeseries_by_day[day.isoformat()].update(
                         int(binding["timeseries_id"])
-                        for binding in site_bindings.values()
+                        for binding in present_bindings.values()
                     )
                     available_pollutants_by_day[day.isoformat()].update(
-                        site_bindings
+                        present_bindings
                     )
             counts: dict[tuple[str, int], int] = {}
             for row in canonical:
@@ -15898,6 +15984,7 @@ def check_official_network_rdata(
             for key, values in binding_ids_by_pollutant.items()
         },
         "unavailable_scopes_by_day": unavailable_scopes_by_day,
+        "column_classifications_by_day": column_classifications_by_day,
         "selected_pollutants": selected,
         "authoritative_mapping_sha256": mapping_hash,
         "observed_property_mapping_sha256": observed_property_hash,
@@ -16173,6 +16260,11 @@ def _prepare_official_rdata_proposal(
         "preserved_baseline_rows": preserved_rows,
         "preserved_baseline_identity": preserved_baseline_identity,
         "source_unavailable_scopes": unavailable_scopes,
+        "source_column_classifications": [
+            classification
+            for classification in context["column_classifications_by_day"].get(day_utc, [])
+            if classification["pollutant_code"] in pollutants
+        ],
         "source_available_timeseries_ids": sorted(
             source_available_timeseries_ids
         ),
@@ -16521,11 +16613,12 @@ def _v2_observations_index_rebuild_command(
 
 
 SOURCE_EVIDENCE_CONTRACT_VERSION = 4
-OFFICIAL_RDATA_SOURCE_AVAILABILITY_CONTRACT_VERSION = 5
+OFFICIAL_RDATA_SOURCE_AVAILABILITY_CONTRACT_VERSION = 10
+OFFICIAL_RDATA_SOURCE_AVAILABILITY_INTRODUCED_VERSION = 5
 OFFICIAL_RDATA_PRESERVED_BASELINE_EVIDENCE_CONTRACT_VERSION = 6
-OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION = 9
-OFFICIAL_RDATA_ACQUISITION_AUDIT_CONTRACT_VERSION = 1
-OFFICIAL_RDATA_PRESERVED_BASELINE_CONTRACT_VERSION = 1
+OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION = 10
+OFFICIAL_RDATA_ACQUISITION_AUDIT_CONTRACT_VERSION = 2
+OFFICIAL_RDATA_PRESERVED_BASELINE_CONTRACT_VERSION = 2
 OFFICIAL_RDATA_DECODER_CONTRACT_VERSION = 1
 OFFICIAL_RDATA_TIMESTAMP_MAPPING = (
     "rdata_date_beginning_plus_one_hour_to_observed_at_utc"
@@ -16690,6 +16783,66 @@ def _official_rdata_v8_semantic_evidence_sha256(
     ).hexdigest()
 
 
+OFFICIAL_RDATA_V10_SEMANTIC_EVIDENCE_FIELDS = (
+    *OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS,
+    "source_column_classifications_sha256",
+    "source_column_classifications",
+)
+
+
+def _official_rdata_semantic_evidence_projection(
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    if evidence.get("evidence_contract_version") in (8, 9):
+        return _official_rdata_v8_semantic_evidence_projection(evidence)
+    if (evidence.get("evidence_contract_version") != 10
+            or evidence.get("timestamp_mapping") != OFFICIAL_RDATA_TIMESTAMP_MAPPING):
+        raise ValueError("official RData v10 semantic evidence version or mapping is invalid")
+    fields = OFFICIAL_RDATA_V10_SEMANTIC_EVIDENCE_FIELDS
+    allowed = set(fields) | {
+        "semantic_evidence_sha256", "acquisition_audit", "acquisition_audit_sha256",
+    }
+    if set(evidence) != allowed:
+        raise ValueError(
+            "official RData v10 semantic evidence shape is invalid: "
+            f"missing={sorted(allowed - set(evidence))} "
+            f"unexpected={sorted(set(evidence) - allowed)}"
+        )
+    return {field: evidence[field] for field in fields}
+
+
+def _official_rdata_semantic_evidence_sha256(evidence: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json_utf8_bytes(
+        _official_rdata_semantic_evidence_projection(evidence)
+    )).hexdigest()
+
+
+def _official_rdata_acquisition_audit_sha256(evidence: Mapping[str, Any]) -> str:
+    if evidence.get("evidence_contract_version") in (8, 9):
+        return _official_rdata_v8_acquisition_audit_sha256(evidence)
+    audit = evidence.get("acquisition_audit")
+    if not isinstance(audit, Mapping):
+        raise ValueError("official RData v10 acquisition audit is unavailable")
+    expected = {
+        "schema_version", "audit_contract", "audit_contract_version",
+        "source_adapter", "day_utc", "connector_id", "history_generation",
+        "source_evidence_input_sha256", "semantic_evidence_sha256",
+        "source_file_acquisition_audit", "source_unavailable_scope_acquisition_audit",
+        "source_column_classification_acquisition_audit", "ratification_audit",
+        "rscript_identity", "backed_up_at_utc", "proposal_writer_git_sha",
+    }
+    if set(audit) != expected or audit.get("audit_contract_version") != 2:
+        raise ValueError("official RData v10 acquisition audit shape is invalid")
+    projection = dict(audit)
+    for field in ("source_file_acquisition_audit",
+                  "source_unavailable_scope_acquisition_audit",
+                  "source_column_classification_acquisition_audit", "ratification_audit"):
+        if not isinstance(projection[field], list):
+            raise ValueError(f"official RData v10 acquisition audit list is invalid: {field}")
+        projection[field] = sorted(projection[field], key=_canonical_json_utf8_bytes)
+    return hashlib.sha256(_canonical_json_utf8_bytes(projection)).hexdigest()
+
+
 def _official_rdata_v8_acquisition_audit_projection(
     evidence: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -16716,6 +16869,35 @@ def _official_rdata_v8_acquisition_audit_projection(
         values = projection[field]
         if not isinstance(values, list):
             raise ValueError("official RData v8 acquisition audit list is invalid")
+        projection[field] = sorted(values, key=_canonical_json_utf8_bytes)
+    return projection
+
+
+def _official_rdata_acquisition_audit_projection(
+    evidence: Mapping[str, Any],
+) -> dict[str, Any]:
+    if evidence.get("evidence_contract_version") in (8, 9):
+        return _official_rdata_v8_acquisition_audit_projection(evidence)
+    audit = evidence.get("acquisition_audit")
+    if not isinstance(audit, Mapping):
+        raise ValueError("official RData v10 acquisition audit is unavailable")
+    fields = (
+        "schema_version", "audit_contract", "audit_contract_version",
+        "source_adapter", "day_utc", "connector_id", "history_generation",
+        "source_evidence_input_sha256", "semantic_evidence_sha256",
+        "source_file_acquisition_audit", "source_unavailable_scope_acquisition_audit",
+        "source_column_classification_acquisition_audit", "ratification_audit",
+        "rscript_identity", "backed_up_at_utc", "proposal_writer_git_sha",
+    )
+    if set(audit) != set(fields) or audit.get("audit_contract_version") != 2:
+        raise ValueError("official RData v10 acquisition audit shape is invalid")
+    projection = {field: audit[field] for field in fields}
+    for field in ("source_file_acquisition_audit",
+                  "source_unavailable_scope_acquisition_audit",
+                  "source_column_classification_acquisition_audit", "ratification_audit"):
+        values = projection[field]
+        if not isinstance(values, list):
+            raise ValueError(f"official RData v10 acquisition audit list is invalid: {field}")
         projection[field] = sorted(values, key=_canonical_json_utf8_bytes)
     return projection
 
@@ -16766,7 +16948,7 @@ def _source_evidence_input_payload(evidence: Mapping[str, Any]) -> dict[str, Any
             "observed_property_mapping_sha256"
         ),
     }
-    if evidence_contract_version >= OFFICIAL_RDATA_SOURCE_AVAILABILITY_CONTRACT_VERSION:
+    if evidence_contract_version >= OFFICIAL_RDATA_SOURCE_AVAILABILITY_INTRODUCED_VERSION:
         payload["source_artifact_availability_sha256"] = evidence.get(
             "source_artifact_availability_sha256"
         )
@@ -16776,6 +16958,10 @@ def _source_evidence_input_payload(evidence: Mapping[str, Any]) -> dict[str, Any
     ):
         payload["preserved_baseline_dependency_sha256"] = evidence.get(
             "preserved_baseline_dependency_sha256"
+        )
+    if evidence_contract_version >= 10:
+        payload["source_column_classifications_sha256"] = evidence.get(
+            "source_column_classifications_sha256"
         )
     if evidence_contract_version >= 8:
         payload.update({
@@ -16831,6 +17017,103 @@ def _official_rdata_source_artifact_availability_identity(
     return normalized
 
 
+def _official_rdata_v10_validate_columns(evidence: Mapping[str, Any]) -> None:
+    if evidence.get("evidence_contract_version") != 10:
+        return
+    columns = evidence.get("source_column_classifications")
+    audit = evidence.get("acquisition_audit")
+    if not isinstance(columns, list) or not isinstance(audit, Mapping):
+        raise ValueError("official RData v10 column classification evidence is missing")
+    if columns != sorted(columns, key=_canonical_json_utf8_bytes):
+        raise ValueError("official RData v10 column classifications are not canonical")
+    if hashlib.sha256(_canonical_json_utf8_bytes(columns)).hexdigest() != evidence.get(
+        "source_column_classifications_sha256"
+    ):
+        raise ValueError("official RData v10 column classification hash changed")
+    acquired = {
+        item["source_file"]: item
+        for item in audit.get("source_file_acquisition_audit") or []
+    }
+    if len(acquired) != len(audit.get("source_file_acquisition_audit") or []):
+        raise ValueError("official RData v10 acquired file enumeration has duplicates")
+    binding_by_key = {
+        (item["site_code"], item["pollutant_code"]): item
+        for item in evidence["mapping_audit"]["mapped_source_groups"]
+    }
+    expected_audit = []
+    seen = set()
+    missing = set()
+    for entry in columns:
+        key = (entry.get("day_utc"), entry.get("site_code"),
+               entry.get("source_year"), entry.get("pollutant_code"))
+        source_key = entry.get("source_file_key")
+        file = acquired.get(source_key)
+        binding = binding_by_key.get((entry.get("site_code"), entry.get("pollutant_code")))
+        selected_column = {"pm25": "PM2.5", "pm10": "PM10", "no2": "NO2", "o3": "O3"}.get(
+            entry.get("pollutant_code")
+        )
+        actual_columns = entry.get("actual_columns")
+        if (key in seen or file is None or binding is None
+                or source_key not in evidence["files_read"]
+                or entry.get("object_name") != f"{entry.get('site_code')}_{entry.get('source_year')}"
+                or entry.get("source_column") != selected_column
+                or entry.get("station_id") != binding["station_id"]
+                or entry.get("timeseries_id") != binding["timeseries_id"]
+                or not isinstance(actual_columns, list) or "date" not in actual_columns
+                or actual_columns != sorted(set(actual_columns), key=_canonical_utf8_sort_key)
+                or entry.get("classification") not in
+                   ("source_column_present", "source_column_unavailable")
+                or (selected_column in actual_columns) !=
+                   (entry.get("classification") == "source_column_present")
+                or entry.get("metadata_source_discrepancy") != (
+                    "metadata_coverage_without_source_column"
+                    if entry.get("classification") == "source_column_unavailable"
+                    and entry.get("lifecycle_classification") == "required"
+                    else None
+                )
+                or entry.get("canonical_windows") !=
+                   official_rdata_canonical_unavailable_windows(entry.get("raw_source_windows") or [])):
+            raise ValueError(f"official RData v10 column identity is contradictory: {key}")
+        seen.add(key)
+        expected_audit.append({
+            "source_file_key": source_key, "day_utc": entry["day_utc"],
+            "pollutant_code": entry["pollutant_code"],
+            "classification": entry["classification"],
+            "requested_at_utc": file.get("requested_at_utc"),
+        })
+        if (entry["classification"] == "source_column_unavailable"
+                and entry.get("lifecycle_classification") != "authoritative_no_coverage"):
+            missing.add(key)
+    if sorted(expected_audit, key=_canonical_json_utf8_bytes) != audit.get(
+        "source_column_classification_acquisition_audit"
+    ):
+        raise ValueError("official RData v10 column acquisition audit disagrees")
+    scoped_missing = set()
+    for scope in evidence.get("source_unavailable_scopes") or []:
+        file_key = scope.get("source_file_key")
+        reason = scope.get("reason")
+        if reason == "provider_site_year_pollutant_column_absent":
+            key = (scope.get("day_utc"), scope.get("site_code"),
+                   scope.get("source_year"), scope.get("pollutant_code"))
+            entry = next((value for value in columns if
+                          (value["day_utc"], value["site_code"], value["source_year"],
+                           value["pollutant_code"]) == key), None)
+            if (key not in missing or entry is None or scope.get("http_status") != 200
+                    or file_key not in evidence["files_read"]
+                    or scope.get("station_id") != entry["station_id"]
+                    or scope.get("timeseries_id") != entry["timeseries_id"]
+                    or scope.get("raw_source_windows") != entry["raw_source_windows"]
+                    or scope.get("canonical_unavailable_windows") != entry["canonical_windows"]):
+                raise ValueError(f"official RData v10 missing-column scope is invalid: {key}")
+            scoped_missing.add(key)
+        elif (reason != "provider_site_year_artifact_absent"
+              or scope.get("http_status") != 404
+              or file_key not in evidence["files_authoritatively_absent"]):
+            raise ValueError("official RData v10 unavailable source subtype is invalid")
+    if missing != scoped_missing:
+        raise ValueError("official RData v10 missing-column windows are incomplete")
+
+
 def _official_rdata_source_artifact_availability_sha256(
     evidence: Mapping[str, Any],
 ) -> str:
@@ -16861,9 +17144,9 @@ def _official_rdata_preserved_baseline_dependency_sha256(
 def _immutable_source_evidence_sha256(evidence: Mapping[str, Any]) -> str:
     if (
         str(evidence.get("source_adapter") or "") in OFFICIAL_RDATA_NETWORKS
-        and evidence.get("evidence_contract_version") in (8, 9)
+        and evidence.get("evidence_contract_version") in (8, 9, 10)
     ):
-        return _official_rdata_v8_semantic_evidence_sha256(evidence)
+        return _official_rdata_semantic_evidence_sha256(evidence)
     payload = dict(evidence)
     payload.pop("source_label_registry_snapshot_file", None)
     payload.pop("source_label_registry_snapshot_file_sha256", None)
@@ -17045,10 +17328,10 @@ def _load_complete_connector_day_source_evidence(
             or evidence.get("observation_content_hash_contract_version") != 1
             or not re.fullmatch(r"[0-9a-f]{64}", semantic_evidence_sha256)
             or semantic_evidence_sha256
-            != _official_rdata_v8_semantic_evidence_sha256(evidence)
+            != _official_rdata_semantic_evidence_sha256(evidence)
             or not re.fullmatch(r"[0-9a-f]{64}", acquisition_audit_sha256)
             or acquisition_audit_sha256
-            != _official_rdata_v8_acquisition_audit_sha256(evidence)
+            != _official_rdata_acquisition_audit_sha256(evidence)
             or not isinstance(acquisition_audit, Mapping)
             or acquisition_audit.get("schema_version") != 1
             or acquisition_audit.get("audit_contract")
@@ -17067,9 +17350,11 @@ def _load_complete_connector_day_source_evidence(
             != semantic_evidence_sha256
         ):
             raise ValueError(
-                "official RData v9 semantic or acquisition evidence identity "
+                "official RData v10 semantic or acquisition evidence identity "
                 "is invalid"
             )
+    if source_adapter in OFFICIAL_RDATA_NETWORKS:
+        _official_rdata_v10_validate_columns(evidence)
     files_required = {str(value) for value in list(evidence.get("files_required") or [])}
     files_read = {str(value) for value in list(evidence.get("files_read") or [])}
     files_absent = {
@@ -17338,7 +17623,7 @@ def _persist_complete_connector_day_source_evidence(
     official_preservation_dependency = str(
         evidence.get("preserved_baseline_dependency_sha256") or ""
     )
-    is_official_v8 = (
+    is_official_semantic = (
         source_adapter in OFFICIAL_RDATA_NETWORKS
         and evidence.get("evidence_contract_version")
         == OFFICIAL_RDATA_SOURCE_EVIDENCE_CONTRACT_VERSION
@@ -17346,15 +17631,15 @@ def _persist_complete_connector_day_source_evidence(
     semantic_evidence: dict[str, Any] | None = None
     acquisition_audit: dict[str, Any] | None = None
     acquisition_audit_sha256: str | None = None
-    if is_official_v8:
-        semantic_evidence = _official_rdata_v8_semantic_evidence_projection(
+    if is_official_semantic:
+        semantic_evidence = _official_rdata_semantic_evidence_projection(
             evidence
         )
-        acquisition_audit = _official_rdata_v8_acquisition_audit_projection(
+        acquisition_audit = _official_rdata_acquisition_audit_projection(
             evidence
         )
         acquisition_audit_sha256 = (
-            _official_rdata_v8_acquisition_audit_sha256(evidence)
+            _official_rdata_acquisition_audit_sha256(evidence)
         )
     if (
         not day_utc
@@ -17381,10 +17666,10 @@ def _persist_complete_connector_day_source_evidence(
             )
         )
         or (
-            is_official_v8
+            is_official_semantic
             and (
                 str(evidence.get("semantic_evidence_sha256") or "")
-                != _official_rdata_v8_semantic_evidence_sha256(evidence)
+                != _official_rdata_semantic_evidence_sha256(evidence)
                 or str(evidence.get("acquisition_audit_sha256") or "")
                 != acquisition_audit_sha256
                 or acquisition_audit is None
@@ -17427,7 +17712,7 @@ def _persist_complete_connector_day_source_evidence(
             or str(existing[2]) != canonical_rows_sha256
             or int(existing[3]) != canonical_rows_bytes
             or (
-                is_official_v8
+                is_official_semantic
                 and (
                     str(existing[4]) != evidence_json
                     or str(existing[5]) != canonical_rows_json
@@ -20427,10 +20712,10 @@ SOS_LIGHT_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
     "uk_aq_sos_light_v2_transition_state_fingerprint_v2"
 )
 GENERIC_INTEGRITY_V2_TRANSITION_STATE_FINGERPRINT_CONTRACT = (
-    "uk_aq_generic_integrity_v2_transition_state_fingerprint_v4"
+    "uk_aq_generic_integrity_v2_transition_state_fingerprint_v5"
 )
 GENERIC_INTEGRITY_V2_SELECTED_SCOPE_AUTHORITY_CONTRACT = (
-    "uk_aq_generic_integrity_v2_selected_scope_authority_v2"
+    "uk_aq_generic_integrity_v2_selected_scope_authority_v3"
 )
 GENERIC_V2_OPERATIONAL_CONTEXT_CONTRACT = (
     "uk_aq_generic_v2_official_rdata_operational_context_v1"
@@ -20610,10 +20895,10 @@ def _official_rdata_scope_source_evidence_authority(
     pollutant_code: str,
 ) -> dict[str, Any]:
     """Freeze the path-free semantic evidence for one selected pollutant."""
-    projection = _official_rdata_v8_semantic_evidence_projection(source_evidence)
-    semantic_sha256 = _official_rdata_v8_semantic_evidence_sha256(source_evidence)
+    projection = _official_rdata_semantic_evidence_projection(source_evidence)
+    semantic_sha256 = _official_rdata_semantic_evidence_sha256(source_evidence)
     source_input_sha256 = _source_evidence_input_sha256(source_evidence)
-    proposal_acquisition_sha256 = _official_rdata_v8_acquisition_audit_sha256(
+    proposal_acquisition_sha256 = _official_rdata_acquisition_audit_sha256(
         source_evidence
     )
     persisted_acquisition_audit_id = persistence.get("acquisition_audit_id")
@@ -20649,7 +20934,7 @@ def _official_rdata_scope_source_evidence_authority(
     return {
         "contract_version":
             "uk_aq_generic_v2_official_rdata_scope_source_authority_v1",
-        "authority_kind": "persisted_official_rdata_v9_semantic_evidence",
+        "authority_kind": "persisted_official_rdata_v10_semantic_evidence",
         "history_generation": "v2",
         "day_utc": str(projection["day_utc"]),
         "connector_id": int(projection["connector_id"]),
@@ -21043,7 +21328,7 @@ def _canonical_generic_v2_scope_source_authority(
     )
     if not common_valid:
         raise ValueError("generic fixed-v2 scope source authority changed")
-    if kind == "persisted_official_rdata_v9_semantic_evidence":
+    if kind == "persisted_official_rdata_v10_semantic_evidence":
         hashes = (
             "semantic_evidence_sha256", "source_evidence_input_sha256",
             "acquisition_audit_sha256", "source_file_identities_sha256",
@@ -21092,6 +21377,46 @@ def _canonical_generic_v2_scope_source_authority(
             )
         ):
             raise ValueError("generic fixed-v2 selected final target changed")
+    elif kind == "authenticated_wholly_source_unavailable_v10":
+        semantic_sha = str(authority.pop("semantic_authority_sha256", ""))
+        audit_sha = str(authority.pop("acquisition_audit_sha256", ""))
+        audit = authority.pop("acquisition_audit", None)
+        files = list(audit.get("source_file_acquisition_audit") or []) if isinstance(audit, Mapping) else []
+        if (outcome != "source_artifact_unavailable_preserved"
+                or authority.get("evidence_contract_version") != 10
+                or not files or len(files) != len(authority.get("files_read") or [])
+                or len(authority.get("source_file_identities") or []) != len(files)
+                or authority.get("source_file_identities") != [{
+                    "source_file": item.get("source_file"),
+                    "bytes": item.get("bytes"),
+                    "sha256": item.get("sha256"),
+                } for item in files]
+                or set(authority.get("files_required") or [])
+                != set(authority.get("files_read") or [])
+                | set(authority.get("files_authoritatively_absent") or [])
+                or hashlib.sha256(_canonical_json_utf8_bytes(
+                    authority["source_column_classifications"]
+                )).hexdigest() != authority.get("source_column_classifications_sha256")
+                or not isinstance(audit, Mapping)
+                or audit.get("audit_contract_version") != 2
+                or audit.get("semantic_authority_sha256") != semantic_sha
+                or audit_sha != hashlib.sha256(
+                    _canonical_json_utf8_bytes(audit)
+                ).hexdigest()
+                or any(
+                    not isinstance(item, Mapping)
+                    or len(body := Path(str(item.get("local_path") or "")).read_bytes())
+                    != item.get("bytes")
+                    or hashlib.sha256(body).hexdigest() != item.get("sha256")
+                    for item in files
+                )
+                or semantic_sha != hashlib.sha256(
+                    _canonical_json_utf8_bytes(authority)
+                ).hexdigest()):
+            raise ValueError("generic fixed-v2 v10 preserved source authority is invalid")
+        authority["semantic_authority_sha256"] = semantic_sha
+        authority["acquisition_audit"] = dict(audit)
+        authority["acquisition_audit_sha256"] = audit_sha
     elif kind == "authenticated_wholly_source_unavailable":
         semantic_sha = str(authority.pop("semantic_authority_sha256", ""))
         metadata_key = f"{authority.get('source_adapter')}:metadata"
@@ -24509,6 +24834,12 @@ def _authenticate_official_rdata_final_target(
             or evidence["observed_property_mapping_sha256"] != context["observed_property_mapping_sha256"]
             or evidence["mapping_audit"] != context["mapping_audit"]):
         raise ValueError("official RData authoritative mapping changed")
+    expected_columns = sorted((
+        item for item in context["column_classifications_by_day"].get(day, [])
+        if item["pollutant_code"] in selected
+    ), key=_canonical_json_utf8_bytes)
+    if evidence.get("source_column_classifications") != expected_columns:
+        raise ValueError("official RData v10 columns differ from pinned native-R decoding")
     audit = evidence["acquisition_audit"]
     if _official_rdata_source_artifact_availability_identity({
         "source_unavailable_scopes": audit["source_unavailable_scope_acquisition_audit"],
@@ -28144,7 +28475,7 @@ def _bound_source_evidence_rows(
         or not isinstance(evidence, Mapping)
         or not isinstance(rows, list)
         or evidence.get("history_generation") != "v2"
-        or _official_rdata_v8_semantic_evidence_sha256(evidence)
+        or _official_rdata_semantic_evidence_sha256(evidence)
         != str(evidence_sha or "")
         or _source_evidence_input_sha256(evidence)
         != str(source_input_sha or "")
