@@ -28445,11 +28445,65 @@ def run_integrity_ingest_boundary_check(
     return output
 
 
+def _official_rdata_verified_repair_pollutants(
+    scope_entry: Mapping[str, Any],
+    selected_scopes: Iterable[Mapping[str, Any]],
+) -> list[str]:
+    """Bind a completed repair to its admitted pollutant-scoped authority."""
+    complete = scope_entry.get("complete_source_evidence")
+    persistence = scope_entry.get("immutable_detector_source_evidence_persistence")
+    if not isinstance(complete, Mapping) or not isinstance(persistence, Mapping):
+        raise ValueError("official RData repair source binding is unavailable")
+    day_utc = scope_entry.get("day_utc")
+    connector_id = scope_entry.get("connector_id")
+    partition_code = scope_entry.get("pollutant_code")
+    if partition_code is not None and (
+        not isinstance(partition_code, str)
+        or partition_code not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
+    ):
+        raise ValueError("official RData repair pollutant scope is invalid")
+    admitted: list[str] = []
+    for scope in selected_scopes:
+        if (scope.get("day_utc") != day_utc
+                or scope.get("connector_id") != connector_id):
+            continue
+        code = scope.get("pollutant_code")
+        if partition_code is not None and code != partition_code:
+            continue
+        authority = scope.get("source_evidence_authority")
+        if not isinstance(authority, Mapping) or authority.get(
+            "authority_kind"
+        ) != "persisted_official_rdata_v10_semantic_evidence":
+            continue
+        if authority.get("evidence_id") != persistence.get("evidence_id"):
+            continue
+        if (
+            scope.get("outcome") not in {
+                "complete_replacement",
+                "partial_source_unavailable_preserved_replacement",
+                "authoritative_no_data_replacement",
+            }
+            or authority != _official_rdata_scope_source_evidence_authority(
+                source_evidence=complete,
+                persistence=persistence,
+                pollutant_code=code,
+            )
+            or code not in (complete.get("requested_pollutant_set") or [])
+            or code not in (complete.get("source_available_pollutant_codes") or [])
+        ):
+            raise ValueError("official RData admitted pollutant source binding changed")
+        admitted.append(code)
+    if not admitted or len(admitted) != len(set(admitted)):
+        raise ValueError("official RData admitted repair pollutant scope is unavailable")
+    return sorted(admitted, key=_canonical_utf8_sort_key)
+
+
 def _bound_source_evidence_rows(
     conn: sqlite3.Connection,
     *,
     env_name: str,
     scope_entry: Mapping[str, Any],
+    selected_scopes: Iterable[Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Reload and authenticate the exact immutable evidence accepted by repair."""
     day_utc = str(scope_entry.get("day_utc") or "").strip()
@@ -28553,11 +28607,11 @@ def _bound_source_evidence_rows(
     ):
         raise ValueError("bound canonical source evidence identity changed")
     verified_codes = scope_entry.get("verified_pollutant_codes")
-    if verified_codes is None:
-        verified_codes = [scope_entry.get("pollutant_code")]
-    if (not isinstance(verified_codes, list) or not verified_codes
-            or any(not isinstance(code, str) or not code for code in verified_codes)
-            or not set(verified_codes).issubset(
+    admitted_codes = _official_rdata_verified_repair_pollutants(
+        scope_entry, selected_scopes,
+    )
+    if (verified_codes != admitted_codes
+            or not set(admitted_codes).issubset(
                 set(evidence.get("requested_pollutant_set") or [])
             )):
         raise ValueError("bound official source verified pollutant membership changed")
@@ -28606,6 +28660,7 @@ def _first_value_at_candidates_from_evidence(
     repair_entry: Mapping[str, Any],
     *,
     env_name: str,
+    selected_scopes: Iterable[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     day_utc = str(repair_entry.get("day_utc") or "").strip()
     try:
@@ -28614,6 +28669,7 @@ def _first_value_at_candidates_from_evidence(
         raise ValueError("canonical source evidence day_utc is invalid") from exc
     canonical_rows, _audit = _bound_source_evidence_rows(
         conn, env_name=env_name, scope_entry=repair_entry,
+        selected_scopes=selected_scopes,
     )
     earliest: dict[int, dt.datetime] = {}
     for canonical_row in canonical_rows:
@@ -28679,6 +28735,7 @@ def _current_state_candidates_from_verified_evidence(
     conn: sqlite3.Connection,
     env_name: str,
     scope_entries: Iterable[Mapping[str, Any]],
+    selected_scopes: Iterable[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Derive current-state inputs only from immutable verified source rows."""
     entries = sorted(
@@ -28706,6 +28763,7 @@ def _current_state_candidates_from_verified_evidence(
         if isinstance(persistence, Mapping):
             rows, evidence_audit = _bound_source_evidence_rows(
                 conn, env_name=env_name, scope_entry=scope_entry,
+                selected_scopes=selected_scopes,
             )
             evidence_audits.append(evidence_audit)
         elif connector_id in {9, 10}:
@@ -29299,6 +29357,7 @@ def run_current_state_reconciliation(
     final_verification: Mapping[str, Any],
     log: logging.Logger,
     dedicated_partition_entries: Iterable[Mapping[str, Any]] | None = None,
+    selected_scopes: Iterable[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     settings = {**os.environ, **{str(key): str(value) for key, value in env.items()}}
     enabled = _is_truthy(settings.get(
@@ -29362,6 +29421,7 @@ def run_current_state_reconciliation(
             })
         }
         bound_official_scopes: dict[tuple[str, int, str], dict[str, Any]] = {}
+        admitted_scope_owners: set[tuple[str, int, str]] = set()
         for entry in source_scope_entries:
             key = (str(entry.get("day_utc") or "").strip(),
                    int(entry.get("connector_id") or 0),
@@ -29369,6 +29429,11 @@ def run_current_state_reconciliation(
             binding = entry.get("immutable_detector_source_evidence_persistence")
             if key[1] not in {9, 10} or not isinstance(binding, Mapping):
                 continue
+            for code in entry.get("verified_pollutant_codes") or []:
+                admitted_key = (key[0], key[1], code)
+                if admitted_key in admitted_scope_owners:
+                    raise ValueError("duplicate admitted official pollutant current-state scope")
+                admitted_scope_owners.add(admitted_key)
             previous = bound_official_scopes.get(key)
             if previous is not None and (
                 previous["immutable_detector_source_evidence_persistence"] != binding
@@ -29391,6 +29456,7 @@ def run_current_state_reconciliation(
             conn=conn,
             env_name=env_name,
             scope_entries=candidate_scope_entries,
+            selected_scopes=selected_scopes,
         )
     raw_candidates = list(derived["raw_candidates"])
     snapshot_candidates = list(derived["latest_snapshot_candidates"])
@@ -29772,6 +29838,7 @@ def run_first_value_at_reconciliation(
     dry_run: bool,
     log: logging.Logger,
     verified_connector_days: Iterable[Mapping[str, Any]] = (),
+    selected_scopes: Iterable[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     def database_summary(status: str = "blocked_dependency") -> dict[str, Any]:
         return {
@@ -29948,6 +30015,7 @@ def run_first_value_at_reconciliation(
                     conn,
                     scope_entry,
                     env_name=str(env.get("UK_AQ_ENV_NAME") or ""),
+                    selected_scopes=selected_scopes,
                 )
             else:
                 candidates = _normalise_first_value_at_candidates(
@@ -31254,6 +31322,28 @@ def run_v2_integrity_repair_flow(
             "mode": generic_v2_noop_mode,
             "canonical_mutation_required": False,
         }
+    admitted_selected_scopes: list[dict[str, Any]] = []
+    if (generic_official_rdata and not proposal_failed
+            and apply_result.get("status") != "failed"
+            and final_verification.get("status") in {"ok", "planned"}):
+        admitted_selected_scopes = list(
+            _canonical_generic_integrity_selected_scope_authority(
+                run_state
+            )["selected_scopes"]
+        )
+        admitted_owners: set[tuple[str, int, str]] = set()
+        for repair_entry in observations.get("v2_observation_repair_results") or []:
+            if repair_entry.get("status") != "ok":
+                continue
+            codes = _official_rdata_verified_repair_pollutants(
+                repair_entry, admitted_selected_scopes,
+            )
+            for code in codes:
+                owner = (repair_entry["day_utc"], repair_entry["connector_id"], code)
+                if owner in admitted_owners:
+                    raise ValueError("duplicate admitted official repair pollutant scope")
+                admitted_owners.add(owner)
+            repair_entry["verified_pollutant_codes"] = codes
     non_serving_retained_v2 = non_serving_retained_v2_requested
     if non_serving_retained_v2:
         first_value_at_reconciliation = {
@@ -31318,6 +31408,7 @@ def run_v2_integrity_repair_flow(
             dry_run=dry_run,
             log=log,
             verified_connector_days=verified_first_value_at_connector_days,
+            selected_scopes=admitted_selected_scopes,
         )
     if generic_v2_operational_context is not None:
         first_value_at_reconciliation["generic_v2_operational_context"] = {
@@ -31442,6 +31533,7 @@ def run_v2_integrity_repair_flow(
                     all_observation_repair_entries
                     if dedicated_sos_historical_replacement else None
                 ),
+                selected_scopes=admitted_selected_scopes,
             )
     except Exception:
         if canonical_apply_succeeded:
