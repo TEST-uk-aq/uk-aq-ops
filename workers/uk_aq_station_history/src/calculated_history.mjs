@@ -235,8 +235,8 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
   }
   const expected = hourEndpoints(outputStartMs, outputEndMs);
   const aqiRows = request.includeAqi ? calculateLogicalAqi(rows, request, selection.segments, outputStartMs, outputEndMs, expected) : [];
-  // Raw-observation completeness uses containing half-open hourly intervals:
-  // exact-hour and sub-hour readings both cover the interval's next endpoint.
+  // Observation gaps use the same hour-ending convention as AQI:
+  // exact-hour readings retain their endpoint; sub-hour readings use the next.
   const aqiPresent = new Set(aqiRows.map((row) => Date.parse(row.timestamp_hour_utc)));
   // Hidden PM context affects AQI only. A continuity gap before the visible
   // range must never make an otherwise complete observation response partial.
