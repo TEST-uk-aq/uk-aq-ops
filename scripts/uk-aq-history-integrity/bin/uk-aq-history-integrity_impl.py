@@ -28462,6 +28462,16 @@ def _official_rdata_verified_repair_pollutants(
         or partition_code not in V2_OBSERVATION_INTEGRITY_POLLUTANTS
     ):
         raise ValueError("official RData repair pollutant scope is invalid")
+    requested = complete.get("requested_pollutant_set")
+    if not isinstance(requested, list) or not requested:
+        raise ValueError("official RData repair pollutant boundary is unavailable")
+    if partition_code is not None and partition_code not in requested:
+        raise ValueError("official RData repair pollutant escaped source boundary")
+    replacement_outcomes = {
+        "complete_replacement",
+        "partial_source_unavailable_preserved_replacement",
+        "authoritative_no_data_replacement",
+    }
     admitted: list[str] = []
     for scope in selected_scopes:
         if (scope.get("day_utc") != day_utc
@@ -28470,25 +28480,25 @@ def _official_rdata_verified_repair_pollutants(
         code = scope.get("pollutant_code")
         if partition_code is not None and code != partition_code:
             continue
+        if partition_code is None and code not in requested:
+            continue
+        if scope.get("outcome") == "source_artifact_unavailable_preserved":
+            continue
+        if scope.get("outcome") not in replacement_outcomes:
+            raise ValueError("official RData admitted repair outcome is invalid")
         authority = scope.get("source_evidence_authority")
         if not isinstance(authority, Mapping) or authority.get(
             "authority_kind"
         ) != "persisted_official_rdata_v10_semantic_evidence":
-            continue
+            raise ValueError("official RData admitted replacement source authority is invalid")
         if authority.get("evidence_id") != persistence.get("evidence_id"):
-            continue
+            raise ValueError("official RData admitted replacement evidence ID changed")
         if (
-            scope.get("outcome") not in {
-                "complete_replacement",
-                "partial_source_unavailable_preserved_replacement",
-                "authoritative_no_data_replacement",
-            }
-            or authority != _official_rdata_scope_source_evidence_authority(
+            authority != _official_rdata_scope_source_evidence_authority(
                 source_evidence=complete,
                 persistence=persistence,
                 pollutant_code=code,
             )
-            or code not in (complete.get("requested_pollutant_set") or [])
             or code not in (complete.get("source_available_pollutant_codes") or [])
         ):
             raise ValueError("official RData admitted pollutant source binding changed")
@@ -31331,10 +31341,22 @@ def run_v2_integrity_repair_flow(
                 run_state
             )["selected_scopes"]
         )
+        replacement_outcomes = {
+            "complete_replacement",
+            "partial_source_unavailable_preserved_replacement",
+            "authoritative_no_data_replacement",
+        }
+        replacement_scopes = {
+            (scope["day_utc"], scope["connector_id"], scope["pollutant_code"])
+            for scope in admitted_selected_scopes
+            if scope["outcome"] in replacement_outcomes
+        }
         admitted_owners: set[tuple[str, int, str]] = set()
+        successful_entries = 0
         for repair_entry in observations.get("v2_observation_repair_results") or []:
             if repair_entry.get("status") != "ok":
                 continue
+            successful_entries += 1
             codes = _official_rdata_verified_repair_pollutants(
                 repair_entry, admitted_selected_scopes,
             )
@@ -31344,6 +31366,23 @@ def run_v2_integrity_repair_flow(
                     raise ValueError("duplicate admitted official repair pollutant scope")
                 admitted_owners.add(owner)
             repair_entry["verified_pollutant_codes"] = codes
+        empty_noop_scopes = (
+            successful_entries == 0
+            and generic_v2_noop_mode is not None
+            and all(
+                scope["outcome"] == "authoritative_no_data_replacement"
+                and scope["authorised_tombstone_prefix"] is None
+                and not scope["replacement_object_keys"]
+                for scope in admitted_selected_scopes
+                if scope["outcome"] in replacement_outcomes
+            )
+        )
+        if not empty_noop_scopes and admitted_owners != replacement_scopes:
+            raise ValueError(
+                "official RData admitted replacement ownership is incomplete: "
+                f"unowned={sorted(replacement_scopes - admitted_owners)} "
+                f"unexpected={sorted(admitted_owners - replacement_scopes)}"
+            )
     non_serving_retained_v2 = non_serving_retained_v2_requested
     if non_serving_retained_v2:
         first_value_at_reconciliation = {
