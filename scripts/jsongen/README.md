@@ -313,6 +313,20 @@ physical schema/writer identity, so schema 3 and 4 may coexist across scopes.
 It does not reconstruct status from Parquet or equate the distinct observation
 and measurement content-hash versions.
 
+Selected-v3 binding inspection retains logical `history_version=v2` and accepts
+schema 1 exact bindings alongside schema 2 continuity bindings. Schema 2 is
+checked as a complete physical family: unique positive members in deterministic
+`valid_from_day_utc`, `timeseries_id` order, real UTC calendar dates, inclusive
+validity intervals with no overlap or multiple open-ended members, and exact
+top-level physical membership. Gaps remain gaps. The continuity key must match
+connector, UK-AIR reference and pollutant; stable reference fields are checked.
+The active shared producer currently requires a non-null `site_ref`, while the
+continuity contract permits null and requires agreement only among non-null
+values. The inspector accepts null as corroborating identity, never as a
+substitute for `uk_air_ref`. The shared source-row builder sorts and materialises
+families, so it cannot validate the ordering of an already published binding;
+this bounded read validator rejects contradictory published payloads.
+
 Verification mode is connector scoped. An independently accepted pre-overlay
 mode with physical schema 3 reports `embedded_status_requires_writer_evidence`;
 the embedded P/R/null values still require the original writer's final proof.
@@ -329,11 +343,23 @@ overlay-authoritative unresolved state, never silent embedded/null fallback.
 source; no such provider is wired into this inactive stage. Its caller must
 establish that evidence outside JSONgen before supplying a mode.
 
+For a scope whose complete parent membership proves current physical absence,
+verification is `not_applicable_to_absent_scope`: there are no rows or physical
+schema from which to select embedded or overlay status. Binding authority is
+still inspected separately, and missing references or metadata drift do not
+become authoritative absence. Current absence does not authenticate the
+originating writer's final removal, complete replacement bundle, registration
+coverage or supersession.
+
 Report schema remains version 1 with existing diagnostic objects and an optional
 per-scope physical identity. Historical receipts are not changed. Old reports
 that claim an `_index_v2` binding prefix as selected-v3 authority now fail
 validation; they remain immutable historical evidence. Metadata drift and
 writer-authentication gaps remain unresolved diagnostics, not supersession.
+Version-1 report validation accepts `not_applicable_to_absent_scope` only with
+`physical.membership=authoritative_absent`, without selected overlay or embedded
+status fields. Existing immutable diagnostic reports keep their historical
+representation. Managed monthly publication selection remains disabled.
 
 `reconcile.mjs` compares a bounded control snapshot, registered receipt references,
 explicit retained references and requested canonical scopes. It preserves evidence

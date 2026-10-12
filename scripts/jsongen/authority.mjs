@@ -20,6 +20,48 @@ import { createBudget, evidence, parseJson, freeze } from './limits.mjs';
 
 const sha = /^[a-f0-9]{64}$/;
 const descriptor = (bucket, key, body) => ({ bucket, key, byte_size: body.length, sha256: sha256Hex(body) });
+const validUtcDay = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)
+  && Number.isFinite(Date.parse(`${value}T00:00:00.000Z`))
+  && new Date(`${value}T00:00:00.000Z`).toISOString().slice(0, 10) === value;
+function validContinuity(continuity, identity) {
+  const c = continuity;
+  if (!c || typeof c !== 'object' || Array.isArray(c)
+    || c.schema_version !== 1 || c.source !== 'sos_station_timeseries_site_refs'
+    || typeof c.uk_air_ref !== 'string' || !c.uk_air_ref.trim()
+    || !(c.site_ref === null || (typeof c.site_ref === 'string' && c.site_ref.trim()))
+    || c.pollutant_code !== identity.pollutant_code
+    || c.continuity_key !== `${identity.connector_id}:${c.uk_air_ref}:${identity.pollutant_code}`
+    || !Array.isArray(c.members) || c.members.length < 2) return false;
+  const allowed = ['schema_version', 'source', 'continuity_key', 'site_ref', 'uk_air_ref', 'pollutant_code', 'members'];
+  if (Object.keys(c).some(key => !allowed.includes(key))) return false;
+  const ids = new Set(); let topLevelCount = 0; let openEndedCount = 0; let previous = null;
+  for (const member of c.members) {
+    if (!member || typeof member !== 'object' || Array.isArray(member)
+      || Object.keys(member).some(key => !['station_id', 'station_ref', 'timeseries_id', 'timeseries_ref',
+        'valid_from_day_utc', 'valid_to_day_utc'].includes(key))
+      || !Number.isSafeInteger(member.station_id) || member.station_id <= 0
+      || !Number.isSafeInteger(member.timeseries_id) || member.timeseries_id <= 0
+      || ![member.station_ref, member.timeseries_ref].every(ref => ref === undefined || ref === null
+        || (typeof ref === 'string' && ref.trim().length > 0))
+      || !validUtcDay(member.valid_from_day_utc)
+      || !(member.valid_to_day_utc === null || validUtcDay(member.valid_to_day_utc))
+      || (member.valid_to_day_utc !== null && member.valid_to_day_utc < member.valid_from_day_utc)
+      || ids.has(member.timeseries_id)) return false;
+    ids.add(member.timeseries_id);
+    if (member.timeseries_id === identity.timeseries_id) {
+      topLevelCount++;
+      if (member.station_id !== identity.station_id) return false;
+    }
+    if (member.valid_to_day_utc === null) openEndedCount++;
+    if (previous && (previous.valid_from_day_utc > member.valid_from_day_utc
+      || (previous.valid_from_day_utc === member.valid_from_day_utc
+        && previous.timeseries_id >= member.timeseries_id)
+      || previous.valid_to_day_utc === null
+      || member.valid_from_day_utc <= previous.valid_to_day_utc)) return false;
+    previous = member;
+  }
+  return topLevelCount === 1 && openEndedCount <= 1;
+}
 function child(parent, fields, parentKey, expectedKey, kind) {
   const lists = fields.map(field => {
     evidence(Array.isArray(parent[field]), 'invalid_canonical_metadata', `missing complete ${field}: ${parentKey}`);
@@ -256,23 +298,8 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
       && Object.entries(identity).every(([k, v]) => value[k] === v), 'invalid_binding_authority', 'physical binding identity mismatch');
     if (value.schema_version === 1) evidence(!Object.hasOwn(value, 'continuity'),
       'invalid_binding_authority', 'schema-1 binding cannot carry continuity');
-    if (value.schema_version === 2) {
-      const c = value.continuity;
-      evidence(c?.schema_version === 1 && c.source === 'sos_station_timeseries_site_refs'
-        && typeof c.uk_air_ref === 'string' && c.uk_air_ref.length > 0
-        && typeof c.site_ref === 'string' && c.site_ref.length > 0
-        && c.pollutant_code === identity.pollutant_code
-        && c.continuity_key === `${identity.connector_id}:${c.uk_air_ref}:${identity.pollutant_code}`
-        && Array.isArray(c.members) && c.members.length >= 2
-        && new Set(c.members.map(m => m.timeseries_id)).size === c.members.length
-        && c.members.some(m => m.timeseries_id === identity.timeseries_id && m.station_id === identity.station_id)
-        && c.members.every(m => Number.isSafeInteger(m.timeseries_id) && m.timeseries_id > 0
-          && Number.isSafeInteger(m.station_id) && m.station_id > 0
-          && /^\d{4}-\d\d-\d\d$/.test(m.valid_from_day_utc)
-          && (m.valid_to_day_utc === null || (typeof m.valid_to_day_utc === 'string'
-            && m.valid_to_day_utc >= m.valid_from_day_utc))),
+    if (value.schema_version === 2) evidence(validContinuity(value.continuity, identity),
       'invalid_binding_authority', 'schema-2 continuity identity is contradictory');
-    }
     return object.reference;
   };
   const verification = async (identity, physical) => {
@@ -319,6 +346,9 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
       result.physical = h.membership === 'authoritative_absent' ? { membership: 'authoritative_absent', row_count: 0 } : await exact(scope, h);
     } catch (error) { result.diagnostics.push({ code: error.code || 'canonical_metadata_unavailable', detail: error.message }); }
     for (const [name, inspect] of [['binding', binding], ['verification', verification]]) {
+      if (name === 'verification' && result.physical?.membership === 'authoritative_absent') {
+        result.verification = { state: 'not_applicable_to_absent_scope' }; continue;
+      }
       try { result[name] = await inspect(scope.identity, result.physical); }
       catch (error) {
         result.diagnostics.push({ code: error.code || `${name}_metadata_unavailable`, detail: error.message });

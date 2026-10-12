@@ -214,7 +214,13 @@ export function assertReconciliationReport(report, { controlRead = null } = {}) 
       if (item.verification !== undefined) {
         keys(item.verification, ['state'], ['manifest', 'entry', 'scope_sha256']);
         evidence(['embedded_status_requires_writer_evidence', 'overlay_metadata_verified',
-          'overlay_authoritative_connector_unresolved', 'unknown_verification_transition_state'].includes(item.verification.state)
+          'overlay_authoritative_connector_unresolved', 'unknown_verification_transition_state',
+          'not_applicable_to_absent_scope'].includes(item.verification.state)
+          && (item.verification.state !== 'not_applicable_to_absent_scope'
+            || (item.physical?.membership === 'authoritative_absent'
+              && Object.keys(item.verification).length === 1))
+          && (!['embedded_status_requires_writer_evidence', 'overlay_metadata_verified'].includes(item.verification.state)
+            || item.physical?.membership === 'present')
           && !(item.physical?.physical_identity?.history_schema_version === 4
             && item.verification.state === 'embedded_status_requires_writer_evidence')
           && (item.verification.state !== 'overlay_metadata_verified' ||
