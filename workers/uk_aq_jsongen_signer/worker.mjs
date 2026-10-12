@@ -128,7 +128,7 @@ export default {
       return Response.json({ intent_id: intentId, object: { bucket: BUCKET, key,
         sha256: input.compressed_sha256, byte_size: input.compressed_byte_size,
         json_sha256: input.uncompressed_sha256, json_byte_size: input.uncompressed_byte_size },
-        upload_url: signed.url, expires_at_utc: new Date(issuedAt.getTime() + 60_000).toISOString(),
+        upload_url: signed.url, expires_at_utc: signed.expiresAtUtc,
         required_headers: signed.headers, state: 'signed_upload_intent' },
       { headers: { 'Cache-Control': 'no-store' } });
     } catch { return error(503, 'signing_failure'); }

@@ -47,7 +47,11 @@ readback must reject incorrect lengths. A fresh 60-second URL may be issued
 for that key; the signed `If-None-Match: *` should make a repeated PUT return
 412 rather than overwrite it. The caller must use the exact returned headers.
 The URL is a bearer capability and must not enter logs, artifacts or public
-clients. Neither the ID nor key is durable confirmation or canonical authority.
+clients. `expires_at_utc` uses the exact second represented by signed
+`X-Amz-Date` plus the 60-second URL lifetime. Future upload clients should
+apply their own safety margin for network latency and clock differences; the
+signer does not shorten the URL to provide that margin. Neither the ID nor key
+is durable confirmation or canonical authority.
 
 ## Signing boundary
 

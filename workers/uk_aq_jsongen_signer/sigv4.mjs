@@ -22,7 +22,9 @@ export async function presignPut({ accountId, accessKeyId, secretAccessKey, buck
     throw new TypeError('invalid presigning configuration');
   const host = `${accountId}.r2.cloudflarestorage.com`;
   const path = `/${quote(bucket)}/${key.split('/').map(quote).join('/')}`;
-  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const signedAt = new Date(now.getTime());
+  signedAt.setUTCMilliseconds(0);
+  const amzDate = signedAt.toISOString().replace(/[:-]|\.\d{3}/g, '');
   const scope = `${amzDate.slice(0, 8)}/auto/s3/aws4_request`;
   const headers = {
     'content-type': contentType,
@@ -47,6 +49,7 @@ export async function presignPut({ accountId, accessKeyId, secretAccessKey, buck
   params['X-Amz-Signature'] = hex(await hmac(signingKey, stringToSign));
   return {
     url: `https://${host}${path}?${queryString(params)}`,
+    expiresAtUtc: new Date(signedAt.getTime() + expiresSeconds * 1000).toISOString(),
     headers: { 'Content-Type': contentType, 'If-None-Match': '*',
       'x-amz-checksum-sha256': checksumBase64 },
   };
