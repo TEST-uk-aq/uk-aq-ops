@@ -1,6 +1,7 @@
 import {
   AQI_ALGORITHM_VERSION,
   helperRowsToNormalizedAqiV1Rows,
+  mergeObservationRowsPreferR2,
   pivotNarrowRowsToHelperRows,
 } from "../../../lib/aqi/aqi_levels.mjs";
 import {
@@ -25,77 +26,93 @@ function identityForSegment(segment) {
   return { timeseriesId: segment.timeseriesId, connectorId: segment.connectorId, stationId: segment.stationId, pollutant: segment.pollutant };
 }
 
-function memberAt(continuity, timestampMs) {
-  const selected = selectContinuitySegments(continuity, timestampMs, timestampMs + 1).segments;
-  return selected.length === 1 ? selected[0] : null;
+function memberAt(segments, timestampMs) {
+  // Selection was already validated and sorted for the complete context range.
+  for (const segment of segments) {
+    if (timestampMs < segment.startMs) break;
+    if (timestampMs < segment.endMs) return segment;
+  }
+  return null;
 }
 
-function mergePhysicalObservations(r2Rows, ingestRows, continuity) {
-  const rows = new Map();
-  for (const source of [ingestRows, r2Rows]) {
-    for (const row of Array.isArray(source) ? source : []) {
+function mergePhysicalObservations(r2Rows, ingestRows, segments, requiredStartMs, requiredEndExclusiveMs) {
+  function prepare(source) {
+    const prepared = [];
+    const seen = new Map();
+    for (const row of source) {
       const timestamp = Date.parse(String(row?.observed_at || ""));
       const value = Number(row?.value);
-      if (!Number.isFinite(timestamp) || !Number.isFinite(value) || value < 0) continue;
-      const member = memberAt(continuity, timestamp);
+      if (!Number.isFinite(timestamp) || !Number.isFinite(value) || value < 0
+        || timestamp < requiredStartMs || timestamp >= requiredEndExclusiveMs) continue;
+      const member = memberAt(segments, timestamp);
       if (!member) continue;
-      const normalized = {
-        ...row,
-        connector_id: member.connectorId,
-        station_id: member.stationId,
-        timeseries_id: member.timeseriesId,
-        pollutant_code: member.pollutant,
-        observed_at: new Date(timestamp).toISOString(),
-        value,
-      };
-      const existing = rows.get(normalized.observed_at);
-      if (existing && (existing.timeseries_id !== normalized.timeseries_id || existing.value !== normalized.value)) throw new Error("station_history_continuity_observation_conflict");
-      if (!existing || normalized.source === "r2" || normalized.source === "json") rows.set(normalized.observed_at, normalized);
+      if (Number(row.timeseries_id) !== member.timeseriesId
+        || Number(row.station_id) !== member.stationId
+        || Number(row.connector_id) !== member.connectorId
+        || row.pollutant_code !== member.pollutant) {
+        throw new Error("station_history_continuity_observation_conflict");
+      }
+      const observedAt = new Date(timestamp).toISOString();
+      const key = `${member.timeseriesId}|${observedAt}`;
+      const previous = seen.get(key);
+      if (previous !== undefined && previous !== value) throw new Error("station_history_continuity_observation_conflict");
+      seen.set(key, value);
+      prepared.push(row.observed_at === observedAt && row.value === value
+        ? row : { ...row, observed_at: observedAt, value });
     }
+    return prepared;
   }
-  return [...rows.values()].sort((left, right) => left.observed_at.localeCompare(right.observed_at));
+  const merged = mergeObservationRowsPreferR2({
+    r2Rows: prepare(Array.isArray(r2Rows) ? r2Rows : []),
+    ingestRows: prepare(Array.isArray(ingestRows) ? ingestRows : []),
+  }).rows;
+  const identityByTimestamp = new Map();
+  for (const row of merged) {
+    const previous = identityByTimestamp.get(row.observed_at);
+    if (previous !== undefined && previous !== row.timeseries_id) throw new Error("station_history_continuity_observation_conflict");
+    identityByTimestamp.set(row.observed_at, row.timeseries_id);
+  }
+  // The shared merge orders by physical timeseries first. The logical chart
+  // stream must instead be chronological across continuity transitions.
+  return merged.sort((left, right) => left.observed_at.localeCompare(right.observed_at)
+    || left.timeseries_id - right.timeseries_id);
 }
 
-function sourceObservationsToHourEndingNarrowRows(rows) {
+function sourceObservationsToHourEndingNarrowRows(rows, request, outputStartMs, outputEndMs) {
   const grouped = new Map();
-  for (const row of Array.isArray(rows) ? rows : []) {
-    const observedMs = Date.parse(String(row?.observed_at || ""));
-    const value = Number(row?.value);
-    const timeseriesId = Number(row?.timeseries_id);
-    const stationId = Number(row?.station_id);
-    const pollutantCode = String(row?.pollutant_code || "").trim().toLowerCase();
-    if (
-      !Number.isFinite(observedMs)
-      || !Number.isFinite(value)
-      || value < 0
-      || !Number.isInteger(timeseriesId)
-      || timeseriesId <= 0
-      || !Number.isInteger(stationId)
-      || stationId <= 0
-      || !pollutantCode
-    ) continue;
+  for (const row of rows) {
+    const observedMs = Date.parse(row.observed_at);
 
     // Station-history AQI intervals are hour-ending. An observation exactly
     // on the hour keeps that timestamp as its endpoint; an observation inside
     // the hour belongs to the next clock-hour endpoint. This makes the bucket
     // represent (previous endpoint, endpoint] without collapsing raw readings.
     const endpointMs = Math.ceil(observedMs / HOUR_MS) * HOUR_MS;
+    if (endpointMs > outputEndMs) continue;
     const endpointIso = new Date(endpointMs).toISOString();
-    const key = `${timeseriesId}|${endpointIso}`;
-    const current = grouped.get(key) || {
-      timeseries_id: timeseriesId,
-      station_id: stationId,
-      connector_id: row?.connector_id == null ? null : Number(row.connector_id),
-      pollutant_code: pollutantCode,
+    const current = grouped.get(endpointMs) || {
+      timeseries_id: request.timeseriesId,
+      station_id: request.stationId,
+      connector_id: request.connectorId,
+      pollutant_code: request.pollutant,
       timestamp_hour_utc: endpointIso,
       sum: 0,
       count: 0,
     };
-    current.sum += value;
+    current.sum += row.value;
     current.count += 1;
-    grouped.set(key, current);
+    grouped.set(endpointMs, current);
   }
-
+  // A complete source read can legitimately have no observation in a visible
+  // hour. Give the shared helper that hour so it evaluates a blank band (or a
+  // valid PM rolling band) instead of leaving the endpoint unevaluated.
+  for (const endpointMs of hourEndpoints(outputStartMs, outputEndMs)) {
+    if (!grouped.has(endpointMs)) grouped.set(endpointMs, {
+      timeseries_id: request.timeseriesId, station_id: request.stationId,
+      connector_id: request.connectorId, pollutant_code: request.pollutant,
+      timestamp_hour_utc: new Date(endpointMs).toISOString(), sum: 0, count: 0,
+    });
+  }
   return Array.from(grouped.values()).map((row) => ({
     timeseries_id: row.timeseries_id,
     station_id: row.station_id,
@@ -104,23 +121,13 @@ function sourceObservationsToHourEndingNarrowRows(rows) {
     pollutant_code: row.pollutant_code,
     hourly_mean_ugm3: row.count ? row.sum / row.count : null,
     sample_count: row.count || null,
-  })).sort((left, right) => {
-    if (left.timestamp_hour_utc !== right.timestamp_hour_utc) {
-      return left.timestamp_hour_utc.localeCompare(right.timestamp_hour_utc);
-    }
-    return left.timeseries_id - right.timeseries_id;
-  });
+  })).sort((left, right) => left.timestamp_hour_utc.localeCompare(right.timestamp_hour_utc));
 }
 
-function calculateLogicalAqi(observationRows, request, continuity, outputStartMs, outputEndMs) {
-  const logicalRows = observationRows.map((row) => ({
-    ...row,
-    station_id: request.stationId,
-    timeseries_id: request.timeseriesId,
-  }));
+function calculateLogicalAqi(observationRows, request, segments, outputStartMs, outputEndMs) {
   return helperRowsToNormalizedAqiV1Rows(
     pivotNarrowRowsToHelperRows(
-      sourceObservationsToHourEndingNarrowRows(logicalRows),
+      sourceObservationsToHourEndingNarrowRows(observationRows, request, outputStartMs, outputEndMs),
       {
         rangeStartUtc: new Date(outputStartMs + HOUR_MS).toISOString(),
         rangeEndUtc: new Date(outputEndMs + HOUR_MS).toISOString(),
@@ -135,7 +142,7 @@ function calculateLogicalAqi(observationRows, request, continuity, outputStartMs
     // AQI timestamps are hour-ending endpoints. Attribute the interval to
     // the physical member that supplied the observation immediately before
     // that endpoint, including at a midnight continuity boundary.
-    const physical = memberAt(continuity, endpoint - 1);
+    const physical = memberAt(segments, endpoint - 1);
     if (!physical) throw new Error("station_history_continuity_aqi_identity_missing");
     return {
       ...row,
@@ -210,20 +217,22 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
     })));
   }
   const r2Rows = reads.flatMap((entry) => entry.result.rows);
-  const rows = mergePhysicalObservations(r2Rows, ingestRows, continuity);
-  const visibleRows = rows.filter((row) => {
+  const rows = mergePhysicalObservations(r2Rows, ingestRows, selection.segments, requiredStartMs, requiredEndExclusiveMs);
+  const visibleRows = [];
+  const observationPresent = new Set();
+  const sourceCounts = { r2: 0, ingest: 0, ...(observationProvider ? { json: 0 } : {}) };
+  for (const row of rows) {
     const timestamp = Date.parse(row.observed_at);
-    return timestamp >= outputStartMs && timestamp <= outputEndMs;
-  });
-  const aqiRows = request.includeAqi ? calculateLogicalAqi(rows, request, continuity, outputStartMs, outputEndMs) : [];
+    if (timestamp < outputStartMs || timestamp > outputEndMs) continue;
+    visibleRows.push(row);
+    observationPresent.add(Math.floor(timestamp / HOUR_MS) * HOUR_MS + HOUR_MS);
+    if (Object.hasOwn(sourceCounts, row.source)) sourceCounts[row.source] += 1;
+  }
+  const aqiRows = request.includeAqi ? calculateLogicalAqi(rows, request, selection.segments, outputStartMs, outputEndMs) : [];
   const expected = hourEndpoints(outputStartMs, outputEndMs);
   // Raw-observation completeness uses containing half-open hourly intervals:
   // exact-hour and sub-hour readings both cover the interval's next endpoint.
-  const observationPresent = new Set(visibleRows
-    .map((row) => Date.parse(row.observed_at))
-    .filter(Number.isFinite)
-    .map((timestamp) => Math.floor(timestamp / HOUR_MS) * HOUR_MS + HOUR_MS));
-  const aqiPresent = new Set(aqiRows.map((row) => Date.parse(row.timestamp_hour_utc)).filter(Number.isFinite));
+  const aqiPresent = new Set(aqiRows.map((row) => Date.parse(row.timestamp_hour_utc)));
   // Hidden PM context affects AQI only. A continuity gap before the visible
   // range must never make an otherwise complete observation response partial.
   const observationGaps = includeObservations
@@ -240,11 +249,17 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
   const r2Complete = reads.length === selection.segments.length
     && reads.every((entry) => entry.result.response_complete === true);
   const sourceComplete = !readBudgetExceeded && (r2Complete || ingestComplete === true);
-  const observationsComplete = includeObservations && sourceComplete && observationGaps.length === 0;
-  const aqiStatusesComplete = !request.includeAqi || aqiRows.every((row) => row.daqi_calculation_status === "ok" && row.eaqi_calculation_status === "ok");
+  const observationsComplete = includeObservations && sourceComplete && visibleSelection.gaps.length === 0;
+  const evaluatedStatus = (status, reason) => status === "ok"
+    || (status === "insufficient_samples" && reason === "insufficient_rolling_24h_hours")
+    || (status === "missing_input" && reason === "no_input_value");
+  const aqiStatusesComplete = !request.includeAqi || aqiRows.every((row) =>
+    evaluatedStatus(row.daqi_calculation_status, row.daqi_missing_reason)
+    && evaluatedStatus(row.eaqi_calculation_status, row.eaqi_missing_reason));
   const aqiContextComplete = selection.gaps.length === 0
     && (!observationProvider || reads.every((entry) => entry.result.context_complete !== false));
-  const aqiComplete = request.includeAqi && sourceComplete && aqiContextComplete && aqiGaps.length === 0 && aqiStatusesComplete;
+  const aqiComplete = request.includeAqi && sourceComplete && aqiContextComplete
+    && aqiPresent.size === expected.length && aqiStatusesComplete;
   const observationPartialReasons = observationsComplete ? [] : Array.from(new Set([
     ...r2PartialReasons,
     ...(sourceComplete ? [] : ["required_observation_source_incomplete"]),
@@ -287,7 +302,7 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
       gap_ranges: observationGaps,
       partial_reasons: includeObservations ? observationPartialReasons : [],
       source_segments: sourceSegments,
-      source_counts: { r2: visibleRows.filter((row) => row.source === "r2").length, ingest: visibleRows.filter((row) => row.source === "ingest").length, ...(observationProvider ? { json: visibleRows.filter((row) => row.source === "json").length } : {}) },
+      source_counts: sourceCounts,
     },
     aqi: request.includeAqi ? {
       enabled: true,

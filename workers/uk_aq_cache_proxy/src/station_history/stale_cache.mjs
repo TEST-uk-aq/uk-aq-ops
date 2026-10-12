@@ -107,13 +107,17 @@ export function inspectCompleteGapFreePayload(payload, internalRoute) {
   if (internalRoute === "/v1/station-series") {
     const aqi = payload.aqi;
     const observations = payload.observations;
+    // Calculated history can have a fully resolved source read with genuine
+    // missing observation hours. Its gap metadata describes the data; only
+    // response_complete certifies the source and continuity evidence.
+    const calculated = payload?.source?.mode === "continuity_calculated_observations";
     const aqiComplete = isObject(aqi) && (
       (aqi.enabled === false && aqi.state === "disabled" && !hasKnownGap(aqi))
-      || (aqi.enabled !== false && aqi.response_complete === true && !hasKnownGap(aqi))
+      || (aqi.enabled !== false && aqi.response_complete === true && (calculated || !hasKnownGap(aqi)))
     );
     const observationsComplete = isObject(observations) && (
       (observations.enabled === false && observations.state === "disabled" && !hasKnownGap(observations))
-      || (observations.enabled !== false && observations.response_complete === true && !hasKnownGap(observations))
+      || (observations.enabled !== false && observations.response_complete === true && (calculated || !hasKnownGap(observations)))
     );
     const cacheable = isObject(aqi)
       && isObject(observations)

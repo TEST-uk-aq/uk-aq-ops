@@ -242,7 +242,9 @@ export async function readDirectIngestObservations({ env, identity, startMs, end
     timeseries_id: identity.timeseriesId,
     window_label: windowLabel,
     limit_rows: null,
-    since_ts: null,
+    // The RPC applies an exclusive lower bound. Subtract one millisecond so
+    // an observation exactly at the required start remains eligible.
+    since_ts: new Date(startMs - 1).toISOString(),
     include_status: false,
   };
 
