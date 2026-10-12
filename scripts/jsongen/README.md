@@ -1,9 +1,14 @@
-# Managed JSONgen Stage 1 foundations
+# Managed JSONgen Stage 1 control and Stage 2 read-only evidence foundations
 
 This directory is an **inactive Node ESM library**, independent of the experimental
 `scripts/compressed_chart_history` publisher and its selector. There is no CLI,
 workflow, writer trigger, regeneration, bootstrap, deployment or serving integration.
 Do not invoke its R2 operations without separate operational authorisation.
+
+Stage 2 adds bounded immutable input verification, committed-metadata inspection,
+and explicit reconciliation reporting. It does **not** establish final-source
+authentication, complete receipt coverage, or a publication-ready current scope.
+All classifications that require those proofs remain reconciliation-required.
 
 ## Implemented and deliberately blocked
 
@@ -231,20 +236,101 @@ verified publication, source/status/binding and absence authority. This stage
 provides their common schema, not those adapters. No normal JSONgen component
 may read their SQLite/journals or infer canonical physical paths from `v3`.
 
+## Stage 2 evidence readers and current limits
+
+`inputs.mjs` reads only exact managed receipt and bundle keys from the private
+derived bucket using `r2GetObjectBounded`. It checks the reference key against
+the content SHA-256, exact compressed and uncompressed byte counts and digests,
+canonical receipt JSON, Stage 1 schema, stable identity against a registered
+receipt when supplied, and every NDJSON scope and row. A gzip input must contain
+exactly one complete record per declared scope. Rows retain physical identity,
+exact UTC millisecond timestamps, values, multiplicity, original source status,
+effective verification status, and genuine missing values. Empty records must be
+explicitly declared, with a declared absence authority. A declared authority is
+not independent proof of final canonical absence. Integrity verification returns
+`writer_authenticated: false`.
+
+`writer-authentication.mjs` records the inspected finalisation boundaries for
+Prune Daily v3, Integrity v3, SOS-light v3 and future IFW. Its interface always
+returns a fail-closed result. Prune's final v3 batch validates parent/aggregate/
+exact/latest metadata, but its frozen source temporary object is removed before
+the final batch verification. Integrity/SOS final VERIFY checks the resolved
+view, persistence and bindings; successful APPLY or an overlay file alone cannot
+bind arbitrary bundle rows to that view. The installed Pro runner and retained
+TEST verification evidence are unavailable here. IFW has no accepted canonical
+repair publication. A writer-owned adapter must retain the complete final source
+and prove its relationship to the bundle, original verified publication,
+source/status/binding evidence and removals. No adapter claims to do so today.
+
+`authority.mjs` follows the committed observation root through year, month, day,
+connector and pollutant, using existing shared validators and hash/alias rules.
+It distinguishes root-proven absence from failed or ambiguous metadata reads.
+It inspects actual index_v3 exact/scoped/leaf metadata and aligned source
+references, verification latest/manifest and physical binding metadata. It uses
+the caller's explicit canonical bucket and generation paths, not index_v3 latest
+as a parent or a guessed physical storage path. Every metadata GET is size and
+time bounded and its digest is rechecked before returning. `compareScopeMetadata`
+can say two inspected scope snapshots match or differ, including an independent
+scope; it cannot call a later snapshot an authenticated supersession without
+writer origin, final rows and complete coverage. The authority reader therefore
+sets `authority_complete: false` even for a consistent metadata read.
+
+`reconcile.mjs` compares a bounded control snapshot, registered receipt references,
+explicit retained references and requested canonical scopes. It preserves evidence
+for each scope of a multi-scope change, including matching/different declared
+metadata pins; it does not choose a winner by arrival or registration order.
+Different physical scopes remain separate. It flags a retained receipt missing
+from registration, a missing bundle, a requested current physical scope without
+a registered receipt, unavailable canonical metadata and unknown global receipt
+coverage. Metadata alone cannot identify every missing event; a durable verified
+writer outbox or equivalent inventory is still needed. Every result has
+`state: reconciliation_required`, `complete_change_coverage: false`, and
+`freshness: unknown`. A matching pin is never promoted to current/authenticated;
+a changed pin is never promoted to superseded. Explicit empty scopes also require
+independent original writer absence proof. The report retains desired/applied and
+selected monthly dependencies and PM rolling/adjacent-month effects; it does not
+calculate AQI or alter the selected pair. `reconciliationArtifact` makes a
+SHA-addressed immutable report, `retainReconciliationReport` conditionally stores
+and reads it back, and an explicitly invoked `recordReconciliationRequired` can
+record its reference via the existing CAS `record_failure` transition. There is
+no schedule, dispatcher, or automatic remote operation.
+
+The provisional per-operation admission bounds in `limits.mjs` are 1 MiB for a
+receipt, 8 MiB compressed and 32 MiB uncompressed per bundle, 8 MiB per NDJSON
+record, 128 scopes, 100,000 rows per bundle, 32 receipt references, 256 canonical
+metadata GETs of at most 8 MiB each, 64 MiB cumulative metadata bytes, 200,000
+cumulative rows, 4 MiB per report and 60 seconds. Bounded GET uses one attempt
+and a deadline; gzip output is capped before full materialisation. Exceeding a
+bound fails closed; operations must be explicitly partitioned. These are safety
+caps, not approved production capacity, control growth policy, writer-outbox
+retention or an evidence garbage-collection rule. The Stage 1 4 MiB control cap
+remains a protective admission limit. Future operating decisions must set actual
+receipt/bundle size, throughput, retention, missing-request and failed-dispatch
+policies before live use.
+
 ## Validation, remaining work and rollback
 
-Local syntax/import checks and the existing focused `tests/r2_sigv4.test.mjs`
-are appropriate here. No broad regressions, remote operations, benchmarks or
-simulated integration programme are required. Actual credentials, conditional
-R2 operations, overlaps, lost events, PM month boundaries and final source parity
-still require separately authorised real TEST acceptance.
+Run `node --test --test-isolation=none tests/jsongen_stage2.test.mjs
+tests/r2_sigv4.test.mjs`, syntax checks and `git diff --check`. The narrow Stage 2
+tests exercise bounded byte identity, complete scope membership, absence rules,
+metadata comparisons, registration gaps, unavailable writer evidence and the
+disabled selector. They do not simulate a verified production writer.
 
-Before Stage 2: implement canonical-scope dominance, complete receipt reconciliation
-and final-bundle authentication; approve
-practical bundle/control limits and retention; implement authenticated immutable
-pair/payload readback and current-scope-checked all-month selection; then implement the bounded
-baseline/context regeneration path. Keep canonical writers non-blocking and
-metadata-only reconciliation fail-closed. Workflow, triggers, bootstrap/rebuild,
+Real TEST acceptance after separate deployment requires approved scoped credentials
+and conditional PUT/readback checks; retained final Prune and Integrity/SOS writer
+evidence; a writer-owned complete-source-to-bundle adapter verified against real
+final publications and authoritative removals; overlapping/delayed and independent
+scope checks; a missing-registration/outbox interruption; PM late-month and
+following-month context checks; bounded large inputs and ambiguous writes. Keep
+the selector disabled until those proofs, complete coverage, selected baseline and
+all-month dependencies are independently authenticated.
+
+Next: add a real writer-owned final-source handover and durable receipt coverage,
+complete canonical-scope dominance, approve practical limits and retention,
+implement authenticated immutable pair/payload readback and current-scope-checked
+all-month selection, then the bounded baseline/context regeneration path. Keep
+canonical writers non-blocking and metadata-only reconciliation fail-closed.
+Workflow, triggers, bootstrap/rebuild,
 identity allowlists and website/Refresh/open-month integration remain later work.
 
 Rollback before deployment is to revert this code change. The original shared R2
@@ -256,17 +342,18 @@ JSONgen artefact enters Dropbox backup.
 
 ## ChatGPT system-documentation handover (do not apply from this repository)
 
-Update the future JSONgen implementation status to distinguish these inactive
-foundations from a working publisher. Record the managed field/path definitions,
-conditional adapter/result protocol, explicit unresolved canonical precedence and pending
-writer-authentication states, and disabled selection. Implement canonical-state
-dominance, complete receipt coverage and the final-authority-to-bundle seam before describing registration as
-publication-eligible. Record actual remote conditional-write acceptance only after
-its separately authorised check. No workflow/deployment/default serving status
-should change. Authoritative `uk-aq-system-docs` was not edited.
+Update the JSONgen implementation status to distinguish bounded read-only Stage 2
+evidence inspection from authenticated current-source classification or a working
+publisher. Record that no production writer adapter or complete receipt outbox has
+been accepted and that selection remains disabled. Record actual remote
+conditional-write acceptance only after its separately authorised check. No
+workflow/deployment/default serving status should change. Authoritative
+`uk-aq-system-docs` was not edited.
 
-There is also an existing documentation routing discrepancy to reconcile: the
-observation schema/current shared generation helper explicitly identify selected
-physical v3 observation storage, while the backup umbrella retains logical-v2
-path wording. This implementation neither resolves that discrepancy nor infers
-physical keys: source descriptors retain explicit authority references unchanged.
+There are existing routing conflicts to resolve in Chat mode: `r2_history/contract.md`
+states the binding root is `_index_v2/timeseries_binding`, while the current shared
+`getObservationHistoryGeneration('v3')` selects `_index_v3/timeseries_binding`.
+The observation schema/current shared helper identify selected physical v3
+observation storage, while older backup/prune text retains logical-v2 path wording.
+This implementation chooses neither conflicting path by guess; callers must supply
+the explicit generation/binding paths and unresolved reads fail closed.
