@@ -304,6 +304,11 @@ export function validateOfficialRdataV10Columns(evidence, audit, scopes, files) 
 }
 
 export function validateOfficialRdataV10PreservedOnlyAuthority(authority) {
+  if (!["v2", "v3"].includes(authority.history_generation)
+      || authority.contract_version
+        !== `uk_aq_generic_${authority.history_generation}_official_rdata_scope_source_authority_v1`) {
+    throw new Error("Official RData v10 preserved-only history generation is invalid");
+  }
   if (officialRdataSha256(authority.mapping_audit?.mapped_source_groups || [])
       !== authority.authoritative_station_timeseries_mapping_sha256) {
     throw new Error("Official RData v10 preserved-only binding hash changed");
@@ -365,6 +370,7 @@ export function validateOfficialRdataV10PreservedOnlyAuthority(authority) {
   }
   const evidence = {
     evidence_contract_version: 10,
+    history_generation: authority.history_generation,
     source_adapter: authority.source_adapter,
     day_utc: authority.day_utc,
     requested_pollutant_set: authority.requested_pollutant_set,

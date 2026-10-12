@@ -472,6 +472,7 @@ export function canonicalGenericV3SelectedScopeAuthority(runState) {
     const sourceEvidenceAuthority = scope.source_evidence_authority;
     if ([9, 10].includes(connectorId) && outcome === "source_artifact_unavailable_preserved") {
       if (sourceEvidenceAuthority?.authority_kind !== "authenticated_wholly_source_unavailable_v10"
+          || sourceEvidenceAuthority.history_generation !== "v3"
           || sourceEvidenceAuthority.source_adapter !== ({ 9: "waqn", 10: "saqn" })[connectorId]
           || sourceEvidenceAuthority.day_utc !== dayUtc
           || sourceEvidenceAuthority.pollutant_code !== pollutantCode) {
