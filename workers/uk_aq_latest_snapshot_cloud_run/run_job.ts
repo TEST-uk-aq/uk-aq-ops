@@ -94,6 +94,8 @@ type SnapshotManifest = {
     state_key: string;
     core_metadata_prefix: string;
     core_metadata_day_utc: string | null;
+    state_sha256: string | null;
+    core_metadata_cache_sha256: string;
   };
   matrix: {
     network_group: string;
@@ -208,6 +210,7 @@ type LoadedState = {
   stateMap: Map<string, LatestStateEntry>;
   existingHash: string | null;
   existingBytes: number;
+  validForReuse: boolean;
 };
 
 type StatePolicySummary = {
@@ -938,6 +941,7 @@ async function loadState(strict = false): Promise<LoadedState> {
       parsed = null;
     }
     const parsedRecord = asRecord(parsed);
+    let validForReuse = parsedRecord?.schema_version === 1 && Array.isArray(parsedRecord.entries);
     if (strict && (
       parsedRecord?.schema_version !== 1 || !Array.isArray(parsedRecord.entries)
     )) {
@@ -950,6 +954,7 @@ async function loadState(strict = false): Promise<LoadedState> {
     for (const row of rows) {
       const record = asRecord(row);
       if (!record) {
+        validForReuse = false;
         if (strict) throw new Error("Durable latest-state object contains a non-object entry.");
         continue;
       }
@@ -958,15 +963,28 @@ async function loadState(strict = false): Promise<LoadedState> {
       const observedAt = normalizeTimestamp(record.observed_at);
       const value = record.value === null || record.value === undefined ? null : Number(record.value);
       if (
+        typeof record.connector_id !== "number" ||
+        typeof record.timeseries_id !== "number" ||
+        typeof record.observed_at !== "string" ||
+        typeof record.value !== "number" ||
+        (record.value_float8_hex !== null && record.value_float8_hex !== undefined && typeof record.value_float8_hex !== "string") ||
+        (record.status !== null && record.status !== undefined && typeof record.status !== "string") ||
+        (record.ingested_at !== null && record.ingested_at !== undefined &&
+          (typeof record.ingested_at !== "string" || !normalizeTimestamp(record.ingested_at)))
+      ) validForReuse = false;
+      if (
         !Number.isInteger(connectorId) || connectorId <= 0 ||
         !Number.isInteger(timeseriesId) || timeseriesId <= 0 ||
         !observedAt || typeof value !== "number" || !Number.isFinite(value)
       ) {
+        validForReuse = false;
         if (strict) throw new Error("Durable latest-state object contains an invalid entry.");
         continue;
       }
+      const key = latestStateKey(Math.trunc(connectorId), Math.trunc(timeseriesId));
+      if (stateMap.has(key)) validForReuse = false;
       stateMap.set(
-        latestStateKey(Math.trunc(connectorId), Math.trunc(timeseriesId)),
+        key,
         {
           connector_id: Math.trunc(connectorId),
           timeseries_id: Math.trunc(timeseriesId),
@@ -984,6 +1002,7 @@ async function loadState(strict = false): Promise<LoadedState> {
       stateMap,
       existingHash: sha256Hex(existing.body),
       existingBytes: bytes,
+      validForReuse,
     };
   } catch (error) {
     if (strict) throw error;
@@ -991,6 +1010,7 @@ async function loadState(strict = false): Promise<LoadedState> {
       stateMap: new Map<string, LatestStateEntry>(),
       existingHash: null,
       existingBytes: 0,
+      validForReuse: false,
     };
   }
 }
@@ -1334,7 +1354,11 @@ function mapObservedPropertyRows(rows: Array<Record<string, unknown>>): Metadata
   return output;
 }
 
-async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: MetadataRefreshStats }> {
+async function loadMetadataIndex(): Promise<{
+  metadata: MetadataIndex;
+  stats: MetadataRefreshStats;
+  durableHash: string;
+}> {
   const startedMs = Date.now();
   let objectsRead = 0;
   let bytesRead = 0;
@@ -1357,6 +1381,7 @@ async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: Me
     ) {
       return {
         metadata: buildMetadataIndex(parsed),
+        durableHash: sha256Hex(cacheObject.body),
         stats: {
           refreshed: false,
           source_day_utc: parsed.source_day_utc || null,
@@ -1415,6 +1440,7 @@ async function loadMetadataIndex(): Promise<{ metadata: MetadataIndex; stats: Me
 
   return {
     metadata: buildMetadataIndex(cachePayload),
+    durableHash: sha256Hex(cacheBytes),
     stats: {
       refreshed: true,
       source_day_utc: cachePayload.source_day_utc,
@@ -1794,6 +1820,123 @@ async function loadExistingManifest(): Promise<SnapshotManifest | null> {
   }
 }
 
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function isTimestamp(value: unknown): value is string {
+  return typeof value === "string" && value.trim() !== "" && Number.isFinite(Date.parse(value));
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function reusablePhysicalEntries(
+  previousManifest: SnapshotManifest | null,
+  triggerMode: string,
+  stateTransitionCount: number,
+  stateLoaded: LoadedState,
+  durableStateHash: string | null,
+  metadataResult: Awaited<ReturnType<typeof loadMetadataIndex>>,
+): { entries: SnapshotManifestEntry[] | null; reason: string | null } {
+  const reject = (reason: string) => ({ entries: null, reason });
+  if (triggerMode !== "scheduler") return reject("non_scheduler");
+  if (stateTransitionCount !== 0) return reject("state_transition");
+  if (metadataResult.stats.refreshed) return reject("metadata_refreshed");
+  if (!stateLoaded.validForReuse || !isSha256(durableStateHash)) return reject("state_untrusted");
+  if (!isSha256(metadataResult.durableHash)) return reject("metadata_untrusted");
+  if (!previousManifest) return reject("previous_manifest_missing");
+
+  const manifest = asRecord(previousManifest);
+  const source = asRecord(manifest?.source);
+  const matrix = asRecord(manifest?.matrix);
+  const build = asRecord(manifest?.build);
+  const priorPollutants = matrix?.pollutants;
+  const expectedPollutants = ["pm25", "pm10", "no2"];
+  const configured = UK_AQ_LATEST_SNAPSHOT_POLLUTANTS;
+  if (
+    configured.length !== 3 ||
+    new Set(configured).size !== 3 ||
+    !expectedPollutants.every((pollutant) => configured.includes(pollutant))
+  ) return reject("configured_matrix_mismatch");
+  if (
+    manifest?.schema_version !== 1 ||
+    manifest.snapshot_family !== "latest" ||
+    manifest.version !== "v2" ||
+    !isTimestamp(manifest.generated_at) ||
+    source?.type !== "pubsub_observation_state" ||
+    source.pubsub_subscription !== subscriptionPath() ||
+    source.state_key !== UK_AQ_LATEST_SNAPSHOT_STATE_KEY ||
+    source.core_metadata_prefix !== UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX ||
+    typeof source.core_metadata_day_utc !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(source.core_metadata_day_utc) ||
+    source.core_metadata_day_utc !== metadataResult.metadata.source_day_utc ||
+    matrix?.network_group !== UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP ||
+    !Array.isArray(priorPollutants) ||
+    priorPollutants.length !== 3 ||
+    new Set(priorPollutants).size !== 3 ||
+    !expectedPollutants.every((pollutant) => priorPollutants.includes(pollutant)) ||
+    !Array.isArray(matrix.windows) ||
+    matrix.windows.length !== 1 ||
+    matrix.windows[0] !== UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW
+  ) return reject("previous_manifest_identity");
+  if (
+    build?.ok !== true ||
+    build.partial_failure !== false ||
+    build.failure_count !== 0 ||
+    build.success_count !== 3 ||
+    !isTimestamp(build.started_at) ||
+    !isTimestamp(build.finished_at) ||
+    Date.parse(build.started_at) > Date.parse(build.finished_at) ||
+    !isNonNegativeInteger(build.duration_ms)
+  ) return reject("previous_build_incomplete");
+  if (
+    !isSha256(source.state_sha256) ||
+    !isSha256(source.core_metadata_cache_sha256) ||
+    source.state_sha256 !== durableStateHash ||
+    source.core_metadata_cache_sha256 !== metadataResult.durableHash
+  ) return reject("durable_input_mismatch");
+  if (!Array.isArray(manifest.snapshots) || manifest.snapshots.length !== 3) {
+    return reject("previous_entries_incomplete");
+  }
+
+  const entries: SnapshotManifestEntry[] = [];
+  const seen = new Set<string>();
+  for (const candidate of manifest.snapshots) {
+    const entry = asRecord(candidate);
+    const pollutant = entry?.pollutant;
+    if (typeof pollutant !== "string" || !expectedPollutants.includes(pollutant) || seen.has(pollutant)) {
+      return reject("previous_entry_identity");
+    }
+    seen.add(pollutant);
+    const expectedId = matrixId(UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP, pollutant, UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW);
+    const expectedKey = snapshotKey(UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP, pollutant, UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW);
+    const min = entry?.min_observed_at;
+    const max = entry?.max_observed_at;
+    if (
+      entry?.id !== expectedId ||
+      entry.network_group !== UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP ||
+      entry.window !== UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW ||
+      entry.object_key !== expectedKey ||
+      entry.content_type !== "application/json; charset=utf-8" ||
+      entry.content_encoding !== null ||
+      !isSha256(entry.sha256) ||
+      entry.etag !== `"sha256-${entry.sha256}"` ||
+      !isNonNegativeInteger(entry.row_count) ||
+      !isNonNegativeInteger(entry.bytes) ||
+      (entry.row_count === 0 ? min !== null || max !== null : !isTimestamp(min) || !isTimestamp(max) || Date.parse(min) > Date.parse(max)) ||
+      !isTimestamp(entry.generated_at) ||
+      !isNonNegativeInteger(entry.build_duration_ms) ||
+      (entry.previous_sha256 !== null && !isSha256(entry.previous_sha256)) ||
+      typeof entry.changed !== "boolean" ||
+      entry.error !== null
+    ) return reject("previous_entry_invalid");
+    entries.push(candidate as SnapshotManifestEntry);
+  }
+  return { entries, reason: null };
+}
+
 async function main(): Promise<void> {
   const reconciliationRequest = await loadIntegrityReconciliationRequest();
   const isReconciliation = reconciliationRequest !== null;
@@ -1833,7 +1976,7 @@ async function main(): Promise<void> {
 
   const previousManifest = await loadExistingManifest();
   const previousById = new Map<string, SnapshotManifestEntry>();
-  for (const entry of previousManifest?.snapshots || []) {
+  for (const entry of Array.isArray(previousManifest?.snapshots) ? previousManifest.snapshots : []) {
     if (entry && typeof entry.id === "string") previousById.set(entry.id, entry as SnapshotManifestEntry);
   }
 
@@ -1884,6 +2027,7 @@ async function main(): Promise<void> {
     ? reconciliationStateApply!.applied_new_count + reconciliationStateApply!.applied_newer_count +
       reconciliationStateApply!.applied_same_timestamp_correction_count
     : scheduledStateApply!.applied_new + scheduledStateApply!.applied_newer;
+  let durableStateHash = stateLoaded.existingHash;
   if (stateTransitionCount > 0) {
     const stateBytes = TEXT_ENCODER.encode(serializeLatestState(stateLoaded.stateMap, ingestedAt));
     const nextStateHash = sha256Hex(stateBytes);
@@ -1899,6 +2043,7 @@ async function main(): Promise<void> {
         stateBytes,
         statePut.etag,
       );
+      durableStateHash = nextStateHash;
     }
   }
 
@@ -1923,132 +2068,169 @@ async function main(): Promise<void> {
     integrity_run_id: reconciliationRequest?.integrity_run_id ?? null,
   }));
 
-  const sourceRows = buildSourceRows(stateLoaded.stateMap, metadataResult.metadata);
-  if (sourceRows.missingMetadata > 0) {
-    warnings.push(`missing_metadata_rows=${sourceRows.missingMetadata}`);
-  }
-
-  const sourceRowsByPollutant = new Map<string, LatestItem[]>();
-  for (const sourceRow of sourceRows.rows) {
-    const rows = sourceRowsByPollutant.get(sourceRow.pollutant);
-    if (rows) {
-      rows.push(sourceRow.item);
-    } else {
-      sourceRowsByPollutant.set(sourceRow.pollutant, [sourceRow.item]);
-    }
-  }
-
+  const reuse = reusablePhysicalEntries(
+    previousManifest,
+    triggerMode,
+    stateTransitionCount,
+    stateLoaded,
+    durableStateHash,
+    metadataResult,
+  );
+  const buildPath = reuse.entries ? "unchanged_fast_path" : "full";
   const entries: SnapshotManifestEntry[] = [];
   let successCount = 0;
   let failureCount = 0;
   let changedCount = 0;
   let skippedUnchangedCount = 0;
 
-  for (const pollutant of UK_AQ_LATEST_SNAPSHOT_POLLUTANTS) {
-    const itemStarted = Date.now();
-    const id = matrixId(
-      UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP,
-      pollutant,
-      UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW,
-    );
-    const key = snapshotKey(
-      UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP,
-      pollutant,
-      UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW,
-    );
-    const previous = previousById.get(id) || null;
-    try {
-      const rows = [...(sourceRowsByPollutant.get(pollutant) || [])];
-
-      sortSnapshotRows(rows);
-      const nextCursor = deriveNextCursor(rows);
-      const payload: SnapshotPayload = {
-        region: null,
-        pcon_code: null,
-        pollutant,
-        window: UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW,
-        since: null,
-        since_id: null,
-        next_since: nextCursor.since,
-        next_since_id: nextCursor.sinceId,
-        count: rows.length,
-        data: rows,
-      };
-
-      const body = `${toStableJson(payload)}\n`;
-      const bodyBytes = TEXT_ENCODER.encode(body);
-      const hash = sha256Hex(bodyBytes);
-      const etag = `"sha256-${hash}"`;
-      const changed = previous?.sha256 !== hash || previous?.object_key !== key;
-      const itemDurationMs = Date.now() - itemStarted;
-
-      if (changed) {
-        await r2PutObject({
-          r2: R2_CONFIG,
-          key,
-          body: bodyBytes,
-          content_type: "application/json; charset=utf-8",
-        });
-        changedCount += 1;
-      } else {
-        skippedUnchangedCount += 1;
-      }
-
-      const observed = minMaxObservedAt(rows);
+  if (reuse.entries) {
+    for (const previous of reuse.entries) {
+      const itemStarted = Date.now();
       entries.push({
-        id,
-        network_group: UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP,
-        pollutant,
-        window: UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW,
-        object_key: key,
-        content_type: "application/json; charset=utf-8",
-        content_encoding: null,
-        sha256: hash,
-        etag,
-        row_count: rows.length,
-        bytes: bodyBytes.byteLength,
-        min_observed_at: observed.min,
-        max_observed_at: observed.max,
+        id: previous.id,
+        network_group: previous.network_group,
+        pollutant: previous.pollutant,
+        window: previous.window,
+        object_key: previous.object_key,
+        content_type: previous.content_type,
+        content_encoding: previous.content_encoding,
+        sha256: previous.sha256,
+        etag: previous.etag,
+        row_count: previous.row_count,
+        bytes: previous.bytes,
+        min_observed_at: previous.min_observed_at,
+        max_observed_at: previous.max_observed_at,
         generated_at: utcNowIso(),
-        build_duration_ms: itemDurationMs,
-        previous_sha256: previous?.sha256 ?? null,
-        changed,
+        build_duration_ms: Date.now() - itemStarted,
+        previous_sha256: previous.sha256,
+        changed: false,
         error: null,
       });
-      successCount += 1;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      failureCount += 1;
-      warnings.push(`${id}: ${message}`);
-      if (previous) {
-        entries.push({
-          ...previous,
-          build_duration_ms: Date.now() - itemStarted,
-          generated_at: utcNowIso(),
-          changed: false,
-          error: message,
-        });
+    }
+    successCount = 3;
+    skippedUnchangedCount = 3;
+  } else {
+    const sourceRows = buildSourceRows(stateLoaded.stateMap, metadataResult.metadata);
+    if (sourceRows.missingMetadata > 0) {
+      warnings.push(`missing_metadata_rows=${sourceRows.missingMetadata}`);
+    }
+
+    const sourceRowsByPollutant = new Map<string, LatestItem[]>();
+    for (const sourceRow of sourceRows.rows) {
+      const rows = sourceRowsByPollutant.get(sourceRow.pollutant);
+      if (rows) {
+        rows.push(sourceRow.item);
       } else {
+        sourceRowsByPollutant.set(sourceRow.pollutant, [sourceRow.item]);
+      }
+    }
+
+    for (const pollutant of UK_AQ_LATEST_SNAPSHOT_POLLUTANTS) {
+      const itemStarted = Date.now();
+      const id = matrixId(
+        UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP,
+        pollutant,
+        UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW,
+      );
+      const key = snapshotKey(
+        UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP,
+        pollutant,
+        UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW,
+      );
+      const previous = previousById.get(id) || null;
+      try {
+        const rows = [...(sourceRowsByPollutant.get(pollutant) || [])];
+
+        sortSnapshotRows(rows);
+        const nextCursor = deriveNextCursor(rows);
+        const payload: SnapshotPayload = {
+          region: null,
+          pcon_code: null,
+          pollutant,
+          window: UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW,
+          since: null,
+          since_id: null,
+          next_since: nextCursor.since,
+          next_since_id: nextCursor.sinceId,
+          count: rows.length,
+          data: rows,
+        };
+
+        const body = `${toStableJson(payload)}\n`;
+        const bodyBytes = TEXT_ENCODER.encode(body);
+        const hash = sha256Hex(bodyBytes);
+        const etag = `"sha256-${hash}"`;
+        const changed = previous?.sha256 !== hash || previous?.object_key !== key;
+        const itemDurationMs = Date.now() - itemStarted;
+
+        if (changed) {
+          await r2PutObject({
+            r2: R2_CONFIG,
+            key,
+            body: bodyBytes,
+            content_type: "application/json; charset=utf-8",
+          });
+          changedCount += 1;
+        } else {
+          skippedUnchangedCount += 1;
+        }
+
+        const observed = minMaxObservedAt(rows);
         entries.push({
           id,
           network_group: UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP,
           pollutant,
           window: UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW,
-          object_key: null,
+          object_key: key,
           content_type: "application/json; charset=utf-8",
           content_encoding: null,
-          sha256: null,
-          etag: null,
-          row_count: null,
-          bytes: null,
-          min_observed_at: null,
-          max_observed_at: null,
+          sha256: hash,
+          etag,
+          row_count: rows.length,
+          bytes: bodyBytes.byteLength,
+          min_observed_at: observed.min,
+          max_observed_at: observed.max,
           generated_at: utcNowIso(),
-          build_duration_ms: Date.now() - itemStarted,
-          previous_sha256: null,
-          changed: false,
-          error: message,
+          build_duration_ms: itemDurationMs,
+          previous_sha256: previous?.sha256 ?? null,
+          changed,
+          error: null,
         });
+        successCount += 1;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        failureCount += 1;
+        warnings.push(`${id}: ${message}`);
+        if (previous) {
+          entries.push({
+            ...previous,
+            build_duration_ms: Date.now() - itemStarted,
+            generated_at: utcNowIso(),
+            changed: false,
+            error: message,
+          });
+        } else {
+          entries.push({
+            id,
+            network_group: UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP,
+            pollutant,
+            window: UK_AQ_LATEST_SNAPSHOT_PHYSICAL_WINDOW,
+            object_key: null,
+            content_type: "application/json; charset=utf-8",
+            content_encoding: null,
+            sha256: null,
+            etag: null,
+            row_count: null,
+            bytes: null,
+            min_observed_at: null,
+            max_observed_at: null,
+            generated_at: utcNowIso(),
+            build_duration_ms: Date.now() - itemStarted,
+            previous_sha256: null,
+            changed: false,
+            error: message,
+          });
+        }
       }
     }
   }
@@ -2070,6 +2252,8 @@ async function main(): Promise<void> {
       state_key: UK_AQ_LATEST_SNAPSHOT_STATE_KEY,
       core_metadata_prefix: UK_AQ_LATEST_SNAPSHOT_CORE_METADATA_PREFIX,
       core_metadata_day_utc: metadataResult.metadata.source_day_utc,
+      state_sha256: durableStateHash,
+      core_metadata_cache_sha256: metadataResult.durableHash,
     },
     matrix: {
       network_group: UK_AQ_LATEST_SNAPSHOT_NETWORK_GROUP,
@@ -2158,6 +2342,8 @@ async function main(): Promise<void> {
     event: "latest_snapshot_job_summary",
     timestamp: new Date().toISOString(),
     ...report,
+    build_path: buildPath,
+    fast_path_rejection_reason: reuse.reason,
     local_cache: LOCAL_R2_CACHE.summary(),
     run_reports: {
       mode: UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_POLICY.mode,
