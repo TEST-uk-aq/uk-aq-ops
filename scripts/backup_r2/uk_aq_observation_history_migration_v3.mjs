@@ -1917,6 +1917,24 @@ function buildSideBySideR2Adapters(options) {
 
 export const SIDE_BY_SIDE_LOCK_OWNER = "observation_history_migration_v2_to_v3";
 
+// A LIVE GCP operator is distinct from the existing TEST entry point. Admission
+// still requires an in-process GCE metadata permit (validated by concurrency
+// limits), and the LIVE wrapper separately pins the GitHub repository, GCE
+// project/zone, R2 account/bucket and the clean main-branch implementation.
+const LIVE_GCP_ENTRYPOINT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "uk_aq_observation_history_migration_v3_live_gcp.mjs",
+);
+
+function isReviewedLiveGcpInvocation({ args, runnerPermit, entrypoint }) {
+  return args.environment === "LIVE" &&
+    args.transition === "v2-to-v3" &&
+    new Set(["plan", "migrate", "verify"]).has(args.mode) &&
+    runnerPermit?.runner_kind === "gcp" &&
+    runnerPermit?.runner_profile === GCP_CLEAN_POLICY.runner_profile &&
+    path.resolve(entrypoint) === LIVE_GCP_ENTRYPOINT;
+}
+
 export function createSideBySideLockAssertion({ env, migrationRunId }) {
   const options = { env, expectedOwner: SIDE_BY_SIDE_LOCK_OWNER, expectedRunId: migrationRunId };
   const pinned = requireObservationsGlobalOperationLockContext(options);
@@ -1929,14 +1947,20 @@ export function createSideBySideLockAssertion({ env, migrationRunId }) {
   };
 }
 
-async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedCommand, adapterFactory, runnerPermit = null, entrypoint = fileURLToPath(import.meta.url) }) {
+async function runSideBySideMigrationOperator({
+  args, argv, reentryArgv = argv, env, now, runLockedCommand, adapterFactory,
+  runnerPermit = null, entrypoint = fileURLToPath(import.meta.url),
+}) {
   const missing = [
     ["--environment", args.environment], ["--expected-bucket", args.expectedBucket],
     ["--migration-run-id", args.migrationRunId], ["--target-writer-git-sha", args.targetWriterGitSha],
     ["--writer-limits-json", args.writerLimitsPath], ["--report-out", args.reportOut],
   ].filter(([, value]) => !String(value || "").trim());
   if (missing.length) throw new Error(`Missing side-by-side arguments: ${missing.map(([flag]) => flag).join(", ")}`);
-  if (args.environment !== "TEST") throw new Error("The active side-by-side operator path is TEST-only");
+  if (args.environment !== "TEST" &&
+      !isReviewedLiveGcpInvocation({ args, runnerPermit, entrypoint })) {
+    throw new Error("LIVE side-by-side execution requires the distinct metadata-admitted LIVE GCP operator");
+  }
   if ([args.dropboxRoot, args.expectedInventoryRootSha256, args.expectedStateRootSha256,
     args.v2RuntimeRollbackRecord, args.operatorAuthorityFile].some(Boolean)) {
     throw new Error("Side-by-side migration does not accept historical Dropbox/runtime rollback authority arguments");
@@ -1979,7 +2003,7 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
         databaseUrl: env.SUPABASE_DB_URL || env.DATABASE_URL,
         owner: SIDE_BY_SIDE_LOCK_OWNER, runId: args.migrationRunId,
         command: process.execPath,
-        commandArgs: [...process.execArgv, entrypoint, ...argv],
+        commandArgs: [...process.execArgv, entrypoint, ...reentryArgv],
         env, diagnostics,
       });
       return { delegated: true, exitCode };
@@ -2125,12 +2149,20 @@ export async function runObservationHistoryMigrationV3({
   runLockedCommand = runCommandWithObservationsGlobalOperationLock,
   sideBySideAdapterFactory = buildSideBySideR2Adapters,
   runnerPermit = null, entrypoint = fileURLToPath(import.meta.url),
+  reentryArgv = argv,
 } = {}) {
   const args = parseObservationHistoryMigrationArgs(argv, runnerPermit);
   if (args.help) return { help: true, text: usage() };
-  if (runnerPermit && (args.environment !== "TEST" || args.transition !== "v2-to-v3" || !["plan", "migrate", "verify"].includes(args.mode))) throw new Error("GCP clean-build runner supports only TEST v2-to-v3 plan/migrate/verify");
+  if (runnerPermit && ((args.environment !== "TEST" &&
+      !isReviewedLiveGcpInvocation({ args, runnerPermit, entrypoint })) ||
+      args.transition !== "v2-to-v3" || !["plan", "migrate", "verify"].includes(args.mode))) {
+    throw new Error("GCP clean-build runner requires TEST or the reviewed LIVE GCP entry point, v2-to-v3 plan/migrate/verify");
+  }
   if (args.transition === "v2-to-v3" && ["plan", "migrate", "verify"].includes(args.mode)) {
-    return runSideBySideMigrationOperator({ args, argv, env, now, runLockedCommand, adapterFactory: sideBySideAdapterFactory, runnerPermit, entrypoint });
+    return runSideBySideMigrationOperator({
+      args, argv, reentryArgv, env, now, runLockedCommand,
+      adapterFactory: sideBySideAdapterFactory, runnerPermit, entrypoint,
+    });
   }
   if (args.checkpointIn && ["rollback", "rollback-plan"].includes(args.mode) &&
       readJsonFile(args.checkpointIn, "migration checkpoint")?.authority?.generation_topology === SIDE_BY_SIDE_TOPOLOGY) {
