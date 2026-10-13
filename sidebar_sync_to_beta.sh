@@ -104,14 +104,19 @@ command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 is required" >&2; e
 echo
 echo "==================================================================="
 if [[ "${APPLY}" -eq 0 ]]; then
-  echo " DRY RUN - NO FILES WILL BE WRITTEN"
+  echo " DRY RUN MODE - no files will be written, transferred or deleted"
 else
-  echo " APPLY - WILL REPLACE ONLY LIVE BETA sidebar.js"
+  echo " APPLY MODE - LIVE beta sidebar.js will be updated if needed"
 fi
 echo "==================================================================="
-echo " Source:      ${SRC}/sidebar.js"
-echo " Destination: ${DST}/sidebar.js"
-echo " Public LIVE: UNTOUCHED"
+echo " Repos: website (sidebar.js only)"
+echo " Website destination: LIVE BETA website repo (UK-AQ/beta-uk-aq)"
+echo
+echo "── website ──────────────────────────────────────"
+echo "   src: ${SRC}/sidebar.js"
+echo "   dst: ${DST}/sidebar.js"
+echo "   WEBSITE ROUTE: TEST website -> LIVE BETA website"
+echo "   NOTE: public LIVE website (ukaq.co.uk) is not affected."
 echo
 
 python3 - \
@@ -120,7 +125,6 @@ python3 - \
   "${COPY_WOOD_BURNING}" "${COPY_NAEI_DATA}" "${COPY_RESEARCH}" \
   "${COPY_BLOG}" <<'PY'
 from pathlib import Path
-import difflib
 import os
 import re
 import stat
@@ -171,9 +175,7 @@ for name, route, copy in features:
             f"ERROR: expected exactly one {name} nav line ({route}) in TEST; "
             f"found {len(matches)}. No changes made."
         )
-    if copy:
-        status = "KEEP as in TEST"
-    else:
+    if not copy:
         index = matches[0]
         line = source_lines[index]
         if name == "Blog" and re.match(r"^\s*\*/", line):
@@ -184,38 +186,38 @@ for name, route, copy in features:
             replacement_lines[index] = line[:line.index("*/") + 2] + newline
         else:
             removed_indices.add(index)
-        status = "REMOVE from beta"
-    print(f"  {name:17} {status}")
+    action = "DRY RUN [website]" if not apply else "LIVE BETA [website]"
+    if copy:
+        print(f"   {action}: keep {name} nav line ({route}) as in TEST")
+    else:
+        print(f"   {action}: {'would remove' if not apply else 'remove'} {name} nav line ({route}) from sidebar.js")
 
 result = "".join(
     replacement_lines.get(i, line)
     for i, line in enumerate(source_lines)
     if i not in removed_indices
 )
+print()
 if result == destination_text:
-    print("\nNo content change: LIVE beta sidebar.js already matches the selected policy.")
+    print("   sidebar.js: unchanged (destination already matches TEST with overrides)")
+    print()
+    print("===================================================================")
+    print(" MODE: " + ("APPLY" if apply else "DRY RUN"))
+    print(" CONFIRMED: no file changes needed.")
+    print("===================================================================")
     sys.exit(0)
-
-old_lines = destination_text.splitlines(keepends=True)
-new_lines = result.splitlines(keepends=True)
-diff = difflib.unified_diff(
-    old_lines, new_lines,
-    fromfile="LIVE beta/sidebar.js (current)",
-    tofile="LIVE beta/sidebar.js (proposed)",
-    n=3,
-)
-max_diff_lines = 120
-print("\nPreview of destination changes (first 120 diff lines):")
-for index, line in enumerate(diff):
-    if index >= max_diff_lines:
-        print("... diff truncated; use git diff after --apply for full details.")
-        break
-    print(line, end="" if line.endswith("\n") else "\n")
 
 if not apply:
-    print("\nDRY RUN COMPLETE: source and destination unchanged.")
-    print("Run ./sidebar_sync_to_beta.sh --apply to write LIVE beta sidebar.js.")
+    print("   sidebar.js: would copy TEST content with the navigation overrides above")
+    print()
+    print("===================================================================")
+    print(" MODE: DRY RUN")
+    print(" CONFIRMED: nothing was transferred, written or deleted.")
+    print(" DRY RUN COMPLETE - add --apply to make these changes")
+    print("===================================================================")
     sys.exit(0)
+
+print("   sidebar.js: applying TEST content with the navigation overrides above")
 
 # Write the fully checked output atomically in the same destination directory.
 # Preserve the existing destination file's permissions.
@@ -233,7 +235,10 @@ finally:
 
 if destination.read_text(encoding="utf-8") != result:
     sys.exit("ERROR: destination verification failed after write.")
-print("\nAPPLY COMPLETE: updated LIVE beta sidebar.js only.")
-print("Review with: git -C <LIVE-beta-uk-aq-path> diff -- sidebar.js")
-print("No commit, push or deployment was performed.")
+print()
+print("===================================================================")
+print(" MODE: APPLY")
+print(" CONFIRMED: LIVE beta sidebar.js updated successfully.")
+print(" No commit, push or deployment was performed.")
+print("===================================================================")
 PY
