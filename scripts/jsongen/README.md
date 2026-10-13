@@ -1,34 +1,31 @@
 # Managed JSONgen foundations and pending Prune source
 
-## Stage 3A pending Prune source (code only; default off)
+## Stage 3A signed Prune source handover (code only; default off)
 
-Selected-v3 Prune can retain its exact frozen connector-day NDJSON before
-canonical connector publication. `UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED`
-defaults to false and is locally targeted; it must be separately authorised
-and configured for TEST. The path reuses the existing dedicated
-`UK_AQ_COMPRESSED_CHART_R2_*` credentials through `managedR2Config()` and
-never uses canonical R2 credentials for private derived writes.
+Selected-v3 Prune can offer its exact frozen connector-day NDJSON before
+canonical connector publication. The TEST-only flag
+`UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED` defaults to false. The handover
+uses the merged JSONgen signer `POST /v1/upload-intents` and the dedicated
+writer bearer and Cloudflare Access client credentials described in the
+[Prune README](../../workers/uk_aq_prune_daily/README.md). Prune never receives
+R2 write credentials for this path. The signer selects an immutable private
+`managed/jsongen/v1/pending/unverified/prune_daily_v3/...` key and returns a
+60-second conditional PUT URL. Prune authenticates its metadata against the
+frozen source and sends exactly the signed headers and gzip bytes. There is no
+second descriptor object.
 
-The private bucket stores immutable gzip bytes at
-`managed/jsongen/v1/prune/pending/run_id=<UUID>/day_utc=<day>/connector_id=<id>/<SHA256>.ndjson.gz`
-and an immutable `descriptor.<SHA256>.json` alongside them. The descriptor
-records the Prune invocation, frozen connector/day source identity, compressed
-and original byte sizes and SHA-256 values. Conditional writes are read back
-byte for byte; an existing different object is rejected. Ambiguous writes are
-resolved by readback. A pending descriptor explicitly contains no final
-publication, gate completion or receipt. It is private source evidence, never
-a selectable or registered JSONgen change. There is no automatic expiration;
-pending objects remain for later reviewed recovery and lifecycle design.
-
-The pending source is prepared after original Prune prior-authority admission
-and before canonical connector publication. The local frozen file is still
-cleaned up at its existing connector verification/failure boundary. A process
-restart therefore preserves only successfully readback-retained private bytes.
-An interrupted upload can leave an orphan source object; its deterministic
-invocation/day/connector prefix and logged reference support later review.
-Missing credentials, oversized source (100,000 rows, 32 MiB original, 8 MiB
-gzip), a failed upload or ambiguous readback produce a warning and unavailable
-JSONgen handover. They cannot block canonical Prune or complete a deletion gate.
+The source keeps original row multiplicity, order, timestamp and numeric JSON
+values. Preparation is bounded at 100,000 rows, 32 MiB original, 8 MiB gzip
+and 128 scopes. Signer and PUT share a 15-second deadline; the optional stage
+starts only with extra headroom reserved for canonical publication and v3 run
+finalization. 2xx records `put_acknowledged_unverified`, not verified retention.
+A 412 conditional conflict needs separate readback; 409, 5xx and transport
+failures are ambiguous. No retry or source readback happens in Prune. The inactive `prune-pending-verification.mjs` helper can independently read
+bounded private bytes, decompress and compare original byte and source
+identities. It is not invoked by Prune and does not grant final writer authority.
+Source cleanup and canonical deletion gates keep their existing rules. There
+is no approved automatic expiry, complete-source receipt or publication
+eligibility from an upload intent or PUT acknowledgment.
 
 **Verified Stage 3A receipt creation is blocked.** The frozen representation
 currently collapses source `status` into `verification_status`; the canonical

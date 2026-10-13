@@ -1,22 +1,26 @@
-# Prune Daily JSONgen pending source
+# Prune Daily JSONgen source handover
 
-The optional selected-v3 JSONgen source handover is disabled by default.
-`UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED=true` enables a private,
-best-effort copy of each admitted frozen connector-day source before its
-canonical connector write. It requires the existing dedicated
-`UK_AQ_COMPRESSED_CHART_R2_*` TEST credentials. Missing configuration,
-source limits or derived storage failures are logged as
-`phase_b_jsongen_pending_source_unavailable`; canonical publication, source
-cleanup, PostgreSQL gates and deletion eligibility keep their existing rules.
+The selected-v3 handover is disabled by default. `UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED=true`
+enables it in TEST only. Configure `UK_AQ_JSONGEN_PRUNE_SIGNER_URL` with the reviewed,
+Cloudflare Access protected HTTPS `/v1/upload-intents` route, plus dedicated
+`UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN`, `UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_ID` and
+`UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_SECRET`. These are separate from canonical
+and chart R2 credentials. No R2 write credential is passed to Prune for this handover.
 
-Successful retention logs `phase_b_jsongen_pending_source_retained` with the
-immutable private source and pending descriptor references. Both are verified
-by exact byte readback. They survive process exit, but the original local
-temporary file follows normal cleanup. Pending evidence has no automatic
-expiry and grants no JSONgen selection or receipt eligibility. Inspect the
-JSONgen [README](../../scripts/jsongen/README.md) for the storage format,
-limits, blocked final-authority seam and later recovery responsibility.
+After prior-authority admission, Prune validates and compresses the exact frozen
+connector-day source. It asks the signer for a 60-second intent bound to its
+invocation, scope, byte sizes and SHA-256 identities, validates the response,
+and sends one conditional PUT with exactly the required signed headers. The
+optional operation has a 15-second shared deadline for signer and PUT, and is
+skipped unless canonical publication and v3 finalization budget is reserved.
+Failures cannot block canonical publication, source cleanup or deletion gates.
+The v2 path never enters this handover.
 
-The v2 Prune path does not invoke this handover. No remote TEST acceptance,
-deployment, managed control registration or monthly publication is provided
-by this code change.
+`phase_b_jsongen_pending_source_put_acknowledged` means only that R2 returned a
+2xx response to the PUT. It does not mean independent byte readback or verified
+retention. 412 means the conditional write did not occur; 409, 5xx and transport
+failures have an ambiguous storage outcome. The warning event
+`phase_b_jsongen_pending_source_unavailable` carries a safe reason code but no
+secret, presigned URL or claim of recovered bytes. Reconciliation requires a
+separate private, bounded reader. No descriptor, receipt, control registration,
+monthly publication or remote acceptance is performed by this path.

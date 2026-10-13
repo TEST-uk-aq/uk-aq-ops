@@ -10,8 +10,7 @@ import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
 import { randomUUID } from "node:crypto";
-import { managedR2Config } from "../../scripts/jsongen/control.mjs";
-import { retainPrunePendingSource } from "../../scripts/jsongen/prune-pending-source.mjs";
+import { uploadPrunePendingSource, resolvePruneSignerConfig, PRUNE_SIGNED_UPLOAD_DEADLINE_MS } from "../../scripts/jsongen/prune-signed-upload.mjs";
 import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import Cursor from "pg-cursor";
@@ -3964,7 +3963,7 @@ async function writeFrozenCandidateObservationsToV2({
   connectorPublisher = runtime.history_write_version === "v3" ? publishFrozenV3Observations : publishFrozenV2Observations,
   admitSnapshot = admitPruneFrozenConnectorSnapshot,
   cleanupFrozenSource = cleanupPhaseBTargetDaySourceTemp,
-  retainPendingSource = retainPrunePendingSource,
+  uploadPendingSource = uploadPrunePendingSource,
 }) {
   try {
     resolvePruneHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version });
@@ -4016,30 +4015,43 @@ async function writeFrozenCandidateObservationsToV2({
     }
     let jsongenPendingSource = null;
     if (emitV3Diagnostics && runtime.jsongen_pending_source?.enabled === true) {
-      try {
-        if (runtime.jsongen_pending_source.config_error) {
-          throw new Error(runtime.jsongen_pending_source.config_error);
-        }
-        jsongenPendingSource = await retainPendingSource({
-          r2: runtime.jsongen_pending_source.r2,
-          path: frozen.temp.ndjsonPath,
-          runId: runtime.run_id,
-          dayUtc: candidate.day_utc,
-          connectorId: candidate.connector_id,
-          expectedRowCount: rows.length,
-          sourceIdentity: frozen.sourceIdentity,
-        });
-        logPhaseB(runtime, "INFO", "phase_b_jsongen_pending_source_retained", {
-          run_id: runtime.run_id, day_utc: candidate.day_utc, connector_id: candidate.connector_id,
-          source: jsongenPendingSource.source, descriptor: jsongenPendingSource.descriptor,
-          eligibility: "pending_unverified",
-        });
-      } catch (error) {
+      // Preserve connector publication plus v3 finalisation headroom even if
+      // the optional signer and PUT consume their entire shared deadline.
+      const requiredMs = PHASE_B_STAGE_MIN_MS.observation_connector_publication
+        + PHASE_B_V3_RUN_FINALIZATION_RESERVE_MS + PRUNE_SIGNED_UPLOAD_DEADLINE_MS + 5_000;
+      if (!runtime.run_budget || !hasBudgetFor(runtime, requiredMs)) {
         logPhaseB(runtime, "WARNING", "phase_b_jsongen_pending_source_unavailable", {
           run_id: runtime.run_id, day_utc: candidate.day_utc, connector_id: candidate.connector_id,
-          reason: error.code || "retention_failed", detail: error.message,
-          recoverable_reference: error.reference || null,
+          reason: "insufficient_headroom",
         });
+      } else {
+        try {
+          if (runtime.jsongen_pending_source.config_error) {
+            const error = new Error("Prune signer configuration unavailable");
+            error.code = "signer_config_unavailable";
+            throw error;
+          }
+          jsongenPendingSource = await uploadPendingSource({
+            signer: runtime.jsongen_pending_source.signer,
+            path: frozen.temp.ndjsonPath,
+            runId: runtime.run_id,
+            dayUtc: candidate.day_utc,
+            connectorId: candidate.connector_id,
+            expectedRowCount: rows.length,
+            sourceIdentity: frozen.sourceIdentity,
+          });
+          logPhaseB(runtime, "INFO", "phase_b_jsongen_pending_source_put_acknowledged", {
+            run_id: runtime.run_id, day_utc: candidate.day_utc, connector_id: candidate.connector_id,
+            intent_id: jsongenPendingSource.intent_id, source: jsongenPendingSource.source,
+            eligibility: "unverified",
+          });
+        } catch (error) {
+          logPhaseB(runtime, "WARNING", "phase_b_jsongen_pending_source_unavailable", {
+            run_id: runtime.run_id, day_utc: candidate.day_utc, connector_id: candidate.connector_id,
+            reason: error.code || "handover_failed",
+            recoverable_reference: error.reference || null, intent_id: error.intent_id || null,
+          });
+        }
       }
     }
     assertBudget(runtime, "observation_connector_publication", {
@@ -6449,9 +6461,9 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
     parseBoolean(env.UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED, false) };
   if (jsongenPendingSource.enabled) {
     try {
-      jsongenPendingSource.r2 = managedR2Config(env);
+      jsongenPendingSource.signer = resolvePruneSignerConfig(env);
     } catch (error) {
-      // Missing derived credentials must never disable canonical Prune.
+      // Missing signer configuration must never disable canonical Prune.
       jsongenPendingSource.config_error = error.message;
     }
   }
