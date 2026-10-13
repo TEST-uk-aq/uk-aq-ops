@@ -88,6 +88,20 @@ function safeKey(raw) {
   return key;
 }
 
+function genericV3ValidationRunState(runState, source = null) {
+  const authority = runState?.generic_integrity_selected_scope_authority;
+  if (runState?.execution_path !== "generic_integrity"
+      || runState?.dedicated_sos_historical_replacement !== false
+      || (Object.hasOwn(runState, "history_generation")
+        && runState.history_generation !== "v3")
+      || authority?.contract_version !== GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT
+      || authority.history_generation !== "v3"
+      || (source !== null && source?.evidence?.history_generation !== "v3")) {
+    throw new Error("Generic fixed-v3 history generation context is invalid");
+  }
+  return { ...runState, history_generation: "v3" };
+}
+
 function officialRdataSemanticEvidenceSha256(evidence) {
   const allowed = new Set([
     ...OFFICIAL_RDATA_V8_FIELDS, "source_column_classifications_sha256", "source_column_classifications",
@@ -420,7 +434,7 @@ function derivePinnedMetadataDependencies(runState, { dayUtc, connectorId, pollu
   }
   if ([9, 10].includes(connectorId)) {
     const manifestKey = keys[5];
-    authenticateOfficialRdataPinnedHierarchy(runState, {
+    authenticateOfficialRdataPinnedHierarchy(genericV3ValidationRunState(runState), {
       day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode,
       manifest_key: manifestKey,
       baseline_state: fs.statSync(path.join(root, ...manifestKey.split("/")), { throwIfNoEntry: false })?.isFile()
@@ -478,6 +492,7 @@ function derivePinnedMetadataDependencies(runState, { dayUtc, connectorId, pollu
 }
 
 export function canonicalGenericV3SelectedScopeAuthority(runState) {
+  genericV3ValidationRunState(runState);
   const authority = runState?.generic_integrity_selected_scope_authority;
   if (!authority || typeof authority !== "object" || Array.isArray(authority)
       || authority.contract_version !== GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT
@@ -839,7 +854,9 @@ export async function validateFinalGenericV3ProposalGraph({ runState, proposal }
         runState, dayUtc: scope.day_utc, connectorId: scope.connector_id,
         pollutantCode: scope.pollutant_code,
       });
-      await validateOfficialRdataPreservationDependencies({ runState, source });
+      await validateOfficialRdataPreservationDependencies({
+        runState: genericV3ValidationRunState(runState, source), source,
+      });
       seen.add(key);
     }
   }
