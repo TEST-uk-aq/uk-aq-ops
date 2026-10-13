@@ -16,16 +16,17 @@ LIVE_BASE="/Users/mikehinford/Dropbox/Projects/UK-AQ Website & Network/LIVE UK-A
 SRC="${TEST_BASE}/TEST-uk-aq.github.io"
 DST="${LIVE_BASE}/LIVE-beta-uk-aq"
 
-# ── Website feature promotion switches ─────────────────────────────────────
-# 0 = omit that feature's sidebar navigation line in LIVE beta.
-# 1 = retain the line exactly as it appears in TEST.
-# These switches affect sidebar navigation ONLY. They do not copy feature pages,
-# images or code, and do not enable a TEST line that is already commented out.
-PROMOTE_SENSORS=0
-PROMOTE_WHO_GUIDELINES=0
-PROMOTE_WOOD_BURNING=0
-PROMOTE_NAEI_DATA=0
-PROMOTE_RESEARCH=0
+# ── Website feature copy switches ──────────────────────────────────────────
+# false = omit that feature's sidebar navigation entry in LIVE beta.
+# true  = keep the entry exactly as it appears in TEST.
+# These switches control navigation ONLY. They do not copy feature pages,
+# images or code, or uncomment TEST entries that are already disabled.
+COPY_SENSORS=false
+COPY_WHO_GUIDELINES=false
+COPY_WOOD_BURNING=false
+COPY_NAEI_DATA=false
+COPY_RESEARCH=false
+COPY_BLOG=true
 
 APPLY=0
 
@@ -39,7 +40,7 @@ Copy TEST website sidebar.js to the LIVE BETA website checkout only:
 The source file's footer, Welsh AQN/SAQN/NI licence attributions, shared
 network-catalogue logic and unrelated sidebar behaviour remain unchanged.
 Feature navigation entries listed near the top of this script are removed
-from the destination copy when their PROMOTE_* switch is 0.
+from the destination copy when their COPY_* switch is false.
 
 Options:
   --apply          Actually replace LIVE beta sidebar.js.
@@ -62,12 +63,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 for flag in \
-  PROMOTE_SENSORS PROMOTE_WHO_GUIDELINES PROMOTE_WOOD_BURNING \
-  PROMOTE_NAEI_DATA PROMOTE_RESEARCH
+  COPY_SENSORS COPY_WHO_GUIDELINES COPY_WOOD_BURNING \
+  COPY_NAEI_DATA COPY_RESEARCH COPY_BLOG
 do
   value="${!flag}"
-  if [[ "${value}" != "0" && "${value}" != "1" ]]; then
-    echo "ERROR: ${flag} must be 0 or 1, found: ${value}" >&2
+  if [[ "${value}" != "true" && "${value}" != "false" ]]; then
+    echo "ERROR: ${flag} must be true or false (lowercase), found: ${value}" >&2
     exit 2
   fi
 done
@@ -115,8 +116,9 @@ echo
 
 python3 - \
   "${SRC}/sidebar.js" "${DST}/sidebar.js" "${APPLY}" \
-  "${PROMOTE_SENSORS}" "${PROMOTE_WHO_GUIDELINES}" \
-  "${PROMOTE_WOOD_BURNING}" "${PROMOTE_NAEI_DATA}" "${PROMOTE_RESEARCH}" <<'PY'
+  "${COPY_SENSORS}" "${COPY_WHO_GUIDELINES}" \
+  "${COPY_WOOD_BURNING}" "${COPY_NAEI_DATA}" "${COPY_RESEARCH}" \
+  "${COPY_BLOG}" <<'PY'
 from pathlib import Path
 import difflib
 import os
@@ -128,11 +130,12 @@ import tempfile
 source, destination = Path(sys.argv[1]), Path(sys.argv[2])
 apply = sys.argv[3] == "1"
 features = (
-    ("Sensors", "/sensors/", int(sys.argv[4])),
-    ("WHO Guidelines", "/who-guidelines/", int(sys.argv[5])),
-    ("Wood Burning", "/wood-burning/", int(sys.argv[6])),
-    ("NAEI Data", "/naei-data/", int(sys.argv[7])),
-    ("Research", "/research/", int(sys.argv[8])),
+    ("Sensors", "/sensors/", sys.argv[4] == "true"),
+    ("WHO Guidelines", "/who-guidelines/", sys.argv[5] == "true"),
+    ("Wood Burning", "/wood-burning/", sys.argv[6] == "true"),
+    ("NAEI Data", "/naei-data/", sys.argv[7] == "true"),
+    ("Research", "/research/", sys.argv[8] == "true"),
+    ("Blog", "/blog/", sys.argv[9] == "true"),
 )
 
 source_lines = source.read_text(encoding="utf-8").splitlines(keepends=True)
@@ -156,7 +159,8 @@ if len(nav_ends) != 1:
 nav_end = nav_ends[0]
 
 removed_indices = set()
-for name, route, promote in features:
+replacement_lines = {}
+for name, route, copy in features:
     marker = f"href: '{route}'"
     matches = [
         i for i in range(nav_start, nav_end)
@@ -167,15 +171,26 @@ for name, route, promote in features:
             f"ERROR: expected exactly one {name} nav line ({route}) in TEST; "
             f"found {len(matches)}. No changes made."
         )
-    if promote:
+    if copy:
         status = "KEEP as in TEST"
     else:
-        removed_indices.add(matches[0])
+        index = matches[0]
+        line = source_lines[index]
+        if name == "Blog" and re.match(r"^\s*\*/", line):
+            # The TEST Blog item immediately follows a closing block-comment
+            # marker for the disabled YouTube item. Keep the closing marker
+            # even when COPY_BLOG=false, or the rest of sidebar.js is commented out.
+            newline = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+            replacement_lines[index] = line[:line.index("*/") + 2] + newline
+        else:
+            removed_indices.add(index)
         status = "REMOVE from beta"
     print(f"  {name:17} {status}")
 
 result = "".join(
-    line for i, line in enumerate(source_lines) if i not in removed_indices
+    replacement_lines.get(i, line)
+    for i, line in enumerate(source_lines)
+    if i not in removed_indices
 )
 if result == destination_text:
     print("\nNo content change: LIVE beta sidebar.js already matches the selected policy.")
