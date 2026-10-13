@@ -43,6 +43,7 @@ const ROUTES: Array<{ pattern: RegExp; methods: ReadonlySet<string> }> = [
   { pattern: /^\/api\/media\/facebook\/connection-check$/, methods: new Set(['POST']) },
   { pattern: /^\/api\/media\/ai-usage$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/runs$/, methods: new Set(['GET']) },
+  { pattern: /^\/api\/media\/health$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/runs\/gdelt$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/source-domain-blocks$/, methods: new Set(['PUT']) },
   { pattern: /^\/api\/media\/source-domain-blocks\/initial-cleanup\/preview$/, methods: new Set(['POST']) },

@@ -560,3 +560,18 @@ button.media-save-state { cursor: pointer; }
   .media-source-visibility { width: 100%; }
   .media-source-visibility select { flex: 1; }
 }
+
+/* Operational health: failed publisher discovery and automatic publication. */
+.media-health__heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.media-health__heading h3 { margin: 0; }
+.media-health__issues { list-style: none; padding: 0; margin: 12px 0 16px; display: grid; gap: 8px; }
+.media-health__issue { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 12px;
+  border-left: 4px solid var(--border); padding: 8px 12px; background: #fff; border-radius: 6px; }
+.media-health__issue--critical { border-left-color: #a92121; }
+.media-health__issue--warning { border-left-color: #b97716; }
+.media-health__issue > span { flex: 1 1 280px; overflow-wrap: anywhere; }
+.media-health__issue small { color: var(--muted); font-weight: 700; }
+.media-health__details { margin-top: 14px; }
+.media-health__details summary { cursor: pointer; font-weight: 650; }
+.media-health__table { min-width: 920px; }
+.media-health__error { color: #8c1515 !important; font-weight: 700; }
