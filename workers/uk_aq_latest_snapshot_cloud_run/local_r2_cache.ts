@@ -45,6 +45,22 @@ function classifyEtag(etag: string | null): { format: EtagFormat; value: string 
   return { format: "malformed", value: null };
 }
 
+function describeMalformedEtag(etag: string) {
+  return {
+    has_weak_etag_prefix: /^[Ww]\//.test(etag),
+    has_leading_whitespace: /^\s/.test(etag),
+    has_trailing_whitespace: /\s$/.test(etag),
+    has_internal_whitespace: /\s/.test(etag.trim()),
+    has_control_characters: /[\x00-\x1f\x7f]/.test(etag),
+    has_non_ascii_characters: /[^\x00-\x7f]/.test(etag),
+    starts_with_double_quote: etag.startsWith("\""),
+    ends_with_double_quote: etag.endsWith("\""),
+    double_quote_count: (etag.match(/"/g) || []).length,
+    has_comma: etag.includes(","),
+    character_length: Array.from(etag).length,
+  };
+}
+
 function logEtagMismatch(key: string, remote: RemoteFingerprint, cachedEtag: string): void {
   const cached = classifyEtag(cachedEtag);
   const remoteEtag = classifyEtag(remote.etag);
@@ -68,6 +84,9 @@ function logEtagMismatch(key: string, remote: RemoteFingerprint, cachedEtag: str
     remote_etag_format: remoteEtag.format,
     equal_after_quote_normalisation: equalAfterQuoteNormalisation,
     mismatch_category: mismatchCategory,
+    ...(remoteEtag.format === "malformed"
+      ? { remote_etag_shape: describeMalformedEtag(remote.etag as string) }
+      : {}),
   }));
 }
 
