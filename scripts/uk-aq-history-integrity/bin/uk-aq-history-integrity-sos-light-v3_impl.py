@@ -16020,7 +16020,7 @@ def check_official_network_rdata(
             and record.get("availability") == "authoritatively_absent"
         ),
         "site_year_files_indeterminate": 0,
-        "source_files_authoritatively_absent": 0,
+        "source_files_authoritatively_absent": len(absent_by_key),
         "source_unavailable_scope_count": len(unavailable_scopes),
         "source_unavailable_scopes": context["source_unavailable_scopes"],
         "downloaded_bytes": downloaded_bytes,
