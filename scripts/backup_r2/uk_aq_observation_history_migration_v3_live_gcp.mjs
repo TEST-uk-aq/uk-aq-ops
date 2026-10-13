@@ -81,8 +81,21 @@ function parseLiveArguments(argv) {
   if (!new Set(["plan", "migrate", "verify"]).has(oneValue(stripped, "--mode"))) {
     throw new Error("LIVE GCP entry point only accepts plan/migrate/verify");
   }
-  if (oneValue(stripped, "--mode") === "migrate" && stripped.includes("--checkpoint-in")) {
-    throw new Error("LIVE GCP clean-build migration must start from a fresh plan, never a partial checkpoint");
+  if (oneValue(stripped, "--mode") === "migrate") {
+    if (stripped.includes("--checkpoint-in")) {
+      throw new Error("LIVE GCP clean-build migration must start from a fresh plan, never a partial checkpoint");
+    }
+    // The shared side-by-side runner invokes the write operation from --mode.
+    // Do not rely on the shared executor to require an explicit --apply flag.
+    // The LIVE wrapper must independently require the complete operator GO.
+    if (!stripped.includes("--apply") || !stripped.includes("--writers-frozen")) {
+      throw new Error("LIVE migrate requires explicit --apply and --writers-frozen");
+    }
+    oneValue(stripped, "--checkpoint-out");
+    const planSha = oneValue(stripped, "--expected-plan-sha256");
+    if (!/^[0-9a-f]{64}$/.test(planSha)) {
+      throw new Error("LIVE migrate requires an exact pinned 64-character migration plan SHA-256");
+    }
   }
   return { sharedArgv: stripped, projectId, zone };
 }
