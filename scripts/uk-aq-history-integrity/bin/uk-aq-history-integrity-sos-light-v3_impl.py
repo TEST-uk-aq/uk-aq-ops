@@ -12579,6 +12579,7 @@ def _v2_observation_repair_source_evidence_summary(
         "source_count_mapping_hash",
         "required_source_file_count",
         "successful_source_file_count",
+        "authoritatively_absent_source_file_count",
         "identity_classification",
         "all_source_groups_excluded_no_authoritative_binding",
         "selected_partition_left_unchanged",
@@ -12606,6 +12607,12 @@ def _v2_observation_repair_source_evidence_summary(
         "historical_identity_rollover_groups",
     )
     list_fields = (
+        ("required_source_file_keys", None),
+        ("successful_source_file_keys", None),
+        ("source_unavailable_file_keys", None),
+        ("source_available_timeseries_ids", None),
+        ("source_unavailable_timeseries_ids", None),
+        ("source_unavailable_scopes", None),
         ("mapping_issue_samples", 25),
         ("no_authoritative_timeseries_binding_warnings", 50),
         ("r2_timeseries_without_bridge_sample", 50),
@@ -12617,6 +12624,12 @@ def _v2_observation_repair_source_evidence_summary(
         for field in scalar_fields
         if field in evidence
     }
+    if "comparison_scope" in evidence:
+        summary["comparison_scope"] = evidence["comparison_scope"]
+    if "source_timeseries_row_counts" in evidence:
+        summary["source_timeseries_row_counts"] = dict(
+            evidence["source_timeseries_row_counts"]
+        )
     for field in count_fields:
         if field in evidence:
             try:
@@ -12765,7 +12778,16 @@ def run_v2_observations_integrity_checks(
         if cached is not None:
             return cached
         resolved: dict[str, dict[str, Any]] = {}
-        for pollutant_code in sorted(V2_OBSERVATION_INTEGRITY_POLLUTANTS):
+        official_source = _official_rdata_source_for_connector(connector_id)
+        detector_pollutants = (
+            _normalise_repair_pollutants(
+                OFFICIAL_RDATA_RUN_CONTEXTS[official_source]["selected_pollutants"]
+            )
+            if official_source else V2_OBSERVATION_INTEGRITY_POLLUTANTS
+        )
+        if official_source and not detector_pollutants:
+            raise RuntimeError("official RData selected pollutant set is empty")
+        for pollutant_code in sorted(detector_pollutants):
             _, evidence = _current_source_counts_for_v2_partition(
                 conn,
                 env_name=env_name,
@@ -12882,6 +12904,31 @@ def run_v2_observations_integrity_checks(
         for connector_dir in connector_dirs:
             connector_raw = connector_dir.name.split("=", 1)[1]
             pollutant_dirs = sorted(p for p in connector_dir.glob("pollutant_code=*") if p.is_dir())
+            try:
+                connector_id_for_detector = int(connector_raw)
+            except (TypeError, ValueError):
+                connector_id_for_detector = None
+            official_source = (
+                _official_rdata_source_for_connector(connector_id_for_detector)
+                if connector_id_for_detector is not None else None
+            )
+            detector_pollutants = (
+                set(_normalise_repair_pollutants(
+                    OFFICIAL_RDATA_RUN_CONTEXTS[official_source]["selected_pollutants"]
+                ))
+                if official_source else V2_OBSERVATION_INTEGRITY_POLLUTANTS
+            )
+            if official_source and not detector_pollutants:
+                raise RuntimeError("official RData selected pollutant set is empty")
+            if official_source:
+                binding_pollutants = {
+                    str(code)
+                    for site_bindings in dict(
+                        OFFICIAL_RDATA_RUN_CONTEXTS[official_source]["bindings"]
+                    ).values()
+                    for code in dict(site_bindings)
+                }
+                detector_pollutants &= binding_pollutants
             connector_level_parts = sorted(p for p in connector_dir.glob("part-*.parquet") if p.is_file())
             if connector_level_parts:
                 gaps.append(_v2_obs_gap(
@@ -12891,7 +12938,47 @@ def run_v2_observations_integrity_checks(
                     expected_path=f"{day_rel}/{connector_dir.name}/pollutant_code=*/part-*.parquet",
                     related_paths=[str(p.relative_to(root)) for p in connector_level_parts],
                 ))
+            if official_source:
+                existing_codes = {
+                    part.name.split("=", 1)[1].strip().lower()
+                    for part in pollutant_dirs
+                }
+                per_code_evidence = source_evidence_for_connector_day(
+                    day_utc, connector_id_for_detector
+                )
+                for missing_code in sorted(detector_pollutants - existing_codes):
+                    evidence = per_code_evidence.get(missing_code)
+                    suitable, reason = _official_rdata_observation_repair_eligibility(
+                        evidence, day_utc=day_utc,
+                        connector_id=connector_id_for_detector,
+                        pollutant_code=missing_code,
+                    )
+                    missing_path = (
+                        f"{day_rel}/{connector_dir.name}/"
+                        f"pollutant_code={missing_code}"
+                    )
+                    if suitable and int((evidence or {}).get("source_rows") or 0) > 0:
+                        gap = _v2_obs_gap(
+                            "missing_pollutant_partitions", day_utc=day_utc,
+                            connector_id=connector_id_for_detector,
+                            pollutant_code=missing_code, expected_path=missing_path,
+                        )
+                    elif not suitable and reason != "source_unavailable_preserved":
+                        gap = _v2_obs_gap(
+                            "source_unavailable", day_utc=day_utc,
+                            connector_id=connector_id_for_detector,
+                            pollutant_code=missing_code, expected_path=missing_path,
+                            related_paths=[reason],
+                        )
+                    else:
+                        continue
+                    gap["source_evidence"] = dict(evidence or {})
+                    gaps.append(gap)
             if not pollutant_dirs:
+                if official_source:
+                    # The exact source-backed children were considered above.
+                    # Empty and unavailable scopes have no physical child.
+                    continue
                 try:
                     connector_id_for_source = int(connector_raw)
                 except (TypeError, ValueError):
@@ -12908,7 +12995,7 @@ def run_v2_observations_integrity_checks(
                 continue
             for pollutant_dir in pollutant_dirs:
                 pollutant = pollutant_dir.name.split("=", 1)[1].strip().lower()
-                if pollutant not in V2_OBSERVATION_INTEGRITY_POLLUTANTS:
+                if pollutant not in detector_pollutants:
                     continue
                 checked += 1
                 partition_gap_start = len(gaps)
@@ -13377,6 +13464,12 @@ def run_v2_observations_integrity_checks(
                                     "timeseries_conflict_groups",
                                     "required_source_file_count",
                                     "successful_source_file_count",
+                                    "authoritatively_absent_source_file_count",
+                                    "required_source_file_keys",
+                                    "successful_source_file_keys",
+                                    "source_unavailable_file_keys",
+                                    "source_rows",
+                                    "source_timeseries_row_counts",
                                     "historical_identity_rollover_groups",
                                     "historical_identity_rollovers",
                                     "identity_classification",
@@ -16364,6 +16457,9 @@ def _official_rdata_source_counts_for_partition(
         (context.get("required_by_day") or {}).get(day_utc) or []
     )
     unavailable_files = sorted(set(required_files) & set(context["absent_keys"]))
+    successful_files = sorted(
+        set(required_files) & set(context["identities_by_key"])
+    )
     evidence: dict[str, Any] = {
         "source_partition_state": state,
         "source_counts_present": bool(counts),
@@ -16377,10 +16473,11 @@ def _official_rdata_source_counts_for_partition(
         "source_unavailable_scopes": unavailable_scopes,
         "source_file_count": len(required_files),
         "source_file_keys": required_files,
+        "required_source_file_keys": required_files,
+        "successful_source_file_keys": successful_files,
         "required_source_file_count": len(required_files),
-        "successful_source_file_count": len(
-            set(required_files) & set(context["identities_by_key"])
-        ),
+        "successful_source_file_count": len(successful_files),
+        "authoritatively_absent_source_file_count": len(unavailable_files),
         "source_unavailable_file_keys": unavailable_files,
         "source_skip_reason": skip_reason,
         "source_available_pollutant_codes": (
@@ -16400,9 +16497,8 @@ def _official_rdata_source_counts_for_partition(
         "source_unavailable_timeseries_ids": sorted(unavailable_ids),
         "source_skip_reason": skip_reason,
         "required_source_file_count": len(required_files),
-        "successful_source_file_count": len(
-            set(required_files) & set(context["identities_by_key"])
-        ),
+        "successful_source_file_count": len(successful_files),
+        "authoritatively_absent_source_file_count": len(unavailable_files),
         "source_available_pollutant_codes": (
             [pollutant_code] if available_ids else []
         ),
@@ -18948,6 +19044,187 @@ def _observation_repair_source_evidence_is_complete(
     return True, "complete_authoritative_source_evidence"
 
 
+def _official_rdata_observation_repair_eligibility(
+    evidence: Mapping[str, Any] | None,
+    *, day_utc: str, connector_id: int, pollutant_code: str,
+) -> tuple[bool, str]:
+    """Authenticate exact acquisition and window classifications for planning.
+
+    Proposal construction and independent Python/Node admission still verify
+    the complete final target before any selected prefix may be deleted.
+    """
+    source_key = _official_rdata_source_for_connector(connector_id)
+    if source_key is None:
+        return False, "official_rdata_acquisition_context_unavailable"
+    context = OFFICIAL_RDATA_RUN_CONTEXTS.get(source_key)
+    if not isinstance(evidence, Mapping) or not isinstance(context, Mapping):
+        return False, "official_rdata_source_evidence_missing"
+    if pollutant_code not in context.get("selected_pollutants", []):
+        return False, "official_rdata_pollutant_outside_acquisition_scope"
+    required = evidence.get("required_source_file_keys")
+    successful = evidence.get("successful_source_file_keys")
+    absent = evidence.get("source_unavailable_file_keys")
+    if not all(isinstance(value, list) for value in (required, successful, absent)):
+        return False, "official_rdata_source_file_sets_missing"
+    if not all(
+        isinstance(key, str) and bool(key)
+        for keys in (required, successful, absent) for key in keys
+    ):
+        return False, "official_rdata_source_file_key_invalid"
+    required_set, successful_set, absent_set = map(
+        set, (required, successful, absent)
+    )
+    expected = set((context.get("required_by_day") or {}).get(day_utc) or [])
+    identities = context.get("identities_by_key") or {}
+    absent_records = context.get("absent_by_key") or {}
+    if (
+        not expected
+        or required_set != expected
+        or any(len(keys) != len(values) for keys, values in (
+            (required, required_set), (successful, successful_set),
+            (absent, absent_set),
+        ))
+        or successful_set & absent_set
+        or successful_set | absent_set != required_set
+        or successful_set != expected & set(identities)
+        or absent_set != expected & set(absent_records)
+        or f"{source_key}:metadata" not in successful_set
+        or evidence.get("required_source_file_count") != len(required)
+        or evidence.get("successful_source_file_count") != len(successful)
+        or evidence.get("authoritatively_absent_source_file_count") != len(absent)
+        or evidence.get("comparison_scope") != "source_available_timestamp_windows"
+    ):
+        return False, "official_rdata_source_artifact_classification_incomplete"
+    acquisition_records = context.get("acquisition_records") or []
+    for key in successful_set:
+        identity = identities[key]
+        matches = [item for item in acquisition_records
+                   if item.get("source_file") == key]
+        if (
+            len(matches) != 1
+            or matches[0].get("availability") != "present"
+            or matches[0].get("sha256") != identity.get("sha256")
+            or matches[0].get("bytes") != identity.get("bytes")
+            or identity.get("source_file") != key
+            or identity.get("availability") != "present"
+            or identity.get("http_status") != 200
+            or not identity.get("sha256")
+            or not isinstance(identity.get("bytes"), int)
+            or identity["bytes"] <= 0
+        ):
+            return False, "official_rdata_successful_source_identity_invalid"
+    for key in absent_set:
+        record = absent_records[key]
+        matches = [item for item in acquisition_records
+                   if item.get("source_file") == key]
+        if (
+            len(matches) != 1
+            or matches[0] != record
+            or record.get("availability") != "authoritatively_absent"
+            or record.get("http_status") != 404
+            or record.get("source_adapter") != source_key
+            or record.get("connector_id") != connector_id
+            or not record.get("site_code")
+            or not isinstance(record.get("source_year"), int)
+            or not record.get("canonical_url")
+            or not record.get("final_url")
+            or not record.get("requested_at_utc")
+            or record.get("reason") != "source_artifact_unavailable"
+        ):
+            return False, "official_rdata_http_404_acquisition_invalid"
+    try:
+        expected_counts, expected_evidence = _official_rdata_source_counts_for_partition(
+            source_key=source_key, day_utc=day_utc,
+            pollutant_code=pollutant_code,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        return False, f"official_rdata_window_classification_invalid:{exc}"
+    bindings = {
+        int(binding["timeseries_id"])
+        for site_bindings in dict(context.get("bindings") or {}).values()
+        for code, binding in dict(site_bindings).items()
+        if code == pollutant_code
+    }
+    available = set(expected_evidence["source_available_timeseries_ids"])
+    unavailable = set(expected_evidence["source_unavailable_timeseries_ids"])
+    if not bindings or bindings != available | unavailable:
+        return False, "official_rdata_binding_availability_incomplete"
+    scopes = evidence.get("source_unavailable_scopes")
+    if not isinstance(scopes, list) or not all(
+        isinstance(scope, Mapping) for scope in scopes
+    ):
+        return False, "official_rdata_unavailable_windows_missing"
+    if (
+        len(scopes) != len({
+            _canonical_json_utf8_bytes(scope) for scope in scopes
+        })
+        or sorted(map(_canonical_json_utf8_bytes, scopes))
+        != sorted(map(_canonical_json_utf8_bytes,
+                      expected_evidence["source_unavailable_scopes"]))
+    ):
+        return False, "official_rdata_unavailable_windows_incomplete"
+    for scope in scopes:
+        key = scope.get("source_file_key")
+        reason = scope.get("reason")
+        if (
+            scope.get("day_utc") != day_utc
+            or scope.get("pollutant_code") != pollutant_code
+            or key not in required_set
+        ):
+            return False, "official_rdata_unavailable_scope_identity_invalid"
+        if reason == "provider_site_year_artifact_absent":
+            record = absent_records.get(key) or {}
+            if (
+                key not in absent_set
+                or scope.get("http_status") != 404
+                or scope.get("canonical_url") != record.get("canonical_url")
+                or scope.get("final_url") != record.get("final_url")
+                or scope.get("request_audit_timestamp") != record.get("requested_at_utc")
+                or scope.get("site_code") != record.get("site_code")
+                or scope.get("source_year") != record.get("source_year")
+            ):
+                return False, "official_rdata_http_404_scope_invalid"
+        elif reason == "provider_site_year_pollutant_column_absent":
+            identity = identities.get(key) or {}
+            classifications = (context.get("column_classifications_by_day") or {}).get(
+                day_utc, []
+            )
+            if (
+                key not in successful_set
+                or scope.get("http_status") != 200
+                or identity.get("availability") != "present"
+                or scope.get("canonical_url") != identity.get("canonical_url")
+                or scope.get("final_url") != identity.get("final_url")
+                or not any(
+                    item.get("source_file_key") == key
+                    and item.get("pollutant_code") == pollutant_code
+                    and item.get("timeseries_id") == scope.get("timeseries_id")
+                    and item.get("classification") == "source_column_unavailable"
+                    for item in classifications
+                )
+            ):
+                return False, "official_rdata_missing_column_scope_invalid"
+        else:
+            return False, "official_rdata_unavailable_scope_reason_invalid"
+    for field in (
+        "source_partition_state", "source_counts_available", "source_skip_reason",
+        "source_rows", "source_timeseries_row_counts",
+        "source_available_timeseries_ids", "source_unavailable_timeseries_ids",
+    ):
+        if evidence.get(field) != expected_evidence.get(field):
+            return False, f"official_rdata_{field}_contradictory"
+    if sum(expected_counts.values()) != expected_evidence["source_rows"]:
+        return False, "official_rdata_source_row_count_invalid"
+    if not available:
+        if unavailable and evidence["source_partition_state"] == "source_artifact_unavailable":
+            return False, "source_unavailable_preserved"
+        return False, "official_rdata_available_source_missing"
+    return True, (
+        "partial_source_requires_authenticated_final_target"
+        if unavailable else "complete_source_requires_authenticated_final_target"
+    )
+
+
 def _derive_observation_hash_check_pollutants(
     *,
     candidates: Iterable[Mapping[str, Any]],
@@ -19009,11 +19286,20 @@ def _derive_observation_hash_check_pollutants(
         if not (valid_non_empty or valid_empty):
             skipped[key] = "no_executable_source_rows"
             continue
-        suitable, reason = _observation_repair_source_evidence_is_complete(
+        candidate_evidence = (
             candidate.get("source_evidence")
             if isinstance(candidate.get("source_evidence"), Mapping)
             else None
         )
+        if connector_id in (9, 10):
+            suitable, reason = _official_rdata_observation_repair_eligibility(
+                candidate_evidence, day_utc=day_utc,
+                connector_id=connector_id, pollutant_code=pollutant_code,
+            )
+        else:
+            suitable, reason = _observation_repair_source_evidence_is_complete(
+                candidate_evidence
+            )
         if not suitable:
             skipped[key] = reason
             continue
@@ -19032,6 +19318,7 @@ def _derive_executable_observation_repair_pollutants(
     dict[tuple[str, int], list[str]],
     set[int],
     list[dict[str, Any]],
+    dict[tuple[str, int], list[str]],
 ]:
     """Narrow operator-allowed scope to executable data-repair findings."""
     gaps = list(v2_observations.get("gaps") or [])
@@ -19060,6 +19347,7 @@ def _derive_executable_observation_repair_pollutants(
             explicit_actions.add((day_utc, connector_id, pollutant_code))
 
     scopes: dict[tuple[str, int], set[str]] = {}
+    preserved: dict[tuple[str, int], set[str]] = {}
     executable_gap_indexes: set[int] = set()
     skipped: list[dict[str, Any]] = []
 
@@ -19159,11 +19447,22 @@ def _derive_executable_observation_repair_pollutants(
             evidence = gap.get("source_evidence")
             if not isinstance(evidence, Mapping):
                 evidence = source_resolution.get(pollutant_code)
-            if repair_plan_present:
-                suitable, reason = _observation_repair_source_evidence_is_complete(
-                    evidence if isinstance(evidence, Mapping) else None
-                )
+            if repair_plan_present or connector_id in (9, 10):
+                if connector_id in (9, 10):
+                    suitable, reason = _official_rdata_observation_repair_eligibility(
+                        evidence if isinstance(evidence, Mapping) else None,
+                        day_utc=day_utc, connector_id=connector_id,
+                        pollutant_code=pollutant_code,
+                    )
+                else:
+                    suitable, reason = _observation_repair_source_evidence_is_complete(
+                        evidence if isinstance(evidence, Mapping) else None
+                    )
                 if not suitable:
+                    if reason == "source_unavailable_preserved":
+                        preserved.setdefault((day_utc, connector_id), set()).add(
+                            pollutant_code
+                        )
                     skip(
                         index=index, day_utc=day_utc,
                         connector_id=connector_id,
@@ -19177,8 +19476,8 @@ def _derive_executable_observation_repair_pollutants(
             executable_gap_indexes.add(index)
             continue
 
-        # A connector/day-wide repair is allowed only when every explicitly
-        # requested pollutant has complete authoritative source evidence.
+        # A connector/day finding discovers selected pollutant scopes; it
+        # never grants connector-wide deletion authority.
         if not requested:
             skip(
                 index=index, day_utc=day_utc,
@@ -19187,8 +19486,8 @@ def _derive_executable_observation_repair_pollutants(
                 reason="explicit_repair_pollutants_required_for_wildcard_repair",
             )
             continue
-        wildcard_pollutants = requested
-        if repair_plan_present:
+        wildcard_pollutants = set(requested)
+        if repair_plan_present or connector_id in (9, 10):
             gap_source_resolution = gap.get(
                 "source_evidence_by_pollutant"
             )
@@ -19197,15 +19496,35 @@ def _derive_executable_observation_repair_pollutants(
                 if isinstance(gap_source_resolution, Mapping)
                 else source_resolution
             )
+            admitted: set[str] = set()
             failures = []
             for code in sorted(wildcard_pollutants):
-                suitable, reason = _observation_repair_source_evidence_is_complete(
+                scoped_evidence = (
                     scoped_source_resolution.get(code)
                     if isinstance(scoped_source_resolution.get(code), Mapping)
                     else None
                 )
-                if not suitable:
-                    failures.append(f"{code}:{reason}")
+                if connector_id in (9, 10):
+                    suitable, reason = _official_rdata_observation_repair_eligibility(
+                        scoped_evidence, day_utc=day_utc,
+                        connector_id=connector_id, pollutant_code=code,
+                    )
+                    if suitable:
+                        admitted.add(code)
+                    else:
+                        if reason == "source_unavailable_preserved":
+                            preserved.setdefault((day_utc, connector_id), set()).add(code)
+                        skip(
+                            index=index, day_utc=day_utc,
+                            connector_id=connector_id, pollutant_code=code,
+                            gap_type=gap_type, reason=reason,
+                        )
+                else:
+                    suitable, reason = _observation_repair_source_evidence_is_complete(
+                        scoped_evidence
+                    )
+                    if not suitable:
+                        failures.append(f"{code}:{reason}")
             if failures:
                 skip(
                     index=index, day_utc=day_utc,
@@ -19215,6 +19534,10 @@ def _derive_executable_observation_repair_pollutants(
                     + ",".join(failures),
                 )
                 continue
+            if connector_id in (9, 10):
+                wildcard_pollutants = admitted
+                if not wildcard_pollutants:
+                    continue
         scopes.setdefault((day_utc, connector_id), set()).update(
             wildcard_pollutants
         )
@@ -19224,6 +19547,7 @@ def _derive_executable_observation_repair_pollutants(
         {key: sorted(values) for key, values in sorted(scopes.items())},
         executable_gap_indexes,
         skipped,
+        {key: sorted(values) for key, values in sorted(preserved.items())},
     )
 
 
@@ -20221,6 +20545,7 @@ def run_v2_gap_backfills(
             executable_pollutants_by_key,
             executable_gap_indexes,
             skipped_nonexecutable_gaps,
+            preserved_pollutants_by_key,
         ) = _derive_executable_observation_repair_pollutants(
             v2_observations=v2_observations,
             requested_pollutants=repair_pollutants,
@@ -20229,6 +20554,7 @@ def run_v2_gap_backfills(
         executable_pollutants_by_key = {}
         executable_gap_indexes = set()
         skipped_nonexecutable_gaps = []
+        preserved_pollutants_by_key = {}
         for target in direct_targets:
             day_utc = str(target.get("day_utc") or "").strip()
             try:
@@ -20283,6 +20609,7 @@ def run_v2_gap_backfills(
         executable_pollutants_by_key = {}
         executable_gap_indexes = set()
         skipped_nonexecutable_gaps = []
+        preserved_pollutants_by_key = {}
         for target in official_force_targets or []:
             day_utc = str(target.get("day_utc") or "").strip()
             connector_id = target.get("connector_id")
@@ -20389,6 +20716,32 @@ def run_v2_gap_backfills(
     metrics["backfill_candidate_days"] = metrics["observation_backfill_candidate_days"]
     metrics["backfill_candidate_timeseries_ids"] = metrics["observation_backfill_candidate_timeseries_ids"]
     metrics["skipped_v2_observation_metadata_gaps"] = skipped_metadata_gaps
+    for (day_iso, connector_id), pollutants in sorted(
+        preserved_pollutants_by_key.items()
+    ):
+        if run_state is None:
+            raise ValueError("official RData preserved-only pinned state is unavailable")
+        source = _official_rdata_source_for_connector(connector_id)
+        context = OFFICIAL_RDATA_RUN_CONTEXTS.get(source or "")
+        if context is None:
+            raise ValueError("official RData preserved-only context is unavailable")
+        outcome = {
+            "day_utc": day_iso,
+            "connector_id": connector_id,
+            "pollutant_codes": pollutants,
+            "outcome": "source_artifact_unavailable_preserved",
+            "selected_partition_left_unchanged": True,
+            "tombstone_created": False,
+            "source_evidence_authorities": {
+                code: _official_rdata_v10_preserved_source_authority(
+                    context=context, day_utc=day_iso, pollutant_code=code
+                ) for code in pollutants
+            },
+        }
+        metrics["selected_partition_outcomes"].append(outcome)
+        metrics["skipped_v2_observation_repairs"].append({
+            **outcome, "reason": "all_timeseries_source_artifacts_unavailable",
+        })
     backfill_log_dir = Path(env["UK_AQ_HISTORY_INTEGRITY_LOG_DIR"]) / "backfill" / run_compact
     for day_iso, connector_id in standalone_index_keys:
         idx_cmd = _v2_observations_index_rebuild_command(day_iso, connector_id)
