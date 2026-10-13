@@ -30,6 +30,47 @@ type LocalCacheHit = {
   etag: string;
 };
 
+type EtagFormat = "quoted" | "unquoted" | "missing" | "malformed";
+
+function classifyEtag(etag: string | null): { format: EtagFormat; value: string | null } {
+  if (etag === null || etag === "") return { format: "missing", value: null };
+  // A weak tag must never become equal to a strong tag by removing quotes.
+  if (/^[Ww]\//.test(etag)) return { format: "malformed", value: null };
+  if (/^"[^"\s\x00-\x1f\x7f]+"$/.test(etag)) {
+    return { format: "quoted", value: etag.slice(1, -1) };
+  }
+  if (/^[^"\s\x00-\x1f\x7f]+$/.test(etag)) {
+    return { format: "unquoted", value: etag };
+  }
+  return { format: "malformed", value: null };
+}
+
+function logEtagMismatch(key: string, remote: RemoteFingerprint, cachedEtag: string): void {
+  const cached = classifyEtag(cachedEtag);
+  const remoteEtag = classifyEtag(remote.etag);
+  const equalAfterQuoteNormalisation = cached.value !== null &&
+    remoteEtag.value !== null && cached.value === remoteEtag.value;
+  const mismatchCategory = !remote.exists
+    ? "missing_remote"
+    : cached.format === "missing" || remoteEtag.format === "missing"
+    ? "missing_etag"
+    : cached.format === "malformed" || remoteEtag.format === "malformed"
+    ? "malformed_etag"
+    : equalAfterQuoteNormalisation
+    ? "quote_format_only"
+    : "different_values";
+
+  console.warn(JSON.stringify({
+    event: "latest_snapshot_local_cache_etag_mismatch",
+    key,
+    remote_exists: remote.exists,
+    cached_etag_format: cached.format,
+    remote_etag_format: remoteEtag.format,
+    equal_after_quote_normalisation: equalAfterQuoteNormalisation,
+    mismatch_category: mismatchCategory,
+  }));
+}
+
 function cacheFileStem(key: string): string {
   return createHash("sha256").update(key).digest("hex");
 }
@@ -155,6 +196,7 @@ export function createLatestSnapshotLocalR2Cache({
       }
       if (!remote.exists || !remote.etag || remote.etag !== sidecar.etag) {
         stats.fingerprint_mismatch += 1;
+        logEtagMismatch(key, remote, sidecar.etag);
         return null;
       }
 
