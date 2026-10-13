@@ -23,6 +23,9 @@ type LocalCacheSidecar = {
 type RemoteFingerprint = {
   exists: boolean;
   etag: string | null;
+  sha256?: string | null;
+  bytes?: number | null;
+  last_modified?: string | null;
 };
 
 type LocalCacheHit = {
@@ -61,7 +64,14 @@ function describeMalformedEtag(etag: string) {
   };
 }
 
-function logEtagMismatch(key: string, remote: RemoteFingerprint, cachedEtag: string): void {
+function logEtagMismatch(
+  key: string,
+  remote: RemoteFingerprint,
+  cachedEtag: string,
+  cachedSha256: string,
+  invocationId: string | null,
+  readSequence: number,
+): void {
   const cached = classifyEtag(cachedEtag);
   const remoteEtag = classifyEtag(remote.etag);
   const equalAfterQuoteNormalisation = cached.value !== null &&
@@ -76,8 +86,30 @@ function logEtagMismatch(key: string, remote: RemoteFingerprint, cachedEtag: str
     ? "quote_format_only"
     : "different_values";
 
+  // Correlation only; weak validators remain ineligible for byte-exact cache reuse.
+  const weakMatch = typeof remote.etag === "string"
+    ? /^W\/"([^"\s\x00-\x1f\x7f]+)"$/.exec(remote.etag)
+    : null;
+  const weakOpaqueMatchesStrong = weakMatch && cached.format === "quoted"
+    ? weakMatch[1] === cached.value
+    : null;
+  const remoteSha256Available = typeof remote.sha256 === "string" &&
+    /^[a-f0-9]{64}$/.test(remote.sha256);
+  const remoteBytes = typeof remote.bytes === "number" &&
+      Number.isSafeInteger(remote.bytes) && remote.bytes >= 0
+    ? remote.bytes
+    : null;
+
   console.warn(JSON.stringify({
     event: "latest_snapshot_local_cache_etag_mismatch",
+    invocation_id: invocationId,
+    read_sequence: readSequence,
+    weak_opaque_matches_cached_strong: weakOpaqueMatchesStrong,
+    head_checksum_available: remoteSha256Available,
+    head_checksum_matches_cached_sha256: remoteSha256Available
+      ? remote.sha256 === cachedSha256 : null,
+    head_bytes: remoteBytes,
+    head_last_modified: remote.last_modified ?? null,
     key,
     remote_exists: remote.exists,
     cached_etag_format: cached.format,
@@ -139,10 +171,13 @@ async function writeAtomically(path: string, bytes: Uint8Array): Promise<void> {
 export function createLatestSnapshotLocalR2Cache({
   enabled,
   directory,
+  invocation_id = null,
 }: {
   enabled: boolean;
   directory: string;
+  invocation_id?: string | null;
 }) {
+  let readSequence = 0;
   const stats: LocalR2CacheStats = {
     enabled,
     cache_dir: directory,
@@ -170,6 +205,7 @@ export function createLatestSnapshotLocalR2Cache({
       loadRemoteFingerprint: () => Promise<RemoteFingerprint>,
       validateBody: (body: Uint8Array) => boolean,
     ): Promise<LocalCacheHit | null> {
+      const currentReadSequence = ++readSequence;
       if (!enabled) {
         stats.disabled += 1;
         return null;
@@ -215,7 +251,9 @@ export function createLatestSnapshotLocalR2Cache({
       }
       if (!remote.exists || !remote.etag || remote.etag !== sidecar.etag) {
         stats.fingerprint_mismatch += 1;
-        logEtagMismatch(key, remote, sidecar.etag);
+        logEtagMismatch(
+          key, remote, sidecar.etag, sidecar.sha256, invocation_id, currentReadSequence,
+        );
         return null;
       }
 

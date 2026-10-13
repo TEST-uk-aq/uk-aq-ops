@@ -77,7 +77,9 @@ function reconciliationResultFromOutput(output: string): Record<string, unknown>
 export async function runJob(
   triggerMode: string,
   reconciliationRequest?: Record<string, unknown>,
+  invocationId?: string,
 ): Promise<{ success: boolean; code: number; result?: Record<string, unknown> }> {
+  const traceId = invocationId || crypto.randomUUID();
   const startedMs = Date.now();
   let requestFile: string | null = null;
   if (reconciliationRequest) {
@@ -100,6 +102,7 @@ export async function runJob(
     env: {
       ...Deno.env.toObject(),
       UK_AQ_LATEST_SNAPSHOT_TRIGGER_MODE: triggerMode,
+      UK_AQ_LATEST_SNAPSHOT_INVOCATION_ID: traceId,
       ...(requestFile
         ? { UK_AQ_LATEST_SNAPSHOT_RECONCILE_REQUEST_FILE: requestFile }
         : {}),
@@ -113,6 +116,7 @@ export async function runJob(
     : Promise.resolve("");
 
   logEvent("log", "latest_snapshot_child_started", {
+    invocation_id: traceId,
     trigger_mode: triggerMode,
     pid: child.pid,
     timeout_ms: JOB_TIMEOUT_MS,
@@ -133,6 +137,7 @@ export async function runJob(
       initialResult.status.success ? "log" : "error",
       "latest_snapshot_child_completed",
       {
+        invocation_id: traceId,
         trigger_mode: triggerMode,
         pid: child.pid,
         code: initialResult.status.code,
@@ -148,6 +153,7 @@ export async function runJob(
   }
 
   logEvent("error", "latest_snapshot_child_timeout", {
+    invocation_id: traceId,
     trigger_mode: triggerMode,
     pid: child.pid,
     timeout_ms: JOB_TIMEOUT_MS,
@@ -158,6 +164,7 @@ export async function runJob(
     child.kill("SIGTERM");
   } catch (error) {
     logEvent("error", "latest_snapshot_child_signal_failed", {
+      invocation_id: traceId,
       trigger_mode: triggerMode,
       pid: child.pid,
       signal: "SIGTERM",
@@ -168,6 +175,7 @@ export async function runJob(
   const graceResult = await waitForStatus(statusPromise, JOB_KILL_GRACE_MS);
   if (graceResult.timed_out) {
     logEvent("error", "latest_snapshot_child_kill_escalated", {
+      invocation_id: traceId,
       trigger_mode: triggerMode,
       pid: child.pid,
       grace_ms: JOB_KILL_GRACE_MS,
@@ -177,6 +185,7 @@ export async function runJob(
       child.kill("SIGKILL");
     } catch (error) {
       logEvent("error", "latest_snapshot_child_signal_failed", {
+        invocation_id: traceId,
         trigger_mode: triggerMode,
         pid: child.pid,
         signal: "SIGKILL",
@@ -187,6 +196,7 @@ export async function runJob(
       const killedResult = await waitForStatus(statusPromise, JOB_KILL_WAIT_MS);
       if (killedResult.timed_out) {
         logEvent("error", "latest_snapshot_child_reap_timeout", {
+          invocation_id: traceId,
           trigger_mode: triggerMode,
           pid: child.pid,
           wait_ms: JOB_KILL_WAIT_MS,
@@ -194,6 +204,7 @@ export async function runJob(
       }
     } catch (error) {
       logEvent("error", "latest_snapshot_child_reap_failed", {
+        invocation_id: traceId,
         trigger_mode: triggerMode,
         pid: child.pid,
         error: error instanceof Error ? error.message : String(error),

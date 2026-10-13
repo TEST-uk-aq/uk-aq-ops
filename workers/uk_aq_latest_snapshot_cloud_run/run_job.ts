@@ -417,10 +417,25 @@ const R2_CONFIG = {
   secret_access_key: optionalEnvAny(["CFLARE_R2_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY"]) || "",
 };
 
+const INVOCATION_ID = (Deno.env.get("UK_AQ_LATEST_SNAPSHOT_INVOCATION_ID") || "").trim() ||
+  crypto.randomUUID();
 const LOCAL_R2_CACHE = createLatestSnapshotLocalR2Cache({
   enabled: UK_AQ_LATEST_SNAPSHOT_LOCAL_CACHE_ENABLED,
   directory: UK_AQ_LATEST_SNAPSHOT_LOCAL_CACHE_DIR,
+  invocation_id: INVOCATION_ID,
 });
+
+// Per-child diagnostics only; counts do not affect cache acceptance or requests.
+const LOCAL_CACHE_R2_IO = {
+  read_count: 0,
+  warm_hits: 0,
+  head_requests: 0,
+  head_duration_ms: 0,
+  fallback_get_requests: 0,
+  fallback_get_duration_ms: 0,
+  fallback_get_bytes: 0,
+};
+let localCacheReadSequence = 0;
 
 const TEXT_ENCODER = new TextEncoder();
 
@@ -435,38 +450,99 @@ function optionalEnvAny(names: string[]): string | null {
 }
 
 async function loadDurableR2Object(key: string) {
-  const local = await LOCAL_R2_CACHE.readValidated(key, async () => {
-    const head = await r2HeadObject({ r2: R2_CONFIG, key });
-    return {
-      exists: Boolean(head.exists),
-      etag: "etag" in head && typeof head.etag === "string" ? head.etag : null,
-    };
-  }, (body) => {
-    try {
-      JSON.parse(new TextDecoder().decode(body));
-      return true;
-    } catch {
-      return false;
+  const readSequence = ++localCacheReadSequence;
+  LOCAL_CACHE_R2_IO.read_count += 1;
+  const startedMs = performance.now();
+  let headRequests = 0;
+  let headDurationMs = 0;
+  let getRequests = 0;
+  let getDurationMs = 0;
+  let getBytes = 0;
+  let result = "error";
+  const before = LOCAL_R2_CACHE.summary();
+  try {
+    const local = await LOCAL_R2_CACHE.readValidated(key, async () => {
+      const headStarted = performance.now();
+      headRequests += 1;
+      LOCAL_CACHE_R2_IO.head_requests += 1;
+      try {
+        const head = await r2HeadObject({ r2: R2_CONFIG, key });
+        return {
+          exists: Boolean(head.exists),
+          etag: "etag" in head && typeof head.etag === "string" ? head.etag : null,
+          sha256: "sha256" in head && typeof head.sha256 === "string" ? head.sha256 : null,
+          bytes: "bytes" in head && typeof head.bytes === "number" ? head.bytes : null,
+          last_modified: "last_modified" in head && typeof head.last_modified === "string"
+            ? head.last_modified : null,
+        };
+      } finally {
+        const duration = performance.now() - headStarted;
+        headDurationMs += duration;
+        LOCAL_CACHE_R2_IO.head_duration_ms += duration;
+      }
+    }, (body) => {
+      try {
+        JSON.parse(new TextDecoder().decode(body));
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (local) {
+      result = "warm_hit";
+      LOCAL_CACHE_R2_IO.warm_hits += 1;
+      return {
+        key,
+        body: local.body,
+        bytes: local.body.byteLength,
+        etag: local.etag,
+      };
     }
-  });
-  if (local) {
-    return {
-      key,
-      body: local.body,
-      bytes: local.body.byteLength,
-      etag: local.etag,
-    };
-  }
 
-  const object = await r2GetObject({ r2: R2_CONFIG, key });
-  const stored = await LOCAL_R2_CACHE.store(key, object.body, object.etag);
-  if (!stored) {
-    console.warn(JSON.stringify({
-      event: "latest_snapshot_local_cache_write_warning",
+    getRequests += 1;
+    LOCAL_CACHE_R2_IO.fallback_get_requests += 1;
+    const getStarted = performance.now();
+    let object: Awaited<ReturnType<typeof r2GetObject>>;
+    try {
+      object = await r2GetObject({ r2: R2_CONFIG, key });
+    } finally {
+      const duration = performance.now() - getStarted;
+      getDurationMs += duration;
+      LOCAL_CACHE_R2_IO.fallback_get_duration_ms += duration;
+    }
+    getBytes += object.body.byteLength;
+    LOCAL_CACHE_R2_IO.fallback_get_bytes += object.body.byteLength;
+    const stored = await LOCAL_R2_CACHE.store(key, object.body, object.etag);
+    if (!stored) {
+      console.warn(JSON.stringify({
+        event: "latest_snapshot_local_cache_write_warning",
+        invocation_id: INVOCATION_ID,
+        key,
+      }));
+    }
+    result = "fallback_get";
+    return object;
+  } finally {
+    const after = LOCAL_R2_CACHE.summary();
+    console.log(JSON.stringify({
+      event: "latest_snapshot_local_cache_r2_read",
+      invocation_id: INVOCATION_ID,
+      child_pid: Deno.pid,
+      read_sequence: readSequence,
       key,
+      result,
+      cache_mismatch_delta: after.fingerprint_mismatch - before.fingerprint_mismatch,
+      cache_cold_miss_delta: after.cold_miss - before.cold_miss,
+      cache_corrupt_delta: after.corrupt - before.corrupt,
+      cache_validation_error_delta: after.validation_error - before.validation_error,
+      head_requests: headRequests,
+      head_duration_ms: Math.round(headDurationMs),
+      fallback_get_requests: getRequests,
+      fallback_get_duration_ms: Math.round(getDurationMs),
+      fallback_get_bytes: getBytes,
+      duration_ms: Math.round(performance.now() - startedMs),
     }));
   }
-  return object;
 }
 
 async function updateLocalR2CacheAfterPut(
@@ -2055,6 +2131,8 @@ async function main(): Promise<void> {
 
   console.log(JSON.stringify({
     event: "latest_snapshot_state_apply",
+    invocation_id: INVOCATION_ID,
+    child_pid: Deno.pid,
     timestamp: utcNowIso(),
     pull: pulled.summary,
     state_apply: stateApply,
@@ -2340,11 +2418,18 @@ async function main(): Promise<void> {
   };
   console.log(JSON.stringify({
     event: "latest_snapshot_job_summary",
+    invocation_id: INVOCATION_ID,
+    child_pid: Deno.pid,
     timestamp: new Date().toISOString(),
     ...report,
     build_path: buildPath,
     fast_path_rejection_reason: reuse.reason,
     local_cache: LOCAL_R2_CACHE.summary(),
+    local_cache_r2_io: {
+      ...LOCAL_CACHE_R2_IO,
+      head_duration_ms: Math.round(LOCAL_CACHE_R2_IO.head_duration_ms),
+      fallback_get_duration_ms: Math.round(LOCAL_CACHE_R2_IO.fallback_get_duration_ms),
+    },
     run_reports: {
       mode: UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_POLICY.mode,
       source: UK_AQ_LATEST_SNAPSHOT_RUN_REPORTS_POLICY.source,
