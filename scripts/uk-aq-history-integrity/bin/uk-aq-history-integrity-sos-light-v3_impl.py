@@ -16037,6 +16037,122 @@ def check_official_network_rdata(
     return metrics
 
 
+def _authenticate_generic_official_rdata_pinned_hierarchy(
+    *, run_state: Mapping[str, Any], env: Mapping[str, str],
+    day_utc: str, connector_id: int, pollutant_code: str,
+) -> None:
+    """Authenticate the fixed-v3 source path with the shared canonical validator."""
+    baseline = Path(str(run_state.get("base_dropbox_root") or ""))
+    if not baseline.is_dir():
+        raise ValueError("official RData pinned baseline is unavailable")
+    currentness = run_state.get("dropbox_currentness") or {}
+    helper = (_repo_root_for_integrity_script(env) / "scripts/backup_r2/lib/"
+              "official_rdata_pinned_hierarchy.mjs")
+    prefix = (f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
+              f"connector_id={connector_id}/pollutant_code={pollutant_code}")
+    manifest_key = f"{prefix}/manifest.json"
+    manifest_path = baseline / manifest_key
+    request = {
+            "run_state": {
+                "history_generation": "v3",
+                "base_dropbox_root": str(baseline),
+                "dropbox_currentness": {
+                    "allowed": currentness.get("allowed"),
+                    "checkpoint_live_root_match": currentness.get("checkpoint_live_root_match"),
+                    "checkpoint": {
+                        "observations_processed_source_root_hash":
+                            (currentness.get("checkpoint") or {}).get(
+                                "observations_processed_source_root_hash")
+                    },
+                    "live_observations_root": currentness.get("live_observations_root"),
+                },
+            },
+            "partition": {
+                "day_utc": day_utc, "connector_id": connector_id,
+                "pollutant_code": pollutant_code, "manifest_key": manifest_key,
+                "baseline_state": (
+                    "partition_present" if manifest_path.is_file()
+                    else "partition_absent"
+                ),
+            },
+    }
+    result = subprocess.run(
+        [str(env.get("UK_AQ_BACKFILL_NODE_BIN") or shutil.which("node") or "node"),
+         str(helper)],
+        input=json.dumps(request, separators=(",", ":")), text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError("official RData pinned hierarchy authentication failed: "
+                         + _truncate_text(result.stderr, 500))
+
+
+def _assert_official_rdata_ratification_nonregression(
+    *, run_state: Mapping[str, Any], env: Mapping[str, str],
+    day_utc: str, connector_id: int,
+    repairable_codes: Iterable[str], target: Iterable[Mapping[str, Any]],
+) -> None:
+    """Check the complete v3 target against pinned R identities before proposal."""
+    def row_identity(row: Mapping[str, Any]) -> tuple[int, str]:
+        observed = _parse_required_timestamp_value(
+            row.get("observed_at_utc") or row.get("observed_at")
+        )
+        if observed is None:
+            raise ValueError("official RData ratification observation timestamp is invalid")
+        return int(row["timeseries_id"]), _format_utc_timestamp(observed)
+
+    target_status: dict[tuple[int, str], Any] = {}
+    for row in target:
+        identity = row_identity(row)
+        if identity in target_status:
+            raise ValueError("official RData final target has duplicate observation identity")
+        target_status[identity] = row.get("verification_status")
+    baseline = Path(str(run_state.get("base_dropbox_root") or ""))
+    for code in sorted(set(repairable_codes)):
+        prefix = (f"{R2_HISTORY_V2_OBSERVATIONS_PREFIX}/day_utc={day_utc}/"
+                  f"connector_id={connector_id}/pollutant_code={code}")
+        manifest_key = f"{prefix}/manifest.json"
+        manifest_path = baseline / manifest_key
+        _authenticate_generic_official_rdata_pinned_hierarchy(
+            run_state=run_state, env=env, day_utc=day_utc,
+            connector_id=connector_id, pollutant_code=code,
+        )
+        if not manifest_path.is_file():
+            continue
+        manifest = json.loads(manifest_path.read_bytes())
+        files = manifest.get("files") if isinstance(manifest, Mapping) else None
+        if not isinstance(files, list):
+            raise ValueError("official RData ratification baseline files are invalid")
+        listed: set[str] = set()
+        parquet_paths: list[str] = []
+        for entry in files:
+            key = str(entry.get("key") or "") if isinstance(entry, Mapping) else ""
+            if (not re.fullmatch(re.escape(prefix) + r"/part-\d+\.parquet", key)
+                    or key in listed):
+                raise ValueError("official RData ratification baseline file closure is invalid")
+            listed.add(key)
+            body = (baseline / key).read_bytes()
+            if (len(body) != entry.get("bytes")
+                    or hashlib.sha256(body).hexdigest() != entry.get("etag_or_hash")):
+                raise ValueError("official RData ratification baseline bytes changed")
+            parquet_paths.append(str(baseline / key))
+        actual = {path.relative_to(baseline).as_posix()
+                  for path in (baseline / prefix).glob("part-*.parquet")}
+        if listed != actual:
+            raise ValueError("official RData ratification baseline file closure changed")
+        baseline_rows = (_observation_rows_from_local_parquet_for_shared_hash(
+            parquet_paths=parquet_paths) if parquet_paths else [])
+        for row in baseline_rows:
+            if (int(row.get("connector_id") or 0) != connector_id
+                    or str(row.get("pollutant_code") or "") != code
+                    or str(row.get("observed_at_utc") or "")[:10] != day_utc):
+                raise ValueError("official RData ratification baseline row escaped scope")
+            if row.get("verification_status", row.get("status")) == "R":
+                identity = row_identity(row)
+                if identity in target_status and target_status[identity] != "R":
+                    raise ValueError("official RData ratification boundary regressed")
+
+
 def _prepare_official_rdata_proposal(
     *,
     source_key: str,
@@ -16046,6 +16162,7 @@ def _prepare_official_rdata_proposal(
     stage_root: Path,
     env: Mapping[str, str],
     history_generation: str = CURRENT_INTEGRITY_HISTORY_VERSION,
+    run_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     context = OFFICIAL_RDATA_RUN_CONTEXTS.get(source_key)
     if context is None:
@@ -16213,6 +16330,13 @@ def _prepare_official_rdata_proposal(
                 partition_identity
             )
     required = list(context["required_by_day"].get(day_utc, []))
+    if run_state is not None:
+        _assert_official_rdata_ratification_nonregression(
+            run_state=run_state, env=env, day_utc=day_utc,
+            connector_id=connector_id,
+            repairable_codes=source_available_pollutant_codes,
+            target=[*rows, *preserved_rows],
+        )
     identities = [
         context["identities_by_key"][key]
         for key in required if key in context["identities_by_key"]
@@ -18095,31 +18219,55 @@ def _generic_preserved_manifest_reference(
     parent_key: str,
     child_key: str,
     reference_fields: tuple[str, ...],
+    identity_field: str = "manifest_hash",
+    expected_child_keys: Iterable[str] | None = None,
 ) -> str:
-    references: dict[str, str] = {}
+    base = R2_HISTORY_V2_OBSERVATIONS_PREFIX
+    parent_prefix = parent_key.removesuffix("/manifest.json")
+    if "pollutant_manifests" in reference_fields:
+        pattern = re.escape(parent_prefix) + r"/pollutant_code=[a-z0-9_]+/manifest\.json"
+    elif "connector_manifests" in reference_fields:
+        pattern = re.escape(parent_prefix) + r"/connector_id=[1-9]\d*/manifest\.json"
+    elif parent_key == f"{base}/_manifests/manifest.json":
+        pattern = re.escape(base) + r"/_manifests/year=\d{4}/manifest\.json"
+    elif re.fullmatch(re.escape(base) + r"/_manifests/year=\d{4}/manifest\.json", parent_key):
+        pattern = re.escape(parent_prefix) + r"/month=(?:0[1-9]|1[0-2])/manifest\.json"
+    elif re.fullmatch(re.escape(base) + r"/_manifests/year=\d{4}/month=(?:0[1-9]|1[0-2])/manifest\.json", parent_key):
+        year_month = parent_key.split("year=", 1)[1].split("/month=", 1)
+        pattern = (re.escape(base) + r"/day_utc="
+                   + re.escape(f"{year_month[0]}-{year_month[1][:2]}")
+                   + r"-\d{2}/manifest\.json")
+    else:
+        raise ValueError(f"generic preserved parent path is invalid: {parent_key}")
+    collections: list[dict[str, dict[str, Any]]] = []
     for field in reference_fields:
-        raw_references = payload.get(field) or []
+        raw_references = payload.get(field)
         if not isinstance(raw_references, list):
             raise ValueError(
                 f"generic preserved parent references are invalid: {parent_key}"
             )
+        references: dict[str, dict[str, Any]] = {}
         for raw_reference in raw_references:
             if not isinstance(raw_reference, Mapping):
                 raise ValueError(
                     f"generic preserved parent reference is invalid: {parent_key}"
                 )
             manifest_key = str(raw_reference.get("manifest_key") or "")
-            manifest_hash = str(raw_reference.get("manifest_hash") or "")
-            if not manifest_key:
-                continue
-            previous = references.get(manifest_key)
-            if previous is not None and previous != manifest_hash:
+            manifest_hash = str(raw_reference.get(identity_field) or "")
+            if (not re.fullmatch(pattern, manifest_key)
+                    or not re.fullmatch(r"[a-f0-9]{64}", manifest_hash)
+                    or manifest_key in references):
                 raise ValueError(
-                    "generic preserved parent has contradictory child identity: "
-                    f"{parent_key} -> {manifest_key}"
+                    f"generic preserved parent has invalid child identity: {parent_key}"
                 )
-            references[manifest_key] = manifest_hash
-    manifest_hash = references.get(child_key)
+            references[manifest_key] = dict(raw_reference)
+        collections.append(references)
+    if any(collection != collections[0] for collection in collections[1:]):
+        raise ValueError(f"generic preserved parent child aliases disagree: {parent_key}")
+    if (expected_child_keys is not None
+            and set(collections[0]) != set(expected_child_keys)):
+        raise ValueError(f"generic preserved parent child dependencies disagree: {parent_key}")
+    manifest_hash = collections[0].get(child_key, {}).get(identity_field)
     if not re.fullmatch(r"[a-f0-9]{64}", str(manifest_hash or "")):
         raise ValueError(
             "generic preserved parent lacks exact child reference: "
@@ -18222,6 +18370,17 @@ def _derive_generic_preserved_scope_evidence(
             "generic preserved pollutant manifest identity changed: "
             f"{pollutant_manifest_key}"
         )
+    if connector_id in (9, 10):
+        pinned = _derive_generic_pinned_metadata_dependencies(
+            run_state, day_utc=day_utc, connector_id=connector_id,
+            pollutant_code=pollutant_code,
+        )[-1]
+        if (pinned["sha256"] != pollutant_identity["sha256"]
+                or pinned["bytes"] != pollutant_identity["bytes"]):
+            raise ValueError(
+                "generic preserved official RData child differs from pinned baseline: "
+                f"{pollutant_manifest_key}"
+            )
     pollutant_manifest_hash = str(
         pollutant_payload.get("manifest_hash") or ""
     )
@@ -18249,6 +18408,11 @@ def _derive_generic_preserved_scope_evidence(
         parent_key=connector_manifest_key,
         child_key=pollutant_manifest_key,
         reference_fields=("pollutant_manifests", "child_manifests"),
+        expected_child_keys={
+            key for key in connector_dependencies
+            if re.fullmatch(re.escape(connector_prefix)
+                            + r"/pollutant_code=[a-z0-9_]+/manifest\.json", str(key))
+        },
     )
     if connector_child_hash != pollutant_manifest_hash:
         raise ValueError(
@@ -18306,6 +18470,11 @@ def _derive_generic_preserved_scope_evidence(
         parent_key=day_manifest_key,
         child_key=connector_manifest_key,
         reference_fields=("connector_manifests", "child_manifests"),
+        expected_child_keys={
+            key for key in day_dependencies
+            if re.fullmatch(re.escape(day_prefix)
+                            + r"/connector_id=[1-9]\d*/manifest\.json", str(key))
+        },
     )
     if day_child_hash != connector_manifest_hash:
         raise ValueError(
@@ -18333,10 +18502,16 @@ def _derive_generic_preserved_scope_evidence(
 def _derive_generic_pinned_metadata_dependencies(
     run_state: Mapping[str, Any], *, day_utc: str,
     connector_id: int, pollutant_code: str,
+    env: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Authenticate an unchanged derived scope through the pinned hierarchy."""
     if (run_state.get("dropbox_currentness") or {}).get("allowed") is not True:
         raise ValueError("generic metadata-only authority requires accepted Dropbox currentness")
+    if connector_id in (9, 10):
+        _authenticate_generic_official_rdata_pinned_hierarchy(
+            run_state=run_state, env=env or os.environ, day_utc=day_utc,
+            connector_id=connector_id, pollutant_code=pollutant_code,
+        )
     base = R2_HISTORY_V2_OBSERVATIONS_PREFIX
     year, month = day_utc[:4], day_utc[5:7]
     keys = [
@@ -18373,15 +18548,44 @@ def _derive_generic_pinned_metadata_dependencies(
             ["connector_manifests", "child_manifests"] if index == 3 else
             ["pollutant_manifests", "child_manifests"]
         )
-        references = [
-            ref for name in reference_fields
-            for ref in list(parent.get(name) or [])
-            if isinstance(ref, Mapping) and ref.get("manifest_key") == keys[index + 1]
-        ]
+        reference_hash = _generic_preserved_manifest_reference(
+            parent, parent_key=keys[index], child_key=keys[index + 1],
+            reference_fields=tuple(reference_fields), identity_field=field,
+        )
+        if index >= 3:
+            parent_dir = (root / keys[index]).parent
+            physical_children: set[str] = set()
+            for child_dir in parent_dir.iterdir():
+                if child_dir.is_symlink():
+                    raise ValueError(
+                        f"generic metadata-only pinned sibling is a symlink: {keys[index]}"
+                    )
+                if not child_dir.is_dir():
+                    continue
+                sibling_key = (child_dir / "manifest.json").relative_to(root).as_posix()
+                if ((child_dir / "manifest.json").is_symlink()
+                        or not (child_dir / "manifest.json").is_file()):
+                    raise ValueError(
+                        f"generic metadata-only pinned sibling manifest is missing: {sibling_key}"
+                    )
+                physical_children.add(sibling_key)
+            references = parent[reference_fields[0]]
+            if physical_children != {ref["manifest_key"] for ref in references}:
+                raise ValueError(
+                    f"generic metadata-only pinned sibling set disagrees: {keys[index]}"
+                )
+            for ref in references:
+                sibling_key = ref["manifest_key"]
+                _body, sibling = _read_generic_preserved_json(
+                    root / sibling_key, object_key=sibling_key,
+                )
+                if sibling.get("manifest_hash") != ref["manifest_hash"]:
+                    raise ValueError(
+                        f"generic metadata-only pinned sibling identity disagrees: {sibling_key}"
+                    )
         if (
-            len(references) != 1
-            or not re.fullmatch(r"[a-f0-9]{64}", str(child.get(field) or ""))
-            or references[0].get(field) != child.get(field)
+            not re.fullmatch(r"[a-f0-9]{64}", str(child.get(field) or ""))
+            or reference_hash != child.get(field)
         ):
             raise ValueError(
                 "generic metadata-only pinned hierarchy disagrees: "
@@ -20155,22 +20359,20 @@ def run_v2_observation_content_hash_checks(
                 (
                     int(row.get("timeseries_id") or 0),
                     canonical_timestamp(row),
-                    float(row.get("value")),
                 )
                 for row in persisted_rows
                 if str(row.get("pollutant_code") or "").lower() == pollutant_code
-                and row.get("verification_status") == "R"
+                and row.get("verification_status", row.get("status")) == "R"
             }
             contradictions = [
                 row for row in source_rows_by_connector_day.get(
                     (day_utc, connector_id), []
                 )
                 if str(row.get("pollutant_code") or "").lower() == pollutant_code
-                and row.get("verification_status") == "P"
+                and row.get("verification_status") != "R"
                 and (
                     int(row.get("timeseries_id") or 0),
                     canonical_timestamp(row),
-                    float(row.get("value")),
                 ) in persisted_ratified
             ]
             if contradictions:
@@ -20182,7 +20384,7 @@ def run_v2_observation_content_hash_checks(
                     expected_path=str(candidate.get("manifest_rel") or ""),
                     related_paths=[
                         "contradictory_rdata_ratification_regression",
-                        f"identical_existing_ratified_rows={len(contradictions)}",
+                        f"existing_ratified_observation_identities={len(contradictions)}",
                     ],
                 )
                 gap["source_evidence"]["contradiction"] = {
@@ -21109,6 +21311,8 @@ def run_v2_gap_backfills(
         )
         try:
             if official_rdata_source:
+                if run_state is None:
+                    raise ValueError("official RData repair requires pinned run state")
                 detector_result = _prepare_official_rdata_proposal(
                     source_key=official_rdata_source,
                     day_utc=day_iso,
@@ -21116,6 +21320,7 @@ def run_v2_gap_backfills(
                     selected_pollutants=selected_repair_pollutants,
                     stage_root=detector_stage_root,
                     env=env,
+                    run_state=run_state,
                 )
             else:
                 detector_result = run_narrow_backfill(
@@ -21298,6 +21503,8 @@ def run_v2_gap_backfills(
                 **({"UK_AQ_BACKFILL_SOS_SITE_REF_BRIDGE_FILE": bridge_snapshot["path"]} if bridge_snapshot else {}),
             }
             if official_rdata_source:
+                if run_state is None:
+                    raise ValueError("official RData repair requires pinned run state")
                 bf = _prepare_official_rdata_proposal(
                     source_key=official_rdata_source,
                     day_utc=day_iso,
@@ -21305,6 +21512,7 @@ def run_v2_gap_backfills(
                     selected_pollutants=selected_repair_pollutants,
                     stage_root=stage_root,
                     env=env,
+                    run_state=run_state,
                 )
             else:
                 bf = run_narrow_backfill(

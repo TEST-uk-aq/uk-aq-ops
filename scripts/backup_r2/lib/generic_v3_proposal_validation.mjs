@@ -14,6 +14,7 @@ import {
 } from "./sos_light_v3_proposal_validation.mjs";
 import { validateOfficialRdataPreservationDependencies } from "./official_rdata_evidence_validation.mjs";
 import { validateOfficialRdataV10PreservedOnlyAuthority } from "./official_rdata_v10_validation.mjs";
+import { authenticateOfficialRdataPinnedHierarchy } from "./official_rdata_pinned_hierarchy.mjs";
 
 const OFFICIAL_RDATA_TIMESTAMP_MAPPING =
   "rdata_date_beginning_plus_one_hour_to_observed_at_utc";
@@ -190,29 +191,57 @@ function parsePreservedManifest(body, objectKey) {
   return payload;
 }
 
-function exactManifestReference(payload, fields, parentKey, childKey) {
-  const references = new Map();
+function exactManifestReference(payload, fields, parentKey, childKey,
+  identityField = "manifest_hash", expectedChildKeys = null) {
+  const base = "history/v3/observations";
+  const parentPrefix = parentKey.slice(0, -"/manifest.json".length);
+  const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  let pattern;
+  if (fields.includes("pollutant_manifests")) {
+    pattern = new RegExp(`^${escape(parentPrefix)}/pollutant_code=[a-z0-9_]+/manifest\\.json$`);
+  } else if (fields.includes("connector_manifests")) {
+    pattern = new RegExp(`^${escape(parentPrefix)}/connector_id=[1-9]\\d*/manifest\\.json$`);
+  } else if (parentKey === `${base}/_manifests/manifest.json`) {
+    pattern = new RegExp(`^${escape(base)}/_manifests/year=\\d{4}/manifest\\.json$`);
+  } else if (new RegExp(`^${escape(base)}/_manifests/year=\\d{4}/manifest\\.json$`).test(parentKey)) {
+    pattern = new RegExp(`^${escape(parentPrefix)}/month=(?:0[1-9]|1[0-2])/manifest\\.json$`);
+  } else {
+    const month = parentKey.match(new RegExp(`^${escape(base)}/_manifests/year=(\\d{4})/month=(0[1-9]|1[0-2])/manifest\\.json$`));
+    if (!month) throw new Error(`Generic fixed-v3 preserved parent path is invalid: ${parentKey}`);
+    pattern = new RegExp(`^${escape(base)}/day_utc=${month[1]}-${month[2]}-\\d{2}/manifest\\.json$`);
+  }
+  const collections = [];
   for (const field of fields) {
-    const rawReferences = payload[field] || [];
+    const rawReferences = payload[field];
     if (!Array.isArray(rawReferences)) {
       throw new Error(`Generic fixed-v3 preserved parent references are invalid: ${parentKey}`);
     }
+    const references = new Map();
     for (const reference of rawReferences) {
       if (!reference || typeof reference !== "object" || Array.isArray(reference)) {
         throw new Error(`Generic fixed-v3 preserved parent reference is invalid: ${parentKey}`);
       }
       const manifestKey = String(reference.manifest_key || "");
-      const manifestHash = String(reference.manifest_hash || "");
-      if (!manifestKey) continue;
-      if (references.has(manifestKey) && references.get(manifestKey) !== manifestHash) {
-        throw new Error(
-          `Generic fixed-v3 preserved parent has contradictory child identity: ${parentKey} -> ${manifestKey}`,
-        );
+      const manifestHash = String(reference[identityField] || "");
+      if (!pattern.test(manifestKey) || !SHA256.test(manifestHash)
+          || references.has(manifestKey)) {
+        throw new Error(`Generic fixed-v3 preserved parent has invalid child identity: ${parentKey}`);
       }
-      references.set(manifestKey, manifestHash);
+      references.set(manifestKey, reference);
     }
+    collections.push(references);
   }
-  const manifestHash = references.get(childKey);
+  const canonical = (collection) => canonicalTransitionFingerprintJson(
+    [...collection.entries()].sort(([left], [right]) => bytewise(left, right)),
+  );
+  if (collections.some((collection) => canonical(collection) !== canonical(collections[0]))) {
+    throw new Error(`Generic fixed-v3 preserved parent child aliases disagree: ${parentKey}`);
+  }
+  if (expectedChildKeys !== null
+      && !exactArray([...collections[0].keys()].sort(bytewise), [...expectedChildKeys].sort(bytewise))) {
+    throw new Error(`Generic fixed-v3 preserved parent child dependencies disagree: ${parentKey}`);
+  }
+  const manifestHash = collections[0].get(childKey)?.[identityField];
   if (!SHA256.test(String(manifestHash || ""))) {
     throw new Error(
       `Generic fixed-v3 preserved parent lacks exact child reference: ${parentKey} -> ${childKey}`,
@@ -294,6 +323,15 @@ function deriveGenericPreservedScopeEvidence(runState, { dayUtc, connectorId, po
       || sha256(pollutantBody) !== pollutantIdentity.sha256) {
     throw new Error(`Generic fixed-v3 preserved pollutant manifest identity changed: ${pollutantManifestKey}`);
   }
+  if ([9, 10].includes(connectorId)) {
+    const pinned = derivePinnedMetadataDependencies(runState, {
+      dayUtc, connectorId, pollutantCode,
+    }).at(-1);
+    if (pinned.sha256 !== pollutantIdentity.sha256
+        || pinned.bytes !== pollutantIdentity.bytes) {
+      throw new Error(`Generic fixed-v3 preserved official RData child differs from pinned baseline: ${pollutantManifestKey}`);
+    }
+  }
   const pollutantPayload = parsePreservedManifest(pollutantBody, pollutantManifestKey);
   const pollutantManifestHash = String(pollutantPayload.manifest_hash || "");
   if (!SHA256.test(pollutantManifestHash)) {
@@ -304,6 +342,9 @@ function deriveGenericPreservedScopeEvidence(runState, { dayUtc, connectorId, po
     ["pollutant_manifests", "child_manifests"],
     connectorManifestKey,
     pollutantManifestKey,
+    "manifest_hash",
+    connector.entry.dependencies.filter((key) =>
+      new RegExp(`^${connectorPrefix}/pollutant_code=[a-z0-9_]+/manifest\\.json$`).test(key)),
   );
   if (connectorChildHash !== pollutantManifestHash) {
     throw new Error(`Generic fixed-v3 connector references stale pollutant identity: ${pollutantManifestKey}`);
@@ -336,6 +377,9 @@ function deriveGenericPreservedScopeEvidence(runState, { dayUtc, connectorId, po
     ["connector_manifests", "child_manifests"],
     dayManifestKey,
     connectorManifestKey,
+    "manifest_hash",
+    day.entry.dependencies.filter((key) =>
+      new RegExp(`^${dayPrefix}/connector_id=[1-9]\\d*/manifest\\.json$`).test(key)),
   );
   if (dayChildHash !== connectorManifestHash) {
     throw new Error(`Generic fixed-v3 day parent references stale connector identity: ${connectorManifestKey}`);
@@ -374,6 +418,15 @@ function derivePinnedMetadataDependencies(runState, { dayUtc, connectorId, pollu
   if (!fs.statSync(root, { throwIfNoEntry: false })?.isDirectory()) {
     throw new Error("Generic metadata-only pinned Dropbox root is unavailable");
   }
+  if ([9, 10].includes(connectorId)) {
+    const manifestKey = keys[5];
+    authenticateOfficialRdataPinnedHierarchy(runState, {
+      day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode,
+      manifest_key: manifestKey,
+      baseline_state: fs.statSync(path.join(root, ...manifestKey.split("/")), { throwIfNoEntry: false })?.isFile()
+        ? "partition_present" : "partition_absent",
+    });
+  }
   const bodies = keys.map((key) => fs.readFileSync(path.join(root, ...key.split("/"))));
   const payloads = bodies.map((body, index) => parsePreservedManifest(body, keys[index]));
   for (let index = 0; index < 5; index += 1) {
@@ -381,11 +434,38 @@ function derivePinnedMetadataDependencies(runState, { dayUtc, connectorId, pollu
     const referenceFields = index < 3 ? ["children"]
       : index === 3 ? ["connector_manifests", "child_manifests"]
         : ["pollutant_manifests", "child_manifests"];
-    const references = referenceFields.flatMap((name) => payloads[index][name] || [])
-      .filter((entry) => entry?.manifest_key === keys[index + 1]);
-    if (references.length !== 1
-        || !SHA256.test(String(payloads[index + 1][field] || ""))
-        || references[0][field] !== payloads[index + 1][field]) {
+    const referenceHash = exactManifestReference(
+      payloads[index], referenceFields, keys[index], keys[index + 1], field,
+    );
+    if (index >= 3) {
+      const parentDir = path.join(root, ...path.posix.dirname(keys[index]).split("/"));
+      const physical = [];
+      for (const entry of fs.readdirSync(parentDir, { withFileTypes: true })) {
+        if (entry.isSymbolicLink()) {
+          throw new Error(`Generic metadata-only pinned sibling is a symlink: ${keys[index]}`);
+        }
+        if (!entry.isDirectory()) continue;
+        const siblingKey = path.posix.join(path.posix.dirname(keys[index]), entry.name, "manifest.json");
+        const siblingPath = path.join(root, ...siblingKey.split("/"));
+        if (!fs.lstatSync(siblingPath, { throwIfNoEntry: false })?.isFile()) {
+          throw new Error(`Generic metadata-only pinned sibling manifest is missing: ${siblingKey}`);
+        }
+        physical.push(siblingKey);
+      }
+      const references = payloads[index][referenceFields[0]];
+      if (!exactArray(physical.sort(bytewise), references.map((ref) => ref.manifest_key).sort(bytewise))) {
+        throw new Error(`Generic metadata-only pinned sibling set disagrees: ${keys[index]}`);
+      }
+      for (const ref of references) {
+        const siblingBody = fs.readFileSync(path.join(root, ...ref.manifest_key.split("/")));
+        const sibling = parsePreservedManifest(siblingBody, ref.manifest_key);
+        if (sibling.manifest_hash !== ref.manifest_hash) {
+          throw new Error(`Generic metadata-only pinned sibling identity disagrees: ${ref.manifest_key}`);
+        }
+      }
+    }
+    if (!SHA256.test(String(payloads[index + 1][field] || ""))
+        || referenceHash !== payloads[index + 1][field]) {
       throw new Error(`Generic metadata-only pinned hierarchy disagrees: ${keys[index]} -> ${keys[index + 1]}`);
     }
   }
