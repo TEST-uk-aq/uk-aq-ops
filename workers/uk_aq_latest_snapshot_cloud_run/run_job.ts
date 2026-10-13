@@ -466,7 +466,11 @@ async function loadDurableR2Object(key: string) {
       headRequests += 1;
       LOCAL_CACHE_R2_IO.head_requests += 1;
       try {
-        const head = await r2HeadObject({ r2: R2_CONFIG, key });
+        const head = await r2HeadObject({
+          r2: R2_CONFIG,
+          key,
+          accept_encoding_identity: true,
+        });
         return {
           exists: Boolean(head.exists),
           etag: "etag" in head && typeof head.etag === "string" ? head.etag : null,

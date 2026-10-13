@@ -600,7 +600,7 @@ export async function r2CopyObject({ r2, source_key, dest_key }) {
   };
 }
 
-export async function r2HeadObject({ r2, key }) {
+export async function r2HeadObject({ r2, key, accept_encoding_identity = false }) {
   if (r2?.adapter?.headObject) {
     const result = await r2.adapter.headObject({ key });
     const sha256 = normalizeR2Sha256Checksum(
@@ -620,6 +620,9 @@ export async function r2HeadObject({ r2, key }) {
       objectKey: key,
       headers: {
         "x-amz-checksum-mode": "ENABLED",
+        // R2 can weaken HEAD ETags during compression and omit Content-Length.
+        // Use identity only when the caller requests byte-exact cache validation.
+        ...(accept_encoding_identity ? { "accept-encoding": "identity" } : {}),
       },
     }),
     consumeResponse: async (response) => ({
