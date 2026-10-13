@@ -122,15 +122,18 @@ export function buildR2ObservationRequestUrl({
 export function summarizeR2ObservationCompleteness(payload) {
   const coverageState = String(payload?.coverage_state || payload?.coverage?.coverage_state || "").trim().toLowerCase();
   const hasGap = payload?.has_gap === true || payload?.coverage?.has_gap === true;
-  const responseComplete = payload?.response_complete !== false
+  const partialReasons = Array.isArray(payload?.partial_reasons) ? payload.partial_reasons.map(String) : [];
+  const responseComplete = payload?.response_complete === true
+    && payload?.has_gap === false
     && payload?.coverage?.response_complete !== false
     && !hasGap
-    && (!coverageState || coverageState === "complete");
+    && coverageState === "complete"
+    && partialReasons.length === 0;
   return {
     response_complete: responseComplete,
     has_gap: hasGap || !responseComplete,
     coverage_state: coverageState || (responseComplete ? "complete" : "partial"),
-    partial_reasons: Array.isArray(payload?.partial_reasons) ? payload.partial_reasons.map(String) : [],
+    partial_reasons: partialReasons,
     coverage: payload?.coverage || null,
   };
 }

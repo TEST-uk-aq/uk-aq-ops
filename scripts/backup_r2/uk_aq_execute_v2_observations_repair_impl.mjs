@@ -2065,7 +2065,8 @@ export async function runV2ObservationsRepair({
     ...args,
     prefixes: [...new Set(scopes.flatMap((scope) => [
       `${dataPrefix}/day_utc=${scope.dayUtc}`,
-      `${indexPrefix}/day_utc=${scope.dayUtc}`,
+      // The official-RData Dropbox baseline excludes this derived index tree.
+      ...(genericOfficialV2 ? [] : [`${indexPrefix}/day_utc=${scope.dayUtc}`]),
     ]))],
     exactKeys: [latestIndexKey],
     dynamicExactKeyPrefixes: [],
@@ -2254,13 +2255,6 @@ export async function runV2ObservationsRepair({
           if (unexpected.length) {
             throw new Error(`Connector removal has unaccounted final objects: ${key}`);
           }
-          const unaccountedIndexes = localStore.listAllObjects({
-            prefix: `${indexPrefix}/day_utc=${dayUtc}/connector_id=${scope.connectorId}/`,
-          }).filter((entry) => ![...emptyCodes].some((code) => entry.key ===
-            `${indexPrefix}/day_utc=${dayUtc}/connector_id=${scope.connectorId}/pollutant_code=${code}/manifest.json`));
-          if (unaccountedIndexes.length) {
-            throw new Error(`Connector removal has an unselected index: ${key}`);
-          }
           staged.remove({
             key, kind: "connector_manifest", dayUtc,
             authority: "generic_v2_authenticated_empty_connector",
@@ -2405,16 +2399,6 @@ export async function runV2ObservationsRepair({
         if (unexpected.length) {
           throw new Error(`Day removal has unaccounted final objects: ${dayManifestKey}`);
         }
-        const unaccountedIndexes = localStore.listAllObjects({
-          prefix: `${indexPrefix}/day_utc=${dayUtc}/`,
-        }).filter((entry) => ![...emptyTargets].some((identity) => {
-          const [targetDay, connectorId, code] = identity.split("|");
-          return targetDay === dayUtc && entry.key ===
-            `${indexPrefix}/day_utc=${dayUtc}/connector_id=${connectorId}/pollutant_code=${code}/manifest.json`;
-        }));
-        if (unaccountedIndexes.length) {
-          throw new Error(`Day removal has an unrelated index: ${dayManifestKey}`);
-        }
         staged.remove({
           key: dayManifestKey, kind: "day_manifest", dayUtc,
           authority: "generic_v2_authenticated_empty_day",
@@ -2454,24 +2438,6 @@ export async function runV2ObservationsRepair({
     }
 
     let index = null;
-    if (genericOfficialV2) {
-      for (const scope of dayScopes) {
-        for (const code of scope.empty_pollutant_codes || []) {
-          if (!emptyTargets.has(`${dayUtc}|${scope.connectorId}|${code}`)) continue;
-          const key = `${indexPrefix}/day_utc=${dayUtc}/connector_id=${scope.connectorId}/pollutant_code=${code}/manifest.json`;
-          staged.remove({
-            key, kind: "pollutant_timeseries_index", dayUtc,
-            authority: "generic_v2_authenticated_empty_pollutant_index",
-          });
-          const remainingIndexObjects = localStore.listAllObjects({
-            prefix: `${indexPrefix}/day_utc=${dayUtc}/connector_id=${scope.connectorId}/pollutant_code=${code}/`,
-          }).filter((entry) => entry.key !== key);
-          if (remainingIndexObjects.length) {
-            throw new Error(`Empty selected index contains unaccounted objects: ${key}`);
-          }
-        }
-      }
-    }
     const indexRequested = dayScopes.some((scope) => scope.needsIndex);
     // Parent manifests only describe their already-final children.  Their
     // hash is not a dependency of a pollutant timeseries index, so a

@@ -1,4 +1,4 @@
-/** Authenticate a local official-RData preservation path against the accepted v2 root. */
+/** Authenticate a local official-RData preservation path against its accepted root. */
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -70,14 +70,15 @@ export function authenticateOfficialRdataPinnedHierarchy(runState, partition) {
   const connectorId = Number(partition?.connector_id);
   const pollutant = String(partition?.pollutant_code || "");
   const parsedDay = new Date(`${day}T00:00:00.000Z`);
-  if ((runState?.history_generation || "v2") !== "v2" || !/^\d{4}-\d{2}-\d{2}$/.test(day)
+  const generation = String(runState?.history_generation || "v2");
+  if (!["v2", "v3"].includes(generation) || !/^\d{4}-\d{2}-\d{2}$/.test(day)
       || Number.isNaN(parsedDay.getTime()) || parsedDay.toISOString().slice(0, 10) !== day
       || ![9, 10].includes(connectorId)
       || !["pm25", "pm10", "no2", "o3"].includes(pollutant)
       || !["partition_present", "partition_absent"].includes(partition?.baseline_state)) {
     throw new Error("Official RData pinned hierarchy scope is invalid");
   }
-  const base = "history/v2/observations";
+  const base = `history/${generation}/observations`;
   const keys = [
     `${base}/_manifests/manifest.json`,
     `${base}/_manifests/year=${day.slice(0, 4)}/manifest.json`,

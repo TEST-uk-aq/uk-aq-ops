@@ -124,3 +124,23 @@ export const OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS = Object.freeze([
   "mapping_audit",
   "source_verification_status_counts",
 ]);
+
+// v8/v9 field lists and projections above are immutable persisted hash inputs.
+export const OFFICIAL_RDATA_V10_SEMANTIC_EVIDENCE_FIELDS = Object.freeze([
+  ...OFFICIAL_RDATA_V8_SEMANTIC_EVIDENCE_FIELDS,
+  "source_column_classifications_sha256",
+  "source_column_classifications",
+]);
+
+export function officialRdataV10ColumnClassifications(values) {
+  return ordered(values.map((entry) => ({
+    ...select(entry, ["day_utc", "site_code", "source_year", "source_file_key",
+      "object_name", "pollutant_code", "source_column", "station_id",
+      "timeseries_id", "classification", "actual_columns", "metadata_row",
+      "lifecycle_classification", "lifecycle_reason", "metadata_source_discrepancy"]),
+    raw_source_windows: ordered(entry.raw_source_windows.map((window) => select(window,
+      ["canonical_day_utc", "raw_start_utc", "raw_end_exclusive_utc"]))),
+    canonical_windows: ordered(entry.canonical_windows.map((window) => select(window,
+      ["canonical_day_utc", "canonical_start_utc", "canonical_end_exclusive_utc"]))),
+  })));
+}

@@ -1,0 +1,317 @@
+import {
+  AQI_ALGORITHM_VERSION,
+  helperRowsToNormalizedAqiV1Rows,
+  pivotNarrowRowsToHelperRows,
+} from "../../../lib/aqi/aqi_levels.mjs";
+import {
+  createStationHistoryV3ReadBudget,
+  readR2Observations,
+  STATION_HISTORY_V3_OBSERVATION_ROW_BUDGET_REASON,
+  STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON,
+  usesV3PhysicalObservationPages,
+} from "./r2_observations.mjs";
+import { publicContinuity, selectContinuitySegments } from "./continuity.mjs";
+
+const HOUR_MS = 60 * 60 * 1000;
+
+function hourEndpoints(startMs, endMs) {
+  const endpoints = [];
+  let cursor = Math.floor(startMs / HOUR_MS) * HOUR_MS + HOUR_MS;
+  for (; cursor <= endMs; cursor += HOUR_MS) endpoints.push(cursor);
+  return endpoints;
+}
+
+function identityForSegment(segment) {
+  return { timeseriesId: segment.timeseriesId, connectorId: segment.connectorId, stationId: segment.stationId, pollutant: segment.pollutant };
+}
+
+function memberAt(continuity, timestampMs) {
+  const selected = selectContinuitySegments(continuity, timestampMs, timestampMs + 1).segments;
+  return selected.length === 1 ? selected[0] : null;
+}
+
+function mergePhysicalObservations(r2Rows, ingestRows, continuity) {
+  const rows = new Map();
+  for (const source of [ingestRows, r2Rows]) {
+    for (const row of Array.isArray(source) ? source : []) {
+      const timestamp = Date.parse(String(row?.observed_at || ""));
+      const value = Number(row?.value);
+      if (!Number.isFinite(timestamp) || !Number.isFinite(value) || value < 0) continue;
+      const member = memberAt(continuity, timestamp);
+      if (!member) continue;
+      const normalized = {
+        ...row,
+        connector_id: member.connectorId,
+        station_id: member.stationId,
+        timeseries_id: member.timeseriesId,
+        pollutant_code: member.pollutant,
+        observed_at: new Date(timestamp).toISOString(),
+        value,
+      };
+      const existing = rows.get(normalized.observed_at);
+      if (existing && (existing.timeseries_id !== normalized.timeseries_id || existing.value !== normalized.value)) throw new Error("station_history_continuity_observation_conflict");
+      if (!existing || normalized.source === "r2" || normalized.source === "json") rows.set(normalized.observed_at, normalized);
+    }
+  }
+  return [...rows.values()].sort((left, right) => left.observed_at.localeCompare(right.observed_at));
+}
+
+function sourceObservationsToHourEndingNarrowRows(rows) {
+  const grouped = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const observedMs = Date.parse(String(row?.observed_at || ""));
+    const value = Number(row?.value);
+    const timeseriesId = Number(row?.timeseries_id);
+    const stationId = Number(row?.station_id);
+    const pollutantCode = String(row?.pollutant_code || "").trim().toLowerCase();
+    if (
+      !Number.isFinite(observedMs)
+      || !Number.isFinite(value)
+      || value < 0
+      || !Number.isInteger(timeseriesId)
+      || timeseriesId <= 0
+      || !Number.isInteger(stationId)
+      || stationId <= 0
+      || !pollutantCode
+    ) continue;
+
+    // Station-history AQI intervals are hour-ending. An observation exactly
+    // on the hour keeps that timestamp as its endpoint; an observation inside
+    // the hour belongs to the next clock-hour endpoint. This makes the bucket
+    // represent (previous endpoint, endpoint] without collapsing raw readings.
+    const endpointMs = Math.ceil(observedMs / HOUR_MS) * HOUR_MS;
+    const endpointIso = new Date(endpointMs).toISOString();
+    const key = `${timeseriesId}|${endpointIso}`;
+    const current = grouped.get(key) || {
+      timeseries_id: timeseriesId,
+      station_id: stationId,
+      connector_id: row?.connector_id == null ? null : Number(row.connector_id),
+      pollutant_code: pollutantCode,
+      timestamp_hour_utc: endpointIso,
+      sum: 0,
+      count: 0,
+    };
+    current.sum += value;
+    current.count += 1;
+    grouped.set(key, current);
+  }
+
+  return Array.from(grouped.values()).map((row) => ({
+    timeseries_id: row.timeseries_id,
+    station_id: row.station_id,
+    connector_id: row.connector_id,
+    timestamp_hour_utc: row.timestamp_hour_utc,
+    pollutant_code: row.pollutant_code,
+    hourly_mean_ugm3: row.count ? row.sum / row.count : null,
+    sample_count: row.count || null,
+  })).sort((left, right) => {
+    if (left.timestamp_hour_utc !== right.timestamp_hour_utc) {
+      return left.timestamp_hour_utc.localeCompare(right.timestamp_hour_utc);
+    }
+    return left.timeseries_id - right.timeseries_id;
+  });
+}
+
+function calculateLogicalAqi(observationRows, request, continuity, outputStartMs, outputEndMs) {
+  const logicalRows = observationRows.map((row) => ({
+    ...row,
+    station_id: request.stationId,
+    timeseries_id: request.timeseriesId,
+  }));
+  return helperRowsToNormalizedAqiV1Rows(
+    pivotNarrowRowsToHelperRows(
+      sourceObservationsToHourEndingNarrowRows(logicalRows),
+      {
+        rangeStartUtc: new Date(outputStartMs + HOUR_MS).toISOString(),
+        rangeEndUtc: new Date(outputEndMs + HOUR_MS).toISOString(),
+      },
+    ),
+    { computedAtUtc: null },
+  ).filter((row) => {
+    const endpoint = Date.parse(row.timestamp_hour_utc);
+    return endpoint > outputStartMs && endpoint <= outputEndMs;
+  }).map((row) => {
+    const endpoint = Date.parse(row.timestamp_hour_utc);
+    // AQI timestamps are hour-ending endpoints. Attribute the interval to
+    // the physical member that supplied the observation immediately before
+    // that endpoint, including at a midnight continuity boundary.
+    const physical = memberAt(continuity, endpoint - 1);
+    if (!physical) throw new Error("station_history_continuity_aqi_identity_missing");
+    return {
+      ...row,
+      connector_id: physical.connectorId,
+      station_id: physical.stationId,
+      timeseries_id: physical.timeseriesId,
+      period_start_utc: new Date(endpoint - HOUR_MS).toISOString(),
+      period_end_utc: new Date(endpoint).toISOString(),
+      timestamp_hour_utc: new Date(endpoint).toISOString(),
+      source: "calculated_from_observations",
+    };
+  });
+}
+
+function missingRanges(expected, present) {
+  return expected.filter((timestamp) => !present.has(timestamp)).map((timestamp) => ({
+    start_utc: new Date(timestamp - HOUR_MS).toISOString(),
+    end_utc: new Date(timestamp).toISOString(),
+  }));
+}
+
+export async function buildCalculatedHistory({ request, continuity, env, outputStartMs, outputEndMs, ingestRows = [], ingestComplete = false, ingestFetchCount = 0, guideline = null, observationReadBudget = null, observationProvider = null } = {}) {
+  const includeObservations = request.includeObservations !== false;
+  const contextHours = request.includeAqi && ["pm25", "pm10"].includes(request.pollutant) ? 23 : 0;
+  const requiredStartMs = outputStartMs - contextHours * HOUR_MS;
+  const requiredEndExclusiveMs = request.includeAqi ? outputEndMs + 1 : outputEndMs;
+  const selection = selectContinuitySegments(continuity, requiredStartMs, requiredEndExclusiveMs);
+  const visibleSelection = selectContinuitySegments(continuity, outputStartMs, requiredEndExclusiveMs);
+  if (!selection.segments.length) throw new Error("station_history_continuity_member_missing");
+  let reads;
+  if (observationProvider) {
+    if (typeof observationProvider !== "function") throw new Error("station_history_observation_provider_invalid");
+    reads = [];
+    for (const segment of selection.segments) {
+      const result = await observationProvider({
+        identity: identityForSegment(segment),
+        startMs: segment.startMs,
+        endMs: segment.endMs,
+      });
+      if (!result || !Array.isArray(result.rows) || typeof result.response_complete !== "boolean"
+        || !Array.isArray(result.partial_reasons) || !Number.isSafeInteger(result.fetch_count)) {
+        throw new Error("station_history_observation_provider_result_invalid");
+      }
+      reads.push({ segment, result });
+    }
+  } else if (usesV3PhysicalObservationPages(env)) {
+    const readBudget = observationReadBudget || createStationHistoryV3ReadBudget();
+    reads = [];
+    for (const segment of selection.segments) {
+      const result = await readR2Observations({
+        env,
+        identity: identityForSegment(segment),
+        startMs: segment.startMs,
+        endMs: segment.endMs,
+        readBudget,
+      });
+      reads.push({ segment, result });
+      if (result.partial_reasons.some((reason) => [
+        STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON,
+        STATION_HISTORY_V3_OBSERVATION_ROW_BUDGET_REASON,
+      ].includes(reason))) break;
+    }
+  } else {
+    reads = await Promise.all(selection.segments.map(async (segment) => ({
+      segment,
+      result: await readR2Observations({
+        env,
+        identity: identityForSegment(segment),
+        startMs: segment.startMs,
+        endMs: segment.endMs,
+      }),
+    })));
+  }
+  const r2Rows = reads.flatMap((entry) => entry.result.rows);
+  const rows = mergePhysicalObservations(r2Rows, ingestRows, continuity);
+  const visibleRows = rows.filter((row) => {
+    const timestamp = Date.parse(row.observed_at);
+    return timestamp >= outputStartMs && timestamp <= outputEndMs;
+  });
+  const aqiRows = request.includeAqi ? calculateLogicalAqi(rows, request, continuity, outputStartMs, outputEndMs) : [];
+  const expected = hourEndpoints(outputStartMs, outputEndMs);
+  // Raw-observation completeness uses containing half-open hourly intervals:
+  // exact-hour and sub-hour readings both cover the interval's next endpoint.
+  const observationPresent = new Set(visibleRows
+    .map((row) => Date.parse(row.observed_at))
+    .filter(Number.isFinite)
+    .map((timestamp) => Math.floor(timestamp / HOUR_MS) * HOUR_MS + HOUR_MS));
+  const aqiPresent = new Set(aqiRows.map((row) => Date.parse(row.timestamp_hour_utc)).filter(Number.isFinite));
+  // Hidden PM context affects AQI only. A continuity gap before the visible
+  // range must never make an otherwise complete observation response partial.
+  const observationGaps = includeObservations
+    ? [...visibleSelection.gaps, ...missingRanges(expected, observationPresent)]
+    : [];
+  const aqiGaps = request.includeAqi
+    ? [...visibleSelection.gaps, ...missingRanges(expected, aqiPresent)]
+    : [];
+  const r2PartialReasons = [...new Set(reads.flatMap((entry) => entry.result.partial_reasons))];
+  const readBudgetExceeded = r2PartialReasons.some((reason) => [
+    STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON,
+    STATION_HISTORY_V3_OBSERVATION_ROW_BUDGET_REASON,
+  ].includes(reason));
+  const r2Complete = reads.length === selection.segments.length
+    && reads.every((entry) => entry.result.response_complete === true);
+  const sourceComplete = !readBudgetExceeded && (r2Complete || ingestComplete === true);
+  const observationsComplete = includeObservations && sourceComplete && observationGaps.length === 0;
+  const aqiStatusesComplete = !request.includeAqi || aqiRows.every((row) => row.daqi_calculation_status === "ok" && row.eaqi_calculation_status === "ok");
+  const aqiContextComplete = selection.gaps.length === 0
+    && (!observationProvider || reads.every((entry) => entry.result.context_complete !== false));
+  const aqiComplete = request.includeAqi && sourceComplete && aqiContextComplete && aqiGaps.length === 0 && aqiStatusesComplete;
+  const observationPartialReasons = observationsComplete ? [] : Array.from(new Set([
+    ...r2PartialReasons,
+    ...(sourceComplete ? [] : ["required_observation_source_incomplete"]),
+    ...(observationGaps.length ? ["missing_visible_observation_hours"] : []),
+  ]));
+  const aqiPartialReasons = aqiComplete ? [] : Array.from(new Set([
+    ...r2PartialReasons,
+    ...(sourceComplete ? [] : ["required_observation_source_incomplete"]),
+    ...(aqiContextComplete ? [] : ["required_aqi_context_incomplete"]),
+    ...(aqiGaps.length ? ["missing_visible_aqi_hours"] : []),
+    ...(aqiStatusesComplete ? [] : ["calculated_aqi_status_incomplete"]),
+  ]));
+  const sourceSegments = reads.map(({ segment, result }) => ({
+    station_id: segment.stationId,
+    timeseries_id: segment.timeseriesId,
+    start_utc: new Date(segment.startMs).toISOString(),
+    end_utc: new Date(segment.endMs).toISOString(),
+    response_complete: result.response_complete === true,
+    row_count: result.rows.length,
+  }));
+  return {
+    schema_version: 2,
+    request: {
+      connector_id: request.connectorId,
+      requested_timeseries_id: request.timeseriesId,
+      station_id: request.stationId,
+      pollutant: request.pollutant,
+      start_utc: new Date(outputStartMs).toISOString(),
+      end_utc: new Date(outputEndMs).toISOString(),
+      include_observations: includeObservations,
+      include_aqi: request.includeAqi,
+    },
+    continuity: publicContinuity(continuity),
+    observations: {
+      enabled: includeObservations,
+      rows: includeObservations ? visibleRows : [],
+      guideline,
+      response_complete: observationsComplete,
+      has_gap: observationGaps.length > 0,
+      gap_ranges: observationGaps,
+      partial_reasons: includeObservations ? observationPartialReasons : [],
+      source_segments: sourceSegments,
+      source_counts: { r2: visibleRows.filter((row) => row.source === "r2").length, ingest: visibleRows.filter((row) => row.source === "ingest").length, ...(observationProvider ? { json: visibleRows.filter((row) => row.source === "json").length } : {}) },
+    },
+    aqi: request.includeAqi ? {
+      enabled: true,
+      calculation_source: "calculated_from_observations",
+      response_contract: "aqi_hour_interval_v2",
+      algorithm_version: AQI_ALGORITHM_VERSION,
+      rows: aqiRows,
+      response_complete: aqiComplete,
+      has_gap: aqiGaps.length > 0 || !aqiStatusesComplete,
+      gap_ranges: aqiGaps,
+      partial_reasons: aqiPartialReasons,
+      required_context_start_utc: new Date(requiredStartMs).toISOString(),
+      output_start_utc: new Date(outputStartMs).toISOString(),
+      output_end_utc: new Date(outputEndMs).toISOString(),
+      source_counts: { calculated_from_observations: aqiRows.length },
+    } : { enabled: false, calculation_source: null, rows: [], response_complete: false, has_gap: false, gap_ranges: [], partial_reasons: [] },
+    source: {
+      mode: observationProvider ? "experimental_compressed_json_calculated_observations" : "continuity_calculated_observations",
+      ingest_fetch_count: ingestFetchCount,
+      r2_observation_fetch_count: observationProvider ? 0 : reads.reduce((sum, entry) => sum + entry.result.fetch_count, 0),
+      ...(observationProvider ? { json_observation_fetch_count: reads.reduce((sum, entry) => sum + entry.result.fetch_count, 0) } : {}),
+      required_context_start_utc: new Date(requiredStartMs).toISOString(),
+      output_start_utc: new Date(outputStartMs).toISOString(),
+      output_end_utc: new Date(outputEndMs).toISOString(),
+    },
+  };
+}

@@ -12,6 +12,8 @@ import {
   canonicalTransitionFingerprintJson,
   coordinatorTransitionStateCommonFingerprintPayload,
 } from "./sos_light_v3_proposal_validation.mjs";
+import { validateOfficialRdataPreservationDependencies } from "./official_rdata_evidence_validation.mjs";
+import { validateOfficialRdataV10PreservedOnlyAuthority } from "./official_rdata_v10_validation.mjs";
 
 const OFFICIAL_RDATA_TIMESTAMP_MAPPING =
   "rdata_date_beginning_plus_one_hour_to_observed_at_utc";
@@ -27,11 +29,11 @@ const OUTCOMES = new Set([
 const POLLUTANT_PREFIX = /^history\/v3\/observations\/day_utc=(\d{4}-\d{2}-\d{2})\/connector_id=([1-9]\d*)\/pollutant_code=([a-z0-9_]+)$/;
 
 export const GENERIC_INTEGRITY_V3_TRANSITION_STATE_FINGERPRINT_CONTRACT =
-  "uk_aq_generic_integrity_v3_transition_state_fingerprint_v4";
+  "uk_aq_generic_integrity_v3_transition_state_fingerprint_v5";
 export const GENERIC_INTEGRITY_V3_SELECTED_SCOPE_AUTHORITY_CONTRACT =
-  "uk_aq_generic_integrity_v3_selected_scope_authority_v3";
+  "uk_aq_generic_integrity_v3_selected_scope_authority_v4";
 export const GENERIC_V3_OFFICIAL_RDATA_PUBLICATION_AUTHORITY_CONTRACT =
-  "uk_aq_generic_v3_official_rdata_publication_authority_v2";
+  "uk_aq_generic_v3_official_rdata_publication_authority_v3";
 
 const OFFICIAL_RDATA_V8_FIELDS = [
   "schema_version", "semantic_evidence_contract", "source_adapter", "day_utc",
@@ -87,15 +89,15 @@ function safeKey(raw) {
 
 function officialRdataSemanticEvidenceSha256(evidence) {
   const allowed = new Set([
-    ...OFFICIAL_RDATA_V8_FIELDS,
+    ...OFFICIAL_RDATA_V8_FIELDS, "source_column_classifications_sha256", "source_column_classifications",
     "semantic_evidence_sha256", "acquisition_audit", "acquisition_audit_sha256",
   ]);
-  if (OFFICIAL_RDATA_V8_FIELDS.some((field) => !Object.hasOwn(evidence || {}, field))
+  if ([...OFFICIAL_RDATA_V8_FIELDS, "source_column_classifications_sha256", "source_column_classifications"].some((field) => !Object.hasOwn(evidence || {}, field))
       || Object.keys(evidence || {}).some((field) => !allowed.has(field))) {
     throw new Error("Generic fixed-v3 official semantic evidence shape is invalid");
   }
   return sha256(Buffer.from(canonicalTransitionFingerprintJson(
-    Object.fromEntries(OFFICIAL_RDATA_V8_FIELDS.map((field) => [field, evidence[field]])),
+    Object.fromEntries([...OFFICIAL_RDATA_V8_FIELDS, "source_column_classifications_sha256", "source_column_classifications"].map((field) => [field, evidence[field]])),
   ), "utf8"));
 }
 
@@ -109,7 +111,8 @@ export function requireGenericV3OfficialRdataAuthority(runState) {
       || !Array.isArray(authority?.selected_scopes) || !authority.selected_scopes.length) {
     throw new Error("Generic fixed-v3 official RData selected authority is unavailable");
   }
-  const selectedScopeSourceEvidence = authority.selected_scopes.map((scope) => {
+  const selectedScopeSourceEvidence = authority.selected_scopes.filter((scope) =>
+    scope.outcome !== "source_artifact_unavailable_preserved").map((scope) => {
     const dayUtc = String(scope?.day_utc || "");
     const pollutantCode = String(scope?.pollutant_code || "");
     if (scope?.connector_id !== connectorId || !validDay(dayUtc)
@@ -120,7 +123,7 @@ export function requireGenericV3OfficialRdataAuthority(runState) {
       runState, dayUtc, connectorId, pollutantCode,
     });
     const semanticSha256 = officialRdataSemanticEvidenceSha256(evidence);
-    if (evidence.evidence_contract_version !== 9
+    if (evidence.evidence_contract_version !== 10
         || evidence.history_generation !== "v3"
         || evidence.source_adapter !== sourceAdapter
         || evidence.day_utc !== dayUtc
@@ -137,7 +140,7 @@ export function requireGenericV3OfficialRdataAuthority(runState) {
       day_utc: dayUtc,
       connector_id: connectorId,
       pollutant_code: pollutantCode,
-      evidence_contract_version: 9,
+      evidence_contract_version: 10,
       source_adapter: sourceAdapter,
       timestamp_mapping: OFFICIAL_RDATA_TIMESTAMP_MAPPING,
       semantic_evidence_sha256: semanticSha256,
@@ -466,6 +469,31 @@ export function canonicalGenericV3SelectedScopeAuthority(runState) {
     } else if (preservationEvidence !== null) {
       throw new Error("Generic fixed-v3 replacement scope has preservation evidence");
     }
+    const sourceEvidenceAuthority = scope.source_evidence_authority;
+    if ([9, 10].includes(connectorId) && outcome === "source_artifact_unavailable_preserved") {
+      if (sourceEvidenceAuthority?.authority_kind !== "authenticated_wholly_source_unavailable_v10"
+          || sourceEvidenceAuthority.history_generation !== "v3"
+          || sourceEvidenceAuthority.source_adapter !== ({ 9: "waqn", 10: "saqn" })[connectorId]
+          || sourceEvidenceAuthority.day_utc !== dayUtc
+          || sourceEvidenceAuthority.pollutant_code !== pollutantCode) {
+        throw new Error("Generic fixed-v3 preserved v10 source authority is invalid");
+      }
+      const copy = JSON.parse(JSON.stringify(sourceEvidenceAuthority));
+      const claimed = copy.semantic_authority_sha256;
+      delete copy.semantic_authority_sha256;
+      const auditSha = copy.acquisition_audit_sha256;
+      delete copy.acquisition_audit_sha256;
+      const audit = copy.acquisition_audit;
+      delete copy.acquisition_audit;
+      if (claimed !== sha256(Buffer.from(canonicalTransitionFingerprintJson(copy), "utf8"))
+          || audit?.audit_contract_version !== 2
+          || audit?.semantic_authority_sha256 !== claimed
+          || auditSha !== sha256(Buffer.from(canonicalTransitionFingerprintJson(audit), "utf8"))) {
+        throw new Error("Generic fixed-v3 preserved v10 source authority hash changed");
+      }
+    } else if (sourceEvidenceAuthority !== null) {
+      throw new Error("Generic fixed-v3 unexpected preserved source authority");
+    }
     return {
       day_utc: dayUtc,
       connector_id: connectorId,
@@ -475,6 +503,7 @@ export function canonicalGenericV3SelectedScopeAuthority(runState) {
       authorised_tombstone_prefix: authorisedPrefix,
       replacement_object_keys: replacementKeys,
       preservation_evidence: preservationEvidence,
+      source_evidence_authority: sourceEvidenceAuthority,
     };
   }).sort((left, right) => bytewise(left.day_utc, right.day_utc)
     || left.connector_id - right.connector_id
@@ -717,6 +746,23 @@ export function validateLocalGenericV3Proposal(runState, env = process.env) {
 
 export async function validateFinalGenericV3ProposalGraph({ runState, proposal }) {
   const authority = canonicalGenericV3SelectedScopeAuthority(runState);
+  if (["waqn", "saqn"].includes(runState.official_rdata_source_adapter)) {
+    const seen = new Set();
+    for (const scope of authority.selected_scopes) {
+      if (scope.outcome === "source_artifact_unavailable_preserved") {
+        validateOfficialRdataV10PreservedOnlyAuthority(scope.source_evidence_authority);
+        continue;
+      }
+      const key = `${scope.day_utc}|${scope.connector_id}`;
+      if (seen.has(key)) continue;
+      const source = loadImmutableSourcePartition({
+        runState, dayUtc: scope.day_utc, connectorId: scope.connector_id,
+        pollutantCode: scope.pollutant_code,
+      });
+      await validateOfficialRdataPreservationDependencies({ runState, source });
+      seen.add(key);
+    }
+  }
   return await validateFinalProposalGraph({
     runState,
     proposal,

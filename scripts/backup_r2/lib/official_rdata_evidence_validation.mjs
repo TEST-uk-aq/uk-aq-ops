@@ -8,8 +8,10 @@ import {
   canonicalOfficialRdataJson as canonical,
   officialRdataAvailabilitySemanticIdentity,
   officialRdataSha256,
+  OFFICIAL_RDATA_V10_SEMANTIC_EVIDENCE_FIELDS,
 } from "./official_rdata_semantic_projection.mjs";
 import { authenticateOfficialRdataPinnedHierarchy } from "./official_rdata_pinned_hierarchy.mjs";
+import { validateOfficialRdataV10Columns } from "./official_rdata_v10_validation.mjs";
 
 const digest = (body) => createHash("sha256").update(body).digest("hex");
 const equal = (a, b) => canonical(a) === canonical(b);
@@ -76,18 +78,24 @@ function pinnedPath(root, key) {
 export async function validateOfficialRdataPreservationDependencies({ runState, source }) {
   const evidence = source.evidence;
   const audit = evidence.acquisition_audit;
-  if (![8, 9].includes(evidence.evidence_contract_version)) {
+  if (![8, 9, 10].includes(evidence.evidence_contract_version)) {
     throw new Error("Official RData evidence contract version is unsupported");
   }
-  if (evidence.evidence_contract_version === 9
+  if (evidence.evidence_contract_version >= 9
       && evidence.timestamp_mapping !== V9_TIMESTAMP_MAPPING) {
-    throw new Error("Official RData v9 timestamp mapping is invalid");
+    throw new Error("Official RData timestamp mapping is invalid");
   }
   if (!["waqn", "saqn"].includes(evidence.source_adapter)
-      || evidence.history_generation !== "v2") {
+      || !["v2", "v3"].includes(evidence.history_generation)) {
     throw new Error("Official RData source scope is invalid");
   }
-  if (!audit || !equal(Object.keys(audit).sort(), [...AUDIT_FIELDS].sort())) {
+  const v10 = evidence.evidence_contract_version === 10;
+  const auditFields = v10
+    ? [...AUDIT_FIELDS, "source_column_classification_acquisition_audit"] : AUDIT_FIELDS;
+  const inputFields = v10
+    ? [...INPUT_FIELDS, "source_column_classifications_sha256"] : INPUT_FIELDS;
+  if (!audit || !equal(Object.keys(audit).sort(), [...auditFields].sort())
+      || audit.audit_contract_version !== (v10 ? 2 : 1)) {
     throw new Error("Official RData acquisition audit shape is invalid");
   }
   if (officialRdataSha256(audit) !== evidence.acquisition_audit_sha256) {
@@ -97,12 +105,24 @@ export async function validateOfficialRdataPreservationDependencies({ runState, 
       || audit.semantic_evidence_sha256 !== evidence.semantic_evidence_sha256) {
     throw new Error("Official RData acquisition audit linkage changed");
   }
-  if (INPUT_FIELDS.some((field) => !Object.hasOwn(evidence, field))) {
+  if (inputFields.some((field) => !Object.hasOwn(evidence, field))) {
     throw new Error("Official RData source-input fields are incomplete");
   }
-  if (officialRdataSha256(Object.fromEntries(INPUT_FIELDS.map((field) => [field, evidence[field]])))
+  if (officialRdataSha256(Object.fromEntries(inputFields.map((field) => [field, evidence[field]])))
       !== evidence.source_evidence_input_sha256) {
     throw new Error("Official RData source-input hash changed");
+  }
+  if (v10) {
+    const allowed = new Set([...OFFICIAL_RDATA_V10_SEMANTIC_EVIDENCE_FIELDS,
+      "semantic_evidence_sha256", "acquisition_audit", "acquisition_audit_sha256"]);
+    if (!equal(Object.keys(evidence).sort(), [...allowed].sort())
+        || officialRdataSha256(Object.fromEntries(
+          OFFICIAL_RDATA_V10_SEMANTIC_EVIDENCE_FIELDS.map((field) => [field, evidence[field]]),
+        )) !== evidence.semantic_evidence_sha256
+        || evidence.source_artifact_availability_contract_version !== 10
+        || evidence.preserved_baseline_dependency_contract_version !== 2) {
+      throw new Error("Official RData v10 semantic evidence authentication failed");
+    }
   }
   for (const field of ["source_adapter", "day_utc", "connector_id", "history_generation"]) {
     if (audit[field] !== evidence[field]) throw new Error("Official RData acquisition scope changed");
@@ -130,10 +150,12 @@ export async function validateOfficialRdataPreservationDependencies({ runState, 
       throw new Error("Official RData authenticated source bytes changed");
     }
   }
-  if (scopes.some((scope) => scope.http_status !== 404 || !evidence.files_authoritatively_absent.includes(scope.source_file_key)
+  if (scopes.some((scope) => (!v10 && (scope.http_status !== 404
+      || !evidence.files_authoritatively_absent.includes(scope.source_file_key)))
       || scope.day_utc !== evidence.day_utc || !scope.canonical_unavailable_windows.length)) {
     throw new Error("Official RData unavailable classification lacks authenticated absence");
   }
+  if (v10) validateOfficialRdataV10Columns(evidence, audit, scopes, files);
   const preservedBody = fs.readFileSync(path.join(path.dirname(source.rowsPath), "preserved_baseline_rows.json"));
   const preserved = JSON.parse(preservedBody.toString("utf8")).map((row) => ({
     ...row, connector_id: evidence.connector_id, observed_at_utc: new Date(row.observed_at).toISOString(),
@@ -175,7 +197,7 @@ export async function validateOfficialRdataPreservationDependencies({ runState, 
     throw new Error("Official RData preservation dependency set changed");
   }
   for (const partition of preservation.partition_identities) {
-    const prefix = `history/v2/observations/day_utc=${evidence.day_utc}/connector_id=${evidence.connector_id}/pollutant_code=${partition.pollutant_code}`;
+    const prefix = `history/${evidence.history_generation}/observations/day_utc=${evidence.day_utc}/connector_id=${evidence.connector_id}/pollutant_code=${partition.pollutant_code}`;
     const partitionScopes = scopes.filter((scope) => scope.pollutant_code === partition.pollutant_code);
     if (partition.day_utc !== evidence.day_utc || partition.connector_id !== evidence.connector_id
         || partition.manifest_key !== `${prefix}/manifest.json`
@@ -219,7 +241,7 @@ export async function validateOfficialRdataPreservationDependencies({ runState, 
     targetStatus.set(identity, row.verification_status);
   }
   for (const pollutantCode of evidence.source_available_pollutant_codes) {
-    const prefix = `history/v2/observations/day_utc=${evidence.day_utc}`
+    const prefix = `history/${evidence.history_generation}/observations/day_utc=${evidence.day_utc}`
       + `/connector_id=${evidence.connector_id}/pollutant_code=${pollutantCode}`;
     const manifestKey = `${prefix}/manifest.json`;
     const manifestPath = pinnedPath(runState.base_dropbox_root, manifestKey);
