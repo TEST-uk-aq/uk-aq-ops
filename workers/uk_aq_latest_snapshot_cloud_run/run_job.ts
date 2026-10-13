@@ -508,7 +508,11 @@ async function loadDurableR2Object(key: string) {
     const getStarted = performance.now();
     let object: Awaited<ReturnType<typeof r2GetObject>>;
     try {
-      object = await r2GetObject({ r2: R2_CONFIG, key });
+      object = await r2GetObject({
+        r2: R2_CONFIG,
+        key,
+        accept_encoding_identity: true,
+      });
     } finally {
       const duration = performance.now() - getStarted;
       getDurationMs += duration;
