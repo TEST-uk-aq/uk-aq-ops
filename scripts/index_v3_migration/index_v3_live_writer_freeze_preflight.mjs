@@ -106,7 +106,7 @@ function assertSchedulerConfig(root) {
   const jobs = fs.readFileSync(path.join(root, "cloudflare/scheduler/jobs.toml"), "utf8");
   for (const [job, workflow] of Object.entries(SCHEDULES)) {
     const block = jobs.match(new RegExp(`\\[jobs\\.${job}\\]([\\s\\S]*?)(?=\\n\\[|$)`))?.[1];
-    if (!block || !/enabled\\s*=\\s*false/.test(block) ||
+    if (!block || !/enabled\s*=\s*false/.test(block) ||
         !block.includes(`github_workflow_file = "${workflow}"`)) {
       throw new Error(`Canonical LIVE jobs.toml does not declare disabled ${job}`);
     }
