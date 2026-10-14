@@ -122,3 +122,20 @@ Exact apply/backfill/refresh/render commands and rollback notes are in the Ops
 README. Implementation stops at working-branch commits and review PRs targeting
 main; merging, schema application, views, backfills, Dropbox writes and launchd
 activation are outside the current authorisation.
+
+
+## Environment-neutral promotion preparation (14/10/2026)
+
+The TEST collector now takes explicit TEST or LIVE source and target boundaries,
+with either existing private config.json or literal private .env input.
+Environment-specific BigQuery job labels, MySQL locks, archive evidence and
+report headings derive from configuration; source/account/view and archive
+identity checks are retained. The generic launchd template renders a separate
+13:00 service per environment, while the installed TEST plist is unchanged.
+
+The TEST Schema repo now includes `gcp_billing_grants_live.sql` for manual
+promotion alongside the unchanged canonical `gcp_billing.sql`. The exact
+source copy list and private LIVE configuration are in `README.live.md`.
+Only TEST repositories were changed. No source archives are to be copied into
+LIVE. The separate LIVE Dropbox *billing-data archive* remains a required
+part of the original billing contract. No LIVE backfill or remote apply ran.

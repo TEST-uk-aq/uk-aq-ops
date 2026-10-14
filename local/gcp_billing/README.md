@@ -1,11 +1,14 @@
-# TEST GCP billing collector — review only, not deployed
+# GCP billing collector — TEST operational; LIVE preparation
 
 Run on the MacBook Pro. BigQuery Cloud Billing exports remain authoritative;
 MySQL and the local Dropbox tree are derived and rebuildable. No Cloud Run,
 Dropbox API, dashboard-triggered collection or cloud infrastructure is added.
-This implementation accepts **TEST only**. LIVE activation requires separate
-scope and configuration support; no LIVE account, grant, template or repository
-is accessed. The canonical table DDL remains reusable for later promotion.
+The same collector code now supports TEST and LIVE with an explicit per-environment
+source, database, runtime and Dropbox binding. The active TEST job still uses its
+existing private config.json unchanged. For new deployments (including LIVE),
+a private local `.env` is supported. See [README.live.md](README.live.md) for the
+exact selective file-copy list, runtime configuration and promotion boundaries.
+No LIVE repository, database, collector or GCP service was changed by this work.
 
 ## Source and destination ownership
 
@@ -41,7 +44,7 @@ Create a private runtime tree **outside Dropbox and Git**:
 
 ```text
 /absolute/path/uk-aq-gcp-billing/TEST/
-  config.json
+  config.json  # deployed TEST input; new installations may use .env instead
   credentials/google-application-credentials.json
   credentials/mysql-password
   collector.lock
@@ -49,7 +52,10 @@ Create a private runtime tree **outside Dropbox and Git**:
   logs/launchd.log
 ```
 
-Copy `config.test.example.json` to this tree and replace every placeholder.
+Existing TEST uses `config.test.example.json` as a template for config.json.
+For new installations use `config.example.env` as a template for a private
+`.env` within the environment-specific runtime (mode 600). The file is parsed
+as literal KEY=VALUE text, not evaluated as shell commands.
 The example deliberately cannot run. `archive_root` is an absolute resolved
 local Dropbox path ending in `Apps/github-uk-air-quality-networks/TEST/gcp_billing`.
 The parent `TEST` directory is the existing UK AQ data directory. The corresponding
@@ -62,12 +68,14 @@ never put them in the archive. A single terminal newline in `mysql-password` is
 removed; all other password characters are preserved. MySQL uses the explicitly
 configured local Unix socket, database and restricted writer account.
 
-No new process environment variables or GitHub secrets are introduced. JSON is
-local configuration, not sourced shell. Explicit credential files replace any
+No GitHub secrets or ambient Google credentials are introduced. Private JSON
+remains supported; a private .env now supplies new deployments. Explicit
+credential files replace any
 global switched ADC login; there is no fallback to ambient Google credentials.
 The existing GitHub environment-target catalogue is therefore unchanged.
 `UK_AQ_ENV_NAME` and dashboard-specific MySQL keys are deliberately not reused:
-this command takes an explicit `--environment TEST`, and dashboard credentials
+this command takes explicit `--environment TEST` or `--environment LIVE`,
+and dashboard credentials
 must not acquire billing writer privileges. Python CodeQL is already enabled.
 
 The binding hash includes the account, source/view, environment, database,
@@ -290,7 +298,7 @@ MySQL retains the latest configured number of run records per source (default
 launchd log with the existing Mac operator log policy; it contains only compact
 one-line statuses, never source rows or SDK exception payloads.
 
-## Daily scheduling at 13:00 (only after TEST acceptance)
+## Daily scheduling at 13:00 (TEST active; LIVE separately authorised)
 
 Render the template; rendering does not install or enable it:
 
@@ -303,7 +311,7 @@ plutil -lint /tmp/co.uk.ukaq.gcp-billing.test.plist
 
 It invokes `--source all incremental` daily at 13:00 in the MacBook Pro's
 configured local time zone (Europe/London expected), with `RunAtLoad=false`.
-This TEST-specific cadence is an operator-approved exception to the future
+Daily cadence is an operator-approved exception to the future
 billing contract's recommended hourly interval; it does not change source
 watermarks, overlap or late-correction handling. Only after separate authorisation,
 install the rendered file to the user's LaunchAgents and bootstrap `gui/<uid>`.
