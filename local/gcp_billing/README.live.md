@@ -31,21 +31,30 @@ schemas/local_mysql/gcp_billing_grants_live.sql
 
 **Do not copy any source-code archives to LIVE.** Exclude `archive/`,
 `system_docs_legacy/`, `ref_docs/`, `__pycache__`, TEST-specific launchd
-templates, `config.test.example.json`, actual `config.json`, `.env`,
-credentials, logs, billing data and MySQL dumps. Do not copy whole TEST
-directories. Commit and push to LIVE yourself after reviewing the selected
-file changes.
+templates, `config.test.example.json`, actual `config.json`,
+`.env.gcp_billing`, legacy `.env`, credentials, logs, billing data and
+MySQL dumps. Do not copy whole TEST directories. Commit and push to LIVE
+yourself after reviewing the selected file changes. The LIVE repository root
+has its own independently completed `.env.gcp_billing`, synced by Dropbox
+but never copied from TEST or committed to Git.
 
 The **billing-data archive** in the local Dropbox
 `Apps/github-uk-air-quality-networks/LIVE/gcp_billing` is separate from
 source-code archives and remains part of the agreed collector contract.
 
-## Environment-specific private .env
+## Environment-specific repository-root .env.gcp_billing
 
 Create a mode-700 private runtime at
-`~/.local/share/uk-aq-gcp-billing/LIVE`, outside Dropbox and Git.
-Copy the `config.example.env` file to `LIVE/.env` (mode 600) and replace
-all placeholders. For LIVE, the settings include:
+`~/.local/share/uk-aq-gcp-billing/LIVE`, outside Dropbox and Git, **for
+credentials, logs, collector state and publication recovery only**.
+Copy `local/gcp_billing/config.example.env` to
+`<LIVE Ops root>/.env.gcp_billing` (mode 600) and replace all placeholders.
+This configuration file is stored in the Dropbox-synchronised LIVE Ops
+checkout, not in Git. Confirm that `.gitignore` excludes it with
+`git check-ignore .env.gcp_billing`; never use `git add -f`.
+Only non-secret configuration belongs in it. Its absolute filesystem paths
+must be valid **on the MacBook Pro**, where the collector runs, even though
+Dropbox also syncs the file to the MacBook Air. For LIVE, the values include:
 
 ```dotenv
 UK_AQ_BILLING_ENVIRONMENT=LIVE
@@ -69,12 +78,16 @@ UK_AQ_BILLING_RUN_HISTORY_LIMIT=200
 The raw export table identifiers are derived from the explicit billing
 account. Source account, query project/dataset, MySQL database/writer, archive
 location and runtime path are validated; source binding hashes fail closed
-on subsequent changes. Do not reuse TEST credentials, databases or data.
+on subsequent changes. A repository-root `.env.gcp_billing` must resolve
+to the same Ops checkout as the collector code and cannot be a symlink.
+Do not reuse TEST credentials, databases or data.
 
 Google credentials and local MySQL writer password remain separate
 mode-600 files inside `LIVE/credentials/`:
 `google-application-credentials.json` and `mysql-password`. Keep
-credentials and private runtime out of Git and Dropbox.
+credentials and private runtime out of Git and Dropbox. The Dropbox-synchronised
+`.env.gcp_billing` deliberately contains **no service-account private key,
+MySQL password or other credentials**.
 
 ## Source verification before writes
 
@@ -108,10 +121,10 @@ After installing the pinned requirements in a local `.venv-gcp-billing`:
 BILLING_RUNTIME="$HOME/.local/share/uk-aq-gcp-billing/LIVE"
 python3 -m py_compile local/gcp_billing/{collector,configuration,publication,queries,reports,render_launchd}.py
 .venv-gcp-billing/bin/python local/gcp_billing/collector.py \
-  --environment LIVE --env-file "$BILLING_RUNTIME/.env" \
+  --environment LIVE --env-file "$PWD/.env.gcp_billing" \
   --runtime-root "$BILLING_RUNTIME" validate
 .venv-gcp-billing/bin/python local/gcp_billing/collector.py \
-  --environment LIVE --env-file "$BILLING_RUNTIME/.env" \
+  --environment LIVE --env-file "$PWD/.env.gcp_billing" \
   --runtime-root "$BILLING_RUNTIME" --source all render-views \
   > /tmp/uk-aq-billing-live-views.sql
 ```
@@ -125,7 +138,7 @@ the schedule without installing it:
 .venv-gcp-billing/bin/python local/gcp_billing/render_launchd.py \
   --repo-root "$PWD" --runtime-root "$BILLING_RUNTIME" \
   --python "$PWD/.venv-gcp-billing/bin/python" \
-  --environment LIVE --env-file "$BILLING_RUNTIME/.env" \
+  --environment LIVE --env-file "$PWD/.env.gcp_billing" \
   > /tmp/co.uk.ukaq.gcp-billing.live.plist
 plutil -lint /tmp/co.uk.ukaq.gcp-billing.live.plist
 ```

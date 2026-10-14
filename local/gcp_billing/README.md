@@ -6,7 +6,8 @@ Dropbox API, dashboard-triggered collection or cloud infrastructure is added.
 The same collector code now supports TEST and LIVE with an explicit per-environment
 source, database, runtime and Dropbox binding. The active TEST job still uses its
 existing private config.json unchanged. For new deployments (including LIVE),
-a private local `.env` is supported. See [README.live.md](README.live.md) for the
+each Ops checkout uses its own Dropbox-synchronised root
+`.env.gcp_billing` with non-secret settings. No runtime secrets are moved. See [README.live.md](README.live.md) for the
 exact selective file-copy list, runtime configuration and promotion boundaries.
 No LIVE repository, database, collector or GCP service was changed by this work.
 
@@ -53,9 +54,14 @@ Create a private runtime tree **outside Dropbox and Git**:
 ```
 
 Existing TEST uses `config.test.example.json` as a template for config.json.
-For new installations use `config.example.env` as a template for a private
-`.env` within the environment-specific runtime (mode 600). The file is parsed
-as literal KEY=VALUE text, not evaluated as shell commands.
+For new installations use `config.example.env` as a template for
+`<Ops root>/.env.gcp_billing` (mode 600), ignored by Git and synced with the
+matching TEST/LIVE Ops checkout in Dropbox. The file is parsed as literal
+KEY=VALUE text, not evaluated as shell commands. `--env-file` accepts only
+this exact file in the matching repository root or the older private runtime
+`.env`; `config.json` is retained for the already-installed TEST job.
+Use machine-local absolute paths for the MacBook Pro, which runs collection.
+Never place passwords or Google service-account keys into Dropbox config.
 The example deliberately cannot run. `archive_root` is an absolute resolved
 local Dropbox path ending in `Apps/github-uk-air-quality-networks/TEST/gcp_billing`.
 The parent `TEST` directory is the existing UK AQ data directory. The corresponding
@@ -69,7 +75,7 @@ removed; all other password characters are preserved. MySQL uses the explicitly
 configured local Unix socket, database and restricted writer account.
 
 No GitHub secrets or ambient Google credentials are introduced. Private JSON
-remains supported; a private .env now supplies new deployments. Explicit
+remains supported; root .env.gcp_billing supplies new deployments. Explicit
 credential files replace any
 global switched ADC login; there is no fallback to ambient Google credentials.
 The existing GitHub environment-target catalogue is therefore unchanged.

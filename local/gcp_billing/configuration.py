@@ -96,7 +96,15 @@ def load(path, runtime, expected_environment):
     require(runtime.is_absolute() and runtime.resolve() == runtime and
             runtime.name == expected_environment, 'RUNTIME_BOUNDARY')
     path = Path(path)
-    if path.suffix == '.env':
+    if path.name == '.env.gcp_billing':
+        # Operator-managed configuration lives in each Ops repository root.
+        # Require this exact location, not a cross-repo or unrelated dotenv.
+        root_file = Path(__file__).resolve().parents[2] / '.env.gcp_billing'
+        require(path.is_absolute() and path.resolve() == root_file and
+                not path.is_symlink(), 'ENV_FILE_BOUNDARY')
+        c = _env_config(path)
+    elif path.name == '.env':
+        # Preserve the previously supported private runtime dotenv format.
         require(path.is_absolute() and path.resolve().is_relative_to(runtime),
                 'ENV_FILE_BOUNDARY')
         c = _env_config(path)

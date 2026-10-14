@@ -139,3 +139,19 @@ source copy list and private LIVE configuration are in `README.live.md`.
 Only TEST repositories were changed. No source archives are to be copied into
 LIVE. The separate LIVE Dropbox *billing-data archive* remains a required
 part of the original billing contract. No LIVE backfill or remote apply ran.
+
+
+## Repository-root billing configuration (14/10/2026)
+
+At the operator's request, each Ops checkout now owns a Git-ignored,
+Dropbox-synchronised `.env.gcp_billing` at its repository root. The file
+contains only non-secret environment-specific settings; it is separate
+between TEST and LIVE and references absolute paths for the MacBook Pro.
+The collector/launchd renderer require a root file to resolve to their
+own Ops checkout (not a symlink), while retaining the existing TEST private
+`config.json` and earlier runtime `.env` compatibility. Privileged Google
+and MySQL credentials, collector journal and logs remain in their separate
+private per-environment runtime outside Dropbox. LIVE promotion instructions
+now point to the root file; the private actual `.env.gcp_billing` itself
+must not be copied to LIVE or committed to Git. Neither running TEST launchd
+nor LIVE systems were modified.
