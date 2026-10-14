@@ -286,7 +286,8 @@ def collect(db, queries, c, runtime, source, args):
         try:
             db.rollback()
             db.ping(reconnect=True)
-            require(sql(db, "SELECT GET_LOCK('uk_aq_gcp_billing_' + c['environment'].lower() + '_collector',0) AS acquired")[0]
+            require(sql(db, "SELECT GET_LOCK(%s,0) AS acquired",
+                             ('uk_aq_gcp_billing_' + c['environment'].lower() + '_collector',))[0]
                     ['acquired'] == 1, 'DATABASE_RECOVERY_LOCK_REQUIRED')
         except Exception:
             raise SafeError('DATABASE_RECOVERY_REQUIRED') from None
@@ -341,7 +342,8 @@ def main():
             raise SafeError('COLLECTOR_ALREADY_RUNNING') from None
         db = connect(c, runtime)
         try:
-            got = sql(db, "SELECT GET_LOCK('uk_aq_gcp_billing_' + c['environment'].lower() + '_collector',0) AS acquired")[0]
+            got = sql(db, "SELECT GET_LOCK(%s,0) AS acquired",
+                             ('uk_aq_gcp_billing_' + c['environment'].lower() + '_collector',))[0]
             require(got['acquired'] == 1, 'DATABASE_COLLECTOR_ALREADY_RUNNING')
             root = Path(c['archive_root'])
             root.mkdir(parents=True, exist_ok=True)
