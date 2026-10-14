@@ -49,16 +49,34 @@ def summaries(connection, source, cutoff, history_complete):
             'resource_global_name', 'sku_id', 'sku_description', 'currency',
         ]
     for name, dims in groups.items():
-        # All SQL names are internal constants. Escape %% for PyMySQL binding.
-        cols = ', '.join(f'{dim} AS d{i}' for i, dim in enumerate(dims))
+        # Stream canonical rows inside the caller's publication transaction.
+        # Grouping/ordering the full TEXT descriptions in MySQL can exhaust its
+        # sort buffer (error 1038); Python integers also preserve exact micros.
+        from pymysql.cursors import SSDictCursor
+        usage_month = "DATE_FORMAT(usage_date, '%%Y-%%m')"
+        cols = list(dict.fromkeys(
+            'usage_date' if dim == usage_month else dim for dim in dims
+        )) + MONEY
         where = "WHERE service_description = %s" if name == 'cloud-run-resources' else ''
-        order = ', '.join(f'd{i}' for i in range(len(dims)))
-        sql = (f'SELECT {cols}, SUM(gross_cost_micros) AS gross, '
-               f'SUM(credit_micros) AS credits, SUM(net_cost_micros) AS net '
-               f'FROM {table} {where} GROUP BY {order} ORDER BY {order}')
-        with connection.cursor() as cur:
-            cur.execute(sql, ('Cloud Run',) if where else ())
-            rows = cur.fetchall()
+        statement = f"SELECT {', '.join(cols)} FROM {table} {where}"
+        totals = {}
+        with connection.cursor(SSDictCursor) as cur:
+            cur.execute(statement, ('Cloud Run',) if where else ())
+            for record in cur:
+                key = tuple(record['usage_date'].strftime('%Y-%m')
+                            if dim == usage_month else record[dim] for dim in dims)
+                amounts = totals.setdefault(key, [0, 0, 0])
+                for i, field in enumerate(MONEY):
+                    amounts[i] += int(record[field])
+        # NULL first, then deterministic dimension ordering without SQL filesort.
+        ordered = sorted(totals.items(), key=lambda pair:
+                         tuple((value is not None, value if value is not None else '')
+                               for value in pair[0]))
+        rows = [
+            {**{f'd{i}': value for i, value in enumerate(key)},
+             'gross': amounts[0], 'credits': amounts[1], 'net': amounts[2]}
+            for key, amounts in ordered
+        ]
         title = ('Standard reporting totals' if source == 'standard' else
                  'Detailed resource investigation — do not add to Standard totals')
         lines = [f'# TEST GCP billing: {name}', '', title, '',

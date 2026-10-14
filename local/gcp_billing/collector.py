@@ -103,10 +103,7 @@ def connect(c, runtime):
                            unix_socket=c['mysql_socket'], user=c['mysql_user'], password=password,
                            database=c['mysql_database'], charset='utf8mb4', autocommit=True,
                            cursorclass=pymysql.cursors.DictCursor,
-                           # SKU summaries sort full TEXT descriptions. Keep the
-                           # sort memory increase scoped to this collector connection.
-                           init_command=("SET time_zone = '+00:00', max_sort_length = 65536, "
-                                         "sort_buffer_size = 8388608"), connect_timeout=10,
+                           init_command="SET time_zone = '+00:00'", connect_timeout=10,
                            read_timeout=60, write_timeout=60)
 
 

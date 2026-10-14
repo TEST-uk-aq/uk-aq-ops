@@ -152,11 +152,13 @@ mysql --login-path=local-admin --database=uk_aq_gcp_billing_test < "$SCHEMA/sche
 The collector has no DDL path. Grants restrict each table, with no global or
 LIVE permissions. Do not reuse an administrator credential for collection.
 
-The collector's MySQL connection uses a session-only 8 MiB `sort_buffer_size`
-with `max_sort_length=65536` so service/SKU summaries with grouped and sorted
-TEXT descriptions can complete on MySQL 9.x. This does **not** change the
-server-global sort buffer, any other UK AQ MySQL connection, billing grouping
-fields or persisted monetary values.
+Billing Markdown summaries now stream canonical MySQL rows and aggregate
+the complete reporting dimensions in Python, with exact integer-micro totals.
+This avoids MySQL GROUP BY/ORDER BY sorting of full TEXT service/SKU descriptions
+and error 1038 without enlarging a MySQL sort buffer. Reports are still built
+inside the publication transaction and sorted deterministically for output.
+Only the collector connection's UTC session time zone is configured; server-global
+memory settings and persisted billing facts are unchanged.
 
 Run an explicitly authorised real TEST backfill batch:
 
