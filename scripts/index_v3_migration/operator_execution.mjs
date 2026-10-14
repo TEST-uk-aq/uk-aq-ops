@@ -60,7 +60,7 @@ function progressLine(label, state, started, status, samples = []) {
   if (samples.length > 10) samples.shift();
   return `${label}: ${status} elapsed=${formatElapsed(elapsed)}${counter}${byteCounter}${rowCounter}${eta}\n`;
 }
-export function createOperatorProgress({ label, total, totalBytes = 0, totalRows = null, enabled = true } = {}) {
+export function createOperatorProgress({ label, total, totalBytes = 0, totalRows = null, enabled = true, emitOnProgress = false } = {}) {
   const noop = Object.freeze({ report() {}, finish() {} });
   if (!enabled) return noop;
   try {
@@ -70,6 +70,8 @@ export function createOperatorProgress({ label, total, totalBytes = 0, totalRows
     state[3] = totalBytes;
     state[6] = Number.isFinite(totalRows) && totalRows >= 0 ? totalRows : -1;
     const started = Date.now();
+    let lastEmitted = started;
+    const samples = [];
     const finish = (status = 'complete') => {
       if (state[4]) return;
       state[4] = 1;
@@ -82,12 +84,17 @@ export function createOperatorProgress({ label, total, totalBytes = 0, totalRows
     safeWrite(progressLine(label, state, started, 'start'));
     worker().postMessage({ id, label, state: state.buffer, started });
     return Object.freeze({
-      report(completed, { bytes, rows } = {}) {
+      report(completed, { bytes, rows, force = false } = {}) {
         try {
           state[0] = Number(completed) || 0;
           if (Number.isFinite(bytes)) state[2] = bytes;
           if (Number.isFinite(rows)) state[5] = rows;
+          const now = Date.now();
           if (state[1] >= 0 && state[0] >= state[1]) finish();
+          else if (emitOnProgress && !state[4] && (force || now - lastEmitted >= 5000)) {
+            safeWrite(progressLine(label, state, started, 'active', samples));
+            lastEmitted = now;
+          }
         } catch { /* counters never affect execution */ }
       },
       finish,
@@ -259,7 +266,7 @@ export async function superviseOperatorInvocation(entry, args, env = process.env
         // Preserve the wrapper's existing migrate SIGHUP policy, including children.
         for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
           const handler = () => {
-            if (signal === 'SIGHUP' && operation === 'migrate') return;
+            if (signal === 'SIGHUP' && new Set(['migrate', 'locked-clean-build']).has(operation)) return;
             // Signal the invocation group, including a shell waiting on Node.
             // The existing lock coordinator still owns its protected child group.
             try { process.kill(-child.pid, signal); } catch (error) { if (error.code !== 'ESRCH') throw error; }

@@ -1,6 +1,6 @@
 import { MigrationWorkerPool } from './observation_history_migration_worker_pool.mjs';
-import { settledMigrationBatches, exactPublicationEvidence, migrationFailure, migrationBatchFailures, throwMigrationBatchFailures, withMigrationBatchEvidence, migrationFailureEvidence } from './observation_history_migration_concurrency.mjs';
-import { validateMigrationConcurrency, inspectEmptyV3Target, validateCleanStartEvidence } from './observation_history_migration_gcp.mjs';
+import { settledMigrationBatches, settledWeightedMigrationBatches, exactPublicationEvidence, migrationFailure, migrationBatchFailures, throwMigrationBatchFailures, withMigrationBatchEvidence, migrationFailureEvidence } from './observation_history_migration_concurrency.mjs';
+import { migrationConcurrencyLimits, validateMigrationConcurrency, inspectEmptyV3Target, validateCleanStartEvidence } from './observation_history_migration_gcp.mjs';
 import { inventorySideBySideBindings } from "./observation_history_generation_bindings.mjs";
 import {
   getObservationHistoryGeneration,
@@ -1129,6 +1129,7 @@ function assertRowsMatchSourcePartition(rows, { scope, manifest }) {
 
 async function deriveLegacyObservationContentHashMetadata({
   getR2Object,
+  getR2ObjectBounded = null,
   manifest,
   scope,
   sosConnectorId,
@@ -1137,7 +1138,9 @@ async function deriveLegacyObservationContentHashMetadata({
   for (const file of [...manifest.files].sort((left, right) =>
     String(left.key).localeCompare(String(right.key))
   )) {
-    const object = await getRequiredObject(getR2Object, file.key, "canonical R2");
+    const object = await getRequiredObject(getR2ObjectBounded
+      ? ({ key }) => getR2ObjectBounded({ key, max_bytes: file.bytes }) : getR2Object,
+    file.key, "canonical R2");
     verifyManifestFileIdentity({
       manifestIdentity: file.etag_or_hash,
       expectedBytes: file.bytes,
@@ -1160,6 +1163,7 @@ async function deriveLegacyObservationContentHashMetadata({
 
 async function effectiveSourceObservationContentHash({
   getR2Object,
+  getR2ObjectBounded = null,
   manifest,
   scope,
   sosConnectorId,
@@ -1176,6 +1180,7 @@ async function effectiveSourceObservationContentHash({
   return Object.freeze({
     metadata: await deriveLegacyObservationContentHashMetadata({
       getR2Object,
+      getR2ObjectBounded,
       manifest,
       scope,
       sosConnectorId,
@@ -1501,283 +1506,171 @@ export function deriveObservationHistoryV3WriterFreezePlan({ repositoryRoot }) {
 }
 
 export function createMigrationProgressReporter(options) {
-  return createOperatorProgress(options);
+  return createOperatorProgress({ ...options, emitOnProgress: true });
 }
 
 function createMigrationActivityReporter(options) {
-  return createOperatorProgress(options);
+  return createOperatorProgress({ ...options, emitOnProgress: true });
 }
 
 export async function inventoryAuthoritativeCanonicalObservationHistory({
   getR2Object,
+  getR2ObjectBounded = null,
   observationsPrefix = DEFAULT_OBSERVATIONS_PREFIX,
   v2IndexRoot = DEFAULT_V2_INDEX_ROOT,
   v2LatestKey = DEFAULT_V2_LATEST_KEY,
   sosConnectorId = 1,
+  inventoryConcurrency = 1,
   onProgress = null,
 }) {
-  if (typeof getR2Object !== "function") {
-    throw new TypeError("Canonical inventory requires getR2Object adapter");
-  }
+  if (typeof getR2Object !== "function") throw new TypeError("Canonical inventory requires getR2Object adapter");
+  if (!Number.isInteger(inventoryConcurrency) || inventoryConcurrency < 1 || inventoryConcurrency > 64) throw new Error("Invalid inventory concurrency");
   const prefix = normalizePrefix(observationsPrefix, "observations prefix");
   const rootKey = buildR2HistoryV2ObservationsRootManifestKey(prefix);
   const rootObject = await getRequiredObject(getR2Object, rootKey, "R2");
-  const rootPayload = assertCanonicalAggregate(
-    parseJsonBody(rootKey, rootObject.body),
-    { basePrefix: prefix },
-  );
-  const hierarchyObjects = [
-    { level: "root", ...bodyIdentity(rootKey, rootObject.body), payload: rootPayload },
-  ];
-  const days = [];
-  const connectors = [];
-  const emptyConnectors = [];
-  const partitions = [];
-  onProgress?.(partitions.length, { force: true });
-  for (const yearReference of rootPayload.children) {
-    const yearKey = buildR2HistoryV2ObservationsYearManifestKey(
-      prefix,
-      yearReference.year,
-    );
-    if (yearReference.manifest_key !== yearKey) {
-      throw new Error(`Observation year key is non-canonical: ${yearReference.manifest_key}`);
-    }
-    const yearObject = await getRequiredObject(getR2Object, yearKey, "R2");
-    const yearPayload = assertCanonicalAggregate(
-      parseJsonBody(yearKey, yearObject.body),
-      { basePrefix: prefix },
-    );
-    if (yearPayload.content_hash !== yearReference.content_hash) {
-      throw new Error(`Observation root/year identity mismatch: ${yearKey}`);
-    }
-    hierarchyObjects.push({
-      level: "year",
-      ...bodyIdentity(yearKey, yearObject.body),
-      payload: yearPayload,
-    });
-    for (const monthReference of yearPayload.children) {
-      const monthKey = buildR2HistoryV2ObservationsMonthManifestKey(
-        prefix,
-        yearPayload.year,
-        monthReference.month,
-      );
-      if (monthReference.manifest_key !== monthKey) {
-        throw new Error(`Observation month key is non-canonical: ${monthReference.manifest_key}`);
+  const rootPayload = assertCanonicalAggregate(parseJsonBody(rootKey, rootObject.body), { basePrefix: prefix });
+  const rootRecord = { level: "root", ...bodyIdentity(rootKey, rootObject.body), payload: rootPayload };
+  const readStage = async (label, items, action) => {
+    const progress = createMigrationProgressReporter({ label, total: items.length });
+    const results = [];
+    try {
+      for await (const batch of settledMigrationBatches(items, inventoryConcurrency, action)) {
+        results.push(...batch.filter((entry) => entry.result.status === 'fulfilled').map((entry) => entry.result.value));
+        progress.report(results.length);
       }
-      const monthObject = await getRequiredObject(getR2Object, monthKey, "R2");
-      const monthPayload = assertCanonicalAggregate(
-        parseJsonBody(monthKey, monthObject.body),
-        { basePrefix: prefix },
-      );
-      if (monthPayload.content_hash !== monthReference.content_hash) {
-        throw new Error(`Observation year/month identity mismatch: ${monthKey}`);
-      }
-      hierarchyObjects.push({
-        level: "month",
-        ...bodyIdentity(monthKey, monthObject.body),
-        payload: monthPayload,
-      });
-      for (const dayReference of monthPayload.children) {
-        const dayUtc = requireIsoDay(dayReference.day_utc);
-        const dayKey = buildHistoryV2DayManifestKey(prefix, dayUtc);
-        if (dayReference.manifest_key !== dayKey) {
-          throw new Error(`Observation day key is non-canonical: ${dayReference.manifest_key}`);
-        }
-        const dayObject = await getRequiredObject(getR2Object, dayKey, "R2");
-        const dayPayload = parseJsonBody(dayKey, dayObject.body);
-        validateCanonicalHistoryV2Manifest(dayPayload, {
-          domain: "observations",
-          manifest_kind: "day",
-          day_utc: dayUtc,
-          manifest_key: dayKey,
-        });
-        if (dayPayload.manifest_hash !== dayReference.manifest_hash) {
-          throw new Error(`Observation month/day identity mismatch: ${dayKey}`);
-        }
-        const dayRecord = {
-          ...bodyIdentity(dayKey, dayObject.body),
-          day_utc: dayUtc,
-          payload: dayPayload,
-        };
-        days.push(dayRecord);
-        const connectorReferences = Array.isArray(dayPayload.connector_manifests)
-          ? dayPayload.connector_manifests
-          : [];
-        if (!connectorReferences.length) {
-          throw new Error(`Observation day has no connector manifests: ${dayKey}`);
-        }
-        for (const connectorReference of connectorReferences) {
-          const connectorId = requirePositiveInteger(
-            connectorReference.connector_id,
-            "connector_id",
-          );
-          const connectorKey = buildHistoryV2ConnectorManifestKey(
-            prefix,
-            dayUtc,
-            connectorId,
-          );
-          const expectedConnectorHash = manifestReferenceIdentity(
-            connectorReference,
-            connectorKey,
-            "connector",
-          );
-          const connectorObject = await getRequiredObject(
-            getR2Object,
-            connectorKey,
-            "R2",
-          );
-          const connectorPayload = parseJsonBody(connectorKey, connectorObject.body);
-          validateCanonicalHistoryV2Manifest(connectorPayload, {
-            domain: "observations",
-            manifest_kind: "connector",
-            day_utc: dayUtc,
-            connector_id: connectorId,
-            manifest_key: connectorKey,
-          });
-          if (connectorPayload.manifest_hash !== expectedConnectorHash) {
-            throw new Error(`Observation day/connector identity mismatch: ${connectorKey}`);
-          }
-          const connectorIdentity = bodyIdentity(
-            connectorKey,
-            connectorObject.body,
-          );
-          const connectorRecord = {
-            ...connectorIdentity,
-            day_utc: dayUtc,
-            connector_id: connectorId,
-            payload: connectorPayload,
-          };
-          connectors.push(connectorRecord);
-          if (!Array.isArray(connectorPayload.pollutant_manifests)) {
-            throw new Error(
-              `Observation connector pollutant_manifests is not an array: ${connectorKey}`,
-            );
-          }
-          const pollutantReferences = connectorPayload.pollutant_manifests;
-          if (!pollutantReferences.length) {
-            emptyConnectors.push(buildEmptySourceConnectorEvidence({
-              connectorManifest: connectorPayload,
-              connectorManifestIdentity: connectorIdentity,
-              dayUtc,
-              connectorId,
-              connectorKey,
-            }));
-            continue;
-          }
-          for (const pollutantReference of pollutantReferences) {
-            const pollutantCode = String(
-              pollutantReference.pollutant_code || "",
-            ).trim();
-            const pollutantKey = buildHistoryV2PollutantManifestKey(
-              prefix,
-              dayUtc,
-              connectorId,
-              pollutantCode,
-            );
-            const expectedPollutantHash = manifestReferenceIdentity(
-              pollutantReference,
-              pollutantKey,
-              "pollutant",
-            );
-            const pollutantObject = await getRequiredObject(
-              getR2Object,
-              pollutantKey,
-              "R2",
-            );
-            const pollutantPayload = parseJsonBody(
-              pollutantKey,
-              pollutantObject.body,
-            );
-            const sourceManifestSelfHash =
-              validateMigrationSourceObservationPollutantManifest({
-                manifest: pollutantPayload,
-                body: pollutantObject.body,
-                expected: {
-                  domain: "observations",
-                  manifest_kind: "pollutant",
-                  day_utc: dayUtc,
-                  connector_id: connectorId,
-                  pollutant_code: pollutantCode,
-                  manifest_key: pollutantKey,
-                },
-              });
-            const pollutantIdentity = bodyIdentity(
-              pollutantKey,
-              pollutantObject.body,
-            );
-            const sourceManifestReference =
-              buildSourceManifestReferenceEvidence({
-                connectorManifest: connectorPayload,
-                connectorManifestIdentity: connectorIdentity,
-                pollutantReference,
-                pollutantManifest: pollutantPayload,
-                pollutantManifestIdentity: pollutantIdentity,
-                pollutantKey,
-              });
-            if (
-              sourceManifestReference.referenced_child_manifest_hash !==
-                expectedPollutantHash
-            ) {
-              throw sourceManifestReferenceMismatch(pollutantKey);
-            }
-            if (pollutantPayload.row_count <= 0 || pollutantPayload.file_count <= 0) {
-              throw new Error(`Canonical migration partition must be non-empty: ${pollutantKey}`);
-            }
-            const scope = { day_utc: dayUtc, connector_id: connectorId, pollutant_code: pollutantCode };
-            const effectiveSourceHash =
-              await effectiveSourceObservationContentHash({
-                getR2Object,
-                manifest: pollutantPayload,
-                scope,
-                sosConnectorId,
-              });
-            const v2IndexKey = v2ScopedIndexKey(v2IndexRoot, scope);
-            const v2IndexObject = await getOptionalObject(getR2Object, v2IndexKey);
-            partitions.push(Object.freeze({
-              scope: Object.freeze(scope),
-              manifest: pollutantPayload,
-              manifest_identity: pollutantIdentity,
-              source_manifest_self_hash: sourceManifestSelfHash,
-              source_manifest_reference: sourceManifestReference,
-              source_observation_content_hash_metadata:
-                effectiveSourceHash.metadata,
-              source_observation_content_hash_provenance:
-                effectiveSourceHash.provenance,
-              canonical_files: Object.freeze(
-                pollutantPayload.files.map((file) => Object.freeze({ ...file })),
-              ),
-              existing_v2_index_identity: v2IndexObject
-                ? bodyIdentity(v2IndexKey, v2IndexObject.body)
-                : null,
-            }));
-            onProgress?.(partitions.length);
-          }
-        }
-      }
-    }
-  }
-  emptyConnectors.sort((left, right) =>
-    left.scope.day_utc.localeCompare(right.scope.day_utc) ||
-    left.scope.connector_id - right.scope.connector_id
-  );
-  partitions.sort((left, right) =>
-    left.scope.day_utc.localeCompare(right.scope.day_utc) ||
-    left.scope.connector_id - right.scope.connector_id ||
-    left.scope.pollutant_code.localeCompare(right.scope.pollutant_code)
-  );
-  const latestObject = await getOptionalObject(getR2Object, v2LatestKey);
-  return Object.freeze({
-    observations_prefix: prefix,
-    root_manifest: Object.freeze(hierarchyObjects[0]),
-    hierarchy_objects: Object.freeze(hierarchyObjects),
-    day_manifests: Object.freeze(days),
-    connector_manifests: Object.freeze(connectors),
-    empty_source_connectors: Object.freeze(emptyConnectors),
-    partitions: Object.freeze(partitions),
-    existing_v2_latest_identity: latestObject
-      ? bodyIdentity(v2LatestKey, latestObject.body)
-      : null,
+      progress.finish();
+      return results;
+    } catch (error) { progress.finish('failed'); throw error; }
+  };
+  // A complete parent stage is validated before any referenced child stage is
+  // scheduled. Returned arrays keep canonical reference order, never arrival order.
+  const years = await readStage("V3 inventory: year manifests", rootPayload.children, async (reference) => {
+    const key = buildR2HistoryV2ObservationsYearManifestKey(prefix, reference.year);
+    if (reference.manifest_key !== key) throw new Error(`Observation year key is non-canonical: ${reference.manifest_key}`);
+    const object = await getRequiredObject(getR2Object, key, "R2");
+    const payload = assertCanonicalAggregate(parseJsonBody(key, object.body), { basePrefix: prefix });
+    if (payload.content_hash !== reference.content_hash) throw new Error(`Observation root/year identity mismatch: ${key}`);
+    return { level: "year", ...bodyIdentity(key, object.body), payload };
   });
+  const monthRequests = years.flatMap((year) => year.payload.children.map((reference) => ({ year, reference })));
+  const months = await readStage("V3 inventory: month manifests", monthRequests, async ({ year, reference }) => {
+    const key = buildR2HistoryV2ObservationsMonthManifestKey(prefix, year.payload.year, reference.month);
+    if (reference.manifest_key !== key) throw new Error(`Observation month key is non-canonical: ${reference.manifest_key}`);
+    const object = await getRequiredObject(getR2Object, key, "R2");
+    const payload = assertCanonicalAggregate(parseJsonBody(key, object.body), { basePrefix: prefix });
+    if (payload.content_hash !== reference.content_hash) throw new Error(`Observation year/month identity mismatch: ${key}`);
+    return { parent: year.key, record: { level: "month", ...bodyIdentity(key, object.body), payload } };
+  });
+  const dayRequests = months.flatMap(({ record }) => record.payload.children.map((reference) => ({ month: record, reference })));
+  const dayResults = await readStage("V3 inventory: day manifests", dayRequests, async ({ month, reference }) => {
+    const dayUtc = requireIsoDay(reference.day_utc);
+    const key = buildHistoryV2DayManifestKey(prefix, dayUtc);
+    if (reference.manifest_key !== key) throw new Error(`Observation day key is non-canonical: ${reference.manifest_key}`);
+    const object = await getRequiredObject(getR2Object, key, "R2");
+    const payload = parseJsonBody(key, object.body);
+    validateCanonicalHistoryV2Manifest(payload, { domain: "observations", manifest_kind: "day", day_utc: dayUtc, manifest_key: key });
+    if (payload.manifest_hash !== reference.manifest_hash) throw new Error(`Observation month/day identity mismatch: ${key}`);
+    return { parent: month.key, record: { ...bodyIdentity(key, object.body), day_utc: dayUtc, payload } };
+  });
+  const days = dayResults.map((entry) => entry.record);
+  const connectorRequests = days.flatMap((day) => {
+    const references = Array.isArray(day.payload.connector_manifests) ? day.payload.connector_manifests : [];
+    if (!references.length) throw new Error(`Observation day has no connector manifests: ${day.key}`);
+    return references.map((reference) => ({ day, reference }));
+  });
+  const connectorResults = await readStage("V3 inventory: connector manifests", connectorRequests, async ({ day, reference }) => {
+    const connectorId = requirePositiveInteger(reference.connector_id, "connector_id");
+    const key = buildHistoryV2ConnectorManifestKey(prefix, day.day_utc, connectorId);
+    const expectedHash = manifestReferenceIdentity(reference, key, "connector");
+    const object = await getRequiredObject(getR2Object, key, "R2");
+    const payload = parseJsonBody(key, object.body);
+    validateCanonicalHistoryV2Manifest(payload, { domain: "observations", manifest_kind: "connector", day_utc: day.day_utc, connector_id: connectorId, manifest_key: key });
+    if (payload.manifest_hash !== expectedHash) throw new Error(`Observation day/connector identity mismatch: ${key}`);
+    const identity = bodyIdentity(key, object.body);
+    const record = { ...identity, day_utc: day.day_utc, connector_id: connectorId, payload };
+    if (!Array.isArray(payload.pollutant_manifests)) throw new Error(`Observation connector pollutant_manifests is not an array: ${key}`);
+    const empty = payload.pollutant_manifests.length ? null : buildEmptySourceConnectorEvidence({
+      connectorManifest: payload, connectorManifestIdentity: identity, dayUtc: day.day_utc, connectorId, connectorKey: key,
+    });
+    return { record, empty };
+  });
+  const connectors = connectorResults.map((entry) => entry.record);
+  const emptyConnectors = connectorResults.flatMap((entry) => entry.empty ? [entry.empty] : []);
+  const pollutantRequests = connectors.flatMap((connector) => connector.payload.pollutant_manifests.map((reference) => ({ connector, reference })));
+  const pollutantResults = await readStage("V3 inventory: pollutant manifests", pollutantRequests, async ({ connector, reference }) => {
+    const pollutantCode = String(reference.pollutant_code || "").trim();
+    const key = buildHistoryV2PollutantManifestKey(prefix, connector.day_utc, connector.connector_id, pollutantCode);
+    const expectedHash = manifestReferenceIdentity(reference, key, "pollutant");
+    const object = await getRequiredObject(getR2Object, key, "R2");
+    const payload = parseJsonBody(key, object.body);
+    const selfHash = validateMigrationSourceObservationPollutantManifest({ manifest: payload, body: object.body, expected: {
+      domain: "observations", manifest_kind: "pollutant", day_utc: connector.day_utc,
+      connector_id: connector.connector_id, pollutant_code: pollutantCode, manifest_key: key,
+    } });
+    const identity = bodyIdentity(key, object.body);
+    const sourceReference = buildSourceManifestReferenceEvidence({
+      connectorManifest: connector.payload,
+      connectorManifestIdentity: { key: connector.key, byte_size: connector.byte_size, sha256: connector.sha256 },
+      pollutantReference: reference, pollutantManifest: payload, pollutantManifestIdentity: identity, pollutantKey: key,
+    });
+    if (sourceReference.referenced_child_manifest_hash !== expectedHash) throw sourceManifestReferenceMismatch(key);
+    if (payload.row_count <= 0 || payload.file_count <= 0) throw new Error(`Canonical migration partition must be non-empty: ${key}`);
+    return { scope: { day_utc: connector.day_utc, connector_id: connector.connector_id, pollutant_code: pollutantCode },
+      payload, identity, selfHash, sourceReference };
+  });
+  // Rare legacy hashless partitions require full decode. Keep those bodies out
+  // of the concurrent manifest stage and derive their hashes one at a time.
+  const partitions = [];
+  const partitionProgress = createMigrationProgressReporter({ label: "V3 inventory: partition identities", total: pollutantResults.length });
+  const sourceHashes = [];
+  try {
+    for (const { scope, payload, identity, selfHash, sourceReference } of pollutantResults) {
+      const effectiveHash = await effectiveSourceObservationContentHash({ getR2Object, getR2ObjectBounded,
+        manifest: payload, scope, sosConnectorId });
+      sourceHashes.push(effectiveHash);
+      partitionProgress.report(sourceHashes.length);
+    }
+    partitionProgress.finish();
+  } catch (error) { partitionProgress.finish('failed'); throw error; }
+  const indexObjects = await readStage("V3 inventory: v2 scoped indexes", pollutantResults,
+    ({ scope }) => getOptionalObject(getR2Object, v2ScopedIndexKey(v2IndexRoot, scope)));
+  for (let index = 0; index < pollutantResults.length; index += 1) {
+      const { scope, payload, identity, selfHash, sourceReference } = pollutantResults[index];
+      const effectiveHash = sourceHashes[index];
+      const v2IndexKey = v2ScopedIndexKey(v2IndexRoot, scope);
+      const v2IndexObject = indexObjects[index];
+      partitions.push(Object.freeze({ scope: Object.freeze(scope), manifest: payload, manifest_identity: identity,
+        source_manifest_self_hash: selfHash, source_manifest_reference: sourceReference,
+        source_observation_content_hash_metadata: effectiveHash.metadata,
+        source_observation_content_hash_provenance: effectiveHash.provenance,
+        canonical_files: Object.freeze(payload.files.map((file) => Object.freeze({ ...file }))),
+        existing_v2_index_identity: v2IndexObject ? bodyIdentity(v2IndexKey, v2IndexObject.body) : null,
+      }));
+      onProgress?.(partitions.length);
+  }
+  const hierarchyObjects = [rootRecord];
+  const monthsByParent = new Map();
+  for (const entry of months) {
+    if (!monthsByParent.has(entry.parent)) monthsByParent.set(entry.parent, []);
+    monthsByParent.get(entry.parent).push(entry.record);
+  }
+  const daysByParent = new Map();
+  for (const entry of dayResults) {
+    if (!daysByParent.has(entry.parent)) daysByParent.set(entry.parent, []);
+    daysByParent.get(entry.parent).push(entry.record);
+  }
+  for (const year of years) {
+    hierarchyObjects.push(year);
+    for (const month of monthsByParent.get(year.key) || []) hierarchyObjects.push(month, ...(daysByParent.get(month.key) || []));
+  }
+  emptyConnectors.sort((left, right) => left.scope.day_utc.localeCompare(right.scope.day_utc) || left.scope.connector_id - right.scope.connector_id);
+  partitions.sort((left, right) => left.scope.day_utc.localeCompare(right.scope.day_utc) ||
+    left.scope.connector_id - right.scope.connector_id || left.scope.pollutant_code.localeCompare(right.scope.pollutant_code));
+  const latestObject = await getOptionalObject(getR2Object, v2LatestKey);
+  return Object.freeze({ observations_prefix: prefix, root_manifest: Object.freeze(rootRecord),
+    hierarchy_objects: Object.freeze(hierarchyObjects), day_manifests: Object.freeze(days),
+    connector_manifests: Object.freeze(connectors), empty_source_connectors: Object.freeze(emptyConnectors),
+    partitions: Object.freeze(partitions), existing_v2_latest_identity: latestObject ? bodyIdentity(v2LatestKey, latestObject.body) : null });
 }
 
 function maxCanonicalIso(values) {
@@ -3625,7 +3518,11 @@ export async function executeObservationHistoryV3MigrationPlan({
     }
     validateCleanStartEvidence(checkpoint.clean_target_admission, plan);
   }
+  const phaseDurations = {};
+  let phaseStarted = Date.now();
   await publishSideBySideBindings({ plan, checkpoint, adapters, publicationConcurrency });
+  phaseDurations.binding_publication_ms = Date.now() - phaseStarted;
+  phaseStarted = Date.now();
   const allowLegacyRecoveryOrdering = false;
   const publishedParquet = authenticatedResume ? plan.units.flatMap((unit) => {
     const record = checkpoint.prepared_units[unit.unit_id];
@@ -3787,84 +3684,70 @@ export async function executeObservationHistoryV3MigrationPlan({
         }
       }, () => preparationPosition);
       throwMigrationBatchFailures(batch);
-      for (const { item: authorityUnit } of batch) {
+      // A prepared CPU batch is the staging bound. Flatten its files in plan
+      // position so independent partitions share one publication limiter.
+      const prepared = batch.map(({ item: authorityUnit }) => {
         const record = checkpoint.prepared_units[authorityUnit.unit_id];
         const wasFilesPublished = record.files_published === true;
         const preparedUnit = preparedUnitFromRecord(authorityUnit, record, {
-          sideBySide: true,
-          allowLegacyRecoveryOrdering,
-          // New worker results passed full supervisor validation before staging;
-          // recovered unpublished records must still pass that full gate here.
+          sideBySide: true, allowLegacyRecoveryOrdering,
           includeV3Hierarchy: Boolean(rawCheckpoint) && !(authenticatedResume && wasFilesPublished),
         });
-        const unitEvidence = [];
-        for await (const settled of settledMigrationBatches(preparedUnit.target_file_intents, publicationConcurrency, async (intent) => {
+        return { authorityUnit, record, wasFilesPublished, preparedUnit };
+      });
+      const fileJobs = prepared.flatMap((unit) => unit.preparedUnit.target_file_intents.map((intent) => ({ unit, intent })));
+      const publicationByteBudget = migrationConcurrencyLimits(runnerPermit).publicationInFlightBytes;
+      const fileProgress = createMigrationProgressReporter({ label: "V3 migration: cross-partition Parquet publication", total: fileJobs.length });
+      let publishedFiles = 0;
+      try {
+      for await (const settled of settledWeightedMigrationBatches(fileJobs, publicationConcurrency,
+        publicationByteBudget, ({ intent }) => intent.byte_size, async ({ intent }) => {
           const reuse = establishedReuse(reverifiedParquet, intent) || await verifyObservationHistoryV3CheckpointReuse({
-            checkpointEntry: checkpoint.completed_objects[intent.key],
-            expected: intent,
-            headObject: adapters.headObject,
-            getObject: adapters.getObject,
-            requireStoredSha256: true,
+            checkpointEntry: checkpoint.completed_objects[intent.key], expected: intent,
+            headObject: adapters.headObject, getObject: adapters.getObject, requireStoredSha256: true,
           });
           let evidence;
           if (reuse.reusable) {
-            evidence = {
-              key: intent.key,
-              byte_size: intent.byte_size,
-              sha256: intent.sha256,
-              stored_sha256_verified: true,
-              reused: true,
-            };
+            evidence = { key: intent.key, byte_size: intent.byte_size, sha256: intent.sha256,
+              stored_sha256_verified: true, reused: true };
           } else {
             const body = await adapters.readStagedBody(intent);
-            const publicationIntent = buildR2ChecksumAwarePutIntent({
-              key: intent.key,
-              body,
-            });
-            if (
-              publicationIntent.byte_size !== intent.byte_size ||
-              publicationIntent.sha256 !== intent.sha256
-            ) {
+            const publicationIntent = buildR2ChecksumAwarePutIntent({ key: intent.key, body });
+            if (publicationIntent.byte_size !== intent.byte_size || publicationIntent.sha256 !== intent.sha256) {
               throw new Error(`Prepared Parquet staging identity changed: ${intent.key}`);
             }
             const putEvidence = await adapters.putChecksumObject(publicationIntent);
-            const verified = exactPublicationEvidence(putEvidence, intent, 'stored_sha256_verified') && putEvidence.stored_byte_size_verified === true
+            const verified = exactPublicationEvidence(putEvidence, intent, 'stored_sha256_verified') &&
+              putEvidence.stored_byte_size_verified === true
               ? putEvidence : verifyR2StoredSha256Head({ head: await adapters.headObject({ key: intent.key }), intent: publicationIntent });
-            evidence = {
-              ...verified,
-              put_status: String(putEvidence?.status || "succeeded"),
-              reused: false,
-            };
+            evidence = { ...verified, put_status: String(putEvidence?.status || "succeeded"), reused: false };
           }
           return { ...evidence, stored_sha256_verified: true };
         })) {
-          const safe = settled.filter((entry) => entry.result.status === 'fulfilled').map((entry) => entry.result.value);
-          await withMigrationBatchEvidence(settled, () => persistCompletedObjectBatch({ checkpoint, evidence: safe, writeCheckpoint: adapters.writeCheckpoint }));
-          parquetEvidence.push(...safe);
-          unitEvidence.push(...safe);
+        const safe = settled.filter((entry) => entry.result.status === 'fulfilled').map((entry) => entry.result.value);
+        await withMigrationBatchEvidence(settled, () => persistCompletedObjectBatch({
+          checkpoint, evidence: safe, writeCheckpoint: adapters.writeCheckpoint,
+        }));
+        parquetEvidence.push(...safe);
+        publishedFiles += safe.length;
+        fileProgress.report(publishedFiles);
+      }
+      } catch (error) { fileProgress.finish('failed'); throw error; }
+      fileProgress.finish();
+      for (const { authorityUnit, record, wasFilesPublished } of prepared) {
+        if (!record.target_file_intents.every((intent) => completionEvidenceMatches(checkpoint.completed_objects[intent.key],
+          { ...intent, require_stored_sha256: true }))) {
+          throw new Error(`Prepared partition lacks durable Parquet children: ${authorityUnit.unit_id}`);
         }
         record.files_published = true;
         try {
-          await persistCompletedObjectBatch({
-            checkpoint, evidence: unitEvidence, writeCheckpoint: adapters.writeCheckpoint,
-            forceWrite: !wasFilesPublished, preparedUnitIds: [authorityUnit.unit_id],
-          });
-        } catch (error) {
-          record.files_published = wasFilesPublished;
-          throw error;
-        }
-        await testHooks?.afterParquetPublication?.({
-          unit_id: authorityUnit.unit_id,
-          checkpoint: structuredClone(checkpoint),
-        });
+          await persistCompletedObjectBatch({ checkpoint, evidence: [], writeCheckpoint: adapters.writeCheckpoint,
+            forceWrite: !wasFilesPublished, preparedUnitIds: [authorityUnit.unit_id] });
+        } catch (error) { record.files_published = wasFilesPublished; throw error; }
+        await testHooks?.afterParquetPublication?.({ unit_id: authorityUnit.unit_id, checkpoint: structuredClone(checkpoint) });
         if (record.target_file_intents.some((intent) => intent.staging_ref)) {
-          await adapters.releaseStagedUnit({
-            unitId: authorityUnit.unit_id,
-            intents: record.target_file_intents,
-          });
-          record.target_file_intents = record.target_file_intents.map(
-            ({ staging_ref: _stagingRef, ...entry }) => entry,
-          );
+          await adapters.releaseStagedUnit({ unitId: authorityUnit.unit_id, intents: record.target_file_intents });
+          record.target_file_intents = record.target_file_intents.map(({ staging_ref: _stagingRef, ...entry }) => entry);
           await adapters.writeCheckpoint(checkpoint, { preparedUnitIds: [authorityUnit.unit_id] });
         }
         if (!wasFilesPublished && checkpoint.prepared_units[authorityUnit.unit_id]?.files_published === true) {
@@ -3875,6 +3758,8 @@ export async function executeObservationHistoryV3MigrationPlan({
       }
     }
   } finally { await pool.close(); }
+  phaseDurations.partition_transform_and_publication_ms = Date.now() - phaseStarted;
+  phaseStarted = Date.now();
   const { currentCanonical, reverifiedCanonical } = earlyCanonicalGate || await verifyCanonicalGate();
   // Early verification may precede staging-reference cleanup. Refresh only this
   // invocation's staging progress; canonical bytes/dependencies remain checked.
@@ -3947,6 +3832,8 @@ export async function executeObservationHistoryV3MigrationPlan({
     }
     throwMigrationBatchFailures(outcome);
   }
+  phaseDurations.canonical_publication_ms = Date.now() - phaseStarted;
+  phaseStarted = Date.now();
   const v3PublicationProgress = createMigrationProgressReporter({
     label: "V3 migration: v3 publication objects",
     total: completedPlan.v3_publication_plan.entries.length,
@@ -4008,6 +3895,8 @@ export async function executeObservationHistoryV3MigrationPlan({
     });
     completionProgress.report(offset + chunk.length);
   }
+  phaseDurations.exact_leaf_publication_ms = Date.now() - phaseStarted;
+  phaseStarted = Date.now();
   await testHooks?.afterV3Finalization?.({
     checkpoint: structuredClone(checkpoint),
     publication: v3Publication,
@@ -4021,6 +3910,7 @@ export async function executeObservationHistoryV3MigrationPlan({
     publicationConcurrency, partitionConcurrency, runnerPermit,
     cleanStartEvidence: checkpoint.clean_target_admission,
   });
+  phaseDurations.independent_verification_ms = Date.now() - phaseStarted;
   checkpoint.full_verification_complete = verification.ok;
   checkpoint.cutover_ready = verification.cutover_ready;
   await adapters.writeCheckpoint(checkpoint, { finalState: true });
@@ -4031,6 +3921,7 @@ export async function executeObservationHistoryV3MigrationPlan({
     parquet_evidence: Object.freeze(parquetEvidence),
     v3_publication: v3Publication,
     verification,
+    phase_durations_ms: Object.freeze(phaseDurations),
     checkpoint: Object.freeze(checkpoint),
   });
 }
@@ -5338,11 +5229,13 @@ export function guardSideBySideMigrationAdapters(plan, adapters) {
 // This inventory stores identities only. All source bodies are read directly
 // from locked canonical R2; no frozen source copy or delta mechanism exists.
 export async function buildObservationHistorySideBySideMigrationPlan({
-  getR2Object, assertLockHeld, repositoryRoot, environmentEvidence,
+  getR2Object, getR2ObjectBounded = null, assertLockHeld, repositoryRoot, environmentEvidence,
   migrationRunId, targetWriterGitSha, sosConnectorId = 1,
-  publicationConcurrency = 1, runnerPermit = null, runnerPolicy = null,
+  publicationConcurrency = 1, inventoryConcurrency = 1, runnerPermit = null, runnerPolicy = null,
 }) {
   if (typeof assertLockHeld !== "function") throw new Error("Side-by-side planning requires the global observations lock");
+  if (runnerPermit && typeof getR2ObjectBounded !== 'function') throw new Error('GCP source inventory requires bounded Parquet GET');
+  validateMigrationConcurrency({ publicationConcurrency, inventoryConcurrency, runnerPermit });
   assertLockHeld();
   const environment = validateObservationHistoryV3MigrationEnvironment({
     ...environmentEvidence, transition: "v2-to-v3",
@@ -5359,28 +5252,46 @@ export async function buildObservationHistorySideBySideMigrationPlan({
     assertLockHeld();
     return result;
   };
+  const readBounded = getR2ObjectBounded ? async ({ key, max_bytes }) => {
+    assertLockHeld();
+    const result = await getR2ObjectBounded({ key, max_bytes });
+    assertLockHeld();
+    return result;
+  } : null;
   const progress = createMigrationActivityReporter({ label: "Side-by-side: locked v2 inventory", enabled: true });
   const inventory = await inventoryAuthoritativeCanonicalObservationHistory({
-    getR2Object: read, observationsPrefix: source.observations_prefix,
+    getR2Object: read, getR2ObjectBounded: readBounded,
+    observationsPrefix: source.observations_prefix,
     v2IndexRoot: source.observations_timeseries_index_prefix,
     v2LatestKey: source.observations_timeseries_latest_key,
-    sosConnectorId, onProgress: progress.report,
+    sosConnectorId, inventoryConcurrency, onProgress: progress.report,
   });
   progress.finish();
   const sourceIdentities = new Map();
   const units = [];
-  const filesProgress = createMigrationProgressReporter({ label: "Side-by-side: source file identities", total: inventory.partitions.length, enabled: true });
-  for (const partition of inventory.partitions) {
-    for (const file of partition.canonical_files) {
-      assertObservationHistoryGenerationKey(source, file.key);
-      const object = await getRequiredObject(read, file.key, "locked v2 Parquet");
-      verifyManifestFileIdentity({ manifestIdentity: file.etag_or_hash, expectedBytes: file.bytes, liveObject: object, objectKey: file.key });
-      sourceIdentities.set(file.key, { ...bodyIdentity(file.key, object.body), stage: "canonical_parquet" });
+  const fileTasks = inventory.partitions.flatMap((partition) => partition.canonical_files);
+  const filesProgress = createMigrationProgressReporter({ label: "Side-by-side: source file identities", total: fileTasks.length, enabled: true });
+  let completedFiles = 0;
+  const sourceByteBudget = migrationConcurrencyLimits(runnerPermit).sourceInFlightBytes;
+  try {
+    for await (const batch of settledWeightedMigrationBatches(fileTasks, inventoryConcurrency, sourceByteBudget,
+      (file) => file.bytes, async (file) => {
+        assertObservationHistoryGenerationKey(source, file.key);
+        const object = await getRequiredObject(readBounded
+          ? ({ key }) => readBounded({ key, max_bytes: file.bytes }) : read,
+        file.key, "locked v2 Parquet");
+        verifyManifestFileIdentity({ manifestIdentity: file.etag_or_hash, expectedBytes: file.bytes, liveObject: object, objectKey: file.key });
+        return { ...bodyIdentity(file.key, object.body), stage: "canonical_parquet" };
+      })) {
+      for (const entry of batch) if (entry.result.status === 'fulfilled') sourceIdentities.set(entry.result.value.key, entry.result.value);
+      completedFiles += batch.filter((entry) => entry.result.status === 'fulfilled').length;
+      filesProgress.report(completedFiles);
     }
+    filesProgress.finish();
+  } catch (error) { filesProgress.finish('failed'); throw error; }
+  for (const partition of inventory.partitions) {
     units.push(sourceUnitFromPartition({ sourcePartition: partition, rollbackObjectsByKey: sourceIdentities, writerLimits, targetWriterGitSha }));
-    filesProgress.report(units.length);
   }
-  validateMigrationConcurrency({ publicationConcurrency, runnerPermit });
   const bindings = await inventorySideBySideBindings(read, { concurrency: publicationConcurrency });
   const transition = normalizeObservationHistoryV3MigrationTransition("v2-to-v3");
   const planIdentity = {

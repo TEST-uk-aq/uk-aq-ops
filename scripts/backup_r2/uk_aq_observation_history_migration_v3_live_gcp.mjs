@@ -16,7 +16,7 @@ const REQUIRED_KEYS = Object.freeze(["--expected-gcp-project-id", "--expected-gc
 const HELP = `Usage:
   node scripts/backup_r2/uk_aq_observation_history_migration_v3_live_gcp.mjs \\
     --expected-gcp-project-id PROJECT_ID --expected-gcp-zone europe-west2-ZONE \\
-    --environment LIVE --transition v2-to-v3 --mode plan|migrate|verify \\
+    --environment LIVE --transition v2-to-v3 --mode plan|migrate|verify|locked-clean-build \\
     --expected-bucket uk-aq-history-live --target-writer-git-sha REVIEWED_SHA \\
     [other shared migration parameters]
 
@@ -26,6 +26,8 @@ checkout of UK-AQ/uk-aq-ops; the LIVE R2 account and bucket; and the existing
 global observation lock, v2 source-root and empty-v3 clean-build safeguards.
 Migrate requires --apply --writers-frozen and a fresh --checkpoint-out.
 GCP clean-build resume with --checkpoint-in is not accepted for migration.
+Locked clean build requires --apply --writers-frozen, a fresh checkpoint-out,
+and an operator-created post-plan approval file while the same lock is held.
 The TEST runner remains separate. No cut-over or scheduler change occurs.
 `;
 
@@ -78,10 +80,10 @@ function parseLiveArguments(argv) {
       !/^[0-9a-f]{40}$/.test(oneValue(stripped, "--target-writer-git-sha"))) {
     throw new Error("LIVE migration identity, transition, bucket or writer SHA is inconsistent");
   }
-  if (!new Set(["plan", "migrate", "verify"]).has(oneValue(stripped, "--mode"))) {
-    throw new Error("LIVE GCP entry point only accepts plan/migrate/verify");
+  if (!new Set(["plan", "migrate", "verify", "locked-clean-build"]).has(oneValue(stripped, "--mode"))) {
+    throw new Error("LIVE GCP entry point only accepts plan/migrate/verify/locked-clean-build");
   }
-  if (oneValue(stripped, "--mode") === "migrate") {
+  if (new Set(["migrate", "locked-clean-build"]).has(oneValue(stripped, "--mode"))) {
     if (stripped.includes("--checkpoint-in")) {
       throw new Error("LIVE GCP clean-build migration must start from a fresh plan, never a partial checkpoint");
     }
@@ -92,9 +94,12 @@ function parseLiveArguments(argv) {
       throw new Error("LIVE migrate requires explicit --apply and --writers-frozen");
     }
     oneValue(stripped, "--checkpoint-out");
-    const planSha = oneValue(stripped, "--expected-plan-sha256");
-    if (!/^[0-9a-f]{64}$/.test(planSha)) {
-      throw new Error("LIVE migrate requires an exact pinned 64-character migration plan SHA-256");
+    if (oneValue(stripped, "--mode") === "migrate") {
+      const planSha = oneValue(stripped, "--expected-plan-sha256");
+      if (!/^[0-9a-f]{64}$/.test(planSha)) throw new Error("LIVE migrate requires an exact pinned 64-character migration plan SHA-256");
+    } else {
+      if (stripped.includes("--expected-plan-sha256")) throw new Error("Combined LIVE build requires post-plan approval, not a pre-plan SHA");
+      oneValue(stripped, "--post-plan-approval-file");
     }
   }
   return { sharedArgv: stripped, projectId, zone };

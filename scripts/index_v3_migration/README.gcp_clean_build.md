@@ -17,9 +17,10 @@ configuration, not another migration implementation. It addresses the slow seria
 partition transformation and large exact-leaf publication of the TEST rehearsal.
 
 The sole initial profile is `gcp-c4a-32`: GCE `c4a-standard-32`, Node `arm64`, at
-least 32 available CPUs and 120 GiB visible memory. Defaults are 16 persistent
-partition workers and 64 independent publications/reads; overrides are bounded
-to 1..24 and 1..96 respectively. Workers are retained across their phase. The
+least 32 available CPUs and 120 GiB visible memory. Defaults are 32 concurrent inventory reads, 16 persistent partition workers and
+64 independent publications/reads; overrides are bounded to 1..64, 1..24 and
+1..96 respectively. Source Parquet identity reads have a 256 MiB in-flight body
+budget; cross-partition publication has a separate 512 MiB body budget. Workers are retained across their phase. The
 remaining CPU capacity serves supervision, networking, journal persistence and
 the OS. Both complete logical verification and transformation use real Worker
 Threads. There is no process or thread per partition.
@@ -53,9 +54,11 @@ failure or malformed response stops admission. Diagnostics identify the namespac
 observed count (a lower bound for a truncated page), example keys, and the need for
 manual cleanup. Cleanup must be separately authorized and performed externally.
 
-Planning checks under the global observations lock before inventory. Fresh
-migration reacquires the lock, reconstructs and verifies the plan, confirms writer
-freeze, revalidates pinned source prerequisites, then checks every namespace again
+Separate planning checks under a global observations lock before inventory. The
+new `locked-clean-build` mode retains that same lock through planning, approval,
+migration and complete independent verification. Separate fresh migration still
+reacquires the lock and reconstructs its plan. Both paths confirm writer freeze,
+revalidate pinned source prerequisites, then check every namespace again
 immediately before the first target write. It journals the successful check before
 publication. Final verification authenticates the recorded clean start and planning
 evidence; it does not require the completed target to be empty.
@@ -100,9 +103,9 @@ environments contain no credentials, lock context or checkpoint paths.
 
 Preparation evidence commits in plan order. After CPU failure only the safe
 contiguous preparation prefix is retained; later successful CPU-only results are
-discarded, with no R2 side effects. Prepared partitions publish in plan order;
-independent Parquet files within each partition publish up to the publication
-limit. Successful file siblings become durable even if a sibling fails. A unit is
+discarded, with no R2 side effects. Prepared partitions are staged in bounded CPU batches. Their independent
+Parquet files are flattened in immutable plan position and published through one
+global publication limiter and byte budget, including across partitions. Successful file siblings become durable even if a sibling fails. A unit is
 marked published only when all files are durable. Staging is released thereafter.
 Only one partition batch's source/decoded/Parquet bodies can be live at a time.
 
@@ -126,7 +129,8 @@ work. No sampling or checkpoint substitution is used. A second copy of all fetch
 index bodies is avoided by retaining verified keys and validating their identical
 pinned bytes.
 
-Progress retains the 15-second worker heartbeat without per-object logging. ETA
+Progress emits throttled completed/total updates as batches finish and retains
+the 15-second worker heartbeat without per-object logging. ETA
 uses throughput across at most ten prior emitted samples and requires at least
 five prior samples, positive progress/time, and a finite result. Object work uses
 object counts; partition transformation and complete logical verification use
@@ -142,24 +146,38 @@ closed on resume; preserve those incomplete artifacts for review. Existing
 historical journals retain their original implementation pin and may reject the
 changed implementation; this is not a conversion tool for the active rehearsal.
 
-Authenticated clean-build resume reuses the original v2 root, plan and clean-start
-evidence; it does not require an already-started target to be empty. If interruption
-preceded the durable clean-start event, resume must check emptiness before writing.
-A local/historical checkpoint cannot be admitted as a GCP clean-build checkpoint.
+An interrupted normal GCP clean build is abandoned. Manual cleanup of only the
+contracted v3 target namespaces, a proven empty target, a new run ID and work
+directory, and a fresh complete operation are required. The shared authenticated
+resume implementation remains for exceptional, separately authorised engineering
+work; it is not the normal GCP restart path. A local/historical checkpoint cannot
+be admitted as a GCP clean-build checkpoint.
 
-## Later TEST command shape — do not run during development
+## New combined mode — later isolated TEST acceptance only
 
-On the already provisioned, separately authorized c4a-standard-32 VM, use the
-reviewed clean checkout and established TEST environment described in
+The currently serving TEST v3 target must not be cleared to make room for this
+rehearsal. Use only an expressly authorised isolated clean TEST destination and
+its verified TEST credentials. The reviewed checkout must be clean at the exact
+writer Git SHA; development changes in this working tree cannot yet be run.
+The TEST wrapper pins the TEST Cloudflare account and accepts the existing
+`uk-aq-history-cic-test` bucket or a separately provisioned
+`uk-aq-history-cic-test-*` bucket in that same account. A clean isolated bucket
+with a complete, independently authenticated frozen v2 observation tree and
+its `_index_v2` binding/index dependencies, and empty v3
+namespaces is an operational prerequisite, not something this command creates.
+
+On the separately authorized c4a-standard-32 VM, use the reviewed clean checkout
+and established TEST environment described in
 [the side-by-side operator guide](README.side_by_side_operator.md). Keep
 `UK_AQ_R2_HISTORY_VERSION=v2` and `UK_AQ_R2_HISTORY_INTEGRITY_VERSION=v2`.
-Do not synthesize lock-context variables.
+Do not synthesize lock-context variables. Prepare the exact isolated TEST bucket
+and reviewed identities:
 
 ```bash
 set -euo pipefail
 migration_cli='scripts/backup_r2/uk_aq_observation_history_migration_v3_gcp.mjs'
 migration_run_id='REPLACE_WITH_UNIQUE_TEST_RUN_ID'
-migration_expected_bucket='REPLACE_WITH_EXACT_TEST_BUCKET'
+migration_expected_bucket='REPLACE_WITH_EXACT_ISOLATED_TEST_BUCKET'
 migration_writer_sha='REPLACE_WITH_REVIEWED_40_HEX_WRITER_SHA'
 migration_work_dir="$HOME/uk-aq-work/gcp-clean/$migration_run_id"
 mkdir -p "$migration_work_dir"
@@ -176,6 +194,66 @@ migration_common=(
   --writer-limits-json "$migration_work_dir/writer_limits.json"
   --partition-concurrency 16 --publication-concurrency 64
 )
+```
+
+After the separately authorized writer freeze, launch the GCP TEST entry point
+with `nohup`, stdin from `/dev/null`, a dedicated log and PID file, then
+`disown`, check `ps`, and follow the log:
+
+```bash
+migration_log="$migration_work_dir/locked-clean-build.nohup.log"
+migration_pid_file="$migration_work_dir/locked-clean-build.nohup.pid"
+nohup node "$migration_cli" "${migration_common[@]}" \
+  --mode locked-clean-build --apply --writers-frozen \
+  --inventory-concurrency 32 \
+  --checkpoint-out "$migration_work_dir/checkpoint.json" \
+  --report-out "$migration_work_dir/locked-clean-build.json" \
+  --post-plan-approval-file "$migration_work_dir/post-plan-approval.txt" \
+  >"$migration_log" 2>&1 < /dev/null &
+migration_pid=$!
+printf '%s\n' "$migration_pid" > "$migration_pid_file"
+disown "$migration_pid"
+ps -p "$(cat "$migration_pid_file")" -o pid,etime,stat,cmd
+tail -f "$migration_log"
+```
+
+The process durably writes `locked-clean-build.json.complete-plan.json` and a
+review summary with `status=awaiting_post_plan_approval`, then holds the global
+lock for at most one hour. Review the complete plan, plan SHA, GCE identity,
+writer freeze and clean-target evidence. Only then create the approval file with
+mode 0600 and the exact line printed in the log:
+
+```text
+APPROVE TEST <run-id> <plan-sha256> <reviewed-writer-git-sha> APPLY WRITERS_FROZEN
+```
+
+Create that file atomically under the same work directory after reviewing the
+plan. For example, after manually setting the four reviewed values shown in
+the required line:
+
+```bash
+umask 077
+migration_plan_sha=$(jq -er '.result | select(.status == "awaiting_post_plan_approval") | .plan_sha256' \
+  "$migration_work_dir/locked-clean-build.json")
+approval_tmp="$migration_work_dir/post-plan-approval.txt.tmp.$$"
+printf 'APPROVE TEST %s %s %s APPLY WRITERS_FROZEN\n' \
+  "$migration_run_id" "$migration_plan_sha" "$migration_writer_sha" > "$approval_tmp"
+chmod 600 "$approval_tmp"
+mv "$approval_tmp" "$migration_work_dir/post-plan-approval.txt"
+```
+
+A pre-existing, stale, missing, mismatched or unsafe file fails closed.
+Successful final evidence in `locked-clean-build.json.result-evidence.json`
+binds the second clean-target admission, authenticated journal head, complete
+independent verification and unchanged v2 root. This
+command does not switch runtime generation or resume writers.
+
+## Retained separate modes — do not run during development
+
+Use the common arguments above if a separately authorized retained-mode operation
+is required.
+
+```bash
 node "$migration_cli" "${migration_common[@]}" --mode plan \
   --report-out "$migration_work_dir/plan.json"
 migration_plan_sha=$(jq -er '.result | select(.ok == true and .status == "planned") | .plan_sha256' \
@@ -197,15 +275,13 @@ node "$migration_cli" "${migration_common[@]}" --mode verify \
   --report-out "$migration_work_dir/verify.json"
 ```
 
-For an interrupted run only, repeat migrate with both
-`--checkpoint-in "$migration_work_dir/checkpoint.json"` and
-`--checkpoint-out "$migration_work_dir/checkpoint.json"`, retaining all other
-identities and the complete evidence directory.
+For normal GCP interruption, preserve evidence, manually clear only the
+contracted v3 target namespaces under separate authorisation, prove emptiness,
+and start a new run ID/work directory. Do not resume a partial checkpoint.
 
-Expected acceptance includes complete `side_by_side_build_verified` results,
-unchanged v2 root, preserved clean-start evidence, no runtime switch, deterministic
-interruption/resume, resource/memory measurements and improved throughput. An
-uninterrupted run alone does not establish recovery acceptance.
+Expected acceptance includes a complete `side_by_side_build_verified` result,
+unchanged v2 root, both clean-target admissions, approval before writes, no runtime
+switch, complete independent verification and resource/memory measurements.
 
 ## Review and system-documentation handover
 
