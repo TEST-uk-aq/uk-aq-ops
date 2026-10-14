@@ -32,7 +32,7 @@ def money(value):
     return format(Decimal(value) / Decimal(1000000), '.6f')
 
 
-def summaries(connection, source, cutoff, history_complete):
+def summaries(connection, source, cutoff, history_complete, environment):
     table = TABLES[source]
     coverage = ('Initial history backfill complete.' if history_complete else
                 'PARTIAL HISTORY: initial backfill is still in progress.')
@@ -79,7 +79,7 @@ def summaries(connection, source, cutoff, history_complete):
         ]
         title = ('Standard reporting totals' if source == 'standard' else
                  'Detailed resource investigation — do not add to Standard totals')
-        lines = [f'# TEST GCP billing: {name}', '', title, '',
+        lines = [f'# {environment} GCP billing: {name}', '', title, '',
                  f'BigQuery is authoritative. Publication cutoff: {scalar(cutoff)}.',
                  coverage,
                  'Recent usage is provisional; absent usage does not prove zero cost.',

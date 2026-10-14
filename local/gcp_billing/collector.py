@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MacBook Pro TEST billing collector. No schema apply or cloud mutation path."""
+"""MacBook Pro TEST/LIVE billing collector. No schema apply or cloud mutation path."""
 import argparse
 import fcntl
 import hashlib
@@ -59,7 +59,7 @@ class Queries:
         self.reserved += reserve
         job = self.client.query(sql, job_config=self.bq.QueryJobConfig(
             maximum_bytes_billed=reserve, query_parameters=params,
-            labels={'uk_aq_environment': 'test', 'uk_aq_collector': 'gcp_billing'}),
+            labels={'uk_aq_environment': self.config['environment'].lower(), 'uk_aq_collector': 'gcp_billing'}),
             job_retry=None)
         try:
             rows = [dict(row.items()) for row in job.result(timeout=300)]
@@ -254,9 +254,10 @@ def collect(db, queries, c, runtime, source, args):
             base = Path('daily') if source == 'standard' else Path('detailed/daily')
             relative = base / day.strftime('%Y/%m') / (day.isoformat() + '.csv.gz')
             files.append(pub.stage(relative, daily_archive(source, rows)))
-        for name, data in summaries(db, source, cutoff, history_complete=watermark is not None):
+        for name, data in summaries(db, source, cutoff, history_complete=watermark is not None,
+                                    environment=c['environment']):
             files.append(pub.stage(Path('reports') / source / name, data))
-        evidence = dict(run_id=run_id, environment='TEST', source_kind=source,
+        evidence = dict(run_id=run_id, environment=c['environment'], source_kind=source,
                         source_view=c['dataset'] + '.' + c['sources'][source]['view'],
                         billing_account_id=c['billing_account_id'], identity_hash=identity(c, source),
                         started_at=scalar(started), cutoff=scalar(cutoff),
@@ -285,7 +286,7 @@ def collect(db, queries, c, runtime, source, args):
         try:
             db.rollback()
             db.ping(reconnect=True)
-            require(sql(db, "SELECT GET_LOCK('uk_aq_gcp_billing_test_collector',0) AS acquired")[0]
+            require(sql(db, "SELECT GET_LOCK('uk_aq_gcp_billing_' + c['environment'].lower() + '_collector',0) AS acquired")[0]
                     ['acquired'] == 1, 'DATABASE_RECOVERY_LOCK_REQUIRED')
         except Exception:
             raise SafeError('DATABASE_RECOVERY_REQUIRED') from None
@@ -310,18 +311,20 @@ def collect(db, queries, c, runtime, source, args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--environment', required=True, choices=['TEST'])
-    parser.add_argument('--config', required=True, type=Path)
+    parser.add_argument('--environment', required=True, choices=['TEST', 'LIVE'])
+    config_input = parser.add_mutually_exclusive_group(required=True)
+    config_input.add_argument('--config', type=Path, help='Existing private config.json (TEST compatibility)')
+    config_input.add_argument('--env-file', type=Path, help='Private per-environment .env settings')
     parser.add_argument('--runtime-root', required=True, type=Path)
     parser.add_argument('--source', choices=['standard', 'detailed', 'all'], default='standard')
     parser.add_argument('command', choices=['validate', 'render-views', 'backfill', 'incremental', 'refresh'])
     parser.add_argument('--start', type=date.fromisoformat)
     parser.add_argument('--end', type=date.fromisoformat)
     args = parser.parse_args()
-    c = load(args.config, args.runtime_root)
+    c = load(args.env_file or args.config, args.runtime_root, args.environment)
     sources = list(c['sources']) if args.source == 'all' else [args.source]
     if args.command == 'validate':
-        print('TEST configuration structurally valid; no credentials or services accessed')
+        print(args.environment + ' configuration structurally valid; no credentials or services accessed')
         return 0
     if args.command == 'render-views':
         for source in sources:
@@ -338,11 +341,11 @@ def main():
             raise SafeError('COLLECTOR_ALREADY_RUNNING') from None
         db = connect(c, runtime)
         try:
-            got = sql(db, "SELECT GET_LOCK('uk_aq_gcp_billing_test_collector',0) AS acquired")[0]
+            got = sql(db, "SELECT GET_LOCK('uk_aq_gcp_billing_' + c['environment'].lower() + '_collector',0) AS acquired")[0]
             require(got['acquired'] == 1, 'DATABASE_COLLECTOR_ALREADY_RUNNING')
             root = Path(c['archive_root'])
             root.mkdir(parents=True, exist_ok=True)
-            binding = {'environment': 'TEST', 'sources': {s: identity(c, s) for s in c['sources']}}
+            binding = {'environment': c['environment'], 'sources': {s: identity(c, s) for s in c['sources']}}
             binding_file = root / 'archive-identity.json'
             if binding_file.exists():
                 require(json.loads(binding_file.read_text()) == binding, 'ARCHIVE_IDENTITY_MISMATCH')
