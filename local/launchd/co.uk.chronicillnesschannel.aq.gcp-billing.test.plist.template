@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>co.uk.chronicillnesschannel.aq.gcp-billing.test</string>
+  <key>ProgramArguments</key><array>
+    <string>__PYTHON__</string>
+    <string>__REPO_ROOT__/local/gcp_billing/collector.py</string>
+    <string>--environment</string><string>TEST</string>
+    <string>--config</string><string>__RUNTIME_ROOT__/config.json</string>
+    <string>--runtime-root</string><string>__RUNTIME_ROOT__</string>
+    <string>--source</string><string>all</string>
+    <string>incremental</string>
+  </array>
+  <key>WorkingDirectory</key><string>__REPO_ROOT__</string>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>__RUNTIME_ROOT__/logs/launchd.log</string>
+  <key>StandardErrorPath</key><string>__RUNTIME_ROOT__/logs/launchd.log</string>
+</dict></plist>

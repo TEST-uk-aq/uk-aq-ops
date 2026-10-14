@@ -1,0 +1,2 @@
+google-cloud-bigquery==3.38.0
+PyMySQL==1.1.2
