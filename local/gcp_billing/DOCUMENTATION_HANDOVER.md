@@ -67,8 +67,8 @@ Record the following implemented semantics in the billing area when appropriate:
   config and standalone pinned direct dependencies. No GitHub env keys added;
   environment-target catalogue unchanged. Existing CodeQL already scans Python.
 - `local/gcp_billing/render_launchd.py` and
-  `local/launchd/co.uk.chronicillnesschannel.aq.gcp-billing.test.plist.template`:
-  render-only hourly MacBook Pro job (`RunAtLoad=false`).
+  `local/launchd/co.uk.ukaq.gcp-billing.test.plist.template`:
+  render-only daily 13:00 MacBook Pro TEST job (`RunAtLoad=false`).
 - `local/gcp_billing/README.md`: manual commands, discovery, budgets, format,
   grants, recovery, rollout, rollback and real TEST acceptance.
 

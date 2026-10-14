@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>co.uk.chronicillnesschannel.aq.gcp-billing.test</string>
+  <key>Label</key><string>co.uk.ukaq.gcp-billing.test</string>
   <key>ProgramArguments</key><array>
     <string>__PYTHON__</string>
     <string>__REPO_ROOT__/local/gcp_billing/collector.py</string>

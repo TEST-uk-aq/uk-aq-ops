@@ -11,7 +11,7 @@ p.add_argument('--python', type=Path, required=True)
 a = p.parse_args()
 if not all(x.is_absolute() for x in (a.repo_root, a.runtime_root, a.python)) or a.runtime_root.name != 'TEST':
     p.error('absolute paths and a TEST runtime root are required')
-template = Path(__file__).resolve().parents[1] / 'launchd/co.uk.chronicillnesschannel.aq.gcp-billing.test.plist.template'
+template = Path(__file__).resolve().parents[1] / 'launchd/co.uk.ukaq.gcp-billing.test.plist.template'
 value = plistlib.loads(template.read_bytes())
 replacements = {'__PYTHON__': str(a.python), '__REPO_ROOT__': str(a.repo_root),
                 '__RUNTIME_ROOT__': str(a.runtime_root)}

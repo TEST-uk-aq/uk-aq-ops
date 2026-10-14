@@ -297,8 +297,8 @@ Render the template; rendering does not install or enable it:
 ```bash
 .venv-gcp-billing/bin/python local/gcp_billing/render_launchd.py \
   --repo-root "$OPS" --runtime-root "$BILLING_RUNTIME" \
-  --python "$OPS/.venv-gcp-billing/bin/python" > /tmp/co.uk.chronicillnesschannel.aq.gcp-billing.test.plist
-plutil -lint /tmp/co.uk.chronicillnesschannel.aq.gcp-billing.test.plist
+  --python "$OPS/.venv-gcp-billing/bin/python" > /tmp/co.uk.ukaq.gcp-billing.test.plist
+plutil -lint /tmp/co.uk.ukaq.gcp-billing.test.plist
 ```
 
 It invokes `--source all incremental` daily at 13:00 in the MacBook Pro's
