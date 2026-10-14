@@ -51,7 +51,11 @@ Create a private runtime tree **outside Dropbox and Git**:
 
 Copy `config.test.example.json` to this tree and replace every placeholder.
 The example deliberately cannot run. `archive_root` is an absolute resolved
-local Dropbox path ending in `Billing/GCP/TEST`. The runtime root must end in
+local Dropbox path ending in `Apps/github-uk-air-quality-networks/TEST/gcp_billing`.
+The parent `TEST` directory is the existing UK AQ data directory. The corresponding
+`LIVE/gcp_billing` directory is reserved for a separately authorised LIVE rollout;
+this TEST implementation MUST NOT write there. Confirm the Dropbox root on the
+MacBook Pro before setting `archive_root`. The runtime root must end in
 `TEST`, be mode 700, and have no symlink aliases. Credential files must be mode
 600 and resolve inside that runtime. Provision the credential files out of band;
 never put them in the archive. A single terminal newline in `mysql-password` is

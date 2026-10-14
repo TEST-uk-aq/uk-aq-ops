@@ -5,7 +5,7 @@
   "location": "REPLACE_WITH_DATASET_LOCATION",
   "billing_account_id": "REPLACE_WITH_TEST_BILLING_ACCOUNT_ID",
   "earliest_usage_date": "2026-05-01",
-  "archive_root": "/REPLACE_WITH_LOCAL_DROPBOX_ROOT/Billing/GCP/TEST",
+  "archive_root": "/REPLACE_WITH_LOCAL_DROPBOX_ROOT/Apps/github-uk-air-quality-networks/TEST/gcp_billing",
   "mysql_database": "uk_aq_gcp_billing_test",
   "mysql_user": "uk_aq_gcp_billing_test_writer",
   "mysql_socket": "/REPLACE_WITH_LOCAL_MYSQL_SOCKET",

@@ -31,7 +31,8 @@ def load(path, runtime):
     require(re.fullmatch(r'[a-zA-Z0-9-]+', c['location']) is not None, 'LOCATION_REQUIRED')
     root = Path(c['archive_root'])
     require(root.is_absolute() and root.resolve() == root, 'ARCHIVE_ABSOLUTE_NO_SYMLINK')
-    require(root.parts[-3:] == ('Billing', 'GCP', 'TEST'), 'ARCHIVE_BOUNDARY')
+    require(root.parts[-4:] == ('Apps', 'github-uk-air-quality-networks', 'TEST', 'gcp_billing'),
+            'ARCHIVE_BOUNDARY')
     require(runtime.is_absolute() and runtime.resolve() == runtime and runtime.name == 'TEST',
             'RUNTIME_BOUNDARY')
     for p in (root, runtime):
