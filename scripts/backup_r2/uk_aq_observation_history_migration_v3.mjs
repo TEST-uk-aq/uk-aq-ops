@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { migrationConcurrencyLimits, validateMigrationConcurrency, inspectEmptyV3Target, validateCleanStartEvidence, GCP_CLEAN_POLICY } from './lib/observation_history_migration_gcp.mjs';
+import { r2GetMigrationObjectBounded } from './lib/observation_history_migration_bounded_r2.mjs';
 import { exactPublicationEvidence, settledMigrationBatches, migrationFailure, migrationFailureEvidence } from './lib/observation_history_migration_concurrency.mjs';
 import { runOperatorCommand, createOperatorProgress, withOperatorPhase, superviseOperatorInvocation, finishOperatorProgress } from "../index_v3_migration/operator_execution.mjs";
 
@@ -26,7 +27,6 @@ import { getObservationHistoryGeneration } from "../../workers/shared/uk_aq_obse
 import {
   hasRequiredR2Config,
   r2GetObject,
-  r2GetObjectBounded,
   r2HeadObject,
   r2ListObjectsV2,
   r2PutObject,
@@ -378,6 +378,9 @@ function recoveryImplementationIdentity(repositoryRoot, runner = null, environme
     throw new Error("Current recovery repository HEAD is unavailable");
   }
   const paths = [...RECOVERY_IMPLEMENTATION_PATHS];
+  if (runner?.runner_kind === 'gcp') {
+    paths.push('scripts/backup_r2/lib/observation_history_migration_bounded_r2.mjs');
+  }
   if (!runner || runner.runner_kind === 'gcp') paths.push(environment === 'LIVE'
     ? 'scripts/backup_r2/uk_aq_observation_history_migration_v3_live_gcp.mjs'
     : 'scripts/backup_r2/uk_aq_observation_history_migration_v3_gcp.mjs');
@@ -1111,22 +1114,23 @@ async function waitForPostPlanApproval({ plan, approvalPath, planPublishedAt, de
   process.stderr.write(`Operator approval expires at ${new Date(deadline).toISOString()}. Create mode-0600 ${approvalPath} containing exactly:\n${expected}`);
   for (;;) {
     assertLockHeld();
+    if (Date.now() >= deadline) throw new Error("Post-plan approval expired while the global lock was held");
     if (fs.existsSync(approvalPath)) {
       const stat = fs.lstatSync(approvalPath);
       if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid() || (stat.mode & 0o077) !== 0 ||
-          stat.size > 512 || stat.mtimeMs < planPublishedAt) {
+          stat.size > 512 || stat.mtimeMs < planPublishedAt || stat.mtimeMs >= deadline) {
         throw new Error("Post-plan approval file is stale, unsafe or ambiguous");
       }
       const bytes = fs.readFileSync(approvalPath);
       if (bytes.toString('utf8') !== expected) throw new Error("Post-plan approval contradicts exact environment, run, plan, writer SHA or apply/frozen-writer intent");
       assertLockHeld();
+      if (Date.now() >= deadline) throw new Error("Post-plan approval expired while the global lock was held");
       return Object.freeze({ kind: "uk_aq_observation_history_v3_post_plan_approval_v1",
         environment: plan.environment.environment, migration_run_id: plan.migration_run_id,
         plan_sha256: plan.plan_sha256, target_writer_git_sha: plan.target_writer_git_sha,
         apply: true, writers_frozen: true, approval_file_sha256: sha256Hex(bytes),
         approval_file_byte_size: bytes.byteLength, approved_at_utc: new Date(stat.mtimeMs).toISOString() });
     }
-    if (Date.now() >= deadline) throw new Error("Post-plan approval expired while the global lock was held");
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
 }
@@ -1850,7 +1854,7 @@ function buildR2Adapters({
   };
   return {
     getObject: ({ key }) => r2GetObject({ r2, key }),
-    getObjectBounded: ({ key, max_bytes }) => r2GetObjectBounded({ r2, key, max_bytes }),
+    getObjectBounded: ({ key, max_bytes }) => r2GetMigrationObjectBounded({ r2, key, max_bytes }),
     headObject: ({ key }) => r2HeadObject({ r2, key }),
     listObjects: (request) => r2ListObjectsV2({ r2, ...request, require_valid_listing: true }),
     putChecksumObject: (intent) => { requireHealthyJournal(); return putAndVerifyR2ObjectWithSha256({ r2, intent }); },
