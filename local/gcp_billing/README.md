@@ -290,7 +290,7 @@ MySQL retains the latest configured number of run records per source (default
 launchd log with the existing Mac operator log policy; it contains only compact
 one-line statuses, never source rows or SDK exception payloads.
 
-## Hourly scheduling (only after TEST acceptance)
+## Daily scheduling at 13:00 (only after TEST acceptance)
 
 Render the template; rendering does not install or enable it:
 
@@ -301,9 +301,13 @@ Render the template; rendering does not install or enable it:
 plutil -lint /tmp/co.uk.chronicillnesschannel.aq.gcp-billing.test.plist
 ```
 
-It invokes `--source all incremental` hourly, with `RunAtLoad=false`. Only after
-separate authorisation, install the rendered file to the user's LaunchAgents
-and bootstrap `gui/<uid>`. Installation/loading was **not** performed here.
+It invokes `--source all incremental` daily at 13:00 in the MacBook Pro's
+configured local time zone (Europe/London expected), with `RunAtLoad=false`.
+This TEST-specific cadence is an operator-approved exception to the future
+billing contract's recommended hourly interval; it does not change source
+watermarks, overlap or late-correction handling. Only after separate authorisation,
+install the rendered file to the user's LaunchAgents and bootstrap `gui/<uid>`.
+Installation/loading was **not** performed here.
 
 ## Real TEST acceptance after authorised deployment
 
@@ -312,7 +316,7 @@ Use normal real TEST billing, without synthetic traffic or speculative suites:
 1. Verify both backfills cover their actual available history; Standard begins
    1 May 2026. Compare selected actual days and currencies, service/SKU totals and
    invoice periods with each separate BigQuery view using the same cutoff/micros.
-2. Observe normal hourly collection and a repeat run: facts do not duplicate,
+2. Observe normal daily collection and a repeat run: facts do not duplicate,
    each source's watermark advances independently, and reports/archive days agree
    with MySQL. Inspect the null flags and integer fields without a float parser.
 3. Observe a naturally arriving late export/correction and confirm the complete

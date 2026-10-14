@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the hourly TEST launchd template to stdout; never install or load it."""
+"""Render the daily 13:00 TEST launchd template to stdout; never install or load it."""
 import argparse
 import plistlib
 from pathlib import Path
