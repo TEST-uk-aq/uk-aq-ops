@@ -127,8 +127,10 @@ install -m 600 local/gcp_billing/config.test.example.json "$BILLING_RUNTIME/conf
 
 `validate` and `render-views` are offline and do not read credentials or create
 runtime/archive directories. Review the generated SELECTs and view DDL. The
-collector verifies that deployed view definitions exactly match the rendered v1
-SELECTs (whitespace is ignored). Apply each reviewed CREATE VIEW statement with
+collector compares ordered view columns/types and meaningful SQL tokens
+against the rendered v1 SELECTs. Formatting, comments and case of unquoted SQL
+words are ignored, but source tables, ordered columns, calculations, aliases and
+literal values remain exact. Apply each reviewed CREATE VIEW statement with
 an authorised administrator via `bq query --use_legacy_sql=false --location=LOCATION`.
 Do not give that privilege to the collector or modify Google's export tables.
 

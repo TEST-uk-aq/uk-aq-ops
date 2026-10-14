@@ -1,4 +1,5 @@
 """Read-only collector queries and operator-rendered view DDL (never applied here)."""
+import re
 DIMENSIONS = [
     'usage_date', 'invoice_month', 'billing_account_id', 'project_id', 'project_name',
     'service_id', 'service_description', 'sku_id', 'sku_description', 'cost_type', 'currency',
@@ -48,3 +49,84 @@ def aggregate_sql(view, source):
     WHERE usage_date = @day AND export_time <= @cutoff
       AND billing_account_id = @account
     GROUP BY {dims}'''
+
+# Lexical view comparison: ignore only formatting/comments/case of bare words.
+# Quoted identifiers and literals remain exact; no semantic SQL rewriting.
+_SQL_WORD = re.compile(r'[A-Za-z_][A-Za-z_0-9]*')
+_SQL_NUMBER = re.compile(r'(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[Ee][+-]?[0-9]+)?')
+_SQL_OPERATORS = ('<=', '>=', '<>', '!=', '||', '<<', '>>', '=>', ':=')
+_SQL_PUNCTUATION = frozenset('(),.*=+-/<>;%[]')
+
+
+def view_sql_tokens(statement):
+    """Return SQL tokens, failing closed on unfamiliar or unterminated input."""
+    tokens = []
+    pos = 0
+    while pos < len(statement):
+        char = statement[pos]
+        if char.isspace():
+            pos += 1
+            continue
+        if statement.startswith('--', pos) or char == '#':
+            end = statement.find('\n', pos)
+            pos = len(statement) if end < 0 else end + 1
+            continue
+        if statement.startswith('/*', pos):
+            end = statement.find('*/', pos + 2)
+            if end < 0:
+                raise ValueError('unterminated SQL comment')
+            pos = end + 2
+            continue
+        if char in ("'", '"', chr(96)):
+            start = pos
+            quote = char
+            pos += 1
+            while pos < len(statement):
+                if statement[pos] == '\\':
+                    if pos + 1 >= len(statement):
+                        raise ValueError('incomplete SQL string escape')
+                    pos += 2
+                elif statement[pos] == quote:
+                    if pos + 1 < len(statement) and statement[pos + 1] == quote:
+                        pos += 2
+                    else:
+                        pos += 1
+                        break
+                else:
+                    pos += 1
+            else:
+                raise ValueError('unterminated SQL quoted value')
+            tokens.append(('quoted', statement[start:pos]))
+            continue
+        word = _SQL_WORD.match(statement, pos)
+        if word:
+            tokens.append(('word', word.group().casefold()))
+            pos = word.end()
+            continue
+        number = _SQL_NUMBER.match(statement, pos)
+        if number:
+            tokens.append(('number', number.group()))
+            pos = number.end()
+            continue
+        operator = next((x for x in _SQL_OPERATORS if statement.startswith(x, pos)), None)
+        if operator:
+            tokens.append(('operator', operator))
+            pos += len(operator)
+            continue
+        if char in _SQL_PUNCTUATION:
+            tokens.append(('punctuation', char))
+            pos += 1
+            continue
+        raise ValueError('unsupported SQL token')
+    if tokens and tokens[-1] == ('punctuation', ';'):
+        tokens.pop()
+    if any(kind == 'punctuation' and value == ';' for kind, value in tokens):
+        raise ValueError('multiple SQL statements')
+    return tuple(tokens)
+
+
+def expected_view_schema(source):
+    """Expected column names/types, ordered as in the pinned generated SQL."""
+    names = dimensions(source) + ['gross_cost_micros', 'credit_micros', 'export_time']
+    return list(zip(names, ['DATE'] + ['STRING'] * (len(dimensions(source)) - 1)
+                    + ['INTEGER', 'INTEGER', 'TIMESTAMP']))

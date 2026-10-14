@@ -12,7 +12,8 @@ from pathlib import Path
 
 from configuration import SafeError, identity, load, require
 from publication import Publication, atomic
-from queries import MONEY, TABLES, aggregate_sql, dimensions, view_ddl
+from queries import (MONEY, TABLES, aggregate_sql, dimensions,
+                     expected_view_schema, view_ddl, view_sql_tokens)
 from reports import daily_archive, scalar, summaries
 
 
@@ -76,11 +77,20 @@ class Queries:
     def verify_view(self, source):
         cfg = self.config['sources'][source]
         table = self.client.get_table(self.config['dataset'] + '.' + cfg['view'])
-        expected = view_ddl(self.config, source).split(' AS\n', 1)[1]
-        normalise = lambda sql: ' '.join(sql.strip().rstrip(';').split())
-        require(table.table_type == 'VIEW' and
-                normalise(table.view_query or '') == normalise(expected), 'VIEW_DEFINITION_MISMATCH')
+        require(table.table_type == 'VIEW', 'VIEW_TYPE_MISMATCH')
         require(table.location.casefold() == self.config['location'].casefold(), 'VIEW_LOCATION')
+        actual_fields = [(f.name.casefold(), 'INTEGER' if f.field_type.upper() == 'INT64'
+                          else f.field_type.upper()) for f in table.schema]
+        require(actual_fields == expected_view_schema(source), 'VIEW_COLUMNS_MISMATCH')
+        expected = view_ddl(self.config, source).split(' AS\n', 1)[1]
+        try:
+            # Token identity retains the original raw table, ordered columns,
+            # aliases, casts, calculations and predicates without a SQL job.
+            same_definition = (view_sql_tokens(table.view_query or '') ==
+                               view_sql_tokens(expected))
+        except ValueError:
+            same_definition = False
+        require(same_definition, 'VIEW_DEFINITION_MISMATCH')
 
 
 def connect(c, runtime):
