@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { migrationConcurrencyLimits, validateMigrationConcurrency, inspectEmptyV3Target, validateCleanStartEvidence, GCP_CLEAN_POLICY } from './lib/observation_history_migration_gcp.mjs';
+import { persistShardedMigrationPlan, readShardedMigrationPlan, sha256StableMigrationJson } from './lib/observation_history_migration_plan_store.mjs';
 import { r2GetMigrationObjectBounded } from './lib/observation_history_migration_bounded_r2.mjs';
 import { exactPublicationEvidence, settledMigrationBatches, migrationFailure, migrationFailureEvidence } from './lib/observation_history_migration_concurrency.mjs';
 import { runOperatorCommand, createOperatorProgress, withOperatorPhase, superviseOperatorInvocation, finishOperatorProgress } from "../index_v3_migration/operator_execution.mjs";
@@ -66,6 +67,7 @@ import {
   validateObservationHistoryV3RecoveryAppend,
   createMigrationProgressReporter,
   buildObservationHistoryV3RerunVerificationPlan,
+  LEGACY_HASH_DERIVATION_LIMITS,
   DEFAULT_OBSERVATIONS_PREFIX,
   DEFAULT_V3_INDEX_ROOT,
   DEFAULT_V3_LATEST_KEY,
@@ -287,6 +289,26 @@ function readJsonFile(filePath, label) {
   }
 }
 
+function readMigrationCheckpoint(filePath) {
+  const checkpoint = readJsonFile(filePath, 'migration checkpoint');
+  if (checkpoint?.authority_format === 'uk_aq_migration_plan_shards_v1') {
+    if (Object.hasOwn(checkpoint, 'authority') || !checkpoint.authority_ref) {
+      throw new Error('Sharded migration checkpoint has contradictory inline authority');
+    }
+    const { plan } = readShardedMigrationPlan(checkpoint.authority_ref);
+    if (checkpoint.authority_sha256 !== checkpoint.authority_ref.full_plan_sha256 ||
+        checkpoint.plan_sha256 !== plan.plan_sha256 ||
+        checkpoint.migration_run_id !== plan.migration_run_id) {
+      throw new Error('Migration checkpoint contradicts its sharded immutable authority');
+    }
+    return { ...checkpoint, authority: plan };
+  }
+  if (checkpoint?.authority_format !== undefined || checkpoint?.authority_ref !== undefined ||
+      !checkpoint?.authority) throw new Error('Unsupported migration checkpoint authority format');
+  // Historical inline authority remains an explicitly distinct format.
+  return checkpoint;
+}
+
 function ensureDurableDirectory(directory, mode = 0o700) {
   const missing = [];
   let current = path.resolve(directory);
@@ -326,6 +348,7 @@ const RECOVERY_PROGRESS_SCHEMA_VERSION = 1;
 const RECOVERY_IMPLEMENTATION_PATHS = Object.freeze([
   "scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs",
   "scripts/backup_r2/lib/observation_history_migration_v3.mjs",
+  "scripts/backup_r2/lib/observation_history_migration_plan_store.mjs",
   "scripts/index_v3_migration/index_v3_migration.sh",
   "scripts/index_v3_migration/recovery_journal_authority.mjs",
   "scripts/backup_r2/lib/observation_history_migration_worker_pool.mjs",
@@ -920,7 +943,7 @@ export function initializeObservationHistoryV3RecoveryProgress({
   repositoryRoot,
   retainedStagingRoot = `${path.resolve(checkpointPath)}.staging`,
 } = {}) {
-  const checkpoint = readJsonFile(checkpointPath, "migration checkpoint");
+  const checkpoint = readMigrationCheckpoint(checkpointPath);
   const context = buildObservationHistoryV3RecoveryProgressContext({
     checkpointPath,
     checkpoint,
@@ -1105,6 +1128,32 @@ function summaryForPlan(plan) {
     rollback_preflight: plan.rollback_preflight,
     blockers: plan.blockers,
     mutation_allowed: plan.mutation_allowed,
+  };
+}
+
+function compactSideBySidePlanSummary(plan) {
+  const blockers = boundedReportList((plan.blockers || []).map(compactReportString));
+  return {
+    schema_version: plan.schema_version,
+    kind: 'uk_aq_observation_history_v3_migration_plan_summary',
+    migration_run_id: plan.migration_run_id,
+    transition: plan.transition,
+    plan_sha256: plan.plan_sha256,
+    environment: plan.environment,
+    target: plan.target,
+    source_root: { key: plan.inventory.root_manifest.key,
+      byte_size: plan.inventory.root_manifest.byte_size,
+      sha256: plan.inventory.root_manifest.sha256,
+      content_hash: plan.inventory.root_manifest.payload.content_hash },
+    estimated: plan.estimated,
+    source_observation_content_hash_provenance_counts: plan.source_observation_content_hash_provenance_counts,
+    source_manifest_reference_provenance_counts: plan.source_manifest_reference_provenance_counts,
+    empty_source_connector_count: plan.empty_source_connector_count,
+    writer_freeze_plan: plan.writer_freeze_plan,
+    blockers: blockers.entries,
+    blocker_count: blockers.total_count,
+    blockers_omitted: blockers.omitted_count,
+    complete_plan_details_excluded: true,
   };
 }
 
@@ -1884,7 +1933,11 @@ function buildR2Adapters({
       if (recoveryProgress) return recoveryProgress.persistCheckpoint(checkpoint, delta);
       if (!freshJournal) return atomicWriteJson(checkpointOut, checkpoint);
       if (fs.existsSync(checkpointOut)) throw new Error('Fresh immutable checkpoint already exists');
-      atomicWriteJson(checkpointOut, checkpoint);
+      const authorityRef = persistShardedMigrationPlan(`${path.resolve(checkpointOut)}.authority`, checkpoint.authority);
+      if (authorityRef.full_plan_sha256 !== checkpoint.authority_sha256) throw new Error('Persisted checkpoint plan identity differs');
+      readShardedMigrationPlan(authorityRef);
+      atomicWriteJson(checkpointOut, { ...checkpoint, authority: undefined,
+        authority_format: authorityRef.format, authority_ref: authorityRef });
       recoveryProgress = buildObservationHistoryV3RecoveryProgressContext({ checkpointPath: checkpointOut, checkpoint, repositoryRoot, create: true });
     },
     stageUnit: async ({ unitId, intents }) => {
@@ -2083,7 +2136,7 @@ async function runSideBySideMigrationOperator({
     readJsonFile(args.writerLimitsPath, "writer limits"), "side-by-side writer limits",
   );
   const checkpointPath = args.checkpointOut || args.checkpointIn;
-  const checkpointArtifacts = checkpointPath ? ["", ".staging", ".recovery", ".publication.json"]
+  const checkpointArtifacts = checkpointPath ? ["", ".authority", ".staging", ".recovery", ".publication.json"]
     .map((suffix) => `${path.resolve(checkpointPath)}${suffix}`) : [];
   const reportPath = path.resolve(args.reportOut);
   if (reportPath === path.resolve(args.writerLimitsPath) || checkpointArtifacts.some((entry) =>
@@ -2093,7 +2146,7 @@ async function runSideBySideMigrationOperator({
   if (new Set(["migrate", "locked-clean-build"]).has(args.mode) && !args.checkpointIn && checkpointArtifacts.some((entry) => fs.existsSync(entry))) {
     throw new Error("Fresh migration cannot overwrite checkpoint artifacts; use --checkpoint-in to resume");
   }
-  const completePlanPath = args.mode === "locked-clean-build" ? `${reportPath}.complete-plan.json` : null;
+  const completePlanPath = args.mode === "locked-clean-build" ? `${reportPath}.complete-plan` : null;
   const resultEvidencePath = completePlanPath ? `${reportPath}.result-evidence.json` : null;
   const approvalPath = args.postPlanApprovalFile ? path.resolve(args.postPlanApprovalFile) : null;
   if (completePlanPath && (fs.existsSync(completePlanPath) || fs.existsSync(resultEvidencePath) ||
@@ -2130,6 +2183,7 @@ async function runSideBySideMigrationOperator({
   let planningAdmission = null;
   let initialSourceRoot = null;
   let postPlanApproval = null;
+  let completePlanReference = null;
   const phaseDurations = {};
   const r2AdapterCalls = { reads: { attempted: 0, completed: 0, failed: 0, body_bytes: 0 },
     writes: { attempted: 0, completed: 0, failed: 0, body_bytes: 0 } };
@@ -2164,7 +2218,7 @@ async function runSideBySideMigrationOperator({
     if (runnerPermit && !args.checkpointIn) planningAdmission = await inspectEmptyV3Target({ listObjects: baseAdapters.listObjects, assertLockHeld, phase: 'plan' });
     if (args.checkpointIn) {
       assertLockHeld();
-      checkpoint = readJsonFile(args.checkpointIn, "side-by-side checkpoint");
+      checkpoint = readMigrationCheckpoint(args.checkpointIn);
       plan = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
       assertSideBySideMigrationPlan(plan);
       if (!runnerPermit && plan.plan_identity.runner_policy?.runner_kind === 'gcp') throw new Error('GCP checkpoint recovery requires the metadata-admitted GCP entrypoint');
@@ -2197,10 +2251,12 @@ async function runSideBySideMigrationOperator({
       runner: { ...(runnerPermit || { runner_kind: 'local', runner_profile: 'local-conservative' }),
         partition_concurrency: args.partitionConcurrency, publication_concurrency: args.publicationConcurrency,
         inventory_concurrency: args.inventoryConcurrency,
+        legacy_hash_concurrency: runnerPermit ? 4 : 1,
+        legacy_hash_limits: LEGACY_HASH_DERIVATION_LIMITS,
         source_in_flight_bytes: migrationConcurrencyLimits(runnerPermit).sourceInFlightBytes,
         publication_in_flight_bytes: migrationConcurrencyLimits(runnerPermit).publicationInFlightBytes },
       planning_clean_target_admission: planningAdmission });
-    process.stderr.write(`V3 migration: runner=${runnerPermit?.runner_profile || 'local-conservative'} inventory_concurrency=${args.inventoryConcurrency} partition_concurrency=${args.partitionConcurrency} publication_concurrency=${args.publicationConcurrency}\n`);
+    process.stderr.write(`V3 migration: runner=${runnerPermit?.runner_profile || 'local-conservative'} inventory_concurrency=${args.inventoryConcurrency} legacy_hash_concurrency=${runnerPermit ? 4 : 1} partition_concurrency=${args.partitionConcurrency} publication_concurrency=${args.publicationConcurrency}\n`);
     if (checkpoint) {
       const hasJournal = fs.existsSync(recoveryProgressPaths(args.checkpointIn).manifest);
       if (!hasJournal && checkpoint.progress_format === "authenticated-journal-v1") throw new Error("Authenticated fresh-run journal is missing");
@@ -2225,22 +2281,23 @@ async function runSideBySideMigrationOperator({
     let result;
     let reportPlan = plan;
     if (args.mode === "plan") {
-      result = { ...summaryForPlan(plan), ok: true, status: "planned", dry_run: true, mutation_calls: 0 };
+      result = { ...compactSideBySidePlanSummary(plan), ok: true, status: "planned", dry_run: true, mutation_calls: 0 };
     } else if (args.mode === "locked-clean-build") {
       phaseDurations.planning_ms = Date.now() - Date.parse(startedAt);
       assertLockHeld();
-      atomicWriteJson(completePlanPath, recoveryEnvelope("uk_aq_observation_history_v3_complete_locked_plan", plan));
+      completePlanReference = persistShardedMigrationPlan(completePlanPath, plan);
+      readShardedMigrationPlan(completePlanReference);
       if (plan.mutation_allowed !== true || !Array.isArray(plan.blockers) || plan.blockers.length) {
         throw new Error("Combined plan has blockers or lacks mutation authority");
       }
-      const planPublishedAt = fs.statSync(completePlanPath).mtimeMs;
+      const planPublishedAt = fs.statSync(completePlanReference.master_path).mtimeMs;
       const approvalWaitStarted = Date.now();
       const approvalDeadline = approvalWaitStarted + POST_PLAN_APPROVAL_WAIT_MS;
-      atomicWriteJson(args.reportOut, { result: { ...summaryForPlan(plan), ok: true,
+      atomicWriteJson(args.reportOut, { result: { ...compactSideBySidePlanSummary(plan), ok: true,
         status: "awaiting_post_plan_approval", dry_run: true, mutation_calls: 0 },
         audit: { runner: plan.runner, planning_clean_target_admission: plan.planning_clean_target_admission,
           global_lock: lockAuditIdentity(assertLockHeld()),
-          complete_plan_path: completePlanPath, complete_plan_sha256: sha256Hex(stableMigrationJson(plan)),
+          complete_plan_path: completePlanReference.master_path, complete_plan_sha256: completePlanReference.full_plan_sha256,
           approval_path: approvalPath, approval_expires_at_utc: new Date(approvalDeadline).toISOString() } });
       postPlanApproval = await waitForPostPlanApproval({ plan, approvalPath, planPublishedAt, deadline: approvalDeadline, assertLockHeld });
       phaseDurations.approval_wait_ms = Date.now() - approvalWaitStarted;
@@ -2250,9 +2307,8 @@ async function runSideBySideMigrationOperator({
           args.apply !== true || args.writersFrozen !== true) {
         throw new Error("Post-plan approval or frozen-writer/apply intent changed before mutation");
       }
-      const durablePlan = readRecoveryEnvelope(completePlanPath,
-        "uk_aq_observation_history_v3_complete_locked_plan");
-      if (stableMigrationJson(durablePlan.payload) !== stableMigrationJson(plan)) {
+      const durablePlan = readShardedMigrationPlan(completePlanReference);
+      if (durablePlan.full_plan_sha256 !== sha256StableMigrationJson(plan)) {
         throw new Error('Persisted complete plan changed before approved migration');
       }
       await verifySideBySideSourceRoot({ plan, getObject: adapters.getObject });
@@ -2288,6 +2344,19 @@ async function runSideBySideMigrationOperator({
         publicationConcurrency: args.publicationConcurrency, partitionConcurrency: args.partitionConcurrency, runnerPermit,
       });
     }
+    if (completePlanReference) {
+      if (sha256StableMigrationJson(plan) !== completePlanReference.full_plan_sha256 ||
+          readShardedMigrationPlan(completePlanReference).full_plan_sha256 !== completePlanReference.full_plan_sha256) {
+        throw new Error('Approved complete plan authority changed during migration');
+      }
+      const durableCheckpoint = readMigrationCheckpoint(args.checkpointOut);
+      const { post_plan_approval: checkpointApproval, ...checkpointPlan } = durableCheckpoint.authority;
+      if (sha256StableMigrationJson(checkpointPlan) !== completePlanReference.full_plan_sha256 ||
+          stableMigrationJson(checkpointApproval) !== stableMigrationJson(postPlanApproval) ||
+          durableCheckpoint.plan_sha256 !== plan.plan_sha256) {
+        throw new Error('Immutable checkpoint authority differs from the approved complete plan');
+      }
+    }
     const finalRootStarted = Date.now();
     const sourceRoot = await verifySideBySideSourceRoot({ plan, getObject: adapters.getObject });
     if (completePlanPath) phaseDurations.final_source_root_ms = Date.now() - finalRootStarted;
@@ -2303,6 +2372,8 @@ async function runSideBySideMigrationOperator({
     output.audit.runner = { ...(runnerPermit || { runner_kind: 'local', runner_profile: 'local-conservative' }),
       inventory_concurrency: args.inventoryConcurrency, partition_concurrency: args.partitionConcurrency,
       publication_concurrency: args.publicationConcurrency,
+      legacy_hash_concurrency: runnerPermit ? 4 : 1,
+      legacy_hash_limits: LEGACY_HASH_DERIVATION_LIMITS,
       source_in_flight_bytes: migrationConcurrencyLimits(runnerPermit).sourceInFlightBytes,
       publication_in_flight_bytes: migrationConcurrencyLimits(runnerPermit).publicationInFlightBytes };
     output.audit.global_lock = lockAuditIdentity(assertLockHeld());
@@ -2310,7 +2381,9 @@ async function runSideBySideMigrationOperator({
     output.audit.initial_runner = plan.runner;
     output.audit.planning_clean_target_admission = plan.planning_clean_target_admission;
     if (completePlanPath) {
-      output.audit.complete_plan_sha256 = sha256Hex(stableMigrationJson(plan));
+      output.audit.complete_plan_path = completePlanReference.master_path;
+      output.audit.complete_plan_master_sha256 = completePlanReference.master_sha256;
+      output.audit.complete_plan_sha256 = sha256StableMigrationJson(plan);
       output.audit.reviewed_writer_git_sha = plan.target_writer_git_sha;
       output.audit.post_plan_approval = postPlanApproval;
       output.audit.phase_durations_ms = { ...phaseDurations, ...(result.phase_durations_ms || {}) };
@@ -2351,7 +2424,7 @@ async function runSideBySideMigrationOperator({
         plan_sha256: plan?.plan_sha256 || null, blockers: plan?.blockers || [],
         error: error.message, failure_evidence: migrationFailureEvidence(error), runtime_switch_performed: false },
       audit: { runner: runnerPermit, post_plan_approval: postPlanApproval,
-        complete_plan_path: completePlanPath, phase_durations_ms: phaseDurations,
+        complete_plan_path: completePlanPath ? path.join(completePlanPath, 'master.json') : null, phase_durations_ms: phaseDurations,
         r2_adapter_calls: r2AdapterCalls,
         clean_target_admission: error.clean_target_admission || checkpoint?.clean_target_admission || null },
     });
@@ -2382,7 +2455,7 @@ export async function runObservationHistoryMigrationV3({
     });
   }
   if (args.checkpointIn && ["rollback", "rollback-plan"].includes(args.mode) &&
-      readJsonFile(args.checkpointIn, "migration checkpoint")?.authority?.generation_topology === SIDE_BY_SIDE_TOPOLOGY) {
+      readMigrationCheckpoint(args.checkpointIn)?.authority?.generation_topology === SIDE_BY_SIDE_TOPOLOGY) {
     throw new Error("Side-by-side rollback selects intact v2; Dropbox restore and historical runtime deployment are not permitted for this checkpoint");
   }
   if (args.mode === "migrate" && !args.checkpointIn && (!args.operatorAuthorityFile || !args.v2RuntimeRollbackRecord)) throw new Error("Fresh migration requires --operator-authority-file and --v2-runtime-rollback-record");
@@ -2522,7 +2595,7 @@ export async function runObservationHistoryMigrationV3({
     }
   }
   let checkpoint = args.checkpointIn
-    ? readJsonFile(args.checkpointIn, "migration checkpoint")
+    ? readMigrationCheckpoint(args.checkpointIn)
     : null;
   let recoveryProgress = null;
   if (checkpoint && args.mode === "migrate") {

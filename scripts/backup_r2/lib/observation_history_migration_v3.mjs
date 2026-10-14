@@ -1,4 +1,5 @@
 import { MigrationWorkerPool } from './observation_history_migration_worker_pool.mjs';
+import { sha256StableMigrationJson } from './observation_history_migration_plan_store.mjs';
 import { settledMigrationBatches, settledWeightedMigrationBatches, exactPublicationEvidence, migrationFailure, migrationBatchFailures, throwMigrationBatchFailures, withMigrationBatchEvidence, migrationFailureEvidence } from './observation_history_migration_concurrency.mjs';
 import { migrationConcurrencyLimits, validateMigrationConcurrency, inspectEmptyV3Target, validateCleanStartEvidence } from './observation_history_migration_gcp.mjs';
 import { inventorySideBySideBindings } from "./observation_history_generation_bindings.mjs";
@@ -89,6 +90,12 @@ import {
 import { compressors } from "./uk_aq_parquet_dependencies.mjs";
 import { buildObservationsManifestHierarchy } from "../uk_aq_observations_manifest_hierarchy.mjs";
 export const OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION = 1;
+export const LEGACY_HASH_DERIVATION_LIMITS = Object.freeze({
+  max_rows_per_partition: 262144,
+  max_compressed_bytes_per_partition: 64 * 1024 ** 2,
+  max_uncompressed_bytes_per_partition: 128 * 1024 ** 2,
+  estimated_decoded_bytes_per_row: 256,
+});
 export const OBSERVATION_HISTORY_V3_MIGRATION_TRANSITIONS = Object.freeze({
   "v2-to-v3": Object.freeze({
     kind: "v2-to-v3",
@@ -1134,7 +1141,16 @@ async function deriveLegacyObservationContentHashMetadata({
   scope,
   sosConnectorId,
 }) {
+  const maxRows = LEGACY_HASH_DERIVATION_LIMITS.max_rows_per_partition;
+  const maxCompressedBytes = LEGACY_HASH_DERIVATION_LIMITS.max_compressed_bytes_per_partition;
+  const maxUncompressedBytes = LEGACY_HASH_DERIVATION_LIMITS.max_uncompressed_bytes_per_partition;
+  const compressedBytes = manifest.files.reduce((sum, file) => sum + file.bytes, 0);
+  if (!Number.isSafeInteger(manifest.row_count) || manifest.row_count > maxRows ||
+      !Number.isSafeInteger(compressedBytes) || compressedBytes > maxCompressedBytes) {
+    throw new Error(`Legacy partition exceeds bounded hash derivation limits: ${partitionIdentity(scope)}`);
+  }
   const rows = [];
+  let decodedBytes = 0;
   for (const file of [...manifest.files].sort((left, right) =>
     String(left.key).localeCompare(String(right.key))
   )) {
@@ -1147,11 +1163,17 @@ async function deriveLegacyObservationContentHashMetadata({
       liveObject: object,
       objectKey: file.key,
     });
-    rows.push(...await readCanonicalObservationRowsFromParquetBytes({
+    const decoded = await readCanonicalObservationRowsFromParquetBytes({
       body: object.body,
       connectorId: scope.connector_id,
       sosConnectorId,
-    }));
+      maxRows: maxRows - rows.length,
+      onMetadata: ({ uncompressedBytes }) => {
+        decodedBytes += uncompressedBytes;
+        if (decodedBytes > maxUncompressedBytes) throw new Error(`Legacy decoded Parquet budget exceeded: ${partitionIdentity(scope)}`);
+      },
+    });
+    for (const row of decoded) rows.push(row);
   }
   assertRowsMatchSourcePartition(rows, { scope, manifest });
   const metadata = contentHashMetadata(computeObservationContentHash(rows));
@@ -1236,6 +1258,8 @@ export async function readCanonicalObservationRowsFromParquetBytes({
   body,
   connectorId,
   sosConnectorId = 1,
+  maxRows = null,
+  onMetadata = null,
 }) {
   const bytes = exactBuffer(body, "observation Parquet");
   const file = new Uint8Array(bytes).slice().buffer;
@@ -1243,6 +1267,20 @@ export async function readCanonicalObservationRowsFromParquetBytes({
   const rowCount = Number(metadata.num_rows || 0);
   if (!Number.isSafeInteger(rowCount) || rowCount <= 0) {
     throw new Error("Canonical observation Parquet must contain rows");
+  }
+  if (maxRows !== null) {
+    if (!Number.isSafeInteger(maxRows) || rowCount > maxRows) throw new Error('Legacy Parquet decoded row budget exceeded');
+    let uncompressedBytes = 0;
+    for (const group of metadata.row_groups || []) for (const column of group.columns || []) {
+      const size = column.meta_data?.total_uncompressed_size;
+      if (size === undefined || BigInt(size) < 0n || BigInt(size) > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error('Legacy Parquet uncompressed size is missing or invalid');
+      }
+      uncompressedBytes += Number(size);
+      if (!Number.isSafeInteger(uncompressedBytes)) throw new Error('Legacy Parquet uncompressed size overflow');
+    }
+    if (!uncompressedBytes) throw new Error('Legacy Parquet uncompressed size is missing');
+    onMetadata?.({ rowCount, uncompressedBytes });
   }
   const schemaColumns = new Set(
     parquetSchema(metadata).children.map((column) => String(column.element.name)),
@@ -1521,10 +1559,14 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
   v2LatestKey = DEFAULT_V2_LATEST_KEY,
   sosConnectorId = 1,
   inventoryConcurrency = 1,
+  legacyHashConcurrency = 1,
+  legacyHashInFlightBytes = 128 * 1024 ** 2,
   onProgress = null,
 }) {
   if (typeof getR2Object !== "function") throw new TypeError("Canonical inventory requires getR2Object adapter");
   if (!Number.isInteger(inventoryConcurrency) || inventoryConcurrency < 1 || inventoryConcurrency > 64) throw new Error("Invalid inventory concurrency");
+  if (!Number.isInteger(legacyHashConcurrency) || legacyHashConcurrency < 1 || legacyHashConcurrency > 4 ||
+      !Number.isSafeInteger(legacyHashInFlightBytes) || legacyHashInFlightBytes < 1) throw new Error('Invalid legacy hash derivation profile');
   const prefix = normalizePrefix(observationsPrefix, "observations prefix");
   const rootKey = buildR2HistoryV2ObservationsRootManifestKey(prefix);
   const rootObject = await getRequiredObject(getR2Object, rootKey, "R2");
@@ -1618,17 +1660,36 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
     return { scope: { day_utc: connector.day_utc, connector_id: connector.connector_id, pollutant_code: pollutantCode },
       payload, identity, selfHash, sourceReference };
   });
-  // Rare legacy hashless partitions require full decode. Keep those bodies out
-  // of the concurrent manifest stage and derive their hashes one at a time.
+  // Only genuine hashless legacy partitions enter the bounded decode stage.
+  // Results are assigned by their original canonical position, never arrival.
   const partitions = [];
   const partitionProgress = createMigrationProgressReporter({ label: "V3 inventory: partition identities", total: pollutantResults.length });
-  const sourceHashes = [];
+  const sourceHashes = new Array(pollutantResults.length);
+  const legacyTasks = [];
+  let completedHashes = 0;
   try {
-    for (const { scope, payload, identity, selfHash, sourceReference } of pollutantResults) {
-      const effectiveHash = await effectiveSourceObservationContentHash({ getR2Object, getR2ObjectBounded,
-        manifest: payload, scope, sosConnectorId });
-      sourceHashes.push(effectiveHash);
-      partitionProgress.report(sourceHashes.length);
+    for (const [position, { scope, payload, identity }] of pollutantResults.entries()) {
+      if (isGenuineLegacyHashlessObservationManifest(payload)) {
+        legacyTasks.push({ position, scope, payload, manifest_key: identity.key });
+      } else {
+        sourceHashes[position] = await effectiveSourceObservationContentHash({ getR2Object, getR2ObjectBounded,
+          manifest: payload, scope, sosConnectorId });
+        partitionProgress.report(++completedHashes);
+      }
+    }
+    for await (const batch of settledWeightedMigrationBatches(legacyTasks, legacyHashConcurrency,
+      legacyHashInFlightBytes, ({ payload }) => {
+        if (!Number.isSafeInteger(payload.row_count) || payload.row_count > LEGACY_HASH_DERIVATION_LIMITS.max_rows_per_partition) throw new Error('Legacy hash partition exceeds decoded row budget');
+        const compressed = payload.files.reduce((sum, file) => sum + file.bytes, 0);
+        if (!Number.isSafeInteger(compressed) || compressed > LEGACY_HASH_DERIVATION_LIMITS.max_compressed_bytes_per_partition) throw new Error('Legacy hash partition exceeds compressed byte budget');
+        return compressed + payload.row_count * LEGACY_HASH_DERIVATION_LIMITS.estimated_decoded_bytes_per_row;
+      }, async ({ scope, payload }) => effectiveSourceObservationContentHash({ getR2Object, getR2ObjectBounded,
+        manifest: payload, scope, sosConnectorId }))) {
+      for (const entry of batch) if (entry.result.status === 'fulfilled') {
+        sourceHashes[entry.item.position] = entry.result.value;
+        completedHashes += 1;
+      }
+      partitionProgress.report(completedHashes);
     }
     partitionProgress.finish();
   } catch (error) { partitionProgress.finish('failed'); throw error; }
@@ -2676,7 +2737,7 @@ export async function buildObservationHistoryV3MigrationPlan({
     mode: "plan",
     migration_run_id: runId,
     transition,
-    plan_sha256: sha256Hex(stableMigrationJson(planIdentityPayload)),
+    plan_sha256: sha256StableMigrationJson(planIdentityPayload),
     plan_identity: Object.freeze(structuredClone(planIdentityPayload)),
     environment,
     target: Object.freeze({
@@ -2962,10 +3023,10 @@ export function buildObservationHistoryV3MigrationPlanFromCheckpoint({
     stableMigrationJson(checkpoint.transition) !==
       stableMigrationJson(authority.transition) ||
     authority.plan_sha256 !==
-      sha256Hex(stableMigrationJson(authority.plan_identity)) ||
+      sha256StableMigrationJson(authority.plan_identity) ||
     stableMigrationJson(authority.plan_identity?.transition) !==
       stableMigrationJson(authority.transition) ||
-    checkpoint.authority_sha256 !== sha256Hex(stableMigrationJson(authority)) ||
+    checkpoint.authority_sha256 !== sha256StableMigrationJson(authority) ||
     !transition ||
     authority.transition.source_index_generation !==
       transition.source_index_generation ||
@@ -3208,7 +3269,7 @@ function emptyCheckpoint(plan) {
     transition: plan.transition,
     plan_sha256: plan.plan_sha256,
     authority,
-    authority_sha256: sha256Hex(stableMigrationJson(authority)),
+    authority_sha256: sha256StableMigrationJson(authority),
     pre_state: {
       canonical_root_key: plan.inventory.root_manifest.key,
       canonical_root_content_hash: plan.inventory.root_manifest.payload.content_hash,
@@ -5148,7 +5209,7 @@ export function assertSideBySideMigrationPlan(plan) {
       plan.transition?.kind !== "v2-to-v3" ||
       plan.inventory?.observations_prefix !== getObservationHistoryGeneration("v2").observations_prefix ||
       plan.plan_identity?.target_observations_prefix !== plan.target_observations_prefix ||
-      plan.plan_sha256 !== sha256Hex(stableMigrationJson(plan.plan_identity))) {
+      plan.plan_sha256 !== sha256StableMigrationJson(plan.plan_identity)) {
     throw new Error("Migration requires fresh authenticated side-by-side authority; in-place v3 authority is retired");
   }
   const identity = plan.plan_identity;
@@ -5264,7 +5325,10 @@ export async function buildObservationHistorySideBySideMigrationPlan({
     observationsPrefix: source.observations_prefix,
     v2IndexRoot: source.observations_timeseries_index_prefix,
     v2LatestKey: source.observations_timeseries_latest_key,
-    sosConnectorId, inventoryConcurrency, onProgress: progress.report,
+    sosConnectorId, inventoryConcurrency,
+    legacyHashConcurrency: runnerPermit ? 4 : 1,
+    legacyHashInFlightBytes: migrationConcurrencyLimits(runnerPermit).sourceInFlightBytes,
+    onProgress: progress.report,
   });
   progress.finish();
   const sourceIdentities = new Map();
@@ -5313,7 +5377,7 @@ export async function buildObservationHistorySideBySideMigrationPlan({
     kind: "uk_aq_observation_history_v3_migration_plan", mode: "plan",
     generation_topology: SIDE_BY_SIDE_TOPOLOGY,
     migration_run_id: runId, transition, environment,
-    plan_identity: planIdentity, plan_sha256: sha256Hex(stableMigrationJson(planIdentity)),
+    plan_identity: planIdentity, plan_sha256: sha256StableMigrationJson(planIdentity),
     target_observations_prefix: target.observations_prefix,
     target_writer_git_sha: targetWriterGitSha,
     target: { history_version: "v2", storage_generation: "v3", index_generation: "v3",

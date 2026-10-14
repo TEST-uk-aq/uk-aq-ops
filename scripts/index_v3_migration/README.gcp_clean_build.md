@@ -80,14 +80,22 @@ needed. The existing session-capable database connection is used only for the lo
 
 ## Scheduling and recovery
 
-Fresh runs now persist `checkpoint.json` once with
-`progress_format: authenticated-journal-v1`, then use the existing authenticated
+Fresh runs now persist `checkpoint.json` once with a versioned
+`authority_format: uk_aq_migration_plan_shards_v1` reference to the complete
+immutable plan under `checkpoint.json.authority/`. The checkpoint retains
+`progress_format: authenticated-journal-v1`, then uses the existing authenticated
 `.recovery/manifest.json`, `head.json` and chained `entries/` format from the start.
 Progress updates identify only changed records. No growing checkpoint or
 `.publication.json` is rewritten per object. Files and parent directories are
 fsynced before durability is returned. Journal writes remain serial; failed
 persistence poisons further appends. Publication batches are journaled in chunks
 of at most 16, even when 64 or 96 objects are in flight.
+
+The admitted GCP profile derives genuine legacy hashless partition content
+hashes with at most four concurrent partitions. Each derivation is bounded by
+64 MiB compressed Parquet, 128 MiB Parquet-declared uncompressed bytes and
+262,144 decoded rows; the shared source in-flight budget may reduce a batch
+below four. The local runner retains one-at-a-time derivation.
 
 Binding ranges are read concurrently, then leaves are read concurrently within
 immutable range order. Publication has barriers: all leaves durable, then
@@ -217,9 +225,11 @@ ps -p "$(cat "$migration_pid_file")" -o pid,etime,stat,cmd
 tail -f "$migration_log"
 ```
 
-The process durably writes `locked-clean-build.json.complete-plan.json` and a
-review summary with `status=awaiting_post_plan_approval`, then holds the global
-lock for at most one hour. Review the complete plan, plan SHA, GCE identity,
+The process durably writes a bounded authenticated plan shard directory at
+`locked-clean-build.json.complete-plan/` with `master.json`, plus a compact
+review summary with `status=awaiting_post_plan_approval`. The master binds the
+ordered shard identities and complete-plan SHA. The process holds the global
+lock for at most one hour. Review the summary, exact plan SHA, GCE identity,
 writer freeze and clean-target evidence. Only then create the approval file with
 mode 0600 and the exact line printed in the log:
 
