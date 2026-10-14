@@ -378,6 +378,12 @@ function recoveryImplementationIdentity(repositoryRoot, runner = null, environme
     throw new Error("Current recovery repository HEAD is unavailable");
   }
   const paths = [...RECOVERY_IMPLEMENTATION_PATHS];
+  // The retired in-place shell executor is historical recovery authority only.
+  // New authenticated-journal v2-to-v3 runs do not execute or depend on it.
+  if (runner) {
+    const legacyPath = 'scripts/index_v3_migration/index_v3_migration.sh';
+    paths.splice(paths.indexOf(legacyPath), 1);
+  }
   if (runner?.runner_kind === 'gcp') {
     paths.push('scripts/backup_r2/lib/observation_history_migration_bounded_r2.mjs');
   }
