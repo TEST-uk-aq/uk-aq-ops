@@ -152,6 +152,12 @@ mysql --login-path=local-admin --database=uk_aq_gcp_billing_test < "$SCHEMA/sche
 The collector has no DDL path. Grants restrict each table, with no global or
 LIVE permissions. Do not reuse an administrator credential for collection.
 
+The collector's MySQL connection uses a session-only 8 MiB `sort_buffer_size`
+with `max_sort_length=65536` so service/SKU summaries with grouped and sorted
+TEXT descriptions can complete on MySQL 9.x. This does **not** change the
+server-global sort buffer, any other UK AQ MySQL connection, billing grouping
+fields or persisted monetary values.
+
 Run an explicitly authorised real TEST backfill batch:
 
 ```bash
