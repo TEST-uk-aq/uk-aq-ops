@@ -37,7 +37,11 @@ function embeddedObservedProperty(row) {
   return { phenomenon, observedProperty };
 }
 
-export async function resolveAuthoritativeTimeseriesIdentity(request, env, { timeoutMs = null, maxResponseBytes = null } = {}) {
+export async function resolveAuthoritativeTimeseriesIdentity(request, env, {
+  timeoutMs = null,
+  maxResponseBytes = null,
+  includeLastValueAt = false,
+} = {}) {
   const timeseriesId = positiveInteger(request?.timeseriesId);
   const suppliedConnectorId = request?.connectorId == null ? null : positiveInteger(request.connectorId);
   const requestedPollutant = normalizePollutantCode(request?.pollutant);
@@ -52,7 +56,7 @@ export async function resolveAuthoritativeTimeseriesIdentity(request, env, { tim
   const endpoint = new URL(`${normalizeBaseUrl(supabaseUrl)}/rest/v1/timeseries`);
   endpoint.searchParams.set(
     "select",
-    "id,station_id,connector_id,phenomenon_id,ended_at,phenomena(connector_id,observed_property_id,observed_properties(code))",
+    `id,station_id,connector_id,phenomenon_id,ended_at${includeLastValueAt ? ",last_value_at" : ""},phenomena(connector_id,observed_property_id,observed_properties(code))`,
   );
   endpoint.searchParams.set("id", `eq.${timeseriesId}`);
   endpoint.searchParams.set("limit", "1");
@@ -133,7 +137,7 @@ export async function resolveAuthoritativeTimeseriesIdentity(request, env, { tim
     fail(409, "station_history_connector_mismatch", `supplied_${suppliedConnectorId}_authoritative_${connectorId}`);
   }
 
-  return {
+  const identity = {
     source: IDENTITY_SOURCE,
     timeseriesId,
     stationId,
@@ -142,6 +146,11 @@ export async function resolveAuthoritativeTimeseriesIdentity(request, env, { tim
     observedPropertyId,
     pollutant,
   };
+  if (includeLastValueAt) {
+    const lastValueAtMs = Date.parse(required(row.last_value_at));
+    identity.lastValueAt = Number.isFinite(lastValueAtMs) ? new Date(lastValueAtMs).toISOString() : null;
+  }
+  return identity;
 }
 
 export function publicTimeseriesIdentity(identity) {
