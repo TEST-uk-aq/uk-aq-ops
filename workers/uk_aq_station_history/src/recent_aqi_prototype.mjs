@@ -97,13 +97,11 @@ async function readRecentRows(env, timeseriesId, endpointMs, timeoutMs) {
   const { payload, bytes } = await readBoundedJson(response);
   const result = Array.isArray(payload) && payload.length === 1 ? payload[0] : null;
   if (!result || result.timeseries_id !== timeseriesId || !Array.isArray(result.data)
-    || result.count !== result.data.length || !Number.isFinite(Date.parse(result.start))
-    || Date.parse(result.start) > endpointMs - 24 * HOUR_MS
-    || !Number.isFinite(Date.parse(result.end)) || Date.parse(result.end) < endpointMs) {
+    || !Number.isInteger(result.count) || result.count !== result.data.length) {
     throw new Error("source_coverage_unverified");
   }
   if (result.data.length > MAX_INPUT_ROWS) throw new Error("input_row_limit_exceeded");
-  return { rows: result.data, bytes, rpcElapsedMs: Date.now() - startedMs, sourceEndUtc: new Date(result.end).toISOString() };
+  return { rows: result.data, bytes, rpcElapsedMs: Date.now() - startedMs };
 }
 
 function calculate(identity, endpointMs, sourceRows) {
@@ -118,11 +116,12 @@ function calculate(identity, endpointMs, sourceRows) {
       throw new Error("source_timestamp_invalid");
     }
     if (timestamp > endpointMs) { outsideRows += 1; continue; }
+    if (timestamp % HOUR_MS !== 0) throw new Error("source_timestamp_convention_unverified");
     const value = raw?.value === null || raw?.value === "" ? NaN : Number(raw?.value);
     if (!Number.isFinite(value) || value < 0) { invalidRows += 1; continue; }
-    // The represented hour is (n-1h,n]. Retain source timestamps and
-    // multiplicity; only the derived hourly input is averaged here.
-    const hour = Math.ceil(timestamp / HOUR_MS) * HOUR_MS;
+    // AURN source timestamps in this prototype must already identify the
+    // canonical hour-ending endpoint. No unapproved sub-hour bucketing.
+    const hour = timestamp;
     const previous = hours.get(hour) || { sum: 0, count: 0 };
     previous.sum += value;
     previous.count += 1;
@@ -189,12 +188,13 @@ export async function handleRecentAqiPrototype(request, env) {
       identity: { connector_id: identity.connectorId, station_id: identity.stationId, timeseries_id: identity.timeseriesId, pollutant: "pm25" },
       source: {
         mode: "ingestdb_only_uncommitted",
+        transport_ok: true,
+        bounded_query_complete: true,
         canonical_history_complete: false,
         response_complete: false,
         ingestdb_response_complete: true,
         partial_reasons: ["canonical_r2_not_read"],
         source_path: "uk_aq_public.uk_aq_timeseries_rpc",
-        source_end_utc: source.sourceEndUtc,
         context_start_exclusive_utc: new Date(parsed.endpointMs - 24 * HOUR_MS).toISOString(),
         context_end_inclusive_utc: new Date(parsed.endpointMs).toISOString(),
         raw_row_count: source.rows.length,
@@ -239,7 +239,7 @@ export async function handleRecentAqiPrototype(request, env) {
     });
   } catch (error) {
     const code = error instanceof Error ? error.message : "prototype_failed";
-    const known = new Set(["response_too_large", "response_missing", "source_config_missing", "source_http_failed", "source_coverage_unverified", "input_row_limit_exceeded", "source_timestamp_invalid"]);
+    const known = new Set(["response_too_large", "response_missing", "source_config_missing", "source_http_failed", "source_coverage_unverified", "input_row_limit_exceeded", "source_timestamp_invalid", "source_timestamp_convention_unverified"]);
     return fail(code === "response_too_large" || code === "input_row_limit_exceeded" ? 413 : code === "source_config_missing" ? 503 : 502, known.has(code) ? code : "prototype_upstream_or_identity_failed");
   }
 }

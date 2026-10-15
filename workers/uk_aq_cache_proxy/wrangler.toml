@@ -66,6 +66,7 @@ UK_AQ_COMPRESSED_CHART_ENABLED = "false"
 # - UK_AQ_TIMESERIES_STALE_IF_ERROR_SECONDS (optional; default 300)
 # - UK_AQ_STATION_HISTORY_STATION_SERIES_ENABLED (optional; default false)
 # - UK_AQ_RECENT_AQI_PROTOTYPE_ENABLED (optional; default false; TEST only)
+# - UK_AQ_RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN (optional TEST-only secret; at least 32 characters; missing fails closed)
 # - UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED (optional; default false)
 # - UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED (optional; default false; non-v2 only in phase 2)
 # - UK_AQ_STATION_HISTORY_STALE_FALLBACK_ENABLED (optional; default false)

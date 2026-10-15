@@ -100,8 +100,13 @@ variable or public pagination control.
 
 `GET /api/aq/recent-aqi-prototype` reaches the private
 `/v1/recent-aqi-prototype` Service Binding route through the authenticated
-cache proxy. It requires the normal origin and session cookie even when local
-development bypass is enabled. Both Workers require `UK_AQ_ENV_NAME=TEST` and
+cache proxy. It requires the normal allowed Origin, valid session cookie, and
+the dedicated `X-UK-AQ-Prototype-Operator-Token` header even when local
+development bypass is enabled. The cache proxy compares this header
+server-side against the TEST-only secret
+`UK_AQ_RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN` using timing-safe comparison; the
+secret must contain 32–512 characters. A missing or malformed configured
+secret fails closed before the Service Binding call. Both Workers require `UK_AQ_ENV_NAME=TEST` and
 `UK_AQ_RECENT_AQI_PROTOTYPE_ENABLED=true`; the private Worker additionally
 requires `UK_AQ_RECENT_AQI_PROTOTYPE_TIMESERIES_ID` to be one explicitly
 approved physical AURN PM2.5 timeseries ID. All values are absent or off by
@@ -120,9 +125,27 @@ This first experiment uses **IngestDB only** through the existing
 merged chart authority. It requests the 24 represented hours `(n-24h,n]`
 using `since_ts`, preserves individual source rows for the derived hourly
 means, and calls the shared AQI helper for rolling and index calculation.
+Source timestamps within the requested interval must already be exact UTC hour
+endpoints. Since the source contract does not establish an AURN sub-hour
+aggregation rule, any sub-hour row in that interval fails closed with
+`source_timestamp_convention_unverified`; no rounding or bucketing is applied.
 The RPC's seven-day label is only a lower-window safeguard; `since_ts` is the
-effective narrow filter. The RPC has no upper bound, so at most the hour after
-the requested endpoint can also be returned and is counted but excluded.
+effective narrow filter. RPC `start` and `end` metadata describe the requested
+window and are not used as proof of record coverage. The returned count must
+match the data array, and the 129th-row sentinel, response-byte cap, and
+identity checks must all pass before the result is marked as a complete
+bounded IngestDB query. At most the hour after the requested endpoint can also
+be returned; it is counted and excluded from calculation.
+
+In the response, `transport_ok` means the RPC returned a valid bounded JSON
+payload; `bounded_query_complete` and `ingestdb_response_complete` mean all
+eligible rows returned by the RPC fit within the query and byte limits. They
+do not establish that observations existed for every hour. `valid_hour_count`
+and `aqi.has_gap` describe observed valid hourly inputs, while
+`canonical_history_complete` and overall `response_complete` remain false
+because canonical R2 history is not read. Missing observation hours are gaps,
+not upstream errors. AQI calculation statuses independently report DAQI rolling
+window availability and current-hour EAQI availability.
 
 Fixed limits: one output endpoint, one physical timeseries, 24 hours of AQI
 input, 128 raw input rows (129th sentinel), 48 KiB observation response,

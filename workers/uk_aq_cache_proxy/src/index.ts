@@ -71,6 +71,7 @@ export interface Env {
   UK_AQ_WEBSITE_DEBUG_LOG_MAX_BODY_BYTES: unknown;
   UK_AQ_STATION_HISTORY_STATION_SERIES_ENABLED: unknown;
   UK_AQ_RECENT_AQI_PROTOTYPE_ENABLED: unknown;
+  UK_AQ_RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN?: unknown;
   UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED: unknown;
   UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED: unknown;
   UK_AQ_STATION_HISTORY_STALE_FALLBACK_ENABLED: unknown;
@@ -2927,6 +2928,14 @@ export default {
       if (String(env.UK_AQ_ENV_NAME) !== "TEST"
         || String(await readSecret(env.UK_AQ_RECENT_AQI_PROTOTYPE_ENABLED)) !== "true") {
         return makeErrorResponse(404, "route_not_found", requestOrigin, allowedOrigins);
+      }
+      const operatorToken = await readSecret(env.UK_AQ_RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN);
+      if (operatorToken.length < 32 || operatorToken.length > 512) {
+        return makeErrorResponse(503, "prototype_operator_auth_unavailable", requestOrigin, allowedOrigins);
+      }
+      const suppliedOperatorToken = request.headers.get("X-UK-AQ-Prototype-Operator-Token") || "";
+      if (!timingSafeEqual(operatorToken, suppliedOperatorToken)) {
+        return makeErrorResponse(403, "prototype_operator_auth_required", requestOrigin, allowedOrigins);
       }
       if (!env.STATION_HISTORY) return makeErrorResponse(503, "station_history_binding_unavailable", requestOrigin, allowedOrigins);
       const internalUrl = new URL(`https://station-history.internal/v1/recent-aqi-prototype${url.search}`);
