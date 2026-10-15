@@ -187,7 +187,17 @@ Run an explicitly authorised real TEST backfill batch:
 Each batch covers at most `maximum_days_per_batch` calendar dates (default 7),
 including empty days. The initial source scan pins an export-time cutoff and
 actual history bounds; successful batches advance only the cursor, with a null
-watermark until the complete initial history has published. Repeating after a
+watermark until the complete initial history has published. Once the final
+backfill batch publishes, the durable watermark is the **newest upstream
+`export_time` observed in the initial snapshot**, not the local backfill
+cutoff. This matters when Google is still populating historical exports:
+subsequent daily incremental runs can pick up newly delivered data carrying
+later `export_time` values, including usage dates beyond the initial snapshot.
+It does **not** guarantee detection of newly inserted rows carrying export
+timestamps older than that watermark. Once an in-progress initial export has
+caught up, reconcile the full source usage-date history by separate bounded
+`refresh --start DATE --end DATE` invocations for Standard and Detailed
+before treating historical totals as complete. Repeating a backfill after a
 failure resumes at the previous successful cursor. `backfill` refuses a source
 already completed; it never resets state silently.
 
