@@ -1,8 +1,9 @@
 # TEST GCP complete observation-history build
 
-This is an unaccepted implementation for the later clean TEST rehearsal. Do not
-transfer it into the checkout running the existing migration or its independent
-verification. No cloud action is part of development validation.
+The combined GCP clean-build path has accepted small-scope TEST build and
+independent-verification evidence dated 14 October 2026. This runbook describes
+that normal path and one separately gated exception for a specific failed LIVE
+run. It does not authorize a cloud operation or a code transfer.
 
 The normal runner remains
 `scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs`. Its partition
@@ -14,7 +15,8 @@ The GCP entrypoint is
 planner, CPU transformation, physical writer, publication schedulers, journal,
 lock coordinator and complete independent verifier. It adds admission and audit
 configuration, not another migration implementation. It addresses the slow serial
-partition transformation and large exact-leaf publication of the TEST rehearsal.
+partition transformation and large exact-leaf publication measured in earlier TEST
+migration work.
 
 The sole initial profile is `gcp-c4a-32`: GCE `c4a-standard-32`, Node `arm64`, at
 least 32 available CPUs and 120 GiB visible memory. Defaults are 32 concurrent inventory reads, 16 persistent partition workers and
@@ -152,7 +154,7 @@ checkpoint; old formats are not silently relabelled. A crash between base creati
 and journal initialization occurs before any staging or R2 mutation and fails
 closed on resume; preserve those incomplete artifacts for review. Existing
 historical journals retain their original implementation pin and may reject the
-changed implementation; this is not a conversion tool for the active rehearsal.
+changed implementation; this is not a checkpoint-conversion tool.
 
 An interrupted normal GCP clean build is abandoned. Manual cleanup of only the
 contracted v3 target namespaces, a proven empty target, a new run ID and work
@@ -161,12 +163,12 @@ resume implementation remains for exceptional, separately authorised engineering
 work; it is not the normal GCP restart path. A local/historical checkpoint cannot
 be admitted as a GCP clean-build checkpoint.
 
-## New combined mode — later isolated TEST acceptance only
+## Combined mode — accepted small-scope TEST path
 
 The currently serving TEST v3 target must not be cleared to make room for this
-rehearsal. Use only an expressly authorised isolated clean TEST destination and
-its verified TEST credentials. The reviewed checkout must be clean at the exact
-writer Git SHA; development changes in this working tree cannot yet be run.
+operation. Any future migration must use an expressly authorised isolated clean
+TEST destination and its verified TEST credentials. The reviewed checkout must
+be clean at the exact writer Git SHA.
 The TEST wrapper pins the TEST Cloudflare account and accepts the existing
 `uk-aq-history-cic-test` bucket or a separately provisioned
 `uk-aq-history-cic-test-*` bucket in that same account. A clean isolated bucket
@@ -414,18 +416,49 @@ checks for 13 modules, both CLI help paths and `git diff --check`. It proves det
 repair/exact replay and rejection of multiple tails, bad ancestry, corrupt
 payload, duplicate completion and unexpected filenames. Unrenamed scratch data
 preserves the previous state. It does not simulate a migration or contact
-R2/GCE. Real VM power-loss behavior, R2 reuse and performance still require the
-separately authorized interrupted clean TEST rehearsal before operational
-acceptance. No runtime configuration, deployment or database schema changes are
-introduced by this correction.
+R2/GCE. Real VM power-loss behavior, R2 reuse and performance are not proven by
+this check. The active GCP interruption/restart amendment explicitly retires an
+interrupted/resumed TEST rehearsal as a general acceptance requirement. The
+accepted uninterrupted small-scope TEST build and independent verification remain
+the normal migration acceptance evidence; an interruption follows the
+restart-from-clean procedure above.
 
 Normal LIVE clean-build admission remains unchanged and rejects `--checkpoint-in`.
 The code includes one separately gated exception for the failed run
-`live-v3-20261015T114250Z-e84f52a`; this is not permission to run it. It remains
-subject to real TEST acceptance, independent review and separate operational
-authorisation.
+`live-v3-20261015T114250Z-e84f52a`; this is not permission to run it. Deployment,
+preflight success and the approval file each remain distinct from separate
+operational authorisation. The existing accepted TEST clean-build evidence does
+not authorize this LIVE exception.
 
 ## Exceptional LIVE recovery
+
+### Acceptance boundaries
+
+**A. Normal GCP clean-build acceptance.** Use an empty admitted v3 target, plan,
+fresh complete migration and full independent verification. If interrupted,
+preserve evidence, clear only the approved partial v3 target after separate
+authorization, prove it empty and use a new run ID and work directory. Do not
+resume the partial run. No deliberately interrupted/resumed TEST rehearsal is a
+general acceptance gate.
+
+**B. This exceptional LIVE recovery.** It applies only to
+`live-v3-20261015T114250Z-e84f52a` and requires its immutable checkpoint and
+journal, the exact original writer identity, separately reviewed current
+recovery implementation, read-only preflight, single-use approval, frozen LIVE
+writers, the supervised global lock and full independent verification. Neither
+deployment nor preflight nor the approval file supplies the separate explicit
+LIVE operational authorization. Preserve the original checkpoint and journal;
+do not cut over runtime authority or release writers after recovery.
+
+**C. TEST acceptance of this exception.** These corrections do not change the
+normal mutating GCP migration path. The exact exception is intentionally bound to
+the one LIVE run, so an end-to-end invocation of that authority against TEST is
+not a valid test. The active interruption/restart amendment retires a deliberate
+interruption/resume rehearsal as a general gate; no such operation is technically
+required for these read-only preflight and report-status corrections. A future
+targeted interrupted TEST operation would need a concrete engineering reason and
+its own separate operator authorization. Do not run one as part of routine
+acceptance.
 
 This mechanism is restricted to the exact failed run, immutable plan, original
 writer commit and checkpoint authority recorded in
@@ -442,6 +475,32 @@ steps describe a guarded path for later review. They do not authorise
 LIVE recovery, and deployment of code does not provide that authorisation.
 
 ### A. Read-only recovery preflight
+
+In the same shell used for preflight and detached migration, append the reviewed
+64 GiB main V8 heap setting to any existing `NODE_OPTIONS`; this retains its
+other Node options and leaves the rest of the operator environment intact.
+Repeat this setup after reconnecting before another attempt:
+
+```bash
+migration_existing_node_options="${NODE_OPTIONS:-}"
+if [[ -n "$migration_existing_node_options" ]]; then
+  export NODE_OPTIONS="$migration_existing_node_options --max-old-space-size=65536"
+else
+  export NODE_OPTIONS="--max-old-space-size=65536"
+fi
+node --input-type=module -e '
+  import v8 from "node:v8";
+  const heapMiB = v8.getHeapStatistics().heap_size_limit / 1024 / 1024;
+  console.log(`Effective V8 heap limit: ${heapMiB.toFixed(0)} MiB`);
+  if (heapMiB < 65536) process.exitCode = 1;
+' || exit 1
+```
+
+Continue only if the assertion succeeds. It checks the effective V8 limit in
+the initial Node process. Keep the exported value for the `nohup` wrapper; the
+operator supervisor and lock-holding child inherit its environment. The setting
+remains in force through schedule reconstruction and recovery. This uses no
+global Node default or new startup infrastructure.
 
 Run preflight under the admitted GCE profile. Supply the established LIVE
 project, zone, writer-limits and work-directory values, with the original
@@ -463,12 +522,18 @@ node scripts/backup_r2/uk_aq_observation_history_migration_v3_live_gcp.mjs \
   --exceptional-recovery --recovery-approval-file "$WORK_DIR/recovery.approval"
 ```
 
-Preflight reads the local checkpoint, journal and epoch ledger and performs a
-read-only GET of the pinned LIVE v2 source-root object. It does not acquire the
-global migration lock, repair or append to the journal, write the epoch ledger,
-write R2, or start migration. It emits a blocker report on authentication
-failure and creates the approval phrase only when all pinned identities match.
-Stop on any blocker.
+Preflight reads the existing local checkpoint, recovery manifest, journal and
+epoch ledger and performs a read-only GET of the pinned LIVE v2 source-root
+object. It does not create operator-run directories or logs, acquire the global
+migration lock, create checkpoint/recovery directories or temporary journal
+files, repair or append to the journal, write the epoch ledger, change staging,
+write R2, or start migration. Its explicitly requested report is its only file
+output. Missing checkpoint, manifest, journal head or entries directory is a
+blocker; no missing recovery directory is created. The report has `ok` and
+`status` fields. Any blocker produces `status=recovery_preflight_blocked`, a
+non-zero exit code and no approval phrase. Only an empty blocker list can
+produce `status=recovery_preflight_passed`, exit code zero and an approval
+phrase. A successful report write alone does not mean admission passed.
 
 ### B. Operator review and explicit approval
 
@@ -489,11 +554,13 @@ not reuse a consumed approval file.
 ### C. Separately authorised LIVE recovery execution
 
 Only after separate explicit LIVE operational authorisation, run the recovery
-detached and preserve the log and PID. The supervised child reacquires the
-existing global observation-operation lock, repeats admission and approval
-checks while holding it, revalidates the locked v2 source root, authenticates
-and semantically replays the journal, verifies reusable completed objects, and
-appends the new recovery-epoch record before migration publication resumes:
+detached and preserve the log and PID. The approval file is not a substitute for
+that authorisation. Keep LIVE writers frozen through full independent
+verification. The supervised child reacquires the existing global
+observation-operation lock, repeats admission and approval checks while holding
+it, revalidates the locked v2 source root, authenticates and semantically replays
+the journal, verifies reusable completed objects, and appends the new
+recovery-epoch record before migration publication resumes:
 
 ```bash
 nohup node scripts/backup_r2/uk_aq_observation_history_migration_v3_live_gcp.mjs \
@@ -514,12 +581,16 @@ nohup node scripts/backup_r2/uk_aq_observation_history_migration_v3_live_gcp.mjs
 echo $! >"$WORK_DIR/recovery.pid"
 ```
 
-The migration appends progress to the authenticated recovery journal while
-preserving its original 46,305-entry prefix. The epoch authority is a separate
+The exported `NODE_OPTIONS` is inherited by the initial `nohup` process, the
+operator supervisor and the lock-holding child; do not unset or replace it in
+the shell or supervisor environment. The migration appends progress to the
+authenticated recovery journal while preserving its original 46,305-entry
+prefix. The epoch authority is a separate
 append-only local ledger at
 `$WORK_DIR/checkpoint.json.exceptional-recovery-epochs/entries/`; it does not
 replace the original checkpoint, plan, manifest or journal anchor. Full
 independent verification and a durable final report remain mandatory. This
-operation does not switch runtime generation, deploy Workers, resume writers,
-delete history or automatically rerun after failure. Preserve partial v3
-objects, journal entries and epoch records for review.
+operation does not switch runtime generation, deploy Workers, release/unfreeze
+writers, delete history or automatically rerun after failure.
+Preserve partial v3 objects, the original checkpoint and journal entries, and
+all epoch records for review.

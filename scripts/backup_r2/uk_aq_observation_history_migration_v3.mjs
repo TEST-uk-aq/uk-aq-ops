@@ -394,6 +394,18 @@ function ensureDurableDirectory(directory, mode = 0o700) {
   }
 }
 
+function requireExistingRecoveryArtifact(target, label, kind) {
+  let stat;
+  try { stat = fs.lstatSync(target); }
+  catch (error) {
+    if (error.code === "ENOENT") throw new Error(`${label} is missing: ${target}`, { cause: error });
+    throw error;
+  }
+  if (stat.isSymbolicLink() || (kind === "directory" ? !stat.isDirectory() : !stat.isFile())) {
+    throw new Error(`${label} must be an existing regular ${kind}: ${target}`);
+  }
+}
+
 function atomicWriteJson(filePath, value, temporaryRoot = null) {
   const target = path.resolve(filePath);
   ensureDurableDirectory(path.dirname(target));
@@ -644,8 +656,16 @@ function applyRecoveryUpdates(checkpoint, updates) {
 }
 
 function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false,
-  allowInterruptedTail = false, onAuthenticatedReplay = null, diagnostics = false }) {
-  ensureDurableDirectory(paths.entries);
+  allowInterruptedTail = false, onAuthenticatedReplay = null, diagnostics = false,
+  readOnly = false }) {
+  if (readOnly) {
+    requireExistingRecoveryArtifact(paths.root, "Recovery state directory", "directory");
+    requireExistingRecoveryArtifact(paths.manifest, "Recovery manifest", "file");
+    requireExistingRecoveryArtifact(paths.head, "Recovery journal head", "file");
+    requireExistingRecoveryArtifact(paths.entries, "Recovery journal entries directory", "directory");
+  } else {
+    ensureDurableDirectory(paths.entries);
+  }
   const names = fs.readdirSync(paths.entries)
     .sort();
   if (!fs.existsSync(paths.head) && repairHead && names.length === 0) {
@@ -660,7 +680,10 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
     ));
   }
   const authenticationStartedAt = Date.now();
-  const authenticationProgress = createOperatorProgress({ label: "V3 recovery: authenticating historical journal", enabled: diagnostics || Boolean(process.env.UK_AQ_OPERATOR_RUN_DIR) });
+  // Operator progress can create run directories and phase-marker files.
+  // Strict read-only inspection uses stream diagnostics only.
+  const authenticationProgress = createOperatorProgress({ label: "V3 recovery: authenticating historical journal",
+    enabled: !readOnly && (diagnostics || Boolean(process.env.UK_AQ_OPERATOR_RUN_DIR)) });
   if (diagnostics) process.stderr.write(`V3 recovery: authenticating ${names.length} journal entries start=${new Date(authenticationStartedAt).toISOString()}\n`);
   const journalOptions = {
     recoveryRoot: paths.root,
@@ -678,7 +701,7 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
   authenticationProgress.finish();
   if (diagnostics) process.stderr.write(`V3 recovery: authentication complete entries=${replay.entries.length} elapsed_ms=${Date.now() - authenticationStartedAt}\n`);
   const replayProgress = createMigrationProgressReporter({
-    label: "V3 recovery: applying authenticated journal", total: replay.entries.length, enabled: diagnostics,
+    label: "V3 recovery: applying authenticated journal", total: replay.entries.length, enabled: !readOnly && diagnostics,
   });
   replayProgress.report(0, { force: true });
   const publicationEvidence = [];
@@ -794,9 +817,20 @@ export function buildObservationHistoryV3RecoveryProgressContext({
   allowInterruptedTail = false,
   onAuthenticatedReplay = null,
   diagnostics = false,
+  readOnly = false,
 }) {
   if (diagnostics) process.stderr.write("V3 recovery: authenticating original checkpoint and recovery manifest\n");
   const paths = recoveryProgressPaths(checkpointPath);
+  if (readOnly) {
+    if (create || repairHead || onAuthenticatedReplay) {
+      throw new Error("Read-only recovery inspection cannot create, repair or append recovery state");
+    }
+    requireExistingRecoveryArtifact(path.resolve(checkpointPath), "Migration checkpoint", "file");
+    requireExistingRecoveryArtifact(paths.root, "Recovery state directory", "directory");
+    requireExistingRecoveryArtifact(paths.manifest, "Recovery manifest", "file");
+    requireExistingRecoveryArtifact(paths.head, "Recovery journal head", "file");
+    requireExistingRecoveryArtifact(paths.entries, "Recovery journal entries directory", "directory");
+  }
   let createdManifest = false;
   if (!fs.existsSync(paths.manifest)) {
     if (!create) throw new Error("Recovery progress manifest is missing; run resume preflight first");
@@ -862,6 +896,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     allowInterruptedTail,
     onAuthenticatedReplay,
     diagnostics,
+    readOnly,
   });
   const authenticatedJournalFrontier = exceptionalRecoveryAuthorization
     ? getExceptionalRecoveryJournalFrontier(exceptionalRecoveryAuthorization.auth.journal) : null;

@@ -194,7 +194,28 @@ function assertLiveRepository(writerSha, { exceptionalRecovery = false } = {}) {
   }
 }
 
-async function runExceptionalRecoveryPreflight({ argv, approvalFile, repositoryRoot, runnerPermit }) {
+function validateExceptionalRecoveryPreflightPaths(argv, approvalFile) {
+  const value = (flag) => oneValue(argv, flag);
+  const checkpointPath = path.resolve(value("--checkpoint-in"));
+  const checkpointOutPath = path.resolve(value("--checkpoint-out"));
+  const reportPath = path.resolve(value("--report-out"));
+  const approvalPath = path.resolve(approvalFile);
+  if (checkpointPath !== checkpointOutPath) {
+    throw new Error("Exceptional recovery must keep the authenticated original checkpoint as both input and output");
+  }
+  const protectedPaths = ["", ".authority", ".staging", ".recovery", ".publication.json", ".exceptional-recovery-epochs"]
+    .map((suffix) => `${checkpointPath}${suffix}`);
+  for (const [label, candidate] of [["preflight report", reportPath], ["approval file", approvalPath]]) {
+    if ((label === "approval file" && candidate === reportPath) ||
+        protectedPaths.some((protectedPath) => candidate === protectedPath || candidate.startsWith(`${protectedPath}${path.sep}`))) {
+      throw new Error(`Exceptional recovery ${label} must be outside checkpoint and journal paths`);
+    }
+  }
+  return Object.freeze({ checkpointPath, reportPath, approvalPath,
+    approvalAlreadyExists: fs.existsSync(approvalPath) });
+}
+
+function validateExceptionalRecoveryPreflightRequest(argv, approvalFile, runnerPermit) {
   const parsed = parseObservationHistoryMigrationArgs(argv, runnerPermit, { allowRecoveryPreflight: true });
   if (parsed.mode !== "recovery-preflight" || parsed.environment !== "LIVE" || parsed.transition !== "v2-to-v3" ||
       parsed.migrationRunId !== EXCEPTIONAL_LIVE_RECOVERY.run_id ||
@@ -204,39 +225,47 @@ async function runExceptionalRecoveryPreflight({ argv, approvalFile, repositoryR
       parsed.apply || parsed.writersFrozen || !parsed.writerLimitsPath || !parsed.reportOut) {
     throw new Error("Exceptional recovery preflight arguments are incomplete or include mutation authority");
   }
-  const value = (flag) => oneValue(argv, flag);
-  const checkpointPath = path.resolve(value("--checkpoint-in"));
-  const reportPath = path.resolve(value("--report-out"));
-  const approvalPath = path.resolve(approvalFile);
-  const protectedPaths = ["", ".authority", ".staging", ".recovery", ".publication.json", ".exceptional-recovery-epochs"]
-    .map((suffix) => `${checkpointPath}${suffix}`);
-  for (const [label, candidate] of [["preflight report", reportPath], ["approval file", approvalPath]]) {
-    if ((label === "approval file" && candidate === reportPath) ||
-        protectedPaths.some((protectedPath) => candidate === protectedPath || candidate.startsWith(`${protectedPath}${path.sep}`))) {
-      throw new Error(`Exceptional recovery ${label} must be outside checkpoint and journal paths`);
-    }
-  }
-  if (fs.existsSync(approvalPath)) throw new Error("Exceptional recovery approval file must not exist before preflight");
+  const paths = validateExceptionalRecoveryPreflightPaths(argv, approvalFile);
+  if (paths.approvalAlreadyExists) throw new Error("Exceptional recovery approval file must not exist before preflight");
+  return Object.freeze({ ...paths, parsed });
+}
+
+function writeExceptionalRecoveryPreflightReport(reportPath, report) {
+  const fd = fs.openSync(reportPath, "wx", 0o600);
+  try { fs.writeFileSync(fd, `${JSON.stringify(report, null, 2)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  return report.ok === true ? 0 : 1;
+}
+
+async function runExceptionalRecoveryPreflight({ argv, approvalFile, repositoryRoot, runnerPermit, request = null }) {
+  const { parsed, checkpointPath, reportPath } = request || validateExceptionalRecoveryPreflightRequest(argv, approvalFile, runnerPermit);
   let auth;
   try {
     auth = authenticateExceptionalRecovery({ checkpointPath, repositoryRoot });
-    auth = Object.freeze({ ...auth, recoveryState: buildObservationHistoryV3RecoveryProgressContext({
+    const recoveryState = buildObservationHistoryV3RecoveryProgressContext({
       checkpointPath, checkpoint: auth.checkpoint, repositoryRoot,
       create: false, repairHead: false, allowInterruptedTail: true, requireCurrentImplementation: false,
-    }) });
+      readOnly: true,
+    });
+    const authenticatedSequence = auth.journal.interrupted_append?.sequence ?? auth.journal.last_sequence;
+    const authenticatedEntrySha = auth.journal.interrupted_append?.payload_sha256 ?? auth.journal.last_entry_sha256;
+    if (recoveryState.sequence !== authenticatedSequence || recoveryState.entrySha256 !== authenticatedEntrySha) {
+      throw new Error("Recovery journal changed between authenticated preflight reads");
+    }
+    auth = Object.freeze({ ...auth, recoveryState });
   } catch (error) {
     const report = { kind: "uk_aq_observation_history_v3_exceptional_recovery_preflight_v1",
+      ok: false, status: "recovery_preflight_blocked",
       generated_at_utc: new Date().toISOString(), read_only: true,
       checkpoint_authenticated: false, journal_authenticated: false,
       original_run_id: EXCEPTIONAL_LIVE_RECOVERY.run_id,
       original_plan_sha256: EXCEPTIONAL_LIVE_RECOVERY.plan_sha256,
       original_implementation_commit: EXCEPTIONAL_LIVE_RECOVERY.original_commit,
+      original_journal_anchor: { sequence: EXCEPTIONAL_LIVE_RECOVERY.journal_sequence,
+        entry_sha256: EXCEPTIONAL_LIVE_RECOVERY.journal_head_sha256 },
       source_root: { status: "not_checked" }, approval_phrase: null,
       blockers: [`checkpoint_or_journal_or_original_code_authentication_failed:${error.message}`] };
-    const fd = fs.openSync(reportPath, "wx", 0o600);
-    try { fs.writeFileSync(fd, `${JSON.stringify(report, null, 2)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-    return 1;
+    return writeExceptionalRecoveryPreflightReport(reportPath, report);
   }
   const recordedRunner = auth.checkpoint.authority?.runner;
   const concurrencyMatches = Boolean(recordedRunner && recordedRunner.runner_kind === "gcp" &&
@@ -245,24 +274,28 @@ async function runExceptionalRecoveryPreflight({ argv, approvalFile, repositoryR
     parsed.inventoryConcurrency === recordedRunner.inventory_concurrency &&
     parsed.partitionConcurrency === recordedRunner.partition_concurrency &&
     parsed.publicationConcurrency === recordedRunner.publication_concurrency);
-  const config = resolveR2HistoryIndexConfig(process.env);
-  if (!hasRequiredR2Config(config.r2) || config.r2.bucket !== "uk-aq-history-live") {
-    throw new Error("Recovery preflight requires the exact configured LIVE history bucket");
-  }
   let sourceRoot = null;
   let sourceReadError = null;
   try {
+    const config = resolveR2HistoryIndexConfig(process.env);
+    if (!hasRequiredR2Config(config.r2) || config.r2.bucket !== "uk-aq-history-live") {
+      throw new Error("Recovery preflight requires the exact configured LIVE history bucket");
+    }
     const sourceObject = await r2GetObject({ r2: config.r2, key: EXCEPTIONAL_LIVE_RECOVERY.source_root_key });
     sourceRoot = { key: sourceObject.key, byte_size: sourceObject.bytes, sha256: sha256Hex(sourceObject.body) };
   } catch (error) {
     sourceReadError = error.message;
   }
-  const identity = getExceptionalRecoveryCodeIdentity(repositoryRoot);
-  const codeSha = exceptionalRecoveryCodeSha256(identity);
+  let identity = null;
+  let codeSha = null;
+  let implementationReadError = null;
+  try {
+    identity = getExceptionalRecoveryCodeIdentity(repositoryRoot);
+    codeSha = exceptionalRecoveryCodeSha256(identity);
+  } catch (error) {
+    implementationReadError = error.message;
+  }
   const sourceMatches = sourceRoot?.sha256 === EXCEPTIONAL_LIVE_RECOVERY.source_root_sha256 && sourceRoot?.byte_size === 559;
-  const approvalPhrase = sourceMatches && concurrencyMatches
-    ? exceptionalRecoveryApprovalPhrase({ auth, sourceRoot, codeSha, codeHead: identity.repository_head, runner: runnerPermit })
-    : null;
   const journal = auth.journal;
   const publicationCount = auth.recoveryState.publicationEvidence.length;
   const blockers = [];
@@ -270,8 +303,23 @@ async function runExceptionalRecoveryPreflight({ argv, approvalFile, repositoryR
   if (!sourceMatches) blockers.push(sourceReadError
     ? `source_root_read_failed:${sourceReadError}`
     : "source_root_identity_differs_from_authorised_live_source");
+  if (implementationReadError) blockers.push(`recovery_implementation_identity_unavailable:${implementationReadError}`);
+  let approvalPhrase = null;
+  if (blockers.length === 0) {
+    try {
+      approvalPhrase = exceptionalRecoveryApprovalPhrase({ auth, sourceRoot, codeSha,
+        codeHead: identity.repository_head, runner: runnerPermit });
+      if (typeof approvalPhrase !== "string" || !approvalPhrase.trim()) {
+        blockers.push("approval_phrase_was_not_created");
+      }
+    } catch (error) {
+      blockers.push(`approval_phrase_creation_failed:${error.message}`);
+    }
+  }
   const report = {
     kind: "uk_aq_observation_history_v3_exceptional_recovery_preflight_v1",
+    ok: blockers.length === 0,
+    status: blockers.length === 0 ? "recovery_preflight_passed" : "recovery_preflight_blocked",
     generated_at_utc: new Date().toISOString(),
     read_only: true,
     environment: "LIVE",
@@ -313,16 +361,14 @@ async function runExceptionalRecoveryPreflight({ argv, approvalFile, repositoryR
       previous_epoch_sha256: auth.recoveryEpoch.previous_epoch_sha256 },
     expected_v3_publication_objects: EXCEPTIONAL_LIVE_RECOVERY.expected_v3_publications,
     remaining_v3_publication_objects: EXCEPTIONAL_LIVE_RECOVERY.expected_v3_publications - publicationCount,
-    source_root: sourceRoot ? { ...sourceRoot, status: sourceMatches ? "matches_authorised_identity" : "identity_mismatch" } : { status: "unavailable" },
+    source_root: sourceRoot ? { ...sourceRoot, status: sourceMatches ? "matches_authorised_identity" : "identity_mismatch" }
+      : { status: "unavailable", read_error: sourceReadError },
     blockers,
     writers_frozen_confirmation_required_at_migrate: true,
     approval_file: path.resolve(approvalFile),
-    approval_phrase: sourceMatches ? approvalPhrase : null,
+    approval_phrase: blockers.length === 0 ? approvalPhrase : null,
   };
-  const fd = fs.openSync(reportPath, "wx", 0o600);
-  try { fs.writeFileSync(fd, `${JSON.stringify(report, null, 2)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-  return 0;
+  return writeExceptionalRecoveryPreflightReport(reportPath, report);
 }
 
 export async function mainLiveGcp({ argv = process.argv.slice(2) } = {}) {
@@ -331,6 +377,66 @@ export async function mainLiveGcp({ argv = process.argv.slice(2) } = {}) {
     return 0;
   }
   const { sharedArgv, projectId, zone, exceptionalRecovery, approvalFile, mode } = parseLiveArguments(argv);
+  if (exceptionalRecovery && mode === "recovery-preflight") {
+    const paths = validateExceptionalRecoveryPreflightPaths(sharedArgv, approvalFile);
+    if (paths.approvalAlreadyExists) {
+      return writeExceptionalRecoveryPreflightReport(paths.reportPath, {
+        kind: "uk_aq_observation_history_v3_exceptional_recovery_preflight_v1",
+        ok: false,
+        status: "recovery_preflight_blocked",
+        generated_at_utc: new Date().toISOString(),
+        read_only: true,
+        environment: "LIVE",
+        checkpoint_authenticated: false,
+        journal_authenticated: false,
+        original_run_id: EXCEPTIONAL_LIVE_RECOVERY.run_id,
+        original_plan_sha256: EXCEPTIONAL_LIVE_RECOVERY.plan_sha256,
+        original_implementation_commit: EXCEPTIONAL_LIVE_RECOVERY.original_commit,
+        original_journal_anchor: { sequence: EXCEPTIONAL_LIVE_RECOVERY.journal_sequence,
+          entry_sha256: EXCEPTIONAL_LIVE_RECOVERY.journal_head_sha256 },
+        source_root: { status: "not_checked" },
+        approval_phrase: null,
+        blockers: ["approval_file_must_not_exist_before_preflight"],
+      });
+    }
+    const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+    let runnerPermit;
+    let request;
+    try {
+      assertLiveEnvironment();
+      const requestedCodeHead = command("git", ["rev-parse", "HEAD"], repositoryRoot);
+      assertLiveRepository(requestedCodeHead, { exceptionalRecovery: true });
+      runnerPermit = await admitGcpRunner({ profile: GCP_PROFILE });
+      if (runnerPermit.project_id !== projectId || runnerPermit.zone !== zone ||
+          runnerPermit.machine_type !== "c4a-standard-32") {
+        throw new Error("GCE metadata disagrees with explicitly reviewed LIVE GCP project, zone or machine");
+      }
+      request = validateExceptionalRecoveryPreflightRequest(sharedArgv, approvalFile, runnerPermit);
+      process.stderr.write(`LIVE GCE admission: ${JSON.stringify(runnerPermit)}\n`);
+    } catch (error) {
+      return writeExceptionalRecoveryPreflightReport(paths.reportPath, {
+        kind: "uk_aq_observation_history_v3_exceptional_recovery_preflight_v1",
+        ok: false,
+        status: "recovery_preflight_blocked",
+        generated_at_utc: new Date().toISOString(),
+        read_only: true,
+        environment: "LIVE",
+        runner: runnerPermit || null,
+        checkpoint_authenticated: false,
+        journal_authenticated: false,
+        original_run_id: EXCEPTIONAL_LIVE_RECOVERY.run_id,
+        original_plan_sha256: EXCEPTIONAL_LIVE_RECOVERY.plan_sha256,
+        original_implementation_commit: EXCEPTIONAL_LIVE_RECOVERY.original_commit,
+        original_journal_anchor: { sequence: EXCEPTIONAL_LIVE_RECOVERY.journal_sequence,
+          entry_sha256: EXCEPTIONAL_LIVE_RECOVERY.journal_head_sha256 },
+        source_root: { status: "not_checked" },
+        approval_phrase: null,
+        blockers: [`gcp_or_repository_admission_failed:${error.message}`],
+      });
+    }
+    return runExceptionalRecoveryPreflight({ argv: sharedArgv, approvalFile,
+      repositoryRoot, runnerPermit, request });
+  }
   assertLiveEnvironment();
   const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
   const requestedCodeHead = exceptionalRecovery
@@ -343,9 +449,6 @@ export async function mainLiveGcp({ argv = process.argv.slice(2) } = {}) {
     throw new Error("GCE metadata disagrees with explicitly reviewed LIVE GCP project, zone or machine");
   }
   process.stderr.write(`LIVE GCE admission: ${JSON.stringify(runnerPermit)}\n`);
-  if (exceptionalRecovery && mode === "recovery-preflight") {
-    return runExceptionalRecoveryPreflight({ argv: sharedArgv, approvalFile, repositoryRoot, runnerPermit });
-  }
   let exceptionalRecoveryApproval = null;
   if (exceptionalRecovery) {
     const auth = authenticateExceptionalRecovery({ checkpointPath: oneValue(sharedArgv, "--checkpoint-in"), repositoryRoot });
@@ -377,7 +480,9 @@ export async function mainLiveGcp({ argv = process.argv.slice(2) } = {}) {
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const execution = process.env.UK_AQ_OPERATOR_SUPERVISED === "1" ||
+  const recoveryPreflight = process.argv.includes("--exceptional-recovery") &&
+    process.argv.some((value, index) => value === "--mode" && process.argv[index + 1] === "recovery-preflight");
+  const execution = recoveryPreflight || process.env.UK_AQ_OPERATOR_SUPERVISED === "1" ||
     process.argv.includes("--help") || process.argv.includes("-h")
     ? mainLiveGcp()
     : superviseOperatorInvocation(process.argv[1], process.argv.slice(2));
