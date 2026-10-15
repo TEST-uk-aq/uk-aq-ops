@@ -419,6 +419,78 @@ separately authorized interrupted clean TEST rehearsal before operational
 acceptance. No runtime configuration, deployment or database schema changes are
 introduced by this correction.
 
-LIVE is deliberately rejected by this entrypoint. Any later LIVE use requires
-separate authorization, accepted TEST results and a reviewed environment/contract
-extension; it is not enabled merely by changing a command-line environment label.
+Normal LIVE clean-build admission remains unchanged and rejects `--checkpoint-in`.
+The code includes one separately gated exception for the failed run
+`live-v3-20261015T114250Z-e84f52a`; this is not permission to run it. It remains
+subject to real TEST acceptance, independent review and separate operational
+authorisation.
+
+## One-off authorised LIVE recovery exception
+
+This exception is restricted to the exact run, plan, original writer commit and
+immutable authority recorded in
+`exceptional_recovery_authority.mjs`. It preserves the original checkpoint,
+recovery manifest, head and numbered journal entries byte-for-byte. Before
+allowing the new implementation to append, it reads every implementation file
+from the pinned original Git commit and verifies the recorded sizes and hashes.
+It then binds approval to the new recovery code identity, current journal head
+and source-root identity. The operator creates a mode-0600 approval file owned
+by the execution account containing the exact phrase emitted by read-only
+preflight. The LIVE wrapper reauthenticates this file in the supervised child.
+
+Run the preflight under the admitted GCE profile. Supply the established LIVE
+project, zone, writer-limits and work-directory values:
+
+```bash
+node scripts/backup_r2/uk_aq_observation_history_migration_v3_live_gcp.mjs \
+  --expected-gcp-project-id "$PROJECT_ID" --expected-gcp-zone "$ZONE" \
+  --environment LIVE --transition v2-to-v3 --mode recovery-preflight \
+  --expected-bucket uk-aq-history-live \
+  --target-writer-git-sha e84f52a6b0ddb6212fc6f321b875bb15244c4090 \
+  --migration-run-id live-v3-20261015T114250Z-e84f52a \
+  --expected-plan-sha256 1e960674e53cd2ddb3c5d08a3318fcce1abc72ebe7a2dc92e11e9ce9a4d79600 \
+  --checkpoint-in "$WORK_DIR/checkpoint.json" \
+  --checkpoint-out "$WORK_DIR/checkpoint.json" \
+  --writer-limits-json "$WRITER_LIMITS_JSON" \
+  --report-out "$WORK_DIR/recovery-preflight.json" \
+  --exceptional-recovery --recovery-approval-file "$WORK_DIR/recovery.approval"
+```
+
+Preflight authenticates the local checkpoint and journal and reads the exact
+LIVE source-root object. It does not acquire the migration lock, repair the
+journal, write R2, append evidence or start migration. Stop on any reported
+blocker. Review the preflight report and recovery-code identity, then create
+`$WORK_DIR/recovery.approval` with exactly the emitted `approval_phrase`, mode
+0600 and owned by the same account. The phrase binds the checkpoint, plan,
+authority, journal sequence/hash, original code, current recovery code and
+source root; any difference invalidates it.
+
+Only after separate explicit LIVE operational authorisation, run the resume
+detached and preserve the log and PID:
+
+```bash
+nohup node scripts/backup_r2/uk_aq_observation_history_migration_v3_live_gcp.mjs \
+  --expected-gcp-project-id "$PROJECT_ID" --expected-gcp-zone "$ZONE" \
+  --environment LIVE --transition v2-to-v3 --mode migrate \
+  --expected-bucket uk-aq-history-live \
+  --target-writer-git-sha e84f52a6b0ddb6212fc6f321b875bb15244c4090 \
+  --migration-run-id live-v3-20261015T114250Z-e84f52a \
+  --expected-plan-sha256 1e960674e53cd2ddb3c5d08a3318fcce1abc72ebe7a2dc92e11e9ce9a4d79600 \
+  --checkpoint-in "$WORK_DIR/checkpoint.json" \
+  --checkpoint-out "$WORK_DIR/checkpoint.json" \
+  --writer-limits-json "$WRITER_LIMITS_JSON" \
+  --report-out "$WORK_DIR/recovery-report.json" \
+  --operator-authority-file "$OPERATOR_AUTHORITY_FILE" \
+  --expected-inventory-root-sha256 "$INVENTORY_ROOT_SHA256" \
+  --expected-state-root-sha256 "$STATE_ROOT_SHA256" \
+  --publication-concurrency 64 --partition-concurrency 16 \
+  --apply --writers-frozen --exceptional-recovery \
+  --recovery-approval-file "$WORK_DIR/recovery.approval" \
+  >"$WORK_DIR/recovery.log" 2>&1 &
+echo $! >"$WORK_DIR/recovery.pid"
+```
+
+This operation only resumes the build. Full independent verification and a
+durable final report remain mandatory. It must not switch runtime generation,
+deploy Workers, resume writers, delete history or automatically rerun after
+failure. Preserve all partial v3 objects and journal evidence for review.

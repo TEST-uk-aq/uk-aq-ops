@@ -32,6 +32,7 @@ import {
   r2ListObjectsV2,
   r2PutObject,
   sha256Hex,
+  isRetryableR2Status,
 } from "../../workers/shared/r2_sigv4.mjs";
 import {
   buildR2HistoryV2ObservationsTimeseriesLatestKey,
@@ -49,6 +50,7 @@ import {
   readAndValidateRecoveryJournal,
   inspectRecoveryJournalForInterruptedAppend,
 } from "../index_v3_migration/recovery_journal_authority.mjs";
+import { verifyOriginalRecoveryImplementation } from "../index_v3_migration/exceptional_recovery_authority.mjs";
 import {
   validateIndexV3OperatorEvidence,
 } from "../index_v3_migration/index_v3_operator_evidence.mjs";
@@ -90,6 +92,57 @@ const MODES = new Set([
   "rollback-plan",
   "rollback",
 ]);
+
+const MIGRATION_VERIFY_MAX_ROUNDS = 5;
+const MIGRATION_VERIFY_RETRY_BASE_MS = 750;
+const MIGRATION_VERIFY_RETRY_MAX_MS = 12_000;
+const MIGRATION_TRANSIENT_NETWORK_CODES = new Set([
+  "ECONNABORTED", "ECONNREFUSED", "ECONNRESET", "EAI_AGAIN", "EHOSTUNREACH",
+  "ENETUNREACH", "EPIPE", "ETIMEDOUT", "UND_ERR_BODY_TIMEOUT", "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_SOCKET",
+]);
+
+function isRetryableMigrationVerificationError(error) {
+  if (isRetryableR2Status(Number(error?.status))) return true;
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 8; depth += 1) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    if (MIGRATION_TRANSIENT_NETWORK_CODES.has(String(current.code || "").toUpperCase())) return true;
+    current = current.cause;
+  }
+  return false;
+}
+
+async function verifyMigrationPostPut({ r2, key, expectedBody, expectedByteSize }) {
+  const expectedSha256 = sha256Hex(expectedBody);
+  let lastError;
+  for (let round = 1; round <= MIGRATION_VERIFY_MAX_ROUNDS; round += 1) {
+    try {
+      const current = await r2GetObject({ r2, key });
+      const bytes = Buffer.from(current.body);
+      if (current.bytes !== expectedByteSize || bytes.byteLength !== expectedByteSize ||
+          sha256Hex(bytes) !== expectedSha256 || !bytes.equals(expectedBody)) {
+        const error = new Error(`Migration post-PUT exact identity mismatch for key=${key}`);
+        error.code = "R2_IDENTITY_MISMATCH";
+        throw error;
+      }
+      return current;
+    } catch (error) {
+      if (!isRetryableMigrationVerificationError(error) || round === MIGRATION_VERIFY_MAX_ROUNDS) {
+        throw error;
+      }
+      lastError = error;
+      const ceiling = Math.min(MIGRATION_VERIFY_RETRY_MAX_MS,
+        MIGRATION_VERIFY_RETRY_BASE_MS * (2 ** (round - 1)));
+      const delayMs = Math.floor(ceiling * (0.5 + Math.random() * 0.5));
+      process.stderr.write(`V3 migration: transient post-PUT GET retry ${round + 1}/${MIGRATION_VERIFY_MAX_ROUNDS} key=${key} status=${error.status || "network"} delay_ms=${delayMs}\n`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError || new Error(`Migration post-PUT GET verification exhausted for key=${key}`);
+}
 
 function usage() {
   return [
@@ -1944,6 +1997,8 @@ function buildR2Adapters({
       body: object.body,
       content_type: object.content_type,
       writeR2: true,
+      postPutVerify: verifyMigrationPostPut,
+      verifyExisting: verifyMigrationPostPut,
     }); },
     recordDurableEvidence: (entry) => recordDurableEvidenceBatch([entry]),
     recordDurableEvidenceBatch,
@@ -2401,6 +2456,12 @@ async function runSideBySideMigrationOperator({
       source_in_flight_bytes: migrationConcurrencyLimits(runnerPermit).sourceInFlightBytes,
       publication_in_flight_bytes: migrationConcurrencyLimits(runnerPermit).publicationInFlightBytes };
     output.audit.global_lock = lockAuditIdentity(assertLockHeld());
+  if (args.exceptionalRecoveryApproval) {
+    output.audit.exceptional_recovery_approval = {
+      kind: "uk_aq_observation_history_v3_exceptional_resume_approval_v1",
+      approval_file_sha256: args.exceptionalRecoveryApproval.approval_file_sha256,
+    };
+  }
     output.audit.clean_target_admission = checkpoint?.clean_target_admission || planningAdmission;
     output.audit.initial_runner = plan.runner;
     output.audit.planning_clean_target_admission = plan.planning_clean_target_admission;
@@ -2448,6 +2509,10 @@ async function runSideBySideMigrationOperator({
         plan_sha256: plan?.plan_sha256 || null, blockers: plan?.blockers || [],
         error: error.message, failure_evidence: migrationFailureEvidence(error), runtime_switch_performed: false },
       audit: { runner: runnerPermit, post_plan_approval: postPlanApproval,
+        ...(args.exceptionalRecoveryApproval ? { exceptional_recovery_approval: {
+          kind: "uk_aq_observation_history_v3_exceptional_resume_approval_v1",
+          approval_file_sha256: args.exceptionalRecoveryApproval.approval_file_sha256,
+        } } : {}),
         complete_plan_path: completePlanPath ? path.join(completePlanPath, 'master.json') : null, phase_durations_ms: phaseDurations,
         r2_adapter_calls: r2AdapterCalls,
         clean_target_admission: error.clean_target_admission || checkpoint?.clean_target_admission || null },
@@ -2464,8 +2529,20 @@ export async function runObservationHistoryMigrationV3({
   sideBySideAdapterFactory = buildSideBySideR2Adapters,
   runnerPermit = null, entrypoint = fileURLToPath(import.meta.url),
   reentryArgv = argv,
+  exceptionalRecoveryApproval = null,
 } = {}) {
   const args = parseObservationHistoryMigrationArgs(argv, runnerPermit);
+  if (exceptionalRecoveryApproval) {
+    if (runnerPermit?.runner_kind !== "gcp" || args.mode !== "migrate" || args.environment !== "LIVE" ||
+        args.transition !== "v2-to-v3" || args.migrationRunId !== "live-v3-20261015T114250Z-e84f52a" ||
+        args.expectedPlanSha256 !== "1e960674e53cd2ddb3c5d08a3318fcce1abc72ebe7a2dc92e11e9ce9a4d79600" ||
+        args.targetWriterGitSha !== "e84f52a6b0ddb6212fc6f321b875bb15244c4090" ||
+        exceptionalRecoveryApproval.kind !== "uk_aq_observation_history_v3_exceptional_resume_approval_v1" ||
+        !/^[0-9a-f]{64}$/.test(String(exceptionalRecoveryApproval.approval_file_sha256 || ""))) {
+      throw new Error("Exceptional recovery approval object is invalid for this invocation");
+    }
+    args.exceptionalRecoveryApproval = Object.freeze({ ...exceptionalRecoveryApproval });
+  }
   if (args.help) return { help: true, text: usage() };
   if (runnerPermit && ((args.environment !== "TEST" &&
       !isReviewedLiveGcpInvocation({ args, runnerPermit, entrypoint })) ||
@@ -2632,16 +2709,23 @@ export async function runObservationHistoryMigrationV3({
       requireCurrentImplementation: false,
       diagnostics: true,
     });
-    const recoveryExecutorCheck = spawnSync("bash", [
-      "scripts/index_v3_migration/index_v3_migration.sh",
-      "--resume-implementation-authority",
-      path.resolve(args.checkpointIn),
-      args.targetWriterGitSha,
-    ], { cwd: repositoryRoot, encoding: "utf8" });
-    if (recoveryExecutorCheck.status !== 0) {
-      throw new Error(`Resume recovery executor is not authorized: ${
-        recoveryExecutorCheck.stderr || recoveryExecutorCheck.error?.message || "local authority check failed"
-      }`);
+    if (args.exceptionalRecoveryApproval) {
+      verifyOriginalRecoveryImplementation({
+        manifest: recoveryProgress.manifest,
+        repositoryRoot,
+      });
+    } else {
+      const recoveryExecutorCheck = spawnSync("bash", [
+        "scripts/index_v3_migration/index_v3_migration.sh",
+        "--resume-implementation-authority",
+        path.resolve(args.checkpointIn),
+        args.targetWriterGitSha,
+      ], { cwd: repositoryRoot, encoding: "utf8" });
+      if (recoveryExecutorCheck.status !== 0) {
+        throw new Error(`Resume recovery executor is not authorized: ${
+          recoveryExecutorCheck.stderr || recoveryExecutorCheck.error?.message || "local authority check failed"
+        }`);
+      }
     }
     checkpoint = recoveryProgress.checkpoint;
   } else if (checkpoint && new Set(["rollback-plan", "rollback"]).has(args.mode)) {

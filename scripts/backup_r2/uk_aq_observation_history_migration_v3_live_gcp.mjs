@@ -2,11 +2,22 @@
 // Dedicated, fail-closed LIVE GCP admission for the existing shared side-by-side
 // clean-build operator. No deployment, selector switch or writer release occurs.
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import { admitGcpRunner, GCP_PROFILE } from "./lib/observation_history_migration_gcp.mjs";
-import { main as sharedMain } from "./uk_aq_observation_history_migration_v3.mjs";
+import { main as sharedMain, buildObservationHistoryV3RecoveryProgressContext } from "./uk_aq_observation_history_migration_v3.mjs";
 import { superviseOperatorInvocation, finishOperatorProgress } from "../index_v3_migration/operator_execution.mjs";
+import { resolveR2HistoryIndexConfig } from "../../workers/shared/uk_aq_r2_history_index.mjs";
+import { hasRequiredR2Config, r2GetObject, sha256Hex } from "../../workers/shared/r2_sigv4.mjs";
+import {
+  EXCEPTIONAL_LIVE_RECOVERY,
+  authenticateExceptionalRecovery,
+  exceptionalRecoveryApprovalPhrase,
+  exceptionalRecoveryCodeSha256,
+  getExceptionalRecoveryCodeIdentity,
+  validateExceptionalRecoveryApproval,
+} from "../index_v3_migration/exceptional_recovery_authority.mjs";
 
 const REPOSITORY = "UK-AQ/uk-aq-ops";
 const BUCKET = "uk-aq-history-live";
@@ -26,6 +37,9 @@ checkout of UK-AQ/uk-aq-ops; the LIVE R2 account and bucket; and the existing
 global observation lock, v2 source-root and empty-v3 clean-build safeguards.
 Migrate requires --apply --writers-frozen and a fresh --checkpoint-out.
 GCP clean-build resume with --checkpoint-in is not accepted for migration.
+The only exception is --exceptional-recovery for the pinned failed LIVE run,
+with its exact preflight-generated --recovery-approval-file; see the GCP
+operator README. The exception does not alter the normal clean-build policy.
 Locked clean build requires --apply --writers-frozen, a fresh checkpoint-out,
 and an operator-created post-plan approval file while the same lock is held.
 The TEST runner remains separate. No cut-over or scheduler change occurs.
@@ -50,10 +64,18 @@ function oneValue(argv, flag) {
 
 function parseLiveArguments(argv) {
   const stripped = [];
+  let exceptionalRecovery = false;
+  let approvalFile = null;
   const expected = {};
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
-    if (REQUIRED_KEYS.includes(flag)) {
+    if (flag === "--exceptional-recovery") {
+      if (exceptionalRecovery) throw new Error("Exceptional recovery flag may be specified only once");
+      exceptionalRecovery = true;
+    } else if (flag === "--recovery-approval-file") {
+      if (approvalFile || !argv[index + 1] || argv[index + 1].startsWith("--")) throw new Error("Exceptional recovery requires exactly one --recovery-approval-file");
+      approvalFile = argv[++index];
+    } else if (REQUIRED_KEYS.includes(flag)) {
       if (Object.hasOwn(expected, flag) || !argv[index + 1] ||
           argv[index + 1].startsWith("--")) {
         throw new Error(`LIVE GCP admission requires exactly one value for ${flag}`);
@@ -80,10 +102,32 @@ function parseLiveArguments(argv) {
       !/^[0-9a-f]{40}$/.test(oneValue(stripped, "--target-writer-git-sha"))) {
     throw new Error("LIVE migration identity, transition, bucket or writer SHA is inconsistent");
   }
-  if (!new Set(["plan", "migrate", "verify", "locked-clean-build"]).has(oneValue(stripped, "--mode"))) {
+  const mode = oneValue(stripped, "--mode");
+  if (!new Set(["plan", "migrate", "verify", "locked-clean-build", "recovery-preflight"]).has(mode)) {
     throw new Error("LIVE GCP entry point only accepts plan/migrate/verify/locked-clean-build");
   }
-  if (new Set(["migrate", "locked-clean-build"]).has(oneValue(stripped, "--mode"))) {
+  if (exceptionalRecovery) {
+    if (!approvalFile || !new Set(["migrate", "recovery-preflight"]).has(mode) ||
+        oneValue(stripped, "--environment") !== "LIVE" ||
+        oneValue(stripped, "--migration-run-id") !== EXCEPTIONAL_LIVE_RECOVERY.run_id ||
+        oneValue(stripped, "--expected-plan-sha256") !== EXCEPTIONAL_LIVE_RECOVERY.plan_sha256 ||
+        oneValue(stripped, "--target-writer-git-sha") !== EXCEPTIONAL_LIVE_RECOVERY.original_commit ||
+        !stripped.includes("--checkpoint-in")) {
+      throw new Error("Exceptional recovery is restricted to its exact LIVE run, plan, original writer and existing checkpoint");
+    }
+    oneValue(stripped, "--checkpoint-out");
+    if (mode === "migrate" && (!stripped.includes("--apply") || !stripped.includes("--writers-frozen"))) {
+      throw new Error("Exceptional recovery migrate requires explicit --apply and --writers-frozen");
+    }
+    if (mode === "recovery-preflight" && (stripped.includes("--apply") || stripped.includes("--writers-frozen"))) {
+      throw new Error("Read-only recovery preflight does not accept mutation or writer-freeze flags");
+    }
+    stripped.push("--recovery-approval-file", approvalFile);
+    stripped.push("--exceptional-recovery");
+  } else if (mode === "recovery-preflight" || approvalFile) {
+    throw new Error("Recovery preflight and approval require --exceptional-recovery");
+  }
+  if (new Set(["migrate", "locked-clean-build"]).has(mode) && !exceptionalRecovery) {
     if (stripped.includes("--checkpoint-in")) {
       throw new Error("LIVE GCP clean-build migration must start from a fresh plan, never a partial checkpoint");
     }
@@ -94,7 +138,7 @@ function parseLiveArguments(argv) {
       throw new Error("LIVE migrate requires explicit --apply and --writers-frozen");
     }
     oneValue(stripped, "--checkpoint-out");
-    if (oneValue(stripped, "--mode") === "migrate") {
+    if (mode === "migrate") {
       const planSha = oneValue(stripped, "--expected-plan-sha256");
       if (!/^[0-9a-f]{64}$/.test(planSha)) throw new Error("LIVE migrate requires an exact pinned 64-character migration plan SHA-256");
     } else {
@@ -102,7 +146,7 @@ function parseLiveArguments(argv) {
       oneValue(stripped, "--post-plan-approval-file");
     }
   }
-  return { sharedArgv: stripped, projectId, zone };
+  return { sharedArgv: stripped, projectId, zone, exceptionalRecovery, approvalFile, mode };
 }
 
 function assertLiveEnvironment(env = process.env) {
@@ -125,21 +169,115 @@ function assertLiveEnvironment(env = process.env) {
   }
 }
 
-function assertLiveRepository(writerSha) {
+function assertLiveRepository(writerSha, { exceptionalRecovery = false } = {}) {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
   const remote = command("git", ["remote", "get-url", "origin"], root);
   if (!/^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)UK-AQ\/uk-aq-ops(?:\.git)?\/?$/.test(remote)) {
     throw new Error("LIVE GCP migration requires UK-AQ/uk-aq-ops origin, not a TEST repository");
   }
+  const currentHead = command("git", ["rev-parse", "HEAD"], root);
   if (command("git", ["branch", "--show-current"], root) !== "main" ||
-      command("git", ["rev-parse", "HEAD"], root) !== writerSha ||
+      (!exceptionalRecovery && currentHead !== writerSha) ||
       command("git", ["status", "--porcelain=v1", "--untracked-files=normal"], root)) {
     throw new Error("LIVE migration requires clean main at the explicitly reviewed writer SHA");
   }
   const githubMain = command("gh", ["api", `repos/${REPOSITORY}/commits/main`, "--jq", ".sha"], root);
-  if (githubMain !== writerSha) {
-    throw new Error("LIVE GitHub main differs from the exact reviewed GCP migration implementation");
+  if (githubMain !== currentHead || currentHead !== writerSha) {
+    if (!exceptionalRecovery || githubMain !== currentHead) {
+      throw new Error("LIVE GitHub main differs from the exact reviewed recovery implementation");
+    }
   }
+}
+
+async function runExceptionalRecoveryPreflight({ argv, approvalFile, repositoryRoot, runnerPermit }) {
+  const value = (flag) => oneValue(argv, flag);
+  const checkpointPath = path.resolve(value("--checkpoint-in"));
+  const recoveryRoot = `${checkpointPath}.recovery`;
+  const reportPath = path.resolve(value("--report-out"));
+  const approvalPath = path.resolve(approvalFile);
+  for (const [label, candidate] of [["preflight report", reportPath], ["approval file", approvalPath]]) {
+    if (candidate === checkpointPath || (label === "approval file" && candidate === reportPath) ||
+        candidate === recoveryRoot || candidate.startsWith(`${recoveryRoot}${path.sep}`)) {
+      throw new Error(`Exceptional recovery ${label} must be outside checkpoint and journal paths`);
+    }
+  }
+  if (fs.existsSync(approvalPath)) throw new Error("Exceptional recovery approval file must not exist before preflight");
+  let auth;
+  try {
+    auth = authenticateExceptionalRecovery({ checkpointPath, repositoryRoot });
+    auth = Object.freeze({ ...auth, recoveryState: buildObservationHistoryV3RecoveryProgressContext({
+      checkpointPath, checkpoint: auth.checkpoint, repositoryRoot,
+      create: false, repairHead: false, requireCurrentImplementation: false,
+    }) });
+  } catch (error) {
+    const report = { kind: "uk_aq_observation_history_v3_exceptional_recovery_preflight_v1",
+      generated_at_utc: new Date().toISOString(), read_only: true,
+      checkpoint_authenticated: false, journal_authenticated: false,
+      original_run_id: EXCEPTIONAL_LIVE_RECOVERY.run_id,
+      original_plan_sha256: EXCEPTIONAL_LIVE_RECOVERY.plan_sha256,
+      original_implementation_commit: EXCEPTIONAL_LIVE_RECOVERY.original_commit,
+      source_root: { status: "not_checked" }, approval_phrase: null,
+      blockers: [`checkpoint_or_journal_or_original_code_authentication_failed:${error.message}`] };
+    const fd = fs.openSync(reportPath, "wx", 0o600);
+    try { fs.writeFileSync(fd, `${JSON.stringify(report, null, 2)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    return 1;
+  }
+  const config = resolveR2HistoryIndexConfig(process.env);
+  if (!hasRequiredR2Config(config.r2) || config.r2.bucket !== "uk-aq-history-live") {
+    throw new Error("Recovery preflight requires the exact configured LIVE history bucket");
+  }
+  let sourceRoot = null;
+  let sourceReadError = null;
+  try {
+    const sourceObject = await r2GetObject({ r2: config.r2, key: EXCEPTIONAL_LIVE_RECOVERY.source_root_key });
+    sourceRoot = { key: sourceObject.key, byte_size: sourceObject.bytes, sha256: sha256Hex(sourceObject.body) };
+  } catch (error) {
+    sourceReadError = error.message;
+  }
+  const identity = getExceptionalRecoveryCodeIdentity(repositoryRoot);
+  const codeSha = exceptionalRecoveryCodeSha256(identity);
+  const sourceMatches = sourceRoot?.sha256 === EXCEPTIONAL_LIVE_RECOVERY.source_root_sha256 && sourceRoot?.byte_size === 559;
+  const approvalPhrase = sourceMatches
+    ? exceptionalRecoveryApprovalPhrase({ auth, sourceRoot, codeSha, codeHead: identity.repository_head, runner: runnerPermit })
+    : null;
+  const journal = auth.journal;
+  const publicationCount = auth.recoveryState.publicationEvidence.length;
+  const blockers = sourceMatches ? [] : [sourceReadError
+    ? `source_root_read_failed:${sourceReadError}`
+    : "source_root_identity_differs_from_authorised_live_source"];
+  const report = {
+    kind: "uk_aq_observation_history_v3_exceptional_recovery_preflight_v1",
+    generated_at_utc: new Date().toISOString(),
+    read_only: true,
+    environment: "LIVE",
+    r2_account_id: R2_ACCOUNT_ID,
+    bucket: BUCKET,
+    runner: runnerPermit,
+    original_checkpoint: journal.manifest.payload.original_checkpoint,
+    original_checkpoint_authenticated: true,
+    immutable_authority_sha256: journal.manifest.payload.immutable_authority_sha256,
+    plan_sha256: journal.manifest.payload.plan_sha256,
+    original_implementation: auth.originalImplementation,
+    original_implementation_verified: true,
+    recovery_implementation: identity,
+    recovery_implementation_sha256: codeSha,
+    journal: { authenticated: true, semantically_replayed: true, last_sequence: auth.recoveryState.sequence,
+      head_sha256: journal.head.payload_sha256, last_entry_sha256: journal.last_entry_sha256,
+      completed_objects: auth.recoveryState.completedEvidence.size,
+      v3_publications: publicationCount },
+    expected_v3_publication_objects: EXCEPTIONAL_LIVE_RECOVERY.expected_v3_publications,
+    remaining_v3_publication_objects: EXCEPTIONAL_LIVE_RECOVERY.expected_v3_publications - publicationCount,
+    source_root: sourceRoot ? { ...sourceRoot, status: sourceMatches ? "matches_authorised_identity" : "identity_mismatch" } : { status: "unavailable" },
+    blockers,
+    writers_frozen_confirmation_required_at_migrate: true,
+    approval_file: path.resolve(approvalFile),
+    approval_phrase: sourceMatches ? approvalPhrase : null,
+  };
+  const fd = fs.openSync(reportPath, "wx", 0o600);
+  try { fs.writeFileSync(fd, `${JSON.stringify(report, null, 2)}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  return 0;
 }
 
 export async function mainLiveGcp({ argv = process.argv.slice(2) } = {}) {
@@ -147,20 +285,48 @@ export async function mainLiveGcp({ argv = process.argv.slice(2) } = {}) {
     process.stdout.write(HELP);
     return 0;
   }
-  const { sharedArgv, projectId, zone } = parseLiveArguments(argv);
+  const { sharedArgv, projectId, zone, exceptionalRecovery, approvalFile, mode } = parseLiveArguments(argv);
   assertLiveEnvironment();
-  assertLiveRepository(oneValue(sharedArgv, "--target-writer-git-sha"));
+  const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+  const requestedCodeHead = exceptionalRecovery
+    ? command("git", ["rev-parse", "HEAD"], repositoryRoot)
+    : oneValue(sharedArgv, "--target-writer-git-sha");
+  assertLiveRepository(requestedCodeHead, { exceptionalRecovery });
   const runnerPermit = await admitGcpRunner({ profile: GCP_PROFILE });
   if (runnerPermit.project_id !== projectId || runnerPermit.zone !== zone ||
       runnerPermit.machine_type !== "c4a-standard-32") {
     throw new Error("GCE metadata disagrees with explicitly reviewed LIVE GCP project, zone or machine");
   }
   process.stderr.write(`LIVE GCE admission: ${JSON.stringify(runnerPermit)}\n`);
+  if (exceptionalRecovery && mode === "recovery-preflight") {
+    return runExceptionalRecoveryPreflight({ argv: sharedArgv, approvalFile, repositoryRoot, runnerPermit });
+  }
+  let exceptionalRecoveryApproval = null;
+  if (exceptionalRecovery) {
+    const auth = authenticateExceptionalRecovery({ checkpointPath: oneValue(sharedArgv, "--checkpoint-in"), repositoryRoot });
+    const config = resolveR2HistoryIndexConfig(process.env);
+    const sourceObject = await r2GetObject({ r2: config.r2, key: EXCEPTIONAL_LIVE_RECOVERY.source_root_key });
+    const sourceRoot = { key: sourceObject.key, byte_size: sourceObject.bytes, sha256: sha256Hex(sourceObject.body) };
+    const identity = getExceptionalRecoveryCodeIdentity(repositoryRoot);
+    const expectedPhrase = exceptionalRecoveryApprovalPhrase({ auth, sourceRoot,
+      codeSha: exceptionalRecoveryCodeSha256(identity), codeHead: identity.repository_head, runner: runnerPermit });
+    exceptionalRecoveryApproval = validateExceptionalRecoveryApproval({ filePath: approvalFile, expectedPhrase,
+      validFromMs: Date.now() - 30 * 60 * 1000 });
+    process.stderr.write(`Exceptional LIVE recovery approval authenticated sha256=${exceptionalRecoveryApproval.approval_file_sha256}\n`);
+  }
   // Preserve the full invocation for re-entry by the lock-holding child. That
   // child must independently re-establish both LIVE and GCE admission.
+  const effectiveSharedArgv = [];
+  for (let index = 0; index < sharedArgv.length; index += 1) {
+    if (sharedArgv[index] === "--exceptional-recovery" || sharedArgv[index] === "--recovery-approval-file") {
+      if (sharedArgv[index] === "--recovery-approval-file") index += 1;
+      continue;
+    }
+    effectiveSharedArgv.push(sharedArgv[index]);
+  }
   return sharedMain({
-    argv: sharedArgv, reentryArgv: argv, runnerPermit,
-    entrypoint: fileURLToPath(import.meta.url),
+    argv: effectiveSharedArgv, reentryArgv: argv, runnerPermit,
+    entrypoint: fileURLToPath(import.meta.url), exceptionalRecoveryApproval,
   });
 }
 
