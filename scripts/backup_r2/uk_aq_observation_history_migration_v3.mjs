@@ -1681,6 +1681,7 @@ export function v2RuntimeAuthorityAdapters({ rollbackEvidence, repositoryRoot, r
 // This avoids duplicating its hash encoding or rebuilding/replacing the plan.
 async function validateMigrationPublicationSchedule(plan) {
   const validated = new Error("V3 publication schedule validated");
+  process.stderr.write("V3 migration: schedule validation start\n");
   try {
     await finalizeObservationHistoryIndexV3Publication({
       plan,
@@ -1689,7 +1690,11 @@ async function validateMigrationPublicationSchedule(plan) {
       recordDurableEvidence: async () => { throw new Error("Unexpected validation evidence"); },
     });
   } catch (error) {
-    if (error === validated) return;
+    if (error === validated) {
+      process.stderr.write("V3 migration: schedule validation complete\n");
+      return;
+    }
+    process.stderr.write("V3 migration: schedule validation failed\n");
     throw error;
   }
   throw new Error("V3 publication validation did not reach the publication boundary");

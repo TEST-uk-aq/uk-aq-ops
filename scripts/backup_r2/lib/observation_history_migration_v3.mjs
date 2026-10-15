@@ -3186,13 +3186,16 @@ function completePreparedV3Plan({ checkpoint, authority, units: canonicalUnits, 
       durable: true,
     })),
   ];
+  onProgress?.({ phase: "v3_publication_schedule_start" });
   const v3PublicationPlan = buildObservationHistoryIndexV3PublicationPlan({
     objects: v3Objects,
     externalReferences,
     onProgress: onProgress
       ? ({ completed, total }) => onProgress({ phase: "v3_publication_plan", completed, total })
       : null,
+    onPhase: onProgress ? (phase) => onProgress({ phase }) : null,
   });
+  onProgress?.({ phase: "v3_publication_schedule_complete" });
   onProgress?.({ phase: "complete", canonical: canonicalObjects.length, v3: v3Objects.length });
   return Object.freeze({
     ...authority,
@@ -3910,9 +3913,18 @@ export async function executeObservationHistoryV3MigrationPlan({
   reportObservationHistoryV3Memory({ phase: "final_index_schedule_start", checkpoint, adapters });
   let completedPlan;
   try {
+    const scheduleMemoryPhases = new Set([
+      "v3_hierarchies", "v3_publication_schedule_start",
+      "v3_schedule_hashing_start", "v3_schedule_hashing_complete",
+    ]);
     completedPlan = completePreparedV3Plan({
       checkpoint, authority: checkpoint.authority, ...currentCanonical,
-      onProgress: onCurrentProgress,
+      onProgress: (event) => {
+        if (scheduleMemoryPhases.has(event.phase)) {
+          reportObservationHistoryV3Memory({ phase: event.phase, checkpoint, adapters });
+        }
+        onCurrentProgress?.(event);
+      },
     });
   } catch (error) {
     reportObservationHistoryV3Memory({ phase: "final_index_schedule_failed", checkpoint, adapters });
