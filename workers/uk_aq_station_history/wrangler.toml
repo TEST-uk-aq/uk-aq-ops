@@ -13,3 +13,5 @@ persist = true
 
 # No routes or custom domains: this Worker is reachable only through the
 # uk-aq-cache-proxy STATION_HISTORY Service Binding.
+# UK_AQ_RECENT_AQI_PROTOTYPE_ENABLED defaults to false and requires an
+# explicitly configured UK_AQ_RECENT_AQI_PROTOTYPE_TIMESERIES_ID in TEST.

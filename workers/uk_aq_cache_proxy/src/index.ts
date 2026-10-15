@@ -70,6 +70,7 @@ export interface Env {
   UK_AIR_ERROR_DROPBOX_FOLDER: unknown;
   UK_AQ_WEBSITE_DEBUG_LOG_MAX_BODY_BYTES: unknown;
   UK_AQ_STATION_HISTORY_STATION_SERIES_ENABLED: unknown;
+  UK_AQ_RECENT_AQI_PROTOTYPE_ENABLED: unknown;
   UK_AQ_STATION_HISTORY_AQI_HISTORY_ENABLED: unknown;
   UK_AQ_STATION_HISTORY_TIMESERIES_ENABLED: unknown;
   UK_AQ_STATION_HISTORY_STALE_FALLBACK_ENABLED: unknown;
@@ -2913,6 +2914,32 @@ export default {
 
     if (request.method !== "GET" && request.method !== "HEAD") {
       return makeErrorResponse(405, "method_not_allowed", requestOrigin, allowedOrigins);
+    }
+
+    if (url.pathname === "/api/aq/recent-aqi-prototype") {
+      if (request.method !== "GET") return makeErrorResponse(405, "method_not_allowed", requestOrigin, allowedOrigins);
+      if (requestOrigin === null) return makeErrorResponse(400, "origin_required", requestOrigin, allowedOrigins);
+      if (!isOriginAllowed(requestOrigin, allowedOrigins)) return makeErrorResponse(403, "origin_not_allowed", requestOrigin, allowedOrigins);
+      const sessionToken = getCookieValue(request.headers.get("Cookie"), SESSION_COOKIE_NAME);
+      if (!sessionToken) return makeErrorResponse(401, "missing_session_cookie", requestOrigin, allowedOrigins);
+      const authCheck = await verifyAccessToken(sessionToken, tokenSecret, requestOrigin);
+      if (!authCheck.ok) return makeErrorResponse(401, authCheck.error, requestOrigin, allowedOrigins);
+      if (String(env.UK_AQ_ENV_NAME) !== "TEST"
+        || String(await readSecret(env.UK_AQ_RECENT_AQI_PROTOTYPE_ENABLED)) !== "true") {
+        return makeErrorResponse(404, "route_not_found", requestOrigin, allowedOrigins);
+      }
+      if (!env.STATION_HISTORY) return makeErrorResponse(503, "station_history_binding_unavailable", requestOrigin, allowedOrigins);
+      const internalUrl = new URL(`https://station-history.internal/v1/recent-aqi-prototype${url.search}`);
+      let internalResponse: Response;
+      try {
+        internalResponse = await env.STATION_HISTORY.fetch(new Request(internalUrl, { method: "GET" }));
+      } catch {
+        return makeErrorResponse(502, "prototype_upstream_unavailable", requestOrigin, allowedOrigins);
+      }
+      const responseHeaders = new Headers(internalResponse.headers);
+      responseHeaders.set("Cache-Control", "no-store");
+      addCorsHeaders(responseHeaders, requestOrigin, allowedOrigins);
+      return new Response(internalResponse.body, { status: internalResponse.status, headers: responseHeaders });
     }
 
     const prototypeMatch = /^\/api\/aq\/chart-history-prototype\/(manifest|month|aqi)$/.exec(url.pathname);

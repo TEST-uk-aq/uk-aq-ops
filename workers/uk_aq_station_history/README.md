@@ -95,3 +95,39 @@ Optional TEST tuning uses safe in-code defaults when absent:
 
 The index_v3 physical-page budget is a fixed safety bound, not an environment
 variable or public pagination control.
+
+## Isolated recent AQI CPU prototype (TEST only)
+
+`GET /api/aq/recent-aqi-prototype` reaches the private
+`/v1/recent-aqi-prototype` Service Binding route through the authenticated
+cache proxy. It requires the normal origin and session cookie even when local
+development bypass is enabled. Both Workers require `UK_AQ_ENV_NAME=TEST` and
+`UK_AQ_RECENT_AQI_PROTOTYPE_ENABLED=true`; the private Worker additionally
+requires `UK_AQ_RECENT_AQI_PROTOTYPE_TIMESERIES_ID` to be one explicitly
+approved physical AURN PM2.5 timeseries ID. All values are absent or off by
+default. A missing allowlist fails closed.
+
+The request has exactly three query parameters: `timeseries_id`,
+`pollutant=pm25`, and `timestamp_hour_utc` (an exact UTC hour, currently the
+latest completed hour). The response contains one calculated AQI row with
+independent DAQI and EAQI statuses, its actual physical identity, the
+hour-ending interval and source counts. It is never cached. A header
+`X-UK-AQ-Prototype-Route: recent-aqi-ingestdb` makes this route identifiable in
+Cloudflare request telemetry.
+
+This first experiment uses **IngestDB only** through the existing
+`uk_aq_timeseries_rpc`. It does not read canonical R2 and cannot claim complete
+merged chart authority. It requests the 24 represented hours `(n-24h,n]`
+using `since_ts`, preserves individual source rows for the derived hourly
+means, and calls the shared AQI helper for rolling and index calculation.
+The RPC's seven-day label is only a lower-window safeguard; `since_ts` is the
+effective narrow filter. The RPC has no upper bound, so at most the hour after
+the requested endpoint can also be returned and is counted but excluded.
+
+Fixed limits: one output endpoint, one physical timeseries, 24 hours of AQI
+input, 128 raw input rows (129th sentinel), 48 KiB observation response,
+8 KiB identity response, 2.5 s per upstream request and 4 s overall elapsed
+budget checked between stages. Exceeded row/byte limits fail the request.
+These are workload bounds, not evidence of CPU acceptance. Real TEST Worker
+telemetry must establish CPU p50/p95/p99/maximum and `exceededCpu` after a
+separately authorised deployment.
