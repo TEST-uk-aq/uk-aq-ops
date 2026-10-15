@@ -14,6 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
+import v8 from "node:v8";
 
 import {
   parquetMetadataAsync,
@@ -3050,7 +3051,8 @@ export function buildObservationHistoryV3MigrationPlanFromCheckpoint({
 // Validate a possible interrupted append against committed state. This is a
 // local authentication gate, never an R2 verifier or a completion inference.
 export function validateObservationHistoryV3RecoveryAppend({ checkpoint, updates }) {
-  const authority = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
+  buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint, validateOnly: true });
+  const authority = checkpoint.authority;
   const units = new Map(authority.units.map((unit) => [unit.unit_id, unit]));
   const records = new Map(Object.entries(checkpoint.prepared_units));
   const added = [];
@@ -3263,12 +3265,61 @@ async function verifyCurrentMigrationObjectIdentity({
   });
 }
 
+// The plan is a JSON authority graph with shared references (for example,
+// inventory manifests also appear in units). Walk iteratively so archive-sized
+// plans cannot overflow the JS call stack. Typed arrays cannot be frozen safely
+// and must never be admitted as shared JSON authority.
+function freezeSharedJsonAuthority(root) {
+  const pending = [root];
+  const seen = new WeakSet();
+  while (pending.length) {
+    const value = pending.pop();
+    if (value === null || typeof value !== "object" || seen.has(value)) continue;
+    if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer ||
+        (!Array.isArray(value) && ![Object.prototype, null].includes(Object.getPrototypeOf(value)))) {
+      throw new Error("Shared migration authority contains non-JSON mutable data");
+    }
+    seen.add(value);
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key === "symbol") throw new Error("Shared migration authority contains a symbol key");
+      const property = Object.getOwnPropertyDescriptor(value, key);
+      if (!Object.hasOwn(property, "value")) throw new Error("Shared migration authority contains an accessor");
+      const child = property.value;
+      if (typeof child === "function" || typeof child === "symbol") {
+        throw new Error("Shared migration authority contains non-JSON data");
+      }
+      if (child && typeof child === "object") pending.push(child);
+    }
+    Object.freeze(value);
+  }
+  return root;
+}
+
+export function reportObservationHistoryV3Memory({ phase, checkpoint = null, adapters = null,
+  workerPool = null, completedPartitions = null, publicationEvidenceCount = null } = {}) {
+  const usage = process.memoryUsage();
+  const evidenceCount = publicationEvidenceCount ?? adapters?.getPublicationEvidenceCount?.() ?? 0;
+  process.stderr.write(`V3 migration memory ${JSON.stringify({
+    phase,
+    parent_heap_used: usage.heapUsed,
+    parent_heap_total: usage.heapTotal,
+    parent_external: usage.external,
+    parent_array_buffers: usage.arrayBuffers,
+    process_rss: usage.rss,
+    parent_heap_limit: v8.getHeapStatistics().heap_size_limit,
+    prepared_unit_count: checkpoint ? Object.keys(checkpoint.prepared_units || {}).length : 0,
+    completed_object_count: checkpoint ? Object.keys(checkpoint.completed_objects || {}).length : 0,
+    publication_evidence_count: evidenceCount,
+    completed_partitions: completedPartitions,
+    worker_memory: workerPool?.memorySummary() || null,
+  })}\n`);
+}
+
 function emptyCheckpoint(plan) {
-  // A locked side-by-side plan is already frozen at the root. Share that
-  // immutable authority within this invocation instead of cloning its large
-  // inventory. Historical/non-frozen plans retain the defensive copy.
+  // The fresh side-by-side authority is shared only after its complete JSON
+  // graph is immutable. Historical/non-frozen plans retain the defensive copy.
   const authority = plan.generation_topology === SIDE_BY_SIDE_TOPOLOGY && Object.isFrozen(plan)
-    ? plan : structuredClone(plan);
+    ? freezeSharedJsonAuthority(plan) : structuredClone(plan);
   return {
     schema_version: OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION,
     kind: "uk_aq_observation_history_v3_migration_checkpoint",
@@ -3531,9 +3582,10 @@ export async function executeObservationHistoryV3MigrationPlan({
   }
   const progressEnabled = true;
   if (rawCheckpoint) {
-    buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
+    buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint, validateOnly: true });
   } else {
     await adapters.writeCheckpoint(checkpoint);
+    reportObservationHistoryV3Memory({ phase: "checkpoint_initialized", checkpoint, adapters });
     const emptyConnectorProgress = createMigrationProgressReporter({
       label: "V3 migration: empty source connectors",
       total: plan.empty_source_connectors.length,
@@ -3589,6 +3641,7 @@ export async function executeObservationHistoryV3MigrationPlan({
   const phaseDurations = {};
   let phaseStarted = Date.now();
   await publishSideBySideBindings({ plan, checkpoint, adapters, publicationConcurrency });
+  reportObservationHistoryV3Memory({ phase: "bindings_published", checkpoint, adapters });
   phaseDurations.binding_publication_ms = Date.now() - phaseStarted;
   phaseStarted = Date.now();
   const allowLegacyRecoveryOrdering = false;
@@ -3647,7 +3700,9 @@ export async function executeObservationHistoryV3MigrationPlan({
   ).length;
   let completedSourceRows = plan.units.filter((unit) => checkpoint.prepared_units[unit.unit_id]?.files_published === true).reduce((sum, unit) => sum + unit.source_row_count, 0);
   partitionProgress.report(completedPartitions, { rows: completedSourceRows });
-  const parquetEvidence = [];
+  const parquetEvidenceSummary = { object_count: 0, total_bytes: 0,
+    stored_sha256_verified_count: 0, reused_count: 0, published_count: 0,
+    object_details_excluded: true };
   const pool = new MigrationWorkerPool(partitionConcurrency);
   const sourceByKey = new Map(plan.inventory.partitions.map((partition) => [partition.manifest_identity.key, partition]));
   try {
@@ -3796,7 +3851,13 @@ export async function executeObservationHistoryV3MigrationPlan({
         await withMigrationBatchEvidence(settled, () => persistCompletedObjectBatch({
           checkpoint, evidence: safe, writeCheckpoint: adapters.writeCheckpoint,
         }));
-        parquetEvidence.push(...safe);
+        for (const evidence of safe) {
+          parquetEvidenceSummary.object_count += 1;
+          if (Number.isSafeInteger(evidence.byte_size) && evidence.byte_size >= 0) parquetEvidenceSummary.total_bytes += evidence.byte_size;
+          if (evidence.stored_sha256_verified === true) parquetEvidenceSummary.stored_sha256_verified_count += 1;
+          if (evidence.reused === true) parquetEvidenceSummary.reused_count += 1;
+          else parquetEvidenceSummary.published_count += 1;
+        }
         publishedFiles += safe.length;
         fileProgress.report(publishedFiles);
       }
@@ -3822,12 +3883,21 @@ export async function executeObservationHistoryV3MigrationPlan({
           completedPartitions += 1;
           completedSourceRows += authorityUnit.source_row_count;
           partitionProgress.report(completedPartitions, { rows: completedSourceRows });
+          if (completedPartitions % 250 === 0 || completedPartitions === plan.units.length) {
+            reportObservationHistoryV3Memory({ phase: "partition_milestone", checkpoint, adapters,
+              workerPool: pool, completedPartitions });
+          }
         }
       }
     }
-  } finally { await pool.close(); }
+  } finally {
+    reportObservationHistoryV3Memory({ phase: "partition_workers_complete", checkpoint, adapters,
+      workerPool: pool, completedPartitions });
+    await pool.close();
+  }
   phaseDurations.partition_transform_and_publication_ms = Date.now() - phaseStarted;
   phaseStarted = Date.now();
+  reportObservationHistoryV3Memory({ phase: "canonical_reconstruction_start", checkpoint, adapters });
   const { currentCanonical, reverifiedCanonical } = earlyCanonicalGate || await verifyCanonicalGate();
   // Early verification may precede staging-reference cleanup. Refresh only this
   // invocation's staging progress; canonical bytes/dependencies remain checked.
@@ -3837,10 +3907,18 @@ export async function executeObservationHistoryV3MigrationPlan({
       (entry) => Object.freeze({ ...entry }),
     )),
   }));
-  const completedPlan = completePreparedV3Plan({
-    checkpoint, authority: checkpoint.authority, ...currentCanonical,
-    onProgress: onCurrentProgress,
-  });
+  reportObservationHistoryV3Memory({ phase: "final_index_schedule_start", checkpoint, adapters });
+  let completedPlan;
+  try {
+    completedPlan = completePreparedV3Plan({
+      checkpoint, authority: checkpoint.authority, ...currentCanonical,
+      onProgress: onCurrentProgress,
+    });
+  } catch (error) {
+    reportObservationHistoryV3Memory({ phase: "final_index_schedule_failed", checkpoint, adapters });
+    throw error;
+  }
+  reportObservationHistoryV3Memory({ phase: "complete_publication_schedule", checkpoint, adapters });
   onReconstructedPlan?.(completedPlan);
   const canonicalPublicationProgress = createMigrationProgressReporter({
     label: "V3 migration: canonical publication objects",
@@ -3901,6 +3979,7 @@ export async function executeObservationHistoryV3MigrationPlan({
     throwMigrationBatchFailures(outcome);
   }
   phaseDurations.canonical_publication_ms = Date.now() - phaseStarted;
+  reportObservationHistoryV3Memory({ phase: "canonical_published", checkpoint, adapters });
   phaseStarted = Date.now();
   const v3PublicationProgress = createMigrationProgressReporter({
     label: "V3 migration: v3 publication objects",
@@ -3964,6 +4043,7 @@ export async function executeObservationHistoryV3MigrationPlan({
     completionProgress.report(offset + chunk.length);
   }
   phaseDurations.exact_leaf_publication_ms = Date.now() - phaseStarted;
+  reportObservationHistoryV3Memory({ phase: "exact_leaf_published", checkpoint, adapters });
   phaseStarted = Date.now();
   await testHooks?.afterV3Finalization?.({
     checkpoint: structuredClone(checkpoint),
@@ -3979,14 +4059,16 @@ export async function executeObservationHistoryV3MigrationPlan({
     cleanStartEvidence: checkpoint.clean_target_admission,
   });
   phaseDurations.independent_verification_ms = Date.now() - phaseStarted;
+  reportObservationHistoryV3Memory({ phase: "independent_verification_complete", checkpoint, adapters });
   checkpoint.full_verification_complete = verification.ok;
   checkpoint.cutover_ready = verification.cutover_ready;
   await adapters.writeCheckpoint(checkpoint, { finalState: true });
+  reportObservationHistoryV3Memory({ phase: "final_checkpoint_persisted", checkpoint, adapters });
   return Object.freeze({
     ok: verification.ok,
     status: verification.cutover_ready ? "cutover_ready" : "blocked",
     dry_run: false,
-    parquet_evidence: Object.freeze(parquetEvidence),
+    parquet_evidence_summary: Object.freeze(parquetEvidenceSummary),
     v3_publication: v3Publication,
     verification,
     phase_durations_ms: Object.freeze(phaseDurations),

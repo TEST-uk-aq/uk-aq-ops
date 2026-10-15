@@ -73,6 +73,7 @@ import {
   DEFAULT_V3_LATEST_KEY,
   executeObservationHistoryV2Rollback,
   executeObservationHistoryV3MigrationPlan,
+  reportObservationHistoryV3Memory,
   inventoryAuthoritativeCanonicalObservationHistory,
   stableMigrationJson,
   validateObservationHistoryV3MigrationEnvironment,
@@ -463,7 +464,8 @@ function recoveryManifestPayload({
   repositoryRoot,
   recoveryImplementation = null,
 }) {
-  const plan = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
+  buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint, validateOnly: true });
+  const plan = checkpoint.authority;
   return Object.freeze({
     original_checkpoint: checkpointFileIdentity(checkpointPath),
     immutable_authority_sha256: checkpoint.authority_sha256,
@@ -620,7 +622,7 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
     replayProgress.report(index + 1);
   }
   if (replay.interrupted_append) {
-    buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
+    buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint, validateOnly: true });
     if (publicationEvidence.length || interruptedPreparedPlan?.v3_publication_plan) {
       const prepared = interruptedPreparedPlan || buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint, requirePrepared: true });
       const recovered = new Set(validateRecoveredPublicationEvidence(prepared.v3_publication_plan, publicationEvidence).map((entry) => entry.key));
@@ -740,7 +742,15 @@ export function buildObservationHistoryV3RecoveryProgressContext({
   // A newly created empty journal has no state to replay into a separate
   // checkpoint. Reuse the fresh checkpoint rather than deep-cloning its large
   // immutable plan; interrupted/resumed journals keep an independent copy.
-  const freshEmptyJournal = createdManifest && !fs.existsSync(paths.head) &&
+  const emptyRecord = (value) => value && typeof value === 'object' &&
+    !Array.isArray(value) && Object.keys(value).length === 0;
+  const freshCheckpoint = checkpoint?.kind === 'uk_aq_observation_history_v3_migration_checkpoint' &&
+    checkpoint.progress_format === 'authenticated-journal-v1' &&
+    checkpoint.clean_target_admission === null &&
+    checkpoint.full_verification_complete === false && checkpoint.cutover_ready === false &&
+    emptyRecord(checkpoint.prepared_units) && emptyRecord(checkpoint.completed_objects) &&
+    Array.isArray(checkpoint.preparation_order) && checkpoint.preparation_order.length === 0;
+  const freshEmptyJournal = createdManifest && freshCheckpoint && !fs.existsSync(paths.head) &&
     (!fs.existsSync(paths.entries) || fs.readdirSync(paths.entries).length === 0);
   const recoveredCheckpoint = freshEmptyJournal ? checkpoint : structuredClone(checkpoint);
   const replay = replayRecoveryJournal({
@@ -768,7 +778,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     preparedState: preparedProgressState(recoveredCheckpoint),
     completedEvidence: new Map(
       Object.entries(recoveredCheckpoint.completed_objects || {}).map(
-        ([key, evidence]) => [key, structuredClone(evidence)],
+        ([key, evidence]) => [key, Object.freeze(evidence)],
       ),
     ),
     preparationOrder: [...(recoveredCheckpoint.preparation_order || [])],
@@ -822,7 +832,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
       const previous = context.completedEvidence.get(key);
       if (!evidence || evidence.verified !== true || evidence.durable !== true) throw new Error(`Invalid completed delta: ${key}`);
       if (previous && stableMigrationJson(previous) !== stableMigrationJson(evidence)) throw new Error(`Completed-object evidence changed for ${key}`);
-      if (!previous) { (updates.completed_objects ||= []).push({ key, evidence }); completedNext.set(key, structuredClone(evidence)); }
+      if (!previous) { (updates.completed_objects ||= []).push({ key, evidence }); completedNext.set(key, Object.freeze(evidence)); }
     }
     for (const unitId of preparedUnitIds) {
       const record = current.prepared_units[unitId];
@@ -920,7 +930,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     context.preparedState = preparedProgressState(current);
     context.completedEvidence = new Map(
       Object.entries(current.completed_objects || {}).map(
-        ([key, evidence]) => [key, structuredClone(evidence)],
+        ([key, evidence]) => [key, Object.freeze(evidence)],
       ),
     );
     context.preparationOrder = [...currentOrder];
@@ -1402,7 +1412,7 @@ function compactMigrationResult(result, mode, checkpoint) {
       status: result?.status,
       dry_run: result?.dry_run,
       checkpoint_summary: checkpointSummary(result?.checkpoint || checkpoint),
-      parquet_evidence_summary: parquetEvidenceSummary(result?.parquet_evidence),
+      parquet_evidence_summary: result?.parquet_evidence_summary || parquetEvidenceSummary(result?.parquet_evidence),
       v3_publication: v3PublicationSummary(result?.v3_publication),
       verification: compactVerificationReport(result?.verification),
     };
@@ -1876,9 +1886,9 @@ function buildR2Adapters({
   const requireHealthyJournal = () => {
     if (recoveryProgress?.poisoned) throw new Error('Recovery journal persistence failed; publication is forbidden until authenticated restart');
   };
-  const durableEvidence = recoveryProgress
-    ? [...recoveryProgress.publicationEvidence]
-    : [];
+  // The authenticated journal owns recovery publication evidence. Keep a
+  // separate array only for the legacy non-journal evidence file.
+  const durableEvidence = [];
   const evidencePath = checkpointOut && !recoveryProgress
     ? `${path.resolve(checkpointOut)}.publication.json`
     : null;
@@ -1899,7 +1909,6 @@ function buildR2Adapters({
         const chunk = entries.slice(offset, offset + 16);
         const result = await recoveryProgress.recordPublicationEvidenceBatch(chunk);
         if (result?.durable !== true) throw new Error('Journal did not prove publication durability');
-        durableEvidence.push(...chunk.map((entry) => ({ ...entry })));
       }
       return { durable: true };
     }
@@ -1933,7 +1942,8 @@ function buildR2Adapters({
     }); },
     recordDurableEvidence: (entry) => recordDurableEvidenceBatch([entry]),
     recordDurableEvidenceBatch,
-    getDurablePublicationEvidence: () => durableEvidence.map((entry) => ({ ...entry })),
+    getDurablePublicationEvidence: () => (recoveryProgress?.publicationEvidence || durableEvidence).map((entry) => ({ ...entry })),
+    getPublicationEvidenceCount: () => (recoveryProgress?.publicationEvidence || durableEvidence).length,
     writeCheckpoint: async (checkpoint, delta) => {
       if (recoveryProgress) return recoveryProgress.persistCheckpoint(checkpoint, delta);
       if (!freshJournal) return atomicWriteJson(checkpointOut, checkpoint);
@@ -2006,7 +2016,7 @@ function buildR2Adapters({
     getBackupObject,
     finalizeV3Publication: (options) =>
       finalizeMigrationV3Publication({ ...options, publicationConcurrency, runnerPermit,
-        recoveredPublicationEvidence: recoveryProgress ? [...recoveryProgress.publicationEvidence] : [] }),
+        recoveredPublicationEvidence: recoveryProgress ? recoveryProgress.publicationEvidence : [] }),
     rebuildV2Indexes: () => runHistoryIndexBuild({
       argv: ["--history-version", "v2", "--domain", "observations", "--write-r2"],
       env,
@@ -2190,6 +2200,7 @@ async function runSideBySideMigrationOperator({
   let postPlanApproval = null;
   let completePlanReference = null;
   const phaseDurations = {};
+  reportObservationHistoryV3Memory({ phase: "planning_start" });
   const r2AdapterCalls = { reads: { attempted: 0, completed: 0, failed: 0, body_bytes: 0 },
     writes: { attempted: 0, completed: 0, failed: 0, body_bytes: 0 } };
   // Construct only R2/local adapters. No Dropbox reader or deployment adapter.
@@ -2261,6 +2272,8 @@ async function runSideBySideMigrationOperator({
         source_in_flight_bytes: migrationConcurrencyLimits(runnerPermit).sourceInFlightBytes,
         publication_in_flight_bytes: migrationConcurrencyLimits(runnerPermit).publicationInFlightBytes },
       planning_clean_target_admission: planningAdmission });
+    reportObservationHistoryV3Memory({ phase: "planning_complete", checkpoint,
+      publicationEvidenceCount: recoveryProgress?.publicationEvidence.length || 0 });
     process.stderr.write(`V3 migration: runner=${runnerPermit?.runner_profile || 'local-conservative'} inventory_concurrency=${args.inventoryConcurrency} legacy_hash_concurrency=${runnerPermit ? 4 : 1} partition_concurrency=${args.partitionConcurrency} publication_concurrency=${args.publicationConcurrency}\n`);
     if (checkpoint) {
       const hasJournal = fs.existsSync(recoveryProgressPaths(args.checkpointIn).manifest);
@@ -2292,6 +2305,7 @@ async function runSideBySideMigrationOperator({
       assertLockHeld();
       completePlanReference = persistShardedMigrationPlan(completePlanPath, plan);
       readShardedMigrationPlan(completePlanReference);
+      reportObservationHistoryV3Memory({ phase: "plan_persisted" });
       if (plan.mutation_allowed !== true || !Array.isArray(plan.blockers) || plan.blockers.length) {
         throw new Error("Combined plan has blockers or lacks mutation authority");
       }
@@ -2312,10 +2326,10 @@ async function runSideBySideMigrationOperator({
           args.apply !== true || args.writersFrozen !== true) {
         throw new Error("Post-plan approval or frozen-writer/apply intent changed before mutation");
       }
-      const durablePlan = readShardedMigrationPlan(completePlanReference);
-      if (durablePlan.full_plan_sha256 !== sha256StableMigrationJson(plan)) {
+      if (readShardedMigrationPlan(completePlanReference).full_plan_sha256 !== sha256StableMigrationJson(plan)) {
         throw new Error('Persisted complete plan changed before approved migration');
       }
+      reportObservationHistoryV3Memory({ phase: "approved_plan_authenticated" });
       await verifySideBySideSourceRoot({ plan, getObject: adapters.getObject });
       assertLockHeld();
       const migrationStarted = Date.now();
