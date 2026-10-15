@@ -110,8 +110,27 @@ normalising views through an administrator, not the collector. Provision
 `uk_aq_gcp_billing_live` and its restricted user(s), apply canonical
 `gcp_billing.sql` with that database selected and apply
 `gcp_billing_grants_live.sql` after users exist. No cross-environment
-grants. Do not start collection/backfill until the actual exports are
-sufficiently populated and sources/grants have been checked.
+grants. Once both exports contain verified data and source/grant checks have passed,
+the initial LIVE backfill may start while Google's historical export is still
+catching up. The backfill fixes its source snapshot at its initial cutoff and
+processes the available usage-date range; on completion, the incremental
+watermark is the **newest actual `export_time` in that snapshot**, not the
+wall-clock time when the backfill began. Incremental collection can then
+discover subsequently delivered days whose `export_time` is newer than that
+watermark (with the usual overlap).
+
+**An early backfill is not proof of complete historical coverage.** If Google
+subsequently adds rows with `export_time` older than the current watermark,
+normal incremental discovery cannot necessarily see them. After the initial
+Google export has caught up, explicitly reconcile the complete historical
+usage-date interval with bounded `refresh --start YYYY-MM-DD --end YYYY-MM-DD`
+runs for **each source independently**, including dates initially absent from
+the export. Each inclusive refresh range may contain at most
+`UK_AQ_BILLING_MAXIMUM_DAYS_PER_BATCH` dates. Check both source watermarks,
+usage-date coverage, archive and MySQL totals against BigQuery before
+declaring the initial history complete. If Google's export reveals an earlier
+first usage date than the configured, identity-bound history boundary, stop
+and review an isolated rebuild rather than changing the bound file in place.
 
 ## Offline structural commands from LIVE Ops
 
