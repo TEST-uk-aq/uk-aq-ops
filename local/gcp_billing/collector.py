@@ -195,7 +195,14 @@ def select_window(db, queries, c, source, mode, state, args):
         last = min(state['backfill_last_date'], start + timedelta(days=cap - 1))
         days = [start + timedelta(days=i) for i in range((last - start).days + 1)]
         final = last == state['backfill_last_date']
-        return days, cutoff, None, cutoff if final else None, state['newest_export_time'], last + timedelta(days=1)
+        # Google can populate historical exports long after their export_time.
+        # The local snapshot cutoff is not an upstream export-time watermark:
+        # using it would skip subsequently delivered older-dated exports.
+        # Start incremental discovery from the newest export_time observed at
+        # the backfill snapshot, with the normal configured overlap.
+        newest = state['newest_export_time']
+        require(newest is not None, 'EXPORT_TIME_MISSING')
+        return days, cutoff, None, newest if final else None, newest, last + timedelta(days=1)
     require(prior is not None, 'BACKFILL_REQUIRED')
     if mode == 'refresh':
         require(args.start and args.end, 'REFRESH_DATES_REQUIRED')
