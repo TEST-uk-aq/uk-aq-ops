@@ -737,7 +737,12 @@ export function buildObservationHistoryV3RecoveryProgressContext({
   if (stableMigrationJson(manifest.payload) !== stableMigrationJson(expectedManifestPayload)) {
     throw new Error("Recovery manifest does not match the original checkpoint or current recovery code");
   }
-  const recoveredCheckpoint = structuredClone(checkpoint);
+  // A newly created empty journal has no state to replay into a separate
+  // checkpoint. Reuse the fresh checkpoint rather than deep-cloning its large
+  // immutable plan; interrupted/resumed journals keep an independent copy.
+  const freshEmptyJournal = createdManifest && !fs.existsSync(paths.head) &&
+    (!fs.existsSync(paths.entries) || fs.readdirSync(paths.entries).length === 0);
+  const recoveredCheckpoint = freshEmptyJournal ? checkpoint : structuredClone(checkpoint);
   const replay = replayRecoveryJournal({
     paths,
     checkpoint: recoveredCheckpoint,
@@ -752,7 +757,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
       replay.publicationEvidence.length
     }\n`);
   }
-  buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint: recoveredCheckpoint });
+  buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint: recoveredCheckpoint, validateOnly: true });
   const context = {
     paths,
     manifest,

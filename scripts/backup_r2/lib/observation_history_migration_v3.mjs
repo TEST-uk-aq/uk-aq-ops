@@ -3004,6 +3004,7 @@ export function buildObservationHistoryV3MigrationPlanFromCheckpoint({
   allowLegacyRecoveryOrdering = false,
   legacyOriginalOrdering = false,
   onProgress = null,
+  validateOnly = false,
 }) {
   const authority = checkpoint?.authority;
   if (checkpoint?.progress_format !== undefined && checkpoint.progress_format !== 'authenticated-journal-v1') throw new Error('Unsupported migration progress format');
@@ -3037,7 +3038,9 @@ export function buildObservationHistoryV3MigrationPlanFromCheckpoint({
   ) {
     throw new Error("Migration checkpoint immutable authority is missing or invalid");
   }
-  if (!requirePrepared) return Object.freeze(structuredClone(authority));
+  // A recovery gate that only needs the authority identity must not clone the
+  // entire approved plan just to discard it after validation.
+  if (!requirePrepared) return validateOnly ? undefined : Object.freeze(structuredClone(authority));
   const { units, canonicalObjects } = reconstructPreparedCanonicalPlan({
     checkpoint, authority, allowLegacyRecoveryOrdering, legacyOriginalOrdering, onProgress,
   });
@@ -3261,7 +3264,11 @@ async function verifyCurrentMigrationObjectIdentity({
 }
 
 function emptyCheckpoint(plan) {
-  const authority = structuredClone(plan);
+  // A locked side-by-side plan is already frozen at the root. Share that
+  // immutable authority within this invocation instead of cloning its large
+  // inventory. Historical/non-frozen plans retain the defensive copy.
+  const authority = plan.generation_topology === SIDE_BY_SIDE_TOPOLOGY && Object.isFrozen(plan)
+    ? plan : structuredClone(plan);
   return {
     schema_version: OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION,
     kind: "uk_aq_observation_history_v3_migration_checkpoint",
