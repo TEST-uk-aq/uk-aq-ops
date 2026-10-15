@@ -425,21 +425,27 @@ The code includes one separately gated exception for the failed run
 subject to real TEST acceptance, independent review and separate operational
 authorisation.
 
-## One-off authorised LIVE recovery exception
+## Exceptional LIVE recovery
 
-This exception is restricted to the exact run, plan, original writer commit and
-immutable authority recorded in
-`exceptional_recovery_authority.mjs`. It preserves the original checkpoint,
-recovery manifest, head and numbered journal entries byte-for-byte. Before
-allowing the new implementation to append, it reads every implementation file
-from the pinned original Git commit and verifies the recorded sizes and hashes.
-It then binds approval to the new recovery code identity, current journal head
-and source-root identity. The operator creates a mode-0600 approval file owned
-by the execution account containing the exact phrase emitted by read-only
-preflight. The LIVE wrapper reauthenticates this file in the supervised child.
+This mechanism is restricted to the exact failed run, immutable plan, original
+writer commit and checkpoint authority recorded in
+`exceptional_recovery_authority.mjs`. The original journal prefix remains
+anchored at sequence 46,305 and its recorded SHA. The original checkpoint and
+recovery manifest are never rewritten. Recovery progress is replayed from the
+existing append-only journal, and the original implementation is verified
+against its pinned Git commit and recorded file identities. The separately
+approved recovery implementation is identified by its own clean `main` commit
+and exact active-file hashes.
 
-Run the preflight under the admitted GCE profile. Supply the established LIVE
-project, zone, writer-limits and work-directory values:
+The normal LIVE clean-build entry point still rejects checkpoint resume. These
+steps describe a guarded path for later review. They do not authorise
+LIVE recovery, and deployment of code does not provide that authorisation.
+
+### A. Read-only recovery preflight
+
+Run preflight under the admitted GCE profile. Supply the established LIVE
+project, zone, writer-limits and work-directory values, with the original
+checkpoint as both input and output and the original 48/16/80 concurrency:
 
 ```bash
 node scripts/backup_r2/uk_aq_observation_history_migration_v3_live_gcp.mjs \
@@ -452,21 +458,42 @@ node scripts/backup_r2/uk_aq_observation_history_migration_v3_live_gcp.mjs \
   --checkpoint-in "$WORK_DIR/checkpoint.json" \
   --checkpoint-out "$WORK_DIR/checkpoint.json" \
   --writer-limits-json "$WRITER_LIMITS_JSON" \
+  --inventory-concurrency 48 --partition-concurrency 16 --publication-concurrency 80 \
   --report-out "$WORK_DIR/recovery-preflight.json" \
   --exceptional-recovery --recovery-approval-file "$WORK_DIR/recovery.approval"
 ```
 
-Preflight authenticates the local checkpoint and journal and reads the exact
-LIVE source-root object. It does not acquire the migration lock, repair the
-journal, write R2, append evidence or start migration. Stop on any reported
-blocker. Review the preflight report and recovery-code identity, then create
-`$WORK_DIR/recovery.approval` with exactly the emitted `approval_phrase`, mode
-0600 and owned by the same account. The phrase binds the checkpoint, plan,
-authority, journal sequence/hash, original code, current recovery code and
-source root; any difference invalidates it.
+Preflight reads the local checkpoint, journal and epoch ledger and performs a
+read-only GET of the pinned LIVE v2 source-root object. It does not acquire the
+global migration lock, repair or append to the journal, write the epoch ledger,
+write R2, or start migration. It emits a blocker report on authentication
+failure and creates the approval phrase only when all pinned identities match.
+Stop on any blocker.
 
-Only after separate explicit LIVE operational authorisation, run the resume
-detached and preserve the log and PID:
+### B. Operator review and explicit approval
+
+Review the preflight report, original and current implementation identities,
+source root, checkpoint plan, journal frontier, previous recovery-epoch SHA and
+the checkpoint's recorded 48/16/80 concurrency. Create
+`$WORK_DIR/recovery.approval` with exactly the emitted `approval_phrase`, mode
+0600 and owned by the execution account. The phrase binds the original anchor,
+current journal frontier, next epoch number, previous epoch SHA, exact recovery
+code, source root, bucket, GCP project/zone/profile and repository `main`.
+Write and use the approval within 30 minutes of its file modification time. An
+approval is consumed once when its recovery-epoch record is durably appended.
+After any later interruption, perform a fresh preflight and create a new
+approval against the then-current journal frontier and epoch-ledger head. Use
+new, previously unused report and approval-file paths for every preflight; do
+not reuse a consumed approval file.
+
+### C. Separately authorised LIVE recovery execution
+
+Only after separate explicit LIVE operational authorisation, run the recovery
+detached and preserve the log and PID. The supervised child reacquires the
+existing global observation-operation lock, repeats admission and approval
+checks while holding it, revalidates the locked v2 source root, authenticates
+and semantically replays the journal, verifies reusable completed objects, and
+appends the new recovery-epoch record before migration publication resumes:
 
 ```bash
 nohup node scripts/backup_r2/uk_aq_observation_history_migration_v3_live_gcp.mjs \
@@ -479,18 +506,20 @@ nohup node scripts/backup_r2/uk_aq_observation_history_migration_v3_live_gcp.mjs
   --checkpoint-in "$WORK_DIR/checkpoint.json" \
   --checkpoint-out "$WORK_DIR/checkpoint.json" \
   --writer-limits-json "$WRITER_LIMITS_JSON" \
+  --inventory-concurrency 48 --partition-concurrency 16 --publication-concurrency 80 \
   --report-out "$WORK_DIR/recovery-report.json" \
-  --operator-authority-file "$OPERATOR_AUTHORITY_FILE" \
-  --expected-inventory-root-sha256 "$INVENTORY_ROOT_SHA256" \
-  --expected-state-root-sha256 "$STATE_ROOT_SHA256" \
-  --publication-concurrency 64 --partition-concurrency 16 \
   --apply --writers-frozen --exceptional-recovery \
   --recovery-approval-file "$WORK_DIR/recovery.approval" \
   >"$WORK_DIR/recovery.log" 2>&1 &
 echo $! >"$WORK_DIR/recovery.pid"
 ```
 
-This operation only resumes the build. Full independent verification and a
-durable final report remain mandatory. It must not switch runtime generation,
-deploy Workers, resume writers, delete history or automatically rerun after
-failure. Preserve all partial v3 objects and journal evidence for review.
+The migration appends progress to the authenticated recovery journal while
+preserving its original 46,305-entry prefix. The epoch authority is a separate
+append-only local ledger at
+`$WORK_DIR/checkpoint.json.exceptional-recovery-epochs/entries/`; it does not
+replace the original checkpoint, plan, manifest or journal anchor. Full
+independent verification and a durable final report remain mandatory. This
+operation does not switch runtime generation, deploy Workers, resume writers,
+delete history or automatically rerun after failure. Preserve partial v3
+objects, journal entries and epoch records for review.
