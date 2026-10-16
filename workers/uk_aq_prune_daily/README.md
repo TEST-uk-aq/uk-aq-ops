@@ -24,3 +24,26 @@ failures have an ambiguous storage outcome. The warning event
 secret, presigned URL or claim of recovered bytes. Reconciliation requires a
 separate private, bounded reader. No descriptor, receipt, control registration,
 monthly publication or remote acceptance is performed by this path.
+
+The optional pending preparation records a versioned, reproducible description
+of the complete frozen source and its exact byte identities. The compact
+source's `status` is effective `verification_status`, not proven original
+provider status. `original_source_status_unavailable` explicitly records that
+provenance gap; its null `source_status` makes no claim that the provider sent
+null. Existing canonical P/R/null values and bytes are left as written.
+The acknowledgment log exposes the preparation digest and intent reference;
+the description itself is not separately retained.
+
+After successful v3 batch finalization and the original protected gate return,
+Prune can prepare an original-final evidence envelope from already available
+connector manifests, child content hashes and status counts, canonical file
+identities, selected-v3 exact-scope references and final batch results. It runs
+only for an acknowledged pending upload. The envelope and gate-return statement
+remain transient and unverified; later gate consumption is allowed, but there
+is no retained original gate transaction proof. No canonical Parquet reread or
+additional derived-bucket write/readback occurs here. Thus neither event can
+authorize a Stage 1 VERIFIED receipt, JSONgen selection or monthly publication.
+Before TEST activation, verify real signer permissions, conditional PUT and
+private readback, budget limits, canonical finalization and gate results,
+interruption recovery, and a durable independently authenticated final evidence
+chain in a separately authorized deployment.

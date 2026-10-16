@@ -11,6 +11,7 @@ import os from "node:os";
 import readline from "node:readline";
 import { randomUUID } from "node:crypto";
 import { uploadPrunePendingSource, resolvePruneSignerConfig, PRUNE_SIGNED_UPLOAD_DEADLINE_MS } from "../../scripts/jsongen/prune-signed-upload.mjs";
+import { preparePruneOriginalFinalEvidence } from "../../scripts/jsongen/prune-final-evidence.mjs";
 import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import Cursor from "pg-cursor";
@@ -4043,6 +4044,8 @@ async function writeFrozenCandidateObservationsToV2({
           logPhaseB(runtime, "INFO", "phase_b_jsongen_pending_source_put_acknowledged", {
             run_id: runtime.run_id, day_utc: candidate.day_utc, connector_id: candidate.connector_id,
             intent_id: jsongenPendingSource.intent_id, source: jsongenPendingSource.source,
+            source_preparation_sha256: jsongenPendingSource.preparation_sha256,
+            original_source_status_provenance: jsongenPendingSource.pending_evidence?.original_source_status?.classification,
             eligibility: "unverified",
           });
         } catch (error) {
@@ -4050,6 +4053,7 @@ async function writeFrozenCandidateObservationsToV2({
             run_id: runtime.run_id, day_utc: candidate.day_utc, connector_id: candidate.connector_id,
             reason: error.code || "handover_failed",
             recoverable_reference: error.reference || null, intent_id: error.intent_id || null,
+            source_preparation_sha256: error.preparation_sha256 || null,
           });
         }
       }
@@ -4230,6 +4234,7 @@ async function finalizePublishedPhaseBConnectors({
   publishedCandidates,
   runFinalizer = finalizeSelectedObservationRun,
   completeCandidateAndGate = markCandidateAndConnectorGateComplete,
+  prepareJsonGenFinalEvidence = preparePruneOriginalFinalEvidence,
 }) {
   if (!Array.isArray(publishedCandidates) || publishedCandidates.length === 0) {
     return { finalized: false, completed: [], gate_failures: [], result: null, lock_diagnostics: [] };
@@ -4270,6 +4275,27 @@ async function finalizePublishedPhaseBConnectors({
         historyTotalBytes: connectorGateEvidence.history_total_bytes,
         sourceIdentity: exportResult.source_identity,
       });
+      if (runtime.history_write_version === "v3" &&
+          exportResult.jsongen_pending_source?.state === "put_acknowledged_unverified") {
+        try {
+          published.jsongen_final_evidence_preparation = prepareJsonGenFinalEvidence({
+            pending: exportResult.jsongen_pending_source,
+            connector: connectorGateEvidence.jsongen_connector_snapshot,
+            finalization: result, runId, dayUtc: candidate.day_utc,
+            connectorId: candidate.connector_id, writerGitSha: runtime.writer_git_sha,
+          });
+          logPhaseB(runtime, "INFO", "phase_b_jsongen_original_final_evidence_prepared", {
+            day_utc: candidate.day_utc, connector_id: candidate.connector_id,
+            preparation_sha256: published.jsongen_final_evidence_preparation.sha256,
+            retention_state: "transient_writer_memory_only", authority_state: "unretained_unverified",
+          });
+        } catch (error) {
+          logPhaseB(runtime, "WARNING", "phase_b_jsongen_original_final_evidence_unavailable", {
+            day_utc: candidate.day_utc, connector_id: candidate.connector_id,
+            reason: "incomplete_original_evidence_preparation",
+          });
+        }
+      }
       completed.push(published);
     } catch (error) {
       gateFailures.push({ published, error });
@@ -4907,6 +4933,7 @@ export async function verifyObservationConnectorHistory({
 
   const seenPollutants = new Set();
   const verifiedChildren = [];
+  const jsongenChildren = runtime.jsongen_pending_source?.enabled === true ? [] : null;
   for (const reference of childReferences) {
     assertBudget(runtime, "observation_history_verification", {
       day_utc: dayUtc,
@@ -4995,6 +5022,20 @@ export async function verifyObservationConnectorHistory({
       total_bytes: totalBytes,
       validation_scope: requiresActiveValidation ? "active" : "opaque_preserved",
     });
+    if (jsongenChildren) {
+      jsongenChildren.push({
+        pollutant_code: pollutantCode, row_count: rowCount,
+        observation_content_hash: childManifest.observation_content_hash,
+        observation_content_hash_contract_version: childManifest.observation_content_hash_contract_version,
+        verification_status_counts: childManifest.verification_status_counts,
+        manifest: { bucket: runtime.r2.bucket, key: childKey,
+          sha256: sha256Hex(childObject.body), byte_size: childObject.body.byteLength,
+          semantic_manifest_hash: childHash },
+        files: files.map(file => ({ key: file.key, row_count: file.row_count,
+          byte_size: file.bytes, sha256: file.etag_or_hash,
+          timeseries_row_counts: file.timeseries_row_counts || null })),
+      });
+    }
   }
 
   const rowCount = requireNonNegativeSafeInteger(connectorManifest.source_row_count, "source_row_count", manifestKey);
@@ -5045,6 +5086,22 @@ export async function verifyObservationConnectorHistory({
       history_row_count: rowCount, history_file_count: fileCount, history_total_bytes: totalBytes,
       connector_index_count: verifiedChildren.length, active_pollutant_count: verifiedChildren.length,
       opaque_preserved_pollutant_count: 0,
+      ...(jsongenChildren ? { jsongen_connector_snapshot: {
+        manifest_key: manifestKey, manifest_hash: connectorManifestHash,
+        run_id: connectorManifest.run_id,
+        day_utc: dayUtc, connector_id: connectorId,
+        connector_manifest: { bucket: runtime.r2.bucket, key: manifestKey,
+          sha256: sha256Hex(connectorObject.body), byte_size: connectorObject.body.byteLength },
+        pollutant_manifests: jsongenChildren,
+        scoped_roots: result.partitions.map(partition => ({
+          scope: partition.scope,
+          reference: { key: partition.scoped_root.evidence.key,
+            sha256: partition.scoped_root.evidence.sha256,
+            byte_size: partition.scoped_root.evidence.byte_size },
+        })),
+        source_row_count: rowCount, file_count: fileCount, total_bytes: totalBytes,
+        retention_state: "transient_writer_memory_only",
+      } } : {}),
     };
   }
 

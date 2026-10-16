@@ -12,7 +12,13 @@ R2 write credentials for this path. The signer selects an immutable private
 `managed/jsongen/v1/pending/unverified/prune_daily_v3/...` key and returns a
 60-second conditional PUT URL. Prune authenticates its metadata against the
 frozen source and sends exactly the signed headers and gzip bytes. There is no
-second descriptor object.
+second descriptor object. A version-1 pending evidence description is prepared
+from the frozen bytes and can be reproduced by the inactive private reader. It
+names the TEST v3 Prune attempt, complete connector/day and physical scope,
+source identity, exact NDJSON and gzip hashes and lengths, effective status
+counts, signer intent, object reference and PUT disposition. The description
+and its SHA-256 are transient writer data; the immutable gzip object is the
+only derived object offered for retention.
 
 The source keeps original row multiplicity, order, timestamp and numeric JSON
 values. Preparation is bounded at 100,000 rows, 32 MiB original, 8 MiB gzip
@@ -27,10 +33,27 @@ Source cleanup and canonical deletion gates keep their existing rules. There
 is no approved automatic expiry, complete-source receipt or publication
 eligibility from an upload intent or PUT acknowledgment.
 
-**Verified Stage 3A receipt creation is blocked.** The frozen representation
-currently collapses source `status` into `verification_status`; the canonical
-source/content hash does not separately authenticate `source_status`. The
-Stage 1 receipt additionally requires independently meaningful before/after,
+**Verified Stage 3A receipt creation is blocked.** The compact source's
+`status` is projected to effective `verification_status`; it is not authenticated
+original provider status. The version-1 pending description classifies original
+status as `original_source_status_unavailable`, with `source_status: null`
+meaning no original-provider assertion. Historical authenticated canonical
+null remains null. No age-based R inference or AURN default-P rewrite occurs;
+the AURN presentation policy and ratified-R protection remain owned by canonical
+authority, and no AURN-specific rule is applied to other connectors.
+
+After the v3 batch finalizer passes and the original protected candidate/gate
+transaction returns, Prune can prepare a version-1 original-final evidence
+envelope. It compares the pending partition content hashes, counts and effective
+statuses with the original canonical child manifests, and captures already-read
+connector/child manifest byte identities, canonical file metadata, selected-v3
+exact-scope references, final batch references and the gate return boundary.
+It adds no routine Parquet read and no derived R2 readback to canonical Prune.
+The preparation is transient memory only, with an unretained/unverified authority
+state. Mutable canonical keys and a later CONSUMED gate cannot reconstruct the
+original publication; no independently authenticated gate transaction receipt
+or immutable final snapshot is currently retained. The Stage 1 receipt
+additionally requires independently meaningful before/after,
 binding, provenance, scope-completeness and retained-receipt authority
 references. Current Prune finalisation returns verified aggregate/index/latest
 control-flow evidence but does not retain a byte-pinned, complete

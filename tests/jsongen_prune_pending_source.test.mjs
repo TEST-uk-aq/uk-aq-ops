@@ -90,6 +90,15 @@ test('frozen duplicates and exact bytes are sent through one authenticated inten
     assert.deepEqual(calls[1].options.body, prepared.body);
     assert.equal(calls[1].options.headers['If-None-Match'], '*');
     assert.equal(result.source.json_sha256, prepared.uncompressed_sha256);
+    assert.equal(result.pending_evidence.original_source_status.classification,
+      'original_source_status_unavailable');
+    assert.equal(result.pending_evidence.original_source_status.source_status, null);
+    assert.deepEqual(result.pending_evidence.effective_verification_status.counts,
+      { P: 2, R: 0, null: 0 });
+    assert.equal(result.pending_evidence.scope.physical_timeseries_days[0].row_count, 2);
+    assert.equal(result.pending_evidence.signed_upload.intent_id, result.intent_id);
+    assert.equal(result.pending_evidence.final_publication.state, 'outstanding');
+    assert.match(result.preparation_sha256, /^[a-f0-9]{64}$/);
   });
 });
 
@@ -181,7 +190,12 @@ test('isolated private reader verifies bounded stored bytes and source identity'
     const r2 = { bucket: BUCKET,
       endpoint: 'https://41a81f781d3bd7234fde0b25df51e879.r2.cloudflarestorage.com',
       region: 'auto', adapter: { async getObjectBounded() { return { body: stored, bytes: stored.length }; } } };
-    assert.equal((await verifyPrunePendingSource({ r2, reference, intentId, ...candidate })).state, 'source_bytes_verified');
+    const verified = await verifyPrunePendingSource({ r2, reference, intentId, ...candidate });
+    assert.equal(verified.state, 'source_bytes_verified');
+    assert.deepEqual(verified.pending_evidence, prepared.evidence);
+    await assert.rejects(verifyPrunePendingSource({ r2, reference, intentId,
+      expectedEvidenceSha256: '0'.repeat(64), ...candidate }),
+    { code: 'invalid_object_identity' });
     await assert.rejects(verifyPrunePendingSource({ r2, reference, intentId: 'a'.repeat(64), ...candidate }),
       { code: 'invalid_object_identity' });
     stored = Buffer.from('wrong');

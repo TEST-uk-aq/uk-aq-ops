@@ -1,7 +1,8 @@
 // Best-effort signed transport only. A PUT acknowledgment is not verified retention.
-import { BUCKET } from './schema.mjs';
+import { BUCKET, canonicalJson } from './schema.mjs';
 import { preparePrunePendingSource } from './prune-pending-source.mjs';
 import { isIP } from 'node:net';
+import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
 
 const HOST = '41a81f781d3bd7234fde0b25df51e879.r2.cloudflarestorage.com';
 const PREFIX = 'managed/jsongen/v1/pending/unverified/prune_daily_v3';
@@ -88,8 +89,10 @@ export async function uploadPrunePendingSource({ signer, fetchImpl = fetch,
   const controller = new AbortController();
   const started = Date.now();
   const timer = setTimeout(() => controller.abort(), deadlineMs);
+  let evidenceSha256 = null;
   try {
     const prepared = preparePrunePendingSource(candidate);
+    evidenceSha256 = sha256Hex(canonicalJson(prepared.evidence));
     if (Date.now() - started >= deadlineMs) throw failure('upload_deadline', 'Optional handover deadline exceeded');
     const request = { writer_identity: 'prune_daily_v3', invocation_id: candidate.runId,
       index_generation: 'v3', connector_id: candidate.connectorId, day_utc: candidate.dayUtc,
@@ -123,15 +126,25 @@ export async function uploadPrunePendingSource({ signer, fetchImpl = fetch,
       `Signed PUT outcome unknown: ${cause?.name || 'transport_error'}`); }
     if (controller.signal.aborted || Date.now() - started >= deadlineMs)
       throw putFailure('upload_ambiguous', 'Signed PUT returned after optional deadline; outcome needs reconciliation');
-    if (put.status >= 200 && put.status < 300) return { state: 'put_acknowledged_unverified',
-      intent_id: intent.intent_id, source: intent.object };
+    if (put.status >= 200 && put.status < 300) {
+      const pendingEvidence = { ...prepared.evidence, signed_upload: {
+        intent_id: intent.intent_id, object: intent.object,
+        disposition: 'put_acknowledged_unverified',
+      } };
+      return { state: 'put_acknowledged_unverified',
+        intent_id: intent.intent_id, source: intent.object,
+        pending_evidence: pendingEvidence, source_evidence_sha256: evidenceSha256,
+        preparation_sha256: sha256Hex(canonicalJson(pendingEvidence)) };
+    }
     if (put.status === 412) throw putFailure('upload_precondition_failed', 'Signed PUT precondition failed; independent readback required');
     if (put.status === 409 || put.status >= 500) throw putFailure('upload_ambiguous', `Signed PUT outcome unknown: HTTP ${put.status}`);
     throw putFailure('upload_rejected', `Signed PUT rejected: HTTP ${put.status}`);
   } catch (error) {
     if (controller.signal.aborted && error.code !== 'upload_ambiguous')
       throw Object.assign(failure('upload_deadline', 'Optional handover deadline exceeded'),
-        { reference: error.reference, intent_id: error.intent_id });
+        { reference: error.reference, intent_id: error.intent_id,
+          preparation_sha256: evidenceSha256 });
+    if (evidenceSha256) error.preparation_sha256 = evidenceSha256;
     throw error;
   } finally { clearTimeout(timer); }
 }

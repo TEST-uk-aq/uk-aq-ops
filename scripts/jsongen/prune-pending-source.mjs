@@ -5,6 +5,7 @@ import { gzipSync } from 'node:zlib';
 import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
 import { computePruneConnectorSourceIdentity, comparePruneConnectorSourceIdentities } from '../../workers/shared/uk_aq_prune_connector_source_identity.mjs';
 import { LIMITS, evidence } from './limits.mjs';
+import { describePrunePendingSource } from './prune-evidence.mjs';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
@@ -26,7 +27,7 @@ export function validatePrunePendingSourceRows(bytes, { dayUtc, connectorId, exp
   evidence(rows.length === expectedRowCount && rows.length > 0, 'invalid_frozen_source', 'frozen source row count changed');
   evidence(comparePruneConnectorSourceIdentities(computePruneConnectorSourceIdentity(rows), sourceIdentity).match,
     'invalid_frozen_source', 'frozen source content identity changed');
-  return rows.length;
+  return rows;
 }
 
 export function preparePrunePendingSource({ path, runId, dayUtc, connectorId, expectedRowCount, sourceIdentity }) {
@@ -39,11 +40,14 @@ export function preparePrunePendingSource({ path, runId, dayUtc, connectorId, ex
     'resource_limit', 'frozen source exceeds JSONgen uncompressed byte limit');
   const source = fs.readFileSync(path);
   evidence(source.length === size, 'invalid_frozen_source', 'frozen source size changed during read');
-  validatePrunePendingSourceRows(source, { dayUtc, connectorId, expectedRowCount, sourceIdentity });
+  const rows = validatePrunePendingSourceRows(source,
+    { dayUtc, connectorId, expectedRowCount, sourceIdentity });
   const compressed = gzipSync(source, { mtime: 0 });
   evidence(compressed.length <= LIMITS.compressed_bytes,
     'resource_limit', 'frozen source exceeds JSONgen compressed byte limit');
-  return { body: compressed, compressed_sha256: sha256Hex(compressed),
+  const evidenceEnvelope = describePrunePendingSource({ source, compressed, rows,
+    runId, dayUtc, connectorId, sourceIdentity });
+  return { body: compressed, evidence: evidenceEnvelope, compressed_sha256: sha256Hex(compressed),
     compressed_byte_size: compressed.length, uncompressed_sha256: sha256Hex(source),
     uncompressed_byte_size: source.length };
 }

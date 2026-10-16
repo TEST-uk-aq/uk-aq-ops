@@ -2,13 +2,14 @@
 import { gunzipSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
 import { r2GetObjectBounded, sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
-import { BUCKET } from './schema.mjs';
+import { BUCKET, canonicalJson } from './schema.mjs';
 import { LIMITS, evidence } from './limits.mjs';
 import { admitDerived } from './inputs.mjs';
 import { validatePrunePendingSourceRows } from './prune-pending-source.mjs';
+import { describePrunePendingSource } from './prune-evidence.mjs';
 
 export async function verifyPrunePendingSource({ r2, reference, intentId, runId, dayUtc,
-  connectorId, expectedRowCount, sourceIdentity }) {
+  connectorId, expectedRowCount, sourceIdentity, expectedEvidenceSha256 = null }) {
   admitDerived(r2);
   const prefix = `managed/jsongen/v1/pending/unverified/prune_daily_v3/connector_id=${connectorId}`
     + `/day_utc=${dayUtc}/invocation=${encodeURIComponent(runId)}`;
@@ -38,6 +39,13 @@ export async function verifyPrunePendingSource({ r2, reference, intentId, runId,
   catch { evidence(false, 'invalid_object_identity', 'pending gzip cannot be decoded within source limit'); }
   evidence(source.length === reference.json_byte_size && sha256Hex(source) === reference.json_sha256,
     'invalid_object_identity', 'pending original bytes differ');
-  validatePrunePendingSourceRows(source, { dayUtc, connectorId, expectedRowCount, sourceIdentity });
-  return { state: 'source_bytes_verified', intent_id: intentId, source: reference };
+  const rows = validatePrunePendingSourceRows(source,
+    { dayUtc, connectorId, expectedRowCount, sourceIdentity });
+  const pendingEvidence = describePrunePendingSource({ source, compressed: readback.body,
+    rows, runId, dayUtc, connectorId, sourceIdentity });
+  const evidenceSha256 = sha256Hex(canonicalJson(pendingEvidence));
+  evidence(expectedEvidenceSha256 === null || expectedEvidenceSha256 === evidenceSha256,
+    'invalid_object_identity', 'pending source evidence declaration differs from stored bytes');
+  return { state: 'source_bytes_verified', intent_id: intentId, source: reference,
+    pending_evidence: pendingEvidence, evidence_sha256: evidenceSha256 };
 }

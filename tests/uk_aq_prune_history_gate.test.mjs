@@ -1096,6 +1096,10 @@ test("Phase B accepts the real v3 finalization shape before connector gating", a
     publishedCandidateForFinalizationTest("2026-08-28", 1),
     publishedCandidateForFinalizationTest("2026-08-28", 2),
   ];
+  publishedCandidates[0].exportResult.jsongen_pending_source = {
+    state: "put_acknowledged_unverified",
+  };
+  publishedCandidates[0].connectorGateEvidence.jsongen_connector_snapshot = { marker: "original" };
   const events = [];
   const result = v3FinalizationResult(["2026-08-28"], 2);
   assert.equal(Object.hasOwn(result, "observations_manifest_hierarchy"), false);
@@ -1113,14 +1117,23 @@ test("Phase B accepts the real v3 finalization shape before connector gating", a
     completeCandidateAndGate: async (_client, evidence) => {
       events.push(`connector_gate:${evidence.connectorId}`);
     },
+    prepareJsonGenFinalEvidence: ({ pending, connector, finalization }) => {
+      assert.equal(pending, publishedCandidates[0].exportResult.jsongen_pending_source);
+      assert.equal(connector, publishedCandidates[0].connectorGateEvidence.jsongen_connector_snapshot);
+      assert.equal(finalization, result);
+      events.push("final_evidence:1");
+      return { sha256: "a".repeat(64) };
+    },
   });
 
   assert.equal(finalized.finalized, true);
   assert.deepEqual(events, [
     "run_finalization",
     "connector_gate:1",
+    "final_evidence:1",
     "connector_gate:2",
   ]);
+  assert.equal(finalized.completed[0].jsongen_final_evidence_preparation.sha256, "a".repeat(64));
 });
 
 test("Phase B v3 finalization validation fails closed before connector gating", async (t) => {
