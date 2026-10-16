@@ -67,7 +67,7 @@ function parse(argv) {
   return Object.fromEntries([...flags].map(([key, value]) => [key.slice(2), value]));
 }
 
-function assertLoadedLiveEnvironment(phase) {
+export function assertLoadedLiveEnvironment(phase) {
   const env = process.env;
   const names = [env.UKAQ_ENV_NAME, env.UK_AQ_ENV_NAME, env.ENVIRONMENT]
     .filter((name) => String(name || "").trim());
@@ -91,7 +91,7 @@ function assertLoadedLiveEnvironment(phase) {
   }
 }
 
-function assertLiveRepository(expectedSha, selectedGeneration) {
+export function assertLiveRepository(expectedSha, selectedGeneration) {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
   const remote = command("git", ["remote", "get-url", "origin"], root);
   if (!/^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)UK-AQ\/uk-aq-ops(?:\.git)?\/?$/.test(remote)) {

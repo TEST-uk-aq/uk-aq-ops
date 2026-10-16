@@ -286,7 +286,7 @@ function addRecoveryReplayDigestRecord(hash, name, value) {
   updateRecoveryReplayDigest(hash, value);
 }
 
-export function buildObservationHistoryV3RecoveryReplayStateSha256(checkpoint) {
+export function buildObservationHistoryV3RecoveryReplayStateSha256(checkpoint, diskEntries = null) {
   const hash = createHash("sha256");
   hash.update("uk_aq_observation_history_v3_recovery_replay_state_v1;");
   if (checkpoint?.progress_format === "authenticated-journal-v1") {
@@ -297,9 +297,9 @@ export function buildObservationHistoryV3RecoveryReplayStateSha256(checkpoint) {
   addRecoveryReplayDigestRecord(hash, "migration_run_id", checkpoint?.migration_run_id);
   addRecoveryReplayDigestRecord(hash, "plan_sha256", checkpoint?.plan_sha256);
 
-  const preparationOrder = Array.isArray(checkpoint?.preparation_order)
+  const preparationOrder = diskEntries?.preparationOrder || (Array.isArray(checkpoint?.preparation_order)
     ? checkpoint.preparation_order
-    : [];
+    : []);
   addRecoveryReplayDigestRecord(hash, "preparation_order_valid", Array.isArray(
     checkpoint?.preparation_order,
   ));
@@ -308,13 +308,13 @@ export function buildObservationHistoryV3RecoveryReplayStateSha256(checkpoint) {
     addRecoveryReplayDigestRecord(hash, "preparation_order_entry", [index, unitId]);
   }
 
-  const preparedEntries = checkpoint?.prepared_units &&
+  const preparedEntries = diskEntries?.preparedEntries || (checkpoint?.prepared_units &&
       typeof checkpoint.prepared_units === "object" &&
       !Array.isArray(checkpoint.prepared_units)
     ? Object.entries(checkpoint.prepared_units).sort(([left], [right]) =>
       Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"))
     )
-    : [];
+    : []);
   addRecoveryReplayDigestRecord(
     hash,
     "prepared_units_valid",
@@ -357,13 +357,13 @@ export function buildObservationHistoryV3RecoveryReplayStateSha256(checkpoint) {
     addRecoveryReplayDigestRecord(hash, "staging_ref_count", stagingRefCount);
   }
 
-  const completedEntries = checkpoint?.completed_objects &&
+  const completedEntries = diskEntries?.completedEntries || (checkpoint?.completed_objects &&
       typeof checkpoint.completed_objects === "object" &&
       !Array.isArray(checkpoint.completed_objects)
     ? Object.entries(checkpoint.completed_objects).sort(([left], [right]) =>
       Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"))
     )
-    : [];
+    : []);
   addRecoveryReplayDigestRecord(
     hash,
     "completed_objects_valid",
@@ -2296,7 +2296,7 @@ function dependenciesFromObjects(objects, kind) {
   }));
 }
 
-function buildCanonicalParents({ inventory, units, observationsPrefix, targetWriterGitSha }) {
+export function buildCanonicalParents({ inventory, units, observationsPrefix, targetWriterGitSha }) {
   const unitsByDayConnector = new Map();
   for (const unit of units) {
     const key = `${unit.scope.day_utc}|${unit.scope.connector_id}`;
@@ -2859,7 +2859,7 @@ function rebuildLegacyPreparedManifestObject(authorityUnit, record) {
   });
 }
 
-function preparedUnitFromRecord(authorityUnit, record, {
+export function preparedUnitFromRecord(authorityUnit, record, {
   sideBySide = false,
   allowLegacyRecoveryOrdering = false,
   legacyOriginalOrdering = false,

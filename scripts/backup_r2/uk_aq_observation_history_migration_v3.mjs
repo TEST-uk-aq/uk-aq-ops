@@ -572,7 +572,7 @@ function recoveryManifestPayload({
   });
 }
 
-function validateRecoveryUpdateStructure(updates) {
+export function validateRecoveryUpdateStructure(updates) {
   const object = (value) => value && typeof value === 'object' && !Array.isArray(value);
   const fields = (value, allowed, required = allowed) => {
     if (!object(value) || Object.keys(value).some((key) => !allowed.includes(key)) ||
