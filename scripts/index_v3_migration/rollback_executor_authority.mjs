@@ -218,7 +218,7 @@ export async function authenticateRollbackExecutor({
   // applying updates. Replay once in memory, with create/repair disabled; no
   // completed-object evidence reaches rollback until every gate below passes.
   const recovery = await withOperatorPhase("Rollback: authenticating historical recovery journal", () => buildObservationHistoryV3RecoveryProgressContext({
-    checkpointPath, checkpoint, repositoryRoot, requireCurrentImplementation: false,
+    checkpointPath, checkpoint, repositoryRoot, requireCurrentImplementation: false, readOnly: true,
   }));
   const implementation = recovery.manifest.payload.recovery_implementation;
   requireAncestor(repositoryRoot, implementation.repository_head);

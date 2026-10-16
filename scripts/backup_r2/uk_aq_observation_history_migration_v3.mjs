@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 import { migrationConcurrencyLimits, validateMigrationConcurrency, inspectEmptyV3Target, validateCleanStartEvidence, GCP_CLEAN_POLICY } from './lib/observation_history_migration_gcp.mjs';
+import { persistShardedMigrationPlan, readShardedMigrationPlan, sha256StableMigrationJson } from './lib/observation_history_migration_plan_store.mjs';
+import { r2GetMigrationObjectBounded } from './lib/observation_history_migration_bounded_r2.mjs';
 import { exactPublicationEvidence, settledMigrationBatches, migrationFailure, migrationFailureEvidence } from './lib/observation_history_migration_concurrency.mjs';
 import { runOperatorCommand, createOperatorProgress, withOperatorPhase, superviseOperatorInvocation, finishOperatorProgress } from "../index_v3_migration/operator_execution.mjs";
+import { createEvidenceRelocation } from "../index_v3_migration/evidence_relocation.mjs";
 
 import fs from "node:fs";
 import crypto from "node:crypto";
@@ -22,6 +25,7 @@ import {
 import {
   assertAcceptedObservationHistoryWriterLimitsV3,
 } from "../../workers/shared/uk_aq_observation_history_writer_limits_v3.mjs";
+import { getObservationHistoryGeneration } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 import {
   hasRequiredR2Config,
   r2GetObject,
@@ -29,6 +33,7 @@ import {
   r2ListObjectsV2,
   r2PutObject,
   sha256Hex,
+  isRetryableR2Status,
 } from "../../workers/shared/r2_sigv4.mjs";
 import {
   buildR2HistoryV2ObservationsTimeseriesLatestKey,
@@ -45,7 +50,17 @@ import {
 import {
   readAndValidateRecoveryJournal,
   inspectRecoveryJournalForInterruptedAppend,
+  isAuthenticatedRecoveryJournal,
 } from "../index_v3_migration/recovery_journal_authority.mjs";
+import {
+  appendExceptionalRecoveryEpoch,
+  exceptionalRecoveryCodeSha256,
+  getExceptionalRecoveryCodeIdentity,
+  getExceptionalRecoveryJournalFrontier,
+  isExceptionalRecoveryAuthorization,
+  validateExceptionalRecoveryAdmission,
+  verifyOriginalRecoveryImplementation,
+} from "../index_v3_migration/exceptional_recovery_authority.mjs";
 import {
   validateIndexV3OperatorEvidence,
 } from "../index_v3_migration/index_v3_operator_evidence.mjs";
@@ -64,11 +79,13 @@ import {
   validateObservationHistoryV3RecoveryAppend,
   createMigrationProgressReporter,
   buildObservationHistoryV3RerunVerificationPlan,
+  LEGACY_HASH_DERIVATION_LIMITS,
   DEFAULT_OBSERVATIONS_PREFIX,
   DEFAULT_V3_INDEX_ROOT,
   DEFAULT_V3_LATEST_KEY,
   executeObservationHistoryV2Rollback,
   executeObservationHistoryV3MigrationPlan,
+  reportObservationHistoryV3Memory,
   inventoryAuthoritativeCanonicalObservationHistory,
   stableMigrationJson,
   validateObservationHistoryV3MigrationEnvironment,
@@ -79,24 +96,78 @@ import {
 const MODES = new Set([
   "runtime-recoverability",
   "plan",
+  "locked-clean-build",
   "migrate",
   "verify",
   "rollback-plan",
   "rollback",
 ]);
 
+const MIGRATION_VERIFY_MAX_ROUNDS = 5;
+const MIGRATION_VERIFY_RETRY_BASE_MS = 750;
+const MIGRATION_VERIFY_RETRY_MAX_MS = 12_000;
+const MIGRATION_TRANSIENT_NETWORK_CODES = new Set([
+  "ECONNABORTED", "ECONNREFUSED", "ECONNRESET", "EAI_AGAIN", "EHOSTUNREACH",
+  "ENETUNREACH", "EPIPE", "ETIMEDOUT", "UND_ERR_BODY_TIMEOUT", "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_SOCKET",
+]);
+
+function isRetryableMigrationVerificationError(error) {
+  if (isRetryableR2Status(Number(error?.status))) return true;
+  const seen = new Set();
+  let current = error;
+  for (let depth = 0; current && depth < 8; depth += 1) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    if (MIGRATION_TRANSIENT_NETWORK_CODES.has(String(current.code || "").toUpperCase())) return true;
+    current = current.cause;
+  }
+  return false;
+}
+
+async function verifyMigrationPostPut({ r2, key, expectedBody, expectedByteSize }) {
+  const expectedSha256 = sha256Hex(expectedBody);
+  let lastError;
+  for (let round = 1; round <= MIGRATION_VERIFY_MAX_ROUNDS; round += 1) {
+    try {
+      const current = await r2GetObject({ r2, key });
+      const bytes = Buffer.from(current.body);
+      if (current.bytes !== expectedByteSize || bytes.byteLength !== expectedByteSize ||
+          sha256Hex(bytes) !== expectedSha256 || !bytes.equals(expectedBody)) {
+        const error = new Error(`Migration post-PUT exact identity mismatch for key=${key}`);
+        error.code = "R2_IDENTITY_MISMATCH";
+        throw error;
+      }
+      return current;
+    } catch (error) {
+      if (!isRetryableMigrationVerificationError(error) || round === MIGRATION_VERIFY_MAX_ROUNDS) {
+        throw error;
+      }
+      lastError = error;
+      const ceiling = Math.min(MIGRATION_VERIFY_RETRY_MAX_MS,
+        MIGRATION_VERIFY_RETRY_BASE_MS * (2 ** (round - 1)));
+      const delayMs = Math.floor(ceiling * (0.5 + Math.random() * 0.5));
+      process.stderr.write(`V3 migration: transient post-PUT GET retry ${round + 1}/${MIGRATION_VERIFY_MAX_ROUNDS} key=${key} status=${error.status || "network"} delay_ms=${delayMs}\n`);
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastError || new Error(`Migration post-PUT GET verification exhausted for key=${key}`);
+}
+
 function usage() {
   return [
     "Usage:",
     "  node scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs [options]",
     "",
-    "Active side-by-side v2-to-v3 (plan, migrate, verify):",
+    "Active side-by-side v2-to-v3 (plan, migrate, verify, locked-clean-build):",
     "  Acquires the existing global observations lock before reading canonical v2.",
     "  Uses direct R2 v2 source and independent v3 targets; no Dropbox/runtime rollback record.",
     "  Required: environment, expected-bucket, migration-run-id, target-writer-git-sha,",
     "            writer-limits-json, report-out; migrate/verify also require expected-plan-sha256.",
     "  migrate requires apply, writers-frozen and checkpoint-out; resume also checkpoint-in.",
     "  plan is a separately locked preview. migrate reacquires, rebuilds and checks its exact plan hash.",
+    "  GCP locked-clean-build holds one lock for plan, post-plan approval, migration and verify.",
+    "  It requires --apply --writers-frozen --checkpoint-out and --post-plan-approval-file.",
     "  This command builds/verifies only; it never switches readers or releases writers onto v3.",
     "",
     "Historical recovery / v3-rebuild interfaces (not the active side-by-side build):",
@@ -129,6 +200,8 @@ function usage() {
     "",
     "  --partition-concurrency <1..4>  Persistent CPU workers (local default: 1)",
     "  --publication-concurrency <1..16>  Concurrent independent publications/reads (local default: 1)",
+    "  --inventory-concurrency <1..4>  Concurrent source inventory reads (local default: 1)",
+    "  --post-plan-approval-file <path>  Operator-created approval for GCP locked-clean-build",
     "",
     "Resume/verify:",
     "  --checkpoint-in <path>   Prior checkpoint; required for verify/rollback and migrate resume",
@@ -150,7 +223,7 @@ export function parsePublicationConcurrency(value, runnerPermit = null) {
   return Number(value);
 }
 
-export function parseObservationHistoryMigrationArgs(argv, runnerPermit = null) {
+export function parseObservationHistoryMigrationArgs(argv, runnerPermit = null, { allowRecoveryPreflight = false } = {}) {
   const limits = migrationConcurrencyLimits(runnerPermit);
   const args = {
     mode: "plan",
@@ -171,8 +244,10 @@ export function parseObservationHistoryMigrationArgs(argv, runnerPermit = null) 
     checkpointIn: null,
     checkpointOut: null,
     expectedPlanSha256: null,
+    postPlanApprovalFile: null,
     publicationConcurrency: limits.publicationDefault,
     partitionConcurrency: limits.partitionDefault,
+    inventoryConcurrency: limits.inventoryDefault,
     help: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -205,6 +280,12 @@ export function parseObservationHistoryMigrationArgs(argv, runnerPermit = null) 
       if (!/^[1-9][0-9]*$/.test(value)) throw new Error("--partition-concurrency requires a positive integer");
       args.partitionConcurrency = Number(value);
     }
+    else if (flag === "--inventory-concurrency") {
+      const value = requireValue(argv, index++, flag);
+      if (!/^[1-9][0-9]*$/.test(value)) throw new Error("--inventory-concurrency requires a positive integer");
+      args.inventoryConcurrency = Number(value);
+    }
+    else if (flag === "--post-plan-approval-file") args.postPlanApprovalFile = requireValue(argv, index++, flag);
     else if (flag === "--checkpoint-in") args.checkpointIn = requireValue(argv, index++, flag);
     else if (flag === "--checkpoint-out") args.checkpointOut = requireValue(argv, index++, flag);
     else if (flag === "--expected-plan-sha256") {
@@ -213,25 +294,34 @@ export function parseObservationHistoryMigrationArgs(argv, runnerPermit = null) 
     else throw new Error(`Unknown argument: ${flag}`);
   }
   validateMigrationConcurrency({ ...args, runnerPermit });
-  if (!MODES.has(args.mode)) throw new Error(`Unsupported --mode: ${args.mode}`);
+  if (!MODES.has(args.mode) && !(allowRecoveryPreflight && args.mode === "recovery-preflight")) {
+    throw new Error(`Unsupported --mode: ${args.mode}`);
+  }
   if (
     !args.help &&
     !new Set(["v2-to-v3", "v3-rebuild"]).has(String(args.transition || ""))
   ) {
     throw new Error("--transition must be explicitly set to v2-to-v3 or v3-rebuild");
   }
-  if (args.apply && !new Set(["migrate", "rollback"]).has(args.mode)) {
+  if (args.apply && !new Set(["migrate", "rollback", "locked-clean-build"]).has(args.mode)) {
     throw new Error("--apply is valid only with a mutation mode");
   }
-  if (new Set(["migrate", "rollback"]).has(args.mode) && !args.apply) {
+  if (new Set(["migrate", "rollback", "locked-clean-build"]).has(args.mode) && !args.apply) {
     throw new Error(`${args.mode} mode requires --apply`);
   }
   if (args.apply && !args.writersFrozen) {
     throw new Error("Mutation requires --writers-frozen");
   }
-  if (args.mode === "migrate" && !args.checkpointOut) {
-    throw new Error("migrate mode requires --checkpoint-out");
+  if (new Set(["migrate", "locked-clean-build"]).has(args.mode) && !args.checkpointOut) {
+    throw new Error(`${args.mode} mode requires --checkpoint-out`);
   }
+  if (args.mode === "locked-clean-build" && (!runnerPermit || !args.postPlanApprovalFile || args.checkpointIn || args.expectedPlanSha256)) {
+    throw new Error("locked-clean-build requires GCP admission and a post-plan approval file, with no checkpoint-in or pre-plan SHA");
+  }
+  if (args.mode === "locked-clean-build" && args.transition !== "v2-to-v3") {
+    throw new Error("locked-clean-build requires the side-by-side v2-to-v3 transition");
+  }
+  if (args.postPlanApprovalFile && args.mode !== "locked-clean-build") throw new Error("--post-plan-approval-file is only valid for locked-clean-build");
   if (
     args.mode === "migrate" &&
     args.checkpointIn &&
@@ -248,10 +338,20 @@ export function parseObservationHistoryMigrationArgs(argv, runnerPermit = null) 
   if (args.mode === "rollback" && !args.v2RuntimeRollbackRecord) {
     throw new Error("rollback mode requires --v2-runtime-rollback-record");
   }
-  if (!new Set(["plan", "runtime-recoverability"]).has(args.mode) && !String(args.expectedPlanSha256 || "").trim()) {
+  if (!new Set(["plan", "runtime-recoverability", "locked-clean-build"]).has(args.mode) && !String(args.expectedPlanSha256 || "").trim()) {
     throw new Error(`${args.mode} mode requires --expected-plan-sha256`);
   }
   return Object.freeze(args);
+}
+
+export function createObservationHistoryMigrationExecutionContext(parsedArgs, exceptionalRecoveryApproval = null) {
+  if (!Object.isFrozen(parsedArgs)) throw new Error("Migration execution requires immutable parsed arguments");
+  if (exceptionalRecoveryApproval &&
+      (!Object.isFrozen(exceptionalRecoveryApproval) ||
+       !Object.isFrozen(exceptionalRecoveryApproval.approval_context))) {
+    throw new Error("Exceptional recovery approval context must be immutable");
+  }
+  return Object.freeze({ args: parsedArgs, exceptionalRecoveryApproval });
 }
 
 function readJsonFile(filePath, label) {
@@ -265,6 +365,26 @@ function readJsonFile(filePath, label) {
   }
 }
 
+function readMigrationCheckpoint(filePath) {
+  const checkpoint = readJsonFile(filePath, 'migration checkpoint');
+  if (checkpoint?.authority_format === 'uk_aq_migration_plan_shards_v1') {
+    if (Object.hasOwn(checkpoint, 'authority') || !checkpoint.authority_ref) {
+      throw new Error('Sharded migration checkpoint has contradictory inline authority');
+    }
+    const { plan } = readShardedMigrationPlan(checkpoint.authority_ref);
+    if (checkpoint.authority_sha256 !== checkpoint.authority_ref.full_plan_sha256 ||
+        checkpoint.plan_sha256 !== plan.plan_sha256 ||
+        checkpoint.migration_run_id !== plan.migration_run_id) {
+      throw new Error('Migration checkpoint contradicts its sharded immutable authority');
+    }
+    return { ...checkpoint, authority: plan };
+  }
+  if (checkpoint?.authority_format !== undefined || checkpoint?.authority_ref !== undefined ||
+      !checkpoint?.authority) throw new Error('Unsupported migration checkpoint authority format');
+  // Historical inline authority remains an explicitly distinct format.
+  return checkpoint;
+}
+
 function ensureDurableDirectory(directory, mode = 0o700) {
   const missing = [];
   let current = path.resolve(directory);
@@ -273,6 +393,18 @@ function ensureDurableDirectory(directory, mode = 0o700) {
     fs.mkdirSync(target, { mode });
     const parent = fs.openSync(path.dirname(target), 'r');
     try { fs.fsyncSync(parent); } finally { fs.closeSync(parent); }
+  }
+}
+
+function requireExistingRecoveryArtifact(target, label, kind) {
+  let stat;
+  try { stat = fs.lstatSync(target); }
+  catch (error) {
+    if (error.code === "ENOENT") throw new Error(`${label} is missing: ${target}`, { cause: error });
+    throw error;
+  }
+  if (stat.isSymbolicLink() || (kind === "directory" ? !stat.isDirectory() : !stat.isFile())) {
+    throw new Error(`${label} must be an existing regular ${kind}: ${target}`);
   }
 }
 
@@ -304,6 +436,7 @@ const RECOVERY_PROGRESS_SCHEMA_VERSION = 1;
 const RECOVERY_IMPLEMENTATION_PATHS = Object.freeze([
   "scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs",
   "scripts/backup_r2/lib/observation_history_migration_v3.mjs",
+  "scripts/backup_r2/lib/observation_history_migration_plan_store.mjs",
   "scripts/index_v3_migration/index_v3_migration.sh",
   "scripts/index_v3_migration/recovery_journal_authority.mjs",
   "scripts/backup_r2/lib/observation_history_migration_worker_pool.mjs",
@@ -346,7 +479,7 @@ function readRecoveryEnvelope(filePath, expectedKind) {
   return envelope;
 }
 
-function recoveryImplementationIdentity(repositoryRoot, runner = null) {
+function recoveryImplementationIdentity(repositoryRoot, runner = null, environment = null) {
   const root = path.resolve(repositoryRoot);
   const repositoryHead = spawnSync("git", ["rev-parse", "HEAD"], {
     cwd: root,
@@ -356,7 +489,18 @@ function recoveryImplementationIdentity(repositoryRoot, runner = null) {
     throw new Error("Current recovery repository HEAD is unavailable");
   }
   const paths = [...RECOVERY_IMPLEMENTATION_PATHS];
-  if (!runner || runner.runner_kind === 'gcp') paths.push('scripts/backup_r2/uk_aq_observation_history_migration_v3_gcp.mjs');
+  // The retired in-place shell executor is historical recovery authority only.
+  // New authenticated-journal v2-to-v3 runs do not execute or depend on it.
+  if (runner) {
+    const legacyPath = 'scripts/index_v3_migration/index_v3_migration.sh';
+    paths.splice(paths.indexOf(legacyPath), 1);
+  }
+  if (runner?.runner_kind === 'gcp') {
+    paths.push('scripts/backup_r2/lib/observation_history_migration_bounded_r2.mjs');
+  }
+  if (!runner || runner.runner_kind === 'gcp') paths.push(environment === 'LIVE'
+    ? 'scripts/backup_r2/uk_aq_observation_history_migration_v3_live_gcp.mjs'
+    : 'scripts/backup_r2/uk_aq_observation_history_migration_v3_gcp.mjs');
   const files = paths.map((relativePath) => {
     const absolutePath = path.join(root, relativePath);
     if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) {
@@ -406,10 +550,15 @@ function recoveryManifestPayload({
   checkpoint,
   repositoryRoot,
   recoveryImplementation = null,
+  historicalCheckpointPath = null,
 }) {
-  const plan = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
+  buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint, validateOnly: true });
+  const plan = checkpoint.authority;
   return Object.freeze({
-    original_checkpoint: checkpointFileIdentity(checkpointPath),
+    original_checkpoint: {
+      ...checkpointFileIdentity(checkpointPath),
+      ...(historicalCheckpointPath ? { path: historicalCheckpointPath } : {}),
+    },
     immutable_authority_sha256: checkpoint.authority_sha256,
     migration_run_id: plan.migration_run_id,
     transition: plan.transition,
@@ -418,11 +567,12 @@ function recoveryManifestPayload({
     recovery_implementation:
       recoveryImplementation || recoveryImplementationIdentity(repositoryRoot,
         checkpoint.progress_format === 'authenticated-journal-v1'
-          ? recoveryRunnerIdentity(plan) : null),
+          ? recoveryRunnerIdentity(plan) : null,
+        plan.environment?.environment || null),
   });
 }
 
-function validateRecoveryUpdateStructure(updates) {
+export function validateRecoveryUpdateStructure(updates) {
   const object = (value) => value && typeof value === 'object' && !Array.isArray(value);
   const fields = (value, allowed, required = allowed) => {
     if (!object(value) || Object.keys(value).some((key) => !allowed.includes(key)) ||
@@ -511,8 +661,134 @@ function applyRecoveryUpdates(checkpoint, updates) {
   }
 }
 
-function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false, diagnostics = false }) {
-  ensureDurableDirectory(paths.entries);
+export function readOnlyJournalView(journal) {
+  const cache = new WeakMap();
+  const mutation = () => { throw new Error("Authenticated read-only journal view cannot be mutated"); };
+  const mutatingArrayMethods = new Set(["copyWithin", "fill", "pop", "push", "reverse", "shift", "sort", "splice", "unshift"]);
+  const callbackArrayMethods = new Set(["every", "filter", "find", "findIndex", "flatMap", "forEach", "map", "reduce", "reduceRight", "some"]);
+  const frozenView = (value) => {
+    const target = Array.isArray(value) ? new Array(value.length) : Object.create(Object.getPrototypeOf(value));
+    cache.set(value, target);
+    for (const property of Reflect.ownKeys(value)) {
+      if (Array.isArray(value) && property === "length") continue;
+      const descriptor = Object.getOwnPropertyDescriptor(value, property);
+      if ("value" in descriptor) {
+        Object.defineProperty(target, property, {
+          enumerable: descriptor.enumerable,
+          configurable: false,
+          get: () => view(descriptor.value),
+        });
+      } else {
+        Object.defineProperty(target, property, {
+          enumerable: descriptor.enumerable,
+          configurable: false,
+          get: descriptor.get ? () => view(descriptor.get.call(value)) : undefined,
+          set: undefined,
+        });
+      }
+    }
+    return Object.freeze(target);
+  };
+  const requiresStructuralFacade = (value) => Reflect.ownKeys(value).some((property) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, property);
+    return descriptor && !descriptor.configurable;
+  });
+  const view = (value) => {
+    if (!value || typeof value !== "object") return value;
+    if (cache.has(value)) return cache.get(value);
+    if (value instanceof Map) {
+      const mapView = Object.freeze({
+        get: (key) => view(value.get(key)),
+        has: (key) => value.has(key),
+        values: function* values() { for (const item of value.values()) yield view(item); },
+        [Symbol.iterator]: function* iterator() { for (const item of value) yield [view(item[0]), view(item[1])]; },
+      });
+      cache.set(value, mapView);
+      return mapView;
+    }
+    if (Object.isFrozen(value) || requiresStructuralFacade(value)) return frozenView(value);
+    const proxy = new Proxy(value, {
+      get(target, property) {
+        if (property === "__defineGetter__" || property === "__defineSetter__") return mutation;
+        const result = Reflect.get(target, property, target);
+        if (typeof result !== "function") return view(result);
+        if (Array.isArray(target) && mutatingArrayMethods.has(property)) return mutation;
+        return (...args) => {
+          const callArgs = [...args];
+          if (Array.isArray(target) && callbackArrayMethods.has(property) && typeof callArgs[0] === "function") {
+            const callback = callArgs[0];
+            const callbackIndex = property === "reduce" || property === "reduceRight" ? 2 : 1;
+            callArgs[0] = (...callbackArgs) => callback(...callbackArgs.map((item, index) =>
+              index === callbackIndex && typeof item === "number" ? item : view(item)));
+          }
+          return view(Reflect.apply(result, target, callArgs));
+        };
+      },
+      getOwnPropertyDescriptor(target, property) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(target, property);
+        if (!descriptor) return undefined;
+        if ("value" in descriptor) {
+          return { ...descriptor, value: view(descriptor.value) };
+        }
+        return {
+          ...descriptor,
+          get: descriptor.get ? () => view(descriptor.get.call(target)) : undefined,
+          set: undefined,
+        };
+      },
+      set: mutation,
+      defineProperty: mutation,
+      deleteProperty: mutation,
+      setPrototypeOf: mutation,
+      preventExtensions: mutation,
+    });
+    cache.set(value, proxy);
+    return proxy;
+  };
+  return Object.freeze({
+    manifest: view(journal.manifest),
+    head: view(journal.head),
+    entries: view(journal.entries),
+    completed_objects: view(journal.completed_objects),
+    last_sequence: journal.last_sequence,
+    last_entry_sha256: journal.last_entry_sha256,
+    interrupted_append: view(journal.interrupted_append),
+  });
+}
+
+function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false,
+  allowInterruptedTail = false, onAuthenticatedReplay = null, diagnostics = false,
+  readOnly = false, authenticatedJournal = null }) {
+  if (authenticatedJournal && !readOnly) {
+    throw new Error("Authenticated recovery journal reuse is restricted to read-only inspection");
+  }
+  if (authenticatedJournal && !isAuthenticatedRecoveryJournal(authenticatedJournal)) {
+    throw new Error("Supplied recovery journal has not passed cryptographic authentication");
+  }
+  if (authenticatedJournal) {
+    const authenticatedManifest = authenticatedJournal.manifest?.payload;
+    const expectedManifest = manifest?.payload;
+    const currentHead = fs.existsSync(paths.head)
+      ? readRecoveryEnvelope(paths.head, "uk_aq_observation_history_v3_recovery_head")
+      : null;
+    if (path.resolve(authenticatedJournal.root || "") !== path.resolve(paths.root) ||
+        !authenticatedManifest || !expectedManifest ||
+        stableMigrationJson(authenticatedManifest) !== stableMigrationJson(expectedManifest) ||
+        !currentHead ||
+        stableMigrationJson(authenticatedJournal.head?.payload) !== stableMigrationJson(currentHead.payload) ||
+        authenticatedJournal.head?.payload?.last_sequence !== authenticatedJournal.last_sequence ||
+        authenticatedJournal.head?.payload?.last_entry_sha256 !== authenticatedJournal.last_entry_sha256) {
+      throw new Error("Supplied authenticated recovery journal is not bound to this recovery evidence");
+    }
+  }
+  if (readOnly) {
+    requireExistingRecoveryArtifact(paths.root, "Recovery state directory", "directory");
+    requireExistingRecoveryArtifact(paths.manifest, "Recovery manifest", "file");
+    requireExistingRecoveryArtifact(paths.head, "Recovery journal head", "file");
+    requireExistingRecoveryArtifact(paths.entries, "Recovery journal entries directory", "directory");
+  } else {
+    ensureDurableDirectory(paths.entries);
+  }
   const names = fs.readdirSync(paths.entries)
     .sort();
   if (!fs.existsSync(paths.head) && repairHead && names.length === 0) {
@@ -527,7 +803,10 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
     ));
   }
   const authenticationStartedAt = Date.now();
-  const authenticationProgress = createOperatorProgress({ label: "V3 recovery: authenticating historical journal", enabled: diagnostics || Boolean(process.env.UK_AQ_OPERATOR_RUN_DIR) });
+  // Operator progress can create run directories and phase-marker files.
+  // Strict read-only inspection uses stream diagnostics only.
+  const authenticationProgress = createOperatorProgress({ label: "V3 recovery: authenticating historical journal",
+    enabled: !readOnly && (diagnostics || Boolean(process.env.UK_AQ_OPERATOR_RUN_DIR)) });
   if (diagnostics) process.stderr.write(`V3 recovery: authenticating ${names.length} journal entries start=${new Date(authenticationStartedAt).toISOString()}\n`);
   const journalOptions = {
     recoveryRoot: paths.root,
@@ -539,13 +818,13 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
     expectedTargetWriterGitSha: manifest.payload.target_writer_git_sha,
     allowEmpty: true,
   };
-  const replay = repairHead
+  const replay = authenticatedJournal || (repairHead || allowInterruptedTail
     ? inspectRecoveryJournalForInterruptedAppend(journalOptions)
-    : readAndValidateRecoveryJournal(journalOptions);
+    : readAndValidateRecoveryJournal(journalOptions));
   authenticationProgress.finish();
   if (diagnostics) process.stderr.write(`V3 recovery: authentication complete entries=${replay.entries.length} elapsed_ms=${Date.now() - authenticationStartedAt}\n`);
   const replayProgress = createMigrationProgressReporter({
-    label: "V3 recovery: applying authenticated journal", total: replay.entries.length, enabled: diagnostics,
+    label: "V3 recovery: applying authenticated journal", total: replay.entries.length, enabled: !readOnly && diagnostics,
   });
   replayProgress.report(0, { force: true });
   const publicationEvidence = [];
@@ -563,7 +842,7 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
     replayProgress.report(index + 1);
   }
   if (replay.interrupted_append) {
-    buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
+    buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint, validateOnly: true });
     if (publicationEvidence.length || interruptedPreparedPlan?.v3_publication_plan) {
       const prepared = interruptedPreparedPlan || buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint, requirePrepared: true });
       const recovered = new Set(validateRecoveredPublicationEvidence(prepared.v3_publication_plan, publicationEvidence).map((entry) => entry.key));
@@ -571,18 +850,31 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
         if (checkpoint.completed_objects[entry.key] && !recovered.has(entry.key)) throw new Error(`Recovery v3 completion lacks publication journal authority: ${entry.key}`);
       }
     }
-    const tail = replay.interrupted_append;
-    // The entry may have been renamed immediately before interruption: flush
-    // it and the entries directory again before committing its head.
-    const entryFd = fs.openSync(path.join(paths.entries, `${String(tail.sequence).padStart(10, '0')}.json`), 'r');
-    try { fs.fsyncSync(entryFd); } finally { fs.closeSync(entryFd); }
-    const entriesFd = fs.openSync(paths.entries, 'r');
-    try { fs.fsyncSync(entriesFd); } finally { fs.closeSync(entriesFd); }
-    atomicWriteJson(paths.head, recoveryEnvelope('uk_aq_observation_history_v3_recovery_head', {
-      ...replay.head.payload, last_sequence: tail.sequence, last_entry_sha256: tail.payload_sha256,
-    }), paths.pending);
-    // Re-enter the unchanged exact reader after durable promotion.
-    readAndValidateRecoveryJournal(journalOptions);
+    if (repairHead) {
+      const tail = replay.interrupted_append;
+      // Flush a renamed candidate before the exceptional epoch can durably
+      // bind to it, then commit it to the ordinary journal head.
+      const entryFd = fs.openSync(path.join(paths.entries, `${String(tail.sequence).padStart(10, '0')}.json`), 'r');
+      try { fs.fsyncSync(entryFd); } finally { fs.closeSync(entryFd); }
+      const entriesFd = fs.openSync(paths.entries, 'r');
+      try { fs.fsyncSync(entriesFd); } finally { fs.closeSync(entriesFd); }
+    }
+    if (onAuthenticatedReplay) onAuthenticatedReplay({ sequence: replay.interrupted_append.sequence,
+      entry_sha256: replay.interrupted_append.payload_sha256, interrupted_append: true,
+      journal: readOnly ? readOnlyJournalView(replay) : replay });
+    if (repairHead) {
+      const tail = replay.interrupted_append;
+      atomicWriteJson(paths.head, recoveryEnvelope('uk_aq_observation_history_v3_recovery_head', {
+        ...replay.head.payload, last_sequence: tail.sequence, last_entry_sha256: tail.payload_sha256,
+      }), paths.pending);
+      // Re-enter the unchanged exact reader after durable promotion.
+      readAndValidateRecoveryJournal(journalOptions);
+    }
+  } else if (onAuthenticatedReplay) {
+    buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint, validateOnly: true });
+    onAuthenticatedReplay({ sequence: replay.last_sequence,
+      entry_sha256: replay.last_entry_sha256, interrupted_append: false,
+      journal: readOnly ? readOnlyJournalView(replay) : replay });
   }
   if (diagnostics) process.stderr.write(`V3 recovery: replay complete entries=${replay.entries.length} elapsed_ms=${Date.now() - authenticationStartedAt}\n`);
   return {
@@ -646,10 +938,29 @@ export function buildObservationHistoryV3RecoveryProgressContext({
   create = false,
   repairHead = false,
   requireCurrentImplementation = true,
+  exceptionalRecoveryAuthorization = null,
+  allowInterruptedTail = false,
+  onAuthenticatedReplay = null,
   diagnostics = false,
+  readOnly = false,
+  evidenceRoot = null,
+  authenticatedJournal = null,
 }) {
+  if (authenticatedJournal && !readOnly) {
+    throw new Error("Authenticated recovery journal reuse is restricted to read-only inspection");
+  }
   if (diagnostics) process.stderr.write("V3 recovery: authenticating original checkpoint and recovery manifest\n");
   const paths = recoveryProgressPaths(checkpointPath);
+  if (readOnly) {
+    if (create || repairHead) {
+      throw new Error("Read-only recovery inspection cannot create, repair or append recovery state");
+    }
+    requireExistingRecoveryArtifact(path.resolve(checkpointPath), "Migration checkpoint", "file");
+    requireExistingRecoveryArtifact(paths.root, "Recovery state directory", "directory");
+    requireExistingRecoveryArtifact(paths.manifest, "Recovery manifest", "file");
+    requireExistingRecoveryArtifact(paths.head, "Recovery journal head", "file");
+    requireExistingRecoveryArtifact(paths.entries, "Recovery journal entries directory", "directory");
+  }
   let createdManifest = false;
   if (!fs.existsSync(paths.manifest)) {
     if (!create) throw new Error("Recovery progress manifest is missing; run resume preflight first");
@@ -664,6 +975,23 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     paths.manifest,
     "uk_aq_observation_history_v3_recovery_manifest",
   );
+  const evidenceRelocation = readOnly
+    ? createEvidenceRelocation({
+      historicalCheckpointPath: manifest.payload.original_checkpoint.path,
+      localCheckpointPath: checkpointPath,
+      evidenceRoot,
+    })
+    : null;
+  if (exceptionalRecoveryAuthorization &&
+      (!isExceptionalRecoveryAuthorization(exceptionalRecoveryAuthorization) ||
+       exceptionalRecoveryAuthorization.checkpoint_path !== path.resolve(checkpointPath) ||
+       exceptionalRecoveryAuthorization.auth.checkpointSha256 !== manifest.payload.original_checkpoint.sha256 ||
+       exceptionalRecoveryAuthorization.auth.journal.manifest.payload.immutable_authority_sha256 !== manifest.payload.immutable_authority_sha256 ||
+       exceptionalRecoveryAuthorization.auth.journal.manifest.payload.migration_run_id !== manifest.payload.migration_run_id ||
+       exceptionalRecoveryAuthorization.auth.journal.manifest.payload.plan_sha256 !== manifest.payload.plan_sha256 ||
+       !requireCurrentImplementation)) {
+    throw new Error("Exceptional recovery authority does not authenticate this immutable checkpoint or preserve the normal implementation gate");
+  }
   if (manifest.payload.recovery_implementation.runner !== undefined &&
       stableMigrationJson(manifest.payload.recovery_implementation.runner) !== stableMigrationJson(recoveryRunnerIdentity(checkpoint.authority))) {
     throw new Error('Recovery implementation profile differs from immutable checkpoint runner');
@@ -672,7 +1000,11 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     checkpointPath,
     checkpoint,
     repositoryRoot,
-    recoveryImplementation: requireCurrentImplementation
+    historicalCheckpointPath: evidenceRelocation?.historical_checkpoint_path || null,
+    // The original manifest stays immutable. Only the branded exact-run
+    // exceptional authority permits replay under its separately approved
+    // current implementation; ordinary recovery keeps the exact-head gate.
+    recoveryImplementation: requireCurrentImplementation && !exceptionalRecoveryAuthorization
       ? (manifest.payload.recovery_implementation.runner === undefined
         ? recoveryImplementationIdentity(repositoryRoot) : null)
       : manifest.payload.recovery_implementation,
@@ -680,14 +1012,38 @@ export function buildObservationHistoryV3RecoveryProgressContext({
   if (stableMigrationJson(manifest.payload) !== stableMigrationJson(expectedManifestPayload)) {
     throw new Error("Recovery manifest does not match the original checkpoint or current recovery code");
   }
-  const recoveredCheckpoint = structuredClone(checkpoint);
+  // A newly created empty journal has no state to replay into a separate
+  // checkpoint. Reuse the fresh checkpoint rather than deep-cloning its large
+  // immutable plan; interrupted/resumed journals keep an independent copy.
+  const emptyRecord = (value) => value && typeof value === 'object' &&
+    !Array.isArray(value) && Object.keys(value).length === 0;
+  const freshCheckpoint = checkpoint?.kind === 'uk_aq_observation_history_v3_migration_checkpoint' &&
+    checkpoint.progress_format === 'authenticated-journal-v1' &&
+    checkpoint.clean_target_admission === null &&
+    checkpoint.full_verification_complete === false && checkpoint.cutover_ready === false &&
+    emptyRecord(checkpoint.prepared_units) && emptyRecord(checkpoint.completed_objects) &&
+    Array.isArray(checkpoint.preparation_order) && checkpoint.preparation_order.length === 0;
+  const freshEmptyJournal = createdManifest && freshCheckpoint && !fs.existsSync(paths.head) &&
+    (!fs.existsSync(paths.entries) || fs.readdirSync(paths.entries).length === 0);
+  const recoveredCheckpoint = freshEmptyJournal ? checkpoint : structuredClone(checkpoint);
   const replay = replayRecoveryJournal({
     paths,
     checkpoint: recoveredCheckpoint,
     manifest,
     repairHead: repairHead || createdManifest,
+    allowInterruptedTail,
+    onAuthenticatedReplay,
     diagnostics,
+    readOnly,
+    authenticatedJournal,
   });
+  const authenticatedJournalFrontier = exceptionalRecoveryAuthorization
+    ? getExceptionalRecoveryJournalFrontier(exceptionalRecoveryAuthorization.auth.journal) : null;
+  if (exceptionalRecoveryAuthorization &&
+      (authenticatedJournalFrontier.sequence !== replay.sequence ||
+       authenticatedJournalFrontier.entry_sha256 !== replay.entrySha256)) {
+    throw new Error("Exceptional recovery journal frontier changed before semantic replay");
+  }
   if (diagnostics) {
     process.stderr.write(`V3 recovery: authenticated entries=${replay.sequence} prepared_units=${
       Object.keys(recoveredCheckpoint.prepared_units || {}).length
@@ -695,7 +1051,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
       replay.publicationEvidence.length
     }\n`);
   }
-  buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint: recoveredCheckpoint });
+  buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint: recoveredCheckpoint, validateOnly: true });
   const context = {
     paths,
     manifest,
@@ -706,12 +1062,13 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     preparedState: preparedProgressState(recoveredCheckpoint),
     completedEvidence: new Map(
       Object.entries(recoveredCheckpoint.completed_objects || {}).map(
-        ([key, evidence]) => [key, structuredClone(evidence)],
+        ([key, evidence]) => [key, Object.freeze(evidence)],
       ),
     ),
     preparationOrder: [...(recoveredCheckpoint.preparation_order || [])],
     fullVerificationComplete: recoveredCheckpoint.full_verification_complete === true,
     cutoverReady: recoveredCheckpoint.cutover_ready === true,
+    evidenceRelocation,
     authenticatedRecoveryAuthority: Object.freeze({
       authenticated: true,
       original_checkpoint_sha256: manifest.payload.original_checkpoint.sha256,
@@ -722,9 +1079,24 @@ export function buildObservationHistoryV3RecoveryProgressContext({
       last_entry_sha256: replay.entrySha256,
       replayed_checkpoint_sha256:
         buildObservationHistoryV3RecoveryReplayStateSha256(recoveredCheckpoint),
+      ...(exceptionalRecoveryAuthorization ? { exceptional_recovery: Object.freeze({
+        kind: exceptionalRecoveryAuthorization.kind,
+        recovery_epoch_sequence: exceptionalRecoveryAuthorization.approval.approval_context.next_epoch_sequence,
+        previous_epoch_sha256: exceptionalRecoveryAuthorization.approval.approval_context.previous_epoch_sha256,
+        approval_file_sha256: exceptionalRecoveryAuthorization.approval.approval_file_sha256,
+        recovery_implementation_sha256: exceptionalRecoveryAuthorization.approval.approval_context.recovery_implementation_sha256,
+      }) } : {}),
     }),
   };
   context.cleanStart = recoveredCheckpoint.clean_target_admission || null;
+  if (readOnly) {
+    const rejectMutation = () => { throw new Error("Read-only recovery context cannot persist or append evidence"); };
+    context.persistCheckpointDelta = rejectMutation;
+    context.persistCheckpoint = rejectMutation;
+    context.recordPublicationEvidenceBatch = rejectMutation;
+    context.recordPublicationEvidence = rejectMutation;
+    return context;
+  }
   // Active side-by-side writers name only the changed records. This path never
   // scans/serializes/clones all previous completions on each progress update.
   context.persistCheckpointDelta = async (current, { preparedUnitIds = [], completedKeys = [], finalState = false, cleanStart = false }) => {
@@ -760,7 +1132,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
       const previous = context.completedEvidence.get(key);
       if (!evidence || evidence.verified !== true || evidence.durable !== true) throw new Error(`Invalid completed delta: ${key}`);
       if (previous && stableMigrationJson(previous) !== stableMigrationJson(evidence)) throw new Error(`Completed-object evidence changed for ${key}`);
-      if (!previous) { (updates.completed_objects ||= []).push({ key, evidence }); completedNext.set(key, structuredClone(evidence)); }
+      if (!previous) { (updates.completed_objects ||= []).push({ key, evidence }); completedNext.set(key, Object.freeze(evidence)); }
     }
     for (const unitId of preparedUnitIds) {
       const record = current.prepared_units[unitId];
@@ -858,7 +1230,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     context.preparedState = preparedProgressState(current);
     context.completedEvidence = new Map(
       Object.entries(current.completed_objects || {}).map(
-        ([key, evidence]) => [key, structuredClone(evidence)],
+        ([key, evidence]) => [key, Object.freeze(evidence)],
       ),
     );
     context.preparationOrder = [...currentOrder];
@@ -886,7 +1258,7 @@ export function initializeObservationHistoryV3RecoveryProgress({
   repositoryRoot,
   retainedStagingRoot = `${path.resolve(checkpointPath)}.staging`,
 } = {}) {
-  const checkpoint = readJsonFile(checkpointPath, "migration checkpoint");
+  const checkpoint = readMigrationCheckpoint(checkpointPath);
   const context = buildObservationHistoryV3RecoveryProgressContext({
     checkpointPath,
     checkpoint,
@@ -1072,6 +1444,65 @@ function summaryForPlan(plan) {
     blockers: plan.blockers,
     mutation_allowed: plan.mutation_allowed,
   };
+}
+
+function compactSideBySidePlanSummary(plan) {
+  const blockers = boundedReportList((plan.blockers || []).map(compactReportString));
+  return {
+    schema_version: plan.schema_version,
+    kind: 'uk_aq_observation_history_v3_migration_plan_summary',
+    migration_run_id: plan.migration_run_id,
+    transition: plan.transition,
+    plan_sha256: plan.plan_sha256,
+    environment: plan.environment,
+    target: plan.target,
+    source_root: { key: plan.inventory.root_manifest.key,
+      byte_size: plan.inventory.root_manifest.byte_size,
+      sha256: plan.inventory.root_manifest.sha256,
+      content_hash: plan.inventory.root_manifest.payload.content_hash },
+    estimated: plan.estimated,
+    source_observation_content_hash_provenance_counts: plan.source_observation_content_hash_provenance_counts,
+    source_manifest_reference_provenance_counts: plan.source_manifest_reference_provenance_counts,
+    empty_source_connector_count: plan.empty_source_connector_count,
+    writer_freeze_plan: plan.writer_freeze_plan,
+    blockers: blockers.entries,
+    blocker_count: blockers.total_count,
+    blockers_omitted: blockers.omitted_count,
+    complete_plan_details_excluded: true,
+  };
+}
+
+const POST_PLAN_APPROVAL_WAIT_MS = 60 * 60 * 1000;
+function postPlanApprovalPhrase(plan) {
+  if (!/^[A-Za-z0-9._-]+$/.test(plan.migration_run_id)) throw new Error("Combined run ID must contain only letters, digits, dots, underscores or hyphens");
+  return `APPROVE ${plan.environment.environment} ${plan.migration_run_id} ${plan.plan_sha256} ${plan.target_writer_git_sha} APPLY WRITERS_FROZEN\n`;
+}
+
+async function waitForPostPlanApproval({ plan, approvalPath, planPublishedAt, deadline, assertLockHeld }) {
+  const expected = postPlanApprovalPhrase(plan);
+  process.stderr.write(`V3 locked clean build: plan_sha256=${plan.plan_sha256} run_id=${plan.migration_run_id}\n`);
+  process.stderr.write(`Operator approval expires at ${new Date(deadline).toISOString()}. Create mode-0600 ${approvalPath} containing exactly:\n${expected}`);
+  for (;;) {
+    assertLockHeld();
+    if (Date.now() >= deadline) throw new Error("Post-plan approval expired while the global lock was held");
+    if (fs.existsSync(approvalPath)) {
+      const stat = fs.lstatSync(approvalPath);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid() || (stat.mode & 0o077) !== 0 ||
+          stat.size > 512 || stat.mtimeMs < planPublishedAt || stat.mtimeMs >= deadline) {
+        throw new Error("Post-plan approval file is stale, unsafe or ambiguous");
+      }
+      const bytes = fs.readFileSync(approvalPath);
+      if (bytes.toString('utf8') !== expected) throw new Error("Post-plan approval contradicts exact environment, run, plan, writer SHA or apply/frozen-writer intent");
+      assertLockHeld();
+      if (Date.now() >= deadline) throw new Error("Post-plan approval expired while the global lock was held");
+      return Object.freeze({ kind: "uk_aq_observation_history_v3_post_plan_approval_v1",
+        environment: plan.environment.environment, migration_run_id: plan.migration_run_id,
+        plan_sha256: plan.plan_sha256, target_writer_git_sha: plan.target_writer_git_sha,
+        apply: true, writers_frozen: true, approval_file_sha256: sha256Hex(bytes),
+        approval_file_byte_size: bytes.byteLength, approved_at_utc: new Date(stat.mtimeMs).toISOString() });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
 }
 
 const REPORT_LIST_LIMIT = 100;
@@ -1275,13 +1706,13 @@ function compactMigrationResult(result, mode, checkpoint) {
       checkpoint_summary: checkpointSummary(checkpoint),
     };
   }
-  if (mode === "migrate") {
+  if (mode === "migrate" || mode === "locked-clean-build") {
     return {
       ok: result?.ok,
       status: result?.status,
       dry_run: result?.dry_run,
       checkpoint_summary: checkpointSummary(result?.checkpoint || checkpoint),
-      parquet_evidence_summary: parquetEvidenceSummary(result?.parquet_evidence),
+      parquet_evidence_summary: result?.parquet_evidence_summary || parquetEvidenceSummary(result?.parquet_evidence),
       v3_publication: v3PublicationSummary(result?.v3_publication),
       verification: compactVerificationReport(result?.verification),
     };
@@ -1550,6 +1981,7 @@ export function v2RuntimeAuthorityAdapters({ rollbackEvidence, repositoryRoot, r
 // This avoids duplicating its hash encoding or rebuilding/replacing the plan.
 async function validateMigrationPublicationSchedule(plan) {
   const validated = new Error("V3 publication schedule validated");
+  process.stderr.write("V3 migration: schedule validation start\n");
   try {
     await finalizeObservationHistoryIndexV3Publication({
       plan,
@@ -1558,7 +1990,11 @@ async function validateMigrationPublicationSchedule(plan) {
       recordDurableEvidence: async () => { throw new Error("Unexpected validation evidence"); },
     });
   } catch (error) {
-    if (error === validated) return;
+    if (error === validated) {
+      process.stderr.write("V3 migration: schedule validation complete\n");
+      return;
+    }
+    process.stderr.write("V3 migration: schedule validation failed\n");
     throw error;
   }
   throw new Error("V3 publication validation did not reach the publication boundary");
@@ -1755,9 +2191,9 @@ function buildR2Adapters({
   const requireHealthyJournal = () => {
     if (recoveryProgress?.poisoned) throw new Error('Recovery journal persistence failed; publication is forbidden until authenticated restart');
   };
-  const durableEvidence = recoveryProgress
-    ? [...recoveryProgress.publicationEvidence]
-    : [];
+  // The authenticated journal owns recovery publication evidence. Keep a
+  // separate array only for the legacy non-journal evidence file.
+  const durableEvidence = [];
   const evidencePath = checkpointOut && !recoveryProgress
     ? `${path.resolve(checkpointOut)}.publication.json`
     : null;
@@ -1778,7 +2214,6 @@ function buildR2Adapters({
         const chunk = entries.slice(offset, offset + 16);
         const result = await recoveryProgress.recordPublicationEvidenceBatch(chunk);
         if (result?.durable !== true) throw new Error('Journal did not prove publication durability');
-        durableEvidence.push(...chunk.map((entry) => ({ ...entry })));
       }
       return { durable: true };
     }
@@ -1793,6 +2228,7 @@ function buildR2Adapters({
   };
   return {
     getObject: ({ key }) => r2GetObject({ r2, key }),
+    getObjectBounded: ({ key, max_bytes }) => r2GetMigrationObjectBounded({ r2, key, max_bytes }),
     headObject: ({ key }) => r2HeadObject({ r2, key }),
     listObjects: (request) => r2ListObjectsV2({ r2, ...request, require_valid_listing: true }),
     putChecksumObject: (intent) => { requireHealthyJournal(); return putAndVerifyR2ObjectWithSha256({ r2, intent }); },
@@ -1808,15 +2244,22 @@ function buildR2Adapters({
       body: object.body,
       content_type: object.content_type,
       writeR2: true,
+      postPutVerify: verifyMigrationPostPut,
+      verifyExisting: verifyMigrationPostPut,
     }); },
     recordDurableEvidence: (entry) => recordDurableEvidenceBatch([entry]),
     recordDurableEvidenceBatch,
-    getDurablePublicationEvidence: () => durableEvidence.map((entry) => ({ ...entry })),
+    getDurablePublicationEvidence: () => (recoveryProgress?.publicationEvidence || durableEvidence).map((entry) => ({ ...entry })),
+    getPublicationEvidenceCount: () => (recoveryProgress?.publicationEvidence || durableEvidence).length,
     writeCheckpoint: async (checkpoint, delta) => {
       if (recoveryProgress) return recoveryProgress.persistCheckpoint(checkpoint, delta);
       if (!freshJournal) return atomicWriteJson(checkpointOut, checkpoint);
       if (fs.existsSync(checkpointOut)) throw new Error('Fresh immutable checkpoint already exists');
-      atomicWriteJson(checkpointOut, checkpoint);
+      const authorityRef = persistShardedMigrationPlan(`${path.resolve(checkpointOut)}.authority`, checkpoint.authority);
+      if (authorityRef.full_plan_sha256 !== checkpoint.authority_sha256) throw new Error('Persisted checkpoint plan identity differs');
+      readShardedMigrationPlan(authorityRef);
+      atomicWriteJson(checkpointOut, { ...checkpoint, authority: undefined,
+        authority_format: authorityRef.format, authority_ref: authorityRef });
       recoveryProgress = buildObservationHistoryV3RecoveryProgressContext({ checkpointPath: checkpointOut, checkpoint, repositoryRoot, create: true });
     },
     stageUnit: async ({ unitId, intents }) => {
@@ -1880,7 +2323,7 @@ function buildR2Adapters({
     getBackupObject,
     finalizeV3Publication: (options) =>
       finalizeMigrationV3Publication({ ...options, publicationConcurrency, runnerPermit,
-        recoveredPublicationEvidence: recoveryProgress ? [...recoveryProgress.publicationEvidence] : [] }),
+        recoveredPublicationEvidence: recoveryProgress ? recoveryProgress.publicationEvidence : [] }),
     rebuildV2Indexes: () => runHistoryIndexBuild({
       argv: ["--history-version", "v2", "--domain", "observations", "--write-r2"],
       env,
@@ -1917,6 +2360,56 @@ function buildSideBySideR2Adapters(options) {
 
 export const SIDE_BY_SIDE_LOCK_OWNER = "observation_history_migration_v2_to_v3";
 
+function lockAuditIdentity(context) {
+  return { owner: context.owner, run_id: context.run_id,
+    logical_identity: context.logical_identity, class_id: context.class_id,
+    object_id: context.object_id, lock_session_nonce_sha256: sha256Hex(context.nonce) };
+}
+
+function meterSideBySideR2Adapters(adapters, counts) {
+  const wrapped = { ...adapters };
+  for (const [name, direction] of [
+    ["getObject", "reads"], ["getObjectBounded", "reads"], ["headObject", "reads"],
+    ["listObjects", "reads"], ["putChecksumObject", "writes"],
+    ["putJsonObject", "writes"], ["putIfChanged", "writes"],
+  ]) {
+    if (typeof adapters[name] !== "function") continue;
+    wrapped[name] = async (...args) => {
+      const counter = counts[direction];
+      counter.attempted += 1;
+      try {
+        const result = await adapters[name](...args);
+        counter.completed += 1;
+        if (direction === "reads" && result?.body) counter.body_bytes += Buffer.byteLength(result.body);
+        if (direction === "writes" && args[0]?.body) counter.body_bytes += Buffer.byteLength(args[0].body);
+        return result;
+      } catch (error) {
+        counter.failed += 1;
+        throw error;
+      }
+    };
+  }
+  return wrapped;
+}
+
+// A LIVE GCP operator is distinct from the existing TEST entry point. Admission
+// still requires an in-process GCE metadata permit (validated by concurrency
+// limits), and the LIVE wrapper separately pins the GitHub repository, GCE
+// project/zone, R2 account/bucket and the clean main-branch implementation.
+const LIVE_GCP_ENTRYPOINT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "uk_aq_observation_history_migration_v3_live_gcp.mjs",
+);
+
+function isReviewedLiveGcpInvocation({ args, runnerPermit, entrypoint }) {
+  return args.environment === "LIVE" &&
+    args.transition === "v2-to-v3" &&
+    new Set(["plan", "migrate", "verify", "locked-clean-build"]).has(args.mode) &&
+    runnerPermit?.runner_kind === "gcp" &&
+    runnerPermit?.runner_profile === GCP_CLEAN_POLICY.runner_profile &&
+    path.resolve(entrypoint) === LIVE_GCP_ENTRYPOINT;
+}
+
 export function createSideBySideLockAssertion({ env, migrationRunId }) {
   const options = { env, expectedOwner: SIDE_BY_SIDE_LOCK_OWNER, expectedRunId: migrationRunId };
   const pinned = requireObservationsGlobalOperationLockContext(options);
@@ -1929,14 +2422,20 @@ export function createSideBySideLockAssertion({ env, migrationRunId }) {
   };
 }
 
-async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedCommand, adapterFactory, runnerPermit = null, entrypoint = fileURLToPath(import.meta.url) }) {
+async function runSideBySideMigrationOperator({
+  args, argv, reentryArgv = argv, env, now, runLockedCommand, adapterFactory,
+  runnerPermit = null, entrypoint = fileURLToPath(import.meta.url), exceptionalRecoveryApproval = null,
+}) {
   const missing = [
     ["--environment", args.environment], ["--expected-bucket", args.expectedBucket],
     ["--migration-run-id", args.migrationRunId], ["--target-writer-git-sha", args.targetWriterGitSha],
     ["--writer-limits-json", args.writerLimitsPath], ["--report-out", args.reportOut],
   ].filter(([, value]) => !String(value || "").trim());
   if (missing.length) throw new Error(`Missing side-by-side arguments: ${missing.map(([flag]) => flag).join(", ")}`);
-  if (args.environment !== "TEST") throw new Error("The active side-by-side operator path is TEST-only");
+  if (args.environment !== "TEST" &&
+      !isReviewedLiveGcpInvocation({ args, runnerPermit, entrypoint })) {
+    throw new Error("LIVE side-by-side execution requires the distinct metadata-admitted LIVE GCP operator");
+  }
   if ([args.dropboxRoot, args.expectedInventoryRootSha256, args.expectedStateRootSha256,
     args.v2RuntimeRollbackRecord, args.operatorAuthorityFile].some(Boolean)) {
     throw new Error("Side-by-side migration does not accept historical Dropbox/runtime rollback authority arguments");
@@ -1944,7 +2443,20 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
   const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
   const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repositoryRoot, encoding: 'utf8' });
   const dirty = spawnSync('git', ['status', '--porcelain=v1', '--untracked-files=normal'], { cwd: repositoryRoot, encoding: 'utf8' });
-  if (head.status !== 0 || dirty.status !== 0 || head.stdout.trim() !== args.targetWriterGitSha || dirty.stdout.trim()) {
+  let approvedRecoveryCode = null;
+  if (exceptionalRecoveryApproval) {
+    approvedRecoveryCode = getExceptionalRecoveryCodeIdentity(repositoryRoot);
+    const approvedContext = exceptionalRecoveryApproval.approval_context;
+    const branch = spawnSync('git', ['branch', '--show-current'], { cwd: repositoryRoot, encoding: 'utf8' });
+    if (approvedContext?.recovery_implementation?.repository_head !== approvedRecoveryCode.repository_head ||
+        approvedContext.recovery_implementation_sha256 !== exceptionalRecoveryCodeSha256(approvedRecoveryCode) ||
+        head.stdout.trim() !== approvedRecoveryCode.repository_head || branch.status !== 0 ||
+        branch.stdout.trim() !== 'main' || args.targetWriterGitSha !== 'e84f52a6b0ddb6212fc6f321b875bb15244c4090') {
+      throw new Error('Exceptional recovery current implementation or original writer identity differs from operator approval');
+    }
+  }
+  if (head.status !== 0 || dirty.status !== 0 ||
+      (!exceptionalRecoveryApproval && head.stdout.trim() !== args.targetWriterGitSha) || dirty.stdout.trim()) {
     throw new Error('Side-by-side execution requires clean reviewed code at the exact target writer Git SHA');
   }
   const config = resolveR2HistoryIndexConfig(env);
@@ -1959,15 +2471,27 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
     readJsonFile(args.writerLimitsPath, "writer limits"), "side-by-side writer limits",
   );
   const checkpointPath = args.checkpointOut || args.checkpointIn;
-  const checkpointArtifacts = checkpointPath ? ["", ".staging", ".recovery", ".publication.json"]
+  const checkpointArtifacts = checkpointPath ? ["", ".authority", ".staging", ".recovery", ".publication.json", ".exceptional-recovery-epochs"]
     .map((suffix) => `${path.resolve(checkpointPath)}${suffix}`) : [];
   const reportPath = path.resolve(args.reportOut);
-  if (reportPath === path.resolve(args.writerLimitsPath) || checkpointArtifacts.some((entry) =>
+  if (reportPath === path.resolve(args.writerLimitsPath) ||
+      (exceptionalRecoveryApproval && reportPath === exceptionalRecoveryApproval.approval_file_path) || checkpointArtifacts.some((entry) =>
     reportPath === entry || reportPath.startsWith(`${entry}${path.sep}`))) {
     throw new Error("Report path must be separate from writer limits and checkpoint/recovery artifacts");
   }
-  if (args.mode === "migrate" && !args.checkpointIn && checkpointArtifacts.some((entry) => fs.existsSync(entry))) {
+  if (new Set(["migrate", "locked-clean-build"]).has(args.mode) && !args.checkpointIn && checkpointArtifacts.some((entry) => fs.existsSync(entry))) {
     throw new Error("Fresh migration cannot overwrite checkpoint artifacts; use --checkpoint-in to resume");
+  }
+  const completePlanPath = args.mode === "locked-clean-build" ? `${reportPath}.complete-plan` : null;
+  const resultEvidencePath = completePlanPath ? `${reportPath}.result-evidence.json` : null;
+  const approvalPath = args.postPlanApprovalFile ? path.resolve(args.postPlanApprovalFile) : null;
+  if (completePlanPath && (fs.existsSync(completePlanPath) || fs.existsSync(resultEvidencePath) ||
+      fs.existsSync(reportPath) || fs.existsSync(approvalPath) ||
+      [reportPath, completePlanPath, resultEvidencePath, args.writerLimitsPath, ...checkpointArtifacts].some((entry) =>
+        approvalPath === path.resolve(entry) || approvalPath.startsWith(`${path.resolve(entry)}${path.sep}`)) ||
+      checkpointArtifacts.some((entry) => [completePlanPath, resultEvidencePath].some((artifact) =>
+        artifact === entry || artifact.startsWith(`${entry}${path.sep}`))))) {
+    throw new Error("Combined run requires unused, separate report, complete-plan, checkpoint and approval paths");
   }
   const lockOptions = { env, expectedOwner: SIDE_BY_SIDE_LOCK_OWNER, expectedRunId: args.migrationRunId };
   const context = observationsGlobalOperationLockContext(lockOptions);
@@ -1979,7 +2503,7 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
         databaseUrl: env.SUPABASE_DB_URL || env.DATABASE_URL,
         owner: SIDE_BY_SIDE_LOCK_OWNER, runId: args.migrationRunId,
         command: process.execPath,
-        commandArgs: [...process.execArgv, entrypoint, ...argv],
+        commandArgs: [...process.execArgv, entrypoint, ...reentryArgv],
         env, diagnostics,
       });
       return { delegated: true, exitCode };
@@ -1992,34 +2516,66 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
   let plan = null;
   let checkpoint = null;
   let recoveryProgress = null;
+  let lockedSourceRoot = null;
+  let exceptionalRecoveryAuthorization = null;
+  let exceptionalRecoveryEpoch = null;
   let planningAdmission = null;
+  let initialSourceRoot = null;
+  let postPlanApproval = null;
+  let completePlanReference = null;
+  const phaseDurations = {};
+  reportObservationHistoryV3Memory({ phase: "planning_start" });
+  const r2AdapterCalls = { reads: { attempted: 0, completed: 0, failed: 0, body_bytes: 0 },
+    writes: { attempted: 0, completed: 0, failed: 0, body_bytes: 0 } };
   // Construct only R2/local adapters. No Dropbox reader or deployment adapter.
-  const baseAdapters = adapterFactory({
+  const baseAdapters = meterSideBySideR2Adapters(adapterFactory({
     config, checkpointOut: args.checkpointOut || args.checkpointIn, env,
     publicationConcurrency: args.publicationConcurrency, runnerPermit, repositoryRoot, assertLockHeld,
-  });
+  }), r2AdapterCalls);
+  if (runnerPermit && typeof baseAdapters.getObjectBounded !== 'function') {
+    throw new Error('GCP source inventory requires a bounded R2 GET adapter');
+  }
   const getObject = async (request) => {
     assertLockHeld();
     const result = await baseAdapters.getObject(request);
     assertLockHeld();
     return result;
   };
+  const getObjectBounded = runnerPermit ? async (request) => {
+    assertLockHeld();
+    const result = await baseAdapters.getObjectBounded(request);
+    assertLockHeld();
+    return result;
+  } : null;
   try {
+    if (args.mode === "locked-clean-build") {
+      const key = getObservationHistoryGeneration('v2').observations_root_key;
+      const source = await getObject({ key });
+      if (!source?.body) throw new Error('Locked canonical v2 source root is missing');
+      const bytes = Buffer.from(source.body);
+      initialSourceRoot = { key, byte_size: bytes.byteLength, sha256: sha256Hex(bytes) };
+    }
     if (runnerPermit && !args.checkpointIn) planningAdmission = await inspectEmptyV3Target({ listObjects: baseAdapters.listObjects, assertLockHeld, phase: 'plan' });
     if (args.checkpointIn) {
       assertLockHeld();
-      checkpoint = readJsonFile(args.checkpointIn, "side-by-side checkpoint");
+      checkpoint = readMigrationCheckpoint(args.checkpointIn);
+      if (exceptionalRecoveryApproval && (!args.checkpointOut ||
+          path.resolve(args.checkpointOut) !== path.resolve(args.checkpointIn))) {
+        throw new Error('Exceptional recovery must retain the original checkpoint as both checkpoint-in and checkpoint-out');
+      }
       plan = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
       assertSideBySideMigrationPlan(plan);
       if (!runnerPermit && plan.plan_identity.runner_policy?.runner_kind === 'gcp') throw new Error('GCP checkpoint recovery requires the metadata-admitted GCP entrypoint');
       // Check pinned source BEFORE recovery journal initialization or target work.
-      await verifySideBySideSourceRoot({ plan, getObject });
+      lockedSourceRoot = await verifySideBySideSourceRoot({ plan, getObject });
     } else {
       plan = await buildObservationHistorySideBySideMigrationPlan({
-        getR2Object: getObject, assertLockHeld, repositoryRoot,
+        getR2Object: getObject, getR2ObjectBounded: getObjectBounded,
+        assertLockHeld, repositoryRoot,
         environmentEvidence: evidence, migrationRunId: args.migrationRunId,
         targetWriterGitSha: args.targetWriterGitSha,
-        publicationConcurrency: args.publicationConcurrency, runnerPermit, runnerPolicy: runnerPermit ? GCP_CLEAN_POLICY : null,
+        publicationConcurrency: args.publicationConcurrency, inventoryConcurrency: args.inventoryConcurrency,
+        runnerPermit, runnerPolicy: runnerPermit ? GCP_CLEAN_POLICY : null,
       });
     }
     if (plan.migration_run_id !== args.migrationRunId ||
@@ -2029,12 +2585,39 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
         (args.expectedPlanSha256 && args.expectedPlanSha256 !== plan.plan_sha256)) {
       throw new Error("Side-by-side pinned run, writer, limits, environment or plan hash differs");
     }
+    if (initialSourceRoot && (plan.inventory.root_manifest.key !== initialSourceRoot.key ||
+        plan.inventory.root_manifest.byte_size !== initialSourceRoot.byte_size ||
+        plan.inventory.root_manifest.sha256 !== initialSourceRoot.sha256)) {
+      throw new Error('Canonical v2 root changed between initial lock-held capture and completed plan');
+    }
     if (runnerPermit && stableMigrationJson(plan.plan_identity.runner_policy) !== stableMigrationJson(GCP_CLEAN_POLICY)) throw new Error('GCP runner requires its own complete clean-build plan; local/historical checkpoint is incompatible');
+    if (exceptionalRecoveryApproval) {
+      const recordedRunner = plan.runner;
+      if (!recordedRunner || recordedRunner.runner_kind !== 'gcp' || recordedRunner.runner_profile !== 'gcp-c4a-32' ||
+          recordedRunner.inventory_concurrency !== 48 || recordedRunner.partition_concurrency !== 16 ||
+          recordedRunner.publication_concurrency !== 80 || args.inventoryConcurrency !== recordedRunner.inventory_concurrency ||
+          args.partitionConcurrency !== recordedRunner.partition_concurrency ||
+          args.publicationConcurrency !== recordedRunner.publication_concurrency) {
+        throw new Error('Exceptional recovery concurrency must exactly match the immutable checkpoint runner settings (inventory 48, partition 16, publication 80)');
+      }
+      if (!lockedSourceRoot) throw new Error('Exceptional recovery lacks lock-held source-root verification');
+      exceptionalRecoveryAuthorization = validateExceptionalRecoveryAdmission({
+        checkpointPath: args.checkpointIn, repositoryRoot, approval: exceptionalRecoveryApproval,
+        sourceRoot: lockedSourceRoot, runner: runnerPermit,
+      });
+    }
     if (!checkpoint) plan = Object.freeze({ ...plan,
       runner: { ...(runnerPermit || { runner_kind: 'local', runner_profile: 'local-conservative' }),
-        partition_concurrency: args.partitionConcurrency, publication_concurrency: args.publicationConcurrency },
+        partition_concurrency: args.partitionConcurrency, publication_concurrency: args.publicationConcurrency,
+        inventory_concurrency: args.inventoryConcurrency,
+        legacy_hash_concurrency: runnerPermit ? 4 : 1,
+        legacy_hash_limits: LEGACY_HASH_DERIVATION_LIMITS,
+        source_in_flight_bytes: migrationConcurrencyLimits(runnerPermit).sourceInFlightBytes,
+        publication_in_flight_bytes: migrationConcurrencyLimits(runnerPermit).publicationInFlightBytes },
       planning_clean_target_admission: planningAdmission });
-    process.stderr.write(`V3 migration: runner=${runnerPermit?.runner_profile || 'local-conservative'} partition_concurrency=${args.partitionConcurrency} publication_concurrency=${args.publicationConcurrency}\n`);
+    reportObservationHistoryV3Memory({ phase: "planning_complete", checkpoint,
+      publicationEvidenceCount: recoveryProgress?.publicationEvidence.length || 0 });
+    process.stderr.write(`V3 migration: runner=${runnerPermit?.runner_profile || 'local-conservative'} inventory_concurrency=${args.inventoryConcurrency} legacy_hash_concurrency=${runnerPermit ? 4 : 1} partition_concurrency=${args.partitionConcurrency} publication_concurrency=${args.publicationConcurrency}\n`);
     if (checkpoint) {
       const hasJournal = fs.existsSync(recoveryProgressPaths(args.checkpointIn).manifest);
       if (!hasJournal && checkpoint.progress_format === "authenticated-journal-v1") throw new Error("Authenticated fresh-run journal is missing");
@@ -2042,6 +2625,17 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
         recoveryProgress = buildObservationHistoryV3RecoveryProgressContext({
           checkpointPath: args.checkpointIn, checkpoint, repositoryRoot,
           create: args.mode === "migrate", repairHead: args.mode === "migrate", requireCurrentImplementation: true,
+          exceptionalRecoveryAuthorization,
+          onAuthenticatedReplay: exceptionalRecoveryAuthorization ? (frontier) => {
+            const approvedFrontier = getExceptionalRecoveryJournalFrontier(exceptionalRecoveryAuthorization.auth.journal);
+            if (frontier.sequence !== approvedFrontier.sequence || frontier.entry_sha256 !== approvedFrontier.entry_sha256) {
+              throw new Error('Exceptional recovery journal frontier changed before epoch admission');
+            }
+            assertLockHeld();
+            exceptionalRecoveryEpoch = appendExceptionalRecoveryEpoch({
+              admission: exceptionalRecoveryAuthorization, assertLockHeld,
+            });
+          } : null,
         });
         checkpoint = recoveryProgress.checkpoint;
         plan = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
@@ -2049,17 +2643,59 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
       }
     }
     const adapters = guardSideBySideMigrationAdapters(plan, {
-      ...(recoveryProgress ? adapterFactory({
+      ...(recoveryProgress ? meterSideBySideR2Adapters(adapterFactory({
         config, checkpointOut: args.checkpointOut || args.checkpointIn, env,
         recoveryProgress, publicationConcurrency: args.publicationConcurrency, runnerPermit, repositoryRoot, assertLockHeld,
-      }) : baseAdapters),
+      }), r2AdapterCalls) : baseAdapters),
       assertLockHeld,
     });
     await verifySideBySideSourceRoot({ plan, getObject: adapters.getObject });
     let result;
     let reportPlan = plan;
     if (args.mode === "plan") {
-      result = { ...summaryForPlan(plan), ok: true, status: "planned", dry_run: true, mutation_calls: 0 };
+      result = { ...compactSideBySidePlanSummary(plan), ok: true, status: "planned", dry_run: true, mutation_calls: 0 };
+    } else if (args.mode === "locked-clean-build") {
+      phaseDurations.planning_ms = Date.now() - Date.parse(startedAt);
+      assertLockHeld();
+      completePlanReference = persistShardedMigrationPlan(completePlanPath, plan);
+      readShardedMigrationPlan(completePlanReference);
+      reportObservationHistoryV3Memory({ phase: "plan_persisted" });
+      if (plan.mutation_allowed !== true || !Array.isArray(plan.blockers) || plan.blockers.length) {
+        throw new Error("Combined plan has blockers or lacks mutation authority");
+      }
+      const planPublishedAt = fs.statSync(completePlanReference.master_path).mtimeMs;
+      const approvalWaitStarted = Date.now();
+      const approvalDeadline = approvalWaitStarted + POST_PLAN_APPROVAL_WAIT_MS;
+      atomicWriteJson(args.reportOut, { result: { ...compactSideBySidePlanSummary(plan), ok: true,
+        status: "awaiting_post_plan_approval", dry_run: true, mutation_calls: 0 },
+        audit: { runner: plan.runner, planning_clean_target_admission: plan.planning_clean_target_admission,
+          global_lock: lockAuditIdentity(assertLockHeld()),
+          complete_plan_path: completePlanReference.master_path, complete_plan_sha256: completePlanReference.full_plan_sha256,
+          approval_path: approvalPath, approval_expires_at_utc: new Date(approvalDeadline).toISOString() } });
+      postPlanApproval = await waitForPostPlanApproval({ plan, approvalPath, planPublishedAt, deadline: approvalDeadline, assertLockHeld });
+      phaseDurations.approval_wait_ms = Date.now() - approvalWaitStarted;
+      const approvalStat = fs.lstatSync(approvalPath);
+      if (!approvalStat.isFile() || approvalStat.isSymbolicLink() ||
+          sha256Hex(fs.readFileSync(approvalPath)) !== postPlanApproval.approval_file_sha256 ||
+          args.apply !== true || args.writersFrozen !== true) {
+        throw new Error("Post-plan approval or frozen-writer/apply intent changed before mutation");
+      }
+      if (readShardedMigrationPlan(completePlanReference).full_plan_sha256 !== sha256StableMigrationJson(plan)) {
+        throw new Error('Persisted complete plan changed before approved migration');
+      }
+      reportObservationHistoryV3Memory({ phase: "approved_plan_authenticated" });
+      await verifySideBySideSourceRoot({ plan, getObject: adapters.getObject });
+      assertLockHeld();
+      const migrationStarted = Date.now();
+      result = await executeObservationHistoryV3MigrationPlan({
+        plan: Object.freeze({ ...plan, post_plan_approval: postPlanApproval }),
+        apply: args.apply, writersFrozen: args.writersFrozen, environmentEvidence: evidence,
+        checkpoint, publicationConcurrency: args.publicationConcurrency,
+        partitionConcurrency: args.partitionConcurrency, runnerPermit,
+        onReconstructedPlan: (value) => { reportPlan = value; }, adapters,
+      });
+      phaseDurations.migration_and_independent_verification_ms = Date.now() - migrationStarted;
+      checkpoint = result.checkpoint;
     } else if (args.mode === "migrate") {
       result = await executeObservationHistoryV3MigrationPlan({
         plan, apply: true, writersFrozen: args.writersFrozen,
@@ -2081,21 +2717,72 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
         publicationConcurrency: args.publicationConcurrency, partitionConcurrency: args.partitionConcurrency, runnerPermit,
       });
     }
+    if (completePlanReference) {
+      if (sha256StableMigrationJson(plan) !== completePlanReference.full_plan_sha256 ||
+          readShardedMigrationPlan(completePlanReference).full_plan_sha256 !== completePlanReference.full_plan_sha256) {
+        throw new Error('Approved complete plan authority changed during migration');
+      }
+      const durableCheckpoint = readMigrationCheckpoint(args.checkpointOut);
+      const { post_plan_approval: checkpointApproval, ...checkpointPlan } = durableCheckpoint.authority;
+      if (sha256StableMigrationJson(checkpointPlan) !== completePlanReference.full_plan_sha256 ||
+          stableMigrationJson(checkpointApproval) !== stableMigrationJson(postPlanApproval) ||
+          durableCheckpoint.plan_sha256 !== plan.plan_sha256) {
+        throw new Error('Immutable checkpoint authority differs from the approved complete plan');
+      }
+    }
+    const finalRootStarted = Date.now();
     const sourceRoot = await verifySideBySideSourceRoot({ plan, getObject: adapters.getObject });
+    if (completePlanPath) phaseDurations.final_source_root_ms = Date.now() - finalRootStarted;
     assertLockHeld();
     const output = buildObservationHistoryV3ReportOutput({
       result, mode: args.mode, checkpoint,
       audit: buildObservationHistoryV3MigrationAuditReport({
         plan: reportPlan, mode: args.mode, startedAt, completedAt: now(),
-        execution: args.mode === "migrate" ? result : args.mode === "verify"
+        execution: new Set(["migrate", "locked-clean-build"]).has(args.mode) ? result : args.mode === "verify"
           ? { verification: result, v3_publication: { ok: true } } : null,
       }),
     });
     output.audit.runner = { ...(runnerPermit || { runner_kind: 'local', runner_profile: 'local-conservative' }),
-      partition_concurrency: args.partitionConcurrency, publication_concurrency: args.publicationConcurrency };
+      inventory_concurrency: args.inventoryConcurrency, partition_concurrency: args.partitionConcurrency,
+      publication_concurrency: args.publicationConcurrency,
+      legacy_hash_concurrency: runnerPermit ? 4 : 1,
+      legacy_hash_limits: LEGACY_HASH_DERIVATION_LIMITS,
+      source_in_flight_bytes: migrationConcurrencyLimits(runnerPermit).sourceInFlightBytes,
+      publication_in_flight_bytes: migrationConcurrencyLimits(runnerPermit).publicationInFlightBytes };
+    output.audit.global_lock = lockAuditIdentity(assertLockHeld());
+  if (exceptionalRecoveryApproval) {
+    output.audit.exceptional_recovery_approval = {
+      kind: exceptionalRecoveryApproval.kind,
+      approval_file_sha256: exceptionalRecoveryApproval.approval_file_sha256,
+      approval_phrase_sha256: exceptionalRecoveryApproval.approval_phrase_sha256,
+      original_journal_anchor: exceptionalRecoveryApproval.approval_context.original_journal_anchor,
+      approved_journal_frontier: exceptionalRecoveryApproval.approval_context.journal_frontier,
+      recovery_implementation_sha256: exceptionalRecoveryApproval.approval_context.recovery_implementation_sha256,
+      recovery_epoch_sequence: exceptionalRecoveryEpoch?.sequence || exceptionalRecoveryApproval.approval_context.next_epoch_sequence,
+      recovery_epoch_sha256: exceptionalRecoveryEpoch?.payload_sha256 || null,
+      recovery_epoch_append_confirmed: Boolean(exceptionalRecoveryEpoch),
+    };
+  }
     output.audit.clean_target_admission = checkpoint?.clean_target_admission || planningAdmission;
     output.audit.initial_runner = plan.runner;
     output.audit.planning_clean_target_admission = plan.planning_clean_target_admission;
+    if (completePlanPath) {
+      output.audit.complete_plan_path = completePlanReference.master_path;
+      output.audit.complete_plan_master_sha256 = completePlanReference.master_sha256;
+      output.audit.complete_plan_sha256 = sha256StableMigrationJson(plan);
+      output.audit.reviewed_writer_git_sha = plan.target_writer_git_sha;
+      output.audit.post_plan_approval = postPlanApproval;
+      output.audit.phase_durations_ms = { ...phaseDurations, ...(result.phase_durations_ms || {}) };
+      const activeMs = phaseDurations.planning_ms + phaseDurations.migration_and_independent_verification_ms;
+      output.audit.r2_adapter_calls = structuredClone(r2AdapterCalls);
+      output.audit.throughput = { active_processing_ms: activeMs,
+        completed_r2_reads_per_second: activeMs > 0 ? r2AdapterCalls.reads.completed * 1000 / activeMs : null,
+        completed_r2_writes_per_second: activeMs > 0 ? r2AdapterCalls.writes.completed * 1000 / activeMs : null,
+        source_rows_per_second: activeMs > 0 ? plan.estimated.source_rows * 1000 / activeMs : null };
+      const head = readRecoveryEnvelope(recoveryProgressPaths(args.checkpointOut).head,
+        "uk_aq_observation_history_v3_recovery_head");
+      output.audit.authenticated_recovery_head_sha256 = head.payload_sha256;
+    }
     output.result.plan_sha256 = plan.plan_sha256;
     output.result.generation_topology = SIDE_BY_SIDE_TOPOLOGY;
     output.result.source_root = sourceRoot;
@@ -2103,16 +2790,40 @@ async function runSideBySideMigrationOperator({ args, argv, env, now, runLockedC
     if (result.ok && args.mode !== "plan") output.result.status = "side_by_side_build_verified";
     output.audit.generation_topology = SIDE_BY_SIDE_TOPOLOGY;
     output.audit.source_root_unchanged = sourceRoot;
+    if (initialSourceRoot) output.audit.initial_source_root = initialSourceRoot;
     output.audit.rollback_ready = false;
     output.audit.rollback_model = "intact_v2_selection_requires_separate_controlled_acceptance";
+    if (resultEvidencePath) {
+      assertLockHeld();
+      const finalEvidence = recoveryEnvelope("uk_aq_observation_history_v3_locked_build_result", output);
+      atomicWriteJson(resultEvidencePath, finalEvidence);
+      readRecoveryEnvelope(resultEvidencePath, finalEvidence.kind);
+      output.result_evidence_path = resultEvidencePath;
+      output.result_evidence_sha256 = finalEvidence.payload_sha256;
+    }
     atomicWriteJson(args.reportOut, output);
     assertLockHeld();
     return output;
   } catch (error) {
     atomicWriteJson(args.reportOut, {
       result: { ok: false, status: "failed", generation_topology: SIDE_BY_SIDE_TOPOLOGY,
-        plan_sha256: plan?.plan_sha256 || null, error: error.message, failure_evidence: migrationFailureEvidence(error), runtime_switch_performed: false },
-      audit: { runner: runnerPermit, clean_target_admission: error.clean_target_admission || checkpoint?.clean_target_admission || null },
+        plan_sha256: plan?.plan_sha256 || null, blockers: plan?.blockers || [],
+        error: error.message, failure_evidence: migrationFailureEvidence(error), runtime_switch_performed: false },
+      audit: { runner: runnerPermit, post_plan_approval: postPlanApproval,
+        ...(exceptionalRecoveryApproval ? { exceptional_recovery_approval: {
+          kind: exceptionalRecoveryApproval.kind,
+          approval_file_sha256: exceptionalRecoveryApproval.approval_file_sha256,
+          approval_phrase_sha256: exceptionalRecoveryApproval.approval_phrase_sha256,
+          original_journal_anchor: exceptionalRecoveryApproval.approval_context.original_journal_anchor,
+          approved_journal_frontier: exceptionalRecoveryApproval.approval_context.journal_frontier,
+          recovery_implementation_sha256: exceptionalRecoveryApproval.approval_context.recovery_implementation_sha256,
+          recovery_epoch_sequence: exceptionalRecoveryEpoch?.sequence || exceptionalRecoveryApproval.approval_context.next_epoch_sequence,
+          recovery_epoch_sha256: exceptionalRecoveryEpoch?.payload_sha256 || null,
+          recovery_epoch_append_confirmed: Boolean(exceptionalRecoveryEpoch),
+        } } : {}),
+        complete_plan_path: completePlanPath ? path.join(completePlanPath, 'master.json') : null, phase_durations_ms: phaseDurations,
+        r2_adapter_calls: r2AdapterCalls,
+        clean_target_admission: error.clean_target_admission || checkpoint?.clean_target_admission || null },
     });
     throw error;
   }
@@ -2125,15 +2836,44 @@ export async function runObservationHistoryMigrationV3({
   runLockedCommand = runCommandWithObservationsGlobalOperationLock,
   sideBySideAdapterFactory = buildSideBySideR2Adapters,
   runnerPermit = null, entrypoint = fileURLToPath(import.meta.url),
+  reentryArgv = argv,
+  exceptionalRecoveryApproval = null,
 } = {}) {
-  const args = parseObservationHistoryMigrationArgs(argv, runnerPermit);
+  const parsedArgs = parseObservationHistoryMigrationArgs(argv, runnerPermit);
+  const executionContext = createObservationHistoryMigrationExecutionContext(parsedArgs, exceptionalRecoveryApproval);
+  const args = executionContext.args;
+  const recoveryApproval = executionContext.exceptionalRecoveryApproval;
+  if (recoveryApproval) {
+    const approvalContext = recoveryApproval.approval_context;
+    if (runnerPermit?.runner_kind !== "gcp" || args.mode !== "migrate" || args.environment !== "LIVE" ||
+        args.transition !== "v2-to-v3" || args.migrationRunId !== "live-v3-20261015T114250Z-e84f52a" ||
+        args.expectedPlanSha256 !== "1e960674e53cd2ddb3c5d08a3318fcce1abc72ebe7a2dc92e11e9ce9a4d79600" ||
+        args.targetWriterGitSha !== "e84f52a6b0ddb6212fc6f321b875bb15244c4090" ||
+        recoveryApproval.kind !== "uk_aq_observation_history_v3_exceptional_resume_approval_v1" ||
+        !/^[0-9a-f]{64}$/.test(String(recoveryApproval.approval_file_sha256 || "")) ||
+        approvalContext?.migration_run_id !== args.migrationRunId ||
+        approvalContext?.plan_sha256 !== args.expectedPlanSha256 ||
+        approvalContext?.immutable_authority_sha256 !== "80ac1e8b1c975d66036a170cd78bce2680c256b36131f3505530789b6c3599b6" ||
+        !/^[0-9a-f]{64}$/.test(String(approvalContext?.recovery_implementation_sha256 || "")) ||
+        !Object.isFrozen(approvalContext)) {
+      throw new Error("Exceptional recovery approval object is invalid for this invocation");
+    }
+  }
   if (args.help) return { help: true, text: usage() };
-  if (runnerPermit && (args.environment !== "TEST" || args.transition !== "v2-to-v3" || !["plan", "migrate", "verify"].includes(args.mode))) throw new Error("GCP clean-build runner supports only TEST v2-to-v3 plan/migrate/verify");
-  if (args.transition === "v2-to-v3" && ["plan", "migrate", "verify"].includes(args.mode)) {
-    return runSideBySideMigrationOperator({ args, argv, env, now, runLockedCommand, adapterFactory: sideBySideAdapterFactory, runnerPermit, entrypoint });
+  if (runnerPermit && ((args.environment !== "TEST" &&
+      !isReviewedLiveGcpInvocation({ args, runnerPermit, entrypoint })) ||
+      args.transition !== "v2-to-v3" || !["plan", "migrate", "verify", "locked-clean-build"].includes(args.mode))) {
+    throw new Error("GCP clean-build runner requires TEST or the reviewed LIVE GCP entry point, v2-to-v3 plan/migrate/verify/locked-clean-build");
+  }
+  if (args.transition === "v2-to-v3" && ["plan", "migrate", "verify", "locked-clean-build"].includes(args.mode)) {
+    return runSideBySideMigrationOperator({
+      args, argv, reentryArgv, env, now, runLockedCommand,
+      adapterFactory: sideBySideAdapterFactory, runnerPermit, entrypoint,
+      exceptionalRecoveryApproval: recoveryApproval,
+    });
   }
   if (args.checkpointIn && ["rollback", "rollback-plan"].includes(args.mode) &&
-      readJsonFile(args.checkpointIn, "migration checkpoint")?.authority?.generation_topology === SIDE_BY_SIDE_TOPOLOGY) {
+      readMigrationCheckpoint(args.checkpointIn)?.authority?.generation_topology === SIDE_BY_SIDE_TOPOLOGY) {
     throw new Error("Side-by-side rollback selects intact v2; Dropbox restore and historical runtime deployment are not permitted for this checkpoint");
   }
   if (args.mode === "migrate" && !args.checkpointIn && (!args.operatorAuthorityFile || !args.v2RuntimeRollbackRecord)) throw new Error("Fresh migration requires --operator-authority-file and --v2-runtime-rollback-record");
@@ -2273,7 +3013,7 @@ export async function runObservationHistoryMigrationV3({
     }
   }
   let checkpoint = args.checkpointIn
-    ? readJsonFile(args.checkpointIn, "migration checkpoint")
+    ? readMigrationCheckpoint(args.checkpointIn)
     : null;
   let recoveryProgress = null;
   if (checkpoint && args.mode === "migrate") {
@@ -2286,16 +3026,23 @@ export async function runObservationHistoryMigrationV3({
       requireCurrentImplementation: false,
       diagnostics: true,
     });
-    const recoveryExecutorCheck = spawnSync("bash", [
-      "scripts/index_v3_migration/index_v3_migration.sh",
-      "--resume-implementation-authority",
-      path.resolve(args.checkpointIn),
-      args.targetWriterGitSha,
-    ], { cwd: repositoryRoot, encoding: "utf8" });
-    if (recoveryExecutorCheck.status !== 0) {
-      throw new Error(`Resume recovery executor is not authorized: ${
-        recoveryExecutorCheck.stderr || recoveryExecutorCheck.error?.message || "local authority check failed"
-      }`);
+    if (recoveryApproval) {
+      verifyOriginalRecoveryImplementation({
+        manifest: recoveryProgress.manifest,
+        repositoryRoot,
+      });
+    } else {
+      const recoveryExecutorCheck = spawnSync("bash", [
+        "scripts/index_v3_migration/index_v3_migration.sh",
+        "--resume-implementation-authority",
+        path.resolve(args.checkpointIn),
+        args.targetWriterGitSha,
+      ], { cwd: repositoryRoot, encoding: "utf8" });
+      if (recoveryExecutorCheck.status !== 0) {
+        throw new Error(`Resume recovery executor is not authorized: ${
+          recoveryExecutorCheck.stderr || recoveryExecutorCheck.error?.message || "local authority check failed"
+        }`);
+      }
     }
     checkpoint = recoveryProgress.checkpoint;
   } else if (checkpoint && new Set(["rollback-plan", "rollback"]).has(args.mode)) {
@@ -2326,6 +3073,7 @@ export async function runObservationHistoryMigrationV3({
       checkpoint,
       repositoryRoot,
       requireCurrentImplementation: args.mode !== "verify",
+      readOnly: args.mode === "verify",
     });
     checkpoint = recoveryProgress.checkpoint;
   }

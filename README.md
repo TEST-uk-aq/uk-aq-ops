@@ -240,6 +240,11 @@ Primary controls:
   - `/api/aq/postcode_lookup`
 - Upstream auth header:
   - injects `X-UK-AQ-Upstream-Auth` using `UK_AQ_EDGE_UPSTREAM_SECRET`.
+- The isolated TEST operator routes `/api/aq/recent-aqi-prototype` and
+  `/api/aq/recent-hourly-prototype` require a real website session, allowed
+  Origin and dedicated operator token. See the [station-history prototype
+  handover](workers/uk_aq_station_history/RECENT_HOURLY_PROTOTYPE.md) for the
+  six-hour schema, bounded AURN allowlist and manual deployment/validation.
 
 ### 11) Dashboard Backend API Source (`local/dashboard/server/uk_aq_dashboard_api.py`)
 

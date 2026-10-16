@@ -37,7 +37,11 @@ function embeddedObservedProperty(row) {
   return { phenomenon, observedProperty };
 }
 
-export async function resolveAuthoritativeTimeseriesIdentity(request, env) {
+export async function resolveAuthoritativeTimeseriesIdentity(request, env, {
+  timeoutMs = null,
+  maxResponseBytes = null,
+  includeLastValueAt = false,
+} = {}) {
   const timeseriesId = positiveInteger(request?.timeseriesId);
   const suppliedConnectorId = request?.connectorId == null ? null : positiveInteger(request.connectorId);
   const requestedPollutant = normalizePollutantCode(request?.pollutant);
@@ -52,15 +56,18 @@ export async function resolveAuthoritativeTimeseriesIdentity(request, env) {
   const endpoint = new URL(`${normalizeBaseUrl(supabaseUrl)}/rest/v1/timeseries`);
   endpoint.searchParams.set(
     "select",
-    "id,station_id,connector_id,phenomenon_id,ended_at,phenomena(connector_id,observed_property_id,observed_properties(code))",
+    `id,station_id,connector_id,phenomenon_id,ended_at${includeLastValueAt ? ",last_value_at" : ""},phenomena(connector_id,observed_property_id,observed_properties(code))`,
   );
   endpoint.searchParams.set("id", `eq.${timeseriesId}`);
   endpoint.searchParams.set("limit", "1");
 
   let response;
+  const controller = timeoutMs === null ? null : new AbortController();
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
   try {
     response = await fetch(endpoint.toString(), {
       method: "GET",
+      ...(controller ? { signal: controller.signal } : {}),
       headers: {
         Accept: "application/json",
         "Accept-Profile": "uk_aq_core",
@@ -69,15 +76,42 @@ export async function resolveAuthoritativeTimeseriesIdentity(request, env) {
       },
     });
   } catch {
+    if (timer) clearTimeout(timer);
     fail(502, "station_history_identity_lookup_failed");
   }
-  if (!response.ok) fail(502, "station_history_identity_lookup_failed", `upstream_status_${response.status}`);
+  if (!response.ok) {
+    if (timer) clearTimeout(timer);
+    fail(502, "station_history_identity_lookup_failed", `upstream_status_${response.status}`);
+  }
 
   let payload;
   try {
-    payload = await response.json();
+    if (maxResponseBytes === null) {
+      payload = await response.json();
+    } else {
+      const declaredLength = Number(response.headers.get("Content-Length"));
+      if (Number.isFinite(declaredLength) && declaredLength > maxResponseBytes) fail(502, "station_history_identity_lookup_oversize");
+      if (!response.body) fail(502, "station_history_identity_lookup_invalid_response");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let body = "";
+      let bytes = 0;
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > maxResponseBytes) {
+          await reader.cancel();
+          fail(502, "station_history_identity_lookup_oversize");
+        }
+        body += decoder.decode(value, { stream: true });
+      }
+      payload = JSON.parse(body + decoder.decode());
+    }
   } catch {
     fail(502, "station_history_identity_lookup_invalid_response");
+  } finally {
+    if (timer) clearTimeout(timer);
   }
   const row = Array.isArray(payload) && payload.length === 1 ? payload[0] : null;
   if (!row) fail(404, "station_history_timeseries_not_found");
@@ -103,7 +137,7 @@ export async function resolveAuthoritativeTimeseriesIdentity(request, env) {
     fail(409, "station_history_connector_mismatch", `supplied_${suppliedConnectorId}_authoritative_${connectorId}`);
   }
 
-  return {
+  const identity = {
     source: IDENTITY_SOURCE,
     timeseriesId,
     stationId,
@@ -112,6 +146,11 @@ export async function resolveAuthoritativeTimeseriesIdentity(request, env) {
     observedPropertyId,
     pollutant,
   };
+  if (includeLastValueAt) {
+    const lastValueAtMs = Date.parse(required(row.last_value_at));
+    identity.lastValueAt = Number.isFinite(lastValueAtMs) ? new Date(lastValueAtMs).toISOString() : null;
+  }
+  return identity;
 }
 
 export function publicTimeseriesIdentity(identity) {

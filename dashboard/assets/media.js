@@ -1525,6 +1525,86 @@
     return match ? `${match[3]}/${match[2]}/${match[1]} ${match[4]}:${match[5]} UTC` : formatUtcDateTime(value, false);
   }
 
+
+  const HEALTH_REASONS = {
+    no_discovery_runs: "No discovery attempts recorded",
+    not_scheduled_configuration_mismatch: "Enabled, but not scheduled due to configuration mismatch",
+    repeated_discovery_failure: "Repeated discovery failures",
+    no_recent_success: "No successful discovery in five hours",
+    latest_run_failed: "Latest run failed",
+    latest_run_skipped: "Latest run skipped",
+    stalled_run: "Discovery appears stalled",
+  };
+
+  function healthIssue(source) {
+    const broken = (source.routes || []).filter(route => route.status !== "healthy");
+    const reason = source.reason ? (HEALTH_REASONS[source.reason] || source.reason)
+      : broken.slice(0, 4).map(route => (route.route_key || "Source-wide") + ": " +
+          (HEALTH_REASONS[route.reason] || route.reason || "Unknown") +
+          (route.latest_error_code ? " (" + route.latest_error_code + ")" : "")).join("; ") +
+        (broken.length > 4 ? "; and " + (broken.length - 4) + " more" : "");
+    return '<li class="media-health__issue media-health__issue--' + esc(source.status) +
+      '"><strong>' + esc(source.name) + '</strong>' +
+      (source.auto_approval ? ' <small>Auto-approval</small>' : '') +
+      '<span>' + esc(reason) + '</span></li>';
+  }
+
+  function renderMediaHealth(data, error = "") {
+    const el = state.root?.querySelector("[data-media-health]");
+    if (!el) return;
+    const heading = '<div class="media-health__heading"><h3>Discovery and automatic publishing health</h3>' +
+      '<button class="media-button" type="button" data-media-health-refresh>Refresh</button></div>';
+    let body = '<p>Loading health…</p>';
+    if (error) {
+      body = '<p class="media-health__error">Unable to load health: ' + esc(error) + '</p>';
+    } else if (data) {
+      const sources = Array.isArray(data.sources) ? data.sources : [];
+      const social = Array.isArray(data.social) ? data.social : [];
+      const affected = sources.filter(source => source.status !== "healthy").sort((a, b) =>
+        Number(b.auto_approval) - Number(a.auto_approval) ||
+        (a.status === "critical" ? -1 : 1) - (b.status === "critical" ? -1 : 1));
+      const severe = affected.some(source => source.status === "critical") ||
+        social.some(row => row.severity === "critical");
+      body = '<p><strong>' + esc(severe ? "Needs attention" :
+        affected.length || social.length ? "Warnings" : "Healthy") + '</strong> · ' +
+        affected.length + ' publishers affected · ' + social.length +
+        ' unresolved automatic social publications · Updated ' +
+        esc(formatUtcDateTime(data.generated_at)) + '</p>';
+      body += affected.length ? '<h4>Publisher discovery</h4><ul class="media-health__issues">' +
+        affected.map(healthIssue).join("") + '</ul>' : '<p>No publisher discovery problems detected.</p>';
+      if (social.length) body += '<h4>Automatic social publications</h4><ul class="media-health__issues">' +
+        social.map(row => '<li class="media-health__issue media-health__issue--' +
+          esc(row.severity) + '"><strong>' + esc(row.channel) + ' · article ' +
+          esc(row.article_id) + '</strong><span>' + esc(row.status) +
+          (row.last_error_code ? " · " + esc(row.last_error_code) : "") +
+          '</span></li>').join("") + '</ul>';
+      const routeRows = sources.flatMap(source => (source.routes || []).map(route =>
+        '<tr><td>' + esc(source.name) + (source.auto_approval ? ' (Auto)' : '') +
+        '</td><td>' + esc(route.route_key || "Source-wide") + '</td><td>' +
+        esc(route.status) + '</td><td>' + esc(formatUtcDateTime(route.last_success_at)) +
+        '</td><td>' + esc(formatUtcDateTime(route.last_attempt_at)) +
+        '</td><td>' + esc(route.latest_error_code || "—") + '</td></tr>'));
+      routeRows.push(...sources.filter(source => source.reason).map(source =>
+        '<tr><td>' + esc(source.name) + '</td><td>Configuration</td><td>Critical</td>' +
+        '<td>—</td><td>—</td><td>' + esc(HEALTH_REASONS[source.reason] || source.reason) +
+        '</td></tr>'));
+      body += '<details class="media-health__details"><summary>All enabled publisher routes (' +
+        routeRows.length + ')</summary><div class="media-table-wrap"><table class="media-table media-health__table">' +
+        '<thead><tr><th>Publisher</th><th>Route</th><th>Health</th>' +
+        '<th>Last success UTC</th><th>Last attempt UTC</th><th>Last error</th></tr></thead><tbody>' +
+        routeRows.join("") + '</tbody></table></div></details>';
+    }
+    el.innerHTML = '<section class="media-card media-health">' + heading + body + '</section>';
+    el.querySelector("[data-media-health-refresh]")?.addEventListener("click", () =>
+      void refreshMediaHealth());
+  }
+
+  async function refreshMediaHealth() {
+    renderMediaHealth(null);
+    try { renderMediaHealth(await request("health")); }
+    catch (error) { renderMediaHealth(null, error.message || "Unknown error"); }
+  }
+
   function publisherRunsTable(rows) {
     return `<div class="media-table-wrap"><table class="media-table"><thead><tr><th>Publication</th><th>Route</th><th>Started UTC</th><th>Duration</th><th>Status</th><th>Seen</th><th>Inserted</th><th>Updated</th><th>Filtered</th><th>Invalid</th><th>Diagnostics</th></tr></thead><tbody>${rows.length ? rows.map(run => `<tr><td>${esc(run.source_name || run.source_key || "System")}</td><td>${esc(run.discovery_route_key || "—")}</td><td>${esc(formatUtcDateTime(run.started_at, false))}</td><td>${esc(duration(run.started_at, run.finished_at))}</td><td>${esc(run.status)}</td><td>${esc(run.items_seen)}</td><td>${esc(run.items_inserted)}</td><td>${esc(run.items_updated)}</td><td>${esc(run.items_filtered ?? 0)}</td><td>${esc(run.items_invalid)}</td><td>${run.error_code ? `<details><summary>${esc(run.error_code)} · raw ISO UTC evidence</summary><pre>${esc(JSON.stringify(run, null, 2))}</pre></details>` : "—"}</td></tr>`).join("") : `<tr><td colspan="11" class="media-empty">No discovery runs found.</td></tr>`}</tbody></table></div>`;
   }
@@ -1764,10 +1844,11 @@
     state.root = container;
     state.apiBase = String(options.apiBaseUrl || "/api").replace(/\/+$/, "");
     if (!container.querySelector(".media-dashboard")) {
-      container.innerHTML = `<div class="media-dashboard"><section class="media-header"><h2>Media</h2><p>Editorial administration for authoritative UK AQ Media D1.</p><nav class="media-mini-nav" role="tablist" aria-label="Media sections">${TABS.map(tab => `<button type="button" data-media-tab="${tab}" role="tab" aria-selected="${tab === state.tab}" class="${tab === state.tab ? "is-active" : ""}">${TAB_LABELS[tab]}</button>`).join("")}</nav></section><div data-media-view></div></div>`;
+      container.innerHTML = `<div class="media-dashboard"><section class="media-header"><h2>Media</h2><p>Editorial administration for authoritative UK AQ Media D1.</p><nav class="media-mini-nav" role="tablist" aria-label="Media sections">${TABS.map(tab => `<button type="button" data-media-tab="${tab}" role="tab" aria-selected="${tab === state.tab}" class="${tab === state.tab ? "is-active" : ""}">${TAB_LABELS[tab]}</button>`).join("")}</nav></section><div data-media-health aria-live="polite"></div><div data-media-view></div></div>`;
       container.querySelectorAll("[data-media-tab]").forEach(button => button.addEventListener("click", () => setTab(button.dataset.mediaTab)));
     }
     setTab(state.tab);
+    void refreshMediaHealth();
   }
 
   window.UKAQMediaDashboard = { mount, refresh: () => setTab(state.tab) };

@@ -9,6 +9,32 @@ export async function* settledMigrationBatches(items, concurrency, action) {
   }
 }
 
+// No subsequent batch starts after a failed batch, and settled results retain
+// their immutable input positions. Oversized bodies fail before download.
+export async function* settledWeightedMigrationBatches(items, concurrency, byteBudget, weight, action) {
+  if (!Number.isInteger(concurrency) || concurrency < 1 || !Number.isSafeInteger(byteBudget) || byteBudget < 1) {
+    throw new Error('Invalid bounded migration batch profile');
+  }
+  for (let offset = 0; offset < items.length;) {
+    const batch = [];
+    let bytes = 0;
+    while (offset + batch.length < items.length && batch.length < concurrency) {
+      const item = items[offset + batch.length];
+      const size = weight(item);
+      if (!Number.isSafeInteger(size) || size < 0) throw new Error(`Invalid migration item byte size at ${offset + batch.length}`);
+      if (size > byteBudget) throw new Error(`Migration item exceeds the in-flight byte budget at ${offset + batch.length}: ${size} > ${byteBudget}`);
+      if (batch.length && bytes + size > byteBudget) break;
+      batch.push(item);
+      bytes += size;
+    }
+    const results = await Promise.allSettled(batch.map((item, index) => action(item, offset + index)));
+    const settled = batch.map((item, index) => ({ item, position: offset + index, result: results[index] }));
+    yield settled;
+    throwMigrationBatchFailures(settled);
+    offset += batch.length;
+  }
+}
+
 export function migrationBatchFailures(batch) {
   return batch.flatMap(({ item, position, result }) => {
     if (result.status !== 'rejected') return [];

@@ -2,6 +2,7 @@ node_modules/
 .DS_Store
 logs/
 .env*
+.env.gcp_billing
 *.numbers
 env-vars-master.csv
 /tmp

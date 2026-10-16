@@ -40,7 +40,7 @@ _ROUTES = (
     (re.compile(r"^/api/media/articles/[1-9]\d*/guardian-image-refresh/(?:preview|apply)$"), {"POST"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*/metadata/preview$"), {"POST"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*/metadata/apply$"), {"PUT"}),
-    (re.compile(r"^/api/media/(?:ai-titles|ai-usage|runs)$"), {"GET"}),
+    (re.compile(r"^/api/media/(?:ai-titles|ai-usage|runs|health)$"), {"GET"}),
     (re.compile(r"^/api/media/runs/gdelt$"), {"GET"}),
     (re.compile(r"^/api/media/source-domain-blocks$"), {"PUT"}),
     (re.compile(r"^/api/media/source-domain-blocks/initial-cleanup/preview$"), {"POST"}),

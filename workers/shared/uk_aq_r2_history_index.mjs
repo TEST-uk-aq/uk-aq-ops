@@ -57,6 +57,9 @@ export async function r2PutObjectIfChanged({
   body,
   content_type,
   writeR2 = true,
+  postPutVerify = null,
+  verifyUnchanged = null,
+  verifyExisting = null,
 }) {
   const newMd5 = md5HexOfBody(body);
   const bodyBytes = typeof body === "string"
@@ -67,17 +70,26 @@ export async function r2PutObjectIfChanged({
     : Buffer.from(body).toString("utf8");
 
   let existingEtag = null;
+  let existingVerified = false;
   try {
     const headObject = r2?.head_object || r2HeadObject;
     const head = await headObject({ r2, key });
     if (head?.exists) {
       existingEtag = stripEtagQuotes(head.etag);
+      if (typeof verifyExisting === "function") {
+        await verifyExisting({ r2, key, expectedBody: Buffer.from(body), expectedByteSize: bodyBytes });
+        existingVerified = true;
+      }
     }
-  } catch (_err) {
+  } catch (error) {
+    if (typeof verifyExisting === "function") throw error;
     // HEAD failure is non-fatal — treat as "unknown" and proceed to PUT.
   }
 
-  if (existingEtag && existingEtag === newMd5) {
+  if (existingVerified || (existingEtag && existingEtag === newMd5)) {
+    if (typeof verifyUnchanged === "function") {
+      await verifyUnchanged({ r2, key, expectedBody: Buffer.from(body), expectedByteSize: bodyBytes });
+    }
     await r2?.proposal_sink?.({
       key,
       body: bodyText,
@@ -93,6 +105,11 @@ export async function r2PutObjectIfChanged({
       write_r2: false,
       verified: true,
       verification_status: "skipped_unchanged",
+      ...(existingVerified ? {
+        byte_size: bodyBytes,
+        sha256: sha256Hex(Buffer.from(body)),
+        post_put_get_verified: true,
+      } : {}),
     };
   }
 
@@ -132,7 +149,9 @@ export async function r2PutObjectIfChanged({
     });
   }
   const result = await r2PutObject({ r2, key, body, content_type });
-  const liveObject = await r2GetObject({ r2, key });
+  const liveObject = typeof postPutVerify === "function"
+    ? await postPutVerify({ r2, key, expectedBody: Buffer.from(body), expectedByteSize: bodyBytes })
+    : await r2GetObject({ r2, key });
   const liveBodyText = liveObject.body.toString("utf8");
   const expectedSha256 = sha256Hex(Buffer.from(body));
   if (liveBodyText !== bodyText || liveObject.bytes !== bodyBytes || sha256Hex(liveObject.body) !== expectedSha256) {

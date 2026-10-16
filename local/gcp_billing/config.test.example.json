@@ -1,0 +1,28 @@
+{
+  "environment": "TEST",
+  "query_project": "project-53835517-a266-48e3-8d9",
+  "dataset": "project-53835517-a266-48e3-8d9.gcp_billing_export",
+  "location": "REPLACE_WITH_DATASET_LOCATION",
+  "billing_account_id": "REPLACE_WITH_TEST_BILLING_ACCOUNT_ID",
+  "earliest_usage_date": "2026-05-01",
+  "archive_root": "/REPLACE_WITH_LOCAL_DROPBOX_ROOT/Apps/github-uk-air-quality-networks/TEST/gcp_billing",
+  "mysql_database": "uk_aq_gcp_billing_test",
+  "mysql_user": "uk_aq_gcp_billing_test_writer",
+  "mysql_socket": "/REPLACE_WITH_LOCAL_MYSQL_SOCKET",
+  "overlap_seconds": 7200,
+  "settling_seconds": 120,
+  "maximum_bytes_billed": 1073741824,
+  "maximum_run_bytes": 8589934592,
+  "maximum_days_per_batch": 7,
+  "run_history_limit": 200,
+  "sources": {
+    "standard": {
+      "raw_table": "REPLACE_WITH_STANDARD_EXPORT_TABLE_NAME",
+      "view": "uk_aq_billing_standard_v1"
+    },
+    "detailed": {
+      "raw_table": "REPLACE_WITH_DETAILED_EXPORT_TABLE_NAME",
+      "view": "uk_aq_billing_detailed_v1"
+    }
+  }
+}

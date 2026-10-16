@@ -12,6 +12,7 @@ export type JobStatus = {
 export type JobRunner = (
   triggerMode: string,
   reconciliationRequest?: Record<string, unknown>,
+  invocationId?: string,
 ) => Promise<JobStatus>;
 
 type Logger = {
@@ -20,6 +21,7 @@ type Logger = {
 };
 
 type InFlightState = {
+  invocation_id: string;
   started_at: string;
   started_ms: number;
   trigger_mode: string;
@@ -210,11 +212,14 @@ export function createLatestSnapshotHandler({
     }
     const triggerMode = isReconciliation ? "integrity_reconciliation" : resolveTriggerMode(req, body);
     const requestNow = now();
+    const invocationId = crypto.randomUUID();
 
     if (inFlight) {
       const ageSeconds = Math.max(0, Math.floor((requestNow - inFlight.started_ms) / 1000));
       writeLog(logger, "log", "latest_snapshot_run_skipped", {
         reason: "run_in_flight",
+        invocation_id: invocationId,
+        active_invocation_id: inFlight.invocation_id,
         requested_trigger_mode: triggerMode,
         active_trigger_mode: inFlight.trigger_mode,
         in_flight_started_at: inFlight.started_at,
@@ -233,11 +238,13 @@ export function createLatestSnapshotHandler({
 
     const startedMs = requestNow;
     inFlight = {
+      invocation_id: invocationId,
       started_at: new Date(startedMs).toISOString(),
       started_ms: startedMs,
       trigger_mode: triggerMode,
     };
     writeLog(logger, "log", "latest_snapshot_run_accepted", {
+      invocation_id: invocationId,
       trigger_mode: triggerMode,
       started_at: inFlight.started_at,
     }, startedMs);
@@ -246,6 +253,7 @@ export function createLatestSnapshotHandler({
       const status = await runJob(
         triggerMode,
         isReconciliation ? body as Record<string, unknown> : undefined,
+        invocationId,
       );
       const finishedMs = now();
       const durationMs = Math.max(0, finishedMs - startedMs);
@@ -255,6 +263,7 @@ export function createLatestSnapshotHandler({
         status.success ? "log" : "error",
         status.success ? "latest_snapshot_run_succeeded" : "latest_snapshot_run_failed",
         {
+          invocation_id: invocationId,
           trigger_mode: triggerMode,
           code: status.code,
           duration_ms: durationMs,
@@ -275,6 +284,7 @@ export function createLatestSnapshotHandler({
       writeLog(logger, "error", timedOut
         ? "latest_snapshot_run_timed_out"
         : "latest_snapshot_run_failed", {
+        invocation_id: invocationId,
         trigger_mode: triggerMode,
         duration_ms: durationMs,
         error: message,

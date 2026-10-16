@@ -5,16 +5,18 @@ import { getObservationHistoryGeneration } from '../../../workers/shared/uk_aq_o
 
 const admitted = new WeakSet();
 export const GCP_PROFILE = 'gcp-c4a-32';
-export const LOCAL_CONCURRENCY = Object.freeze({ partitionDefault: 1, partitionMax: 4, publicationDefault: 1, publicationMax: 16 });
-const GCP_CONCURRENCY = Object.freeze({ partitionDefault: 16, partitionMax: 24, publicationDefault: 64, publicationMax: 96 });
+export const LOCAL_CONCURRENCY = Object.freeze({ partitionDefault: 1, partitionMax: 4, publicationDefault: 1, publicationMax: 16,
+  inventoryDefault: 1, inventoryMax: 4, sourceInFlightBytes: 128 * 1024 ** 2, publicationInFlightBytes: 256 * 1024 ** 2 });
+const GCP_CONCURRENCY = Object.freeze({ partitionDefault: 16, partitionMax: 24, publicationDefault: 64, publicationMax: 96,
+  inventoryDefault: 32, inventoryMax: 64, sourceInFlightBytes: 256 * 1024 ** 2, publicationInFlightBytes: 512 * 1024 ** 2 });
 export function migrationConcurrencyLimits(permit = null) {
   if (permit === null) return LOCAL_CONCURRENCY;
   if (!admitted.has(permit)) throw new Error('High concurrency requires this process to pass GCE admission');
   return GCP_CONCURRENCY;
 }
-export function validateMigrationConcurrency({ partitionConcurrency = 1, publicationConcurrency = 1, runnerPermit = null }) {
+export function validateMigrationConcurrency({ partitionConcurrency = 1, publicationConcurrency = 1, inventoryConcurrency = 1, runnerPermit = null }) {
   const limits = migrationConcurrencyLimits(runnerPermit);
-  for (const [name, value, max] of [['partition', partitionConcurrency, limits.partitionMax], ['publication', publicationConcurrency, limits.publicationMax]]) {
+  for (const [name, value, max] of [['partition', partitionConcurrency, limits.partitionMax], ['publication', publicationConcurrency, limits.publicationMax], ['inventory', inventoryConcurrency, limits.inventoryMax]]) {
     if (!Number.isInteger(value) || value < 1 || value > max) throw new Error(`--${name}-concurrency must be an integer from 1 to ${max}`);
   }
 }

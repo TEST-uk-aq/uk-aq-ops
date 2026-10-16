@@ -10,7 +10,7 @@ export class MigrationWorkerPool {
     this.sequence = 0;
     this.slots = Array.from({ length: size }, () => {
       const worker = new Worker(new URL('./observation_history_migration_worker.mjs', import.meta.url), { env: {} });
-      const slot = { worker, pending: null };
+      const slot = { worker, pending: null, memory: null };
       const fail = (error) => {
         this.failure ||= error;
         slot.pending?.reject(error);
@@ -22,6 +22,7 @@ export class MigrationWorkerPool {
         const pending = slot.pending;
         if (!pending || message.id !== pending.id) { fail(new Error('Migration worker result identity mismatch')); return; }
         slot.pending = null;
+        if (message.memory) slot.memory = message.memory;
         if (message.error) pending.reject(new Error(message.error));
         else pending.resolve(message.result);
       });
@@ -38,6 +39,20 @@ export class MigrationWorkerPool {
       try { slot.worker.postMessage({ id, kind, input }, transferableBuffers(input)); }
       catch (error) { slot.pending = null; reject(error); }
     });
+  }
+  memorySummary() {
+    const samples = this.slots.map((slot) => slot.memory).filter(Boolean);
+    if (!samples.length) return { sampled_workers: 0, total_workers: this.slots.length };
+    const sum = (field) => samples.reduce((total, sample) => total + sample[field], 0);
+    return {
+      sampled_workers: samples.length,
+      total_workers: this.slots.length,
+      heap_used: sum('heap_used'),
+      heap_total: sum('heap_total'),
+      external: sum('external'),
+      array_buffers: sum('array_buffers'),
+      heap_limit_per_worker: samples[0].heap_limit,
+    };
   }
   async close() {
     this.closed = true;

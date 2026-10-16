@@ -600,7 +600,7 @@ export async function r2CopyObject({ r2, source_key, dest_key }) {
   };
 }
 
-export async function r2HeadObject({ r2, key }) {
+export async function r2HeadObject({ r2, key, accept_encoding_identity = false }) {
   if (r2?.adapter?.headObject) {
     const result = await r2.adapter.headObject({ key });
     const sha256 = normalizeR2Sha256Checksum(
@@ -620,6 +620,9 @@ export async function r2HeadObject({ r2, key }) {
       objectKey: key,
       headers: {
         "x-amz-checksum-mode": "ENABLED",
+        // R2 can weaken HEAD ETags during compression and omit Content-Length.
+        // Use identity only when the caller requests byte-exact cache validation.
+        ...(accept_encoding_identity ? { "accept-encoding": "identity" } : {}),
       },
     }),
     consumeResponse: async (response) => ({
@@ -727,7 +730,12 @@ export async function r2GetObjectBounded({ r2, key, max_bytes, timeout_ms = R2_R
   });
 }
 
-export async function r2GetObject({ r2, key, max_attempts = R2_REQUEST_MAX_ATTEMPTS }) {
+export async function r2GetObject({
+  r2,
+  key,
+  max_attempts = R2_REQUEST_MAX_ATTEMPTS,
+  accept_encoding_identity = false,
+}) {
   if (r2?.adapter?.getObject) {
     return r2.adapter.getObject({ key });
   }
@@ -741,6 +749,8 @@ export async function r2GetObject({ r2, key, max_attempts = R2_REQUEST_MAX_ATTEM
       secretAccessKey: r2.secret_access_key,
       bucket: r2.bucket,
       objectKey: key,
+      // Cache-populating GETs must request the same representation as their HEAD.
+      ...(accept_encoding_identity ? { headers: { "accept-encoding": "identity" } } : {}),
     }),
     consumeResponse: async (response) => ({
       response,

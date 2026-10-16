@@ -8,6 +8,11 @@ export const RECOVERY_MANIFEST_KIND = "uk_aq_observation_history_v3_recovery_man
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const GIT_SHA1_PATTERN = /^[0-9a-f]{40}$/;
+const AUTHENTICATED_JOURNALS = new WeakSet();
+
+export function isAuthenticatedRecoveryJournal(value) {
+  return Boolean(value && typeof value === "object" && AUTHENTICATED_JOURNALS.has(value));
+}
 
 function stableObject(value) {
   if (Array.isArray(value)) return value.map(stableObject);
@@ -29,6 +34,8 @@ export function recoverySha256(value) {
 
 function readJson(filePath, label) {
   try {
+    const stat = fs.lstatSync(filePath);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`${label} is not a regular file`);
     return JSON.parse(fs.readFileSync(filePath, "utf8"));
   } catch (error) {
     throw new Error(`${label} is unreadable or invalid JSON: ${filePath}`, { cause: error });
@@ -88,7 +95,7 @@ function readEnvelope(filePath, expectedKind, label) {
   return envelope;
 }
 
-function validateManifestPayload(payload) {
+export function validateManifestPayload(payload) {
   requireExactKeys(payload, [
     "original_checkpoint",
     "immutable_authority_sha256",
@@ -249,6 +256,11 @@ function inspectJournal({
   const names = fs.readdirSync(entriesRoot).sort();
   for (const name of names) {
     if (!/^\d{10}\.json$/.test(name)) throw new Error(`Unexpected recovery entry filename: ${name}`);
+    const entryPath = path.join(entriesRoot, name);
+    const entryStat = fs.lstatSync(entryPath);
+    if (!entryStat.isFile() || entryStat.isSymbolicLink()) {
+      throw new Error(`Recovery entry is not a regular file: ${name}`);
+    }
   }
   if (names.length !== lastSequence && !(permitSingleTail && names.length === lastSequence + 1)) {
     throw new Error("Recovery entry count does not exactly match the claimed head sequence");
@@ -334,7 +346,7 @@ function inspectJournal({
     throw new Error("Recovery head terminal entry SHA does not equal the final enumerated entry");
   }
 
-  return Object.freeze({
+  const authenticatedJournal = Object.freeze({
     root,
     manifest,
     head,
@@ -344,4 +356,6 @@ function inspectJournal({
     last_entry_sha256: lastEntrySha,
     interrupted_append: names.length === lastSequence + 1 ? entries.at(-1) : null,
   });
+  AUTHENTICATED_JOURNALS.add(authenticatedJournal);
+  return authenticatedJournal;
 }

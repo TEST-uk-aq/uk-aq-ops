@@ -48,6 +48,8 @@ import { resolveStationHistoryPolicy } from "./policy.mjs";
 import { buildCalculatedHistory } from "./calculated_history.mjs";
 import { publicContinuity, resolveTimeseriesBinding, selectContinuitySegments } from "./continuity.mjs";
 import { shouldValidateAqi, validateCalculatedAqiAgainstR2 } from "./aqi_validation.mjs";
+import { handleRecentAqiPrototype } from "./recent_aqi_prototype.mjs";
+import { handleRecentHourlyPrototype } from "./recent_hourly_prototype.mjs";
 
 const CONTRACT_VERSION = "v2";
 const UPSTREAM_AUTH_HEADER = "X-UK-AQ-Upstream-Auth";
@@ -789,6 +791,8 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method !== "GET") return errorResponse(405, "internal_method_not_allowed", url.pathname);
+    if (url.pathname === "/v1/recent-aqi-prototype") return handleRecentAqiPrototype(request, env);
+    if (url.pathname === "/v1/recent-hourly-prototype") return handleRecentHourlyPrototype(request, env);
     if (url.pathname === "/v1/aqi-history") return handleAqiHistoryChunk(request, env);
     if (url.pathname === "/v1/observations-history") return handleObservationHistoryChunk(request, env, ctx);
     if (url.pathname !== "/v1/station-series") return errorResponse(404, "internal_route_not_found", url.pathname);

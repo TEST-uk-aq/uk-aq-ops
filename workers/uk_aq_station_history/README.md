@@ -95,3 +95,96 @@ Optional TEST tuning uses safe in-code defaults when absent:
 
 The index_v3 physical-page budget is a fixed safety bound, not an environment
 variable or public pagination control.
+
+## Isolated recent AQI CPU prototype (TEST only)
+
+The additional six-hour `recent-hourly-prototype` route is documented in
+[RECENT_HOURLY_PROTOTYPE.md](RECENT_HOURLY_PROTOTYPE.md). It reuses the same
+security controls and bounded RPC reader. The original single-result route
+below retains its configuration, 48-hour query overlap and response contract.
+
+`GET /api/aq/recent-aqi-prototype` reaches the private
+`/v1/recent-aqi-prototype` Service Binding route through the authenticated
+cache proxy. It requires the normal allowed Origin, valid session cookie, and
+the dedicated `X-UK-AQ-Prototype-Operator-Token` header even when local
+development bypass is enabled. The cache proxy compares this header
+server-side against the TEST-only secret
+`UK_AQ_RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN` using timing-safe comparison; the
+secret must contain 32–512 characters. A missing or malformed configured
+secret fails closed before the Service Binding call. Both Workers require `UK_AQ_ENV_NAME=TEST` and
+`UK_AQ_RECENT_AQI_PROTOTYPE_ENABLED=true`; the private Worker additionally
+requires `UK_AQ_RECENT_AQI_PROTOTYPE_TIMESERIES_ID` to be one explicitly
+approved physical AURN PM2.5 timeseries ID. All values are absent or off by
+default. A missing allowlist fails closed.
+
+The request has exactly two query parameters: `timeseries_id` and
+`pollutant=pm25`; the caller does not provide an AQI endpoint. The response
+contains one calculated AQI row with independent DAQI and EAQI statuses, its
+actual physical identity, the selected hour-ending interval, request time,
+latest completed clock hour, latest source-observation timestamp and age of
+the selected observation. It is never cached. A header
+`X-UK-AQ-Prototype-Route: recent-aqi-ingestdb` makes this route identifiable in
+Cloudflare request telemetry.
+
+This first experiment uses **IngestDB only** through the existing
+`uk_aq_timeseries_rpc`. It does not read canonical R2 and cannot claim complete
+merged chart authority. It requests the 24 represented hours `(n-24h,n]`,
+preserves individual source rows for the derived hourly means, and calls the
+shared AQI helper for rolling and index calculation. For this prototype only,
+the identity lookup also selects `uk_aq_core.timeseries.last_value_at` in the
+same request; existing identity callers retain their previous response shape.
+That timestamp anchors the observation RPC at `last_value_at - 48 hours`; it is
+not treated as proof that the observation remains present or valid. The latest
+valid exact-hour observation in the bounded RPC rows, no later than the
+request's latest completed UTC hour, selects endpoint `n`.
+
+The 48-hour anchor overlap covers the 24-hour DAQI context plus up to 24 hours
+of selected-endpoint lag behind the metadata anchor. The selected context
+`(n-24h,n]` must be within both the
+requested `since_ts` and the RPC's returned 30-day window start. If the
+metadata anchor excludes required context, the request fails closed with
+`source_context_outside_metadata_anchor`; if the 30-day RPC window excludes
+it, the code is `source_window_limit_exceeded`. Neither case calculates from
+truncated context. If no valid observation is found within the query, the route
+returns `no_valid_source_observation` (or the window-limit error when the
+metadata anchor indicates the source may be older than the RPC window). A later
+invalid source observation is reported separately from the earlier selected
+valid endpoint.
+
+Source timestamps within the requested interval must already be exact UTC hour
+endpoints. Since the source contract does not establish an AURN sub-hour
+aggregation rule, any sub-hour row in that interval fails closed with
+`source_timestamp_convention_unverified`; no rounding or bucketing is applied.
+The RPC's 30-day label bounds the supported source window; `since_ts` is the
+effective narrow filter. RPC `start` is used only to verify that the selected
+24-hour context falls inside the supported 30-day window; it is not proof of
+record coverage. The returned count must match the data array, and the
+129th-row sentinel, response-byte cap, and identity checks must all pass before
+the result is marked as a complete bounded IngestDB query. Rows after the
+latest completed clock hour are excluded from endpoint selection.
+
+In the response, `transport_ok` means the RPC returned a valid bounded JSON
+payload; `bounded_query_complete` and `ingestdb_response_complete` mean all
+eligible rows returned by the RPC fit within the query and byte limits. They
+do not establish that observations existed for every hour. `valid_hour_count`
+and `aqi.has_gap` describe observed valid hourly inputs, while
+`canonical_history_complete` and overall `response_complete` remain false
+because canonical R2 history is not read. Missing observation hours are gaps,
+not upstream errors. AQI calculation statuses independently report DAQI rolling
+window availability and selected-hour EAQI availability.
+`request.requested_at_utc` and `request.latest_completed_clock_hour_utc` bound
+selection; `selection.calculation_endpoint_utc` is the actual AQI endpoint.
+`selection.latest_source_observation_timestamp_utc` and
+`selection.latest_source_observation_has_valid_value` expose whether a later
+encountered timestamp was invalid, while
+`selection.selected_observation_age_minutes` measures the selected endpoint
+against request time. An older selected observation can still yield a valid
+historical AQI and is not labelled as a current-hour measurement.
+
+Fixed limits: one output endpoint, one physical timeseries, 24 hours of AQI
+input, 128 raw input rows (129th sentinel), 48 KiB observation response,
+8 KiB identity response, 2.5 s per upstream request and 4 s overall elapsed
+budget checked between stages. Exceeded row/byte limits fail the request.
+These are workload bounds, not evidence of CPU acceptance. Real TEST Worker
+telemetry must establish CPU p50/p95/p99/maximum and `exceededCpu` after a
+separately authorised deployment.

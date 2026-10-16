@@ -1,8 +1,9 @@
 # TEST GCP complete observation-history build
 
-This is an unaccepted implementation for the later clean TEST rehearsal. Do not
-transfer it into the checkout running the existing migration or its independent
-verification. No cloud action is part of development validation.
+The combined GCP clean-build path has accepted small-scope TEST build and
+independent-verification evidence dated 14 October 2026. This runbook describes
+that normal path and one separately gated exception for a specific failed LIVE
+run. It does not authorize a cloud operation or a code transfer.
 
 The normal runner remains
 `scripts/backup_r2/uk_aq_observation_history_migration_v3.mjs`. Its partition
@@ -14,12 +15,14 @@ The GCP entrypoint is
 planner, CPU transformation, physical writer, publication schedulers, journal,
 lock coordinator and complete independent verifier. It adds admission and audit
 configuration, not another migration implementation. It addresses the slow serial
-partition transformation and large exact-leaf publication of the TEST rehearsal.
+partition transformation and large exact-leaf publication measured in earlier TEST
+migration work.
 
 The sole initial profile is `gcp-c4a-32`: GCE `c4a-standard-32`, Node `arm64`, at
-least 32 available CPUs and 120 GiB visible memory. Defaults are 16 persistent
-partition workers and 64 independent publications/reads; overrides are bounded
-to 1..24 and 1..96 respectively. Workers are retained across their phase. The
+least 32 available CPUs and 120 GiB visible memory. Defaults are 32 concurrent inventory reads, 16 persistent partition workers and
+64 independent publications/reads; overrides are bounded to 1..64, 1..24 and
+1..96 respectively. Source Parquet identity reads have a 256 MiB in-flight body
+budget; cross-partition publication has a separate 512 MiB body budget. Workers are retained across their phase. The
 remaining CPU capacity serves supervision, networking, journal persistence and
 the OS. Both complete logical verification and transformation use real Worker
 Threads. There is no process or thread per partition.
@@ -53,9 +56,11 @@ failure or malformed response stops admission. Diagnostics identify the namespac
 observed count (a lower bound for a truncated page), example keys, and the need for
 manual cleanup. Cleanup must be separately authorized and performed externally.
 
-Planning checks under the global observations lock before inventory. Fresh
-migration reacquires the lock, reconstructs and verifies the plan, confirms writer
-freeze, revalidates pinned source prerequisites, then checks every namespace again
+Separate planning checks under a global observations lock before inventory. The
+new `locked-clean-build` mode retains that same lock through planning, approval,
+migration and complete independent verification. Separate fresh migration still
+reacquires the lock and reconstructs its plan. Both paths confirm writer freeze,
+revalidate pinned source prerequisites, then check every namespace again
 immediately before the first target write. It journals the successful check before
 publication. Final verification authenticates the recorded clean start and planning
 evidence; it does not require the completed target to be empty.
@@ -77,14 +82,22 @@ needed. The existing session-capable database connection is used only for the lo
 
 ## Scheduling and recovery
 
-Fresh runs now persist `checkpoint.json` once with
-`progress_format: authenticated-journal-v1`, then use the existing authenticated
+Fresh runs now persist `checkpoint.json` once with a versioned
+`authority_format: uk_aq_migration_plan_shards_v1` reference to the complete
+immutable plan under `checkpoint.json.authority/`. The checkpoint retains
+`progress_format: authenticated-journal-v1`, then uses the existing authenticated
 `.recovery/manifest.json`, `head.json` and chained `entries/` format from the start.
 Progress updates identify only changed records. No growing checkpoint or
 `.publication.json` is rewritten per object. Files and parent directories are
 fsynced before durability is returned. Journal writes remain serial; failed
 persistence poisons further appends. Publication batches are journaled in chunks
 of at most 16, even when 64 or 96 objects are in flight.
+
+The admitted GCP profile derives genuine legacy hashless partition content
+hashes with at most four concurrent partitions. Each derivation is bounded by
+64 MiB compressed Parquet, 128 MiB Parquet-declared uncompressed bytes and
+262,144 decoded rows; the shared source in-flight budget may reduce a batch
+below four. The local runner retains one-at-a-time derivation.
 
 Binding ranges are read concurrently, then leaves are read concurrently within
 immutable range order. Publication has barriers: all leaves durable, then
@@ -100,9 +113,9 @@ environments contain no credentials, lock context or checkpoint paths.
 
 Preparation evidence commits in plan order. After CPU failure only the safe
 contiguous preparation prefix is retained; later successful CPU-only results are
-discarded, with no R2 side effects. Prepared partitions publish in plan order;
-independent Parquet files within each partition publish up to the publication
-limit. Successful file siblings become durable even if a sibling fails. A unit is
+discarded, with no R2 side effects. Prepared partitions are staged in bounded CPU batches. Their independent
+Parquet files are flattened in immutable plan position and published through one
+global publication limiter and byte budget, including across partitions. Successful file siblings become durable even if a sibling fails. A unit is
 marked published only when all files are durable. Staging is released thereafter.
 Only one partition batch's source/decoded/Parquet bodies can be live at a time.
 
@@ -126,7 +139,8 @@ work. No sampling or checkpoint substitution is used. A second copy of all fetch
 index bodies is avoided by retaining verified keys and validating their identical
 pinned bytes.
 
-Progress retains the 15-second worker heartbeat without per-object logging. ETA
+Progress emits throttled completed/total updates as batches finish and retains
+the 15-second worker heartbeat without per-object logging. ETA
 uses throughput across at most ten prior emitted samples and requires at least
 five prior samples, positive progress/time, and a finite result. Object work uses
 object counts; partition transformation and complete logical verification use
@@ -140,26 +154,40 @@ checkpoint; old formats are not silently relabelled. A crash between base creati
 and journal initialization occurs before any staging or R2 mutation and fails
 closed on resume; preserve those incomplete artifacts for review. Existing
 historical journals retain their original implementation pin and may reject the
-changed implementation; this is not a conversion tool for the active rehearsal.
+changed implementation; this is not a checkpoint-conversion tool.
 
-Authenticated clean-build resume reuses the original v2 root, plan and clean-start
-evidence; it does not require an already-started target to be empty. If interruption
-preceded the durable clean-start event, resume must check emptiness before writing.
-A local/historical checkpoint cannot be admitted as a GCP clean-build checkpoint.
+An interrupted normal GCP clean build is abandoned. Manual cleanup of only the
+contracted v3 target namespaces, a proven empty target, a new run ID and work
+directory, and a fresh complete operation are required. The shared authenticated
+resume implementation remains for exceptional, separately authorised engineering
+work; it is not the normal GCP restart path. A local/historical checkpoint cannot
+be admitted as a GCP clean-build checkpoint.
 
-## Later TEST command shape — do not run during development
+## Combined mode — accepted small-scope TEST path
 
-On the already provisioned, separately authorized c4a-standard-32 VM, use the
-reviewed clean checkout and established TEST environment described in
+The currently serving TEST v3 target must not be cleared to make room for this
+operation. Any future migration must use an expressly authorised isolated clean
+TEST destination and its verified TEST credentials. The reviewed checkout must
+be clean at the exact writer Git SHA.
+The TEST wrapper pins the TEST Cloudflare account and accepts the existing
+`uk-aq-history-cic-test` bucket or a separately provisioned
+`uk-aq-history-cic-test-*` bucket in that same account. A clean isolated bucket
+with a complete, independently authenticated frozen v2 observation tree and
+its `_index_v2` binding/index dependencies, and empty v3
+namespaces is an operational prerequisite, not something this command creates.
+
+On the separately authorized c4a-standard-32 VM, use the reviewed clean checkout
+and established TEST environment described in
 [the side-by-side operator guide](README.side_by_side_operator.md). Keep
 `UK_AQ_R2_HISTORY_VERSION=v2` and `UK_AQ_R2_HISTORY_INTEGRITY_VERSION=v2`.
-Do not synthesize lock-context variables.
+Do not synthesize lock-context variables. Prepare the exact isolated TEST bucket
+and reviewed identities:
 
 ```bash
 set -euo pipefail
 migration_cli='scripts/backup_r2/uk_aq_observation_history_migration_v3_gcp.mjs'
 migration_run_id='REPLACE_WITH_UNIQUE_TEST_RUN_ID'
-migration_expected_bucket='REPLACE_WITH_EXACT_TEST_BUCKET'
+migration_expected_bucket='REPLACE_WITH_EXACT_ISOLATED_TEST_BUCKET'
 migration_writer_sha='REPLACE_WITH_REVIEWED_40_HEX_WRITER_SHA'
 migration_work_dir="$HOME/uk-aq-work/gcp-clean/$migration_run_id"
 mkdir -p "$migration_work_dir"
@@ -176,6 +204,68 @@ migration_common=(
   --writer-limits-json "$migration_work_dir/writer_limits.json"
   --partition-concurrency 16 --publication-concurrency 64
 )
+```
+
+After the separately authorized writer freeze, launch the GCP TEST entry point
+with `nohup`, stdin from `/dev/null`, a dedicated log and PID file, then
+`disown`, check `ps`, and follow the log:
+
+```bash
+migration_log="$migration_work_dir/locked-clean-build.nohup.log"
+migration_pid_file="$migration_work_dir/locked-clean-build.nohup.pid"
+nohup node "$migration_cli" "${migration_common[@]}" \
+  --mode locked-clean-build --apply --writers-frozen \
+  --inventory-concurrency 32 \
+  --checkpoint-out "$migration_work_dir/checkpoint.json" \
+  --report-out "$migration_work_dir/locked-clean-build.json" \
+  --post-plan-approval-file "$migration_work_dir/post-plan-approval.txt" \
+  >"$migration_log" 2>&1 < /dev/null &
+migration_pid=$!
+printf '%s\n' "$migration_pid" > "$migration_pid_file"
+disown "$migration_pid"
+ps -p "$(cat "$migration_pid_file")" -o pid,etime,stat,cmd
+tail -f "$migration_log"
+```
+
+The process durably writes a bounded authenticated plan shard directory at
+`locked-clean-build.json.complete-plan/` with `master.json`, plus a compact
+review summary with `status=awaiting_post_plan_approval`. The master binds the
+ordered shard identities and complete-plan SHA. The process holds the global
+lock for at most one hour. Review the summary, exact plan SHA, GCE identity,
+writer freeze and clean-target evidence. Only then create the approval file with
+mode 0600 and the exact line printed in the log:
+
+```text
+APPROVE TEST <run-id> <plan-sha256> <reviewed-writer-git-sha> APPLY WRITERS_FROZEN
+```
+
+Create that file atomically under the same work directory after reviewing the
+plan. For example, after manually setting the four reviewed values shown in
+the required line:
+
+```bash
+umask 077
+migration_plan_sha=$(jq -er '.result | select(.status == "awaiting_post_plan_approval") | .plan_sha256' \
+  "$migration_work_dir/locked-clean-build.json")
+approval_tmp="$migration_work_dir/post-plan-approval.txt.tmp.$$"
+printf 'APPROVE TEST %s %s %s APPLY WRITERS_FROZEN\n' \
+  "$migration_run_id" "$migration_plan_sha" "$migration_writer_sha" > "$approval_tmp"
+chmod 600 "$approval_tmp"
+mv "$approval_tmp" "$migration_work_dir/post-plan-approval.txt"
+```
+
+A pre-existing, stale, missing, mismatched or unsafe file fails closed.
+Successful final evidence in `locked-clean-build.json.result-evidence.json`
+binds the second clean-target admission, authenticated journal head, complete
+independent verification and unchanged v2 root. This
+command does not switch runtime generation or resume writers.
+
+## Retained separate modes — do not run during development
+
+Use the common arguments above if a separately authorized retained-mode operation
+is required.
+
+```bash
 node "$migration_cli" "${migration_common[@]}" --mode plan \
   --report-out "$migration_work_dir/plan.json"
 migration_plan_sha=$(jq -er '.result | select(.ok == true and .status == "planned") | .plan_sha256' \
@@ -197,15 +287,13 @@ node "$migration_cli" "${migration_common[@]}" --mode verify \
   --report-out "$migration_work_dir/verify.json"
 ```
 
-For an interrupted run only, repeat migrate with both
-`--checkpoint-in "$migration_work_dir/checkpoint.json"` and
-`--checkpoint-out "$migration_work_dir/checkpoint.json"`, retaining all other
-identities and the complete evidence directory.
+For normal GCP interruption, preserve evidence, manually clear only the
+contracted v3 target namespaces under separate authorisation, prove emptiness,
+and start a new run ID/work directory. Do not resume a partial checkpoint.
 
-Expected acceptance includes complete `side_by_side_build_verified` results,
-unchanged v2 root, preserved clean-start evidence, no runtime switch, deterministic
-interruption/resume, resource/memory measurements and improved throughput. An
-uninterrupted run alone does not establish recovery acceptance.
+Expected acceptance includes a complete `side_by_side_build_verified` result,
+unchanged v2 root, both clean-target admissions, approval before writes, no runtime
+switch, complete independent verification and resource/memory measurements.
 
 ## Review and system-documentation handover
 
@@ -328,11 +416,181 @@ checks for 13 modules, both CLI help paths and `git diff --check`. It proves det
 repair/exact replay and rejection of multiple tails, bad ancestry, corrupt
 payload, duplicate completion and unexpected filenames. Unrenamed scratch data
 preserves the previous state. It does not simulate a migration or contact
-R2/GCE. Real VM power-loss behavior, R2 reuse and performance still require the
-separately authorized interrupted clean TEST rehearsal before operational
-acceptance. No runtime configuration, deployment or database schema changes are
-introduced by this correction.
+R2/GCE. Real VM power-loss behavior, R2 reuse and performance are not proven by
+this check. The active GCP interruption/restart amendment explicitly retires an
+interrupted/resumed TEST rehearsal as a general acceptance requirement. The
+accepted uninterrupted small-scope TEST build and independent verification remain
+the normal migration acceptance evidence; an interruption follows the
+restart-from-clean procedure above.
 
-LIVE is deliberately rejected by this entrypoint. Any later LIVE use requires
-separate authorization, accepted TEST results and a reviewed environment/contract
-extension; it is not enabled merely by changing a command-line environment label.
+Normal LIVE clean-build admission remains unchanged and rejects `--checkpoint-in`.
+The code includes one separately gated exception for the failed run
+`live-v3-20261015T114250Z-e84f52a`; this is not permission to run it. Deployment,
+preflight success and the approval file each remain distinct from separate
+operational authorisation. The existing accepted TEST clean-build evidence does
+not authorize this LIVE exception.
+
+## Exceptional LIVE recovery
+
+### Acceptance boundaries
+
+**A. Normal GCP clean-build acceptance.** Use an empty admitted v3 target, plan,
+fresh complete migration and full independent verification. If interrupted,
+preserve evidence, clear only the approved partial v3 target after separate
+authorization, prove it empty and use a new run ID and work directory. Do not
+resume the partial run. No deliberately interrupted/resumed TEST rehearsal is a
+general acceptance gate.
+
+**B. This exceptional LIVE recovery.** It applies only to
+`live-v3-20261015T114250Z-e84f52a` and requires its immutable checkpoint and
+journal, the exact original writer identity, separately reviewed current
+recovery implementation, read-only preflight, single-use approval, frozen LIVE
+writers, the supervised global lock and full independent verification. Neither
+deployment nor preflight nor the approval file supplies the separate explicit
+LIVE operational authorization. Preserve the original checkpoint and journal;
+do not cut over runtime authority or release writers after recovery.
+
+**C. TEST acceptance of this exception.** These corrections do not change the
+normal mutating GCP migration path. The exact exception is intentionally bound to
+the one LIVE run, so an end-to-end invocation of that authority against TEST is
+not a valid test. The active interruption/restart amendment retires a deliberate
+interruption/resume rehearsal as a general gate; no such operation is technically
+required for these read-only preflight and report-status corrections. A future
+targeted interrupted TEST operation would need a concrete engineering reason and
+its own separate operator authorization. Do not run one as part of routine
+acceptance.
+
+This mechanism is restricted to the exact failed run, immutable plan, original
+writer commit and checkpoint authority recorded in
+`exceptional_recovery_authority.mjs`. The original journal prefix remains
+anchored at sequence 46,305 and its recorded SHA. The original checkpoint and
+recovery manifest are never rewritten. Recovery progress is replayed from the
+existing append-only journal, and the original implementation is verified
+against its pinned Git commit and recorded file identities. The separately
+approved recovery implementation is identified by its own clean `main` commit
+and exact active-file hashes.
+
+The normal LIVE clean-build entry point still rejects checkpoint resume. These
+steps describe a guarded path for later review. They do not authorise
+LIVE recovery, and deployment of code does not provide that authorisation.
+
+### A. Read-only recovery preflight
+
+In the same shell used for preflight and detached migration, append the reviewed
+64 GiB main V8 heap setting to any existing `NODE_OPTIONS`; this retains its
+other Node options and leaves the rest of the operator environment intact.
+Repeat this setup after reconnecting before another attempt:
+
+```bash
+migration_existing_node_options="${NODE_OPTIONS:-}"
+if [[ -n "$migration_existing_node_options" ]]; then
+  export NODE_OPTIONS="$migration_existing_node_options --max-old-space-size=65536"
+else
+  export NODE_OPTIONS="--max-old-space-size=65536"
+fi
+node --input-type=module -e '
+  import v8 from "node:v8";
+  const heapMiB = v8.getHeapStatistics().heap_size_limit / 1024 / 1024;
+  console.log(`Effective V8 heap limit: ${heapMiB.toFixed(0)} MiB`);
+  if (heapMiB < 65536) process.exitCode = 1;
+' || exit 1
+```
+
+Continue only if the assertion succeeds. It checks the effective V8 limit in
+the initial Node process. Keep the exported value for the `nohup` wrapper; the
+operator supervisor and lock-holding child inherit its environment. The setting
+remains in force through schedule reconstruction and recovery. This uses no
+global Node default or new startup infrastructure.
+
+Run preflight under the admitted GCE profile. Supply the established LIVE
+project, zone, writer-limits and work-directory values, with the original
+checkpoint as both input and output and the original 48/16/80 concurrency:
+
+```bash
+node scripts/backup_r2/uk_aq_observation_history_migration_v3_live_gcp.mjs \
+  --expected-gcp-project-id "$PROJECT_ID" --expected-gcp-zone "$ZONE" \
+  --environment LIVE --transition v2-to-v3 --mode recovery-preflight \
+  --expected-bucket uk-aq-history-live \
+  --target-writer-git-sha e84f52a6b0ddb6212fc6f321b875bb15244c4090 \
+  --migration-run-id live-v3-20261015T114250Z-e84f52a \
+  --expected-plan-sha256 1e960674e53cd2ddb3c5d08a3318fcce1abc72ebe7a2dc92e11e9ce9a4d79600 \
+  --checkpoint-in "$WORK_DIR/checkpoint.json" \
+  --checkpoint-out "$WORK_DIR/checkpoint.json" \
+  --writer-limits-json "$WRITER_LIMITS_JSON" \
+  --inventory-concurrency 48 --partition-concurrency 16 --publication-concurrency 80 \
+  --report-out "$WORK_DIR/recovery-preflight.json" \
+  --exceptional-recovery --recovery-approval-file "$WORK_DIR/recovery.approval"
+```
+
+Preflight reads the existing local checkpoint, recovery manifest, journal and
+epoch ledger and performs a read-only GET of the pinned LIVE v2 source-root
+object. It does not create operator-run directories or logs, acquire the global
+migration lock, create checkpoint/recovery directories or temporary journal
+files, repair or append to the journal, write the epoch ledger, change staging,
+write R2, or start migration. Its explicitly requested report is its only file
+output. Missing checkpoint, manifest, journal head or entries directory is a
+blocker; no missing recovery directory is created. The report has `ok` and
+`status` fields. Any blocker produces `status=recovery_preflight_blocked`, a
+non-zero exit code and no approval phrase. Only an empty blocker list can
+produce `status=recovery_preflight_passed`, exit code zero and an approval
+phrase. A successful report write alone does not mean admission passed.
+
+### B. Operator review and explicit approval
+
+Review the preflight report, original and current implementation identities,
+source root, checkpoint plan, journal frontier, previous recovery-epoch SHA and
+the checkpoint's recorded 48/16/80 concurrency. Create
+`$WORK_DIR/recovery.approval` with exactly the emitted `approval_phrase`, mode
+0600 and owned by the execution account. The phrase binds the original anchor,
+current journal frontier, next epoch number, previous epoch SHA, exact recovery
+code, source root, bucket, GCP project/zone/profile and repository `main`.
+Write and use the approval within 30 minutes of its file modification time. An
+approval is consumed once when its recovery-epoch record is durably appended.
+After any later interruption, perform a fresh preflight and create a new
+approval against the then-current journal frontier and epoch-ledger head. Use
+new, previously unused report and approval-file paths for every preflight; do
+not reuse a consumed approval file.
+
+### C. Separately authorised LIVE recovery execution
+
+Only after separate explicit LIVE operational authorisation, run the recovery
+detached and preserve the log and PID. The approval file is not a substitute for
+that authorisation. Keep LIVE writers frozen through full independent
+verification. The supervised child reacquires the existing global
+observation-operation lock, repeats admission and approval checks while holding
+it, revalidates the locked v2 source root, authenticates and semantically replays
+the journal, verifies reusable completed objects, and appends the new
+recovery-epoch record before migration publication resumes:
+
+```bash
+nohup node scripts/backup_r2/uk_aq_observation_history_migration_v3_live_gcp.mjs \
+  --expected-gcp-project-id "$PROJECT_ID" --expected-gcp-zone "$ZONE" \
+  --environment LIVE --transition v2-to-v3 --mode migrate \
+  --expected-bucket uk-aq-history-live \
+  --target-writer-git-sha e84f52a6b0ddb6212fc6f321b875bb15244c4090 \
+  --migration-run-id live-v3-20261015T114250Z-e84f52a \
+  --expected-plan-sha256 1e960674e53cd2ddb3c5d08a3318fcce1abc72ebe7a2dc92e11e9ce9a4d79600 \
+  --checkpoint-in "$WORK_DIR/checkpoint.json" \
+  --checkpoint-out "$WORK_DIR/checkpoint.json" \
+  --writer-limits-json "$WRITER_LIMITS_JSON" \
+  --inventory-concurrency 48 --partition-concurrency 16 --publication-concurrency 80 \
+  --report-out "$WORK_DIR/recovery-report.json" \
+  --apply --writers-frozen --exceptional-recovery \
+  --recovery-approval-file "$WORK_DIR/recovery.approval" \
+  >"$WORK_DIR/recovery.log" 2>&1 &
+echo $! >"$WORK_DIR/recovery.pid"
+```
+
+The exported `NODE_OPTIONS` is inherited by the initial `nohup` process, the
+operator supervisor and the lock-holding child; do not unset or replace it in
+the shell or supervisor environment. The migration appends progress to the
+authenticated recovery journal while preserving its original 46,305-entry
+prefix. The epoch authority is a separate
+append-only local ledger at
+`$WORK_DIR/checkpoint.json.exceptional-recovery-epochs/entries/`; it does not
+replace the original checkpoint, plan, manifest or journal anchor. Full
+independent verification and a durable final report remain mandatory. This
+operation does not switch runtime generation, deploy Workers, release/unfreeze
+writers, delete history or automatically rerun after failure.
+Preserve partial v3 objects, the original checkpoint and journal entries, and
+all epoch records for review.

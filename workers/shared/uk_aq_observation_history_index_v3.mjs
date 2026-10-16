@@ -1,5 +1,6 @@
 // @ts-nocheck -- shared deterministic builder is consumed by Node and Deno callers.
 import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 
 import {
   validateObservationContentHashMetadata,
@@ -164,6 +165,104 @@ function canonicalizeJsonValue(value) {
 
 export function encodeObservationHistoryIndexV3Json(payload) {
   return `${JSON.stringify(canonicalizeJsonValue(payload), null, 2)}\n`;
+}
+
+// Match canonicalizeJsonValue() followed by JSON.stringify(..., null, 2)
+// for the schedule's plain JSON values. The schedule projection contains no
+// custom toJSON hooks or publication bodies.
+// Object.fromEntries puts array-index keys first in numeric order even when
+// the preceding bytewise sort placed them elsewhere. Each yielded string is
+// bounded independently of the size of the complete JSON document.
+const CANONICAL_ARRAY_VIEW = Symbol("canonical_array_view");
+const CANONICAL_STRING_CHUNK_CODE_UNITS = 32 * 1024;
+
+function canonicalJsonKeys(value) {
+  const keys = Object.keys(value)
+    .filter((key) => value[key] !== undefined &&
+      typeof value[key] !== "function" && typeof value[key] !== "symbol")
+    .sort(bytewiseCompare);
+  const isIndex = (key) => {
+    const number = Number(key);
+    return Number.isInteger(number) && number >= 0 && number < 4294967295 && String(number) === key;
+  };
+  return [
+    ...keys.filter(isIndex).sort((left, right) => Number(left) - Number(right)),
+    ...keys.filter((key) => !isIndex(key)),
+  ];
+}
+
+function* quotedJsonStringChunks(value) {
+  yield '"';
+  for (let offset = 0; offset < value.length;) {
+    let end = Math.min(offset + CANONICAL_STRING_CHUNK_CODE_UNITS, value.length);
+    if (end < value.length && end > offset &&
+        value.charCodeAt(end - 1) >= 0xd800 && value.charCodeAt(end - 1) <= 0xdbff &&
+        value.charCodeAt(end) >= 0xdc00 && value.charCodeAt(end) <= 0xdfff) end -= 1;
+    yield JSON.stringify(value.slice(offset, end)).slice(1, -1);
+    offset = end;
+  }
+  yield '"';
+}
+
+function canonicalArrayView(source, project) {
+  return { [CANONICAL_ARRAY_VIEW]: true, source, project };
+}
+
+export function* canonicalObservationHistoryIndexV3JsonChunks(value) {
+  const stack = [{ value, depth: 0, state: "start" }];
+  while (stack.length) {
+    const frame = stack[stack.length - 1];
+    if (frame.state === "start") {
+      const current = frame.value;
+      if (Array.isArray(current) || current?.[CANONICAL_ARRAY_VIEW] === true) {
+        frame.state = "array";
+        frame.index = 0;
+        frame.length = current?.[CANONICAL_ARRAY_VIEW] === true
+          ? current.source.length : current.length;
+        if (frame.length === 0) { yield "[]"; stack.pop(); }
+        else yield "[\n";
+      } else if (current && typeof current === "object") {
+        frame.state = "object";
+        frame.index = 0;
+        frame.keys = canonicalJsonKeys(current);
+        if (frame.keys.length === 0) { yield "{}"; stack.pop(); }
+        else yield "{\n";
+      } else {
+        if (typeof current === "string") yield* quotedJsonStringChunks(current);
+        else yield JSON.stringify(current);
+        stack.pop();
+      }
+      continue;
+    }
+    if (frame.state === "array") {
+      if (frame.index === frame.length) {
+        yield `\n${"  ".repeat(frame.depth)}]`;
+        stack.pop();
+        continue;
+      }
+      if (frame.index > 0) yield ",\n";
+      yield "  ".repeat(frame.depth + 1);
+      const current = frame.value;
+      const item = current?.[CANONICAL_ARRAY_VIEW] === true
+        ? current.project(current.source[frame.index]) : current[frame.index];
+      frame.index += 1;
+      stack.push({ value: item === undefined || typeof item === "function" || typeof item === "symbol"
+        ? null : item, depth: frame.depth + 1, state: "start" });
+      continue;
+    }
+    if (frame.index === frame.keys.length) {
+      yield `\n${"  ".repeat(frame.depth)}}`;
+      stack.pop();
+      continue;
+    }
+    if (frame.index > 0) yield ",\n";
+    const key = frame.keys[frame.index++];
+    yield "  ".repeat(frame.depth + 1);
+    yield* quotedJsonStringChunks(key);
+    yield ": ";
+    stack.push({ value: frame.value[key], depth: frame.depth + 1, state: "start" });
+  }
+  yield "\n";
 }
 
 function normalizePrefix(raw, fieldName) {
@@ -2334,8 +2433,8 @@ function normalizeExternalReference(raw) {
   return { ...identity, verified: true, durable: true };
 }
 
-function scheduleHashInput(plan) {
-  return encodeObservationHistoryIndexV3Json({
+function scheduleSha256(plan) {
+  const payload = {
     contract_version: plan.contract_version,
     tie_breaker: plan.tie_breaker,
     changed_dependency_edge_count: plan.changed_dependency_edge_count,
@@ -2344,10 +2443,8 @@ function scheduleHashInput(plan) {
     changed_order_prerequisite_edge_count:
       plan.changed_order_prerequisite_edge_count,
     external_reference_count: plan.external_reference_count,
-    external_references: plan.external_references.map((entry) =>
-      identityDescriptor(entry)
-    ),
-    entries: plan.entries.map((entry) => ({
+    external_references: canonicalArrayView(plan.external_references, identityDescriptor),
+    entries: canonicalArrayView(plan.entries, (entry) => ({
       position: entry.position,
       key: entry.key,
       byte_size: entry.byte_size,
@@ -2362,13 +2459,31 @@ function scheduleHashInput(plan) {
       external_publication_prerequisites:
         entry.external_publication_prerequisites,
     })),
-  });
+  };
+  const hash = createHash("sha256");
+  const hashBatch = [];
+  let batchCodeUnits = 0;
+  const flush = () => {
+    if (!batchCodeUnits) return;
+    hash.update(hashBatch.join(""), "utf8");
+    hashBatch.length = 0;
+    batchCodeUnits = 0;
+  };
+  for (const chunk of canonicalObservationHistoryIndexV3JsonChunks(payload)) {
+    if (!chunk) continue;
+    if (batchCodeUnits + chunk.length > 64 * 1024) flush();
+    if (chunk.length >= 64 * 1024) hash.update(chunk, "utf8");
+    else { hashBatch.push(chunk); batchCodeUnits += chunk.length; }
+  }
+  flush();
+  return hash.digest("hex");
 }
 
 export function buildObservationHistoryIndexV3PublicationPlan({
   objects,
   externalReferences = [],
   onProgress = null,
+  onPhase = null,
 }) {
   const normalizedObjects = (Array.isArray(objects) ? objects : [])
     .map(normalizePublicationObject);
@@ -2381,6 +2496,10 @@ export function buildObservationHistoryIndexV3PublicationPlan({
     } catch {
       // Optional diagnostics cannot change planner output or blocker semantics.
     }
+  } : null;
+  const reportPhase = typeof onPhase === "function" ? (phase) => {
+    try { onPhase(phase); }
+    catch { /* Optional diagnostics cannot change planner output. */ }
   } : null;
   reportProgress?.(0);
   const byKey = new Map();
@@ -2510,9 +2629,12 @@ export function buildObservationHistoryIndexV3PublicationPlan({
     ),
     entries,
   };
+  reportPhase?.("v3_schedule_hashing_start");
+  const scheduleSha = scheduleSha256(plan);
+  reportPhase?.("v3_schedule_hashing_complete");
   return Object.freeze({
     ...plan,
-    schedule_sha256: sha256Hex(scheduleHashInput(plan)),
+    schedule_sha256: scheduleSha,
   });
 }
 
@@ -2526,7 +2648,7 @@ function validatePublicationPlan(plan) {
   ) {
     throw new Error("Invalid observation-history v3 publication plan");
   }
-  const expectedHash = sha256Hex(scheduleHashInput(plan));
+  const expectedHash = scheduleSha256(plan);
   if (plan.schedule_sha256 !== expectedHash) {
     throw new Error("Observation-history v3 publication schedule identity mismatch");
   }
