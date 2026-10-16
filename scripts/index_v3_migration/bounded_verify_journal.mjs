@@ -21,8 +21,9 @@ export function envelope(file, kind, maxBytes = 4 * MiB) {
 
 // Exact read-only reader: no repair/create options, no journal array, no Maps.
 // The brand is granted only after the entire committed chain and exact entry set.
-export async function authenticateDiskJournal({ checkpoint, checkpointIdentity, checkpointPath, store, onEntry,
+export async function authenticateDiskJournal({ checkpoint, checkpointIdentity, checkpointPath, store, onEntry, validateUpdateStructure,
   maxEntryBytes = 128 * MiB, anchorSequence = 0 }) {
+  demand(typeof validateUpdateStructure === 'function', 'Recovery update structure validator is required');
   const root = `${path.resolve(checkpointPath)}.recovery`;
   const entryRoot = path.join(root, 'entries');
   for (const directory of [root, entryRoot]) {
@@ -68,6 +69,9 @@ export async function authenticateDiskJournal({ checkpoint, checkpointIdentity, 
       entry.payload.immutable_authority_sha256 === checkpoint.authority_sha256 &&
       entry.payload.updates && typeof entry.payload.updates === 'object' && !Array.isArray(entry.payload.updates),
     `Journal identity/ancestry mismatch at ${sequence}`);
+    // Authenticate first, then validate the ENTIRE update before any completion,
+    // journal-index or callback replay write. No whole-journal accumulation.
+    validateUpdateStructure(entry.payload.updates);
     const seen = new Set(); // at most one bounded journal entry, never global
     for (const completion of entry.payload.updates.completed_objects || []) {
       exactKeys(completion, ['key', 'evidence'], `Completion ${sequence}`);

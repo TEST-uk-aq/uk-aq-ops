@@ -5,10 +5,11 @@ import {
   buildObservationHistoryV3RecoveryReplayStateSha256,
 } from '../backup_r2/lib/observation_history_migration_v3.mjs';
 import { validateCleanStartEvidence, GCP_CLEAN_POLICY } from '../backup_r2/lib/observation_history_migration_gcp.mjs';
+import { validateRecoveryUpdateStructure } from '../backup_r2/uk_aq_observation_history_migration_v3.mjs';
 import { createEvidenceRelocation } from './evidence_relocation.mjs';
 import { authenticateCutoverVerifierDependencies } from './index_v3_cutover_generation_evidence.mjs';
 import { authenticateExceptionalRecovery, EXCEPTIONAL_LIVE_RECOVERY } from './exceptional_recovery_authority.mjs';
-import { authenticateDiskJournal, envelope, exactKeys } from './bounded_verify_journal.mjs';
+import { authenticateDiskJournal, envelope } from './bounded_verify_journal.mjs';
 import { DiskPlan, demand, same, sha256, MiB, readJsonBounded } from './bounded_verify_store.mjs';
 import { getObservationHistoryGeneration, assertObservationHistoryGenerationKey } from '../../workers/shared/uk_aq_observation_history_generation.mjs';
 import { buildObservationsManifestHierarchy } from '../backup_r2/uk_aq_observations_manifest_hierarchy.mjs';
@@ -300,22 +301,17 @@ export async function readBoundedBaseline({ checkpointPath, planReport, evidence
   store.phase = 'authenticate-journal';
   const journal = await authenticateDiskJournal({ checkpoint, checkpointIdentity, checkpointPath, store,
     anchorSequence: plan.migration_run_id === EXCEPTIONAL_LIVE_RECOVERY.run_id ? EXCEPTIONAL_LIVE_RECOVERY.journal_sequence : 0,
+    validateUpdateStructure: validateRecoveryUpdateStructure,
     onEntry: async (updates) => {
-      demand(Object.keys(updates).every((key) => ['clean_target_admission', 'prepared_records', 'prepared_state_updates',
-        'completed_objects', 'preparation_order_append', 'final_state', 'publication_evidence'].includes(key)), 'Unknown recovery update');
       if (updates.clean_target_admission) {
         demand(!checkpoint.clean_target_admission, 'Clean-start admission redefined');
         validateCleanStartEvidence(updates.clean_target_admission, plan); checkpoint.clean_target_admission = updates.clean_target_admission;
-      }
-      for (const key of ['prepared_records', 'prepared_state_updates', 'completed_objects', 'preparation_order_append', 'publication_evidence']) {
-        demand(updates[key] === undefined || Array.isArray(updates[key]), `Invalid journal update array ${key}`);
       }
       if ((updates.prepared_records?.length || updates.completed_objects?.length || updates.publication_evidence?.length))
         demand(checkpoint.clean_target_admission, 'Target progress precedes clean-start admission');
       const records = updates.prepared_records || [], order = updates.preparation_order_append || [];
       demand(records.length === order.length, 'Preparation order/record count differs');
       for (const [index, entry] of records.entries()) {
-        exactKeys(entry, ['unit_id', 'record'], 'Prepared journal record');
         const ordinal = nextPrepared++;
         const authorityUnit = disk.value('units', String(ordinal));
         demand(entry.unit_id === order[index] && entry.unit_id === authorityUnit.unit_id &&
@@ -324,9 +320,6 @@ export async function readBoundedBaseline({ checkpointPath, planReport, evidence
         store.run('INSERT INTO prepared VALUES(?,?,?)', entry.unit_id, ordinal, JSON.stringify(entry.record));
       }
       for (const entry of updates.prepared_state_updates || []) {
-        demand(Object.keys(entry).every((key) => ['unit_id', 'files_published', 'remove_staging_refs'].includes(key)) &&
-          (entry.files_published === undefined || entry.files_published === true) &&
-          (entry.remove_staging_refs === undefined || entry.remove_staging_refs === true), 'Invalid prepared-state update');
         const row = store.get('SELECT record FROM prepared WHERE id=?', entry.unit_id);
         demand(row, 'State update for unknown prepared unit'); const record = JSON.parse(row.record);
         if (entry.files_published === true) record.files_published = true;
@@ -338,11 +331,8 @@ export async function readBoundedBaseline({ checkpointPath, planReport, evidence
         store.run('INSERT INTO publications(key,evidence) VALUES(?,?)', entry.key, JSON.stringify(entry)); store.counters.publication_records++;
       }
       if (updates.final_state) {
-        exactKeys(updates.final_state, ['full_verification_complete', 'cutover_ready'], 'Final journal state');
-        demand(Object.values(updates.final_state).every((value) => typeof value === 'boolean') &&
-          (!checkpoint.full_verification_complete || updates.final_state.full_verification_complete) &&
-          (!checkpoint.cutover_ready || updates.final_state.cutover_ready) &&
-          (!updates.final_state.cutover_ready || updates.final_state.full_verification_complete), 'Final state invalid/regresses');
+        demand((!checkpoint.full_verification_complete || updates.final_state.full_verification_complete) &&
+          (!checkpoint.cutover_ready || updates.final_state.cutover_ready), 'Final state regresses');
         Object.assign(checkpoint, updates.final_state);
       }
     } });

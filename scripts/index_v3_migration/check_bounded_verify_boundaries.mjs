@@ -8,6 +8,7 @@ import { VerificationStore, DiskPlan, MiB, sha256 } from './bounded_verify_store
 import { BoundedBaseline } from './bounded_verify_baseline.mjs';
 import { authenticateDiskJournal } from './bounded_verify_journal.mjs';
 import { readAndValidateRecoveryJournal } from './recovery_journal_authority.mjs';
+import { validateRecoveryUpdateStructure } from '../backup_r2/uk_aq_observation_history_migration_v3.mjs';
 import { buildObservationHistoryV3RecoveryReplayStateSha256 } from '../backup_r2/lib/observation_history_migration_v3.mjs';
 import { persistShardedMigrationPlan, sha256StableMigrationJson } from '../backup_r2/lib/observation_history_migration_plan_store.mjs';
 import { buildObservationHistoryIndexV3PublicationPlan } from '../../workers/shared/uk_aq_observation_history_index_v3.mjs';
@@ -90,7 +91,8 @@ try {
     last_sequence: 1, last_entry_sha256: entry.payload_sha256 });
   const old = readAndValidateRecoveryJournal({ recoveryRoot: journalRoot, expectedCheckpointSha256: cpIdentity.sha256,
     expectedAuthoritySha256: cp.authority_sha256, expectedCheckpointByteSize: cpIdentity.byte_size });
-  const options = { checkpoint: cp, checkpointIdentity: cpIdentity, checkpointPath, store, onEntry: async () => {} };
+  const options = { checkpoint: cp, checkpointIdentity: cpIdentity, checkpointPath, store,
+    validateUpdateStructure: validateRecoveryUpdateStructure, onEntry: async () => {} };
   const authenticated = await authenticateDiskJournal(options);
   assert.equal(authenticated.last_entry_sha256, old.last_entry_sha256);
   fs.copyFileSync(entryPath, path.join(entriesRoot, '0000000002.json'));
@@ -98,6 +100,71 @@ try {
   fs.unlinkSync(path.join(entriesRoot, '0000000002.json'));
   entry.payload.previous_entry_sha256 = '0'.repeat(64); fs.writeFileSync(entryPath, JSON.stringify(entry));
   await assert.rejects(authenticateDiskJournal(options), /authentication failed/);
+  // Structurally malformed but fully hash-authenticated updates must fail before
+  // completion/index writes OR the baseline's prepared/publication replay callback.
+  const completion = { key: 'one', evidence: { verified: true, durable: true } };
+  const malformed = [
+    ['empty update', {}],
+    ['unknown field', { unexpected: true }],
+    ...['prepared_records', 'prepared_state_updates', 'completed_objects', 'preparation_order_append', 'publication_evidence']
+      .flatMap((key) => [[`empty ${key}`, { [key]: [] }], [`non-array ${key}`, { [key]: {} }]]),
+    ['publication batch over 16', { publication_evidence: Array.from({ length: 17 }, (_, position) => ({ position })) }],
+    ['equal publication positions', { publication_evidence: [{ position: 1 }, { position: 1 }] }],
+    ['decreasing publication positions', { publication_evidence: [{ position: 2 }, { position: 1 }] }],
+    ['invalid publication position', { publication_evidence: [{ position: -1 }] }],
+    ['non-integer publication position', { publication_evidence: [{ position: 1.5 }] }],
+    ['non-object publication', { publication_evidence: [null] }],
+    ['duplicate state units', { prepared_state_updates: [{ unit_id: 'one', files_published: true }, { unit_id: 'one', remove_staging_refs: true }] }],
+    ['state without transition', { prepared_state_updates: [{ unit_id: 'one' }] }],
+    ['state missing unit', { prepared_state_updates: [{ files_published: true }] }],
+    ['state false transition', { prepared_state_updates: [{ unit_id: 'one', files_published: false }] }],
+    ['state non-boolean transition', { prepared_state_updates: [{ unit_id: 'one', remove_staging_refs: 1 }] }],
+    ['state unknown field', { prepared_state_updates: [{ unit_id: 'one', files_published: true, unexpected: true }] }],
+    ['prepared missing field', { prepared_records: [{ unit_id: 'one' }] }],
+    ['prepared extra field', { prepared_records: [{ unit_id: 'one', record: {}, unexpected: true }] }],
+    ['completion missing field', { completed_objects: [{ key: 'one' }] }],
+    ['completion extra field', { completed_objects: [{ ...completion, unexpected: true }] }],
+    ...[null, false, [], 1].map((value) => ['invalid clean-start structure', { clean_target_admission: value }]),
+    ['final missing field', { final_state: { full_verification_complete: true } }],
+    ['final extra field', { final_state: { full_verification_complete: true, cutover_ready: true, unexpected: true } }],
+    ['final non-boolean', { final_state: { full_verification_complete: true, cutover_ready: 1 } }],
+    ['cutover before verification', { final_state: { full_verification_complete: false, cutover_ready: true } }],
+    ['malformed later field with valid completion', { completed_objects: [completion], prepared_state_updates: [{ unit_id: 'one' }] }],
+  ];
+  const valid = [
+    { clean_target_admission: {} },
+    { prepared_records: [{ unit_id: 'one', record: {} }], preparation_order_append: ['one'] },
+    { completed_objects: [completion] },
+    { prepared_state_updates: [{ unit_id: 'one', files_published: true }] },
+    { prepared_state_updates: [{ unit_id: 'one', remove_staging_refs: true }] },
+    { prepared_state_updates: [{ unit_id: 'one', files_published: true, remove_staging_refs: true }] },
+    ...[[false, false], [true, false], [true, true]].map(([full_verification_complete, cutover_ready]) =>
+      ({ final_state: { full_verification_complete, cutover_ready } })),
+    { publication_evidence: Array.from({ length: 16 }, (_, position) => ({ position })) },
+  ];
+  const writeUpdate = (updates) => {
+    store.run('DELETE FROM completed'); store.run('DELETE FROM journal');
+    store.counters.completion_records = 0; store.counters.journal_entries = 0;
+    const authenticatedEntry = writeEnvelope(entryPath, entry.kind, { ...entry.payload, previous_entry_sha256: null, updates });
+    writeEnvelope(path.join(journalRoot, 'head.json'), 'uk_aq_observation_history_v3_recovery_head', {
+      original_checkpoint_sha256: cpIdentity.sha256, immutable_authority_sha256: cp.authority_sha256,
+      last_sequence: 1, last_entry_sha256: authenticatedEntry.payload_sha256 });
+  };
+  for (const [name, updates] of malformed) {
+    assert.throws(() => validateRecoveryUpdateStructure(updates), undefined, name);
+    writeUpdate(updates); let callbacks = 0;
+    await assert.rejects(authenticateDiskJournal({ ...options, onEntry: async () => { callbacks++; } }), undefined, name);
+    assert.equal(callbacks, 0, name);
+    assert.equal(store.count('completed'), 0, name); assert.equal(store.count('journal'), 0, name);
+    assert.equal(store.counters.completion_records, 0, name); assert.equal(store.counters.journal_entries, 0, name);
+  }
+  for (const updates of valid) {
+    assert.doesNotThrow(() => validateRecoveryUpdateStructure(updates));
+    writeUpdate(updates); let callbacks = 0;
+    await authenticateDiskJournal({ ...options, onEntry: async () => { callbacks++; } });
+    assert.equal(callbacks, 1); assert.equal(store.count('journal'), 1);
+  }
+  await assert.rejects(authenticateDiskJournal({ ...options, validateUpdateStructure: undefined }), /validator is required/);
   // The SQLite eligible-node ordering and original streaming encoder must
   // produce EXACTLY the existing publication schedule SHA, including an edge
   // that is an order prerequisite rather than a content dependency.
@@ -136,5 +203,5 @@ try {
     rows++; await store.boundary();
   }
   assert.equal(rows, 300);
-  process.stdout.write('PASS: disk plan/replay encodings, exact chain/tail refusal, publication DAG/hash and contradictory evidence refusal\n');
+  process.stdout.write(`PASS: disk plan/replay encodings, exact chain/tail refusal, shared update validator (${malformed.length} malformed / ${valid.length} valid structures; rejection before replay writes), publication DAG/hash and contradictory evidence refusal\n`);
 } finally { store?.close(); fs.rmSync(work, { recursive: true }); }
