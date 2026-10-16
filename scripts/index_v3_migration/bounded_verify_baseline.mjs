@@ -195,19 +195,26 @@ export class BoundedBaseline {
   async scheduleAndAuthenticatePublications() {
     const store = this.store;
     store.phase = 'authenticate-publication-schedule';
+    const totalPublications = store.get('SELECT COUNT(*) AS n FROM objects WHERE v3=1').n;
+    store.counters.publications_total = totalPublications;
+    store.counters.publications_scheduled = 0;
     store.run(`UPDATE objects SET indegree=(SELECT COUNT(*) FROM edges e JOIN objects child ON child.key=e.child
       WHERE e.parent=objects.key AND child.v3=1) WHERE v3=1`);
+    await store.boundary(true);
     let position = 0;
     for (;;) {
       const next = store.get('SELECT key FROM objects WHERE v3=1 AND indegree=0 AND position IS NULL ORDER BY rank,key COLLATE BINARY LIMIT 1');
       if (!next) break;
       store.run('UPDATE objects SET position=? WHERE key=?', ++position, next.key);
       // Multiple relationship types are distinct graph edges, as in the existing scheduler.
-      store.run(`UPDATE objects SET indegree=indegree-(SELECT COUNT(*) FROM edges e WHERE e.parent=objects.key AND e.child=?)
+      // The keys in the dependency subquery are already selective. Avoid a full v3-index scan
+      // for every publication by locating affected objects through their primary keys.
+      store.run(`UPDATE objects INDEXED BY sqlite_autoindex_objects_1 SET indegree=indegree-(SELECT COUNT(*) FROM edges e WHERE e.parent=objects.key AND e.child=?)
         WHERE v3=1 AND key IN (SELECT parent FROM edges WHERE child=?)`, next.key, next.key);
+      store.counters.publications_scheduled = position;
       await store.boundary();
     }
-    demand(position === store.get('SELECT COUNT(*) AS n FROM objects WHERE v3=1').n, 'Publication DAG cycle or incomplete schedule');
+    demand(position === totalPublications, 'Publication DAG cycle or incomplete schedule');
     const count = (sql) => store.get(sql).n;
     const diskArray = (length, lookup) => new Proxy([], { get(_target, name) {
       if (name === 'length') return length;
