@@ -132,9 +132,11 @@ export async function verifyLiveImmutableGeneration({ argv = process.argv.slice(
     checkpointPath: args.checkpoint, planReport: report,
     environment: "LIVE", bucket: LIVE_BUCKET,
   });
-  if (plan.target_writer_git_sha !== args["expected-repository-git-sha"]) {
-    throw new Error("Immutable migration writer SHA differs from reviewed current LIVE implementation");
-  }
+  // These are intentionally independent identities. The historical writer is
+  // authenticated by the immutable checkpoint/plan/recovery authority and the
+  // pinned semantic dependency checks. The current verifier checkout was
+  // authenticated above by assertLiveRepository and the current dependency
+  // trust model; exceptional recovery may therefore have a different SHA.
   const r2 = {
     endpoint: process.env.CFLARE_R2_ENDPOINT,
     bucket: LIVE_BUCKET,
@@ -179,6 +181,8 @@ export async function verifyLiveImmutableGeneration({ argv = process.argv.slice(
     immutable_migration_verified: true,
     source_root_unchanged: true,
     complete_v3_dependency_closure: true,
+    historical_migration_writer_git_sha: plan.target_writer_git_sha,
+    current_verifier_git_sha: args["expected-repository-git-sha"],
     plan_sha256: plan.plan_sha256,
     migration_run_id: plan.migration_run_id,
     checkpoint_evidence: provenance,

@@ -299,7 +299,7 @@ function readEpochLedger({ checkpointPath, journal, checkpointSha256, repository
     last_epoch_sha256: previousSha, next_sequence: entries.length + 1, previous_epoch_sha256: previousSha });
 }
 
-export function authenticateExceptionalRecovery({ checkpointPath, repositoryRoot }) {
+export function authenticateExceptionalRecovery({ checkpointPath, repositoryRoot, authenticatedJournal = null }) {
   const absoluteCheckpoint = path.resolve(checkpointPath);
   const checkpointBytes = fs.readFileSync(absoluteCheckpoint);
   const checkpointSha256 = sha256(checkpointBytes);
@@ -320,7 +320,7 @@ export function authenticateExceptionalRecovery({ checkpointPath, repositoryRoot
   } else if (!checkpoint.authority || sha256StableMigrationJson(checkpoint.authority) !== EXCEPTIONAL_LIVE_RECOVERY.authority_sha256) {
     throw new Error("Exceptional recovery immutable inline plan identity differs from the authorised run");
   }
-  const journal = inspectRecoveryJournalForInterruptedAppend({
+  const journal = authenticatedJournal || inspectRecoveryJournalForInterruptedAppend({
     recoveryRoot: `${absoluteCheckpoint}.recovery`,
     expectedCheckpointSha256: checkpointSha256,
     expectedCheckpointByteSize: checkpointBytes.byteLength,
@@ -329,6 +329,17 @@ export function authenticateExceptionalRecovery({ checkpointPath, repositoryRoot
     expectedPlanSha256: EXCEPTIONAL_LIVE_RECOVERY.plan_sha256,
     expectedTargetWriterGitSha: EXCEPTIONAL_LIVE_RECOVERY.original_commit,
   });
+  if (!journal?.manifest?.payload || !Array.isArray(journal.entries) ||
+      !journal.completed_objects || !Number.isSafeInteger(journal.last_sequence)) {
+    throw new Error("Authenticated exceptional recovery journal is incomplete");
+  }
+  if (journal.manifest.payload.original_checkpoint.sha256 !== checkpointSha256 ||
+      journal.manifest.payload.immutable_authority_sha256 !== EXCEPTIONAL_LIVE_RECOVERY.authority_sha256 ||
+      journal.manifest.payload.migration_run_id !== EXCEPTIONAL_LIVE_RECOVERY.run_id ||
+      journal.manifest.payload.plan_sha256 !== EXCEPTIONAL_LIVE_RECOVERY.plan_sha256 ||
+      journal.manifest.payload.target_writer_git_sha !== EXCEPTIONAL_LIVE_RECOVERY.original_commit) {
+    throw new Error("Authenticated exceptional recovery manifest does not preserve the original migration identities");
+  }
   const originalImplementation = verifyOriginalRecoveryImplementation({ manifest: journal.manifest, repositoryRoot });
   if (journal.manifest.payload.original_checkpoint.path !== absoluteCheckpoint) {
     throw new Error("Exceptional recovery checkpoint path differs from the authenticated original path");

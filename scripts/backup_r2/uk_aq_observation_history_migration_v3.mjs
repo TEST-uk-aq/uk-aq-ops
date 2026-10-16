@@ -737,7 +737,7 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
       try { fs.fsyncSync(entriesFd); } finally { fs.closeSync(entriesFd); }
     }
     if (onAuthenticatedReplay) onAuthenticatedReplay({ sequence: replay.interrupted_append.sequence,
-      entry_sha256: replay.interrupted_append.payload_sha256, interrupted_append: true });
+      entry_sha256: replay.interrupted_append.payload_sha256, interrupted_append: true, journal: replay });
     if (repairHead) {
       const tail = replay.interrupted_append;
       atomicWriteJson(paths.head, recoveryEnvelope('uk_aq_observation_history_v3_recovery_head', {
@@ -749,7 +749,7 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
   } else if (onAuthenticatedReplay) {
     buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint, validateOnly: true });
     onAuthenticatedReplay({ sequence: replay.last_sequence,
-      entry_sha256: replay.last_entry_sha256, interrupted_append: false });
+      entry_sha256: replay.last_entry_sha256, interrupted_append: false, journal: replay });
   }
   if (diagnostics) process.stderr.write(`V3 recovery: replay complete entries=${replay.entries.length} elapsed_ms=${Date.now() - authenticationStartedAt}\n`);
   return {
