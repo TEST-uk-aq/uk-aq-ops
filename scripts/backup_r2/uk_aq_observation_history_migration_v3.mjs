@@ -689,6 +689,10 @@ export function readOnlyJournalView(journal) {
     }
     return Object.freeze(target);
   };
+  const requiresStructuralFacade = (value) => Reflect.ownKeys(value).some((property) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, property);
+    return descriptor && !descriptor.configurable;
+  });
   const view = (value) => {
     if (!value || typeof value !== "object") return value;
     if (cache.has(value)) return cache.get(value);
@@ -702,7 +706,7 @@ export function readOnlyJournalView(journal) {
       cache.set(value, mapView);
       return mapView;
     }
-    if (Object.isFrozen(value)) return frozenView(value);
+    if (Object.isFrozen(value) || requiresStructuralFacade(value)) return frozenView(value);
     const proxy = new Proxy(value, {
       get(target, property) {
         const result = Reflect.get(target, property, target);
@@ -717,6 +721,18 @@ export function readOnlyJournalView(journal) {
               index === callbackIndex && typeof item === "number" ? item : view(item)));
           }
           return view(Reflect.apply(result, target, callArgs));
+        };
+      },
+      getOwnPropertyDescriptor(target, property) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(target, property);
+        if (!descriptor) return undefined;
+        if ("value" in descriptor) {
+          return { ...descriptor, value: view(descriptor.value) };
+        }
+        return {
+          ...descriptor,
+          get: descriptor.get ? () => view(descriptor.get.call(target)) : undefined,
+          set: undefined,
         };
       },
       set: mutation,
@@ -740,6 +756,9 @@ export function readOnlyJournalView(journal) {
 function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false,
   allowInterruptedTail = false, onAuthenticatedReplay = null, diagnostics = false,
   readOnly = false, authenticatedJournal = null }) {
+  if (authenticatedJournal && !readOnly) {
+    throw new Error("Authenticated recovery journal reuse is restricted to read-only inspection");
+  }
   if (authenticatedJournal && !isAuthenticatedRecoveryJournal(authenticatedJournal)) {
     throw new Error("Supplied recovery journal has not passed cryptographic authentication");
   }
@@ -924,6 +943,9 @@ export function buildObservationHistoryV3RecoveryProgressContext({
   evidenceRoot = null,
   authenticatedJournal = null,
 }) {
+  if (authenticatedJournal && !readOnly) {
+    throw new Error("Authenticated recovery journal reuse is restricted to read-only inspection");
+  }
   if (diagnostics) process.stderr.write("V3 recovery: authenticating original checkpoint and recovery manifest\n");
   const paths = recoveryProgressPaths(checkpointPath);
   if (readOnly) {
