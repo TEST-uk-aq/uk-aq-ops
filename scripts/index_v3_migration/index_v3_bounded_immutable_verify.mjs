@@ -17,7 +17,9 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const HELP = `Usage (only inside the existing supervised global observations lock):
   node --max-old-space-size=4096 scripts/index_v3_migration/index_v3_bounded_immutable_verify.mjs \\
     --phase pre-cutover|read-cutover --expected-repository-git-sha SHA \\
-    --expected-bucket BUCKET --plan-report PATH --checkpoint PATH \\
+    --expected-bucket BUCKET (--plan-report PATH | \\
+      --expected-migration-run-id RUN_ID --expected-plan-sha256 SHA256) \\
+    --checkpoint PATH \\
     --evidence-root PATH --scratch-directory PATH [--environment LIVE|TEST] \\
     [--r2-concurrency 1] [--batch-size 128] [--max-object-mib 128] \\
     [--max-file-rows 250000] [--max-uncompressed-mib 256] \\
@@ -31,7 +33,8 @@ remain alive. Read-cutover must precede the first normal v3-only write.
 `;
 
 export function parseBoundedVerifyArgs(argv) {
-  const allowed = new Set(['phase', 'expected-repository-git-sha', 'expected-bucket', 'plan-report', 'checkpoint',
+  const allowed = new Set(['phase', 'expected-repository-git-sha', 'expected-bucket', 'plan-report',
+    'expected-migration-run-id', 'expected-plan-sha256', 'checkpoint',
     'evidence-root', 'scratch-directory', 'environment', 'r2-concurrency', 'batch-size', 'max-object-mib',
     'max-file-rows', 'max-uncompressed-mib', 'max-scratch-gib', 'cleanup-on-success']);
   const args = {};
@@ -41,8 +44,20 @@ export function parseBoundedVerifyArgs(argv) {
       `Missing, repeated or unsupported bounded verifier argument: ${argv[index]}`);
     args[name] = value;
   }
-  for (const name of ['phase', 'expected-repository-git-sha', 'expected-bucket', 'plan-report', 'checkpoint', 'scratch-directory'])
+  for (const name of ['phase', 'expected-repository-git-sha', 'expected-bucket', 'checkpoint', 'scratch-directory'])
     demand(args[name], `Missing required --${name}`);
+  const hasPlanReport = args['plan-report'] !== undefined;
+  const hasExpectedRunId = args['expected-migration-run-id'] !== undefined;
+  const hasExpectedPlanSha = args['expected-plan-sha256'] !== undefined;
+  demand((hasPlanReport && !hasExpectedRunId && !hasExpectedPlanSha) ||
+    (!hasPlanReport && hasExpectedRunId && hasExpectedPlanSha),
+  'Supply either --plan-report or both explicit migration identity arguments');
+  if (hasExpectedRunId) {
+    const runId = args['expected-migration-run-id'];
+    demand(runId.length <= 256 && runId.trim() === runId && !/[\u0000-\u001f\u007f]/.test(runId),
+      'Invalid --expected-migration-run-id');
+    demand(/^[0-9a-f]{64}$/.test(args['expected-plan-sha256']), 'Invalid --expected-plan-sha256');
+  }
   demand(['pre-cutover', 'read-cutover'].includes(args.phase) && /^[0-9a-f]{40}$/.test(args['expected-repository-git-sha']),
     'Exact reviewed Git SHA and pre-cutover/read-cutover phase required');
   args.environment ||= 'LIVE';
@@ -60,6 +75,12 @@ export function parseBoundedVerifyArgs(argv) {
   demand(args['cleanup-on-success'] === undefined || ['true', 'false'].includes(args['cleanup-on-success']), 'Invalid cleanup option');
   args.cleanupOnSuccess = args['cleanup-on-success'] === 'true';
   return args;
+}
+
+export function boundedVerifyLockMigrationRunId(args, report = null) {
+  const migrationRunId = report?.result?.migration_run_id || args['expected-migration-run-id'];
+  demand(typeof migrationRunId === 'string' && migrationRunId.trim(), 'Migration run ID for supervised lock is missing');
+  return migrationRunId;
 }
 
 function assertTestRepositoryAndEnvironment(args, generation) {
@@ -93,9 +114,10 @@ export async function verifyBoundedImmutableGeneration({ argv = process.argv.sli
     demand(args['expected-bucket'] === 'uk-aq-history-live', 'Reviewed LIVE bucket required');
     assertLoadedLiveEnvironment(args.phase); assertLiveRepository(args['expected-repository-git-sha'], generation);
   } else assertTestRepositoryAndEnvironment(args, generation);
-  const report = readJsonBounded(path.resolve(args['plan-report']), 4 * MiB).value;
-  demand(typeof report?.result?.migration_run_id === 'string' && report.result.migration_run_id.trim(), 'Plan report migration run ID missing');
-  const lockAssertion = createSideBySideLockAssertion({ env: process.env, migrationRunId: report?.result?.migration_run_id });
+  const report = args['plan-report'] ? readJsonBounded(path.resolve(args['plan-report']), 4 * MiB).value : null;
+  if (report) demand(typeof report?.result?.migration_run_id === 'string' && report.result.migration_run_id.trim(), 'Plan report migration run ID missing');
+  const migrationRunId = boundedVerifyLockMigrationRunId(args, report);
+  const lockAssertion = createSideBySideLockAssertion({ env: process.env, migrationRunId });
   const lock = lockAssertion();
   let interrupted = null, store = null, completed = false;
   const stop = (signal) => { interrupted ||= new Error(`INTERRUPTED: ${signal}; all R2 evidence must be repeated under a new supervised session`); };
@@ -109,6 +131,7 @@ export async function verifyBoundedImmutableGeneration({ argv = process.argv.sli
     process.stderr.write(`Disposable verification scratch: ${store.root}\n`);
     store.progress(true);
     const baseline = await readBoundedBaseline({ checkpointPath: path.resolve(args.checkpoint), planReport: report,
+      expectedMigrationRunId: args['expected-migration-run-id'], expectedPlanSha256: args['expected-plan-sha256'],
       evidenceRoot: args['evidence-root'] || null, store, repositoryRoot: root, environment: args.environment,
       bucket: args['expected-bucket'] });
     const r2 = { endpoint: process.env.CFLARE_R2_ENDPOINT, bucket: args['expected-bucket'], region: process.env.CFLARE_R2_REGION || 'auto',

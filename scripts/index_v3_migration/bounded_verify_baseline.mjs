@@ -30,6 +30,20 @@ export function completionMatches(evidence, expected, parquet = false) {
     (evidence.key === undefined || evidence.key === expected.key);
 }
 
+export function assertBoundedOperatorIdentity({ plan, checkpoint, manifest, planReport,
+  expectedMigrationRunId, expectedPlanSha256 }) {
+  const hasReport = planReport !== null && planReport !== undefined;
+  const hasExplicitIdentity = expectedMigrationRunId !== undefined && expectedPlanSha256 !== undefined;
+  demand((hasReport && expectedMigrationRunId === undefined && expectedPlanSha256 === undefined) ||
+    (!hasReport && hasExplicitIdentity), 'Choose exactly one complete operator migration identity source');
+  const expectedRunId = hasReport ? planReport?.result?.migration_run_id : expectedMigrationRunId;
+  const expectedPlan = hasReport ? planReport?.result?.plan_sha256 : expectedPlanSha256;
+  demand(expectedRunId === plan.migration_run_id && expectedRunId === checkpoint.migration_run_id &&
+    expectedRunId === manifest.payload.migration_run_id && expectedPlan === plan.plan_sha256 &&
+    expectedPlan === checkpoint.plan_sha256 && expectedPlan === manifest.payload.plan_sha256,
+  'Operator migration identity differs from authenticated checkpoint, sharded plan or recovery manifest');
+}
+
 // Only bounded compact summaries may be accumulated (never leaves/completions).
 function collectSmall(values, limit = 64 * MiB) {
   const result = []; let bytes = 0;
@@ -250,7 +264,8 @@ export class BoundedBaseline {
   }
 }
 
-export async function readBoundedBaseline({ checkpointPath, planReport, evidenceRoot, store, repositoryRoot, environment, bucket }) {
+export async function readBoundedBaseline({ checkpointPath, planReport, expectedMigrationRunId, expectedPlanSha256,
+  evidenceRoot, store, repositoryRoot, environment, bucket }) {
   const { value: checkpoint, bytes } = readJsonBounded(checkpointPath, 4 * MiB);
   const checkpointIdentity = { sha256: sha256(bytes), byte_size: bytes.length };
   demand(checkpoint.kind === 'uk_aq_observation_history_v3_migration_checkpoint' &&
@@ -286,9 +301,9 @@ export async function readBoundedBaseline({ checkpointPath, planReport, evidence
   'Side-by-side generation/source/writer/runner identity differs');
   for (const field of ['target_observations_prefix', 'target_writer_git_sha', 'migration_run_id', 'v3_index_root', 'v3_latest_key'])
     demand(identity[field] === plan[field], `Pinned plan ${field} differs`);
+  assertBoundedOperatorIdentity({ plan, checkpoint, manifest, planReport, expectedMigrationRunId, expectedPlanSha256 });
   demand(plan.environment.environment === environment && plan.environment.bucket === bucket && identity.environment === environment &&
     identity.bucket === bucket && checkpoint.migration_run_id === plan.migration_run_id && checkpoint.plan_sha256 === plan.plan_sha256 &&
-    planReport?.result?.plan_sha256 === plan.plan_sha256 && planReport?.result?.migration_run_id === plan.migration_run_id &&
     plan.writer_freeze_plan?.entries?.length > 0, 'Explicit environment/report/complete freeze authority differs');
   for (const field of ['bindings', 'empty_source_connectors']) demand(await disk.hash(disk.at(field)) ===
     await disk.hash(disk.at('plan_identity', field)), `Pinned ${field} differs`);

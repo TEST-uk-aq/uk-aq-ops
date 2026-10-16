@@ -189,12 +189,19 @@ On the Pro itself:
    preflight evidence. This verifier's success is immutable-data verification;
    it does not replace current v2 runtime rollback or deployed-path acceptance.
 6. Set the shell-local placeholders below from reviewed evidence/configuration;
-   they are not new repository configuration variables. `CHECKPOINT` and
-   `PLAN_REPORT` must name original files, `MIGRATION_RUN_ID` must equal the report,
-   `SCRATCH_DIRECTORY` must have the capacity above, and `RUN_LOG_DIRECTORY`
-   must be a new directory outside evidence/Dropbox/the checkout. For LIVE the
-   supplied run ID is `live-v3-20261015T114250Z-e84f52a` and plan SHA is
-   `1e960674e53cd2ddb3c5d08a3318fcce1abc72ebe7a2dc92e11e9ce9a4d79600`.
+   they are not new repository configuration variables. `CHECKPOINT` must name
+   the original file, `SCRATCH_DIRECTORY` must have the capacity above, and
+   `RUN_LOG_DIRECTORY` must be a new directory outside evidence/Dropbox/the
+   checkout. With a plan report, `MIGRATION_RUN_ID` must equal its result fields.
+   If the original plan report is unavailable, supply both
+   `EXPECTED_MIGRATION_RUN_ID` and `EXPECTED_PLAN_SHA256` from independently
+   reviewed operator evidence. They are authenticated against the original
+   checkpoint, authenticated sharded plan and recovery manifest before any
+   verification result can complete. The verifier does not infer either value.
+   For reference, the preserved LIVE run identity is
+   `live-v3-20261015T114250Z-e84f52a` with plan SHA-256
+   `1e960674e53cd2ddb3c5d08a3318fcce1abc72ebe7a2dc92e11e9ce9a4d79600`;
+   these are evidence values, not verifier defaults.
 
 Run from the reviewed Ops checkout. The following command always enters through
 the existing coordinator, retaining its same-session heartbeat and process-group
@@ -228,6 +235,20 @@ nohup /usr/bin/caffeinate -i /usr/bin/nice -n 10 \
   >"$RUN_LOG_DIRECTORY/result.jsonl" \
   2>"$RUN_LOG_DIRECTORY/progress.jsonl" </dev/null &
 ```
+
+The command above preserves the existing plan-report mode. If the original
+report is unavailable, omit `--plan-report "$PLAN_REPORT"` and pass both of
+these options in its place:
+
+```bash
+  --expected-migration-run-id "$EXPECTED_MIGRATION_RUN_ID" \\
+  --expected-plan-sha256 "$EXPECTED_PLAN_SHA256" \\
+```
+
+Set `MIGRATION_RUN_ID` to `EXPECTED_MIGRATION_RUN_ID` for the coordinator's
+`--run-id`. Keep the existing `--checkpoint "$CHECKPOINT"` argument. The
+modes are mutually exclusive, and the supplied values remain untrusted until
+they match the authenticated checkpoint, sharded plan and recovery manifest.
 
 Record/monitor the background job PID and the Pro-local
 `coordinator-exit-code` file. The small shell wrapper above records the actual
