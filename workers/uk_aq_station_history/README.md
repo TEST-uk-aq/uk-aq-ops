@@ -98,6 +98,11 @@ variable or public pagination control.
 
 ## Isolated recent AQI CPU prototype (TEST only)
 
+The additional six-hour `recent-hourly-prototype` route is documented in
+[RECENT_HOURLY_PROTOTYPE.md](RECENT_HOURLY_PROTOTYPE.md). It reuses the same
+security controls and bounded RPC reader. The original single-result route
+below retains its configuration, 48-hour query overlap and response contract.
+
 `GET /api/aq/recent-aqi-prototype` reaches the private
 `/v1/recent-aqi-prototype` Service Binding route through the authenticated
 cache proxy. It requires the normal allowed Origin, valid session cookie, and

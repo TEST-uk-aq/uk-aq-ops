@@ -14,7 +14,6 @@ const UPSTREAM_TIMEOUT_MS = 2_500;
 const REQUEST_TIMEOUT_MS = 4_000;
 const RPC_WINDOW_LABEL = "30d";
 const METADATA_BACKTRACK_MS = 24 * HOUR_MS;
-const QUERY_OVERLAP_MS = 24 * HOUR_MS + METADATA_BACKTRACK_MS;
 
 function reply(status, body) {
   return new Response(JSON.stringify(body), {
@@ -67,18 +66,18 @@ function parseRequest(url, nowMs, allowedId) {
   };
 }
 
-async function readRecentRows(env, timeseriesId, lastValueAt, timeoutMs) {
+export async function readRecentRows(env, timeseriesId, lastValueAt, timeoutMs, contextHours = 24) {
   const startedMs = Date.now();
   const base = String(env.SUPABASE_URL || "").trim().replace(/\/+$/, "");
   const key = String(env.SB_SECRET_KEY || "").trim();
   if (!base || !key) throw new Error("source_config_missing");
   const metadataAnchorMs = Date.parse(String(lastValueAt || ""));
   if (!Number.isFinite(metadataAnchorMs)) throw new Error("source_metadata_anchor_unavailable");
-  const requestedSinceMs = metadataAnchorMs - QUERY_OVERLAP_MS;
+  const requestedSinceMs = metadataAnchorMs - contextHours * HOUR_MS - METADATA_BACKTRACK_MS;
   const target = new URL(`${base}/rest/v1/rpc/uk_aq_timeseries_rpc`);
-  // last_value_at is only a query anchor. The 48-hour lookback covers the
-  // 24-hour AQI context plus up to 24 hours of metadata lag; returned source
-  // rows, not the metadata value, select the actual endpoint.
+  // last_value_at is only a query anchor. Include calculation context plus
+  // up to 24 hours of selected-endpoint lag behind metadata. Source rows,
+  // not the metadata value, select the actual endpoint.
   const response = await fetch(target, {
     method: "POST",
     headers: {

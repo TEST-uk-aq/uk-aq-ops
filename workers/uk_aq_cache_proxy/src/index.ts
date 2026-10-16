@@ -2917,7 +2917,7 @@ export default {
       return makeErrorResponse(405, "method_not_allowed", requestOrigin, allowedOrigins);
     }
 
-    if (url.pathname === "/api/aq/recent-aqi-prototype") {
+    if (url.pathname === "/api/aq/recent-aqi-prototype" || url.pathname === "/api/aq/recent-hourly-prototype") {
       if (request.method !== "GET") return makeErrorResponse(405, "method_not_allowed", requestOrigin, allowedOrigins);
       if (requestOrigin === null) return makeErrorResponse(400, "origin_required", requestOrigin, allowedOrigins);
       if (!isOriginAllowed(requestOrigin, allowedOrigins)) return makeErrorResponse(403, "origin_not_allowed", requestOrigin, allowedOrigins);
@@ -2938,7 +2938,9 @@ export default {
         return makeErrorResponse(403, "prototype_operator_auth_required", requestOrigin, allowedOrigins);
       }
       if (!env.STATION_HISTORY) return makeErrorResponse(503, "station_history_binding_unavailable", requestOrigin, allowedOrigins);
-      const internalUrl = new URL(`https://station-history.internal/v1/recent-aqi-prototype${url.search}`);
+      const privatePath = url.pathname === "/api/aq/recent-hourly-prototype"
+        ? "/v1/recent-hourly-prototype" : "/v1/recent-aqi-prototype";
+      const internalUrl = new URL(`https://station-history.internal${privatePath}${url.search}`);
       let internalResponse: Response;
       try {
         internalResponse = await env.STATION_HISTORY.fetch(new Request(internalUrl, { method: "GET" }));
