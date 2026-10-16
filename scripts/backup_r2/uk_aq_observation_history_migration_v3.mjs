@@ -50,6 +50,7 @@ import {
 import {
   readAndValidateRecoveryJournal,
   inspectRecoveryJournalForInterruptedAppend,
+  isAuthenticatedRecoveryJournal,
 } from "../index_v3_migration/recovery_journal_authority.mjs";
 import {
   appendExceptionalRecoveryEpoch,
@@ -660,11 +661,34 @@ function applyRecoveryUpdates(checkpoint, updates) {
   }
 }
 
-function readOnlyJournalView(journal) {
+export function readOnlyJournalView(journal) {
   const cache = new WeakMap();
   const mutation = () => { throw new Error("Authenticated read-only journal view cannot be mutated"); };
   const mutatingArrayMethods = new Set(["copyWithin", "fill", "pop", "push", "reverse", "shift", "sort", "splice", "unshift"]);
   const callbackArrayMethods = new Set(["every", "filter", "find", "findIndex", "flatMap", "forEach", "map", "reduce", "reduceRight", "some"]);
+  const frozenView = (value) => {
+    const target = Array.isArray(value) ? new Array(value.length) : Object.create(Object.getPrototypeOf(value));
+    cache.set(value, target);
+    for (const property of Reflect.ownKeys(value)) {
+      if (Array.isArray(value) && property === "length") continue;
+      const descriptor = Object.getOwnPropertyDescriptor(value, property);
+      if ("value" in descriptor) {
+        Object.defineProperty(target, property, {
+          enumerable: descriptor.enumerable,
+          configurable: false,
+          get: () => view(descriptor.value),
+        });
+      } else {
+        Object.defineProperty(target, property, {
+          enumerable: descriptor.enumerable,
+          configurable: false,
+          get: descriptor.get ? () => view(descriptor.get.call(value)) : undefined,
+          set: undefined,
+        });
+      }
+    }
+    return Object.freeze(target);
+  };
   const view = (value) => {
     if (!value || typeof value !== "object") return value;
     if (cache.has(value)) return cache.get(value);
@@ -678,6 +702,7 @@ function readOnlyJournalView(journal) {
       cache.set(value, mapView);
       return mapView;
     }
+    if (Object.isFrozen(value)) return frozenView(value);
     const proxy = new Proxy(value, {
       get(target, property) {
         const result = Reflect.get(target, property, target);
@@ -715,6 +740,25 @@ function readOnlyJournalView(journal) {
 function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false,
   allowInterruptedTail = false, onAuthenticatedReplay = null, diagnostics = false,
   readOnly = false, authenticatedJournal = null }) {
+  if (authenticatedJournal && !isAuthenticatedRecoveryJournal(authenticatedJournal)) {
+    throw new Error("Supplied recovery journal has not passed cryptographic authentication");
+  }
+  if (authenticatedJournal) {
+    const authenticatedManifest = authenticatedJournal.manifest?.payload;
+    const expectedManifest = manifest?.payload;
+    const currentHead = fs.existsSync(paths.head)
+      ? readRecoveryEnvelope(paths.head, "uk_aq_observation_history_v3_recovery_head")
+      : null;
+    if (path.resolve(authenticatedJournal.root || "") !== path.resolve(paths.root) ||
+        !authenticatedManifest || !expectedManifest ||
+        stableMigrationJson(authenticatedManifest) !== stableMigrationJson(expectedManifest) ||
+        !currentHead ||
+        stableMigrationJson(authenticatedJournal.head?.payload) !== stableMigrationJson(currentHead.payload) ||
+        authenticatedJournal.head?.payload?.last_sequence !== authenticatedJournal.last_sequence ||
+        authenticatedJournal.head?.payload?.last_entry_sha256 !== authenticatedJournal.last_entry_sha256) {
+      throw new Error("Supplied authenticated recovery journal is not bound to this recovery evidence");
+    }
+  }
   if (readOnly) {
     requireExistingRecoveryArtifact(paths.root, "Recovery state directory", "directory");
     requireExistingRecoveryArtifact(paths.manifest, "Recovery manifest", "file");

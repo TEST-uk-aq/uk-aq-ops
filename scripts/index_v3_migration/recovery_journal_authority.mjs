@@ -8,6 +8,11 @@ export const RECOVERY_MANIFEST_KIND = "uk_aq_observation_history_v3_recovery_man
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const GIT_SHA1_PATTERN = /^[0-9a-f]{40}$/;
+const AUTHENTICATED_JOURNALS = new WeakSet();
+
+export function isAuthenticatedRecoveryJournal(value) {
+  return Boolean(value && typeof value === "object" && AUTHENTICATED_JOURNALS.has(value));
+}
 
 function stableObject(value) {
   if (Array.isArray(value)) return value.map(stableObject);
@@ -341,7 +346,7 @@ function inspectJournal({
     throw new Error("Recovery head terminal entry SHA does not equal the final enumerated entry");
   }
 
-  return Object.freeze({
+  const authenticatedJournal = Object.freeze({
     root,
     manifest,
     head,
@@ -351,4 +356,6 @@ function inspectJournal({
     last_entry_sha256: lastEntrySha,
     interrupted_append: names.length === lastSequence + 1 ? entries.at(-1) : null,
   });
+  AUTHENTICATED_JOURNALS.add(authenticatedJournal);
+  return authenticatedJournal;
 }
