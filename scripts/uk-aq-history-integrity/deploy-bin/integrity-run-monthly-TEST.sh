@@ -608,6 +608,21 @@ wait_for_local_materialisation() {
   fail "local Dropbox materialisation did not authenticate within ${DROPBOX_SYNC_TIMEOUT_SECONDS}s; evidence=${attempt_report}"
 }
 
+cleanup_accepted_month() {
+  local marker="$1" label="$2" from_day="$3" to_day="$4"
+  # The helper independently checks the report, coordinator completion record,
+  # exact backup workflow/checkpoint chain and local materialisation receipts.
+  # Cleanup failure never changes an accepted month into an Integrity failure.
+  if ! "$PYTHON_BIN" "$OPS_REPO_ROOT/scripts/uk-aq-history-integrity/bin/integrity/local_cleanup.py" \
+    --accepted-month "$marker" --tmp-root "$LOCAL_INTEGRITY_ROOT/state/$INTEGRITY_ENV/tmp" \
+    --env "$INTEGRITY_ENV" --source "$SOURCE" --label "$label" \
+    --from-day "$from_day" --to-day "$to_day" >>"$SUMMARY" 2>&1; then
+    log "CLEANUP DEFERRED label=${label}; inspect cleanup receipts/errors; accepted month remains complete"
+  else
+    log "CLEANUP COMPLETE label=${label}; per-file results and bytes are recorded in the run cleanup receipt"
+  fi
+}
+
 run_batch() {
   local from_day="$1"
   local to_day="$2"
@@ -627,6 +642,7 @@ run_batch() {
   elif [ -f "$ok_marker" ]; then
     if month_state_valid "$label" "$from_day" "$to_day" "$integrity_receipt" "$dispatch_receipt" "$backup_receipt" "$sync_receipt"; then
       log "SKIP label=${label} final_month_complete=true"
+      cleanup_accepted_month "$ok_marker" "$label" "$from_day" "$to_day"
       return 0
     fi
     rm -f "$ok_marker"
@@ -753,6 +769,7 @@ run_batch() {
 
   touch "$ok_marker"
   log "MONTH COMPLETE label=${label} integrity=success caller_run_id=${caller_run_id} run_id=${run_id} url=${run_url} backup_status=${backup_status} backup_conclusion=${backup_conclusion} observation_parquet_copy_mode=${OBSERVATION_PARQUET_COPY_MODE} expected_hash=${expected_hash} local_hash=${expected_hash} final_month_complete=true"
+  cleanup_accepted_month "$ok_marker" "$label" "$from_day" "$to_day"
 }
 
 preflight
