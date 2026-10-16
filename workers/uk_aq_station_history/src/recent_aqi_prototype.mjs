@@ -296,7 +296,7 @@ export async function handleRecentAqiPrototype(request, env) {
           timeseries_id: identity.timeseriesId,
           pollutant_code: "pm25",
           timestamp_hour_utc: aqi.timestamp_hour_utc,
-          period_start_utc: new Date(parsed.endpointMs - HOUR_MS).toISOString(),
+          period_start_utc: new Date(calculated.endpointMs - HOUR_MS).toISOString(),
           period_end_utc: aqi.timestamp_hour_utc,
           daqi_index_level: aqi.daqi_index_level,
           daqi_input_value_ugm3: aqi.daqi_input_value_ugm3,
