@@ -163,10 +163,12 @@ deployment. No per-request Supabase log/metric writes are added.
 | `observations.rows` | Exactly six chronological slots, physical identity, interval, `valid`/`invalid`/`missing`, hourly mean, valid/invalid counts and all source timestamps/values in that output slot |
 | `observations.missing_hour_endpoints_utc` | Output slots without a valid mean, including invalid-only slots; never imputed |
 | `aqi` | Shared algorithm/version, source, averaging codes, per-index gaps and six rows |
-| `aqi.rows` | Interval, independent DAQI/EAQI indices, input concentrations, source/required counts, calculation statuses and missing reasons |
+| `aqi.rows` | Physical identity, interval, independent DAQI/EAQI indices, input concentrations, source/required counts, calculation statuses and missing reasons |
 | `source` | IngestDB-only authority limit, separate transport/query/canonical completeness, context bounds/gaps/counts, future exclusions, input bytes, RPC elapsed ms and request counts |
 
-Every AQI row inherits the physical request identity and `aqi.algorithm_version`.
+Every AQI row includes `connector_id`, `station_id`, `timeseries_id` and
+`pollutant_code` from the resolved authoritative identity; the algorithm version
+is provided by `aqi.algorithm_version`.
 The following excerpts illustrate fields; they are documentation examples,
 not measured TEST output or complete six-row responses:
 
@@ -189,6 +191,7 @@ An internal missing PM hour can have a valid rolling DAQI independently of EAQI:
   "timestamp_hour_utc":"2026-10-16T10:00:00.000Z",
   "period_start_utc":"2026-10-16T09:00:00.000Z",
   "period_end_utc":"2026-10-16T10:00:00.000Z",
+  "connector_id":1,"station_id":441,"timeseries_id":324,"pollutant_code":"pm25",
   "daqi_index_level":1,"daqi_input_value_ugm3":8,
   "daqi_source_observation_count":23,"daqi_required_observation_count":18,
   "daqi_calculation_status":"ok","daqi_missing_reason":null,
@@ -209,7 +212,10 @@ one timestamp contributes to that hour's mean, not extra PM rolling hours.
 mean the authorised bounded query completed within all checks. They do not
 prove that every hour has readings. Input valid/invalid counts exclude
 clock-future rows, which have their own count; context counts cover only the
-six/29 represented hours. Context missing endpoints mean no valid mean in
+six/29 represented hours. `outside_context_row_count` counts only non-future
+rows outside that context. The valid-context, invalid-context, excluded-future
+and outside-context row counts are mutually exclusive and sum to `raw_row_count`.
+Context missing endpoints mean no valid mean in
 this IngestDB read, not a verified canonical absence. `canonical_history_complete`
 and overall `response_complete` stay false, with reason `canonical_r2_not_read`.
 HTTP 200 never establishes canonical historical authority. Source mode remains

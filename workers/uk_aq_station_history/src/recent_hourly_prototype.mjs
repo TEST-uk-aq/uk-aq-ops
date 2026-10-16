@@ -158,6 +158,8 @@ function calculate(identity, request, source, contextHours) {
     });
     aqiRows.push({
       ...interval,
+      connector_id: identity.connectorId, station_id: identity.stationId,
+      timeseries_id: identity.timeseriesId, pollutant_code: identity.pollutant,
       daqi_index_level: aqi.daqi_index_level, daqi_input_value_ugm3: aqi.daqi_input_value_ugm3,
       daqi_source_observation_count: aqi.daqi_source_observation_count,
       daqi_required_observation_count: aqi.daqi_required_observation_count,
@@ -233,7 +235,7 @@ export async function handleRecentHourlyPrototype(request, env) {
         raw_row_count: source.rows.length, valid_input_row_count: result.allValidRows, invalid_input_row_count: result.allInvalidRows,
         valid_context_row_count: result.validRows, invalid_context_row_count: result.invalidRows,
         excluded_future_row_count: result.futureRows,
-        outside_context_row_count: source.rows.length - result.validRows - result.invalidRows,
+        outside_context_row_count: source.rows.length - result.validRows - result.invalidRows - result.futureRows,
         max_input_rows: 128, input_response_bytes: source.bytes, rpc_elapsed_ms: source.rpcElapsedMs,
         identity_lookup_count: 1, observation_rpc_count: 1,
       },
