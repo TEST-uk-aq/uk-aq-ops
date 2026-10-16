@@ -26,7 +26,7 @@ const HELP = `Usage:
   node scripts/index_v3_migration/index_v3_live_immutable_verify.mjs \\
     --phase pre-cutover|read-cutover \\
     --expected-repository-git-sha SHA --expected-bucket uk-aq-history-live \\
-    --plan-report PATH --checkpoint PATH
+    --plan-report PATH --checkpoint PATH [--evidence-root PATH]
 
 Pre-cutover requires selected v2; read-cutover requires selected v3. Both
 require the existing supervised global observations lock and complete, current,
@@ -47,7 +47,7 @@ function command(name, args, cwd) {
 function parse(argv) {
   const flags = new Map();
   const allowed = new Set(["--phase", "--expected-repository-git-sha",
-    "--expected-bucket", "--plan-report", "--checkpoint"]);
+    "--expected-bucket", "--plan-report", "--checkpoint", "--evidence-root"]);
   for (let i = 0; i < argv.length; i += 2) {
     const key = argv[i], value = argv[i + 1];
     if (!allowed.has(key) || flags.has(key) || !value || value.startsWith("--")) {
@@ -55,7 +55,8 @@ function parse(argv) {
     }
     flags.set(key, value);
   }
-  if (flags.size !== allowed.size) throw new Error("LIVE verifier requires all five explicit arguments");
+  const required = ["--phase", "--expected-repository-git-sha", "--expected-bucket", "--plan-report", "--checkpoint"];
+  if (required.some((name) => !flags.has(name))) throw new Error("LIVE verifier requires all five explicit arguments");
   if (!new Set(["pre-cutover", "read-cutover"]).has(flags.get("--phase"))) {
     throw new Error("LIVE verifier phase must be pre-cutover or read-cutover");
   }
@@ -130,7 +131,7 @@ export async function verifyLiveImmutableGeneration({ argv = process.argv.slice(
   assertLockHeld();
   const { plan, checkpoint, provenance } = readAuthenticatedCutoverBaseline({
     checkpointPath: args.checkpoint, planReport: report,
-    environment: "LIVE", bucket: LIVE_BUCKET,
+    environment: "LIVE", bucket: LIVE_BUCKET, evidenceRoot: args.evidenceRoot || null,
   });
   // These are intentionally independent identities. The historical writer is
   // authenticated by the immutable checkpoint/plan/recovery authority and the

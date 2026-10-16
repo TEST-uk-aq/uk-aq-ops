@@ -13,6 +13,7 @@ import {
   assertSideBySideMigrationPlan,
   buildObservationHistoryV3RerunVerificationPlan,
 } from "../backup_r2/lib/observation_history_migration_v3.mjs";
+import { readShardedMigrationPlan } from "../backup_r2/lib/observation_history_migration_plan_store.mjs";
 import {
   resolveObservationHistoryGeneration,
   assertObservationHistoryGenerationPrefixes,
@@ -25,6 +26,7 @@ import {
   EXCEPTIONAL_LIVE_RECOVERY,
   authenticateExceptionalRecovery,
 } from "./exceptional_recovery_authority.mjs";
+import { createEvidenceRelocation } from "./evidence_relocation.mjs";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const sha256 = (body) => crypto.createHash("sha256").update(body).digest("hex");
@@ -37,6 +39,7 @@ const sha256 = (body) => crypto.createHash("sha256").update(body).digest("hex");
 export const VERIFY_CURRENT_TRUSTED_DEPENDENCIES = Object.freeze([
   "scripts/index_v3_migration/index_v3_live_immutable_verify.mjs",
   "scripts/index_v3_migration/index_v3_cutover_generation_evidence.mjs",
+  "scripts/index_v3_migration/evidence_relocation.mjs",
   "scripts/index_v3_migration/recovery_journal_authority.mjs",
   "scripts/index_v3_migration/exceptional_recovery_authority.mjs",
   "scripts/index_v3_migration/operator_execution.mjs",
@@ -169,9 +172,32 @@ export function selectedCutoverGeneration(env) {
   return generation;
 }
 
-export function readAuthenticatedCutoverBaseline({ checkpointPath, planReport, environment, bucket }) {
+function readCutoverCheckpoint({ checkpointPath, evidenceRoot }) {
   const bytes = fs.readFileSync(checkpointPath);
   const original = JSON.parse(bytes.toString("utf8"));
+  if (original.authority_format !== "uk_aq_migration_plan_shards_v1") return { checkpoint: original, bytes };
+  const manifestPath = `${path.resolve(checkpointPath)}.recovery/manifest.json`;
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  const historicalCheckpointPath = manifest?.payload?.original_checkpoint?.path;
+  const relocation = createEvidenceRelocation({
+    historicalCheckpointPath,
+    localCheckpointPath: checkpointPath,
+    evidenceRoot,
+  });
+  const localReference = {
+    ...original.authority_ref,
+    master_path: relocation.mapHistoricalPath(original.authority_ref.master_path, "Sharded migration plan master"),
+  };
+  const { plan } = readShardedMigrationPlan(localReference);
+  if (original.authority_ref.full_plan_sha256 !== original.authority_sha256 ||
+      original.plan_sha256 !== plan.plan_sha256 || original.migration_run_id !== plan.migration_run_id) {
+    throw new Error("Migration checkpoint contradicts its relocated sharded immutable authority");
+  }
+  return { checkpoint: { ...original, authority: plan }, bytes };
+}
+
+export function readAuthenticatedCutoverBaseline({ checkpointPath, planReport, environment, bucket, evidenceRoot = null }) {
+  const { checkpoint: original, bytes } = readCutoverCheckpoint({ checkpointPath, evidenceRoot });
   let exceptionalRecovery = null;
   const recovery = buildObservationHistoryV3RecoveryProgressContext({
     checkpointPath, checkpoint: original, repositoryRoot,
@@ -180,10 +206,13 @@ export function readAuthenticatedCutoverBaseline({ checkpointPath, planReport, e
     // The immutable recovery manifest remains historical authority and must not
     // be repinned to the current verifier checkout.
     requireCurrentImplementation: false,
+    readOnly: true,
+    evidenceRoot,
     onAuthenticatedReplay: ({ journal }) => {
       if (original.migration_run_id === EXCEPTIONAL_LIVE_RECOVERY.run_id) {
         exceptionalRecovery = authenticateExceptionalRecovery({
           checkpointPath, repositoryRoot, authenticatedJournal: journal,
+          authenticatedCheckpoint: original, authenticatedCheckpointBytes: bytes, evidenceRoot,
         });
       }
     },
@@ -220,6 +249,12 @@ export function readAuthenticatedCutoverBaseline({ checkpointPath, planReport, e
       target_writer_git_sha: plan.target_writer_git_sha,
       recovery_reconciliation_mode: plan.recovery_reconciliation.mode,
       verifier_trust: verifierTrust,
+      evidence_relocation: recovery.evidenceRelocation ? {
+        historical_checkpoint_path: recovery.evidenceRelocation.historical_checkpoint_path,
+        local_checkpoint_path: recovery.evidenceRelocation.local_checkpoint_path,
+        evidence_root: recovery.evidenceRelocation.evidence_root,
+        relocated: recovery.evidenceRelocation.relocated,
+      } : null,
       ...(exceptionalRecovery ? { exceptional_recovery: {
         kind: "authenticated_exceptional_recovery_epoch_ledger",
         original_writer_git_sha: exceptionalRecovery.originalImplementation.repository_head,

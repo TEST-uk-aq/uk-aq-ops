@@ -987,8 +987,8 @@ function requireAuthenticatedCompletedPlanIdentity(completed, expected, label) {
   return identity;
 }
 
-async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, accepted, requiredUnchangedDay, environment, bucket }) {
-  const baseline = readAuthenticatedCutoverBaseline({ checkpointPath, planReport, environment, bucket });
+async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, evidenceRoot, accepted, requiredUnchangedDay, environment, bucket }) {
+  const baseline = readAuthenticatedCutoverBaseline({ checkpointPath, planReport, environment, bucket, evidenceRoot });
   const baselinePlan = baseline.plan;
   const journal = { completed_objects: baseline.completedObjects };
   const provenance = validateSteadyStateBaselineProvenance(baseline.provenance);
@@ -1236,6 +1236,7 @@ export async function executeSteadyStatePostWriteVerifier(options, adaptersInput
     getObject: adapters.getObject,
     planReport,
     checkpointPath: options.checkpoint,
+    evidenceRoot: options.evidenceRoot || null,
     recoveryRoot: `${options.checkpoint}.recovery`,
     accepted,
     requiredUnchangedDay: options.requiredUnchangedDay,

@@ -245,7 +245,7 @@ async function runExceptionalRecoveryPreflight({ argv, approvalFile, repositoryR
     const recoveryState = buildObservationHistoryV3RecoveryProgressContext({
       checkpointPath, checkpoint: auth.checkpoint, repositoryRoot,
       create: false, repairHead: false, allowInterruptedTail: true, requireCurrentImplementation: false,
-      readOnly: true,
+      readOnly: true, authenticatedJournal: auth.journal,
     });
     const authenticatedSequence = auth.journal.interrupted_append?.sequence ?? auth.journal.last_sequence;
     const authenticatedEntrySha = auth.journal.interrupted_append?.payload_sha256 ?? auth.journal.last_entry_sha256;

@@ -29,6 +29,8 @@ export function recoverySha256(value) {
 
 function readJson(filePath, label) {
   try {
+    const stat = fs.lstatSync(filePath);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`${label} is not a regular file`);
     return JSON.parse(fs.readFileSync(filePath, "utf8"));
   } catch (error) {
     throw new Error(`${label} is unreadable or invalid JSON: ${filePath}`, { cause: error });
@@ -249,6 +251,11 @@ function inspectJournal({
   const names = fs.readdirSync(entriesRoot).sort();
   for (const name of names) {
     if (!/^\d{10}\.json$/.test(name)) throw new Error(`Unexpected recovery entry filename: ${name}`);
+    const entryPath = path.join(entriesRoot, name);
+    const entryStat = fs.lstatSync(entryPath);
+    if (!entryStat.isFile() || entryStat.isSymbolicLink()) {
+      throw new Error(`Recovery entry is not a regular file: ${name}`);
+    }
   }
   if (names.length !== lastSequence && !(permitSingleTail && names.length === lastSequence + 1)) {
     throw new Error("Recovery entry count does not exactly match the claimed head sequence");

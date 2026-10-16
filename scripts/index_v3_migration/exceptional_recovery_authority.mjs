@@ -4,6 +4,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { inspectRecoveryJournalForInterruptedAppend } from "./recovery_journal_authority.mjs";
 import { readShardedMigrationPlan, sha256StableMigrationJson } from "../backup_r2/lib/observation_history_migration_plan_store.mjs";
+import { createEvidenceRelocation } from "./evidence_relocation.mjs";
 
 export const EXCEPTIONAL_LIVE_RECOVERY = Object.freeze({
   run_id: "live-v3-20261015T114250Z-e84f52a",
@@ -299,26 +300,17 @@ function readEpochLedger({ checkpointPath, journal, checkpointSha256, repository
     last_epoch_sha256: previousSha, next_sequence: entries.length + 1, previous_epoch_sha256: previousSha });
 }
 
-export function authenticateExceptionalRecovery({ checkpointPath, repositoryRoot, authenticatedJournal = null }) {
+export function authenticateExceptionalRecovery({ checkpointPath, repositoryRoot, authenticatedJournal = null,
+  authenticatedCheckpoint = null, authenticatedCheckpointBytes = null, evidenceRoot = null }) {
   const absoluteCheckpoint = path.resolve(checkpointPath);
-  const checkpointBytes = fs.readFileSync(absoluteCheckpoint);
+  const checkpointBytes = authenticatedCheckpointBytes || fs.readFileSync(absoluteCheckpoint);
   const checkpointSha256 = sha256(checkpointBytes);
-  const checkpoint = JSON.parse(checkpointBytes.toString("utf8"));
+  const checkpoint = authenticatedCheckpoint || JSON.parse(checkpointBytes.toString("utf8"));
   if (checkpoint.progress_format !== "authenticated-journal-v1" ||
       checkpoint.migration_run_id !== EXCEPTIONAL_LIVE_RECOVERY.run_id ||
       checkpoint.plan_sha256 !== EXCEPTIONAL_LIVE_RECOVERY.plan_sha256 ||
       checkpoint.authority_sha256 !== EXCEPTIONAL_LIVE_RECOVERY.authority_sha256) {
     throw new Error("Exceptional recovery immutable checkpoint identity differs from the authorised run");
-  }
-  if (checkpoint.authority_format === "uk_aq_migration_plan_shards_v1") {
-    const { plan } = readShardedMigrationPlan(checkpoint.authority_ref);
-    if (checkpoint.authority_ref.full_plan_sha256 !== EXCEPTIONAL_LIVE_RECOVERY.authority_sha256 ||
-        plan.plan_sha256 !== EXCEPTIONAL_LIVE_RECOVERY.plan_sha256 || plan.migration_run_id !== EXCEPTIONAL_LIVE_RECOVERY.run_id) {
-      throw new Error("Exceptional recovery immutable sharded plan identity differs from the authorised run");
-    }
-    checkpoint.authority = plan;
-  } else if (!checkpoint.authority || sha256StableMigrationJson(checkpoint.authority) !== EXCEPTIONAL_LIVE_RECOVERY.authority_sha256) {
-    throw new Error("Exceptional recovery immutable inline plan identity differs from the authorised run");
   }
   const journal = authenticatedJournal || inspectRecoveryJournalForInterruptedAppend({
     recoveryRoot: `${absoluteCheckpoint}.recovery`,
@@ -340,8 +332,30 @@ export function authenticateExceptionalRecovery({ checkpointPath, repositoryRoot
       journal.manifest.payload.target_writer_git_sha !== EXCEPTIONAL_LIVE_RECOVERY.original_commit) {
     throw new Error("Authenticated exceptional recovery manifest does not preserve the original migration identities");
   }
+  const relocation = createEvidenceRelocation({
+    historicalCheckpointPath: journal.manifest.payload.original_checkpoint.path,
+    localCheckpointPath: absoluteCheckpoint,
+    evidenceRoot,
+  });
+  if (checkpoint.authority_format === "uk_aq_migration_plan_shards_v1") {
+    if (!checkpoint.authority) {
+      const localReference = {
+        ...checkpoint.authority_ref,
+        master_path: relocation.mapHistoricalPath(checkpoint.authority_ref.master_path, "Exceptional recovery sharded plan master"),
+      };
+      const { plan } = readShardedMigrationPlan(localReference);
+      checkpoint.authority = plan;
+    }
+    if (checkpoint.authority_ref.full_plan_sha256 !== EXCEPTIONAL_LIVE_RECOVERY.authority_sha256 ||
+        checkpoint.authority.plan_sha256 !== EXCEPTIONAL_LIVE_RECOVERY.plan_sha256 ||
+        checkpoint.authority.migration_run_id !== EXCEPTIONAL_LIVE_RECOVERY.run_id) {
+      throw new Error("Exceptional recovery immutable sharded plan identity differs from the authorised run");
+    }
+  } else if (!checkpoint.authority || sha256StableMigrationJson(checkpoint.authority) !== EXCEPTIONAL_LIVE_RECOVERY.authority_sha256) {
+    throw new Error("Exceptional recovery immutable inline plan identity differs from the authorised run");
+  }
   const originalImplementation = verifyOriginalRecoveryImplementation({ manifest: journal.manifest, repositoryRoot });
-  if (journal.manifest.payload.original_checkpoint.path !== absoluteCheckpoint) {
+  if (journal.manifest.payload.original_checkpoint.path !== relocation.historical_checkpoint_path) {
     throw new Error("Exceptional recovery checkpoint path differs from the authenticated original path");
   }
   if (journal.last_sequence < EXCEPTIONAL_LIVE_RECOVERY.journal_sequence ||

@@ -4,6 +4,7 @@ import { persistShardedMigrationPlan, readShardedMigrationPlan, sha256StableMigr
 import { r2GetMigrationObjectBounded } from './lib/observation_history_migration_bounded_r2.mjs';
 import { exactPublicationEvidence, settledMigrationBatches, migrationFailure, migrationFailureEvidence } from './lib/observation_history_migration_concurrency.mjs';
 import { runOperatorCommand, createOperatorProgress, withOperatorPhase, superviseOperatorInvocation, finishOperatorProgress } from "../index_v3_migration/operator_execution.mjs";
+import { createEvidenceRelocation } from "../index_v3_migration/evidence_relocation.mjs";
 
 import fs from "node:fs";
 import crypto from "node:crypto";
@@ -548,11 +549,15 @@ function recoveryManifestPayload({
   checkpoint,
   repositoryRoot,
   recoveryImplementation = null,
+  historicalCheckpointPath = null,
 }) {
   buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint, validateOnly: true });
   const plan = checkpoint.authority;
   return Object.freeze({
-    original_checkpoint: checkpointFileIdentity(checkpointPath),
+    original_checkpoint: {
+      ...checkpointFileIdentity(checkpointPath),
+      ...(historicalCheckpointPath ? { path: historicalCheckpointPath } : {}),
+    },
     immutable_authority_sha256: checkpoint.authority_sha256,
     migration_run_id: plan.migration_run_id,
     transition: plan.transition,
@@ -655,9 +660,61 @@ function applyRecoveryUpdates(checkpoint, updates) {
   }
 }
 
+function readOnlyJournalView(journal) {
+  const cache = new WeakMap();
+  const mutation = () => { throw new Error("Authenticated read-only journal view cannot be mutated"); };
+  const mutatingArrayMethods = new Set(["copyWithin", "fill", "pop", "push", "reverse", "shift", "sort", "splice", "unshift"]);
+  const callbackArrayMethods = new Set(["every", "filter", "find", "findIndex", "flatMap", "forEach", "map", "reduce", "reduceRight", "some"]);
+  const view = (value) => {
+    if (!value || typeof value !== "object") return value;
+    if (cache.has(value)) return cache.get(value);
+    if (value instanceof Map) {
+      const mapView = Object.freeze({
+        get: (key) => view(value.get(key)),
+        has: (key) => value.has(key),
+        values: function* values() { for (const item of value.values()) yield view(item); },
+        [Symbol.iterator]: function* iterator() { for (const item of value) yield [view(item[0]), view(item[1])]; },
+      });
+      cache.set(value, mapView);
+      return mapView;
+    }
+    const proxy = new Proxy(value, {
+      get(target, property) {
+        const result = Reflect.get(target, property, target);
+        if (typeof result !== "function") return view(result);
+        if (Array.isArray(target) && mutatingArrayMethods.has(property)) return mutation;
+        return (...args) => {
+          const callArgs = [...args];
+          if (Array.isArray(target) && callbackArrayMethods.has(property) && typeof callArgs[0] === "function") {
+            const callback = callArgs[0];
+            const callbackIndex = property === "reduce" || property === "reduceRight" ? 2 : 1;
+            callArgs[0] = (...callbackArgs) => callback(...callbackArgs.map((item, index) =>
+              index === callbackIndex && typeof item === "number" ? item : view(item)));
+          }
+          return view(Reflect.apply(result, target, callArgs));
+        };
+      },
+      set: mutation,
+      defineProperty: mutation,
+      deleteProperty: mutation,
+    });
+    cache.set(value, proxy);
+    return proxy;
+  };
+  return Object.freeze({
+    manifest: view(journal.manifest),
+    head: view(journal.head),
+    entries: view(journal.entries),
+    completed_objects: view(journal.completed_objects),
+    last_sequence: journal.last_sequence,
+    last_entry_sha256: journal.last_entry_sha256,
+    interrupted_append: view(journal.interrupted_append),
+  });
+}
+
 function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false,
   allowInterruptedTail = false, onAuthenticatedReplay = null, diagnostics = false,
-  readOnly = false }) {
+  readOnly = false, authenticatedJournal = null }) {
   if (readOnly) {
     requireExistingRecoveryArtifact(paths.root, "Recovery state directory", "directory");
     requireExistingRecoveryArtifact(paths.manifest, "Recovery manifest", "file");
@@ -695,9 +752,9 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
     expectedTargetWriterGitSha: manifest.payload.target_writer_git_sha,
     allowEmpty: true,
   };
-  const replay = repairHead || allowInterruptedTail
+  const replay = authenticatedJournal || (repairHead || allowInterruptedTail
     ? inspectRecoveryJournalForInterruptedAppend(journalOptions)
-    : readAndValidateRecoveryJournal(journalOptions);
+    : readAndValidateRecoveryJournal(journalOptions));
   authenticationProgress.finish();
   if (diagnostics) process.stderr.write(`V3 recovery: authentication complete entries=${replay.entries.length} elapsed_ms=${Date.now() - authenticationStartedAt}\n`);
   const replayProgress = createMigrationProgressReporter({
@@ -737,7 +794,8 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
       try { fs.fsyncSync(entriesFd); } finally { fs.closeSync(entriesFd); }
     }
     if (onAuthenticatedReplay) onAuthenticatedReplay({ sequence: replay.interrupted_append.sequence,
-      entry_sha256: replay.interrupted_append.payload_sha256, interrupted_append: true, journal: replay });
+      entry_sha256: replay.interrupted_append.payload_sha256, interrupted_append: true,
+      journal: readOnly ? readOnlyJournalView(replay) : replay });
     if (repairHead) {
       const tail = replay.interrupted_append;
       atomicWriteJson(paths.head, recoveryEnvelope('uk_aq_observation_history_v3_recovery_head', {
@@ -749,7 +807,8 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
   } else if (onAuthenticatedReplay) {
     buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint, validateOnly: true });
     onAuthenticatedReplay({ sequence: replay.last_sequence,
-      entry_sha256: replay.last_entry_sha256, interrupted_append: false, journal: replay });
+      entry_sha256: replay.last_entry_sha256, interrupted_append: false,
+      journal: readOnly ? readOnlyJournalView(replay) : replay });
   }
   if (diagnostics) process.stderr.write(`V3 recovery: replay complete entries=${replay.entries.length} elapsed_ms=${Date.now() - authenticationStartedAt}\n`);
   return {
@@ -818,11 +877,13 @@ export function buildObservationHistoryV3RecoveryProgressContext({
   onAuthenticatedReplay = null,
   diagnostics = false,
   readOnly = false,
+  evidenceRoot = null,
+  authenticatedJournal = null,
 }) {
   if (diagnostics) process.stderr.write("V3 recovery: authenticating original checkpoint and recovery manifest\n");
   const paths = recoveryProgressPaths(checkpointPath);
   if (readOnly) {
-    if (create || repairHead || onAuthenticatedReplay) {
+    if (create || repairHead) {
       throw new Error("Read-only recovery inspection cannot create, repair or append recovery state");
     }
     requireExistingRecoveryArtifact(path.resolve(checkpointPath), "Migration checkpoint", "file");
@@ -845,6 +906,13 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     paths.manifest,
     "uk_aq_observation_history_v3_recovery_manifest",
   );
+  const evidenceRelocation = readOnly
+    ? createEvidenceRelocation({
+      historicalCheckpointPath: manifest.payload.original_checkpoint.path,
+      localCheckpointPath: checkpointPath,
+      evidenceRoot,
+    })
+    : null;
   if (exceptionalRecoveryAuthorization &&
       (!isExceptionalRecoveryAuthorization(exceptionalRecoveryAuthorization) ||
        exceptionalRecoveryAuthorization.checkpoint_path !== path.resolve(checkpointPath) ||
@@ -863,6 +931,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     checkpointPath,
     checkpoint,
     repositoryRoot,
+    historicalCheckpointPath: evidenceRelocation?.historical_checkpoint_path || null,
     // The original manifest stays immutable. Only the branded exact-run
     // exceptional authority permits replay under its separately approved
     // current implementation; ordinary recovery keeps the exact-head gate.
@@ -897,6 +966,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     onAuthenticatedReplay,
     diagnostics,
     readOnly,
+    authenticatedJournal,
   });
   const authenticatedJournalFrontier = exceptionalRecoveryAuthorization
     ? getExceptionalRecoveryJournalFrontier(exceptionalRecoveryAuthorization.auth.journal) : null;
@@ -929,6 +999,7 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     preparationOrder: [...(recoveredCheckpoint.preparation_order || [])],
     fullVerificationComplete: recoveredCheckpoint.full_verification_complete === true,
     cutoverReady: recoveredCheckpoint.cutover_ready === true,
+    evidenceRelocation,
     authenticatedRecoveryAuthority: Object.freeze({
       authenticated: true,
       original_checkpoint_sha256: manifest.payload.original_checkpoint.sha256,
@@ -949,6 +1020,14 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     }),
   };
   context.cleanStart = recoveredCheckpoint.clean_target_admission || null;
+  if (readOnly) {
+    const rejectMutation = () => { throw new Error("Read-only recovery context cannot persist or append evidence"); };
+    context.persistCheckpointDelta = rejectMutation;
+    context.persistCheckpoint = rejectMutation;
+    context.recordPublicationEvidenceBatch = rejectMutation;
+    context.recordPublicationEvidence = rejectMutation;
+    return context;
+  }
   // Active side-by-side writers name only the changed records. This path never
   // scans/serializes/clones all previous completions on each progress update.
   context.persistCheckpointDelta = async (current, { preparedUnitIds = [], completedKeys = [], finalState = false, cleanStart = false }) => {
@@ -2925,6 +3004,7 @@ export async function runObservationHistoryMigrationV3({
       checkpoint,
       repositoryRoot,
       requireCurrentImplementation: args.mode !== "verify",
+      readOnly: args.mode === "verify",
     });
     checkpoint = recoveryProgress.checkpoint;
   }
