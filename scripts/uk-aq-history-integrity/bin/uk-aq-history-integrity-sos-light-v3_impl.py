@@ -79,6 +79,14 @@ from integrity.current_state.audit import (
     start_target_attempt,
 )
 from integrity.runtime import CANONICAL_REPAIR_STAGE_ORDER
+from integrity.local_cleanup import (
+    POLICY as LOCAL_CLEANUP_POLICY,
+    persist_cleanup_state,
+    record_cleanup_failure,
+    remove_duplicates as remove_authenticated_generated_duplicates,
+    retire_working_files,
+    staging_candidates as local_cleanup_staging_candidates,
+)
 from integrity.timeseries_binding_provider import (
     PackedBindingError,
     binding_backup_view,
@@ -16424,6 +16432,10 @@ def _prepare_official_rdata_proposal(
     result = json.loads(process.stdout)
     if not isinstance(result, dict) or result.get("status") != "ok":
         raise RuntimeError(f"{source_key} RData proposal helper returned invalid JSON")
+    # subprocess.run has waited for the only input-file consumer. Preserve all
+    # input evidence byte for byte before retiring this redundant working copy.
+    retire_working_files(run_state, [input_path])
+    persist_cleanup_state(run_state, write_run_state)
     result.update({
         "exit_code": 0,
         "backfill_run_status": "ok",
@@ -20652,6 +20664,30 @@ def run_v2_observation_content_hash_checks(
     return metrics
 
 
+def _cleanup_observation_working_files(
+    run_state: dict[str, Any], *, day_utc: str, connector_id: int,
+) -> None:
+    """Workers returned and agreement/guard handling finished for this scope.
+
+    Applies equally to dry-runs and handled failures: exact compressed evidence
+    survives, including rejected input. Unexpected interruptions keep originals.
+    Completed SOS acquisition roots remain immutable under their contract.
+    """
+    overlay = Path(str(run_state["overlay_root"]))
+    detector = overlay / "detector-source-evidence"
+    directory = detector / f"day_utc={day_utc}" / f"connector_id={connector_id}"
+    paths = [directory / name for name in (
+        "source-evidence.json", "obs_history_rows.json", "preserved_baseline_rows.json",
+    ) if (directory / name).is_file()]
+    for root in (overlay, detector):
+        for source in ("waqn", "saqn"):
+            path = root / "official-rdata-input" / f"{source}-{day_utc}-connector-{connector_id}.json"
+            if path.is_file():
+                paths.append(path)
+    retire_working_files(run_state, paths)
+    persist_cleanup_state(run_state, write_run_state)
+
+
 def run_v2_gap_backfills(
     *,
     conn: sqlite3.Connection,
@@ -21465,6 +21501,9 @@ def run_v2_gap_backfills(
                 partition_pollutant,
                 "all_groups_excluded_no_authoritative_binding",
             )
+            _cleanup_observation_working_files(
+                run_state, day_utc=day_iso, connector_id=connector_id,
+            )
             continue
         for gap in gaps_by_key.get((day_iso, connector_id), []):
             _set_v2_source_repair_plan(
@@ -22008,6 +22047,10 @@ def run_v2_gap_backfills(
                 ),
                 "tombstone_created": False,
             })
+        if run_state is not None:
+            _cleanup_observation_working_files(
+                run_state, day_utc=day_iso, connector_id=connector_id,
+            )
     return metrics
 
 def fmt_iso(t: dt.datetime) -> str:
@@ -25657,6 +25700,12 @@ def _capture_local_v2_observation_scope(
         {entry["prefix"]: entry for entry in prefix_tombstones}.values(),
         key=lambda entry: str(entry["prefix"]),
     )
+    # No worker reads generated-objects: capture is its final consumer. The
+    # planner, APPLY and final verifier use the authenticated canonical copy.
+    # Limit removal to the exact keys just captured and validated; unmatched
+    # detector serialisations and unregistered generated files remain.
+    remove_authenticated_generated_duplicates(run_state, captured)
+    remove_authenticated_generated_duplicates(run_state, captured, detector=True)
     write_run_state(run_state)
     return captured
 
@@ -26967,19 +27016,33 @@ def run_v2_final_verification(
     }
 
 
-def cleanup_successful_repair_overlay(run_state: dict[str, Any]) -> dict[str, Any]:
-    """Deterministically remove duplicate generated bodies only after reporting."""
-    generated_root = Path(str(run_state["overlay_root"])) / "generated-objects"
-    verification_view = Path(str(run_state["run_root"])) / "final-verification-view"
-    shutil.rmtree(generated_root, ignore_errors=True)
-    shutil.rmtree(verification_view, ignore_errors=True)
-    run_state["cleanup"] = {
-        "policy": "successful repair removes generated-object duplicates and the verification view after reports; failed overlays are retained",
-        "completed_at_utc": fmt_iso(utc_now()),
-        "generated_objects_removed": True,
-        "verification_view_removed": True,
+def cleanup_successful_repair_overlay(
+    run_state: dict[str, Any], *, summary: Mapping[str, Any], report_json: Path,
+) -> dict[str, Any]:
+    """Retry authenticated duplicates and defer final bodies to monthly acceptance.
+
+    The former ignore_errors directory removal both hid failures and discarded
+    unknown files. Never infer deletion eligibility from directory/status alone.
+    """
+    keys = list(run_state["objects"])
+    remove_authenticated_generated_duplicates(run_state, keys)
+    remove_authenticated_generated_duplicates(run_state, keys, detector=True)
+    cleanup = run_state.setdefault("cleanup", {"policy": LOCAL_CLEANUP_POLICY})
+    cleanup["completion"] = {
+        "recorded_at_utc": fmt_iso(utc_now()),
+        "report_json": str(Path(report_json).absolute()),
+        "run_id": summary["run_id"],
+        "environment": summary["env"],
+        "source": summary["source"],
+        "from_day": summary["from_day"],
+        "to_day": summary["to_day"],
+        "state_fingerprint_sha256": (run_state.get("proposal_transition_validation") or {}).get(
+            "state_fingerprint_sha256"
+        ),
+        "staging": local_cleanup_staging_candidates(run_state),
+        "disposal_gate": "exact_month_backup_local_materialisation_and_acceptance",
     }
-    write_run_state(run_state)
+    persist_cleanup_state(run_state, write_run_state)
     return dict(run_state["cleanup"])
 
 
@@ -34063,12 +34126,30 @@ def write_reports(
     report_dir: str,
     run_compact: str,
     summary: dict[str, Any],
+    *, atomic_refresh: bool = False,
 ) -> tuple[Path, Path]:
     Path(report_dir).mkdir(parents=True, exist_ok=True)
     json_path = Path(report_dir) / f"{run_compact}-summary.json"
     md_path = Path(report_dir) / f"{run_compact}-summary.md"
-    json_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
-    md_path.write_text(format_summary_md(summary))
+    if atomic_refresh:
+        # Keep the already-completed JSON report intact if optional cleanup
+        # rendering/writing fails. Prepare both files, publish JSON last.
+        pending = []
+        for target, body in (
+            (md_path, format_summary_md(summary)),
+            (json_path, json.dumps(summary, indent=2, sort_keys=True)),
+        ):
+            temporary = target.with_name(f"{target.name}.cleanup-{os.getpid()}.tmp")
+            with temporary.open("x", encoding="utf-8") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            pending.append((temporary, target))
+        for temporary, target in pending:
+            temporary.replace(target)
+    else:
+        json_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
+        md_path.write_text(format_summary_md(summary))
     return json_path, md_path
 
 
@@ -35836,24 +35917,34 @@ def main(argv: list[str]) -> int:
             except sqlite3.Error:
                 pass
 
+        if repair_overlay is not None:
+            summary["repair_overlay_cleanup"] = dict(repair_overlay.get("cleanup") or {})
         json_path, md_path = write_reports(
             env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary
         )
         log.info("report_json=%s", json_path)
         log.info("report_md=%s", md_path)
         if repair_overlay is not None and status == "ok" and not args.dry_run:
-            cleanup = cleanup_successful_repair_overlay(repair_overlay)
-            summary["repair_overlay_cleanup"] = cleanup
-            json_path, md_path = write_reports(
-                env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary
-            )
-            log.info(
-                "reports refreshed after final complete-state cleanup write "
-                "report_json=%s report_md=%s",
-                json_path,
-                md_path,
-            )
-            log.info("successful repair overlay cleanup=%s", json.dumps(cleanup, sort_keys=True))
+            try:
+                cleanup = cleanup_successful_repair_overlay(
+                    repair_overlay, summary=summary, report_json=Path(json_path),
+                )
+                summary["repair_overlay_cleanup"] = cleanup
+                json_path, md_path = write_reports(
+                    env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary,
+                    atomic_refresh=True,
+                )
+                log.info(
+                    "reports refreshed after cleanup checkpoint report_json=%s report_md=%s",
+                    json_path, md_path,
+                )
+                log.info("successful repair overlay cleanup=%s", json.dumps(cleanup, sort_keys=True))
+            except Exception as exc:
+                # Required repair/report completion already succeeded. Optional
+                # cleanup or its report refresh cannot reverse that result.
+                record_cleanup_failure(repair_overlay, json_path, exc)
+                summary["repair_overlay_cleanup"] = dict(repair_overlay.get("cleanup") or {})
+                log.warning("repair remains successful; cleanup/report refresh failed: %s", exc)
         log.info("done status=%s runtime_seconds=%s", status, runtime_seconds)
         if daily_task_health_enabled:
             finish_summary = {
