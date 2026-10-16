@@ -95,7 +95,7 @@ function readEnvelope(filePath, expectedKind, label) {
   return envelope;
 }
 
-function validateManifestPayload(payload) {
+export function validateManifestPayload(payload) {
   requireExactKeys(payload, [
     "original_checkpoint",
     "immutable_authority_sha256",

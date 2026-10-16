@@ -37,6 +37,14 @@ const sha256 = (body) => crypto.createHash("sha256").update(body).digest("hex");
 // output authority: these files may evolve after the migration when the
 // current reviewed verifier remains authenticated.
 export const VERIFY_CURRENT_TRUSTED_DEPENDENCIES = Object.freeze([
+  "scripts/index_v3_migration/index_v3_bounded_immutable_verify.mjs",
+  "scripts/index_v3_migration/bounded_verify_store.mjs",
+  "scripts/index_v3_migration/bounded_verify_journal.mjs",
+  "scripts/index_v3_migration/bounded_verify_baseline.mjs",
+  "scripts/index_v3_migration/bounded_verify_r2.mjs",
+  "scripts/backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs",
+  "scripts/operations/lib/uk_aq_sos_light_v2_lock_recovery.mjs",
+  "scripts/operations/uk_aq_observations_global_operation_child_supervisor.mjs",
   "scripts/index_v3_migration/index_v3_live_immutable_verify.mjs",
   "scripts/index_v3_migration/index_v3_cutover_generation_evidence.mjs",
   "scripts/index_v3_migration/evidence_relocation.mjs",
@@ -126,7 +134,11 @@ export function authenticateCutoverVerifierDependencies({
   if (!/^[0-9a-f]{40}$/.test(String(historicalWriterGitSha || ""))) {
     throw new Error("Historical migration writer Git SHA is missing or malformed");
   }
-  for (const relativePath of VERIFY_CURRENT_TRUSTED_DEPENDENCIES) {
+  // Authenticate the actual current relative-import closure. In particular,
+  // TEST-only schema-4 imports do not become unconditional LIVE dependencies.
+  // Worker/supervisor URL entrypoints remain explicit roots above.
+  const trustedPaths = new Set(VERIFY_CURRENT_TRUSTED_DEPENDENCIES);
+  for (const relativePath of trustedPaths) {
     const localPath = requireTrackedRegularFile(root, relativePath);
     const currentHead = gitOutput(root, ["show", `HEAD:${relativePath}`]);
     if (!fs.readFileSync(localPath).equals(currentHead)) {
@@ -135,6 +147,19 @@ export function authenticateCutoverVerifierDependencies({
     if (gitOutput(root, ["diff", "--exit-code", "HEAD", "--", relativePath]).length ||
         gitOutput(root, ["diff", "--cached", "--exit-code", "HEAD", "--", relativePath]).length) {
       throw new Error(`Current verifier dependency has uncommitted drift: ${relativePath}`);
+    }
+    if (/\.[cm]?js$/.test(relativePath)) {
+      const source = currentHead.toString("utf8");
+      // All local imports in this reviewed .mjs closure are literal specifiers.
+      // Cover static imports, re-exports, side-effect imports and import().
+      const imports = /(?:\bfrom\s*|\bimport\s*\(?\s*)["'](\.[^"']+)["']/g;
+      for (const match of source.matchAll(imports)) {
+        const dependency = path.posix.normalize(path.posix.join(path.posix.dirname(relativePath), match[1]));
+        if (dependency.startsWith("../") || dependency.startsWith("archive/") || path.posix.isAbsolute(dependency)) {
+          throw new Error(`Unsafe current verifier import: ${relativePath} -> ${match[1]}`);
+        }
+        trustedPaths.add(dependency);
+      }
     }
   }
   for (const relativePath of VERIFY_HISTORICALLY_PINNED_SEMANTIC_DEPENDENCIES) {
@@ -145,7 +170,7 @@ export function authenticateCutoverVerifierDependencies({
     }
   }
   return Object.freeze({
-    current_trusted_dependencies: VERIFY_CURRENT_TRUSTED_DEPENDENCIES,
+    current_trusted_dependencies: Object.freeze([...trustedPaths].sort()),
     historically_pinned_semantic_dependencies: VERIFY_HISTORICALLY_PINNED_SEMANTIC_DEPENDENCIES,
     historical_writer_git_sha: historicalWriterGitSha,
   });

@@ -598,7 +598,7 @@ export function validateObservationHistoryExactLeafScopedManifestArtifactV3({
   return Object.freeze({ artifact: value });
 }
 
-function scopedRootDescriptor(scopedManifest) {
+export function scopedRootDescriptor(scopedManifest) {
   const payload = scopedManifest.payload;
   return Object.freeze({
     day_utc: payload.day_utc,
@@ -691,7 +691,7 @@ function rootsFromHierarchies(scopedHierarchies) {
   );
 }
 
-function latestArtifactFromRoots(roots, indexRoot, latestKey) {
+export function latestArtifactFromRoots(roots, indexRoot, latestKey) {
   return artifact({
     kind: "observation_history_index_v3_latest_global",
     key: latestKey,

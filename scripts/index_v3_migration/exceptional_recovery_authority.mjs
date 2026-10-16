@@ -5,6 +5,8 @@ import { execFileSync } from "node:child_process";
 import { inspectRecoveryJournalForInterruptedAppend } from "./recovery_journal_authority.mjs";
 import { readShardedMigrationPlan, sha256StableMigrationJson } from "../backup_r2/lib/observation_history_migration_plan_store.mjs";
 import { createEvidenceRelocation } from "./evidence_relocation.mjs";
+import { isAuthenticatedDiskJournal } from "./bounded_verify_journal.mjs";
+import { directoryEntries } from "./bounded_verify_store.mjs";
 
 export const EXCEPTIONAL_LIVE_RECOVERY = Object.freeze({
   run_id: "live-v3-20261015T114250Z-e84f52a",
@@ -202,7 +204,14 @@ function readEpochLedger({ checkpointPath, journal, checkpointSha256, repository
   const entriesRoot = path.join(root, "entries");
   if (!fs.existsSync(entriesRoot)) throw new Error("Exceptional recovery epoch entries directory is missing");
   assertOwnedPrivateDirectory(entriesRoot, "Exceptional recovery epoch entries");
-  const names = fs.readdirSync(entriesRoot).sort();
+  const names = isAuthenticatedDiskJournal(journal) ? [] : fs.readdirSync(entriesRoot).sort();
+  if (isAuthenticatedDiskJournal(journal)) {
+    for (const entry of directoryEntries(entriesRoot)) {
+      if (names.length >= 128) throw new Error("Exceptional epoch ledger exceeds bounded verifier limit");
+      names.push(entry.name);
+    }
+    names.sort();
+  }
   const entries = [];
   const seenApprovals = new Set();
   const seenPhrases = new Set();
@@ -216,6 +225,9 @@ function readEpochLedger({ checkpointPath, journal, checkpointSha256, repository
     if (name !== expectedName) throw new Error(`Exceptional recovery epoch sequence is missing or reordered before ${expectedName}`);
     const filePath = path.join(entriesRoot, name);
     const stat = fs.lstatSync(filePath);
+    if (isAuthenticatedDiskJournal(journal) && stat.size > 1024 * 1024) {
+      throw new Error("Exceptional epoch entry exceeds bounded verifier limit");
+    }
     if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid() || (stat.mode & 0o077) !== 0) {
       throw new Error(`Exceptional recovery epoch entry is unsafe: ${name}`);
     }
@@ -322,7 +334,7 @@ export function authenticateExceptionalRecovery({ checkpointPath, repositoryRoot
     expectedTargetWriterGitSha: EXCEPTIONAL_LIVE_RECOVERY.original_commit,
   });
   if (!journal?.manifest?.payload || !Array.isArray(journal.entries) ||
-      !journal.completed_objects || !Number.isSafeInteger(journal.last_sequence)) {
+      (!journal.completed_objects && !isAuthenticatedDiskJournal(journal)) || !Number.isSafeInteger(journal.last_sequence)) {
     throw new Error("Authenticated exceptional recovery journal is incomplete");
   }
   if (journal.manifest.payload.original_checkpoint.sha256 !== checkpointSha256 ||
@@ -362,10 +374,15 @@ export function authenticateExceptionalRecovery({ checkpointPath, repositoryRoot
       journal.entries[EXCEPTIONAL_LIVE_RECOVERY.journal_sequence - 1]?.payload_sha256 !== EXCEPTIONAL_LIVE_RECOVERY.journal_head_sha256) {
     throw new Error("Original authenticated journal anchor is missing or changed");
   }
-  const completedAtAnchor = [...journal.completed_objects.values()]
-    .filter((entry) => entry.recovery_sequence <= EXCEPTIONAL_LIVE_RECOVERY.journal_sequence).length;
-  const publicationsAtAnchor = journal.entries.slice(0, EXCEPTIONAL_LIVE_RECOVERY.journal_sequence)
-    .reduce((total, entry) => total + (entry.payload.updates?.publication_evidence?.length || 0), 0);
+  if (isAuthenticatedDiskJournal(journal) && journal.anchorSequence !== EXCEPTIONAL_LIVE_RECOVERY.journal_sequence) {
+    throw new Error("Disk journal does not bind the original exceptional recovery anchor");
+  }
+  const completedAtAnchor = isAuthenticatedDiskJournal(journal) ? journal.completedAtAnchor
+    : [...journal.completed_objects.values()]
+      .filter((entry) => entry.recovery_sequence <= EXCEPTIONAL_LIVE_RECOVERY.journal_sequence).length;
+  const publicationsAtAnchor = isAuthenticatedDiskJournal(journal) ? journal.publicationsAtAnchor
+    : journal.entries.slice(0, EXCEPTIONAL_LIVE_RECOVERY.journal_sequence)
+      .reduce((total, entry) => total + (entry.payload.updates?.publication_evidence?.length || 0), 0);
   if (completedAtAnchor !== EXCEPTIONAL_LIVE_RECOVERY.authenticated_completed_objects ||
       publicationsAtAnchor !== EXCEPTIONAL_LIVE_RECOVERY.authenticated_v3_publications) {
     throw new Error("Original authenticated completion/publication counts differ from the independently recorded recovery anchor");
