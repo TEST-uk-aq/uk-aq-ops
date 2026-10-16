@@ -709,6 +709,7 @@ export function readOnlyJournalView(journal) {
     if (Object.isFrozen(value) || requiresStructuralFacade(value)) return frozenView(value);
     const proxy = new Proxy(value, {
       get(target, property) {
+        if (property === "__defineGetter__" || property === "__defineSetter__") return mutation;
         const result = Reflect.get(target, property, target);
         if (typeof result !== "function") return view(result);
         if (Array.isArray(target) && mutatingArrayMethods.has(property)) return mutation;
@@ -738,6 +739,8 @@ export function readOnlyJournalView(journal) {
       set: mutation,
       defineProperty: mutation,
       deleteProperty: mutation,
+      setPrototypeOf: mutation,
+      preventExtensions: mutation,
     });
     cache.set(value, proxy);
     return proxy;
