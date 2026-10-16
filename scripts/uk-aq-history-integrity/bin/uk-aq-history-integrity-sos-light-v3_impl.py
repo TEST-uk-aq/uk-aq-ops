@@ -81,6 +81,8 @@ from integrity.current_state.audit import (
 from integrity.runtime import CANONICAL_REPAIR_STAGE_ORDER
 from integrity.local_cleanup import (
     POLICY as LOCAL_CLEANUP_POLICY,
+    persist_cleanup_state,
+    record_cleanup_failure,
     remove_duplicates as remove_authenticated_generated_duplicates,
     retire_working_files,
     staging_candidates as local_cleanup_staging_candidates,
@@ -16433,7 +16435,7 @@ def _prepare_official_rdata_proposal(
     # subprocess.run has waited for the only input-file consumer. Preserve all
     # input evidence byte for byte before retiring this redundant working copy.
     retire_working_files(run_state, [input_path])
-    write_run_state(run_state)
+    persist_cleanup_state(run_state, write_run_state)
     result.update({
         "exit_code": 0,
         "backfill_run_status": "ok",
@@ -20683,7 +20685,7 @@ def _cleanup_observation_working_files(
             if path.is_file():
                 paths.append(path)
     retire_working_files(run_state, paths)
-    write_run_state(run_state)
+    persist_cleanup_state(run_state, write_run_state)
 
 
 def run_v2_gap_backfills(
@@ -27040,7 +27042,7 @@ def cleanup_successful_repair_overlay(
         "staging": local_cleanup_staging_candidates(run_state),
         "disposal_gate": "exact_month_backup_local_materialisation_and_acceptance",
     }
-    write_run_state(run_state)
+    persist_cleanup_state(run_state, write_run_state)
     return dict(run_state["cleanup"])
 
 
@@ -34124,12 +34126,30 @@ def write_reports(
     report_dir: str,
     run_compact: str,
     summary: dict[str, Any],
+    *, atomic_refresh: bool = False,
 ) -> tuple[Path, Path]:
     Path(report_dir).mkdir(parents=True, exist_ok=True)
     json_path = Path(report_dir) / f"{run_compact}-summary.json"
     md_path = Path(report_dir) / f"{run_compact}-summary.md"
-    json_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
-    md_path.write_text(format_summary_md(summary))
+    if atomic_refresh:
+        # Keep the already-completed JSON report intact if optional cleanup
+        # rendering/writing fails. Prepare both files, publish JSON last.
+        pending = []
+        for target, body in (
+            (md_path, format_summary_md(summary)),
+            (json_path, json.dumps(summary, indent=2, sort_keys=True)),
+        ):
+            temporary = target.with_name(f"{target.name}.cleanup-{os.getpid()}.tmp")
+            with temporary.open("x", encoding="utf-8") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            pending.append((temporary, target))
+        for temporary, target in pending:
+            temporary.replace(target)
+    else:
+        json_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
+        md_path.write_text(format_summary_md(summary))
     return json_path, md_path
 
 
@@ -35905,20 +35925,26 @@ def main(argv: list[str]) -> int:
         log.info("report_json=%s", json_path)
         log.info("report_md=%s", md_path)
         if repair_overlay is not None and status == "ok" and not args.dry_run:
-            cleanup = cleanup_successful_repair_overlay(
-                repair_overlay, summary=summary, report_json=Path(json_path),
-            )
-            summary["repair_overlay_cleanup"] = cleanup
-            json_path, md_path = write_reports(
-                env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary
-            )
-            log.info(
-                "reports refreshed after final complete-state cleanup write "
-                "report_json=%s report_md=%s",
-                json_path,
-                md_path,
-            )
-            log.info("successful repair overlay cleanup=%s", json.dumps(cleanup, sort_keys=True))
+            try:
+                cleanup = cleanup_successful_repair_overlay(
+                    repair_overlay, summary=summary, report_json=Path(json_path),
+                )
+                summary["repair_overlay_cleanup"] = cleanup
+                json_path, md_path = write_reports(
+                    env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary,
+                    atomic_refresh=True,
+                )
+                log.info(
+                    "reports refreshed after cleanup checkpoint report_json=%s report_md=%s",
+                    json_path, md_path,
+                )
+                log.info("successful repair overlay cleanup=%s", json.dumps(cleanup, sort_keys=True))
+            except Exception as exc:
+                # Required repair/report completion already succeeded. Optional
+                # cleanup or its report refresh cannot reverse that result.
+                record_cleanup_failure(repair_overlay, json_path, exc)
+                summary["repair_overlay_cleanup"] = dict(repair_overlay.get("cleanup") or {})
+                log.warning("repair remains successful; cleanup/report refresh failed: %s", exc)
         log.info("done status=%s runtime_seconds=%s", status, runtime_seconds)
         if daily_task_health_enabled:
             finish_summary = {

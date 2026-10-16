@@ -105,13 +105,18 @@ def _event(state, **event):
     for key, value in event.items():
         if key in {"files_removed", "bytes_removed", "evidence_bytes_written", "failures", "already_absent"}:
             cleanup[key] = cleanup.get(key, 0) + value
-    cleanup["net_bytes_released"] = cleanup.get("bytes_removed", 0) - cleanup.get("evidence_bytes_written", 0)
+    cleanup["net_bytes_released"] = (
+        None if cleanup.get("evidence_bytes_unmeasured") else
+        cleanup.get("bytes_removed", 0) - cleanup.get("evidence_bytes_written", 0)
+    )
     with _parent(state["run_root"], "cleanup-receipts.jsonl") as (parent, name):
-        fd = os.open(name, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=parent)
+        fd = os.open(name, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=parent)
         with os.fdopen(fd, "a", encoding="utf-8") as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise ValueError("cleanup receipt is not a single-link regular file")
+            if info.st_size and os.pread(stream.fileno(), 1, info.st_size - 1) != b"\n":
+                raise ValueError("cleanup receipt has an incomplete trailing record; manual review required")
             stream.write(json.dumps(event, sort_keys=True) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
@@ -128,6 +133,44 @@ def _failure(state, path, error):
         # Stop this file's disposal when intent cannot be recorded, but do not
         # turn optional disk cleanup into a canonical repair failure.
         state["cleanup"]["receipt_write_error"] = str(receipt_error)
+
+
+def persist_cleanup_state(state, writer):
+    """An optional cleanup checkpoint must not change the repair outcome.
+
+    The normal writer increments persistence counters before replacing state.
+    Restore those counters if that optional write fails. Essential proposal,
+    APPLY and verification checkpoints still use the normal fail-closed writer.
+    """
+    counters = (
+        "node_complete_run_state_write_count", "coordinator_complete_run_state_write_count",
+        "total_complete_run_state_write_count", "complete_run_state_write_count",
+    )
+    mappings = [
+        (state.get("apply") or {}).get("persistence"),
+        ((state.get("coordinator") or {}).get("final_verification") or {}).get("apply_persistence_artifacts"),
+    ]
+    missing = object()
+    snapshots = [(value, {key: value.get(key, missing) for key in counters})
+                 for value in mappings if isinstance(value, dict)]
+    try:
+        writer(state)
+        return True
+    except Exception as error:
+        for value, snapshot in snapshots:
+            for key, original in snapshot.items():
+                if original is missing:
+                    value.pop(key, None)
+                else:
+                    value[key] = original
+        state.setdefault("cleanup", {"policy": POLICY})["state_write_error"] = str(error)
+        _failure(state, state.get("run_state_path"), error)
+        return False
+
+
+def record_cleanup_failure(state, path, error):
+    """Surface a cleanup-only failure without changing canonical repair state."""
+    _failure(state, path, error)
 
 
 def remove_duplicates(state, object_keys, *, detector=False):
@@ -199,15 +242,25 @@ def retire_working_files(state, paths):
                     except FileExistsError:
                         fd = None
                     if fd is not None:
-                        with os.fdopen(fd, "wb") as output:
-                            with gzip.GzipFile(fileobj=output, mode="wb", mtime=0) as compressed:
-                                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                                    compressed.write(chunk)
-                            output.flush()
-                            os.fsync(output.fileno())
-                            written = output.tell()
-                        _event(state, action="evidence_created", evidence_path=archive,
-                               evidence_bytes_written=written)
+                        complete = False
+                        try:
+                            with os.fdopen(fd, "wb") as output:
+                                with gzip.GzipFile(fileobj=output, mode="wb", mtime=0) as compressed:
+                                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                                        compressed.write(chunk)
+                                output.flush()
+                                os.fsync(output.fileno())
+                            complete = True
+                        finally:
+                            # Account for bytes left by a failed compression too.
+                            # Partial evidence never authorises the original unlink.
+                            try:
+                                written = os.stat(an, dir_fd=ap, follow_symlinks=False).st_size
+                            except OSError:
+                                state["cleanup"]["evidence_bytes_unmeasured"] = True
+                                raise
+                            _event(state, action="evidence_created" if complete else "evidence_incomplete",
+                                   evidence_path=archive, evidence_bytes_written=written)
                     os.fsync(ap)
                 with _file(root, archive) as (compressed, ap, an, ai):
                     with gzip.GzipFile(fileobj=compressed, mode="rb") as evidence:
@@ -242,13 +295,16 @@ def staging_candidates(state):
     """Exact v3 bodies only; never source evidence, journals or recovery files."""
     result = []
     for key, entry in state["objects"].items():
-        if (not V3_KEY.match(key) or not entry.get("proposed")
+        if (not V3_KEY.match(key) or entry.get("proposed") is not True
                 or entry.get("structurally_validated") is not True
                 or entry.get("r2_verified") is not True):
             continue
         relative = _relative(state["run_root"], entry["local_path"])
         if relative != "overlay/" + key:
             raise ValueError("staged body is outside its exact object path")
+        if (not re.fullmatch(r"[a-f0-9]{64}", str(entry.get("sha256") or ""))
+                or type(entry.get("bytes")) is not int or entry["bytes"] < 0):
+            raise ValueError("staged body has an invalid recorded identity")
         result.append({"path": relative, "sha256": entry["sha256"], "bytes": entry["bytes"]})
     return sorted(result, key=lambda entry: entry["path"])
 
@@ -362,7 +418,10 @@ def main():
                         _event(state, action="removed_accepted_staging", path=relative,
                                files_removed=1, bytes_removed=before.st_size)
                 except FileNotFoundError:
-                    _event(state, action="already_absent", path=relative, already_absent=1)
+                    try:
+                        _event(state, action="already_absent", path=relative, already_absent=1)
+                    except (OSError, ValueError) as exc:
+                        _failure(state, relative, exc)
                 except (OSError, ValueError) as exc:
                     _failure(state, relative, exc)
     # The append-only receipt is authoritative for deferred results; do not

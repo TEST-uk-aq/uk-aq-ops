@@ -610,6 +610,10 @@ wait_for_local_materialisation() {
 
 cleanup_accepted_month() {
   local marker="$1" label="$2" from_day="$3" to_day="$4"
+  if [ "$SOURCE" = "ni" ]; then
+    log "CLEANUP SKIPPED source=ni; NI Integrity and its cleanup contract are not implemented"
+    return 0
+  fi
   # The helper independently checks the report, coordinator completion record,
   # exact backup workflow/checkpoint chain and local materialisation receipts.
   # Cleanup failure never changes an accepted month into an Integrity failure.

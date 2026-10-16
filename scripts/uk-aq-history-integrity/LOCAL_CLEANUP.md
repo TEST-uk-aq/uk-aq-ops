@@ -64,6 +64,37 @@ inspection location. A gzip file left incomplete by interruption blocks disposal
 on retry; it is not silently overwritten. This is evidence retention, not a new
 replay/resume facility.
 
+### Follow-up consumer trace (PR #106)
+
+The active v3 paths were reviewed against system-docs main
+`c6d2ed60cf33c379ceecfc0e1ebae581bb92014e`; the relevant Integrity contracts
+are unchanged from the initial review. These are the producer/reader boundaries,
+including the distinction between working and authoritative source evidence:
+
+| Retired working file | Producer | Readers and final consumer |
+| --- | --- | --- |
+| `official-rdata-input/*.json`, under either proposal or detector root | Python `_prepare_official_rdata_proposal` serialises pinned source rows, preservation inputs and acquisition audit | `official_network_rdata_proposal.mjs` reads it once at entry, then writes separate source/proposal outputs. `subprocess.run` waits for the entire helper and both output pipes. Retirement follows successful JSON-result validation. There is no subsequent input-path reader in planner, APPLY, verification or reconciliation. A handled helper failure retains complete rejected input until the later scope boundary; an escaping exception leaves the original. |
+| Detector `source-evidence.json` | SOS `run_job.ts` evidence-only worker, or official RData proposal helper | Python `_load_complete_connector_day_source_evidence` validates it; `_persist_complete_connector_day_source_evidence` commits immutable SQL evidence; dedicated SOS additionally copies it through `_retain_dedicated_sos_partition_source_evidence`. Proposal agreement consumes the loaded detector dictionary. Final consumer is scope agreement/guard handling, or retained-evidence handling for all-unmapped SOS. |
+| Detector `obs_history_rows.json` | Same workers/helpers | The same loader authenticates row bytes and semantic counts, and SQLite stores canonical rows. Dedicated SOS copies the original bytes to per-pollutant authority first. No later operation opens the detector pathname. |
+| Detector `preserved_baseline_rows.json` | Official RData helper for preservation scopes | The detector loader verifies its SHA/length and validates complete final-target preservation. Later authority uses the **separate main proposal** copy at `overlay/day_utc=.../connector_id=.../preserved_baseline_rows.json`. That main copy is excluded from retirement. |
+
+Later generic APPLY uses `sourceEvidencePaths` / `loadImmutableSourcePartition`
+and the official preservation validator on the main proposal directory. Dedicated
+SOS APPLY uses `source_evidence_partitions` at the retained per-pollutant paths.
+Generic frozen-authority validation also reloads the main proposal evidence.
+First-value reconciliation uses the exact persisted SQLite evidence ID;
+dedicated current-state reconciliation reads the retained per-pollutant files.
+Generic final verification reads canonical staged bodies and mutation evidence;
+dedicated final verification uses ordered-APPLY evidence and retained source
+authority. None needs an original compressed working-file pathname.
+
+Recovery remains a new appropriately scoped run, not a replay of detector inputs.
+Exact compressed bytes plus SHA/length/path receipts preserve all working
+diagnostics without replacing the required SQL identity, pinned raw acquisition,
+proposal source authority or mutation journals. Handled failures and dry-runs
+retain those authorities and complete diagnostic input bytes. The compression
+allowlist does not include main proposal evidence or immutable SOS acquisition.
+
 ## Completion, failures and concurrency
 
 Cleanup metadata occupies the top-level `cleanup` field, outside the explicit
@@ -106,6 +137,65 @@ Non-monthly/manual runs keep final staging pending until a matching accepted
 monthly chain is available. There is no age-based migration of old runs, daily
 sweeper, scheduled installation, or automatic adoption of legacy evidence.
 
+NI is a reserved monthly source name, not an implemented Integrity source. The
+monthly cleanup function now returns an explicit `CLEANUP SKIPPED source=ni`
+before invoking Python. The helper continues to accept only SOS, WAQN and SAQN;
+NI file lifetimes and cleanup authority must be designed with NI Integrity.
+
+### Completion-field compatibility
+
+`stage_overlay_object` and `stage_file_backed_proposal_object` initially record
+`proposed=true`, `structurally_validated=false`, exact `local_path`, SHA and length,
+and `r2_verified=false`. Validation sets `structurally_validated=true`. SOS-light
+complete-day baseline assembly creates equivalent canonical entries and validates
+their staged content. These fields are not inferred by cleanup.
+
+Dedicated SOS uses `runPersistedSosLightV3Apply`; its tracked post-PUT GET validates
+SHA/length and updates the original `operation.entry` with `r2_verified=true`
+and exact identities, including verified skipped-unchanged PUTs. Generic WAQN/SAQN
+uses `applyValidatedGenericV3Proposal` and the shared `applyValidatedProposal`;
+`putAndVerify` updates the original entry after GET verification. Their complete
+state writers retain these object fields and the unrelated cleanup metadata.
+Python then reloads the child-written state, performs final verification and
+reconciliation, and writes `coordinator.status=succeeded` plus the final result.
+
+The completion list contains every **eligible registered** object; it is not an
+inventory of every file under the run. It excludes unverified, non-proposed,
+unrecognised or noncanonical bodies. A missing completion, malformed identity or
+path mismatch blocks disposal rather than weakening the gate. Proposed flags
+must be actual booleans, and recorded SHA/length must have valid types.
+
+Normal successful SOS and WAQN/SAQN monthly repairs can therefore satisfy the
+same cleanup gates. No source-specific relaxation or new v2 path is required.
+The report's completion list must exactly equal the persisted run-state list,
+which is recomputed from the unchanged object entries before each cleanup retry.
+Failed, dry-run, noop-without-freeze or otherwise unproven runs remain ineligible.
+
+### Cleanup-only I/O failure corrections
+
+Optional cleanup checkpoints now use `persist_cleanup_state`. On failure they
+report an error and restore the normal writer's attempted persistence-counter
+increments; required proposal/APPLY/verification checkpoints still fail closed.
+The original authenticated fingerprint projections and normal state writer are
+unchanged. Missing persisted completion keeps final staging ineligible.
+
+The optional post-cleanup report refresh writes exclusive temporary files and
+flushes them before replacing the completed reports, publishing JSON last.
+Rendering/write failures leave the previously completed JSON intact; failures
+are logged without reversing a verified repair. A report/completion mismatch
+retains staging for review. The required initial report write is still required
+for normal Integrity completion.
+
+Absent-file receipt failures during deferred retries are caught and reported
+without being counted as deletions. A receipt with a torn trailing record blocks
+further receipt writes/unlinks until reviewed; it is never automatically repaired.
+An actual unlink remains counted even if its result receipt fails. An unrecorded
+or uncertain historical outcome is not retrospectively counted as a new deletion.
+Partial gzip output is now included in evidence-byte accounting, marked incomplete
+and retained with its original; only a fully verified evidence copy permits unlink.
+If its length cannot be measured, accounting marks that uncertainty and reports
+net bytes released as unknown rather than claiming a numeric saving.
+
 ## Accounting and limits
 
 `cleanup-receipts.jsonl` records durable per-file intent, evidence creation,
@@ -135,6 +225,26 @@ individual shares. Manual pre-13 October deletion may have removed source eviden
 journals or paths referenced by audit/recovery records. This PR neither certifies
 those deletions safe nor reconstructs the missing evidence.
 
+The expected benefit is bounded, and these categories remain distinct:
+
+| Category | Disk-space effect / remaining growth |
+| --- | --- |
+| Authenticated generated duplicates | Exact copies are removed at capture and retried after successful repair; no duplicate-removal claim for mismatches or unregistered files. |
+| Redundant detector/proposal JSON | Original working representations are retired; compressed complete evidence remains and may continue to grow. Failed compression can retain both original and partial output. |
+| Final staged canonical bodies | Eligible registered v3 bodies are removed after exact monthly acceptance. Failed backup/materialisation or mismatched/missing evidence leaves them pending. |
+| Completed SOS acquisition partitions | Preserved in full under the immutable-root contract; potentially substantial. Disposal requires an authoritative amendment, not an implementation shortcut. |
+| Failed/interrupted-run working data | Earlier proven duplicates may already be gone; canonical staging, unprocessed inputs, failed acquisitions, journals and required evidence remain. No terminal-status sweep. |
+| Standalone/non-monthly runs | Final bodies remain pending without a matching accepted monthly chain. A general backup-linked disposal owner would be separate follow-up. |
+| Required immutable/audit evidence | Source authority, SQL records, raw downloads, journals, snapshots, reports and receipts remain. No retention period is invented here. |
+
+Unregistered generated files and detector bodies with different serialisations
+may also remain. Their sizes cannot be inferred from the historical total.
+The review found no additional large category that could be removed safely by
+loosening existing gates. Acquisition disposal, broad failed-run retention,
+non-monthly backup integration and evidence compaction need separate authority or
+design. This PR reduces eligible working-copy accumulation; it does not eliminate
+all future tmp growth or establish a numeric saving from the deleted 60 GB.
+
 ## Validation, acceptance and rollback
 
 Before deployment: syntax parsing, unchanged fingerprint/state-writer checks,
@@ -148,6 +258,14 @@ unchanged final verification/current-state results, deferred staging while backu
 is pending, and staging disposal after the exact accepted monthly chain. Inspect
 dry-run/handled-failure evidence on real authorised operations, and verify an
 accepted-month retry reports absent files without duplicate deletion counts.
+Observe the same gates on successful real SOS and WAQN/SAQN operations: recorded
+proposed/validation/verification fields, matching state/report completion lists,
+eligible body counts and post-acceptance receipts. Confirm the main proposal
+preserved-baseline file, retained SOS evidence and SQLite evidence IDs remain
+usable through final verification and reconciliation. Inspect naturally occurring
+cleanup failures separately from repair/backup outcomes; do not deliberately
+damage evidence or exhaust disk to perform acceptance. NI must never invoke the
+cleanup helper or produce an unsupported-source cleanup warning.
 Deployment must explicitly update the normal TEST monthly script copy; changing
 its repository template alone does not install the new acceptance hook.
 
