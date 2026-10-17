@@ -40,7 +40,7 @@ export function preparePruneOriginalFinalEvidence({ pending, connector, finaliza
   const envelope = {
     schema_version: 1,
     kind: 'uk_aq_jsongen_prune_original_final_evidence_preparation',
-    authority_state: 'unretained_unverified',
+    authority_state: 'precommit_prepared_unverified',
     environment: 'TEST', index_generation: 'v3',
     writer: { identity: 'prune_daily_v3', invocation_id: runId, attempt_id: runId,
       git_sha: writerGitSha || null },
@@ -61,25 +61,25 @@ export function preparePruneOriginalFinalEvidence({ pending, connector, finaliza
       observed_boundary: 'validated_v3_run_finalizer_returned',
     },
     original_candidate_connector_gate: {
-      transaction_returned: 'commit_returned',
+      transaction_state: 'not_asserted_in_preparation',
       candidate_run_id: runId,
       connector_manifest_key: connector.manifest_key,
       connector_manifest_hash: connector.manifest_hash,
       source_identity: pending.pending_evidence.source_identity,
-      marker_at_commit: 'PRUNE_FIRST_DELETE_READY:v1',
+      expected_ready_marker: 'PRUNE_FIRST_DELETE_READY:v1',
       retained_transaction_proof: false,
     },
     unresolved: [
       'pending_private_readback_not_in_original_prune_path',
-      'original_gate_commit_has_no_immutable_independent_receipt',
+      'original_gate_acceptance_is_external_to_prepared_envelope',
       'mutable_canonical_parent_and_index_bytes_not_retained_as_original_snapshot',
       'current_canonical_status_and_binding_authority_not_independently_authenticated',
-      'evidence_envelope_not_durably_retained_or_discoverable',
+      'evidence_envelope_retention_depends_on_optional_outbox_commit',
     ],
   };
   const bytes = canonicalJson(envelope);
   if (bytes.length > 1024 * 1024)
     throw new Error('JSONgen final preparation exceeds bounded metadata size');
-  return { envelope, sha256: sha256Hex(bytes), byte_size: bytes.length,
+  return { envelope, bytes, sha256: sha256Hex(bytes), byte_size: bytes.length,
     retention_state: 'transient_writer_memory_only' };
 }

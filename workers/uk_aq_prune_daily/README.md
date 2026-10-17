@@ -34,21 +34,37 @@ null. Existing canonical P/R/null values and bytes are left as written.
 The acknowledgment log exposes the preparation digest and intent reference;
 the description itself is not separately retained.
 
-After successful v3 batch finalization and the original protected gate return,
+After successful v3 batch finalization and before the protected gate transaction,
 Prune can prepare an original-final evidence envelope from already available
 connector manifests, child content hashes and status counts, canonical file
 identities, selected-v3 exact-scope references and final batch results. It runs
-only for an acknowledged pending upload. The envelope and gate-return statement
-remain transient and unverified; later gate consumption is allowed, but there
-is no retained original gate transaction proof. No canonical Parquet reread or
-additional derived-bucket write/readback occurs here. Thus neither event can
-authorize a Stage 1 VERIFIED receipt, JSONgen selection or monthly publication.
+only for an acknowledged pending upload. Its version-1 shape now states that
+the gate transaction has not yet been asserted; it never says `commit_returned`
+before COMMIT. The optional same-connection PostgreSQL function in open TEST
+Schema PR #11 can retain this preparation plus typed original-gate evidence
+inside the protected transaction. It is called only when this TEST-only
+handover is enabled. A savepoint isolates supported evidence-only insert
+failures; the original mandatory candidate/gate checks remain fail-closed.
+`outbox_missing` and `incomplete_json_source_coverage` diagnostics identify
+gaps, but a missing event is not discoverable from the outbox later. A unique
+identity conflict is `outbox_unresolved`: an earlier event may exist and must
+be independently compared, never rewritten or treated as this call's success.
+
+The 1 MiB preparation is a structural cap, not measured operational capacity
+or complete final authority. Prune already reads the exact connector manifest
+and child metadata during verification, but the envelope retains references
+and hashes rather than every original mutable connector/child/parent/index/root
+metadata byte. Those keys may later change. `prepared_unverified` or
+`not_captured` therefore cannot authorize a Stage 1 VERIFIED receipt,
+JSONgen selection or monthly publication. A separately reviewed complete
+bounded snapshot or pre-gate independently verified immutable metadata
+reference is still required. No canonical Parquet reread or optional derived
+network operation occurs inside the PostgreSQL transaction.
 Before TEST activation, verify real signer permissions, conditional PUT and
 private readback, budget limits, canonical finalization and gate results,
 interruption recovery, and a durable independently authenticated final evidence
 chain in a separately authorized deployment.
 The [gate durability review](../../docs/investigations/jsongen_prune_final_evidence_durability_boundary.md)
-records why the current mutable candidate/gate rows and late run manifest do
-not provide a replayable original gate receipt. An additive transactional
-acceptance/outbox design needs schema-owner review before this hook can retain
-trusted final evidence.
+records why mutable candidate/gate rows and a late run manifest alone do not
+provide a replayable original gate receipt. TEST Schema PR #11 remains unmerged
+and unapplied; this integration is default-off and has no operational acceptance.

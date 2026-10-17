@@ -177,7 +177,7 @@ do update set
 
 export async function setConnectorDayGateComplete(client, evidenceInput) {
   const evidence = normalizeConnectorGateCompletionEvidence(evidenceInput);
-  await client.query(
+  const result = await client.query(
     `
 insert into uk_aq_ops.prune_connector_day_gates (
   day_utc,
@@ -228,6 +228,14 @@ do update set
   source_content_hash_row_count = excluded.source_content_hash_row_count,
   completion_source = excluded.completion_source,
   updated_at = now()
+returning day_utc::text as day_utc, connector_id, history_done,
+  history_run_id, history_manifest_key, history_manifest_hash,
+  history_row_count::text as history_row_count, history_file_count,
+  history_total_bytes::text as history_total_bytes,
+  history_completed_at::text as history_completed_at,
+  source_content_hash, source_content_hash_contract_version,
+  source_content_hash_row_count::text as source_content_hash_row_count,
+  completion_source
 `,
     [
       evidence.day_utc,
@@ -244,7 +252,10 @@ do update set
       evidence.completion_source,
     ],
   );
-  return evidence;
+  if (result.rowCount !== 1 || result.rows?.length !== 1) {
+    throw new Error("Connector-day gate completion did not return exactly one database row");
+  }
+  return result.rows[0];
 }
 
 export async function withConnectorDayGateClient(databaseUrl, callback) {

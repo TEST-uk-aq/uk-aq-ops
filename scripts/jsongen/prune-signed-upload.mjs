@@ -118,7 +118,7 @@ export async function uploadPrunePendingSource({ signer, fetchImpl = fetch,
     const putFailure = (code, message) => Object.assign(failure(code, message),
       { reference: intent.object, intent_id: intent.intent_id });
     if (controller.signal.aborted || Date.now() - started >= deadlineMs)
-      throw failure('upload_deadline', 'Optional handover deadline exceeded');
+      throw putFailure('intent_issued', 'Optional handover deadline exceeded before PUT');
     let put;
     try { put = await fetchImpl(intent.upload_url, { method: 'PUT', redirect: 'error', signal: controller.signal,
       headers: intent.required_headers, body: prepared.body }); }
@@ -140,7 +140,7 @@ export async function uploadPrunePendingSource({ signer, fetchImpl = fetch,
     if (put.status === 409 || put.status >= 500) throw putFailure('upload_ambiguous', `Signed PUT outcome unknown: HTTP ${put.status}`);
     throw putFailure('upload_rejected', `Signed PUT rejected: HTTP ${put.status}`);
   } catch (error) {
-    if (controller.signal.aborted && error.code !== 'upload_ambiguous')
+    if (controller.signal.aborted && error.code !== 'upload_ambiguous' && error.code !== 'intent_issued')
       throw Object.assign(failure('upload_deadline', 'Optional handover deadline exceeded'),
         { reference: error.reference, intent_id: error.intent_id,
           preparation_sha256: evidenceSha256 });

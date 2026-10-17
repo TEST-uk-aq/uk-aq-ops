@@ -206,7 +206,9 @@ test("v3 pending source failure cannot block canonical publication", async () =>
     cleanupFrozenSource: () => { calls.push("cleanup"); },
   });
   assert.deepEqual(calls, ["upload", "publish"]);
-  assert.equal(result.jsongen_pending_source, null);
+  assert.equal(result.jsongen_pending_source.state, "no_intent");
+  assert.equal(result.jsongen_pending_source.intent_id, null);
+  assert.equal(result.jsongen_pending_source.source, null);
 });
 
 test("insufficient optional headroom skips signer while canonical connector publication continues", async () => {
@@ -229,7 +231,7 @@ test("insufficient optional headroom skips signer while canonical connector publ
     cleanupFrozenSource: () => { calls.push("cleanup"); },
   });
   assert.deepEqual(calls, ["publish"]);
-  assert.equal(result.jsongen_pending_source, null);
+  assert.deepEqual(result.jsongen_pending_source, { state: "not_attempted" });
 });
 
 test("a prior committed 100-row connector blocks a one-row late snapshot before writer invocation", async () => {

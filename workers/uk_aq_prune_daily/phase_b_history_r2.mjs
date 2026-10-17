@@ -12,6 +12,7 @@ import readline from "node:readline";
 import { randomUUID } from "node:crypto";
 import { uploadPrunePendingSource, resolvePruneSignerConfig, PRUNE_SIGNED_UPLOAD_DEADLINE_MS } from "../../scripts/jsongen/prune-signed-upload.mjs";
 import { preparePruneOriginalFinalEvidence } from "../../scripts/jsongen/prune-final-evidence.mjs";
+import { describePruneGateOutboxEvidence } from "../../scripts/jsongen/prune-outbox.mjs";
 import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import Cursor from "pg-cursor";
@@ -2232,7 +2233,7 @@ async function markCandidateComplete(client, {
   historyTotalBytes,
   sourceIdentity,
 }) {
-  await client.query(
+  const result = await client.query(
     `
 update uk_aq_ops.history_candidates
 set
@@ -2255,6 +2256,17 @@ set
   updated_at = now()
 where day_utc = $1::date
   and connector_id = $2::integer
+  and run_id = $3
+  and status = 'in_progress'
+  and expected_row_count = $5::bigint
+  and last_error is null
+returning day_utc::text as day_utc, connector_id, status, run_id, last_error,
+  expected_row_count::text as expected_row_count, manifest_key,
+  history_row_count::text as history_row_count, history_file_count,
+  history_total_bytes::text as history_total_bytes,
+  history_completed_at::text as history_completed_at,
+  source_content_hash, source_content_hash_contract_version,
+  source_content_hash_row_count::text as source_content_hash_row_count
 `,
     [
       dayUtc,
@@ -2270,6 +2282,55 @@ where day_utc = $1::date
       FIRST_DELETE_READY,
     ],
   );
+  if (result.rowCount !== 1 || result.rows?.length !== 1) {
+    throw new Error("Original Prune candidate completion did not update exactly one intended in-progress row");
+  }
+  return result.rows[0];
+}
+
+function assertOriginalCandidateGateCompletion(candidate, gate, expected) {
+  const source = expected.sourceIdentity;
+  const matches = [
+    [candidate.day_utc, expected.dayUtc], [gate.day_utc, expected.dayUtc],
+    [candidate.connector_id, expected.connectorId], [gate.connector_id, expected.connectorId],
+    [candidate.status, 'complete'], [candidate.last_error, FIRST_DELETE_READY],
+    [candidate.run_id, expected.runId], [gate.history_run_id, expected.runId],
+    [gate.history_done, true], [gate.completion_source, 'prune_daily_phase_b'],
+    [candidate.manifest_key, expected.manifestKey],
+    [gate.history_manifest_key, expected.manifestKey],
+    [gate.history_manifest_hash, expected.manifestHash],
+    [candidate.expected_row_count, expected.historyRowCount],
+    [candidate.history_row_count, expected.historyRowCount],
+    [gate.history_row_count, expected.historyRowCount],
+    [candidate.history_file_count, expected.historyFileCount],
+    [gate.history_file_count, expected.historyFileCount],
+    [candidate.history_total_bytes, expected.historyTotalBytes],
+    [gate.history_total_bytes, expected.historyTotalBytes],
+    [candidate.source_content_hash, source.source_content_hash],
+    [gate.source_content_hash, source.source_content_hash],
+    [candidate.source_content_hash_contract_version, source.source_content_hash_contract_version],
+    [gate.source_content_hash_contract_version, source.source_content_hash_contract_version],
+    [candidate.source_content_hash_row_count, source.source_content_hash_row_count],
+    [gate.source_content_hash_row_count, source.source_content_hash_row_count],
+  ];
+  if (matches.some(([actual, intended]) => actual == null || String(actual) !== String(intended))
+    || !candidate.history_completed_at
+    || candidate.history_completed_at !== gate.history_completed_at) {
+    throw new Error("Original Prune candidate and database-returned connector gate disagree");
+  }
+}
+
+function isRecoverableOptionalOutboxError(error) {
+  const code = String(error?.code || '');
+  // Connection, cancellation, transaction and server failures cannot be
+  // reclassified as a missing derived event.
+  if (code === 'P0001') {
+    return error.message === 'Prune JSONgen final preparation identity disagrees with accepted gate'
+      || error.message === 'Invalid Prune JSONgen acceptance identity or evidence'
+      || error.message === 'Prune JSONgen final preparation exceeds structural byte limit';
+  }
+  return code.startsWith('22') || code.startsWith('23')
+    || code === '42501' || code === '42883' || code === '42P01';
 }
 
 async function markCandidateAndConnectorGateComplete(client, {
@@ -2282,10 +2343,16 @@ async function markCandidateAndConnectorGateComplete(client, {
   historyFileCount,
   historyTotalBytes,
   sourceIdentity,
+  writerGitSha,
+  outbox = null,
 }) {
   await client.query("begin");
   try {
-    await markCandidateComplete(client, {
+    const expected = {
+      dayUtc, connectorId, runId, manifestKey, manifestHash,
+      historyRowCount, historyFileCount, historyTotalBytes, sourceIdentity,
+    };
+    const candidate = await markCandidateComplete(client, {
       dayUtc,
       connectorId,
       runId,
@@ -2295,7 +2362,7 @@ async function markCandidateAndConnectorGateComplete(client, {
       historyTotalBytes,
       sourceIdentity,
     });
-    await setConnectorDayGateComplete(client, {
+    const gate = await setConnectorDayGateComplete(client, {
       day_utc: dayUtc,
       connector_id: connectorId,
       history_run_id: runId,
@@ -2307,7 +2374,35 @@ async function markCandidateAndConnectorGateComplete(client, {
       ...sourceIdentity,
       completion_source: "prune_daily_phase_b",
     });
+    assertOriginalCandidateGateCompletion(candidate, gate, expected);
+    let outboxState = outbox ? 'outbox_missing' : 'disabled';
+    let outboxReason = outbox?.unavailable_reason || null;
+    if (outbox?.evidence) {
+      await client.query('savepoint jsongen_outbox');
+      try {
+        await client.query(
+          `select uk_aq_ops.insert_prune_jsongen_gate_acceptance(
+            $1::date, $2::integer, $3::uuid, $4::text, $5::jsonb, $6::bytea
+          )`,
+          [dayUtc, connectorId, runId, writerGitSha,
+            JSON.stringify(outbox.evidence), outbox.bytes || null],
+        );
+      } catch (error) {
+        // A mismatched protected gate, aborted connection or transaction error
+        // is still a mandatory failure. Recover only bounded evidence errors.
+        if (!isRecoverableOptionalOutboxError(error)) throw error;
+        await client.query('rollback to savepoint jsongen_outbox');
+        await client.query('release savepoint jsongen_outbox');
+        outboxReason = `insert_${error.code}`;
+        if (error.code === '23505') outboxState = 'outbox_unresolved';
+      }
+      if (!outboxReason) {
+        await client.query('release savepoint jsongen_outbox');
+        outboxState = 'inserted';
+      }
+    }
     await client.query("commit");
+    return { outbox_state: outboxState, outbox_reason: outboxReason };
   } catch (error) {
     await client.query("rollback");
     throw error;
@@ -4016,6 +4111,7 @@ async function writeFrozenCandidateObservationsToV2({
     }
     let jsongenPendingSource = null;
     if (emitV3Diagnostics && runtime.jsongen_pending_source?.enabled === true) {
+      jsongenPendingSource = { state: 'not_attempted' };
       // Preserve connector publication plus v3 finalisation headroom even if
       // the optional signer and PUT consume their entire shared deadline.
       const requiredMs = PHASE_B_STAGE_MIN_MS.observation_connector_publication
@@ -4049,6 +4145,15 @@ async function writeFrozenCandidateObservationsToV2({
             eligibility: "unverified",
           });
         } catch (error) {
+          const hasIntent = Boolean(error.intent_id && error.reference);
+          jsongenPendingSource = {
+            state: !hasIntent ? 'no_intent'
+              : error.code === 'intent_issued' ? 'intent_issued'
+                : error.code === 'upload_rejected' ? 'put_failed' : 'put_ambiguous',
+            intent_id: hasIntent ? error.intent_id : null,
+            source: hasIntent ? error.reference : null,
+            failure_code: error.code || 'handover_failed',
+          };
           logPhaseB(runtime, "WARNING", "phase_b_jsongen_pending_source_unavailable", {
             run_id: runtime.run_id, day_utc: candidate.day_utc, connector_id: candidate.connector_id,
             reason: error.code || "handover_failed",
@@ -4264,7 +4369,44 @@ async function finalizePublishedPhaseBConnectors({
   for (const published of publishedCandidates) {
     const { candidate, exportResult, connectorGateEvidence } = published;
     try {
-      await completeCandidateAndGate(client, {
+      let outbox = null;
+      if (runtime.history_write_version === 'v3' && runtime.jsongen_pending_source?.enabled === true) {
+        if (exportResult.jsongen_pending_source?.state === 'put_acknowledged_unverified') {
+          try {
+            published.jsongen_final_evidence_preparation = prepareJsonGenFinalEvidence({
+              pending: exportResult.jsongen_pending_source,
+              connector: connectorGateEvidence.jsongen_connector_snapshot,
+              finalization: result, runId, dayUtc: candidate.day_utc,
+              connectorId: candidate.connector_id, writerGitSha: runtime.writer_git_sha,
+            });
+            logPhaseB(runtime, 'INFO', 'phase_b_jsongen_original_final_evidence_prepared', {
+              day_utc: candidate.day_utc, connector_id: candidate.connector_id,
+              preparation_sha256: published.jsongen_final_evidence_preparation.sha256,
+              retention_state: 'transient_writer_memory_only', authority_state: 'precommit_prepared_unverified',
+            });
+          } catch {
+            logPhaseB(runtime, 'WARNING', 'phase_b_jsongen_original_final_evidence_unavailable', {
+              day_utc: candidate.day_utc, connector_id: candidate.connector_id,
+              reason: 'incomplete_original_evidence_preparation',
+            });
+          }
+        }
+        try {
+          const evidence = describePruneGateOutboxEvidence({
+            pending: exportResult.jsongen_pending_source,
+            connector: connectorGateEvidence.jsongen_connector_snapshot,
+            finalPreparation: published.jsongen_final_evidence_preparation,
+          });
+          outbox = {
+            evidence,
+            bytes: evidence.final_evidence_state === 'prepared_unverified'
+              ? published.jsongen_final_evidence_preparation.bytes : null,
+          };
+        } catch {
+          outbox = { unavailable_reason: 'evidence_payload_unavailable' };
+        }
+      }
+      const gateOutcome = await completeCandidateAndGate(client, {
         dayUtc: candidate.day_utc,
         connectorId: candidate.connector_id,
         runId,
@@ -4274,25 +4416,29 @@ async function finalizePublishedPhaseBConnectors({
         historyFileCount: connectorGateEvidence.history_file_count,
         historyTotalBytes: connectorGateEvidence.history_total_bytes,
         sourceIdentity: exportResult.source_identity,
+        writerGitSha: runtime.writer_git_sha,
+        outbox,
       });
-      if (runtime.history_write_version === "v3" &&
-          exportResult.jsongen_pending_source?.state === "put_acknowledged_unverified") {
-        try {
-          published.jsongen_final_evidence_preparation = prepareJsonGenFinalEvidence({
-            pending: exportResult.jsongen_pending_source,
-            connector: connectorGateEvidence.jsongen_connector_snapshot,
-            finalization: result, runId, dayUtc: candidate.day_utc,
-            connectorId: candidate.connector_id, writerGitSha: runtime.writer_git_sha,
-          });
-          logPhaseB(runtime, "INFO", "phase_b_jsongen_original_final_evidence_prepared", {
+      published.jsongen_outbox = gateOutcome || {
+        outbox_state: outbox ? 'outbox_missing' : 'disabled',
+        outbox_reason: outbox ? 'completion_result_unavailable' : null,
+      };
+      if (runtime.history_write_version === 'v3') {
+        logPhaseB(runtime,
+          ['outbox_missing', 'outbox_unresolved'].includes(published.jsongen_outbox.outbox_state)
+            ? 'WARNING' : 'INFO',
+          `phase_b_jsongen_${published.jsongen_outbox.outbox_state}`, {
             day_utc: candidate.day_utc, connector_id: candidate.connector_id,
-            preparation_sha256: published.jsongen_final_evidence_preparation.sha256,
-            retention_state: "transient_writer_memory_only", authority_state: "unretained_unverified",
+            reason: published.jsongen_outbox.outbox_reason,
+            pending_disposition: outbox?.evidence?.pending_disposition || null,
+            final_evidence_state: outbox?.evidence?.final_evidence_state || 'not_captured',
+            authority_state: 'unverified',
           });
-        } catch (error) {
-          logPhaseB(runtime, "WARNING", "phase_b_jsongen_original_final_evidence_unavailable", {
+        if (outbox && exportResult.jsongen_pending_source?.state !== 'put_acknowledged_unverified') {
+          logPhaseB(runtime, 'WARNING', 'phase_b_jsongen_incomplete_json_source_coverage', {
             day_utc: candidate.day_utc, connector_id: candidate.connector_id,
-            reason: "incomplete_original_evidence_preparation",
+            pending_disposition: outbox?.evidence?.pending_disposition || null,
+            original_gate_state: 'committed',
           });
         }
       }
@@ -4350,6 +4496,25 @@ async function finalizeAndRecordPublishedPhaseBBatch({
     for (const completed of finalized.completed) {
       const { candidate, exportResult, connectorComparison, startedAtMs } = completed;
       summary.completed_candidates += 1;
+      if (completed.jsongen_outbox?.outbox_state === 'inserted') {
+        summary.jsongen_outbox_inserted_count = (summary.jsongen_outbox_inserted_count || 0) + 1;
+      } else if (completed.jsongen_outbox?.outbox_state === 'outbox_missing') {
+        summary.jsongen_outbox_missing_count = (summary.jsongen_outbox_missing_count || 0) + 1;
+        summary.jsongen_outbox_missing_preview ||= [];
+        if (summary.jsongen_outbox_missing_preview.length < 10) {
+          summary.jsongen_outbox_missing_preview.push({
+            day_utc: candidate.day_utc, connector_id: candidate.connector_id,
+            reason: completed.jsongen_outbox.outbox_reason,
+          });
+        }
+      } else if (completed.jsongen_outbox?.outbox_state === 'outbox_unresolved') {
+        summary.jsongen_outbox_unresolved_count = (summary.jsongen_outbox_unresolved_count || 0) + 1;
+      }
+      if (completed.jsongen_outbox?.outbox_state !== 'disabled' &&
+          exportResult.jsongen_pending_source?.state !== 'put_acknowledged_unverified') {
+        summary.jsongen_incomplete_source_coverage_count =
+          (summary.jsongen_incomplete_source_coverage_count || 0) + 1;
+      }
       completedWrittenRows += exportResult.written_row_count;
       completedWrittenBytes += exportResult.total_bytes;
       logStructured("INFO", "phase_b_history_candidate_complete", {
@@ -6733,6 +6898,11 @@ export async function runPhaseBBackup({
     pending_candidates: 0,
     processed_candidates: 0,
     completed_candidates: 0,
+    jsongen_outbox_inserted_count: 0,
+    jsongen_outbox_missing_count: 0,
+    jsongen_outbox_unresolved_count: 0,
+    jsongen_outbox_missing_preview: [],
+    jsongen_incomplete_source_coverage_count: 0,
     failed_candidates: 0,
     blocked_scope_count: 0,
     blocked_scopes_preview: [],

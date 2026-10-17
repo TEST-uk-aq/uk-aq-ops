@@ -9,6 +9,9 @@ import { computePruneConnectorSourceIdentity } from '../workers/shared/uk_aq_pru
 import { BUCKET } from '../scripts/jsongen/schema.mjs';
 import { preparePrunePendingSource } from '../scripts/jsongen/prune-pending-source.mjs';
 import { uploadPrunePendingSource } from '../scripts/jsongen/prune-signed-upload.mjs';
+import { preparePruneOriginalFinalEvidence } from '../scripts/jsongen/prune-final-evidence.mjs';
+import { describePruneGateOutboxEvidence } from '../scripts/jsongen/prune-outbox.mjs';
+import { canonicalJson } from '../scripts/jsongen/schema.mjs';
 import { verifyPrunePendingSource } from '../scripts/jsongen/prune-pending-verification.mjs';
 import signerWorker from '../workers/uk_aq_jsongen_signer/worker.mjs';
 import { resolvePhaseBRuntimeConfig } from '../workers/uk_aq_prune_daily/phase_b_history_r2.mjs';
@@ -154,6 +157,25 @@ test('one deadline aborts the signer request and prevents PUT', async () => {
   });
 });
 
+test('a validated intent that times out before PUT retains its intent-only reference', async () => {
+  await fixtureAsync(async ({ candidate }) => {
+    let calls = 0;
+    await assert.rejects(uploadPrunePendingSource({ signer, ...candidate, deadlineMs: 20,
+      fetchImpl: async (_url, options) => {
+        calls++;
+        await new Promise(resolve => setTimeout(resolve, 30));
+        return Response.json(signedIntent(JSON.parse(options.body)));
+      } }), error => {
+      assert.equal(error.code, 'intent_issued');
+      assert.equal(error.intent_id, 'b'.repeat(64));
+      assert.equal(error.reference.bucket, BUCKET);
+      assert.equal(error.reference.upload_url, undefined);
+      return true;
+    });
+    assert.equal(calls, 1);
+  });
+});
+
 test('PUT deadline is ambiguous and retains only a safe reconciliation reference', async () => {
   await fixtureAsync(async ({ candidate }) => {
     let calls = 0;
@@ -170,6 +192,42 @@ test('PUT deadline is ambiguous and retains only a safe reconciliation reference
       return true;
     });
     assert.equal(calls, 2);
+  });
+});
+
+test('pre-commit final preparation and outbox description retain only unverified original evidence', async () => {
+  await fixtureAsync(async ({ candidate }) => {
+    const prepared = preparePrunePendingSource(candidate);
+    const source = signedIntent({ compressed_sha256: prepared.compressed_sha256,
+      compressed_byte_size: prepared.compressed_byte_size,
+      uncompressed_sha256: prepared.uncompressed_sha256,
+      uncompressed_byte_size: prepared.uncompressed_byte_size }).object;
+    const pending = { state: 'put_acknowledged_unverified', intent_id: 'b'.repeat(64),
+      source, pending_evidence: prepared.evidence,
+      preparation_sha256: 'c'.repeat(64), source_evidence_sha256: 'd'.repeat(64) };
+    const manifestKey = `history/v3/observations/day_utc=${dayUtc}/connector_id=1/manifest.json`;
+    const connector = { run_id: runId, day_utc: dayUtc, connector_id: 1,
+      manifest_key: manifestKey, manifest_hash: 'e'.repeat(64),
+      connector_manifest: { key: manifestKey, sha256: 'f'.repeat(64), byte_size: 123 },
+      pollutant_manifests: prepared.evidence.scope.pollutant_partitions,
+      scoped_roots: [] };
+    const finalPreparation = preparePruneOriginalFinalEvidence({
+      pending, connector, finalization: { ok: true, affected_days_utc: [dayUtc] },
+      runId, dayUtc, connectorId: 1, writerGitSha: '4'.repeat(40),
+    });
+    assert.equal(finalPreparation.envelope.original_candidate_connector_gate.transaction_state,
+      'not_asserted_in_preparation');
+    assert.equal(canonicalJson(finalPreparation.envelope).equals(finalPreparation.bytes), true);
+    assert.equal(finalPreparation.bytes.includes(Buffer.from('commit_returned')), false);
+    const evidence = describePruneGateOutboxEvidence({ pending, connector, finalPreparation });
+    assert.equal(evidence.final_evidence_state, 'prepared_unverified');
+    assert.equal(evidence.pending_disposition, 'put_acknowledged_unverified');
+    assert.equal(evidence.original_source_status_provenance, 'original_source_status_unavailable');
+    assert.equal(evidence.connector_manifest_byte_sha256, 'f'.repeat(64));
+    assert.equal(describePruneGateOutboxEvidence({ pending: { state: 'no_intent' }, connector })
+      .final_evidence_state, 'not_captured');
+    assert.equal(describePruneGateOutboxEvidence({ pending: { state: 'not_attempted' }, connector })
+      .pending_intent_id, null);
   });
 });
 
