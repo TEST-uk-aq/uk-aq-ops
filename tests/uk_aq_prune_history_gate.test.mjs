@@ -272,6 +272,27 @@ test("candidate and connector gate completion persist identical source identity"
   const client = {
     async query(sql, params = []) {
       calls.push({ sql, params });
+      if (/update uk_aq_ops\.history_candidates/i.test(sql)) {
+        return { rowCount: 1, rows: [{
+          day_utc: dayUtc, connector_id: 7, status: 'complete', run_id: 'run-1',
+          last_error: 'PRUNE_FIRST_DELETE_READY:v1', expected_row_count: '2',
+          manifest_key: canonicalObservationConnectorManifestKey(dayUtc, 7),
+          history_row_count: '2', history_file_count: 1, history_total_bytes: '100',
+          history_completed_at: '2026-07-21 00:00:00+00',
+          ...sourceIdentity,
+        }] };
+      }
+      if (/insert into uk_aq_ops\.prune_connector_day_gates/i.test(sql)) {
+        return { rowCount: 1, rows: [{
+          day_utc: dayUtc, connector_id: 7, history_done: true,
+          history_run_id: 'run-1',
+          history_manifest_key: canonicalObservationConnectorManifestKey(dayUtc, 7),
+          history_manifest_hash: 'a'.repeat(64),
+          history_row_count: '2', history_file_count: 1, history_total_bytes: '100',
+          history_completed_at: '2026-07-21 00:00:00+00',
+          completion_source: 'prune_daily_phase_b', ...sourceIdentity,
+        }] };
+      }
       return { rows: [], rowCount: 1 };
     },
   };
@@ -309,6 +330,126 @@ test("candidate and connector gate completion persist identical source identity"
   });
   assert.deepEqual(aqiResult, { status: "skipped", reason: "aqilevels_disabled" });
   assert.equal(calls.length, completedGateCallCount, "disabled AQI must not revoke the completed observation gate");
+});
+
+function originalGateCompletionFixture({ candidateRows = 1, gateOverride = {},
+  outboxError = null, savepointRecoveryError = null } = {}) {
+  const dayUtc = '2026-10-10';
+  const connectorId = 7;
+  const runId = 'ca2a2ad8-c46c-4d65-9ee0-7147f03684eb';
+  const sourceIdentity = computePruneConnectorSourceIdentity(canonicalCandidateRows(dayUtc, connectorId, 2));
+  const manifestKey = canonicalObservationConnectorManifestKey(dayUtc, connectorId);
+  const input = { dayUtc, connectorId, runId, manifestKey, manifestHash: 'a'.repeat(64),
+    historyRowCount: 2n, historyFileCount: 1, historyTotalBytes: 100n,
+    sourceIdentity, writerGitSha: '4'.repeat(40) };
+  const completedAt = '2026-10-10 00:00:00+00';
+  const candidate = { day_utc: dayUtc, connector_id: connectorId, status: 'complete',
+    run_id: runId, last_error: 'PRUNE_FIRST_DELETE_READY:v1', expected_row_count: '2',
+    manifest_key: manifestKey, history_row_count: '2', history_file_count: 1,
+    history_total_bytes: '100', history_completed_at: completedAt, ...sourceIdentity };
+  const gate = { day_utc: dayUtc, connector_id: connectorId, history_done: true,
+    history_run_id: runId, history_manifest_key: manifestKey,
+    history_manifest_hash: input.manifestHash, history_row_count: '2',
+    history_file_count: 1, history_total_bytes: '100',
+    history_completed_at: completedAt, completion_source: 'prune_daily_phase_b',
+    ...sourceIdentity, ...gateOverride };
+  const calls = [];
+  const client = { async query(sql, params = []) {
+    calls.push({ sql, params });
+    if (/update uk_aq_ops\.history_candidates/i.test(sql)) {
+      return { rowCount: candidateRows, rows: candidateRows === 1 ? [candidate] : [] };
+    }
+    if (/insert into uk_aq_ops\.prune_connector_day_gates/i.test(sql)) {
+      return { rowCount: 1, rows: [gate] };
+    }
+    if (/select uk_aq_ops\.insert_prune_jsongen_gate_acceptance/i.test(sql) && outboxError) {
+      throw outboxError;
+    }
+    if (/rollback to savepoint/i.test(sql) && savepointRecoveryError) {
+      throw savepointRecoveryError;
+    }
+    return { rowCount: 0, rows: [] };
+  } };
+  return { client, calls, input };
+}
+
+test('optional Prune outbox insert uses the protected connection after mandatory returned-row checks', async () => {
+  const { client, calls, input } = originalGateCompletionFixture();
+  const evidence = { pending_disposition: 'not_attempted',
+    original_source_status_provenance: 'not_captured', final_evidence_state: 'not_captured' };
+  const outcome = await markCandidateAndConnectorGateCompleteForTest(client,
+    { ...input, outbox: { evidence, bytes: null } });
+  assert.deepEqual(outcome, { outbox_state: 'inserted', outbox_reason: null });
+  assert.deepEqual(calls.map(({ sql }) => sql.trim().split(/\s+/)[0].toLowerCase()),
+    ['begin', 'update', 'insert', 'savepoint', 'select', 'release', 'commit']);
+  assert.match(calls[1].sql, /and run_id = \$3[\s\S]*and status = 'in_progress'/);
+  assert.match(calls[1].sql, /and expected_row_count = \$5::bigint[\s\S]*returning/);
+  assert.equal(calls[4].params.length, 6);
+  assert.deepEqual(calls[4].params.slice(0, 4),
+    [input.dayUtc, input.connectorId, input.runId, input.writerGitSha]);
+  assert.deepEqual(JSON.parse(calls[4].params[4]), evidence);
+  assert.equal(calls[4].params[5], null);
+});
+
+test('optional evidence constraint failure rolls back only the savepoint and commits the valid gate', async () => {
+  for (const error of [
+    Object.assign(new Error('evidence check failed'), { code: '23514' }),
+    Object.assign(new Error('Prune JSONgen final preparation identity disagrees with accepted gate'),
+      { code: 'P0001' }),
+  ]) {
+    const { client, calls, input } = originalGateCompletionFixture({ outboxError: error });
+    const outcome = await markCandidateAndConnectorGateCompleteForTest(client,
+      { ...input, outbox: { evidence: { pending_disposition: 'not_attempted' } } });
+    assert.deepEqual(outcome, { outbox_state: 'outbox_missing', outbox_reason: `insert_${error.code}` });
+    assert.deepEqual(calls.slice(-3).map(({ sql }) => sql.toLowerCase()),
+      ['rollback to savepoint jsongen_outbox', 'release savepoint jsongen_outbox', 'commit']);
+  }
+});
+
+test('a duplicate immutable event stays unresolved without overwriting it or blocking the gate', async () => {
+  const error = Object.assign(new Error('duplicate event'), { code: '23505' });
+  const { client, calls, input } = originalGateCompletionFixture({ outboxError: error });
+  const outcome = await markCandidateAndConnectorGateCompleteForTest(client,
+    { ...input, outbox: { evidence: { pending_disposition: 'not_attempted' } } });
+  assert.deepEqual(outcome, { outbox_state: 'outbox_unresolved', outbox_reason: 'insert_23505' });
+  assert.doesNotMatch(calls.find(({ sql }) => /insert_prune_jsongen_gate_acceptance/i.test(sql)).sql,
+    /on conflict/i);
+  assert.equal(calls.at(-1).sql, 'commit');
+});
+
+test('candidate mismatch and returned-gate mismatch fail closed before an optional savepoint', async () => {
+  for (const options of [{ candidateRows: 0 }, { gateOverride: { history_run_id: 'another-run' } }]) {
+    const { client, calls, input } = originalGateCompletionFixture(options);
+    await assert.rejects(markCandidateAndConnectorGateCompleteForTest(client,
+      { ...input, outbox: { evidence: { pending_disposition: 'not_attempted' } } }),
+    /Original Prune candidate/);
+    assert.equal(calls.some(({ sql }) => /savepoint|insert_prune_jsongen_gate_acceptance|^commit$/i.test(sql)), false);
+    assert.equal(calls.at(-1).sql, 'rollback');
+  }
+});
+
+test('unrecoverable outbox or failed savepoint recovery cannot commit the original gate', async () => {
+  for (const options of [
+    { outboxError: Object.assign(new Error('connection lost'), { code: '08006' }) },
+    { outboxError: Object.assign(new Error('invalid evidence'), { code: '23514' }),
+      savepointRecoveryError: new Error('rollback to savepoint failed') },
+    { outboxError: Object.assign(new Error('Prune JSONgen acceptance is not bound to the original candidate/gate transaction'),
+      { code: 'P0001' }) },
+  ]) {
+    const { client, calls, input } = originalGateCompletionFixture(options);
+    await assert.rejects(markCandidateAndConnectorGateCompleteForTest(client,
+      { ...input, outbox: { evidence: { pending_disposition: 'not_attempted' } } }));
+    assert.equal(calls.some(({ sql }) => sql === 'commit'), false);
+    assert.equal(calls.at(-1).sql, 'rollback');
+  }
+});
+
+test('default-off Prune completion never calls the schema-only outbox interface', async () => {
+  const { client, calls, input } = originalGateCompletionFixture();
+  const outcome = await markCandidateAndConnectorGateCompleteForTest(client, input);
+  assert.deepEqual(outcome, { outbox_state: 'disabled', outbox_reason: null });
+  assert.equal(calls.some(({ sql }) => /savepoint|insert_prune_jsongen_gate_acceptance/i.test(sql)), false);
+  assert.equal(calls.at(-1).sql, 'commit');
 });
 
 test("incomplete connector gate clears all source identity fields", async () => {
@@ -1096,14 +1237,20 @@ test("Phase B accepts the real v3 finalization shape before connector gating", a
     publishedCandidateForFinalizationTest("2026-08-28", 1),
     publishedCandidateForFinalizationTest("2026-08-28", 2),
   ];
+  publishedCandidates[0].exportResult.jsongen_pending_source = {
+    state: "put_acknowledged_unverified",
+  };
+  publishedCandidates[0].connectorGateEvidence.jsongen_connector_snapshot = { marker: "original" };
   const events = [];
   const result = v3FinalizationResult(["2026-08-28"], 2);
   assert.equal(Object.hasOwn(result, "observations_manifest_hierarchy"), false);
   assert.equal(Object.hasOwn(result, "index_finalization"), false);
 
+  const runtime = finalizationValidationRuntime('v3');
+  runtime.jsongen_pending_source = { enabled: true };
   const finalized = await phaseBHistoryModule.finalizePublishedPhaseBConnectorsForTest({
     client: {},
-    runtime: finalizationValidationRuntime("v3"),
+    runtime,
     runId: "v3-finalization-contract",
     publishedCandidates,
     runFinalizer: async () => {
@@ -1113,14 +1260,40 @@ test("Phase B accepts the real v3 finalization shape before connector gating", a
     completeCandidateAndGate: async (_client, evidence) => {
       events.push(`connector_gate:${evidence.connectorId}`);
     },
+    prepareJsonGenFinalEvidence: ({ pending, connector, finalization }) => {
+      assert.equal(pending, publishedCandidates[0].exportResult.jsongen_pending_source);
+      assert.equal(connector, publishedCandidates[0].connectorGateEvidence.jsongen_connector_snapshot);
+      assert.equal(finalization, result);
+      events.push("final_evidence:1");
+      return { sha256: "a".repeat(64) };
+    },
   });
 
   assert.equal(finalized.finalized, true);
   assert.deepEqual(events, [
     "run_finalization",
+    "final_evidence:1",
     "connector_gate:1",
     "connector_gate:2",
   ]);
+  assert.equal(finalized.completed[0].jsongen_final_evidence_preparation.sha256, "a".repeat(64));
+});
+
+test('default-off v3 finalization does not prepare or insert JSONgen evidence', async () => {
+  const published = publishedCandidateForFinalizationTest();
+  published.exportResult.jsongen_pending_source = { state: 'put_acknowledged_unverified' };
+  const finalized = await phaseBHistoryModule.finalizePublishedPhaseBConnectorsForTest({
+    client: {}, runtime: finalizationValidationRuntime('v3'), runId: 'default-off-v3',
+    publishedCandidates: [published],
+    runFinalizer: async () => v3FinalizationResult([published.candidate.day_utc]),
+    prepareJsonGenFinalEvidence: () => assert.fail('default-off cannot prepare JSONgen final evidence'),
+    completeCandidateAndGate: async (_client, evidence) => {
+      assert.equal(evidence.outbox, null);
+      return { outbox_state: 'disabled', outbox_reason: null };
+    },
+  });
+  assert.equal(finalized.completed.length, 1);
+  assert.equal(finalized.completed[0].jsongen_outbox.outbox_state, 'disabled');
 });
 
 test("Phase B v3 finalization validation fails closed before connector gating", async (t) => {

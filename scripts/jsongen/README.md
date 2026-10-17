@@ -1,4 +1,100 @@
-# Managed JSONgen Stage 1 control and Stage 2 read-only evidence foundations
+# Managed JSONgen foundations and pending Prune source
+
+## Stage 3A signed Prune source handover (code only; default off)
+
+Selected-v3 Prune can offer its exact frozen connector-day NDJSON before
+canonical connector publication. The TEST-only flag
+`UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED` defaults to false. The handover
+uses the merged JSONgen signer `POST /v1/upload-intents` and the dedicated
+writer bearer and Cloudflare Access client credentials described in the
+[Prune README](../../workers/uk_aq_prune_daily/README.md). Prune never receives
+R2 write credentials for this path. The signer selects an immutable private
+`managed/jsongen/v1/pending/unverified/prune_daily_v3/...` key and returns a
+60-second conditional PUT URL. Prune authenticates its metadata against the
+frozen source and sends exactly the signed headers and gzip bytes. There is no
+second descriptor object. A version-1 pending evidence description is prepared
+from the frozen bytes and can be reproduced by the inactive private reader. It
+names the TEST v3 Prune attempt, complete connector/day and physical scope,
+source identity, exact NDJSON and gzip hashes and lengths, effective status
+counts, signer intent, object reference and PUT disposition. The description
+and its SHA-256 are transient writer data; the immutable gzip object is the
+only derived object offered for retention.
+
+The source keeps original row multiplicity, order, timestamp and numeric JSON
+values. Preparation is bounded at 100,000 rows, 32 MiB original, 8 MiB gzip
+and 128 scopes. Signer and PUT share a 15-second deadline; the optional stage
+starts only with extra headroom reserved for canonical publication and v3 run
+finalization. 2xx records `put_acknowledged_unverified`, not verified retention.
+A 412 conditional conflict needs separate readback; 409, 5xx and transport
+failures are ambiguous. No retry or source readback happens in Prune. The inactive `prune-pending-verification.mjs` helper can independently read
+bounded private bytes, decompress and compare original byte and source
+identities. It is not invoked by Prune and does not grant final writer authority.
+Source cleanup and canonical deletion gates keep their existing rules. There
+is no approved automatic expiry, complete-source receipt or publication
+eligibility from an upload intent or PUT acknowledgment.
+
+**Verified Stage 3A receipt creation is blocked.** The compact source's
+`status` is projected to effective `verification_status`; it is not authenticated
+original provider status. The version-1 pending description classifies original
+status as `original_source_status_unavailable`, with `source_status: null`
+meaning no original-provider assertion. Historical authenticated canonical
+null remains null. No age-based R inference or AURN default-P rewrite occurs;
+the AURN presentation policy and ratified-R protection remain owned by canonical
+authority, and no AURN-specific rule is applied to other connectors.
+
+After the v3 batch finalizer passes and before the original protected candidate/gate
+transaction begins, Prune can prepare a version-1 original-final evidence
+envelope. It compares the pending partition content hashes, counts and effective
+statuses with the original canonical child manifests, and captures already-read
+connector/child manifest byte identities, canonical file metadata, selected-v3
+exact-scope references and final batch references. When bounded, its versioned
+`original_metadata_snapshot` also stores exact bytes for the canonical
+connector/pollutant manifests, published exact-v3 aligned shards/leaves/scoped
+roots, every affected day manifest, affected aggregate ancestors and latest-global index.
+These are selected from the writer's verified publication references, with
+byte hashes and lengths checked against exact bytes observed in its existing
+PUT/readback path. This adds no R2 request. The envelope explicitly
+does not assert a successful gate commit before the transaction runs.
+It adds no routine Parquet read and no derived R2 readback to canonical Prune.
+When the TEST-only handover is enabled, the optional function proposed in open
+Schema PR #11 may retain the exact bounded preparation bytes with original
+gate acceptance inside the same protected PostgreSQL transaction. A failed
+optional insert can be rolled back to its savepoint while an otherwise valid
+gate commits. A committed gate with no event yields `outbox_missing`, not a
+discoverable receipt. An immutable-key conflict yields `outbox_unresolved`
+until the existing row is independently compared. A retained row is append-only original gate evidence,
+not independent final-publication authentication or current authority.
+Mutable canonical keys and a later CONSUMED gate cannot reconstruct missing
+original bytes. If any required byte is absent, the bounded capture or the
+1 MiB database envelope limit is exceeded, a successful optional outbox insert
+records `final_evidence_state=not_captured`; the run logs the coverage gap. The
+8 MiB / 4,096-object transient capture ceiling prevents unbounded writer memory use. A
+bounded snapshot remains `prepared_unverified` until a separate reader
+authenticates its bytes, relationships, original source and canonical authority.
+The Stage 1 receipt
+additionally requires independently meaningful before/after,
+binding, provenance, scope-completeness and retained-receipt authority
+references. Current Prune finalisation returns verified aggregate/index/latest
+control-flow evidence; the optional snapshot and outbox may now retain exact
+writer-produced metadata, but do not independently authenticate it. PostgreSQL gate-only
+recovery remains disabled by its own contract. This code therefore does not
+produce a bundle or receipt, promote `authenticateFinalPublication()`, mutate
+managed control, dispatch JSONgen, or select monthly publication. Stage 3B
+must define independent metadata/source authentication, an immutable external
+metadata snapshot for scopes that exceed 1 MiB, and
+delivery/reconciliation and missing-registration detection before complete
+coverage can be claimed. The existing `selectManagedPublications()` blocker remains.
+The [original gate durability review](../../docs/investigations/jsongen_prune_final_evidence_durability_boundary.md)
+traces the mutable candidate/gate schema, READY-to-CONSUMED transition and
+commit-to-delivery crash window. It identifies a separately reviewed
+transactional acceptance/outbox schema as the prerequisite for durable trusted
+final evidence; a post-commit upload cannot close that window.
+
+The v2 Prune path does not enter this handover. Before any TEST activation,
+perform a separately authorised controlled Prune run to verify dedicated
+bucket permission, conditional PUT/readback, byte and row limits, source
+cleanup, canonical finalisation, PostgreSQL gate behavior and restart review.
+No such operational acceptance is implied by local checks.
 
 This directory is an **inactive Node ESM library**, independent of the experimental
 `scripts/compressed_chart_history` publisher and its selector. There is no CLI,

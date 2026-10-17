@@ -3,6 +3,7 @@ import test from "node:test";
 import { admitPruneFrozenConnectorSnapshot, PruneCommittedHistoryGuardError } from "../workers/uk_aq_prune_daily/committed_history_guard.mjs";
 import { writeFrozenCandidateObservationsToV2ForTest, createPhaseBRunBudgetForTest } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 import { computeObservationContentHash } from "../workers/shared/uk_aq_observation_content_hash.mjs";
+import { computePruneConnectorSourceIdentity } from "../workers/shared/uk_aq_prune_connector_source_identity.mjs";
 import {
   DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY,
   DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT,
@@ -162,6 +163,75 @@ test("first publication ignores unreferenced connector objects and can reach wri
   });
   assert.equal(writes, 1);
   assert.equal(result.source_row_count, 1n);
+});
+
+test("v3 signed source upload precedes publication and remains unverified", async () => {
+  const calls = [];
+  const frozenRow = row("pm25", 102);
+  const sourceIdentity = computePruneConnectorSourceIdentity([frozenRow]);
+  const result = await writeFrozenCandidateObservationsToV2ForTest({
+    candidate: { day_utc: dayUtc, connector_id: connectorId, expected_row_count: 1n },
+    runtime: {
+      run_budget: createPhaseBRunBudgetForTest({ nowMs: () => 0, startedAtMs: 0, maxSecondsPerRun: 1740, stopBeforeTimeoutSeconds: 60 }),
+      history_write_version: "v3", committed_prefix: prefix, r2: {}, environment: "TEST", writer_git_sha: "a".repeat(40),
+      run_id: "c771948f-9d20-4bd5-ac1d-6cef0a4f106a",
+      jsongen_pending_source: { enabled: true, signer: { endpoint: "https://signer.test.example/v1/upload-intents" } },
+    },
+    streamClient: {}, frozen: { temp: { ndjsonPath: "unused" }, counts: {}, sourceIdentity },
+    readFrozenRows: async function* () { yield frozenRow; },
+    admitSnapshot: async () => ({ admission: "first_publication" }),
+    uploadPendingSource: async () => { calls.push("upload"); return { state: "put_acknowledged_unverified", intent_id: "a".repeat(64), source: { key: "private/pending" } }; },
+    connectorPublisher: async () => { calls.push("publish"); return { file_count: 1, total_bytes: 100n }; },
+    cleanupFrozenSource: () => { calls.push("cleanup"); },
+  });
+  assert.deepEqual(calls, ["upload", "publish"]);
+  assert.equal(result.jsongen_pending_source.state, "put_acknowledged_unverified");
+});
+
+test("v3 pending source failure cannot block canonical publication", async () => {
+  const calls = [];
+  const frozenRow = row("pm25", 102);
+  const result = await writeFrozenCandidateObservationsToV2ForTest({
+    candidate: { day_utc: dayUtc, connector_id: connectorId, expected_row_count: 1n },
+    runtime: {
+      run_budget: createPhaseBRunBudgetForTest({ nowMs: () => 0, startedAtMs: 0, maxSecondsPerRun: 1740, stopBeforeTimeoutSeconds: 60 }),
+      history_write_version: "v3", committed_prefix: prefix, r2: {}, environment: "TEST", writer_git_sha: "a".repeat(40),
+      jsongen_pending_source: { enabled: true, signer: {} }, logStructured: () => {},
+    },
+    streamClient: {}, frozen: { temp: { ndjsonPath: "unused" }, counts: {}, sourceIdentity: {} },
+    readFrozenRows: async function* () { yield frozenRow; },
+    admitSnapshot: async () => ({ admission: "first_publication" }),
+    uploadPendingSource: async () => { calls.push("upload"); throw new Error("derived unavailable"); },
+    connectorPublisher: async () => { calls.push("publish"); return { file_count: 1, total_bytes: 100n }; },
+    cleanupFrozenSource: () => { calls.push("cleanup"); },
+  });
+  assert.deepEqual(calls, ["upload", "publish"]);
+  assert.equal(result.jsongen_pending_source.state, "no_intent");
+  assert.equal(result.jsongen_pending_source.intent_id, null);
+  assert.equal(result.jsongen_pending_source.source, null);
+});
+
+test("insufficient optional headroom skips signer while canonical connector publication continues", async () => {
+  const calls = [];
+  const frozenRow = row("pm25", 102);
+  const result = await writeFrozenCandidateObservationsToV2ForTest({
+    candidate: { day_utc: dayUtc, connector_id: connectorId, expected_row_count: 1n },
+    runtime: {
+      run_budget: createPhaseBRunBudgetForTest({ nowMs: () => 0, startedAtMs: 0,
+        maxSecondsPerRun: 600, stopBeforeTimeoutSeconds: 60 }),
+      history_write_version: "v3", committed_prefix: prefix, r2: {}, environment: "TEST",
+      writer_git_sha: "a".repeat(40),
+      jsongen_pending_source: { enabled: true, signer: {} },
+    },
+    streamClient: {}, frozen: { temp: { ndjsonPath: "unused" }, counts: {}, sourceIdentity: {} },
+    readFrozenRows: async function* () { yield frozenRow; },
+    admitSnapshot: async () => ({ admission: "first_publication" }),
+    uploadPendingSource: async () => { calls.push("signer"); },
+    connectorPublisher: async () => { calls.push("publish"); return { file_count: 1, total_bytes: 100n }; },
+    cleanupFrozenSource: () => { calls.push("cleanup"); },
+  });
+  assert.deepEqual(calls, ["publish"]);
+  assert.deepEqual(result.jsongen_pending_source, { state: "not_attempted" });
 });
 
 test("a prior committed 100-row connector blocks a one-row late snapshot before writer invocation", async () => {
