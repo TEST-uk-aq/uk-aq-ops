@@ -15,7 +15,7 @@ dry_run = false
 notes = "Observations partition maintenance via GitHub Actions"
 
 [jobs.uk_aq_prune_daily]
-enabled = true
+enabled = false
 cron_expr = "30 2 * * *"
 target_type = "github_workflow"
 github_repo = "TEST-uk-aq/uk-aq-ops"
