@@ -35,6 +35,37 @@ checkpoint. Missing overlay checkpoint evidence is permitted only for explicitly
 selected pre-overlay schema-3 history. Schema 4 requires authenticated overlay
 authority. Age and raw provider-status absence never change P/R/null.
 
+The confirmed 17 October 2026 backup evidence supplied by the cross-repository
+review has `history/_index_v3/verification/latest.json` entries for connectors
+**9 and 10, not connector 1 (AURN)**. The inspected AURN **PM2.5** manifests for
+5, 6 and 12 October declare **history schema version 3**. These are the reviewed
+scopes, not proof of every pollutant/day in the proposed operation. No new
+Dropbox read was performed for this documentation correction.
+
+For that selected backup, `1=pre_overlay_accepted` is the expected AURN mode
+**only if supported by accepted connector-transition evidence**. Neither
+connector 1's absence from the overlay pointer nor the inspected schema-3
+manifests establishes that acceptance by itself. The operator must establish
+the accepted AURN transition state before supplying the mode and running.
+That backup-specific acceptance remains an **unresolved operational prerequisite**;
+the example below is not an approval or an instruction to activate a transition.
+
+The [verification-overlay contract's existing-seven-column, reader and cut-over
+rules](https://github.com/TEST-uk-aq/uk-aq-system-docs/blob/bbc09c2da361136bf1dcbdea077f07014f84b668/system_docs/r2_history/observation_verification_overlay_contract.md#existing-seven-column-parquet)
+support schema-3 embedded-status compatibility before accepted connector cut-over.
+The [JSONgen AURN status decision](https://github.com/TEST-uk-aq/uk-aq-system-docs/blob/bbc09c2da361136bf1dcbdea077f07014f84b668/system_docs/station_charts/compressed_history_json_verified_writer_regeneration_contract.md#aurn-verification-status-and-unavailable-source-provenance-decision-17102026)
+requires preservation of canonical P/R/null. These contracts support the code
+path; they do not provide a backup-specific AURN acceptance record.
+
+The existing validator requires an explicit mode; it does not infer acceptance
+from a missing connector overlay. With the reviewed pointer, selecting an AURN
+overlay mode fails because no authoritative connector-1 overlay is selected.
+Conversely, a selected connector-1 overlay contradicts pre-overlay mode, and
+schema 4 cannot use that mode. An unexpected verification transition must fail
+closed and require review. Mode selection is **not an instruction to rewrite
+observation status**: schema-3 embedded `P`, `R` and `null` remain unchanged;
+JSONgen never infers ratification from age or fills stored null with `P`.
+
 Generic connector support grants no public publication permission. Explicitly
 review connector/physical-series/pollutant selection before operation. Other
 networks, including Sensor.Community, must not be promoted by inference. Logical
@@ -84,6 +115,13 @@ intentionally **not fetched** during development. Obtain/review these in narrowl
 scoped metadata preparation for the separately authorised real operation. Never
 substitute the observation root hash for the checkpoint byte digest.
 
+The checkpoint `root.json` is **mutable**: a later backup can replace its bytes.
+The operator must obtain and pin the exact SHA-256 of the selected completed
+root bytes, separately from the observation-root digest. A replaced checkpoint
+must cause a mismatch at the initial read or final stability recheck, even if
+the observation-root digest is unchanged. The tool must not implicitly switch
+to the newer checkpoint/generation or substitute one digest for the other.
+
 Checkpoint year/month completion and selected day state must agree with the
 canonical root/year/month/day/connector/pollutant chain. Valid parent omission
 proves absence; missing referenced objects fail. Every consumed Parquet file
@@ -123,8 +161,9 @@ from reviewed operational evidence; they are not new repository environment keys
 
 ```sh
 # bootstrap_checkpoint_sha256=<exact completed root.json byte SHA-256>
-# bootstrap_verification_modes=1=overlay_accepted
-#   or 1=pre_overlay_accepted ONLY if established by accepted transition evidence
+# bootstrap_verification_modes=1=pre_overlay_accepted
+#   Set ONLY after establishing accepted AURN transition evidence for this backup.
+#   That prerequisite remains unresolved; this example is not run authorisation.
 # bootstrap_output_dir=/absolute/private/work/jsongen-october-seven-days-unique-run
 
 UK_AQ_ENV_NAME=TEST node --max-old-space-size=4096 \
