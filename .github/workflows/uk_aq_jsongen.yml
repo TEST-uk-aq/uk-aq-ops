@@ -1,0 +1,103 @@
+name: UK AQ JSONgen
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Stage A diagnostic environment"
+        required: true
+        type: choice
+        default: TEST
+        options: [TEST]
+      connector_id:
+        description: "Admitted diagnostic connector"
+        required: true
+        type: choice
+        default: "1"
+        options: ["1"]
+      timeseries_id:
+        description: "Admitted diagnostic timeseries (no baseline asserted)"
+        required: true
+        type: choice
+        default: "212"
+        options: ["212"]
+      pollutant:
+        description: "Admitted diagnostic pollutant"
+        required: true
+        type: choice
+        default: pm25
+        options: [pm25]
+      month_utc:
+        description: "Admitted diagnostic UTC month"
+        required: true
+        type: choice
+        default: "2026-09"
+        options: ["2026-09"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-jsongen-test
+  cancel-in-progress: false
+
+jobs:
+  diagnostic:
+    if: ${{ github.repository == 'TEST-uk-aq/uk-aq-ops' && github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Repository validation plus a fixed stage environment; no environment,
+      # credentials or remote destinations can be selected through repo variables.
+      UK_AQ_ENV_NAME: TEST
+      INPUT_ENVIRONMENT: ${{ inputs.environment }}
+      INPUT_CONNECTOR_ID: ${{ inputs.connector_id }}
+      INPUT_TIMESERIES_ID: ${{ inputs.timeseries_id }}
+      INPUT_POLLUTANT: ${{ inputs.pollutant }}
+      INPUT_MONTH_UTC: ${{ inputs.month_utc }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Existing metadata-inspection modules transitively import the repository's
+      # Parquet packages. Installation does not invoke a Parquet reader or writer.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Run bounded local diagnostic
+        run: |
+          set -euo pipefail
+          timeout --kill-after=5s 60s node scripts/jsongen/diagnose.mjs \
+            --environment "$INPUT_ENVIRONMENT" \
+            --connector-id "$INPUT_CONNECTOR_ID" \
+            --timeseries-id "$INPUT_TIMESERIES_ID" \
+            --pollutant "$INPUT_POLLUTANT" \
+            --month-utc "$INPUT_MONTH_UTC"
+
+      - name: Write diagnostic job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -f tmp/jsongen-diagnostic/summary.md ]; then
+            cat tmp/jsongen-diagnostic/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'JSONgen diagnostic did not produce a report. Inspect failed setup/CLI steps. Publication remains ineligible; selector disabled.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload bounded diagnostic report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uk-aq-jsongen-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            tmp/jsongen-diagnostic/report.json
+            tmp/jsongen-diagnostic/summary.md
+          if-no-files-found: warn
+          retention-days: 14
