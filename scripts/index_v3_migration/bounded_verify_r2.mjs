@@ -55,9 +55,33 @@ export async function verifyBoundedDependencies({ baseline, reads, concurrency }
   demand(!store.get('SELECT key FROM objects WHERE verified!=1 LIMIT 1'), 'R2 dependency scan incomplete');
 }
 
+const STABLE_BINDING_CACHE_LIMIT = 8192;
+
+function createStableBindingCache(store) {
+  const cache = new Map();
+  return (timeseriesId) => {
+    const cached = cache.get(timeseriesId);
+    if (cached !== undefined) {
+      // Map insertion order supplies a bounded LRU: the oldest entry is
+      // evicted when a new authenticated binding arrives.
+      cache.delete(timeseriesId); cache.set(timeseriesId, cached);
+      return cached;
+    }
+    const binding = store.get('SELECT connector,pollutant FROM bindings WHERE id=?', timeseriesId);
+    demand(binding && Number.isSafeInteger(binding.connector) && typeof binding.pollutant === 'string',
+      `Stable binding is missing or malformed: ${timeseriesId}`);
+    const verified = Object.freeze({ connector: binding.connector, pollutant: binding.pollutant });
+    if (cache.size >= STABLE_BINDING_CACHE_LIMIT) cache.delete(cache.keys().next().value);
+    cache.set(timeseriesId, verified);
+    return verified;
+  };
+}
+
 export async function verifyBoundedLogicalOutput({ baseline, reads, maxFileRows, maxUncompressedBytes }) {
   const { store, plan } = baseline;
   store.phase = 'verify-independent-logical-content';
+  const stableBinding = createStableBindingCache(store);
+  const logicalRowBatchSize = store.logicalRowBatchSize;
   for (let ordinal = 0; ordinal < baseline.unitCount; ordinal++) {
     const unit = baseline.unit(ordinal, false);
     const manifest = await reads.getObject({ key: unit.source_manifest_identity.key, max_bytes: unit.source_manifest_identity.byte_size });
@@ -73,11 +97,12 @@ export async function verifyBoundedLogicalOutput({ baseline, reads, maxFileRows,
           sosConnectorId: plan.sos_connector_id, maxRows: maxFileRows,
           onMetadata: ({ uncompressedBytes }) => demand(uncompressedBytes <= maxUncompressedBytes,
             `Decoded Parquet byte budget exceeded: ${file.key}`) });
+        let rowsSinceWriteBoundary = 0;
         for (const row of rows) {
           demand(row.connector_id === unit.scope.connector_id && row.pollutant_code === unit.scope.pollutant_code &&
             row.observed_at_utc.slice(0, 10) === unit.scope.day_utc, 'Decoded row contradicts planned partition');
           if (target) {
-            const binding = store.get('SELECT connector,pollutant FROM bindings WHERE id=?', row.timeseries_id);
+            const binding = stableBinding(row.timeseries_id);
             demand(binding && binding.connector === row.connector_id && binding.pollutant === row.pollutant_code,
               `Stable binding disagrees with target observation: ${row.timeseries_id}`);
           }
@@ -88,15 +113,26 @@ export async function verifyBoundedLogicalOutput({ baseline, reads, maxFileRows,
           store.run('INSERT INTO logical_rows VALUES(?)', encoded);
           statuses[row.verification_status === null ? 'null' : row.verification_status]++;
           count++;
-          await store.boundary();
+          if (++rowsSinceWriteBoundary >= logicalRowBatchSize) {
+            await store.logicalWriteBoundary();
+            rowsSinceWriteBoundary = 0;
+          }
         }
-        await store.boundary(true);
+        // Commit the final partial file batch, and keep the existing
+        // cooperative lock/resource checkpoint at every file boundary.
+        await store.logicalWriteBoundary();
       }
       demand(count > 0, 'Independent partition has no observations');
       const hash = createHash('sha256'); hash.update(OBSERVATION_CONTENT_HASH_PREFIX);
+      let rowsSinceReadBoundary = 0;
       for (const row of store.iterate('SELECT encoded FROM logical_rows ORDER BY encoded COLLATE BINARY')) {
-        hash.update(row.encoded); hash.update('\n'); await store.boundary();
+        hash.update(row.encoded); hash.update('\n');
+        if (++rowsSinceReadBoundary >= logicalRowBatchSize) {
+          await store.logicalReadBoundary();
+          rowsSinceReadBoundary = 0;
+        }
       }
+      await store.logicalReadBoundary();
       return { observation_content_hash: hash.digest('hex'), observation_content_hash_algorithm: 'sha256',
         observation_content_hash_contract_version: 1, observation_content_hash_row_count: count,
         observation_content_hash_columns: [...OBSERVATION_CONTENT_HASH_COLUMNS], verification_status_counts: statuses };

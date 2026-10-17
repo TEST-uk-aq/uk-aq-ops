@@ -6,6 +6,7 @@ import { sha256StableMigrationJson } from '../backup_r2/lib/observation_history_
 
 export const MiB = 1024 ** 2;
 export const GiB = 1024 ** 3;
+export const LOGICAL_ROW_BATCH_SIZE = 1024;
 export const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 export const same = (a, b) => sha256StableMigrationJson(a) === sha256StableMigrationJson(b);
 export const demand = (condition, message) => { if (!condition) throw new Error(message); };
@@ -100,6 +101,7 @@ export class VerificationStore {
 
   constructor(options) {
     Object.assign(this, options);
+    this.logicalRowBatchSize = LOGICAL_ROW_BATCH_SIZE;
     this.statements = new Map();
     this.started = Date.now(); this.lastProgress = 0;
     this.counters = { journal_entries: 0, completion_records: 0, publication_records: 0, r2_dependencies: 0, logical_partitions: 0 };
@@ -120,6 +122,19 @@ export class VerificationStore {
     if (++this.pending >= this.batchSize || force) {
       this.flush(); this.progress(); await tick(); this.assertHeld();
     }
+  }
+  // Logical-row writes use their own larger batch so the existing general
+  // transaction cadence remains unchanged for journal/index work.
+  async logicalWriteBoundary() {
+    this.assertHeld();
+    this.flush(); this.progress(); await tick(); this.assertHeld();
+  }
+  // Never commit or otherwise touch SQLite while an ordered row iterator is
+  // active. This boundary runs the existing throttled resource/progress gate,
+  // yields, and reasserts the supervised lock.
+  async logicalReadBoundary() {
+    this.assertHeld();
+    this.progress(); await tick(); this.assertHeld();
   }
   progress(force = false) {
     if (!force && Date.now() - this.lastProgress < 15000) return;

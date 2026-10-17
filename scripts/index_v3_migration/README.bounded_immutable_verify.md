@@ -84,6 +84,15 @@ concurrency alone does not remove those allocations.
    SQLite BINARY order exactly matches JS string sort. Source/target/planned row
    counts, full content metadata, P/R/null counts and every target stable binding
    must agree. No sampling or approximate identity is used.
+   Logical-row writes are committed in internal 1,024-row batches (with a final
+   commit at each Parquet-file boundary). Ordered-row hashing uses a separate
+   read-only boundary at the same cadence: it rechecks the supervised lock,
+   invokes the existing throttled resource/progress gate and yields without
+   issuing `COMMIT; BEGIN` against the active SQLite iterator. Target binding
+   checks use a bounded 8,192-entry LRU cache whose values are copied from the
+   authenticated SQLite `bindings` table; every target row still performs the
+   connector/pollutant comparison, and a cache miss still fails closed for
+   missing or malformed data.
 10. The unchanged v2 source root is checked before and after all current R2
     checks. Checkpoint and recovery anchors are rechecked before completion.
     Every expected R2 dependency and every partition must have completed.
@@ -113,6 +122,8 @@ Defaults and admission limits:
 | Process RSS | Fail incomplete if observed above 6 GiB at progress boundaries |
 | R2 concurrency | 1 by default; explicitly configurable 1..16 |
 | Transaction/yield batch | 128; configurable 1..1024 |
+| Logical-row write/read batch | 1,024 internal rows; not a new CLI setting |
+| Stable binding cache | At most 8,192 authenticated entries; bounded LRU |
 | GET body | 128 MiB maximum; configurable up to 256 MiB |
 | One Parquet decode | 250,000 rows / 256 MiB declared uncompressed bytes; caps configurable up to 500,000 / 512 MiB |
 | Checkpoint/report/master/shard | 4 MiB each |
@@ -296,6 +307,12 @@ A different setting requires the existing supervisor to finish or stop,
 confirmed release of its lock, an unchanged writer freeze and a fresh
 invocation using new scratch/log directories and reviewed current Git SHA.
 
+The existing `--batch-size` remains the general journal/index transaction and
+yield setting. Logical observation rows use the fixed internal 1,024-row
+cadence above so increasing logical throughput does not broaden every other
+SQLite transaction. The verifier still defaults to `--batch-size 128`; no new
+environment variable or command-line option is required.
+
 There is **no acceptance resume** and no R2-check reuse in this version, including
 after a controlled interruption. Every invocation creates a fresh private store,
 reauthenticates the complete original evidence and repeats EVERY R2/logical check
@@ -356,6 +373,11 @@ and `--help`, the narrow boundary check, review of bounded loops/limits and
 GET/HEAD-only capability, unchanged historical pin list and mutation call sites,
 current import-closure inventory, and `git diff --check`. No broad suite,
 full-evidence run, LIVE R2/Supabase access, migration, rollback or cutover was run.
+
+The logical verifier optimisation preserves the existing concurrency-16 opt-in
+and publication primary-key scheduling change. Full-archive timing, SQLite
+index expansion, peak RSS/disk use and the hit rate of the 8,192-entry binding
+cache remain unmeasured until separately authorised real TEST validation.
 
 ## System-doc handover and remaining acceptance blockers
 
