@@ -16,9 +16,11 @@ export function describePruneGateOutboxEvidence({ pending, connector, finalPrepa
     throw new Error('Acknowledged Prune pending source lacks its intent');
   }
   const manifest = connector?.connector_manifest;
-  // The schema requires a byte-pinned connector manifest for a preparation.
-  // Without one, keep the honest gate-only state.
+  // Retain final bytes only when every required writer-produced metadata byte
+  // was captured. The DB row can still retain gate acceptance without them.
   const bytes = manifest?.sha256 && manifest?.byte_size
+    && finalPreparation?.envelope?.original_metadata_snapshot?.completeness ===
+      'exact_writer_metadata_captured_unverified'
     ? finalPreparation?.bytes ?? null : null;
   return {
     connector_manifest_byte_sha256: manifest?.sha256 || null,

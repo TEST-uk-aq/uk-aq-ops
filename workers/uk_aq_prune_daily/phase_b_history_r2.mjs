@@ -13,6 +13,7 @@ import { randomUUID } from "node:crypto";
 import { uploadPrunePendingSource, resolvePruneSignerConfig, PRUNE_SIGNED_UPLOAD_DEADLINE_MS } from "../../scripts/jsongen/prune-signed-upload.mjs";
 import { preparePruneOriginalFinalEvidence } from "../../scripts/jsongen/prune-final-evidence.mjs";
 import { describePruneGateOutboxEvidence } from "../../scripts/jsongen/prune-outbox.mjs";
+import { createPruneOriginalMetadataCapture, preparePruneOriginalMetadataSnapshot } from "../../scripts/jsongen/prune-original-metadata.mjs";
 import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import Cursor from "pg-cursor";
@@ -105,6 +106,18 @@ import {
   mergeAqiHourlyRowsPreferTargetDay,
   sourceObservationsToNarrowRows,
 } from "../../lib/aqi/aqi_levels.mjs";
+
+const jsongenOriginalMetadataCaptures = new WeakMap();
+function optionalJsongenMetadataCapture(runtime) {
+  if (runtime.history_write_version !== 'v3' || runtime.jsongen_pending_source?.enabled !== true)
+    return null;
+  let capture = jsongenOriginalMetadataCaptures.get(runtime);
+  if (!capture) {
+    capture = createPruneOriginalMetadataCapture();
+    jsongenOriginalMetadataCaptures.set(runtime, capture);
+  }
+  return capture;
+}
 
 const ISOLATED_HISTORY_BLOCK = "PRUNE_HISTORY_AUTHORITY_BLOCKED:";
 const UNPROVEN_GATE_RECOVERY = "PRUNE_GATE_ONLY_RECOVERY_UNPROVEN:";
@@ -3726,6 +3739,7 @@ async function publishFrozenV2Observations({ candidate, runtime, streamClient, r
 }
 
 async function publishFrozenV3Observations({ candidate, runtime, streamClient, rows, backedUpAtUtc }) {
+  const metadataCapture = optionalJsongenMetadataCapture(runtime);
   const byPollutant = new Map();
   for (const row of rows) {
     const code = normalizePollutantCodeForPath(row.pollutant_code);
@@ -3753,7 +3767,9 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
 
   const publicationGetObject = async ({ r2, key }) => {
     assertPublicationRequestBudget("v3_publication_r2_read", 1, { key });
-    return await r2GetObject({ r2: r2 || runtime.r2, key });
+    const object = await r2GetObject({ r2: r2 || runtime.r2, key });
+    metadataCapture?.recordPublishedObject({ key, body: object?.body });
+    return object;
   };
 
   const publicationPutIfChanged = async (object) => {
@@ -3762,7 +3778,9 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
     assertPublicationRequestBudget("v3_publication_json_artifact", 3, {
       key: object?.key || null,
     });
-    return await r2PutObjectIfChanged({ ...object, r2: runtime.r2 });
+    const result = await r2PutObjectIfChanged({ ...object, r2: runtime.r2 });
+    if (result?.ok !== false) metadataCapture?.recordPublishedObject(object);
+    return result;
   };
 
   const diagnosticLog = (event, fields = {}) => {
@@ -3916,6 +3934,11 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
     total_bytes: BigInt(manifest.total_bytes), file_count: files.length,
     files, parquet_object_keys: files.map((file) => file.key),
     v3_connector_publication: publication.run_finalization_evidence,
+    ...(metadataCapture ? { jsongen_original_metadata_references: {
+      canonical: [...result.canonical.pollutant_manifests,
+        result.canonical.connector_manifest],
+      exact: [...result.v3_exact_publication.objects],
+    } } : {}),
   };
 }
 
@@ -3960,6 +3983,7 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
     return finalizeObservationV2Run({ client, runtime, publishedCandidates, diagnostics });
   }
   resolvePruneHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version });
+  const metadataCapture = optionalJsongenMetadataCapture(runtime);
   const affectedDays = uniqueSorted(
     publishedCandidates.map(({ candidate }) => candidate.day_utc),
   );
@@ -3977,14 +4001,18 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
   };
   const finalizationGetObject = async ({ r2, key }) => {
     assertFinalizationRequestBudget("v3_run_finalization_r2_read", 1, { key });
-    return await r2GetObject({ r2: r2 || runtime.r2, key });
+    const object = await r2GetObject({ r2: r2 || runtime.r2, key });
+    metadataCapture?.recordPublishedObject({ key, body: object?.body });
+    return object;
   };
   const finalizationPutIfChanged = async (object) => {
     // HEAD + PUT + GET is one retry-safe idempotent publication operation.
     assertFinalizationRequestBudget("v3_run_finalization_json_artifact", 3, {
       key: object?.key || null,
     });
-    return await r2PutObjectIfChanged({ ...object, r2: runtime.r2 });
+    const result = await r2PutObjectIfChanged({ ...object, r2: runtime.r2 });
+    if (result?.ok !== false) metadataCapture?.recordPublishedObject(object);
+    return result;
   };
   const finalizationPutObject = async (object) => {
     // The hierarchy finalizer reads the changed object back immediately. Admit
@@ -3992,7 +4020,9 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
     assertFinalizationRequestBudget("v3_run_finalization_hierarchy_artifact", 2, {
       key: object?.key || null,
     });
-    return await r2PutObject({ ...object, r2: object?.r2 || runtime.r2 });
+    const result = await r2PutObject({ ...object, r2: object?.r2 || runtime.r2 });
+    if (result?.ok !== false) metadataCapture?.recordPublishedObject(object);
+    return result;
   };
   const finalizationListAllCommonPrefixes = async ({
     r2,
@@ -4373,21 +4403,45 @@ async function finalizePublishedPhaseBConnectors({
       if (runtime.history_write_version === 'v3' && runtime.jsongen_pending_source?.enabled === true) {
         if (exportResult.jsongen_pending_source?.state === 'put_acknowledged_unverified') {
           try {
+            const dayReferences = (result.affected_days_utc || []).map(dayUtc =>
+              (result.day_results || []).find(entry => entry.day_utc === dayUtc)?.day_manifest);
+            const originalMetadataSnapshot = preparePruneOriginalMetadataSnapshot({
+              capture: optionalJsongenMetadataCapture(runtime),
+              bucket: runtime.r2?.bucket,
+              dayUtc: candidate.day_utc, connectorId: candidate.connector_id,
+              runId, writerGitSha: runtime.writer_git_sha,
+              canonicalReferences: exportResult.jsongen_original_metadata_references?.canonical,
+              exactReferences: exportResult.jsongen_original_metadata_references?.exact,
+              dayReferences, affectedDaysUtc: result.affected_days_utc,
+              aggregateReferences: result.canonical_aggregate_result?.aggregate_manifests,
+              latestReferences: result.v3_publication?.latest_global?.objects,
+            });
             published.jsongen_final_evidence_preparation = prepareJsonGenFinalEvidence({
               pending: exportResult.jsongen_pending_source,
               connector: connectorGateEvidence.jsongen_connector_snapshot,
               finalization: result, runId, dayUtc: candidate.day_utc,
               connectorId: candidate.connector_id, writerGitSha: runtime.writer_git_sha,
+              originalMetadataSnapshot,
             });
+            const retainedMetadata = published.jsongen_final_evidence_preparation.envelope
+              .original_metadata_snapshot;
             logPhaseB(runtime, 'INFO', 'phase_b_jsongen_original_final_evidence_prepared', {
               day_utc: candidate.day_utc, connector_id: candidate.connector_id,
               preparation_sha256: published.jsongen_final_evidence_preparation.sha256,
               retention_state: 'transient_writer_memory_only', authority_state: 'precommit_prepared_unverified',
+              metadata_completeness: retainedMetadata.completeness,
+              metadata_reason: retainedMetadata.reason || null,
+              metadata_object_count: retainedMetadata.required_object_count,
+              metadata_raw_byte_size: retainedMetadata.required_raw_byte_size,
+              metadata_required_keys_preview: retainedMetadata.required_keys_preview || [],
+              complete_envelope_byte_size: retainedMetadata.complete_envelope_byte_size || null,
+              preparation_byte_size: published.jsongen_final_evidence_preparation.byte_size,
             });
-          } catch {
+          } catch (error) {
             logPhaseB(runtime, 'WARNING', 'phase_b_jsongen_original_final_evidence_unavailable', {
               day_utc: candidate.day_utc, connector_id: candidate.connector_id,
-              reason: 'incomplete_original_evidence_preparation',
+              reason: error?.message === 'JSONgen final preparation exceeds bounded metadata size'
+                ? 'metadata_payload_exceeds_1mib' : 'incomplete_original_evidence_preparation',
             });
           }
         }
@@ -4423,6 +4477,10 @@ async function finalizePublishedPhaseBConnectors({
         outbox_state: outbox ? 'outbox_missing' : 'disabled',
         outbox_reason: outbox ? 'completion_result_unavailable' : null,
       };
+      published.jsongen_metadata_completeness = outbox
+        ? published.jsongen_final_evidence_preparation?.envelope
+          ?.original_metadata_snapshot?.completeness || 'not_captured'
+        : 'disabled';
       if (runtime.history_write_version === 'v3') {
         logPhaseB(runtime,
           ['outbox_missing', 'outbox_unresolved'].includes(published.jsongen_outbox.outbox_state)
@@ -4432,6 +4490,7 @@ async function finalizePublishedPhaseBConnectors({
             reason: published.jsongen_outbox.outbox_reason,
             pending_disposition: outbox?.evidence?.pending_disposition || null,
             final_evidence_state: outbox?.evidence?.final_evidence_state || 'not_captured',
+            metadata_completeness: published.jsongen_metadata_completeness,
             authority_state: 'unverified',
           });
         if (outbox && exportResult.jsongen_pending_source?.state !== 'put_acknowledged_unverified') {
@@ -4514,6 +4573,10 @@ async function finalizeAndRecordPublishedPhaseBBatch({
           exportResult.jsongen_pending_source?.state !== 'put_acknowledged_unverified') {
         summary.jsongen_incomplete_source_coverage_count =
           (summary.jsongen_incomplete_source_coverage_count || 0) + 1;
+      }
+      if (completed.jsongen_metadata_completeness === 'not_captured') {
+        summary.jsongen_metadata_incomplete_count =
+          (summary.jsongen_metadata_incomplete_count || 0) + 1;
       }
       completedWrittenRows += exportResult.written_row_count;
       completedWrittenBytes += exportResult.total_bytes;
@@ -5253,7 +5316,7 @@ export async function verifyObservationConnectorHistory({
       opaque_preserved_pollutant_count: 0,
       ...(jsongenChildren ? { jsongen_connector_snapshot: {
         manifest_key: manifestKey, manifest_hash: connectorManifestHash,
-        run_id: connectorManifest.run_id,
+        run_id: runtime.run_id,
         day_utc: dayUtc, connector_id: connectorId,
         connector_manifest: { bucket: runtime.r2.bucket, key: manifestKey,
           sha256: sha256Hex(connectorObject.body), byte_size: connectorObject.body.byteLength },
@@ -6903,6 +6966,7 @@ export async function runPhaseBBackup({
     jsongen_outbox_unresolved_count: 0,
     jsongen_outbox_missing_preview: [],
     jsongen_incomplete_source_coverage_count: 0,
+    jsongen_metadata_incomplete_count: 0,
     failed_candidates: 0,
     blocked_scope_count: 0,
     blocked_scopes_preview: [],

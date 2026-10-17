@@ -11,6 +11,7 @@ import { preparePrunePendingSource } from '../scripts/jsongen/prune-pending-sour
 import { uploadPrunePendingSource } from '../scripts/jsongen/prune-signed-upload.mjs';
 import { preparePruneOriginalFinalEvidence } from '../scripts/jsongen/prune-final-evidence.mjs';
 import { describePruneGateOutboxEvidence } from '../scripts/jsongen/prune-outbox.mjs';
+import { createPruneOriginalMetadataCapture, preparePruneOriginalMetadataSnapshot } from '../scripts/jsongen/prune-original-metadata.mjs';
 import { canonicalJson } from '../scripts/jsongen/schema.mjs';
 import { verifyPrunePendingSource } from '../scripts/jsongen/prune-pending-verification.mjs';
 import signerWorker from '../workers/uk_aq_jsongen_signer/worker.mjs';
@@ -23,6 +24,27 @@ const row = { connector_id: 1, station_id: 5, timeseries_id: 8, pollutant_code: 
   value: 1.23456789012345, verification_status: 'P' };
 const signer = { endpoint: 'https://signer.test.example/v1/upload-intents',
   writerToken: 'w'.repeat(32), accessId: 'test-id', accessSecret: 'test-secret' };
+
+function sampleOriginalMetadataSnapshot() {
+  const capture = createPruneOriginalMetadataCapture();
+  const entries = ['canonical', 'child', 'exact', 'day', 'aggregate', 'latest'].map(role => {
+    const key = role === 'canonical'
+      ? `history/v3/observations/day_utc=${dayUtc}/connector_id=1/manifest.json`
+      : `history/v3/observations/${role}.json`;
+    const body = Buffer.from(`{  "role": "${role}" }\n`);
+    const reference = { key, byte_size: body.byteLength, verified: true, durable: true,
+      sha256: createHash('sha256').update(body).digest('hex') };
+    capture.recordPublishedObject({ key, body });
+    return { role, body, reference };
+  });
+  const args = { capture, bucket: 'uk-aq-test', dayUtc, connectorId: 1, runId,
+    writerGitSha: '4'.repeat(40),
+    canonicalReferences: [entries[0].reference, entries[1].reference],
+    exactReferences: [entries[2].reference], dayReferences: [entries[3].reference],
+    affectedDaysUtc: [dayUtc],
+    aggregateReferences: [entries[4].reference], latestReferences: [entries[5].reference] };
+  return { args, entries, snapshot: preparePruneOriginalMetadataSnapshot(args) };
+}
 
 async function fixtureAsync(fn) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'jsongen-pending-'));
@@ -195,6 +217,38 @@ test('PUT deadline is ambiguous and retains only a safe reconciliation reference
   });
 });
 
+test('exact writer metadata bytes are retained by value only for a complete bounded reference set', () => {
+  const { args, entries, snapshot } = sampleOriginalMetadataSnapshot();
+  assert.equal(snapshot.completeness, 'exact_writer_metadata_captured_unverified');
+  assert.equal(snapshot.required_object_count, 6);
+  for (const entry of entries) {
+    const stored = snapshot.objects.find(object => object.key === entry.reference.key);
+    assert.equal(Buffer.from(stored.bytes_base64, 'base64').equals(entry.body), true);
+    assert.equal(stored.sha256, entry.reference.sha256);
+  }
+  const missing = preparePruneOriginalMetadataSnapshot({
+    ...args, exactReferences: [{ ...entries[2].reference, sha256: '0'.repeat(64) }],
+  });
+  assert.equal(missing.completeness, 'not_captured');
+  assert.equal(missing.reason, 'original_bytes_unavailable');
+  assert.equal(missing.objects, undefined);
+  const missingDay = preparePruneOriginalMetadataSnapshot({
+    ...args, affectedDaysUtc: [dayUtc, '2025-01-03'],
+  });
+  assert.equal(missingDay.completeness, 'not_captured');
+  assert.deepEqual(missingDay.missing_roles, ['day_manifest']);
+  const conflicting = preparePruneOriginalMetadataSnapshot({
+    ...args, exactReferences: [{ ...entries[0].reference, sha256: '0'.repeat(64) }],
+  });
+  assert.equal(conflicting.reason, 'conflicting_publication_reference');
+  assert.equal(conflicting.completeness, 'not_captured');
+  const oversized = preparePruneOriginalMetadataSnapshot({
+    ...args, latestReferences: [{ ...entries[5].reference, byte_size: 786433 }],
+  });
+  assert.equal(oversized.completeness, 'not_captured');
+  assert.equal(oversized.reason, 'metadata_payload_exceeds_1mib');
+});
+
 test('pre-commit final preparation and outbox description retain only unverified original evidence', async () => {
   await fixtureAsync(async ({ candidate }) => {
     const prepared = preparePrunePendingSource(candidate);
@@ -205,15 +259,19 @@ test('pre-commit final preparation and outbox description retain only unverified
     const pending = { state: 'put_acknowledged_unverified', intent_id: 'b'.repeat(64),
       source, pending_evidence: prepared.evidence,
       preparation_sha256: 'c'.repeat(64), source_evidence_sha256: 'd'.repeat(64) };
-    const manifestKey = `history/v3/observations/day_utc=${dayUtc}/connector_id=1/manifest.json`;
+    const metadata = sampleOriginalMetadataSnapshot();
+    const manifestKey = metadata.entries[0].reference.key;
     const connector = { run_id: runId, day_utc: dayUtc, connector_id: 1,
       manifest_key: manifestKey, manifest_hash: 'e'.repeat(64),
-      connector_manifest: { key: manifestKey, sha256: 'f'.repeat(64), byte_size: 123 },
-      pollutant_manifests: prepared.evidence.scope.pollutant_partitions,
+      connector_manifest: { bucket: metadata.args.bucket,
+        ...metadata.entries[0].reference },
+      pollutant_manifests: prepared.evidence.scope.pollutant_partitions
+        .map(partition => ({ ...partition, manifest: metadata.entries[1].reference })),
       scoped_roots: [] };
     const finalPreparation = preparePruneOriginalFinalEvidence({
       pending, connector, finalization: { ok: true, affected_days_utc: [dayUtc] },
       runId, dayUtc, connectorId: 1, writerGitSha: '4'.repeat(40),
+      originalMetadataSnapshot: metadata.snapshot,
     });
     assert.equal(finalPreparation.envelope.original_candidate_connector_gate.transaction_state,
       'not_asserted_in_preparation');
@@ -223,7 +281,30 @@ test('pre-commit final preparation and outbox description retain only unverified
     assert.equal(evidence.final_evidence_state, 'prepared_unverified');
     assert.equal(evidence.pending_disposition, 'put_acknowledged_unverified');
     assert.equal(evidence.original_source_status_provenance, 'original_source_status_unavailable');
-    assert.equal(evidence.connector_manifest_byte_sha256, 'f'.repeat(64));
+    assert.equal(evidence.connector_manifest_byte_sha256, metadata.entries[0].reference.sha256);
+    assert.equal(finalPreparation.envelope.original_metadata_snapshot.objects.length, 6);
+    const overLimit = preparePruneOriginalFinalEvidence({
+      pending, connector, finalization: { ok: true, affected_days_utc: [dayUtc] },
+      runId, dayUtc, connectorId: 1, writerGitSha: '4'.repeat(40),
+      originalMetadataSnapshot: { ...metadata.snapshot, objects:
+        metadata.snapshot.objects.map((object, index) => index === 0
+          ? { ...object, bytes_base64: 'a'.repeat(1024 * 1024) } : object) },
+    });
+    assert.equal(overLimit.envelope.original_metadata_snapshot.completeness, 'not_captured');
+    assert.equal(overLimit.envelope.original_metadata_snapshot.reason, 'metadata_payload_exceeds_1mib');
+    assert.equal(describePruneGateOutboxEvidence({ pending, connector,
+      finalPreparation: overLimit }).final_evidence_state, 'not_captured');
+    assert.throws(() => preparePruneOriginalFinalEvidence({
+      pending, connector, finalization: { ok: true, affected_days_utc: [dayUtc] },
+      runId, dayUtc, connectorId: 1, writerGitSha: '4'.repeat(40),
+      originalMetadataSnapshot: { ...metadata.snapshot, invocation_id: 'another-run' },
+    }), /snapshot is not bound/);
+    const incomplete = preparePruneOriginalFinalEvidence({
+      pending, connector, finalization: { ok: true, affected_days_utc: [dayUtc] },
+      runId, dayUtc, connectorId: 1, writerGitSha: '4'.repeat(40),
+    });
+    assert.equal(describePruneGateOutboxEvidence({ pending, connector,
+      finalPreparation: incomplete }).final_evidence_state, 'not_captured');
     assert.equal(describePruneGateOutboxEvidence({ pending: { state: 'no_intent' }, connector })
       .final_evidence_state, 'not_captured');
     assert.equal(describePruneGateOutboxEvidence({ pending: { state: 'not_attempted' }, connector })

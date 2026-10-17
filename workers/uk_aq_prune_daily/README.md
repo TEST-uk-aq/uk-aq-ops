@@ -50,16 +50,23 @@ gaps, but a missing event is not discoverable from the outbox later. A unique
 identity conflict is `outbox_unresolved`: an earlier event may exist and must
 be independently compared, never rewritten or treated as this call's success.
 
-The 1 MiB preparation is a structural cap, not measured operational capacity
-or complete final authority. Prune already reads the exact connector manifest
-and child metadata during verification, but the envelope retains references
-and hashes rather than every original mutable connector/child/parent/index/root
-metadata byte. Those keys may later change. `prepared_unverified` or
-`not_captured` therefore cannot authorize a Stage 1 VERIFIED receipt,
-JSONgen selection or monthly publication. A separately reviewed complete
-bounded snapshot or pre-gate independently verified immutable metadata
-reference is still required. No canonical Parquet reread or optional derived
-network operation occurs inside the PostgreSQL transaction.
+When bounded, the versioned preparation includes exact original bytes for the
+writer-published connector/pollutant manifests, exact-v3 aligned shards/leaves
+and scoped roots, all affected day parents, aggregate parents and latest-global index.
+These replaceable canonical keys cannot be used later to recover overwritten
+original bytes. The snapshot uses the existing PUT/readback path and actual
+verified writer references; no additional R2 GET or routine Parquet reread is
+added. Exact bytes are base64 encoded once in the deterministic envelope.
+The 8 MiB / 4,096-object transient capture ceiling and 1 MiB database payload limit are
+structural safeguards, not measured operational capacity. Missing bytes or an
+oversized envelope yield `not_captured` in a successfully inserted outbox row and bounded coverage
+diagnostics while an otherwise safe gate still commits. An oversized scope
+needs a separately reviewed immutable metadata snapshot with verified exact
+bytes before gate acceptance; no such external pipeline is implemented.
+`prepared_unverified` proves neither independent source readback nor original
+or current canonical authority, and cannot authorize a VERIFIED receipt,
+JSONgen selection or monthly publication. No derived network operation occurs
+inside the PostgreSQL transaction.
 Before TEST activation, verify real signer permissions, conditional PUT and
 private readback, budget limits, canonical finalization and gate results,
 interruption recovery, and a durable independently authenticated final evidence

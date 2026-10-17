@@ -12,7 +12,7 @@ const references = values => (Array.isArray(values) ? values : [])
   .map(reference).filter(Boolean).sort((a, b) => a.key.localeCompare(b.key));
 
 export function preparePruneOriginalFinalEvidence({ pending, connector, finalization,
-  runId, dayUtc, connectorId, writerGitSha }) {
+  runId, dayUtc, connectorId, writerGitSha, originalMetadataSnapshot = null }) {
   if (pending?.state !== 'put_acknowledged_unverified'
     || pending.pending_evidence?.writer?.invocation_id !== runId
     || pending.pending_evidence?.connector_id !== connectorId
@@ -36,6 +36,24 @@ export function preparePruneOriginalFinalEvidence({ pending, connector, finaliza
       || !same(child.verification_status_counts, partition.verification_status_counts))
       throw new Error('JSONgen frozen source does not match original canonical pollutant content');
   }
+  if (originalMetadataSnapshot?.completeness === 'exact_writer_metadata_captured_unverified') {
+    const objects = originalMetadataSnapshot.objects;
+    const contains = reference => objects.some(object =>
+      object.key === reference?.key && object.sha256 === reference?.sha256
+      && object.byte_size === reference?.byte_size
+      && object.canonical_bucket === connector.connector_manifest.bucket);
+    if (originalMetadataSnapshot.day_utc !== dayUtc
+      || originalMetadataSnapshot.connector_id !== connectorId
+      || originalMetadataSnapshot.invocation_id !== runId
+      || originalMetadataSnapshot.writer_git_sha !== writerGitSha
+      || !same(originalMetadataSnapshot.affected_days_utc, finalization.affected_days_utc)
+      || !Array.isArray(objects)
+      || !contains(connector.connector_manifest)
+      || actual.some(child => !contains(child.manifest))
+      || (connector.scoped_roots || []).some(root => !contains(root.reference))) {
+      throw new Error('JSONgen original metadata snapshot is not bound to the connector publication');
+    }
+  }
   const dayResult = (finalization.day_results || []).find(entry => entry.day_utc === dayUtc);
   const envelope = {
     schema_version: 1,
@@ -52,6 +70,13 @@ export function preparePruneOriginalFinalEvidence({ pending, connector, finaliza
       original_source_status: pending.pending_evidence.original_source_status,
       effective_verification_status: pending.pending_evidence.effective_verification_status },
     original_connector_publication: connector,
+    original_metadata_snapshot: originalMetadataSnapshot?.completeness ===
+      'exact_writer_metadata_captured_unverified'
+      ? originalMetadataSnapshot
+      : { schema_version: 1, completeness: 'not_captured',
+        reason: originalMetadataSnapshot?.reason || 'original_metadata_snapshot_unavailable',
+        required_object_count: originalMetadataSnapshot?.required_object_count ?? null,
+        required_raw_byte_size: originalMetadataSnapshot?.required_raw_byte_size ?? null },
     original_final_batch: {
       affected_days_utc: [...finalization.affected_days_utc],
       canonical_aggregate_references: references(finalization.canonical_aggregate_result?.aggregate_manifests),
@@ -72,12 +97,26 @@ export function preparePruneOriginalFinalEvidence({ pending, connector, finaliza
     unresolved: [
       'pending_private_readback_not_in_original_prune_path',
       'original_gate_acceptance_is_external_to_prepared_envelope',
-      'mutable_canonical_parent_and_index_bytes_not_retained_as_original_snapshot',
+      ...(originalMetadataSnapshot?.completeness === 'exact_writer_metadata_captured_unverified'
+        ? [] : ['original_canonical_metadata_bytes_not_completely_captured']),
       'current_canonical_status_and_binding_authority_not_independently_authenticated',
       'evidence_envelope_retention_depends_on_optional_outbox_commit',
     ],
   };
-  const bytes = canonicalJson(envelope);
+  let bytes = canonicalJson(envelope);
+  if (bytes.length > 1024 * 1024 &&
+    envelope.original_metadata_snapshot.completeness === 'exact_writer_metadata_captured_unverified') {
+    envelope.original_metadata_snapshot = {
+      schema_version: 1, completeness: 'not_captured',
+      reason: 'metadata_payload_exceeds_1mib',
+      required_object_count: originalMetadataSnapshot.required_object_count,
+      required_raw_byte_size: originalMetadataSnapshot.required_raw_byte_size,
+      required_keys_preview: originalMetadataSnapshot.objects.slice(0, 10).map(object => object.key),
+      complete_envelope_byte_size: bytes.length,
+    };
+    envelope.unresolved.push('original_canonical_metadata_bytes_not_completely_captured');
+    bytes = canonicalJson(envelope);
+  }
   if (bytes.length > 1024 * 1024)
     throw new Error('JSONgen final preparation exceeds bounded metadata size');
   return { envelope, bytes, sha256: sha256Hex(bytes), byte_size: bytes.length,

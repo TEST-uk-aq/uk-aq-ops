@@ -47,7 +47,13 @@ transaction begins, Prune can prepare a version-1 original-final evidence
 envelope. It compares the pending partition content hashes, counts and effective
 statuses with the original canonical child manifests, and captures already-read
 connector/child manifest byte identities, canonical file metadata, selected-v3
-exact-scope references and final batch references. The envelope explicitly
+exact-scope references and final batch references. When bounded, its versioned
+`original_metadata_snapshot` also stores exact bytes for the canonical
+connector/pollutant manifests, published exact-v3 aligned shards/leaves/scoped
+roots, every affected day manifest, affected aggregate ancestors and latest-global index.
+These are selected from the writer's verified publication references, with
+byte hashes and lengths checked against exact bytes observed in its existing
+PUT/readback path. This adds no R2 request. The envelope explicitly
 does not assert a successful gate commit before the transaction runs.
 It adds no routine Parquet read and no derived R2 readback to canonical Prune.
 When the TEST-only handover is enabled, the optional function proposed in open
@@ -58,19 +64,24 @@ gate commits. A committed gate with no event yields `outbox_missing`, not a
 discoverable receipt. An immutable-key conflict yields `outbox_unresolved`
 until the existing row is independently compared. A retained row is append-only original gate evidence,
 not independent final-publication authentication or current authority.
-Mutable canonical keys and a later CONSUMED gate cannot reconstruct the
-original publication. The retained preparation still lacks all original
-mutable parent/index/root metadata bytes and cannot itself become VERIFIED.
+Mutable canonical keys and a later CONSUMED gate cannot reconstruct missing
+original bytes. If any required byte is absent, the bounded capture or the
+1 MiB database envelope limit is exceeded, a successful optional outbox insert
+records `final_evidence_state=not_captured`; the run logs the coverage gap. The
+8 MiB / 4,096-object transient capture ceiling prevents unbounded writer memory use. A
+bounded snapshot remains `prepared_unverified` until a separate reader
+authenticates its bytes, relationships, original source and canonical authority.
 The Stage 1 receipt
 additionally requires independently meaningful before/after,
 binding, provenance, scope-completeness and retained-receipt authority
 references. Current Prune finalisation returns verified aggregate/index/latest
-control-flow evidence but does not retain a byte-pinned, complete
-source-to-final-publication proof across interruption. PostgreSQL gate-only
+control-flow evidence; the optional snapshot and outbox may now retain exact
+writer-produced metadata, but do not independently authenticate it. PostgreSQL gate-only
 recovery remains disabled by its own contract. This code therefore does not
 produce a bundle or receipt, promote `authenticateFinalPublication()`, mutate
 managed control, dispatch JSONgen, or select monthly publication. Stage 3B
-must define complete immutable final metadata, independent authentication,
+must define independent metadata/source authentication, an immutable external
+metadata snapshot for scopes that exceed 1 MiB, and
 delivery/reconciliation and missing-registration detection before complete
 coverage can be claimed. The existing `selectManagedPublications()` blocker remains.
 The [original gate durability review](../../docs/investigations/jsongen_prune_final_evidence_durability_boundary.md)
