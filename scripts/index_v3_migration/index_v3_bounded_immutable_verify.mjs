@@ -66,7 +66,7 @@ export function parseBoundedVerifyArgs(argv) {
     const value = args[name] === undefined ? fallback : Number(args[name]);
     demand(Number.isSafeInteger(value) && value >= 1 && value <= max, `Invalid --${name} (1..${max})`); return value;
   };
-  args.concurrency = integer('r2-concurrency', 1, 4);
+  args.concurrency = integer('r2-concurrency', 1, 16);
   args.batchSize = integer('batch-size', 128, 1024);
   args.maxObjectBytes = integer('max-object-mib', 128, 256) * MiB;
   args.maxFileRows = integer('max-file-rows', 250000, 500000);
