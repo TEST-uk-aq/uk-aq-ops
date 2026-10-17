@@ -2,9 +2,11 @@
 
 This isolated Worker only issues `POST /v1/upload-intents` for a Prune Daily v3
 connector-day pending source. It is **inactive**: `UK_AQ_JSONGEN_SIGNER_ENABLED`
-defaults to `false`; workers.dev and preview URLs are off; no route, custom domain,
-workflow or trigger is provided. It receives at most 4 KiB of metadata, never
-observation bytes. No canonical writer calls it yet. An intent does not show that
+defaults to `false`; workers.dev and preview URLs are off. The proposed custom
+domain and [manual deployment workflow](../../.github/workflows/uk_aq_jsongen_signer_deploy.yml)
+prepare a disabled TEST deployment only; neither has been applied by this change.
+It receives at most 4 KiB of metadata, never observation bytes. Prune's optional
+caller remains default-off. An intent does not show that
 R2 received bytes, verified a source, accepted final writer evidence or registered
 a JSONgen change.
 
@@ -110,9 +112,9 @@ if the binding is missing, throws, or does not return success. Cloudflare counts
 each key **per Cloudflare location**, with asynchronous local counter updates;
 10 requests per 10 seconds is protective admission, not a globally consistent
 or exact hard writer quota. A `namespace_id` is an account-wide positive integer
-and the same ID and key share counters across Workers. The old `"1001"` value
-was only an example; the checked-in config has no binding until the target
-account owner allocates an unused namespace. This also makes accidental
+and the same ID and key share counters across Workers. The checked-in config
+has no binding until the account owner allocates an unused namespace and the
+manual workflow renders it into `wrangler.deploy.toml`. This also makes accidental
 enablement fail closed. No globally consistent quota is claimed in Phase 1.
 
 Errors contain only a bounded code: `disabled`, `invalid_endpoint`,
@@ -121,44 +123,216 @@ Errors contain only a bounded code: `disabled`, `invalid_endpoint`,
 `unauthorised_writer`, `invalid_generation`,
 `invalid_scope_or_object_identity`, `unauthorised_scope` or `signing_failure`.
 
-## Later manual TEST setup
+## Controlled operator handover
 
-No setup or deployment is performed by this change. A separate review must:
+The following are **separate decisions**: A code preparation, B disabled
+deployment, C signer activation, D Prune pending-upload activation, and E the
+first authorised real TEST operation. Merging A authorises none of B–E.
+The workflow has only `workflow_dispatch`, accepts only this TEST repository's
+`main`, and always deploys with `UK_AQ_ENV_NAME=TEST` and
+`UK_AQ_JSONGEN_SIGNER_ENABLED=false`. It has no enablement input or variable
+override. Rerunning it after activation disables the signer again.
 
-1. Confirm ownership of `uk-aq-chart-history-json-test` in the Sleepercar TEST
-   Cloudflare account. Select and approve a signer credential model: a separate
-   standard R2 Object Read & Write token restricted to this bucket carries the
-   broader bucket risk described above; an action/path-scoped temporary
-   credential design needs separate implementation and session-token signing;
-   a separate protected bucket changes storage ownership. Do not reuse a
-   canonical R2 writer credential. Confirm the required S3 permission and
-   account endpoint before adding secrets. This credential decision remains a
-   deployment blocker.
-2. Add the Worker secrets `UK_AQ_JSONGEN_SIGNER_R2_ACCESS_KEY_ID`,
-   `UK_AQ_JSONGEN_SIGNER_R2_SECRET_ACCESS_KEY` and
-   `UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN` (at least 32 unpredictable characters).
-   Rotate/revoke the writer token independently of the R2 signer credential.
-3. Supply a reviewed deployment config with a bounded comma-separated
-   `UK_AQ_JSONGEN_PRUNE_CONNECTOR_IDS` allowlist and set
-   `UK_AQ_JSONGEN_SIGNER_ENABLED=true`. Keep `UK_AQ_ENV_NAME=TEST`. The checked-in
-   allowlist is empty and enablement is false.
-4. In an operator-only deployment config, add the documented Wrangler 4
-   `[[ratelimits]]` binding named `UK_AQ_JSONGEN_SIGNER_RATE_LIMIT`, with
-   `simple = { limit = 10, period = 10 }` and a `namespace_id` allocated and
-   checked for uniqueness across the target account. The checked-in config
-   deliberately has no ID or binding. Protect a TEST-only HTTPS route with
-   Cloudflare Access Service Auth, using a service token separate from the
-   Worker writer token. Do not enable workers.dev, preview URLs or browser
-   CORS access. No route is present in this repository configuration.
-5. Run separately authorised real TEST checks of signature headers, wrong-body
-   checksum rejection, actual size mismatch, immutable repeated PUT/412,
-   expiry, auth, per-location rate limits, exact private readback and Worker
-   CPU/`exceededCpu`. The service is not accepted as operational until those
-   checks pass.
+**Before merging:** the operator must confirm the repository pending-upload
+variable is `false`. The cloud GitHub integration returned HTTP 403 when reading
+that variable, so its current remote value has not been independently checked.
 
-To roll back after a future deployment, disable the Worker enablement variable
+### A. Code preparation (this PR)
+
+The signing implementation and protocol are unchanged: Web Crypto SigV4,
+60-second PUT-only URLs, fixed private TEST bucket/account and pending prefix,
+checksum and conditional headers, writer authentication and bounded admission.
+Initial connector allowlist is exactly `1`. No R2 binding or canonical writer
+credential is needed in this Worker. Native rate limiting remains 10 requests
+per 10 seconds per writer key per Cloudflare location.
+
+Prune's workflow now passes the existing optional handover settings, defaulting
+`UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED` to `false`. It also supplies the
+exact `UK_AQ_ENV_NAME=TEST` required by `resolvePruneSignerConfig`; the existing
+`UKAQ_ENV_NAME` remains in place. No Prune extraction, canonical R2 publication,
+object/manifest verification, v3 finalisation, PostgreSQL gate or deletion code
+is changed. No new confirmation/receipt endpoint or monthly publisher is added.
+
+### B. Manual setup and deployment with signer disabled
+
+Perform these steps only under separate operator authority, after merging:
+
+1. Confirm account **sleepercar.co.uk**, ID
+   `41a81f781d3bd7234fde0b25df51e879`, and ownership of private bucket
+   `uk-aq-chart-history-json-test`. Keep public bucket access disabled. Approve
+   the residual bucket-wide credential risk described above, including access
+   to the existing experimental objects. Create a **dedicated standard R2 API
+   token**, Object Read & Write, restricted to **this bucket only**. Retain its
+   S3 Access Key ID and Secret Access Key securely. It is not a Cloudflare
+   Workers deployment API token. It is compatible with the existing presigner;
+   temporary session credentials are not. **A standard bucket-restricted token
+   covers objects across the bucket, not just the pending prefix, and is not
+   PUT-only.** If narrower credential-level scope is mandatory, stop: this
+   implementation does not supply it. Do not substitute temporary credentials
+   or reuse canonical/chart writer credentials.
+2. Create a separate revocable Prune writer authentication token, at least 32
+   unpredictable characters. It must differ from the R2 secret, deployment API
+   token and Access service token. Store it both as the GitHub secret below and
+   (through the deployment workflow) the identically named Worker secret.
+3. Allocate a rate-limit namespace in this account. Cloudflare's native rate
+   limit binding uses an account-unique positive integer **chosen and managed
+   by the account owner**, not an R2/KV namespace or an ID invented in code.
+   Inventory existing Worker rate-limit bindings/configurations and the
+   account's allocation register; reserve an unused positive integer for
+   `uk-aq-jsongen-signer-test`, record its owner/purpose, and confirm it will
+   not share counters with another Worker. If allocations cannot be established,
+   stop and resolve with the account administrator. Put the allocated ID in
+   `UK_AQ_JSONGEN_SIGNER_RATE_LIMIT_NAMESPACE_ID`. No `wrangler kv namespace
+   create` or speculative numeric example is appropriate. The workflow rejects
+   missing/non-positive/non-decimal values and appends:
+
+   ```toml
+   [[ratelimits]]
+   name = "UK_AQ_JSONGEN_SIGNER_RATE_LIMIT"
+   namespace_id = "<operator-allocated-positive-integer>"
+   simple = { limit = 10, period = 10 }
+   ```
+
+   The placeholder is documentation only; never deploy it. Account-wide
+   uniqueness requires the operator's inventory; syntax validation cannot prove it.
+4. In Cloudflare Zero Trust, create a dedicated Access service token and a
+   self-hosted application covering **all paths** of
+   `jsongen-signer-test.sleepercar.co.uk`. Apply a **Service Auth** policy
+   admitting only that service token; do not add bypass, public allow or
+   interactive browser login as an alternate path. Keep the writer's
+   `Authorization: Bearer` header independent: the existing client sends
+   `CF-Access-Client-Id` and `CF-Access-Client-Secret` for Access. Verify policy
+   coverage before deployment creates the custom domain. The Worker does not
+   validate Access JWTs itself and relies on this edge protection. Keep
+   workers.dev and preview URLs disabled and add no other route. Reserve the
+   hostname in the Sleepercar zone and resolve any existing DNS/domain conflict;
+   Wrangler's `custom_domain = true` config attaches the hostname on deployment.
+5. Configure the **TEST Ops repository** GitHub values below. Reuse the existing
+   R2-account deployment selectors; verify their token can edit Workers scripts
+   in the exact account and manage the custom domain (including required zone/DNS
+   permissions for `sleepercar.co.uk`). R2 object credentials alone cannot deploy
+   Workers. If the existing deployment token lacks permissions, arrange a
+   separately authorised appropriate credential; do not silently fall back to
+   another account/token. Do not place secret values in code, docs or artifacts.
+
+   | GitHub variable | Required value |
+   |---|---|
+   | `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID` | `41a81f781d3bd7234fde0b25df51e879` |
+   | `UK_AQ_JSONGEN_SIGNER_RATE_LIMIT_NAMESPACE_ID` | The operator-allocated ID |
+   | `UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED` | Explicitly `false` before merging/configuration; keep false throughout B/C |
+   | `UK_AQ_JSONGEN_PRUNE_SIGNER_URL` | `https://jsongen-signer-test.sleepercar.co.uk/v1/upload-intents` |
+
+   | GitHub secret | Consumer |
+   |---|---|
+   | `UK_AQ_R2_CLOUDFLARE_API_TOKEN` | Wrangler deployment, separate from S3 credentials |
+   | `UK_AQ_JSONGEN_SIGNER_R2_ACCESS_KEY_ID` | Signer Worker secret only |
+   | `UK_AQ_JSONGEN_SIGNER_R2_SECRET_ACCESS_KEY` | Signer Worker secret only |
+   | `UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN` | Signer Worker secret and Prune caller |
+   | `UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_ID` | Prune's dedicated Access service token ID |
+   | `UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_SECRET` | Prune's dedicated Access service token secret |
+
+   The signer does not receive the Access client secret or canonical R2 keys.
+   The tracked `config/uk_aq_github_env_targets.csv` maps these settings for the
+   existing sync tooling. The ignored `env-vars-master.csv` is absent from this
+   cloud checkout: update the operator's private catalogue with the same target
+   classifications before any later sync; keep actual credentials private. No
+   sync or GitHub setting change is performed by this PR. Before merging, confirm
+   there is no pre-existing `true` pending-upload variable: newly wiring a latent
+   true value would activate the optional path on a later Prune invocation.
+6. After Access protection and credentials are ready, **separately authorise B**,
+   then manually run:
+
+   ```bash
+   gh workflow run uk_aq_jsongen_signer_deploy.yml --repo TEST-uk-aq/uk-aq-ops --ref main
+   ```
+
+   The workflow copies the config, adds the allocated binding, runs a Wrangler
+   4.130.0 package dry-run, deploys the disabled base, uploads only the three
+   dedicated Worker secrets via stdin, and deploys the disabled final version.
+   Base and final deployments remain disabled even if secret upload fails.
+   Inspect deployment state: Worker name, exact account, protected hostname,
+   allowlist `1`, native rate limit `10/10`, no alternate ingress and enablement
+   `false`. An authenticated request through Access must return `503 disabled`;
+   a caller without valid Access credentials must be stopped by Access. This
+   does not validate signed PUT or R2 permission enforcement.
+
+### C. Signer activation (separate decision)
+
+After B is accepted, separately authorise activation with a reviewed operator
+copy of the **rendered** `wrangler.deploy.toml`, changing only
+`UK_AQ_JSONGEN_SIGNER_ENABLED` to `true`. Retain the exact account, binding,
+protected route, TEST environment and connector `1`. The manual deployment
+workflow intentionally cannot activate it; a dashboard-only edit is overwritten
+by a later deployment. Keep Prune's pending-upload flag false. Activation is
+not acceptance of signature enforcement, CPU capacity or writer handover.
+Use a reviewed fresh TEST checkout; render the binding as in the workflow and
+keep the deployment copy beside `worker.mjs` so its relative entry point resolves.
+With the authorised deployment API token loaded securely as
+`CLOUDFLARE_API_TOKEN`, the separate C deployment command, from that directory, is:
+
+```bash
+CLOUDFLARE_ACCOUNT_ID=41a81f781d3bd7234fde0b25df51e879 \
+  npx --yes wrangler@4.130.0 deploy --config wrangler.deploy.toml --name uk-aq-jsongen-signer-test
+```
+
+Run it only after reviewing that copy's single enablement change and authorising C.
+
+### D. Prune pending-upload activation (separate decision)
+
+Before authorising D, confirm the actual PostgreSQL login used by Prune's
+**`SUPABASE_DB_URL`**, not the REST `SB_SECRET_KEY` or an assumed `service_role`.
+In an independently authorised read-only session using that same connection,
+run `SELECT session_user, current_user;` and check the exact function privilege:
+
+```sql
+SELECT has_function_privilege(current_user,
+  'uk_aq_ops.insert_prune_jsongen_gate_acceptance(date,integer,uuid,text,jsonb,bytea)',
+  'EXECUTE');
+```
+
+Retain the non-secret role/grant result; never print the DSN. The investigation
+reported the TEST outbox table/function present and `service_role` EXECUTE, but
+that does not identify Prune's login or prove its permission. Verify required
+schema access and the restricted function under the real login; if missing,
+arrange separately reviewed schema-owned grants rather than broad table-write
+access. No database query or grant is performed by this change.
+
+Confirm selected complete-v3 Prune configuration (`UK_AQ_R2_HISTORY_VERSION=v3`),
+all URL/Access/writer settings, bounded optional-upload headroom, and a reviewed
+plan for independent private pending readback and original gate evidence. Only
+then, with separate D authority, set repository variable
+`UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED=true`. This authorises the optional
+path on the **next Prune invocation**, including any existing external scheduler;
+coordinate the operational window before changing it. It does not itself run
+Prune. The code's 15-second optional deadline, failure diagnostics and best-effort
+outbox savepoint policy remain unchanged. No new scope selector is introduced:
+the signer admits connector `1`, while any other connector receives no intent
+and the optional handover fails without changing canonical Prune authority.
+
+### E. First authorised real TEST operation (separate decision)
+
+Authorise a bounded operation explicitly, including any R2 writes and any normal
+Prune deletion. Validate real signed PUT plus required headers, wrong-body
+checksum rejection, size mismatch detection by independent exact private
+readback, immutable retry/412, URL expiry, writer/Access rejection, scope and
+per-location rate limits, and Worker CPU/`exceededCpu`. Do not remove checksum
+or conditional restrictions if the chosen R2 combination fails. Validate Prune
+canonical verification/finalisation/gate/deletion behaviour and timing unchanged,
+then inspect the first original acceptance/outbox event and evidence completeness.
+No pending objects or original events were found in the prior investigation;
+never fabricate/backfill them or run Prune merely to make a deployment check pass.
+
+An upload acknowledgement remains **pending/unverified**. Independent full-source,
+status/binding/final-authority authentication, durable receipt/registration and
+reconciliation remain unresolved later gates. `prepared_unverified` or an outbox
+row does not make a VERIFIED receipt. Stage A run `39064499471` accepted only the
+manual diagnostic shell. Monthly publication, managed selection, automatic
+JSONgen triggers and chart/LIVE activation remain outside all of B–E.
+
+To roll back after a future deployment, first set Prune's pending-upload flag
+back to `false`, then disable the Worker enablement variable
 or remove the protected route and revoke the writer token. Already issued URLs
 remain usable until their short expiry unless the dedicated R2 signing token is
 also revoked; rotate that token for immediate URL invalidation. Pending objects
-require separate verified retention/cleanup rules. No canonical operation or
-JSONgen publication is wired to this Worker in Phase 1.
+require separate verified retention/cleanup rules. No canonical verification or
+deletion decision depends on this Worker; no JSONgen publication is wired to it.

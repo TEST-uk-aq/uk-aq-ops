@@ -4,14 +4,16 @@ compatibility_date = "2026-10-12"
 workers_dev = false
 preview_urls = false
 
-# No route, custom domain, deployment workflow or schedule is configured.
+# Proposed TEST custom domain. Protect the entire hostname with Access Service
+# Auth BEFORE manually dispatching the disabled deployment workflow.
+routes = [{ pattern = "jsongen-signer-test.sleepercar.co.uk", custom_domain = true }]
+
 [vars]
 UK_AQ_ENV_NAME = "TEST"
 UK_AQ_JSONGEN_SIGNER_ENABLED = "false"
-# Set only in a separately reviewed operator deployment config.
-UK_AQ_JSONGEN_PRUNE_CONNECTOR_IDS = ""
+UK_AQ_JSONGEN_PRUNE_CONNECTOR_IDS = "1"
 
-# A native [[ratelimits]] binding is required before enablement. Its numeric
-# namespace_id must first be allocated by the owning Cloudflare account;
-# "1001" was an unverified example and is deliberately not reserved here.
+# The manual workflow appends the native [[ratelimits]] binding to a deployment
+# copy using UK_AQ_JSONGEN_SIGNER_RATE_LIMIT_NAMESPACE_ID (10 per 10 seconds).
+# No namespace ID is reserved here. The account owner must allocate it first.
 # The Worker fails closed while the binding is absent. See README.md.
