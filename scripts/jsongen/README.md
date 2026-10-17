@@ -1,5 +1,9 @@
 # Managed JSONgen foundations and pending Prune source
 
+The common [UK AQ JSONgen workflow](../../.github/workflows/uk_aq_jsongen.yml)
+now has a **Stage A manual, local-only diagnostic**. See [Stage A operation](#stage-a-manual-diagnostic-operation)
+below. It is executable code, but it is not an enabled managed monthly publisher.
+
 The separate [manual Dropbox historical bootstrap](bootstrap/README.md) creates
 bounded local/private monthly observation/AQI candidates from an explicitly pinned
 completed TEST backup. Its versioned candidate evidence is not a managed writer
@@ -102,10 +106,12 @@ bucket permission, conditional PUT/readback, byte and row limits, source
 cleanup, canonical finalisation, PostgreSQL gate behavior and restart review.
 No such operational acceptance is implied by local checks.
 
-This directory is an **inactive Node ESM library**, independent of the experimental
-`scripts/compressed_chart_history` publisher and its selector. There is no CLI,
-workflow, writer trigger, regeneration, bootstrap, deployment or serving integration.
-Do not invoke its R2 operations without separate operational authorisation.
+The managed data operations in this directory remain an **inactive Node ESM
+library**, independent of the experimental `scripts/compressed_chart_history`
+publisher and its selector. Stage A only inspects local library availability;
+the separate bootstrap is independently invoked. There is no managed writer
+trigger, regeneration, publication or serving integration. Do not invoke its R2
+operations without separate operational authorisation.
 
 Stage 2 adds bounded immutable input verification, committed-metadata inspection,
 and explicit reconciliation reporting. It does **not** establish final-source
@@ -542,8 +548,9 @@ complete canonical-scope dominance, approve practical limits and retention,
 implement authenticated immutable pair/payload readback and current-scope-checked
 all-month selection, then the bounded baseline/context regeneration path. Keep
 canonical writers non-blocking and metadata-only reconciliation fail-closed.
-Workflow, triggers, bootstrap/rebuild,
-identity allowlists and website/Refresh/open-month integration remain later work.
+Beyond the Stage A manual diagnostic and the separate local bootstrap, managed
+workflow generation/publication, automatic triggers, accepted baseline/rebuild,
+broader identity allowlists and website/Refresh/open-month integration remain later work.
 
 Rollback before deployment is to revert this code change. Existing same-day
 JSONgen archive copies were reused and the exact immediate pre-change source
@@ -561,3 +568,170 @@ Record Stage 2.6 as a bounded, inactive diagnostic implementation after code rev
 Its connector mode input still lacks an accepted runtime provider, final writer
 adapters and complete receipt outbox; current selector and operational acceptance
 remain unproven. Authoritative `uk-aq-system-docs` was not edited.
+
+## Stage A manual diagnostic operation
+
+Workflow: **UK AQ JSONgen**, `.github/workflows/uk_aq_jsongen.yml`.
+Entry point: `scripts/jsongen/diagnose.mjs` (Node ESM, Node >=20, import-safe).
+It uses the repository's `actions/checkout@v4`, `actions/setup-node@v4` and Node 20
+conventions, including `npm ci --ignore-scripts`. The existing canonical-metadata
+inspector transitively imports the repository's existing Arrow/Parquet packages;
+availability inspection never invokes their readers, writers or WASM initialization.
+No package or lockfile changes, new secret/variable names, GitHub environment setup
+or settings are required.
+
+This implements only the approved initial manual stage in the authoritative
+[17 October contract](https://github.com/TEST-uk-aq/uk-aq-system-docs/blob/1c0e4affa8385eb2e6025bd3a029cebe53f9362b/system_docs/station_charts/compressed_history_json_verified_writer_regeneration_contract.md).
+The reported 433 paired local Dropbox bootstrap candidates in 316 seconds are
+separate seven-day partial-October operational evidence. They are not managed
+writer receipts, an accepted September baseline, or current canonical authority.
+
+### Admission and manual dispatch
+
+After review and merge, obtain **separate authorisation for the first real
+GitHub-hosted TEST operation**. Do not dispatch as part of implementation or PR
+review. Once authorised, select TEST Ops → Actions → **UK AQ JSONgen** → Run
+workflow → branch **main**, retaining exactly these single-choice inputs:
+
+| Input | Only permitted value |
+| --- | --- |
+| `environment` | `TEST` |
+| `connector_id` | `1` |
+| `timeseries_id` | `212` |
+| `pollutant` | `pm25` |
+| `month_utc` | `2026-09` |
+
+The equivalent command **only after that separate authorisation** is:
+
+```sh
+gh workflow run uk_aq_jsongen.yml --repo TEST-uk-aq/uk-aq-ops --ref main \
+  -f environment=TEST -f connector_id=1 -f timeseries_id=212 \
+  -f pollutant=pm25 -f month_utc=2026-09
+```
+
+There are no arbitrary path, bucket, credential, command, apply or publish inputs.
+CLI admission independently rejects missing, duplicate, unknown or widened
+arguments, even when bypassing the dispatch form. It does not infer a station ID
+or accepted binding from the diagnostic timeseries identity. The job is restricted
+to the exact TEST repository and `workflow_dispatch`, with fixed `UKAQ_ENV_NAME=TEST`;
+the CLI rechecks that context and the checked-out commit against `GITHUB_SHA`.
+Local invocations also reject a supplied non-TEST `UKAQ_ENV_NAME`.
+
+For a local, non-operational availability check from the Ops repository:
+
+```sh
+npm ci --ignore-scripts
+node scripts/jsongen/diagnose.mjs --environment TEST --connector-id 1 \
+  --timeseries-id 212 --pollutant pm25 --month-utc 2026-09
+```
+
+### Report and success meaning
+
+The CLI writes `tmp/jsongen-diagnostic/report.json` and `summary.md`, logs only
+a compact outcome, and exits 0 on successful diagnostics or 1 on execution error.
+The workflow appends the concise Markdown summary to the Actions job summary and
+uploads only those two files as
+`uk-aq-jsongen-diagnostic-<run_id>-<attempt>`, retained for 14 days. Both reporting
+steps use `always()`. The JSON report is capped at **16 KiB**, with a closed runtime
+schema in `diagnostic-report.mjs`, reusing managed `requireValid`, `same`, canonical
+JSON encoding, selector blocker and resource limits. It is a distinct execution
+report; the existing reconciliation schema requires authentic control/source
+evidence that this stage does not have. No synthetic control snapshot or receipt
+is supplied to make reconciliation run.
+
+| Report fields | Meaning |
+| --- | --- |
+| `kind`, `schema_version`, `report_version` | `uk_aq_jsongen_stage_a_diagnostic`, version 1 / 1 |
+| `environment`, `selection`, `invocation_mode` | TEST, admitted scope (null if rejected), `local_diagnostic` |
+| `run` | GitHub run ID/attempt when valid and available; actual Git source commit SHA |
+| `implementation` | Package/Node/managed schema/AQI version and SHA-256 inventory of installed libraries; null on incomplete inspection |
+| `duration_ms`, `diagnostic_results` | CLI elapsed time and bounded passed/failed diagnostic codes |
+| `capabilities` | Available local checks and explicitly unavailable managed operations |
+| `authorities`, `authority_blockers` | Required authority states and reasons, all `not_established` in Stage A |
+| `remote_access` | Per-service reads/writes, accounting scope and measurement boundary |
+| `publication_eligible`, `selector` | Always false; disabled with existing blocker; current publication not inspected |
+| `readiness`, `outcome`, `error_code` | Diagnostic success with publication blocked, or distinct execution failure |
+
+Success establishes admission, Git/package/algorithm identity, and successful
+imports/export availability of managed schema, immutable-input, canonical-authority,
+control-snapshot, reconciliation-report validation, limit and writer-authentication
+libraries. No reader or authentication operation is invoked. Control and
+reconciliation modules are only read locally for installed-file hashes, not
+imported. Import availability is not functional or operational acceptance.
+
+Successful output has `outcome=success`,
+`readiness=diagnostic_passed_publication_blocked`, and
+`publication_eligible=false`. Expected missing remote authority does not fail this
+diagnostic. All final writer, complete receipt/outbox coverage, current canonical
+source/status/binding, full-month baseline, adjacent-month PM context, immutable
+pair readback and conditional-publication protection authorities remain explicitly
+unestablished. Schema PR #11 merging definitions does not establish migration
+application, grants or operational acceptance. `verified_event_ordering_unavailable`
+remains the selector blocker for unauthenticated canonical precedence/receipt
+coverage; it does not call for a new global numeric event sequence.
+
+### Remote, write and failure boundaries
+
+The diagnostic makes **zero canonical R2, derived R2, Dropbox, PostgreSQL or Supabase
+reads or writes** by construction: it invokes no remote client and receives no
+data-service credentials. These counters cover the diagnostic process only.
+GitHub checkout, Node/dependency setup and artifact transport use network access outside
+that accounting and are explicitly **not measured**, rather than claimed as zero.
+GitHub token permissions are `contents: read`, checkout credentials are not
+persisted, and no application secrets or repository-variable destinations are read.
+Only fixed diagnostic codes, validated run metadata, local version/hash evidence
+and fixed authority classifications are reported; raw errors, arguments,
+environment dumps and source contents are never serialized.
+
+The workflow is manual-only on GitHub-hosted Ubuntu, has a 10-minute overall
+timeout and a 60-second CLI timeout with five-second kill grace. Existing JSONgen
+duration budgets apply within the CLI. A single TEST concurrency group with
+`cancel-in-progress: false` serializes runs; GitHub may replace an older pending
+run. This scheduling policy is not the future derived CAS protection mechanism.
+
+Invalid admission/context, missing or incompatible local implementation, import
+failure, invalid report or local output failure fail the step. Handled inspection
+errors produce an error report; failures before module loading, hard timeout,
+runner cancellation or setup failure can leave no report. The always-run summary
+then states that no report exists, and artifact upload warns if files are missing;
+the failed step stays failed. Do not interpret absent reports as diagnostic success.
+Each hosted attempt starts in a fresh workspace and has a distinct artifact name.
+An approved retry is another independent diagnostic; there is no state to resume,
+receipt to replay, baseline to repair or publication to roll back. Local reruns
+replace only the two local diagnostic output files. Rollback is reverting this PR;
+no remote data or managed control rollback is needed.
+
+This path never registers changes, manufactures writer bundles/receipts, creates a
+monthly baseline, generates or uploads managed observation/AQI objects, mutates
+managed control, invokes `retainReconciliationReport()`,
+`recordReconciliationRequired()` or `selectManagedPublications()`, reads historical
+Parquet, or changes Prune, Integrity, canonical status, chart serving or LIVE.
+The existing managed selector implementation/blocker is unchanged. The bootstrap
+candidate, verified writer change ID and selected monthly pubID remain distinct.
+
+### Remaining stages and first-run review
+
+Still requiring separately reviewed implementation and operational approval:
+
+1. Authenticated complete final writer handover and durable verified receipt registration.
+2. Bounded read-only reconciliation with complete receipt coverage/current scope authority.
+3. Accepted initial full-month baseline and authenticated PM context (preceding 23 hours,
+   with following-23-hour effects retained across month boundaries).
+4. Incremental monthly observations and shared AQI calculation over that authenticated result.
+5. Immutable paired upload/readback and conditional managed-selector advancement.
+6. Automatic verified-event dispatch and scheduled reconciliation.
+7. Opt-in chart serving, cache/pubID discovery and Refresh integration.
+
+Do not guess unresolved handover or credential contracts. No ordinary Parquet or
+Dropbox fallback is authorised. After the first separately authorised diagnostic
+run, inspect its source SHA, admitted identity, summary and bounded artifact;
+confirm successful local diagnostics, zero diagnostic service operations, all
+authority blockers, false publication eligibility and disabled selector. Record
+that as Stage A operational evidence only, not writer-handover, database,
+monthly-generation, AQI parity, R2 CAS or publication acceptance.
+
+For ChatGPT in Chat mode: after review, record the Stage A workflow/CLI and its
+local-only boundary in the authoritative contract's implementation status. No
+schema/configuration/deployment change is required; the approved authority
+contract is preserved. Keep all later publication gates explicit. Coding agents
+have not changed authoritative system documentation or plans.
