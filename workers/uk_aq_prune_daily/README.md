@@ -47,3 +47,8 @@ Before TEST activation, verify real signer permissions, conditional PUT and
 private readback, budget limits, canonical finalization and gate results,
 interruption recovery, and a durable independently authenticated final evidence
 chain in a separately authorized deployment.
+The [gate durability review](../../docs/investigations/jsongen_prune_final_evidence_durability_boundary.md)
+records why the current mutable candidate/gate rows and late run manifest do
+not provide a replayable original gate receipt. An additive transactional
+acceptance/outbox design needs schema-owner review before this hook can retain
+trusted final evidence.

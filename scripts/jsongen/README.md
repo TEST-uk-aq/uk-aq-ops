@@ -64,6 +64,11 @@ managed control, dispatch JSONgen, or select monthly publication. Stage 3B
 must define durable final writer evidence, gate-recovery ownership, missing
 registration detection and an outbox/inventory before complete coverage can
 be claimed. The existing `selectManagedPublications()` blocker remains.
+The [original gate durability review](../../docs/investigations/jsongen_prune_final_evidence_durability_boundary.md)
+traces the mutable candidate/gate schema, READY-to-CONSUMED transition and
+commit-to-delivery crash window. It identifies a separately reviewed
+transactional acceptance/outbox schema as the prerequisite for durable trusted
+final evidence; a post-commit upload cannot close that window.
 
 The v2 Prune path does not enter this handover. Before any TEST activation,
 perform a separately authorised controlled Prune run to verify dedicated
