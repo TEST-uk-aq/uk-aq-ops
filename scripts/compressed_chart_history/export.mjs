@@ -61,18 +61,19 @@ function parseOptions(args) {
 }
 function aqiInputRows(result) {
   return [...result.contextRows, ...result.rows].map((row) => ({
-    connector_id: 1, station_id: row[2], timeseries_id: result.binding.timeseries_id,
+    connector_id: result.binding.connector_id, station_id: row[2], timeseries_id: result.binding.timeseries_id,
     pollutant_code: result.binding.pollutant_code, observed_at: row[0], value: row[1],
     source_status: row[3], verification_status: row[4], source: "json",
   }));
 }
 export async function calculateMonthAqi(result, month, options) {
+  const connectorId = result.binding.connector_id;
   const allRows = aqiInputRows(result);
   const continuity = { enabled: false, continuityKey: null, siteRef: null, ukAirRef: null,
-    pollutant: options.pollutant, members: [{ connectorId: 1, stationId: result.binding.station_id,
+    pollutant: options.pollutant, members: [{ connectorId, stationId: result.binding.station_id,
       timeseriesId: options.timeseriesId, pollutant: options.pollutant,
       validFromDayUtc: null, validToDayUtc: null }] };
-  const request = { connectorId: 1, stationId: result.binding.station_id,
+  const request = { connectorId, stationId: result.binding.station_id,
     timeseriesId: options.timeseriesId, pollutant: options.pollutant,
     includeObservations: false, includeAqi: true };
   const batches = [], rows = [], gapRanges = [], reasons = new Set(), seen = new Set();
@@ -109,7 +110,7 @@ export async function calculateMonthAqi(result, month, options) {
   rows.sort((a, b) => a.timestamp_hour_utc.localeCompare(b.timestamp_hour_utc));
   const complete = batches.every((batch) => batch.response_complete);
   return { schema_version: 2, kind: "uk_aq_compressed_chart_aqi_month",
-    identity: { connector_id: 1, timeseries_id: options.timeseriesId,
+    identity: { connector_id: connectorId, timeseries_id: options.timeseriesId,
       station_id: result.binding.station_id, pollutant_code: options.pollutant },
     source: { generation: result.generation, bucket: result.bucket,
       source_evidence: result.evidence, algorithm_version: AQI_ALGORITHM_VERSION },
