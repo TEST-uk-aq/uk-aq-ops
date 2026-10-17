@@ -613,9 +613,9 @@ There are no arbitrary path, bucket, credential, command, apply or publish input
 CLI admission independently rejects missing, duplicate, unknown or widened
 arguments, even when bypassing the dispatch form. It does not infer a station ID
 or accepted binding from the diagnostic timeseries identity. The job is restricted
-to the exact TEST repository and `workflow_dispatch`, with fixed `UKAQ_ENV_NAME=TEST`;
+to the exact TEST repository and `workflow_dispatch`, with fixed `UK_AQ_ENV_NAME=TEST`;
 the CLI rechecks that context and the checked-out commit against `GITHUB_SHA`.
-Local invocations also reject a supplied non-TEST `UKAQ_ENV_NAME`.
+Local invocations also reject a supplied non-TEST `UK_AQ_ENV_NAME`.
 
 For a local, non-operational availability check from the Ops repository:
 

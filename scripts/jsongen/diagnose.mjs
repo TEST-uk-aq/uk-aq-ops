@@ -46,9 +46,9 @@ export async function diagnose(argv, { env = process.env } = {}) {
         || argv[i + 1] !== admittedArguments[key]) fail('scope_not_admitted');
       supplied[key] = argv[i + 1];
     }
-    if (env.UKAQ_ENV_NAME !== undefined && env.UKAQ_ENV_NAME !== 'TEST') fail('test_environment_required');
+    if (env.UK_AQ_ENV_NAME !== undefined && env.UK_AQ_ENV_NAME !== 'TEST') fail('test_environment_required');
     if (env.GITHUB_ACTIONS === 'true' && (env.GITHUB_REPOSITORY !== 'TEST-uk-aq/uk-aq-ops'
-      || env.GITHUB_EVENT_NAME !== 'workflow_dispatch' || env.UKAQ_ENV_NAME !== 'TEST'
+      || env.GITHUB_EVENT_NAME !== 'workflow_dispatch' || env.UK_AQ_ENV_NAME !== 'TEST'
       || report.run.github_run_id === null || report.run.github_run_attempt === null))
       fail('github_test_dispatch_required');
     report.selection = { ...DIAGNOSTIC_SELECTION };

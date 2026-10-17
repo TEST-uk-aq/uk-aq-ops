@@ -49,7 +49,7 @@ jobs:
     env:
       # Repository validation plus a fixed stage environment; no environment,
       # credentials or remote destinations can be selected through repo variables.
-      UKAQ_ENV_NAME: TEST
+      UK_AQ_ENV_NAME: TEST
       INPUT_ENVIRONMENT: ${{ inputs.environment }}
       INPUT_CONNECTOR_ID: ${{ inputs.connector_id }}
       INPUT_TIMESERIES_ID: ${{ inputs.timeseries_id }}
