@@ -6,6 +6,10 @@ Cloudflare Access protected HTTPS `/v1/upload-intents` route, plus dedicated
 `UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN`, `UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_ID` and
 `UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_SECRET`. These are separate from canonical
 and chart R2 credentials. No R2 write credential is passed to Prune for this handover.
+The Actions workflow now passes these settings with the upload flag defaulting
+to `false`. See the [signer operator handover](../uk_aq_jsongen_signer/README.md#controlled-operator-handover)
+for the exact TEST hostname, secret mapping, real database login-role check and
+separate disabled-deployment, activation and first-operation decisions.
 
 After prior-authority admission, Prune validates and compresses the exact frozen
 connector-day source. It asks the signer for a 60-second intent bound to its
@@ -40,7 +44,7 @@ connector manifests, child content hashes and status counts, canonical file
 identities, selected-v3 exact-scope references and final batch results. It runs
 only for an acknowledged pending upload. Its version-1 shape now states that
 the gate transaction has not yet been asserted; it never says `commit_returned`
-before COMMIT. The optional same-connection PostgreSQL function in open TEST
+before COMMIT. The optional same-connection PostgreSQL function in merged TEST
 Schema PR #11 can retain this preparation plus typed original-gate evidence
 inside the protected transaction. It is called only when this TEST-only
 handover is enabled. A savepoint isolates supported evidence-only insert
@@ -73,5 +77,8 @@ interruption recovery, and a durable independently authenticated final evidence
 chain in a separately authorized deployment.
 The [gate durability review](../../docs/investigations/jsongen_prune_final_evidence_durability_boundary.md)
 records why mutable candidate/gate rows and a late run manifest alone do not
-provide a replayable original gate receipt. TEST Schema PR #11 remains unmerged
-and unapplied; this integration is default-off and has no operational acceptance.
+provide a replayable original gate receipt. The prior operational investigation
+reported the TEST outbox table/function present and `service_role` EXECUTE;
+the actual Prune login role and its permission remain unconfirmed. No original
+acceptance event has been recorded; the integration remains default-off and
+has no operational acceptance.
