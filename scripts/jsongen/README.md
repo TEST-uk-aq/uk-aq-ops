@@ -1,5 +1,11 @@
 # Managed JSONgen foundations and pending Prune source
 
+The separate [manual Dropbox historical bootstrap](bootstrap/README.md) creates
+bounded local/private monthly observation/AQI candidates from an explicitly pinned
+completed TEST backup. Its versioned candidate evidence is not a managed writer
+receipt/publication. It does not activate pending Prune source, managed selection
+or chart serving; its first real TEST run requires separate operator authorisation.
+
 ## Stage 3A signed Prune source handover (code only; default off)
 
 Selected-v3 Prune can offer its exact frozen connector-day NDJSON before

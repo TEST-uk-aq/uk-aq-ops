@@ -26,8 +26,11 @@ function overlaps(file, id) {
   return !(integer(file.min_timeseries_id) && integer(file.max_timeseries_id)) || (id >= Number(file.min_timeseries_id) && id <= Number(file.max_timeseries_id));
 }
 
-async function decode(reader, fileDescriptor, manifest, segments, selection, authority, stats) {
+// Whole-file offline consumers may select several physical series in one decode.
+// The original pilot keeps its exact-leaf/single-series path and tuple format.
+export async function decodeCanonicalObservations(reader, fileDescriptor, manifest, segments, selection, authority, stats) {
   const { timeseriesId, pollutant, binding, day } = selection;
+  const connectorId = selection.connectorId ?? 1;
   const fileKey = fileDescriptor.key;
   const canonical = manifest.files.find((f) => f.key === fileKey);
   check(canonical, `Index references noncanonical file: ${fileKey}`);
@@ -44,9 +47,18 @@ async function decode(reader, fileDescriptor, manifest, segments, selection, aut
   const file = new Uint8Array(object.body).slice().buffer;
   const metadata = await parquetMetadataAsync(file);
   const count = Number(metadata.num_rows);
-  check(integer(count) && count <= 1_000_000 && count === Number(canonical.row_count), `Invalid Parquet row count: ${fileKey}`);
+  check(integer(count) && count <= (selection.maxFileRows ?? 1_000_000) && count === Number(canonical.row_count), `Invalid Parquet row count: ${fileKey}`);
   if (segments) check(fileDescriptor.row_count === count && fileDescriptor.row_group_count === metadata.row_groups.length, "Exact file/Parquet metadata disagreement");
-  const columns = parquetSchema(metadata).children.map((column) => String(column.element.name));
+  const schemaColumns = parquetSchema(metadata).children;
+  const columns = schemaColumns.map((column) => String(column.element.name));
+  if (selection.requireMillisecondTimestamps) {
+    const timestamp = schemaColumns.find(column => column.element.name === "observed_at_utc")?.element;
+    check(timestamp?.type === "INT64" && (timestamp.logical_type
+      ? timestamp.logical_type.type === "TIMESTAMP" && timestamp.logical_type.unit === "MILLIS"
+      : timestamp.converted_type === "TIMESTAMP_MILLIS")
+      && (!timestamp.converted_type || timestamp.converted_type === "TIMESTAMP_MILLIS"), "Canonical millisecond timestamp schema required; finer precision must not be truncated");
+    check(schemaColumns.find(column => column.element.name === "value")?.element.type === "DOUBLE", "Canonical binary64 values required");
+  }
   const declared = observationHistoryPhysicalSchemasFromManifest(manifest);
   const matches = declared.filter((schema) => JSON.stringify(schema.columns) === JSON.stringify(columns));
   check(matches.length === 1, `Missing or ambiguous canonical physical schema identity: ${fileKey}`);
@@ -83,20 +95,33 @@ async function decode(reader, fileDescriptor, manifest, segments, selection, aut
       const observed = row.observed_at_utc instanceof Date ? row.observed_at_utc : new Date(row.observed_at_utc);
       check(!Number.isNaN(observed.getTime()), `Invalid observation timestamp: ${fileKey}`);
       const timestamp = observed.toISOString();
-      check(Number(row.connector_id) === 1 && row.pollutant_code === pollutant && timestamp.slice(0, 10) === day, `Canonical row outside file scope: ${fileKey}`);
+      check(Number(row.connector_id) === connectorId && row.pollutant_code === pollutant && timestamp.slice(0, 10) === day, `Canonical row outside file scope: ${fileKey}`);
       if (segments) check(Number(row.timeseries_id) === timeseriesId, `Exact row group contains another timeseries: ${fileKey}`);
-      if (Number(row.timeseries_id) !== timeseriesId) continue;
-      check(row.station_id === null || Number(row.station_id) === binding.station_id, "Physical station identity disagrees with binding");
+      if (timeseriesId != null && Number(row.timeseries_id) !== timeseriesId) continue;
+      if (selection.timeseriesIds && !selection.timeseriesIds.has(Number(row.timeseries_id))) continue;
+      const physicalBinding = selection.resolveBinding
+        ? await selection.resolveBinding(Number(row.timeseries_id)) : binding;
+      check(physicalBinding && (row.station_id === null || Number(row.station_id) === physicalBinding.station_id), "Physical station identity disagrees with binding");
       const embedded = statusColumn ? row[statusColumn] : null;
       check(statusColumn === "status" ? embedded === null || typeof embedded === "string" : embedded === null || embedded === "P" || embedded === "R", "Invalid persisted verification status");
-      const legacy = resolveLegacyVerificationStatus(row, { isSos: true });
-      const effective = resolveEffectiveObservationVerificationStatus({ authority, timeseriesId, observedAtUtc: timestamp, legacyStatus: legacy });
-      result.push([timestamp, row.value, row.station_id === null ? null : Number(row.station_id), embedded, effective]);
+      const legacy = resolveLegacyVerificationStatus(row, { isSos: connectorId === 1 });
+      const effective = resolveEffectiveObservationVerificationStatus({ authority, timeseriesId: Number(row.timeseries_id), observedAtUtc: timestamp, legacyStatus: legacy });
+      const tuple = [timestamp, row.value, row.station_id === null ? null : Number(row.station_id), embedded, effective];
+      if (selection.onRow) await selection.onRow({
+        connector_id: connectorId, timeseries_id: Number(row.timeseries_id),
+        station_id: tuple[2], pollutant_code: pollutant, observed_at_utc: timestamp,
+        value: row.value, verification_status: effective,
+        embedded_verification_status: statusColumn === "verification_status" ? embedded : null,
+        source_status: statusColumn === "status" ? embedded : null,
+        source_status_provenance: statusColumn === "status" ? "legacy_source_status_retained" : "original_source_status_unavailable",
+      }, physical);
+      else result.push(tuple);
     }
   }
   stats.decode_wall_ms += performance.now() - started;
   return result;
 }
+const decode = decodeCanonicalObservations;
 
 async function proveMissingScope(reader, generation, day, pollutant, canonical) {
   if (canonical) return "unexported_missing_index";
