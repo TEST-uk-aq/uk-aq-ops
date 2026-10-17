@@ -111,7 +111,7 @@ Defaults and admission limits:
 |---|---|
 | Node old-space setting | Operator command uses 4096 MiB |
 | Process RSS | Fail incomplete if observed above 6 GiB at progress boundaries |
-| R2 concurrency | 1; configurable 1..4 |
+| R2 concurrency | 1 by default; explicitly configurable 1..16 |
 | Transaction/yield batch | 128; configurable 1..1024 |
 | GET body | 128 MiB maximum; configurable up to 256 MiB |
 | One Parquet decode | 250,000 rows / 256 MiB declared uncompressed bytes; caps configurable up to 500,000 / 512 MiB |
@@ -151,7 +151,12 @@ Bounded GET has one attempt and an existing 30-second request/body deadline;
 existing HEAD transport retains its bounded retry policy. There is no full-run
 deadline, aggressive polling or unlimited retry loop. One logical decoder and
 concurrency 1 preserve headroom for operational services, Plex, Dropbox and Time
-Machine. Use nice priority as below.
+Machine. An explicitly authorised `--r2-concurrency 16` runs at most 16
+bounded GET/HEAD operations together, without relaxing per-object size/SHA
+verification, the 30-second GET deadline, the 6 GiB process RSS gate or the
+8 GiB scratch reserve. Up to sixteen 128 MiB GET bodies can require 2 GiB
+of payload buffers plus transient copies; peak memory, R2 error rate and
+throughput at 16 are not yet measured. Use nice priority as below.
 
 ## Proposed Pro procedure (requires later operational authorisation)
 
@@ -285,6 +290,11 @@ SIGKILL, power loss or ENOSPC may leave only IN_PROGRESS. All are incomplete.
 Missing/contradictory evidence, absent stored SHA, source drift, graph/row/hash
 mismatch, insufficient resources or an unknown mandatory format also mean STOP.
 Retain the writer freeze and resolve the operational state separately.
+
+Changing `--r2-concurrency` does not affect an already running verifier.
+A different setting requires the existing supervisor to finish or stop,
+confirmed release of its lock, an unchanged writer freeze and a fresh
+invocation using new scratch/log directories and reviewed current Git SHA.
 
 There is **no acceptance resume** and no R2-check reuse in this version, including
 after a controlled interruption. Every invocation creates a fresh private store,
