@@ -311,7 +311,7 @@ function r2RequestErrorField(error, field) {
   }
 }
 
-function isRetryableR2RequestError(error) {
+export function isRetryableR2RequestError(error) {
   const seen = new Set();
   let current = error;
   for (let depth = 0; depth < R2_REQUEST_ERROR_CAUSE_MAX_DEPTH; depth += 1) {
@@ -375,15 +375,18 @@ async function fetchR2WithRetry({
   body = undefined,
   consumeResponse = null,
   maxAttempts = R2_REQUEST_MAX_ATTEMPTS,
+  assertHeld = null,
 }) {
   const boundedMaxAttempts = Number.isSafeInteger(Number(maxAttempts))
     && Number(maxAttempts) > 0
     ? Number(maxAttempts)
     : R2_REQUEST_MAX_ATTEMPTS;
   for (let attempt = 1; attempt <= boundedMaxAttempts; attempt += 1) {
+    assertHeld?.();
     const request = buildRequest();
+    let attemptResult, attemptFailed = false;
     try {
-      const attemptResult = await fetchWithTimeout(
+      attemptResult = await fetchWithTimeout(
         request.url,
         {
           method,
@@ -408,18 +411,25 @@ async function fetchR2WithRetry({
           };
         },
       );
-      if (!attemptResult.retry) {
-        return attemptResult.value;
-      }
     } catch (error) {
+      assertHeld?.();
       if (
         !isRetryableR2RequestError(error) ||
         attempt === boundedMaxAttempts
       ) {
         throw error;
       }
+      attemptFailed = true;
     }
+    if (!attemptFailed) {
+      assertHeld?.();
+      if (!attemptResult.retry) {
+        return attemptResult.value;
+      }
+    }
+    assertHeld?.();
     await sleep(computeR2RetryDelayMs(attempt));
+    assertHeld?.();
   }
 
   throw new Error("R2 request retry loop exhausted unexpectedly.");
@@ -600,9 +610,11 @@ export async function r2CopyObject({ r2, source_key, dest_key }) {
   };
 }
 
-export async function r2HeadObject({ r2, key, accept_encoding_identity = false }) {
+export async function r2HeadObject({ r2, key, accept_encoding_identity = false, assertHeld = null }) {
   if (r2?.adapter?.headObject) {
+    assertHeld?.();
     const result = await r2.adapter.headObject({ key });
+    assertHeld?.();
     const sha256 = normalizeR2Sha256Checksum(
       result?.sha256 ?? result?.checksums?.sha256,
     );
@@ -631,6 +643,7 @@ export async function r2HeadObject({ r2, key, accept_encoding_identity = false }
         ? ""
         : await readResponseText(response, 2000),
     }),
+    assertHeld,
   });
 
   if (response.status === 404) {

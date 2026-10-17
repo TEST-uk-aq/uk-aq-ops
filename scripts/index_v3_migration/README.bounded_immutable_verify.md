@@ -158,16 +158,27 @@ fail closed; ENOSPC cannot turn progress into acceptance. SQLite spills may be
 unlinked while open, so the free-space check also matters. These are scratch-only
 writes, never evidence repair or migration authority.
 
-Bounded GET has one attempt and an existing 30-second request/body deadline;
-existing HEAD transport retains its bounded retry policy. There is no full-run
-deadline, aggressive polling or unlimited retry loop. One logical decoder and
-concurrency 1 preserve headroom for operational services, Plex, Dropbox and Time
-Machine. An explicitly authorised `--r2-concurrency 16` runs at most 16
-bounded GET/HEAD operations together, without relaxing per-object size/SHA
-verification, the 30-second GET deadline, the 6 GiB process RSS gate or the
-8 GiB scratch reserve. Up to sixteen 128 MiB GET bodies can require 2 GiB
-of payload buffers plus transient copies; peak memory, R2 error rate and
-throughput at 16 are not yet measured. Use nice priority as below.
+Verifier GET and HEAD operations use at most four attempts, each with the existing
+30-second request/body deadline and shared 500/1,000/2,000 ms exponential delays.
+GET retries only HTTP 408, 429, 500, 502, 503 and 504 plus transient transport
+errors/timeouts; HEAD retains the shared R2 client's matching status and transport
+retry policy. The lock is reasserted around every verifier request attempt and
+retry delay. Failed GET response bodies are cancelled; per-object byte and SHA
+checks remain unchanged. Authentication/missing-object responses, malformed
+evidence, size errors and integrity mismatches are not retried. Retry-After and
+jitter are not currently used, so sustained throttling can still fail closed.
+
+There is no full-run deadline, aggressive polling or unlimited retry loop. One
+logical decoder and default R2 concurrency 1 preserve headroom for operational
+services, Plex, Dropbox and Time Machine. An explicitly authorised
+`--r2-concurrency 16` runs at most 16 bounded GET/HEAD operations together,
+without relaxing per-object size/SHA verification, the per-attempt deadline, the
+6 GiB process RSS gate or the 8 GiB scratch reserve. Up to sixteen 128 MiB GET
+bodies can require 2 GiB of payload buffers plus transient copies; peak memory,
+R2 error rate and throughput at 16 are not yet measured. A LIVE verifier attempt
+at concurrency 16 encountered HTTP 429 after approximately 155,820 successful
+dependency checks; use concurrency 8 for the next separately authorised LIVE
+attempt and reassess from its progress/error evidence. Use nice priority as below.
 
 ## Proposed Pro procedure (requires later operational authorisation)
 
