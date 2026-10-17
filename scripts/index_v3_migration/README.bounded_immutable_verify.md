@@ -1,6 +1,6 @@
 # Bounded immutable migration-generation verification
 
-Implementation/review handover, 16 October 2026. This document is not operational
+Implementation/review handover, 17 October 2026. This document is not operational
 authorisation, a system contract, or evidence of real TEST acceptance. No LIVE
 repository, R2, Supabase, deployment, scheduler or generation was changed.
 
@@ -158,15 +158,36 @@ fail closed; ENOSPC cannot turn progress into acceptance. SQLite spills may be
 unlinked while open, so the free-space check also matters. These are scratch-only
 writes, never evidence repair or migration authority.
 
-Verifier GET and HEAD operations use at most four attempts, each with the existing
-30-second request/body deadline and shared 500/1,000/2,000 ms exponential delays.
-GET retries only HTTP 408, 429, 500, 502, 503 and 504 plus transient transport
-errors/timeouts; HEAD retains the shared R2 client's matching status and transport
-retry policy. The lock is reasserted around every verifier request attempt and
-retry delay. Failed GET response bodies are cancelled; per-object byte and SHA
-checks remain unchanged. Authentication/missing-object responses, malformed
-evidence, size errors and integrity mismatches are not retried. Retry-After and
-jitter are not currently used, so sustained throttling can still fail closed.
+Verifier GET and HEAD requests go through the private
+`bounded_verify_r2_transport.mjs` module. It is limited to read-only `getObject`
+and `headObject` capabilities and does not import TEST-only shared R2 features.
+Bounded GET uses the migration-local one-attempt body reader; signed HEAD uses the
+stable shared signer, timeout and checksum-normalisation primitives. Neither
+one-attempt path contains its own retry loop, so each logical GET or HEAD makes
+at most four network attempts.
+
+Both methods retry only HTTP 408, 429, 500, 502, 503 and 504, plus the bounded
+cause-chain transport failures recognised by the shared client. The private
+classifier inspects at most eight causes and does not classify response-size,
+checksum, malformed-evidence or logical-integrity failures as transient. Each
+attempt has a 30-second request-and-body deadline, followed by fixed delays of
+500, 1,000 and 2,000 ms. The existing supervised lock assertion runs before and
+after every attempt, before and after each delay, and before returning success.
+Lock loss stops the operation without another retry.
+
+Failed GET and HEAD responses are cancelled. GET retains Content-Length, streamed
+byte-count and object-size bounds. Signed HEAD sends
+`x-amz-checksum-mode: ENABLED` and `Accept-Encoding: identity`; malformed size or
+checksum headers fail closed. Missing stored SHA-256 evidence remains terminal
+for external canonical Parquet because `verifyR2StoredSha256Head()` requires it.
+HTTP 404, 401/403, malformed evidence, size errors and checksum/logical identity
+mismatches are not retried. Retry-After and jitter are not used. A bounded
+Retry-After override could reduce repeated 429 responses, but would extend the
+per-object time under the same lock; jitter could de-synchronise parallel
+requests, but would replace the specified fixed delay schedule with variable
+timing. Either change needs a separately reviewed finite cap and coordinator
+time-budget assessment. Sustained R2 throttling can still fail after four
+attempts; retries do not make an incomplete verification resumable.
 
 There is no full-run deadline, aggressive polling or unlimited retry loop. One
 logical decoder and default R2 concurrency 1 preserve headroom for operational
@@ -347,6 +368,7 @@ Active implementation additions:
 - `scripts/index_v3_migration/bounded_verify_journal.mjs`
 - `scripts/index_v3_migration/bounded_verify_baseline.mjs`
 - `scripts/index_v3_migration/bounded_verify_r2.mjs`
+- `scripts/index_v3_migration/bounded_verify_r2_transport.mjs`
 
 Narrow modifications:
 
@@ -389,6 +411,28 @@ The logical verifier optimisation preserves the existing concurrency-16 opt-in
 and publication primary-key scheduling change. Full-archive timing, SQLite
 index expansion, peak RSS/disk use and the hit rate of the 8,192-entry binding
 cache remain unmeasured until separately authorised real TEST validation.
+
+### Transport isolation update, 17 October 2026
+
+- `scripts/index_v3_migration/bounded_verify_r2.mjs` now delegates all verifier
+  GET and HEAD operations to the private transport while keeping its public
+  capability limited to those two methods.
+- `scripts/index_v3_migration/bounded_verify_r2_transport.mjs` supplies the
+  verifier-only bounded, signed read transport and finite retry policy.
+- This README records the transport boundary, retry limits and remaining
+  throttling risk.
+
+`authenticateCutoverVerifierDependencies()` follows literal relative imports
+from its existing trusted roots, so it includes the private module automatically;
+no historical semantic pin or explicit root list change is needed. Its existing
+tracked-file and clean-HEAD gates still apply. The new module must be committed
+and reviewed before an operational verifier invocation can authenticate the
+updated import closure. No successful full TEST verification is claimed here.
+Structural validation for this update used `node --check` on both changed
+JavaScript modules, direct module imports, a static walk of the current literal
+relative-import closure, GET/HEAD capability and finite-loop inspection, and
+`git diff --check` including the untracked module. No migration, verifier
+operation or R2 request was started.
 
 ## System-doc handover and remaining acceptance blockers
 

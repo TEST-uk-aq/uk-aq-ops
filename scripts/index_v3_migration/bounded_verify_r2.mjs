@@ -1,68 +1,27 @@
 import { createHash } from 'node:crypto';
 import { demand, same, sha256 } from './bounded_verify_store.mjs';
-import { r2GetMigrationObjectBounded } from '../backup_r2/lib/observation_history_migration_bounded_r2.mjs';
-import {
-  R2_REQUEST_MAX_ATTEMPTS, R2_REQUEST_RETRY_DELAYS_MS, isRetryableR2RequestError,
-  isRetryableR2Status, r2HeadObject,
-} from '../../workers/shared/r2_sigv4.mjs';
+import { createBoundedVerifierR2Transport } from './bounded_verify_r2_transport.mjs';
 import { verifyR2StoredSha256Head } from '../../workers/shared/uk_aq_r2_checksum_publication.mjs';
 import { readCanonicalObservationRowsFromParquetBytes } from '../backup_r2/lib/observation_history_migration_v3.mjs';
 import {
   encodeCanonicalObservationRow, OBSERVATION_CONTENT_HASH_PREFIX, OBSERVATION_CONTENT_HASH_COLUMNS,
 } from '../../workers/shared/uk_aq_observation_content_hash.mjs';
 
-// The capability supplied to verification has only GET/HEAD. No mutation or
-// migration adapter is constructed, and no publication API is invoked.
-function isTransientBoundedGetFailure(error) {
-  if (Number.isInteger(error?.status)) return isRetryableR2Status(error.status);
-  return error?.message === 'Bounded R2 GET deadline exceeded' || isRetryableR2RequestError(error);
-}
-
-async function getWithBoundedRetry({ r2, key, max_bytes, store }) {
-  let lastError, attemptFailed = false;
-  for (let attempt = 1; attempt <= R2_REQUEST_MAX_ATTEMPTS; attempt += 1) {
-    store.assertHeld();
-    let result;
-    try {
-      result = await r2GetMigrationObjectBounded({ r2, key, max_bytes });
-    } catch (error) {
-      lastError = error;
-      attemptFailed = true;
-    }
-    store.assertHeld();
-    if (!attemptFailed) return result;
-    if (!isTransientBoundedGetFailure(lastError)) throw lastError;
-    if (attempt === R2_REQUEST_MAX_ATTEMPTS) {
-      const status = Number.isInteger(lastError.status) ? lastError.status : null;
-      const statusText = status === null ? '' : ` HTTP ${status}`;
-      const exhausted = new Error(
-        `Bounded R2 GET exhausted after ${attempt} attempts: key=${key}${statusText}`,
-        { cause: lastError },
-      );
-      if (status !== null) exhausted.status = status;
-      throw exhausted;
-    }
-    const delayMs = R2_REQUEST_RETRY_DELAYS_MS[attempt - 1];
-    store.assertHeld();
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
-    store.assertHeld();
-    lastError = undefined; attemptFailed = false;
-  }
-  throw new Error(`Bounded R2 GET retry loop exhausted unexpectedly: key=${key}`, { cause: lastError });
-}
-
+// The capability supplied to verification has only bounded GET and HEAD. The
+// private transport uses one network attempt per call and owns the finite retry
+// policy, lock assertions, request timeout and response validation.
 export function boundedR2Reads({ r2, store, maxObjectBytes }) {
+  const transport = createBoundedVerifierR2Transport({ r2, assertHeld: () => store.assertHeld() });
   return Object.freeze({
     getObject: async ({ key, max_bytes = maxObjectBytes }) => {
       store.assertHeld();
       demand(Number.isSafeInteger(max_bytes) && max_bytes > 0 && max_bytes <= maxObjectBytes,
         `R2 object exceeds response buffer budget: ${key}`);
-      const result = await getWithBoundedRetry({ r2, key, max_bytes, store });
+      const result = await transport.getObject({ key, max_bytes });
       store.assertHeld(); return result;
     },
     headObject: async ({ key }) => {
-      store.assertHeld(); const result = await r2HeadObject({ r2, key, accept_encoding_identity: true,
-        assertHeld: () => store.assertHeld() });
+      store.assertHeld(); const result = await transport.headObject({ key });
       store.assertHeld(); return result;
     },
   });
