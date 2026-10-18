@@ -8,6 +8,11 @@ const HOST = '41a81f781d3bd7234fde0b25df51e879.r2.cloudflarestorage.com';
 const PREFIX = 'managed/jsongen/v1/pending/unverified/prune_daily_v3';
 const SHA = /^[a-f0-9]{64}$/;
 export const PRUNE_SIGNED_UPLOAD_DEADLINE_MS = 15_000;
+// Mirrors the currently reviewed TEST signer admission, without changing it or
+// adding a second environment setting. Extend only with reviewed signer support.
+export const PRUNE_PENDING_SOURCE_CONNECTOR_IDS = Object.freeze([1]);
+export const isPrunePendingSourceConnector = connectorId =>
+  PRUNE_PENDING_SOURCE_CONNECTOR_IDS.includes(connectorId);
 
 export function resolvePruneSignerConfig(env) {
   if (env.UK_AQ_ENV_NAME !== 'TEST') throw new Error('TEST environment required for Prune signer handover');
@@ -90,7 +95,11 @@ export async function uploadPrunePendingSource({ signer, fetchImpl = fetch,
   const started = Date.now();
   const timer = setTimeout(() => controller.abort(), deadlineMs);
   let evidenceSha256 = null;
+  const transport = { handover_attempted: true, signer_intent_state: 'not_attempted',
+    put_state: 'not_attempted' };
   try {
+    if (!isPrunePendingSourceConnector(candidate.connectorId))
+      throw failure('connector_not_allowed', 'Connector not admitted for optional Prune handover');
     const prepared = preparePrunePendingSource(candidate);
     evidenceSha256 = sha256Hex(canonicalJson(prepared.evidence));
     if (Date.now() - started >= deadlineMs) throw failure('upload_deadline', 'Optional handover deadline exceeded');
@@ -101,6 +110,7 @@ export async function uploadPrunePendingSource({ signer, fetchImpl = fetch,
       uncompressed_byte_size: prepared.uncompressed_byte_size, uncompressed_sha256: prepared.uncompressed_sha256,
       scope: { kind: 'connector_day', connector_id: candidate.connectorId, day_utc: candidate.dayUtc } };
     let response;
+    transport.signer_intent_state = 'ambiguous';
     try { response = await fetchImpl(signer.endpoint, { method: 'POST', redirect: 'error', signal: controller.signal,
       headers: { Authorization: `Bearer ${signer.writerToken}`, 'Content-Type': 'application/json',
         'CF-Access-Client-Id': signer.accessId, 'CF-Access-Client-Secret': signer.accessSecret },
@@ -108,6 +118,7 @@ export async function uploadPrunePendingSource({ signer, fetchImpl = fetch,
     catch { throw failure(controller.signal.aborted ? 'upload_deadline' : 'signer_transport_unavailable',
       'Signer request did not complete'); }
     if (!response.ok) {
+      transport.signer_intent_state = 'rejected';
       const code = [401, 403].includes(response.status) ? 'signer_auth_rejected'
         : response.status === 429 ? 'signer_rate_limited'
           : response.status >= 500 ? 'signer_unavailable' : 'signer_rejected';
@@ -115,11 +126,13 @@ export async function uploadPrunePendingSource({ signer, fetchImpl = fetch,
       throw failure(code, `Signer returned HTTP ${response.status}`);
     }
     const intent = validateIntent(await boundedJson(response), prepared, candidate);
+    transport.signer_intent_state = 'accepted';
     const putFailure = (code, message) => Object.assign(failure(code, message),
       { reference: intent.object, intent_id: intent.intent_id });
     if (controller.signal.aborted || Date.now() - started >= deadlineMs)
       throw putFailure('intent_issued', 'Optional handover deadline exceeded before PUT');
     let put;
+    transport.put_state = 'ambiguous';
     try { put = await fetchImpl(intent.upload_url, { method: 'PUT', redirect: 'error', signal: controller.signal,
       headers: intent.required_headers, body: prepared.body }); }
     catch (cause) { throw putFailure('upload_ambiguous',
@@ -127,6 +140,7 @@ export async function uploadPrunePendingSource({ signer, fetchImpl = fetch,
     if (controller.signal.aborted || Date.now() - started >= deadlineMs)
       throw putFailure('upload_ambiguous', 'Signed PUT returned after optional deadline; outcome needs reconciliation');
     if (put.status >= 200 && put.status < 300) {
+      transport.put_state = 'acknowledged';
       const pendingEvidence = { ...prepared.evidence, signed_upload: {
         intent_id: intent.intent_id, object: intent.object,
         disposition: 'put_acknowledged_unverified',
@@ -134,17 +148,20 @@ export async function uploadPrunePendingSource({ signer, fetchImpl = fetch,
       return { state: 'put_acknowledged_unverified',
         intent_id: intent.intent_id, source: intent.object,
         pending_evidence: pendingEvidence, source_evidence_sha256: evidenceSha256,
-        preparation_sha256: sha256Hex(canonicalJson(pendingEvidence)) };
+        preparation_sha256: sha256Hex(canonicalJson(pendingEvidence)), transport };
     }
     if (put.status === 412) throw putFailure('upload_precondition_failed', 'Signed PUT precondition failed; independent readback required');
     if (put.status === 409 || put.status >= 500) throw putFailure('upload_ambiguous', `Signed PUT outcome unknown: HTTP ${put.status}`);
+    transport.put_state = 'rejected';
     throw putFailure('upload_rejected', `Signed PUT rejected: HTTP ${put.status}`);
   } catch (error) {
+    if (error.code === 'invalid_signer_response') transport.signer_intent_state = 'invalid_response';
     if (controller.signal.aborted && error.code !== 'upload_ambiguous' && error.code !== 'intent_issued')
       throw Object.assign(failure('upload_deadline', 'Optional handover deadline exceeded'),
         { reference: error.reference, intent_id: error.intent_id,
-          preparation_sha256: evidenceSha256 });
+          preparation_sha256: evidenceSha256, transport });
     if (evidenceSha256) error.preparation_sha256 = evidenceSha256;
+    error.transport = transport;
     throw error;
   } finally { clearTimeout(timer); }
 }

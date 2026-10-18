@@ -10,7 +10,7 @@ import { BUCKET } from '../scripts/jsongen/schema.mjs';
 import { preparePrunePendingSource } from '../scripts/jsongen/prune-pending-source.mjs';
 import { uploadPrunePendingSource } from '../scripts/jsongen/prune-signed-upload.mjs';
 import { preparePruneOriginalFinalEvidence } from '../scripts/jsongen/prune-final-evidence.mjs';
-import { describePruneGateOutboxEvidence } from '../scripts/jsongen/prune-outbox.mjs';
+import { describePruneGateOutboxEvidence, preparePrunePostCommitHandover } from '../scripts/jsongen/prune-outbox.mjs';
 import { createPruneOriginalMetadataCapture, preparePruneOriginalMetadataSnapshot } from '../scripts/jsongen/prune-original-metadata.mjs';
 import { canonicalJson } from '../scripts/jsongen/schema.mjs';
 import { verifyPrunePendingSource } from '../scripts/jsongen/prune-pending-verification.mjs';
@@ -152,6 +152,10 @@ test('client accepts an intent produced by the merged signer Worker', async () =
 test('mismatched signer metadata blocks PUT; statuses remain unverified and do not retry', async () => {
   await fixtureAsync(async ({ candidate }) => {
     let calls = 0;
+    await assert.rejects(uploadPrunePendingSource({ signer, ...candidate, connectorId: 2,
+      fetchImpl: async () => { calls++; assert.fail('disallowed connector cannot request signing'); } }),
+    { code: 'connector_not_allowed' });
+    assert.equal(calls, 0);
     await assert.rejects(uploadPrunePendingSource({ signer, ...candidate,
       fetchImpl: async (_url, options) => { calls++; return Response.json(signedIntent(JSON.parse(options.body),
         { object: { bucket: 'wrong' } })); } }), { code: 'invalid_signer_response' });
@@ -257,8 +261,11 @@ test('pre-commit final preparation and outbox description retain only unverified
       uncompressed_sha256: prepared.uncompressed_sha256,
       uncompressed_byte_size: prepared.uncompressed_byte_size }).object;
     const pending = { state: 'put_acknowledged_unverified', intent_id: 'b'.repeat(64),
-      source, pending_evidence: prepared.evidence,
-      preparation_sha256: 'c'.repeat(64), source_evidence_sha256: 'd'.repeat(64) };
+      source, pending_evidence: { ...prepared.evidence, signed_upload: {
+        intent_id: 'b'.repeat(64), object: source, disposition: 'put_acknowledged_unverified' } } };
+    const sha = value => createHash('sha256').update(canonicalJson(value)).digest('hex');
+    pending.source_evidence_sha256 = sha(prepared.evidence);
+    pending.preparation_sha256 = sha(pending.pending_evidence);
     const metadata = sampleOriginalMetadataSnapshot();
     const manifestKey = metadata.entries[0].reference.key;
     const connector = { run_id: runId, day_utc: dayUtc, connector_id: 1,
@@ -268,9 +275,14 @@ test('pre-commit final preparation and outbox description retain only unverified
       pollutant_manifests: prepared.evidence.scope.pollutant_partitions
         .map(partition => ({ ...partition, manifest: metadata.entries[1].reference })),
       scoped_roots: [] };
+    const finalization = { ok: true, affected_days_utc: [dayUtc],
+      canonical_aggregate_result: { canonical_aggregate_authority_verified: true,
+        parent_state_reread_under_lock: true, affected_days_utc: [dayUtc] },
+      v3_publication: { exact_scopes: [{ ok: true }], latest_global: { ok: true } } };
     const finalPreparation = preparePruneOriginalFinalEvidence({
-      pending, connector, finalization: { ok: true, affected_days_utc: [dayUtc] },
+      pending, connector, finalization,
       runId, dayUtc, connectorId: 1, writerGitSha: '4'.repeat(40),
+      sourceIdentity: candidate.sourceIdentity,
       originalMetadataSnapshot: metadata.snapshot,
     });
     assert.equal(finalPreparation.envelope.original_candidate_connector_gate.transaction_state,
@@ -283,9 +295,36 @@ test('pre-commit final preparation and outbox description retain only unverified
     assert.equal(evidence.original_source_status_provenance, 'original_source_status_unavailable');
     assert.equal(evidence.connector_manifest_byte_sha256, metadata.entries[0].reference.sha256);
     assert.equal(finalPreparation.envelope.original_metadata_snapshot.objects.length, 6);
+    assert.deepEqual(finalPreparation.envelope.pending.source_evidence.scope,
+      prepared.evidence.scope);
+    const acceptance = { event_schema_version: 1, environment: 'TEST', writer_identity: 'prune_daily_v3',
+      run_id: runId, attempt_id: runId, writer_git_sha: '4'.repeat(40), day_utc: dayUtc, connector_id: 1,
+      ...candidate.sourceIdentity, history_manifest_key: manifestKey, history_manifest_hash: 'e'.repeat(64),
+      gate_history_completed_at: '2026-10-10 12:34:56.789+00',
+      gate_completion_source: 'prune_daily_phase_b', candidate_ready_marker: 'PRUNE_FIRST_DELETE_READY:v1',
+      ...evidence, final_evidence_sha256: finalPreparation.sha256,
+      final_evidence_byte_size: finalPreparation.byte_size };
+    const reference = preparePrunePostCommitHandover(acceptance);
+    assert.equal(reference.state, 'reference_prepared');
+    assert.equal(reference.delivery_state, 'not_attempted');
+    assert.equal(reference.ready_for_independent_authentication, true);
+    assert.equal(reference.message.authority_state, 'requires_independent_authentication');
+    assert.equal(reference.message.pending.object.key, source.key);
+    assert.ok(reference.byte_size <= 4096);
+    assert.deepEqual(preparePrunePostCommitHandover({ ...acceptance,
+      source_content_hash_row_count: String(acceptance.source_content_hash_row_count),
+      gate_history_completed_at: new Date(acceptance.gate_history_completed_at),
+      final_evidence_byte_size: String(finalPreparation.byte_size) }), reference);
+    assert.throws(() => preparePruneOriginalFinalEvidence({
+      pending: { ...pending, preparation_sha256: '0'.repeat(64) }, connector,
+      finalization,
+      runId, dayUtc, connectorId: 1, writerGitSha: '4'.repeat(40), sourceIdentity: candidate.sourceIdentity,
+      originalMetadataSnapshot: metadata.snapshot,
+    }), /differs from original complete frozen source/);
     const overLimit = preparePruneOriginalFinalEvidence({
-      pending, connector, finalization: { ok: true, affected_days_utc: [dayUtc] },
+      pending, connector, finalization,
       runId, dayUtc, connectorId: 1, writerGitSha: '4'.repeat(40),
+      sourceIdentity: candidate.sourceIdentity,
       originalMetadataSnapshot: { ...metadata.snapshot, objects:
         metadata.snapshot.objects.map((object, index) => index === 0
           ? { ...object, bytes_base64: 'a'.repeat(1024 * 1024) } : object) },
@@ -295,13 +334,15 @@ test('pre-commit final preparation and outbox description retain only unverified
     assert.equal(describePruneGateOutboxEvidence({ pending, connector,
       finalPreparation: overLimit }).final_evidence_state, 'not_captured');
     assert.throws(() => preparePruneOriginalFinalEvidence({
-      pending, connector, finalization: { ok: true, affected_days_utc: [dayUtc] },
+      pending, connector, finalization,
       runId, dayUtc, connectorId: 1, writerGitSha: '4'.repeat(40),
+      sourceIdentity: candidate.sourceIdentity,
       originalMetadataSnapshot: { ...metadata.snapshot, invocation_id: 'another-run' },
     }), /snapshot is not bound/);
     const incomplete = preparePruneOriginalFinalEvidence({
-      pending, connector, finalization: { ok: true, affected_days_utc: [dayUtc] },
+      pending, connector, finalization,
       runId, dayUtc, connectorId: 1, writerGitSha: '4'.repeat(40),
+      sourceIdentity: candidate.sourceIdentity,
     });
     assert.equal(describePruneGateOutboxEvidence({ pending, connector,
       finalPreparation: incomplete }).final_evidence_state, 'not_captured');

@@ -10,10 +10,12 @@ completed TEST backup. Its versioned candidate evidence is not a managed writer
 receipt/publication. It does not activate pending Prune source, managed selection
 or chart serving; its first real TEST run requires separate operator authorisation.
 
-## Stage 3A signed Prune source handover (code only; default off)
+## AURN Prune writer handover (code only; no operational acceptance)
 
 Selected-v3 Prune can offer its exact frozen connector-day NDJSON before
-canonical connector publication. The TEST-only flag
+canonical connector publication. Only connector `1` (AURN) is currently admitted;
+other connectors retain canonical processing without requesting signing or an outbox.
+The TEST-only flag
 `UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED` defaults to false. The handover
 uses the merged JSONgen signer `POST /v1/upload-intents` and the dedicated
 writer bearer and Cloudflare Access client credentials described in the
@@ -32,7 +34,11 @@ only derived object offered for retention.
 
 The source keeps original row multiplicity, order, timestamp and numeric JSON
 values. Preparation is bounded at 100,000 rows, 32 MiB original, 8 MiB gzip
-and 128 scopes. Signer and PUT share a 15-second deadline; the optional stage
+and 1,024 physical scopes per complete pending connector-day. Stage 1 receipt
+and general consumer limits remain 128 scopes. No rows or pollutants are filtered
+to make a source fit. See the [writer interface](prune-writer-handover.md) for
+capacity evidence, all coupled limits, diagnostics and deterministic outbox replay.
+Signer and PUT share a 15-second deadline; the optional stage
 starts only with extra headroom reserved for canonical publication and v3 run
 finalization. 2xx records `put_acknowledged_unverified`, not verified retention.
 A 412 conditional conflict needs separate readback; 409, 5xx and transport
@@ -54,7 +60,10 @@ authority, and no AURN-specific rule is applied to other connectors.
 
 After the v3 batch finalizer passes and before the original protected candidate/gate
 transaction begins, Prune can prepare a version-1 original-final evidence
-envelope. It compares the pending partition content hashes, counts and effective
+envelope, including the full original pending-source description and physical
+scope membership. It validates both source-description digests, exact signed
+object identities and the frozen source identity used by the gate. It compares
+the pending partition content hashes, counts and effective
 statuses with the original canonical child manifests, and captures already-read
 connector/child manifest byte identities, canonical file metadata, selected-v3
 exact-scope references and final batch references. When bounded, its versioned
@@ -66,7 +75,7 @@ byte hashes and lengths checked against exact bytes observed in its existing
 PUT/readback path. This adds no R2 request. The envelope explicitly
 does not assert a successful gate commit before the transaction runs.
 It adds no routine Parquet read and no derived R2 readback to canonical Prune.
-When the TEST-only handover is enabled, the optional function proposed in open
+When the TEST-only handover is enabled, the restricted function defined in merged
 Schema PR #11 may retain the exact bounded preparation bytes with original
 gate acceptance inside the same protected PostgreSQL transaction. A failed
 optional insert can be rolled back to its savepoint while an otherwise valid
@@ -89,11 +98,17 @@ control-flow evidence; the optional snapshot and outbox may now retain exact
 writer-produced metadata, but do not independently authenticate it. PostgreSQL gate-only
 recovery remains disabled by its own contract. This code therefore does not
 produce a bundle or receipt, promote `authenticateFinalPublication()`, mutate
-managed control, dispatch JSONgen, or select monthly publication. Stage 3B
-must define independent metadata/source authentication, an immutable external
-metadata snapshot for scopes that exceed 1 MiB, and
-delivery/reconciliation and missing-registration detection before complete
-coverage can be claimed. The existing `selectManagedPublications()` blocker remains.
+managed control, dispatch JSONgen, or select monthly publication. After an explicit
+PostgreSQL `COMMIT` command acknowledgement, a retained row can produce the small
+version-1 post-commit reference described in the [writer interface](prune-writer-handover.md).
+It can be reconstructed from the immutable original row after a crash. It is
+`reference_prepared`, with delivery `not_attempted`, and never a VERIFIED receipt.
+Stage 3B must implement independently authenticated outbox discovery/replay,
+private pending readback, original metadata/status/scope and current authority
+authentication, receipt lifecycle and missing-registration detection. Oversized
+original metadata remains `not_captured`; any external overflow snapshot needs
+its own reviewed design and retention/readback authority. The existing
+`selectManagedPublications()` blocker remains.
 The [original gate durability review](../../docs/investigations/jsongen_prune_final_evidence_durability_boundary.md)
 traces the mutable candidate/gate schema, READY-to-CONSUMED transition and
 commit-to-delivery crash window. It identifies a separately reviewed
