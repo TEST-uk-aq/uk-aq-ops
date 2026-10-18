@@ -157,6 +157,7 @@ export class PruneCommittedHistoryGuardError extends Error {
 // are committed authority; loose same-key objects can be interrupted artefacts.
 async function inspectPruneFrozenConnectorSnapshot({
   r2, observationsPrefix, dayUtc, connectorId, rows, getObject = r2GetObject,
+  onOriginalAuthority = null,
 }) {
   const prefix = observationsPrefix;
   const rootKey = buildR2HistoryV2ObservationsRootManifestKey(prefix);
@@ -168,32 +169,48 @@ async function inspectPruneFrozenConnectorSnapshot({
     throw new Error(`Committed observation root identity disagrees: ${rootKey}`);
   }
   const indexRoots = await currentIndexAuthority(getObject, r2, dayUtc, connectorId);
-  const firstPublication = () => {
+  const hierarchyKeys = [rootKey];
+  const firstPublication = (parentKey, childField, childIdentity) => {
     if (indexRoots.length) throw new Error(`Current index_v3 authority contradicts absent connector hierarchy: ${dayUtc}/${connectorId}`);
+    // These are the ORIGINAL admitted root-reachable facts, before any PUT.
+    // The latest registry only corroborates the hierarchy; it is not a parent.
+    // Optional retention must never alter canonical admission or its return.
+    try {
+      onOriginalAuthority?.({ admission: "first_publication",
+        membership: "authoritative_empty", row_count: 0,
+        observations_root_key: rootKey, hierarchy_keys: [...hierarchyKeys],
+        authority_key: parentKey,
+        absence: { parent_key: parentKey, child_field: childField, child_identity: childIdentity },
+        index_discovery_key: DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY,
+        previous_authority: null });
+    } catch { /* Optional original evidence cannot change canonical admission. */ }
     return { admission: "first_publication", previous_authority: null };
   };
   const year = Number(dayUtc.slice(0, 4));
   const month = dayUtc.slice(5, 7);
   const yearKey = buildR2HistoryV2ObservationsYearManifestKey(prefix, year);
   const yearRef = oneChild(root.children, "year", year, rootKey);
-  if (!yearRef) return firstPublication();
+  if (!yearRef) return firstPublication(rootKey, "year", year);
   if (yearRef.manifest_key !== yearKey) throw new Error(`Committed observation year key disagrees: ${rootKey}`);
   const yearManifest = await aggregate(getObject, r2, prefix, yearKey, "uk_aq_observations_year_manifest");
   if (yearManifest.year !== year || yearManifest.content_hash !== yearRef.content_hash) throw new Error(`Committed observation year identity disagrees: ${yearKey}`);
+  hierarchyKeys.push(yearKey);
   const monthKey = buildR2HistoryV2ObservationsMonthManifestKey(prefix, year, month);
   const monthRef = oneChild(yearManifest.children, "month", month, yearKey);
-  if (!monthRef) return firstPublication();
+  if (!monthRef) return firstPublication(yearKey, "month", month);
   if (monthRef.manifest_key !== monthKey) throw new Error(`Committed observation month key disagrees: ${yearKey}`);
   const monthManifest = await aggregate(getObject, r2, prefix, monthKey, "uk_aq_observations_month_manifest");
   if (monthManifest.year !== year || monthManifest.month !== month || monthManifest.content_hash !== monthRef.content_hash) throw new Error(`Committed observation month identity disagrees: ${monthKey}`);
+  hierarchyKeys.push(monthKey);
   const dayKey = buildHistoryV2DayManifestKey(prefix, dayUtc);
   const dayRef = oneChild(monthManifest.children, "day_utc", dayUtc, monthKey);
-  if (!dayRef) return firstPublication();
+  if (!dayRef) return firstPublication(monthKey, "day_utc", dayUtc);
   if (dayRef.manifest_key !== dayKey) throw new Error(`Committed observation day key disagrees: ${monthKey}`);
   const day = await manifest(getObject, r2, dayKey, { manifest_kind: "day", day_utc: dayUtc }, dayRef.manifest_hash);
+  hierarchyKeys.push(dayKey);
   const connectors = matchingReferences(day, "connector_manifests", "child_manifests", "connector_id", dayKey);
   const connectorRef = oneChild(connectors, "connector_id", connectorId, dayKey);
-  if (!connectorRef) return firstPublication();
+  if (!connectorRef) return firstPublication(dayKey, "connector_id", connectorId);
   const connectorKey = buildHistoryV2ConnectorManifestKey(prefix, dayUtc, connectorId);
   if (connectorRef.manifest_key !== connectorKey) throw new Error(`Committed observation connector key disagrees: ${dayKey}`);
   const authority = `${connectorKey}#${connectorRef.manifest_hash}`;

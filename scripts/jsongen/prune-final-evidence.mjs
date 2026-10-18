@@ -2,6 +2,7 @@
 // attestation nor an authenticated Stage 1 verified-change receipt.
 import { BUCKET, canonicalJson } from './schema.mjs';
 import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
+import { preparePruneOriginalAuthorityExtension } from './prune-original-metadata.mjs';
 
 const same = (a, b) => canonicalJson(a).equals(canonicalJson(b));
 const reference = value => value && typeof value.key === 'string'
@@ -12,7 +13,8 @@ const references = values => (Array.isArray(values) ? values : [])
   .map(reference).filter(Boolean).sort((a, b) => a.key.localeCompare(b.key));
 
 export function preparePruneOriginalFinalEvidence({ pending, connector, finalization,
-  runId, dayUtc, connectorId, writerGitSha, sourceIdentity, originalMetadataSnapshot = null }) {
+  runId, dayUtc, connectorId, writerGitSha, sourceIdentity, originalMetadataSnapshot = null,
+  originalAuthorityCapture = null }) {
   if (pending?.state !== 'put_acknowledged_unverified'
     || pending.pending_evidence?.writer?.invocation_id !== runId
     || pending.pending_evidence?.connector_id !== connectorId
@@ -142,7 +144,31 @@ export function preparePruneOriginalFinalEvidence({ pending, connector, finaliza
       'evidence_envelope_retention_depends_on_optional_outbox_commit',
     ],
   };
+  // Compatible schema-1 addition: neither the legacy metadata group meanings
+  // nor the immutable SQL event/version/identity changes. Absence of this
+  // versioned extension remains a legacy incomplete event for the consumer.
+  envelope.original_authority_extension = preparePruneOriginalAuthorityExtension({
+    capture: originalAuthorityCapture, pending, connector,
+    finalBatch: envelope.original_final_batch,
+    runId, dayUtc, connectorId, writerGitSha, sourceIdentity,
+  });
+  if (envelope.original_authority_extension.completeness !== 'captured')
+    envelope.unresolved.push('original_before_or_binding_authority_not_completely_captured');
   let bytes = canonicalJson(envelope);
+  if (bytes.length > 1024 * 1024 && envelope.original_authority_extension.objects?.length) {
+    const original = envelope.original_authority_extension;
+    envelope.original_authority_extension = {
+      schema_version: 1, kind: original.kind, completeness: 'oversized',
+      reason: 'inline_final_evidence_limit', identity: original.identity,
+      required_object_count: original.required_object_count,
+      required_raw_byte_size: original.required_raw_byte_size,
+      complete_envelope_byte_size: bytes.length,
+      before: { state: 'unavailable', reason: 'original_bytes_exceed_inline_limit' },
+      binding: { state: 'unavailable', reason: 'original_bytes_exceed_inline_limit' },
+    };
+    envelope.unresolved.push('original_before_or_binding_authority_not_completely_captured');
+    bytes = canonicalJson(envelope);
+  }
   if (bytes.length > 1024 * 1024 &&
     envelope.original_metadata_snapshot.completeness === 'exact_writer_metadata_captured_unverified') {
     envelope.original_metadata_snapshot = {

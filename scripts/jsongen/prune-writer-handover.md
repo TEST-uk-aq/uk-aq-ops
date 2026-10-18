@@ -6,6 +6,13 @@ and its linked contracts. This document describes repository code, not deploymen
 or real TEST acceptance. The operator reports the Actions pending-source flag is
 already true and Prune scheduling paused. Neither setting is changed here.
 
+The later [original-authority amendment](prune-original-authority-handover.md)
+adds separately retained pre-PUT admitted absence and selected-v3 Core-owned
+binding closure to a versioned extension of the same schema-1 final envelope.
+It supersedes the earlier missing-before/binding capture boundary for eligible
+new first-publication events only. Legacy/incomplete events remain blocked;
+PR #112 still needs its independent extension decoder before receipt creation.
+
 ## Capacity and complete source
 
 A physical scope is `(connector_id, timeseries_id, station_id, pollutant_code,
