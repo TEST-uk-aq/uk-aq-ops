@@ -12,6 +12,11 @@ omission. `--inspection-partition 0..7` selects a deterministic subset; other
 scopes remain uninspected. Separate invocations cannot be merged as one coherent
 snapshot. Full-event reports use lossless dictionaries under the unchanged 4 MiB
 wire cap; report schemas 1/2 and verified receipt schemas 1/2 remain supported.
+Admission requires the sourced `UK_AQ_ENV_NAME=TEST` and existing
+`UK_AQ_GITHUB_REPO=OWNER/REPO`, plus `--execute-read-only`. Missing repository
+configuration blocks before remote access. GitHub runs must match that configured
+repository and use `workflow_dispatch`; the optional private reader shares this
+check. The repository key is local-only in the environment target mapping.
 
 The manual-only [independent Prune consumer](prune-consumer-handover.md) implements
 Stage 3B for original TEST/AURN first publication: private outbox discovery/replay,

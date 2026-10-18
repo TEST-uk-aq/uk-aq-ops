@@ -195,11 +195,44 @@ atomically renamed from a mode-0600 temporary file only after full admission.
 Logs contain counts/codes, not credentials or observations. Exit 2 still means
 reconciliation required. Importing modules does not execute the interface.
 
-Existing TEST/v3 canonical and derived R2 configuration and the restricted private
-reader URL are reused. No credentials, environment keys, SQL schema or service is
-added. An absent real control blocks rather than initializing it. No automatic
-remote write, retention, dispatch, schedule, generator or chart route is added.
-The manual interface was not executed during implementation.
+Source the existing TEST environment before any separately authorised invocation.
+Admission now reuses `UK_AQ_ENV_NAME` and `UK_AQ_GITHUB_REPO`, the existing sourced
+Ops repository identity already used by the WHO runner. Both are mandatory:
+`UK_AQ_ENV_NAME` must be exactly `TEST`; `UK_AQ_GITHUB_REPO` must be a nonempty
+`OWNER/REPO` identifier for that environment. The required `--execute-read-only`
+flag remains the explicit manual opt-in; no new enable key is needed.
+
+The shared `admission.mjs` check runs before local input or remote reads in the
+Stage 3C CLI, and before client construction in the optional private outbox reader.
+An absent, empty or malformed configured repository fails closed. A supplied
+`GITHUB_REPOSITORY` must exactly match it. Under `GITHUB_ACTIONS=true`, that runtime
+identity is mandatory and `GITHUB_EVENT_NAME` must be `workflow_dispatch`, reusing
+the existing manual diagnostic admission convention. Local operation may omit
+GitHub runtime metadata. Runtime identity, Git remotes and another environment
+are never configuration fallbacks; LIVE and missing environment names are rejected.
+
+`UK_AQ_GITHUB_REPO` is recorded as `local` in
+`config/uk_aq_github_env_targets.csv`, consistent with its sourced-environment
+meaning. No GitHub variable/secret, workflow, credential, SQL schema or service
+is provisioned. The operator-owned ignored `env-vars-master.csv` is absent in this
+checkout; retain/verify its existing `UK_AQ_GITHUB_REPO` definition when preparing
+the external TEST environment. No value is inferred or automatically supplied.
+The independent consumer also uses the private reader, so it now requires this
+same repository configuration before connecting.
+
+Existing TEST/v3 canonical and derived R2 configuration, dedicated credentials
+and restricted private reader URL remain unchanged. An absent real control blocks
+rather than initializing it. No automatic remote write, retention, dispatch,
+schedule, generator or chart route is added. The manual interface was not executed.
+
+The focused PR #114 application-diff review found no other newly hard-coded
+environment-specific repository, account, bucket or service values. The optional
+reader contained an equivalent pre-existing repository literal on this diagnostic
+path; it now shares the external admission check. Earlier Stage A
+`diagnose.mjs`/workflow repository literals and existing derived-storage account/
+bucket pins in `control.mjs`, `inputs.mjs` and `schema.mjs` predate PR #114 and remain
+separate portability work. Their accepted TEST scope/storage and receipt schemas
+were not broadened during this review.
 
 ## Validation, remaining limits and Stage 3D handover
 
@@ -245,3 +278,23 @@ compatibility. Original canonical verification, receipt authority, writer covera
 and publication conditions are unchanged. Rollback is reverting this reader/report
 hardening; retain original outbox, bundles, receipts and diagnostic evidence. The
 existing 18 October archives were reused and newly touched files archived once.
+
+The configuration review passed 27 synthetic admission cases (4 allowed,
+23 blocked): required/malformed configuration, repository mismatch, LIVE rejection,
+missing Actions identity, non-manual events and absence of runtime-identity
+fallback. Rejected configurations never construct a database client. Syntax
+checks passed for 15 active PR modules/check files; CSV targeting, daily archive
+integrity and `git diff --check` passed. Two existing focused read-only checks also
+passed, without adding a test suite or executing the manual diagnostic:
+
+```sh
+node --test --test-isolation=none --test-reporter=tap --test-name-pattern='^authenticated original matches exact current scope' tests/jsongen_currentness.test.mjs
+node --test --test-isolation=none --test-reporter=tap --test-name-pattern='^late visibility is recovered' tests/jsongen_prune_consumer.test.mjs
+```
+
+For later TEST acceptance, first verify the sourced
+repository identity and least-privilege destinations, then use a separately
+authorised manual invocation. Reverting this configuration correction restores
+the older admission behaviour without altering retained data. Chat-mode system-doc
+handover: record the required existing repository configuration and shared
+fail-closed local/manual-Actions admission; no authoritative system_docs were edited.

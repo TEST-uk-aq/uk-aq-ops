@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { reconcileManagedInputs, reconciliationArtifact } from './reconcile.mjs';
 import { readManagedControl, managedR2Config } from './control.mjs';
 import { connectPruneOutboxReader } from './prune-outbox-reader.mjs';
+import { assertTestOpsEnvironment } from './admission.mjs';
 import { resolveObservationHistoryGeneration } from '../../workers/shared/uk_aq_observation_history_generation.mjs';
 import { resolveR2HistoryIndexConfig } from '../../workers/shared/uk_aq_r2_history_index.mjs';
 import { hasRequiredR2Config } from '../../workers/shared/r2_sigv4.mjs';
@@ -23,6 +24,8 @@ scopes stay explicitly uninspected. Separate invocations have separate source-as
 boundaries and must not be merged as one complete consistent inspection.
 Uses existing TEST canonical/derived R2 configuration and optional restricted
 private Prune reader. Requires an existing managed control; never initializes it.
+Requires UK_AQ_ENV_NAME=TEST and the sourced UK_AQ_GITHUB_REPO. GitHub runs must
+match that repository and use workflow_dispatch; missing configuration blocks.
 Discovery is one overlapping page, never a completeness watermark. Repeat
 overlapping windows and historical resweeps. Outputs private local JSON only.
 Publication is disabled; no monthly generation, retention, registration or dispatch.`;
@@ -51,8 +54,7 @@ export async function runReconciliationInspection(argv, { env = process.env } = 
   evidence(options['execute-read-only'] && options.output, 'invalid_inspection_arguments', 'Explicit read-only execution and private local output required');
   evidence(!options['inspection-partition'] || /^[0-7]$/.test(options['inspection-partition']),
     'invalid_inspection_arguments', 'Inspection partition must be 0..7');
-  evidence(env.UK_AQ_ENV_NAME === 'TEST' && (!env.GITHUB_REPOSITORY || env.GITHUB_REPOSITORY === 'TEST-uk-aq/uk-aq-ops'),
-    'unapproved_environment', 'Manual inspection is TEST Ops only');
+  assertTestOpsEnvironment(env);
   evidence(options.discover ? ['recent', 'resweep'].includes(options.discover) && options.from && options.to
     && (!options.limit || /^[1-9]\d?$/.test(options.limit)) && Number(options.limit || 4) <= 16
     : !options.from && !options.to && !options.limit && !options['cursor-file'],

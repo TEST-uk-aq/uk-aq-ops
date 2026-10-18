@@ -3,6 +3,7 @@ import { PRUNE_GATE_ACCEPTANCE_RELATION, preparePrunePostCommitHandover } from '
 import { canonicalJson } from './schema.mjs';
 import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
 import { evidence, freeze } from './limits.mjs';
+import { assertTestOpsEnvironment } from './admission.mjs';
 
 export const OUTBOX_PAGE_LIMIT = 16;
 const originals = new WeakMap();
@@ -46,8 +47,7 @@ export function originalPruneAcceptance(token) {
 }
 
 export async function connectPruneOutboxReader({ env = process.env, Client = null } = {}) {
-  evidence(env.UK_AQ_ENV_NAME === 'TEST' && (!env.GITHUB_REPOSITORY || env.GITHUB_REPOSITORY === 'TEST-uk-aq/uk-aq-ops'),
-    'unapproved_environment', 'Independent consumer is TEST Ops only');
+  assertTestOpsEnvironment(env);
   evidence(env.UK_AQ_JSONGEN_PRUNE_READER_DB_URL
     && env.UK_AQ_JSONGEN_PRUNE_READER_DB_URL !== env.SUPABASE_DB_URL
     && env.UK_AQ_JSONGEN_PRUNE_READER_DB_URL !== env.UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN,

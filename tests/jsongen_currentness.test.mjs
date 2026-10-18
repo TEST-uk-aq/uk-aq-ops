@@ -22,7 +22,8 @@ import { buildObservationVerificationLatest, encodeObservationVerificationJson,
   OBSERVATION_VERIFICATION_LATEST_KEY } from '../workers/shared/uk_aq_observation_verification_overlay.mjs';
 
 const G = getObservationHistoryGeneration('v3');
-const env = { UK_AQ_ENV_NAME: 'TEST', SUPABASE_URL: 'https://aaaaaaaaaaaaaaaaaaaa.supabase.co',
+const env = { UK_AQ_ENV_NAME: 'TEST', UK_AQ_GITHUB_REPO: 'fixture-org/fixture-ops',
+  SUPABASE_URL: 'https://aaaaaaaaaaaaaaaaaaaa.supabase.co',
   UK_AQ_JSONGEN_PRUNE_READER_DB_URL: 'postgresql://reader:fixture@db.aaaaaaaaaaaaaaaaaaaa.supabase.co/postgres' };
 
 function canonicalFixture(f) {
