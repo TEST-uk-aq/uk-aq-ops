@@ -1,12 +1,31 @@
 # Managed JSONgen foundations and pending Prune source
 
+The manual read-only [Stage 3C currentness/coverage assessment](currentness-coverage-handover.md)
+extends the existing reconciler with a key-derived budget and four-worker selected-v3
+metadata inspection, physical-scope comparison, compact schema-3 reports and explicit original-event,
+receipt/registration and missing writer-inventory coverage. Matching metadata
+does not establish complete writer coverage or enable publication. The explicit
+manual interface is `scripts/jsongen/reconcile-cli.mjs`; it has not been run
+against operational TEST services. No schedule, generator or selector is enabled.
+One invocation inspects at most 128 scopes and accounts for up to 1,024 without
+omission. `--inspection-partition 0..7` selects a deterministic subset; other
+scopes remain uninspected. Separate invocations cannot be merged as one coherent
+snapshot. Full-event reports use lossless dictionaries under the unchanged 4 MiB
+wire cap; report schemas 1/2 and verified receipt schemas 1/2 remain supported.
+Admission requires the sourced `UK_AQ_ENV_NAME=TEST` and existing
+`UK_AQ_GITHUB_REPO=OWNER/REPO`, plus `--execute-read-only`. Missing repository
+configuration blocks before remote access. GitHub runs must match that configured
+repository and use `workflow_dispatch`; the optional private reader shares this
+check. The repository key is local-only in the environment target mapping.
+
 The manual-only [independent Prune consumer](prune-consumer-handover.md) implements
 Stage 3B for original TEST/AURN first publication: private outbox discovery/replay,
 compressed original before/binding/final-authority authentication, strict version-2
 VERIFIED receipts, immutable bundle/receipt retention and whole-event atomic
 control registration with deterministic crash recovery. Read-only diagnostics
 remain separate from explicit `--execute-retain`. This authenticates original
-Prune changes; currentness, supersession and monthly publication remain unresolved.
+Prune changes; Stage 3C separately assesses current metadata and coverage gaps.
+Monthly publication remains blocked.
 No schedule or publication is activated. Run
 `node scripts/jsongen/prune-consumer.mjs --help` for the explicit CLI.
 
@@ -545,7 +564,7 @@ inside every CAS attempt. If control changed before or during recording, the
 report survives, no stale failure is applied, and the result is
 `stale_reconciliation_inspection` with `new_inspection_required: true`.
 
-The provisional per-operation admission bounds in `limits.mjs` are 1 MiB for a
+The legacy Stage 2 per-operation admission bounds in `limits.mjs` are 1 MiB for a
 receipt, 8 MiB compressed and 32 MiB uncompressed per bundle, 8 MiB per NDJSON
 record, 128 scopes, 100,000 rows per bundle, 32 receipt references, 256 canonical
 metadata GETs of at most 8 MiB each, 64 MiB cumulative derived/metadata/decompressed bytes, 200,000
@@ -557,6 +576,16 @@ retention or an evidence garbage-collection rule. The Stage 1 4 MiB control cap
 remains a protective admission limit. Future operating decisions must set actual
 receipt/bundle size, throughput, retention, missing-request and failed-dispatch
 policies before live use.
+
+Stage 3C retains those byte/row/time/report safeguards and the legacy budget API.
+Its dedicated inspection profile derives requests from the selected deterministic
+metadata keys: initial reads plus complete rechecks plus a closing root GET.
+The dense synthetic 128-series case uses 541 GETs within a 543-GET plan. Four
+workers share one deadline, byte reservations and an 8 MiB raw metadata cache.
+The theoretical 3,337-GET profile ceiling is always lowered to the selected key
+plan. A larger event is fully reported but only one 128-scope partition is
+inspected per invocation. See the Stage 3C handover for schema-3 decoding,
+resource accounting, source-as-of limits and remaining operational acceptance.
 
 ## Validation, remaining work and rollback
 

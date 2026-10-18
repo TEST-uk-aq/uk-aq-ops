@@ -18,7 +18,8 @@ import { reconcileManagedInputs } from '../scripts/jsongen/reconcile.mjs';
 const run = 'ca2a2ad8-c46c-4d65-9ee0-7147f03684eb'; const day = '2026-10-10';
 const key = { environment: 'TEST', writer_identity: 'prune_daily_v3', run_id: run,
   attempt_id: run, day_utc: day, connector_id: 1 };
-const env = { UK_AQ_ENV_NAME: 'TEST', SUPABASE_URL: 'https://aaaaaaaaaaaaaaaaaaaa.supabase.co',
+const env = { UK_AQ_ENV_NAME: 'TEST', UK_AQ_GITHUB_REPO: 'fixture-org/fixture-ops',
+  SUPABASE_URL: 'https://aaaaaaaaaaaaaaaaaaaa.supabase.co',
   UK_AQ_JSONGEN_PRUNE_READER_DB_URL: 'postgresql://reader:fixture@db.aaaaaaaaaaaaaaaaaaaa.supabase.co/postgres' };
 
 import { sourceAndOriginalEvent } from './jsongen_prune_consumer_fixture.mjs';

@@ -215,9 +215,16 @@ Logs expose bounded counts, opaque IDs and safe failure codes, never credentials
 URLs, observations or evidence bytea. Exit 2 means incomplete/reconciliation-required;
 help and confirmed registration exit successfully.
 
-No new configuration is added in this completion. Reuse
+No new configuration name is added. Reuse
 `UK_AQ_JSONGEN_PRUNE_READER_DB_URL`, `UK_AQ_ENV_NAME=TEST`, existing `SUPABASE_URL`
-and `UK_AQ_COMPRESSED_CHART_R2_*`. The reader key remains local-only in
+and `UK_AQ_COMPRESSED_CHART_R2_*`. PR #114's configuration review also requires
+the existing sourced `UK_AQ_GITHUB_REPO=OWNER/REPO` before the private reader
+connects. Missing or malformed repository configuration fails closed. Supplied
+GitHub repository metadata must match; Actions execution additionally requires
+that metadata and `workflow_dispatch`. Local operation may omit runtime metadata;
+it cannot replace the configured repository. This shared admission is documented
+in the [Stage 3C handover](currentness-coverage-handover.md#manual-operation-and-configuration).
+Both repository identity and the reader key are local-only in
 `config/uk_aq_github_env_targets.csv`; the operator-owned ignored
 `env-vars-master.csv` is absent locally and requires its existing key definition
 when separately provisioning. Derived credentials need existing namespace
