@@ -1,6 +1,6 @@
 // Writer-lifetime preparation only. This is deliberately neither a retained
 // attestation nor an authenticated Stage 1 verified-change receipt.
-import { canonicalJson } from './schema.mjs';
+import { BUCKET, canonicalJson } from './schema.mjs';
 import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
 
 const same = (a, b) => canonicalJson(a).equals(canonicalJson(b));
@@ -12,7 +12,7 @@ const references = values => (Array.isArray(values) ? values : [])
   .map(reference).filter(Boolean).sort((a, b) => a.key.localeCompare(b.key));
 
 export function preparePruneOriginalFinalEvidence({ pending, connector, finalization,
-  runId, dayUtc, connectorId, writerGitSha, originalMetadataSnapshot = null }) {
+  runId, dayUtc, connectorId, writerGitSha, sourceIdentity, originalMetadataSnapshot = null }) {
   if (pending?.state !== 'put_acknowledged_unverified'
     || pending.pending_evidence?.writer?.invocation_id !== runId
     || pending.pending_evidence?.connector_id !== connectorId
@@ -22,8 +22,37 @@ export function preparePruneOriginalFinalEvidence({ pending, connector, finaliza
     || connector?.connector_id !== connectorId
     || connector?.connector_manifest?.key !== connector?.manifest_key
     || finalization?.ok !== true
+    || finalization.canonical_aggregate_result?.canonical_aggregate_authority_verified !== true
+    || finalization.canonical_aggregate_result?.parent_state_reread_under_lock !== true
+    || !same(finalization.canonical_aggregate_result.affected_days_utc, finalization.affected_days_utc)
+    || !Array.isArray(finalization.v3_publication?.exact_scopes)
+    || !finalization.v3_publication.exact_scopes.length
+    || finalization.v3_publication.exact_scopes.some(scope => scope?.ok !== true)
+    || finalization.v3_publication.latest_global?.ok !== true
     || !finalization.affected_days_utc?.includes(dayUtc))
     throw new Error('JSONgen final preparation lacks the original pending, connector, or batch identity');
+  const sourceEvidence = pending.pending_evidence;
+  const { signed_upload: signedUpload, ...unsignedEvidence } = sourceEvidence;
+  const expectedPendingKey = `managed/jsongen/v1/pending/unverified/prune_daily_v3/connector_id=${connectorId}`
+    + `/day_utc=${dayUtc}/invocation=${runId}/compressed_sha256=${pending.source?.sha256}`
+    + `/uncompressed_sha256=${pending.source?.json_sha256}.ndjson.gz`;
+  if (sourceEvidence.writer.attempt_id !== runId
+    || !same(sourceEvidence.source_identity, sourceIdentity)
+    || sourceEvidence.scope?.kind !== 'complete_connector_day'
+    || sourceEvidence.scope.connector_id !== connectorId || sourceEvidence.scope.day_utc !== dayUtc
+    || !Array.isArray(sourceEvidence.scope.physical_timeseries_days)
+    || !sourceEvidence.scope.physical_timeseries_days.length
+    || sourceEvidence.original_ndjson?.row_count !== sourceIdentity.source_content_hash_row_count
+    || sourceEvidence.original_ndjson.sha256 !== pending.source?.json_sha256
+    || sourceEvidence.original_ndjson.byte_size !== pending.source?.json_byte_size
+    || sourceEvidence.compressed_ndjson_gzip?.sha256 !== pending.source?.sha256
+    || sourceEvidence.compressed_ndjson_gzip.byte_size !== pending.source?.byte_size
+    || pending.source?.bucket !== BUCKET || pending.source.key !== expectedPendingKey
+    || signedUpload?.intent_id !== pending.intent_id || !same(signedUpload.object, pending.source)
+    || signedUpload.disposition !== 'put_acknowledged_unverified'
+    || sha256Hex(canonicalJson(unsignedEvidence)) !== pending.source_evidence_sha256
+    || sha256Hex(canonicalJson(sourceEvidence)) !== pending.preparation_sha256)
+    throw new Error('JSONgen final preparation differs from original complete frozen source evidence');
   const expected = pending.pending_evidence.scope.pollutant_partitions;
   const actual = connector.pollutant_manifests;
   if (!Array.isArray(actual) || expected.length !== actual.length)
@@ -67,6 +96,10 @@ export function preparePruneOriginalFinalEvidence({ pending, connector, finaliza
       preparation_sha256: pending.preparation_sha256,
       source_evidence_sha256: pending.source_evidence_sha256,
       source_identity: pending.pending_evidence.source_identity,
+      // Retain the entire reproducible source description, including exact
+      // physical membership, pollutant content/status counts and byte digests.
+      // Its original hashes can be authenticated later without a Parquet read.
+      source_evidence: sourceEvidence,
       original_source_status: pending.pending_evidence.original_source_status,
       effective_verification_status: pending.pending_evidence.effective_verification_status },
     original_connector_publication: connector,
@@ -79,6 +112,12 @@ export function preparePruneOriginalFinalEvidence({ pending, connector, finaliza
         required_raw_byte_size: originalMetadataSnapshot?.required_raw_byte_size ?? null },
     original_final_batch: {
       affected_days_utc: [...finalization.affected_days_utc],
+      validation: { boundary: 'validatePhaseBV3RunFinalizationResult',
+        canonical_aggregate_authority_verified: finalization.canonical_aggregate_result.canonical_aggregate_authority_verified,
+        parent_state_reread_under_lock: finalization.canonical_aggregate_result.parent_state_reread_under_lock,
+        exact_scope_publication_count: finalization.v3_publication.exact_scopes.length,
+        all_exact_scope_publications_ok: true,
+        latest_global_ok: finalization.v3_publication.latest_global.ok },
       canonical_aggregate_references: references(finalization.canonical_aggregate_result?.aggregate_manifests),
       day_manifest: reference(dayResult?.day_manifest),
       exact_scope_references: references(connector.scoped_roots?.map(entry => entry.reference)),

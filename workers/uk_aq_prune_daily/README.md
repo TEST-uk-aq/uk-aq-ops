@@ -1,6 +1,8 @@
 # Prune Daily JSONgen source handover
 
-The selected-v3 handover is disabled by default. `UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED=true`
+The selected-v3 handover has a false code/workflow fallback. The operator reports
+the TEST Actions flag already true for this implementation window; this change
+does not change its value or the paused scheduler. `UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED=true`
 enables it in TEST only. Configure `UK_AQ_JSONGEN_PRUNE_SIGNER_URL` with the reviewed,
 Cloudflare Access protected HTTPS `/v1/upload-intents` route, plus dedicated
 `UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN`, `UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_ID` and
@@ -18,7 +20,9 @@ and sends one conditional PUT with exactly the required signed headers. The
 optional operation has a 15-second shared deadline for signer and PUT, and is
 skipped unless canonical publication and v3 finalization budget is reserved.
 Failures cannot block canonical publication, source cleanup or deletion gates.
-The v2 path never enters this handover.
+The v2 path never enters this handover. Only AURN (`connector_id=1`) is currently
+admitted; disallowed connectors make no optional signing/outbox request and
+continue the existing canonical path. No signer allowlist or credentials change.
 
 `phase_b_jsongen_pending_source_put_acknowledged` means only that R2 returned a
 2xx response to the PUT. It does not mean independent byte readback or verified
@@ -36,7 +40,8 @@ provider status. `original_source_status_unavailable` explicitly records that
 provenance gap; its null `source_status` makes no claim that the provider sent
 null. Existing canonical P/R/null values and bytes are left as written.
 The acknowledgment log exposes the preparation digest and intent reference;
-the description itself is not separately retained.
+the complete description is retained inside final evidence only when the optional
+complete original metadata envelope fits and its outbox transaction commits.
 
 After successful v3 batch finalization and before the protected gate transaction,
 Prune can prepare an original-final evidence envelope from already available
@@ -79,6 +84,13 @@ The [gate durability review](../../docs/investigations/jsongen_prune_final_evide
 records why mutable candidate/gate rows and a late run manifest alone do not
 provide a replayable original gate receipt. The prior operational investigation
 reported the TEST outbox table/function present and `service_role` EXECUTE;
-the actual Prune login role and its permission remain unconfirmed. No original
-acceptance event has been recorded; the integration remains default-off and
-has no operational acceptance.
+the actual Prune login role and its permission remain unconfirmed. This task
+performed no operational inspection or acceptance.
+
+The [writer handover interface](../../scripts/jsongen/prune-writer-handover.md)
+defines the 1,024-scope pending-source envelope (all other byte/row/metadata caps
+retained), complete source evidence, explicit `COMMIT` acknowledgement, replayable
+version-1 post-commit reference and bounded diagnostics. The reference is prepared
+only after the original gate transaction commits with its optional event retained.
+Delivery is `not_attempted`; no final-evidence endpoint, independently authenticated
+consumer, VERIFIED receipt or monthly publisher is installed by this work.
