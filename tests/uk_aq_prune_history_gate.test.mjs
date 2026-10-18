@@ -2215,7 +2215,21 @@ test("Prune Daily CLI orchestration delegates the whole job to the retained glob
   assert.equal(jobCalls, 0);
   assert.equal(lockedOptions.databaseUrl, "postgresql://direct-session");
   assert.equal(lockedOptions.owner, "prune_daily");
-  assert.equal(lockedOptions.runId, "prune-daily:123:2");
+  assert.match(lockedOptions.runId, /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
+  const identity = observationsGlobalOperationLockIdentity();
+  const inherited = {
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.held]: 'true',
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.owner]: 'prune_daily',
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.runId]: lockedOptions.runId,
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.logicalIdentity]: identity.logical_identity,
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.classId]: String(identity.class_id),
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.objectId]: String(identity.object_id),
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.nonce]: 'test-nonce',
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.acquired]: 'true',
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.waitMs]: '0',
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.outcome]: 'held',
+  };
+  assert.equal(phaseBHistoryModule.resolvePrunePhaseBRunId(inherited), lockedOptions.runId);
   assert.match(lockedOptions.commandArgs[0], /workers\/uk_aq_prune_daily\/job\.mjs$/);
 });
 

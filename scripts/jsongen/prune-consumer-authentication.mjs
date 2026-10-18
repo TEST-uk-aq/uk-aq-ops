@@ -4,9 +4,15 @@ import { verifyPrunePendingSource } from './prune-pending-verification.mjs';
 import { BUCKET, canonicalJson, same } from './schema.mjs';
 import { createBudget, evidence, freeze, parseJson } from './limits.mjs';
 import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
+import { decodePruneMetadataEvidence } from './prune-metadata-codec.mjs';
+import { authenticatePruneOriginalAuthority, prunePhysicalKey } from './prune-original-authority.mjs';
+import { validateR2HistoryV2ObservationsAggregateManifest, serializeR2HistoryV2ObservationsAggregateManifest }
+  from '../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs';
+import { validateCanonicalHistoryV2Manifest } from '../../workers/shared/uk_aq_r2_history_manifest_validation.mjs';
+import { validateObservationHistoryExactLeafArtifactV3, validateObservationHistoryExactLeafScopedManifestArtifactV3 }
+  from '../../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs';
 
-// Schema-1 writer capture has no pre-replacement view and no binding capture
-// group. Do not invent either a reference or an empty before-membership.
+// Retained for precise diagnostics on legacy incomplete events only.
 export const PRUNE_RECEIPT_AUTHORITY_GAPS = freeze([
   { code: 'original_before_membership_not_retained', field: 'scopes[].before',
     required: 'Original pre-replacement physical scope membership/count and byte-pinned authority, including any admitted removals.' },
@@ -65,6 +71,8 @@ function retainedMetadata(envelope, row, budget) {
 function bindOriginalPublication(e, row, source, metadata) {
   const c = e.original_connector_publication;
   const manifest = metadata.lookup(c.connector_manifest, 'canonical_manifest');
+  validateCanonicalHistoryV2Manifest(manifest, { manifest_key: row.history_manifest_key,
+    manifest_kind: 'connector', connector_id: 1, day_utc: row.day_utc, domain: 'observations' });
   check(manifest.manifest_key === row.history_manifest_key && manifest.manifest_hash === row.history_manifest_hash
     && manifest.connector_id === 1 && manifest.day_utc === row.day_utc && manifest.history_version === 'v2'
     && manifest.source_row_count === Number(row.history_row_count)
@@ -81,6 +89,8 @@ function bindOriginalPublication(e, row, source, metadata) {
     const p = c.pollutant_manifests.find(p => p.pollutant_code === partition.pollutant_code);
     present(p, 'original_pollutant_publication');
     const m = metadata.lookup(p.manifest, 'canonical_manifest');
+    validateCanonicalHistoryV2Manifest(m, { manifest_key: p.manifest.key, manifest_kind: 'pollutant',
+      day_utc: row.day_utc, connector_id: 1, pollutant_code: partition.pollutant_code, domain: 'observations' });
     check(p.row_count === partition.row_count && p.observation_content_hash === partition.observation_content_hash
       && p.observation_content_hash_contract_version === partition.observation_content_hash_contract_version
       && same(p.verification_status_counts, partition.verification_status_counts)
@@ -111,8 +121,66 @@ function bindOriginalPublication(e, row, source, metadata) {
     // transition would need original overlay/transition authority, absent here.
     present(index.history_schema_version === 3 && index.writer_version === 'parquet-wasm-zstd-v3',
       'original_effective_status.schema3_embedded_or_authenticated_overlay_transition');
+    const artifact = (reference, kind, stage) => {
+      const payload = metadata.lookup(reference, 'exact_v3_index');
+      const object = metadata.objects.get(reference.key);
+      return { kind, publication_stage: stage, key: reference.key, sha256: reference.sha256,
+        byte_size: reference.byte_size, body: Buffer.from(object.bytes_base64, 'base64').toString(), payload };
+    };
+    const aligned = metadata.lookup(index.source_aligned_scoped_manifest, 'exact_v3_index');
+    check(aligned.canonical_source_manifest?.key === p.manifest.key
+      && aligned.canonical_source_manifest.sha256 === p.manifest.sha256
+      && aligned.canonical_source_manifest.byte_size === p.manifest.byte_size
+      && aligned.canonical_source_manifest.manifest_hash === m.manifest_hash
+      && aligned.canonical_source_manifest.observation_content_hash === partition.observation_content_hash,
+    'original_exact_to_canonical_source_relationship');
+    const leaves = [];
+    for (const [id, tuple] of Object.entries(index.leaves_by_timeseries_id)) {
+      const reference = { key: tuple[0], byte_size: tuple[1], sha256: tuple[2] };
+      const leaf = artifact(reference, 'observation_history_index_v3_exact_leaf', 'child_shard');
+      validateObservationHistoryExactLeafArtifactV3({ artifact: leaf });
+      check(leaf.payload.timeseries_id === Number(id) && leaf.payload.row_count === counts[id], 'original_leaf_row_membership');
+      const shard = metadata.lookup(leaf.payload.source_aligned_child, 'exact_v3_index');
+      check(same(shard.canonical_source_manifest, aligned.canonical_source_manifest)
+        && aligned.children.some(child => child.key === leaf.payload.source_aligned_child.key
+          && child.sha256 === leaf.payload.source_aligned_child.sha256 && child.byte_size === leaf.payload.source_aligned_child.byte_size),
+      'original_aligned_parent_child_relationship');
+      check(leaf.payload.files.every(file => m.files.some(f => f.key === file.key && f.bytes === file.byte_size
+        && f.etag_or_hash === file.sha256)), 'original_exact_file_identity');
+      leaves.push(leaf);
+    }
+    validateObservationHistoryExactLeafScopedManifestArtifactV3({ artifact: artifact(roots[0].reference,
+      'observation_history_index_v3_exact_leaf_scoped_manifest', 'scoped_manifest'), exactLeaves: leaves });
   }
   check(c.scoped_roots.length === expected.length, 'complete_exact_scope_membership');
+}
+
+function authenticateFinalHierarchy(e, row, metadata) {
+  const day = row.day_utc, base = 'history/v3/observations';
+  const keys = [`${base}/_manifests/manifest.json`, `${base}/_manifests/year=${day.slice(0, 4)}/manifest.json`,
+    `${base}/_manifests/year=${day.slice(0, 4)}/month=${day.slice(5, 7)}/manifest.json`, `${base}/day_utc=${day}/manifest.json`];
+  let parent = null; let root;
+  for (let i = 0; i < keys.length; i++) {
+    const object = metadata.objects.get(keys[i]); present(object, 'complete_final_root_to_day_metadata');
+    const value = object.value;
+    if (i < 3) {
+      const parsed = validateR2HistoryV2ObservationsAggregateManifest(value, { basePrefix: base });
+      check(Buffer.from(object.bytes_base64, 'base64').equals(serializeR2HistoryV2ObservationsAggregateManifest(parsed, { basePrefix: base }))
+        && value.kind === `uk_aq_observations_${['root', 'year', 'month'][i]}_manifest`
+        && (i === 0 || String(value.year) === day.slice(0, 4)) && (i !== 2 || value.month === day.slice(5, 7)), 'final_aggregate_identity');
+    } else validateCanonicalHistoryV2Manifest(value, { manifest_key: keys[i], manifest_kind: 'day', day_utc: day, domain: 'observations' });
+    if (parent) {
+      const references = parent.children.filter(child => child.manifest_key === keys[i]);
+      check(references.length === 1 && references[0][i === 3 ? 'manifest_hash' : 'content_hash']
+        === value[i === 3 ? 'manifest_hash' : 'content_hash'], 'final_root_to_day_relationship');
+    }
+    if (i === 0) root = { bucket: object.canonical_bucket, key: object.key, sha256: object.sha256, byte_size: object.byte_size };
+    parent = value;
+  }
+  check(same(parent.connector_manifests, parent.child_manifests)
+    && parent.connector_manifests.filter(c => c.connector_id === 1 && c.manifest_key === row.history_manifest_key
+      && c.manifest_hash === row.history_manifest_hash).length === 1, 'final_day_to_accepted_connector');
+  return root;
 }
 
 export function inspectAuthenticatedPruneHandover(value) {
@@ -134,6 +202,21 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
     && e.authority_state === 'precommit_prepared_unverified' && e.environment === 'TEST'
     && e.index_generation === 'v3' && same(e.writer, message.writer)
     && e.connector_id === 1 && e.day_utc === row.day_utc, 'final_evidence.original_writer');
+  present(e.original_metadata_evidence && e.original_metadata_snapshot?.schema_version === 2
+    && e.original_authority_extension?.schema_version === 2, 'compressed_original_before_and_binding_authority');
+  evidence(Number.isSafeInteger(e.original_metadata_evidence.json_byte_size)
+    && Number.isSafeInteger(e.original_metadata_evidence.byte_size)
+    && e.original_metadata_evidence.json_byte_size + e.original_metadata_evidence.byte_size <= budget.remainingBytes(),
+  'resource_limit', 'Original compressed metadata exceeds remaining decode budget');
+  let decoded;
+  try { decoded = decodePruneMetadataEvidence(e); } catch (error) {
+    evidence(false, error.original_authority_code || 'invalid_original_metadata_encoding', 'Original compressed metadata failed strict decoding');
+  }
+  budget.bytes('metadata', e.original_metadata_evidence.byte_size + e.original_metadata_evidence.json_byte_size);
+  // Only replace local transport markers after exact original bytea validation.
+  // The immutable outer bytes and their digest remain the original authority.
+  e.original_metadata_snapshot = decoded.original_metadata_snapshot;
+  e.original_authority_extension = decoded.original_authority_extension;
   const p = e.pending; const c = e.original_connector_publication; const gate = e.original_candidate_connector_gate;
   check(p?.intent_id === row.pending_intent_id && same(p.object, message.pending.object)
     && same(p.source_identity, message.source_identity) && c?.run_id === row.run_id && c.connector_id === 1
@@ -190,17 +273,41 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
     && row.original_source_status_provenance === unsigned.original_source_status.classification,
   'complete_source_scope_and_status_provenance');
   bindOriginalPublication(e, row, unsigned, metadata);
+  const root = authenticateFinalHierarchy(e, row, metadata);
+  const original = authenticatePruneOriginalAuthority({ envelope: e, row, source: unsigned, budget });
+  const bucket = root.bucket;
+  const pin = r => ({ bucket: r.bucket || bucket, key: r.key, sha256: r.sha256, byte_size: r.byte_size });
+  const sources = {}; const scopes = {};
+  for (const partition of unsigned.scope.pollutant_partitions) {
+    const child = c.pollutant_manifests.find(p => p.pollutant_code === partition.pollutant_code);
+    const index = pin(c.scoped_roots.find(p => p.scope.pollutant_code === partition.pollutant_code).reference);
+    sources[partition.pollutant_code] = { index_generation: 'v3', history_version: 'v2',
+      generation_authority: index, observations_root: root, index_authority: index,
+      final_publication: root, verification_authority: pin(child.manifest),
+      binding_authority: original.bindingRoot, verified_at_utc: new Date(row.gate_history_completed_at).toISOString() };
+    for (const s of unsigned.scope.physical_timeseries_days.filter(s => s.pollutant_code === partition.pollutant_code)) {
+      const identity = { connector_id: 1, timeseries_id: s.timeseries_id, station_id: s.station_id, pollutant_code: s.pollutant_code };
+      scopes[prunePhysicalKey(s)] = { identity, day_utc: row.day_utc, before: original.beforeScopes[prunePhysicalKey(s)],
+        after: { state: 'present', row_count: s.row_count, authority: pin(child.manifest) } };
+    }
+  }
+  const authority = { schema_version: 1, kind: 'uk_aq_jsongen_prune_acceptance_authority',
+    relation: 'uk_aq_ops.prune_jsongen_gate_acceptance_outbox', key: acceptance.key, event_id: acceptance.event_id,
+    writer_git_sha: row.writer_git_sha, final_evidence_sha256: row.final_evidence_sha256,
+    final_evidence_byte_size: Number(row.final_evidence_byte_size), post_commit_reference_sha256: acceptance.post_commit_reference.sha256 };
   const result = freeze({ state: 'authenticated', event_id: acceptance.event_id, key: acceptance.key,
     original_gate: 'authenticated_committed_immutable_outbox', original_final_evidence: 'authenticated_original_prune_attestation',
     pending_source: 'source_bytes_verified', physical_scope_count: unsigned.scope.physical_timeseries_days.length,
     observation_count: unsigned.original_ndjson.row_count,
     effective_status: 'original_schema3_embedded_status_bound',
     source_status: unsigned.original_source_status.classification,
-    receipt_eligible: false, missing_authority: PRUNE_RECEIPT_AUTHORITY_GAPS,
+    receipt_eligible: true, missing_authority: [],
     current_canonical_authority: 'not_inspected', publication_eligible: false });
   // Keep actual rows out of public machine-readable results and log summaries.
   const token = Object.freeze({ event_id: result.event_id });
-  authenticated.set(token, freeze({ result, pending, original_evidence_sha256: row.final_evidence_sha256,
+  authenticated.set(token, freeze({ result, pending, authority, sources, scopes, writer: e.writer,
+    original_source_status: unsigned.original_source_status, source_identity: unsigned.source_identity,
+    original_global_lock: original.lock, original_evidence_sha256: row.final_evidence_sha256,
     post_commit_reference_sha256: acceptance.post_commit_reference.sha256 }));
   return token;
 }

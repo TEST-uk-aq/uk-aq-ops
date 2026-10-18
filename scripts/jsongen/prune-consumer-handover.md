@@ -1,202 +1,277 @@
-# Independent Prune consumer: Stage 3B safe boundary
+# Independent Prune consumer: Stage 3B
 
-Implementation record, 18 October 2026. Code only; no operational acceptance.
+Implementation record, 18 October 2026. TEST/AURN code only; operational acceptance
+is still required. Existing [Ops PR #112](https://github.com/TEST-uk-aq/uk-aq-ops/pull/112)
+continues on `codex/jsongen-prune-independent-consumer`. Main includes merged
+[PR #113](https://github.com/TEST-uk-aq/uk-aq-ops/pull/113), merge
+`72de38e3676e6ccefb9f7d66c1c68e60cd453481`. The reconciliation uses main
+`642c723f65bd80fb5cb85519b849b431d850553b`, preserving its producer implementation,
+codec, required archives and unrelated committed changes.
+
 The [authoritative quick reference](https://github.com/TEST-uk-aq/uk-aq-system-docs/blob/main/system_docs/station_charts/jsongen_prune_verification_handover_quick_reference.md)
-and its linked contracts govern this implementation. System documentation was
-read without modification. Prune, its paused scheduler, the enabled pending-source
-flag, signer, existing configuration and LIVE were not operated or changed.
+and linked contracts govern this implementation. System documentation was read
+without modification. Prune remains the authoritative verifier of canonical
+observations. This consumer authenticates its original immutable attestation and
+private pending source. It does not repeat Parquet verification, add a gate,
+query current Core, scan canonical observations or require Prune to run again.
 
-## Structural decision made before implementation
+## Original authentication and eligibility
 
-The merged PR #111 schema-1 envelope preserves original committed gate identity,
-validated finalisation, source description, physical membership and exact original
-metadata. Its capture groups are canonical manifests, exact observation indexes,
-day manifests, aggregate manifests and latest-global indexes. It does **not**
-capture either of these mandatory Stage 1 fields:
+`prune-outbox-reader.mjs` retains the dedicated private PostgreSQL SELECT boundary:
+verified TLS, read-only transactions, bounded statements, reader-group/RLS and
+privilege checks, and the same TEST Supabase project. Writer/service-role,
+superuser and gate-acceptance-capable credentials are rejected. The complete
+immutable key is `(environment, writer_identity, run_id, attempt_id, day_utc,
+connector_id)`, fixed to TEST, `prune_daily_v3`, connector 1. Module-private proof
+tokens prevent caller rows, notifications or success flags from impersonating a
+read. READY-to-CONSUMED does not change the immutable original event.
 
-| Missing proof | Existing consumer requirement | Required resolution |
-| --- | --- | --- |
-| Original pre-replacement physical membership and count, with original authority | `scopes[].before` | Retain the actual admitted pre-publication membership, including genuine absence/removal authority, or accept an explicit versioned contract change. A source-present row does not prove previous absence. |
-| Original selected-v3 binding authority/closure | `source.binding_authority` | Retain the original `history/_index_v3/timeseries_binding` authority and physical station/timeseries bindings under a reviewed writer contract. A station ID in source rows or an observation index is not this authority. |
+The final envelope stays schema 1. `prune-consumer-authentication.mjs` requires the
+nested schema-2 `inline_original_metadata_gzip_v1` markers and reuses PR #113's
+unchanged `decodePruneMetadataEvidence()`. Its schema-1
+`canonical_json_gzip_v1` descriptor binds compressed bytes and exact canonical
+JSON SHA-256/lengths. The decoder checks bounded decompression, both markers,
+each retained object's canonical base64/size/SHA-256 and combined limits.
+The retained bytea itself must match the original row's digest and length and
+canonical outer encoding. Legacy incomplete evidence is ineligible.
 
-No schema-1 event can meet the existing strict receipt contract. The implementation
-therefore stops at the task's expressly permitted **safe consumer boundary**.
-It does not add guessed before-membership, weaken `assertReceipt`, introduce an
-alternative receipt store, or label a source/metadata checksum VERIFIED.
-Source preservation and original accepted completion can be authenticated while
-receipt eligibility remains false. This is **not a completed VERIFIED receipt
-capability**. Receipt/bundle durable publication, partition registration and their
-write-recovery path remain unimplemented until those original authorities are
-available; adding them speculatively would not make this handover valid.
+Decoding alone grants no authority. Independent relationship checks bind the
+original invocation, attempt, writer Git SHA, environment, generation, lock,
+frozen source, pending preparation, original connector publication, required
+final batch, original committed gate and deterministic post-COMMIT reference.
+Final retained root/year/month/day/connector/pollutant manifests, exact-v3
+roots/leaves/aligned shards and file references must form the original complete
+publication and agree with source content, statuses, counts and membership.
+Only retained metadata and the private pending gzip are read; canonical file
+references do not cause canonical file GETs.
 
-## Working interfaces and authority
+`prune-original-authority.mjs` authenticates these additional PR #113 authorities:
 
-- `prune-outbox-reader.mjs`: direct private PostgreSQL SELECT, with a dedicated
-  restricted reader credential, verified TLS, five-second SQL timeout and explicit
-  read-only transactions. No public RPC. It verifies reader-group membership,
-  policy presence, SELECT access and absence of elevated role, outbox mutation
-  and original acceptance-function privileges. The connection is tied to the
-  existing TEST `SUPABASE_URL` project, including pooler project identity.
-- Exact reads require the complete immutable key `(environment, writer_identity,
-  run_id, attempt_id, day_utc, connector_id)`, fixed to TEST/AURN. They retrieve
-  the exact original bytea (up to 1 MiB) and reconstruct PR #111's deterministic
-  post-COMMIT reference. Module-private tokens prevent caller rows, success flags
-  or notifications from being accepted as database-read evidence.
-- `prune-consumer-authentication.mjs`: checks original event/envelope hashes,
-  TEST/selected-v3/original Git SHA/run/attempt/day/connector, gate/source/manifest
-  identities, the retained required-v3-finaliser boundary and pinned metadata
-  groups. It binds the complete private source to original pollutant content,
-  row/status counts, physical timeseries membership and original file identities.
-  It authenticates Prune's retained original attestation; it does not recalculate
-  canonical publication success. Missing original bytes fail closed.
-- `verifyPrunePendingSource`: independently reads only the private derived
-  pending object; checks exact key, deterministic signer-intent identity, bucket,
-  invocation, compressed/uncompressed SHA-256 and size, bounded valid gzip, frozen
-  source hash, complete source declaration, scopes and effective P/R/null. Strict
-  canonical row admission rejects numeric coercion and timestamp rounding; the
-  writer's redundant `observed_at` alias must exactly equal `observed_at_utc`.
-  No deduplication, filling hours or status rewriting occurs. AURN original
-  provider status remains explicitly `original_source_status_unavailable`.
-- `writer-authentication.mjs`: connects the authenticated AURN proof to the
-  existing admission seam while reporting the exact remaining authorities.
-  It still cannot return authenticated receipt admission. Integrity, SOS-light
-  and IFW remain fail closed. Existing receipt validation, control CAS,
-  reconciliation and the disabled publication selector are unchanged.
+- **Before:** exact original root-to-absence hierarchy in selected v3, matching
+  child identities/hashes, original global lock and invocation, genuinely absent
+  AURN connector-day, original latest-registry corroboration and every affected
+  physical scope. `scopes[].before` is `authoritative_empty`, zero rows, with the
+  actual authenticated absence-parent reference. Missing evidence or a 404 does
+  not establish absence. Previously committed historical scopes remain blocked.
+- **Binding:** original Core-owned selected-v3 binding root, each applicable
+  1,000-ID range and exact physical binding bytes, root/range/physical membership
+  and hashes, original source-state and refresh-state completion, matching source
+  fingerprint/root hash, complete source-table provenance and schema-2 continuity
+  validation where applicable. `source.binding_authority` is this genuine root.
+  It attests Core's completed snapshot; it does not assert Prune reconciled Core.
 
-Only schema-3 embedded effective status is admitted at this boundary. A schema-4
-event requires its original accepted overlay/transition evidence and fails with
-the exact missing authority; neither a missing overlay pointer nor age invents
-P/R/null. Current status/binding authority and later supersession are separate,
-uninspected questions; original authentication never establishes monthly eligibility.
+The private pending readback independently checks signing-intent identity, exact
+key/bucket, compressed/uncompressed SHA-256 and lengths, original canonical
+source hash and complete physical/pollutant membership. It preserves timestamps,
+float64 values, duplicate order/multiplicity and effective P/R/null. A redundant
+`observed_at` must equal `observed_at_utc`. Original AURN provider status remains
+explicitly `original_source_status_unavailable`; bundle `source_status:null`
+makes no original-provider claim. Only original schema-3 embedded effective
+status is supported. Schema-4 without its actual original overlay/transition
+authority, unsupported pollutants/identities, contradictory/missing evidence and
+resource overflow fail the whole event before registration. No scope is dropped.
 
-There are **zero canonical R2 GETs**, no Parquet reads, no candidate/gate queries,
-no IngestDB deletion gate and no fallback source reconstruction. READY-to-CONSUMED
-does not affect an authentic original immutable event. No Prune rerun is needed
-for replay, and replay cannot recover genuinely missing original authority.
+## Compatible strict receipts
 
-## Discovery and replay
+`schema.mjs` adds schema-2 `uk_aq_jsongen_verified_change`; existing schema-1
+receipts and schema-1 complete-scope bundles remain compatible. All existing
+source/scope/row, affected-month and rolling-AQI checks remain. The adaptation
+represents original PostgreSQL authority accurately rather than inventing an
+R2 object for it. `origin.authority` has:
 
-Each page contains at most 16 events (default 4) and spans at most seven days.
-Discovery uses the existing accepted-at/run/attempt/day/connector index, with the
-complete tuple as a page cursor. PostgreSQL microseconds are preserved. Cursors
-are bound to the same mode/window. No original row is updated or acknowledged.
+```text
+schema_version: 1
+kind: uk_aq_jsongen_prune_acceptance_authority
+relation: uk_aq_ops.prune_jsongen_gate_acceptance_outbox
+key: full immutable six-field primary key
+event_id: SHA-256 of canonical primary key
+writer_git_sha: original accepted writer SHA
+final_evidence_sha256 / final_evidence_byte_size: original retained bytea
+post_commit_reference_sha256: reconstructed original reference digest
+```
 
-`accepted_at` is insertion time, never commit order or canonical precedence.
-Every result explicitly says `coverage_complete=false` and `replay_required`.
-An operator must repeat overlapping recent windows from their beginning and
-periodically resweep all historical windows in bounded pages, restarting passes
-to find transactions that became visible behind a cursor. Neither one completed
-pass nor an overlap horizon is a permanent completeness proof. There is no
-stored one-way high-water mark, automatic schedule or inferred event frontier.
-Event IDs hash the full immutable primary key; repeated discovery/replay gives
-the same original event and deterministic source/partition identities.
+`verification.provenance_authority`, `verification.scope_completeness_authority`
+and `durability.retained_receipt_authority` must equal that typed original
+PostgreSQL authority. The outbox remains the sole original gate authority; no
+original-evidence copy is published or promoted to authority.
 
-## Complete-scope partition plans
+Genuine source mappings are:
 
-`prune-consumer-partitions.mjs` consumes only independently authenticated source
-proof. It constructs prospective Stage 1 `complete_scope_ndjson_gzip` records
-with every original observation per physical UTC-day scope and explicit
-unavailable-provider-status provenance in the source binding. It preserves
-timestamps, numeric values, duplicates and effective statuses. It does not infer
-empty replacements or removals. Unsupported identities/pollutants or unbound
-station IDs fail the entire plan; none are filtered away.
+| Receipt field | Authenticated original evidence |
+| --- | --- |
+| `generation_authority`, `index_authority` | Selected-v3 exact scoped pollutant manifest |
+| `observations_root`, `final_publication`, `verification.authority` | Original final selected-v3 observations root |
+| `verification_authority`, `scopes[].after.authority` | Original pollutant manifest with bound schema-3 effective status |
+| `binding_authority` | Original completed Core selected-v3 binding root |
+| `verified_at_utc` | Original gate completion timestamp |
+| `scopes[].before.authority` | Original admitted absence parent |
 
-Deterministic groups preserve the 128-scope receipt cap and existing 100,000-row,
-8 MiB record/gzip and 32 MiB original bundle caps. Oversized groups split only
-between complete scopes. An individual oversized scope fails closed. All source
-scopes and row counts must be covered exactly once before a complete **source
-plan** is reported. The 1,024-source-scope cap remains separate; other limits
-were not increased. Shared operation budgets also apply (64 MiB, 200,000 total
-rows, 60 seconds per event); sources that cannot fit coupled budgets fail whole.
+`origin` additionally binds pending gzip, frozen source identity, unavailable
+provider-status boundary, original lock, whole-source scope/row count and coverage
+hash, complete partition descriptors, group digest and partition index. The
+writer includes attempt and Git SHA. A receipt describes original
+`canonical_final_verified`/`verified_pending` evidence; only successful independent
+authentication can construct the branded group admitted by the new control path.
+Schema validation by itself is never writer authentication. Stable `prune:`
+change IDs remain separate from monthly UUID pubIDs.
 
-Every partition is bound to the same original event, original final-evidence
-digest, reconstructed reference, complete pending object, original scope/row
-counts and its exact scopes. Prospective change IDs and content-addressed bundle
-references are stable, distinct from monthly UUID pubIDs. They are **plans only**:
-no object is written, no receipt is issued and `receipt_coverage_complete` and
-`handover_complete` stay false even with full source partition coverage. There
-is no crash point that can turn half a plan into a registered connector-day.
+## Complete partitions and immutable retention
 
-The immutable original PostgreSQL event and confirmed private pending gzip are
-the surviving recovery inputs. Keep them; no age-based cleanup is introduced.
-Missing or conflicting original bytes/source stop before any derived write.
-After authority gaps are closed, implement existing conditional immutable
-bundle/receipt PUT, exact compressed/uncompressed/schema readback and ambiguous
-PUT/412 resolution, followed by full partition coverage registration through
-existing control CAS. Receipt-retained/registration-interrupted recovery belongs
-there; it is not claimed by the present read-only boundary.
+`prune-consumer-partitions.mjs` now builds actual deterministic complete-scope
+NDJSON gzip artifacts. It groups by pollutant, splits only between complete
+physical scopes and covers all source rows/scopes exactly once. Maximum source
+scope count stays 1,024; maximum per receipt/bundle stays 128. Existing 100,000-row,
+8 MiB record/gzip, 32 MiB original bundle, 32 receipt-reference, 64 MiB combined
+byte, 200,000 total-row and 60-second operation caps remain. An indivisible
+oversized scope or event exceeding coupled limits fails closed. The original
+1 MiB outbox, 8 MiB/4,096 retained metadata-object limits are unchanged.
 
-## Configuration and explicit operation
+`prune-receipts.mjs` constructs and validates the whole group before retention.
+It uses existing conditional PUT/readback helpers and existing derived layout:
 
-There is no new workflow, schedule, automatic import execution or dispatch.
-`prune-consumer.mjs --help` is local-only. Actual reads require the explicit
-`--execute-read-only` flag and TEST environment. No operation was run here.
+```text
+managed/jsongen/v1/bundles/<gzip-sha256>.ndjson.gz
+managed/jsongen/v1/receipts/<canonical-json-sha256>.json
+```
 
-The one new local-only key is `UK_AQ_JSONGEN_PRUNE_READER_DB_URL`: a dedicated
-private TLS PostgreSQL login for the existing TEST IngestDB project. Reusing
-Prune's writer/service credentials would violate the independent read boundary.
-`config/uk_aq_github_env_targets.csv` marks it `local`, so environment sync does
-not create or change a GitHub secret/variable. The ignored `env-vars-master.csv`
-is absent from this checkout; its operator-owned catalogue needs the same local
-key definition when separately provisioning credentials. Existing
-`UK_AQ_ENV_NAME`, `SUPABASE_URL` and `UK_AQ_COMPRESSED_CHART_R2_*` are reused.
-The existing dedicated derived-bucket credential is used only for GET here.
+Every PUT is immutable `If-None-Match:*`. Success, 412 and ambiguous outcomes
+require exact bounded readback. Bundles are checked for exact gzip bytes and
+uncompressed digest/length, with every complete record validated. Receipts require
+exact canonical JSON/schema/readback and reauthentication against original event
+and bundle. Conflicting existing bytes are never overwritten. Unconfirmed writes
+remain reconciliation-required with deterministic expected references.
 
-The companion TEST Schema PR adds a NOLOGIN reader group, schema USAGE/table
-SELECT and a TEST/AURN-only RLS SELECT policy. This is necessary because the
-merged outbox currently grants SELECT only to `service_role` and provides no RLS
-policy for an independent restricted reader. It changes neither rows nor writer
-function authority. Applying the migration and provisioning a restricted INHERIT
-login/member with read-only defaults require separate operational authorisation;
-no login/password or membership is provisioned by this code. Do not use
-`service_role`, a superuser, a role that can accept events, or the signing token.
+## Atomic registration and recovery
 
-Examples for a **later separately authorised** read operation:
+The existing `control.mjs` CAS framework adds `retain_prune_event`, admitted only
+with a module-private token minted after **all** partitions have durable verified
+bundle/receipt readbacks. Its command cannot carry caller-invented evidence.
+Individual `retain_receipt` remains for schema 1 and rejects schema-2 Prune inputs.
+`assertPruneReceiptGroup()` and `assertControl()` require the complete expected
+set, unique indices/change IDs/scopes, matching original authority/group digest
+and exact whole-event scope/row coverage. An arbitrary subset cannot be valid
+registered state.
+
+One CAS transition installs the whole group, preserving unrelated entries and
+month dependencies. Existing stable IDs must have identical receipt bytes.
+Conflicts reread fresh state and reapply only the bounded command. Revision,
+operation ID and previous-byte hash fencing remain. Ambiguous control writes
+require readback of the attempted state or a newer valid state containing the
+identical complete event. Replay is idempotent and does not advance revision for
+an already registered event. Control stays within its 4 MiB cap; event-mode
+control reads/writes share the operation deadline and byte budget.
+
+Original outbox plus private pending gzip are the crash-replay inputs. Reconstructing
+the same event gives the same partition set, bundle/receipt references and change
+IDs. Interrupted/partial retention leaves no registration; retained receipts
+survive failed registration, missing initialization or CAS interruption. Replay
+checks existing immutable bytes, completes missing retention and registers the
+whole set. Conflicting or missing originals fail closed; no Prune rerun, mutable
+original-authority store, source reconstruction or age-based cleanup is added.
+`reconcilePruneAcceptance()` reuses the full event replay path, separate from the
+existing 128-scope current-metadata inspector. That inspector can optionally
+reauthenticate schema-2 receipts through the actual private reader; unavailable
+recovery inputs remain reconciliation-required.
+
+`handover_complete:true` is returned only after complete original-event durable
+retention **and** confirmed atomic registration. It does not assert currentness.
+Every result keeps `publication_eligible:false`, current canonical authority
+uninspected and supersession unevaluated. Superseded originals may still be
+recovered as original events; this never bypasses later precedence checks.
+
+## Manual interface, discovery and prerequisites
+
+No imports, diagnostics or CLI help execute writes. `--execute-read-only` remains;
+`--execute-retain` is a separate explicit future operational mode. Optional
+`--initialize-control` is retain-only; an absent control is otherwise a recoverable
+registration failure. No workflow, schedule, public API, Queue or service is added.
+
+Local help:
 
 ```sh
 node scripts/jsongen/prune-consumer.mjs --help
-node scripts/jsongen/prune-consumer.mjs --execute-read-only \
-  --event-key-file work/original-event-key.json --output work/prune-consumer-result.json
-node scripts/jsongen/prune-consumer.mjs --execute-read-only --discover resweep \
-  --from 2026-10-10T00:00:00.000Z --to 2026-10-11T00:00:00.000Z \
-  --limit 4 --process --output work/prune-consumer-page.json
 ```
 
-An event-key file has all six key fields; a cursor file contains the previous
-result's complete `discovery.next`. Detailed reports require an explicit output
-path and are atomically retained as mode 0600 local JSON.
-Logs contain only bounded counts, opaque event IDs and safe failure codes. No
-credential, presigned URL, source rows or final-evidence bytea is logged. Exit 2
-means the handover is incomplete/reconciliation-required even if reads succeeded.
+For later separately authorised TEST operation, use the full original key:
 
-## Validation and Chat-mode system-documentation handover
+```sh
+node scripts/jsongen/prune-consumer.mjs --execute-read-only \
+  --event-key-file work/original-event-key.json --output work/prune-read.json
+node scripts/jsongen/prune-consumer.mjs --execute-retain \
+  --event-key-file work/original-event-key.json --output work/prune-retain.json
+```
 
-Changed active Node modules pass syntax checks; CLI help imports without remote
-operations. Three focused offline checks pass: complete 1,024-scope/2,048-row
-partition coverage and deterministic identities; forged/missing/tampered authority
-admission; and late-visibility resweep recovery. One existing private-source check
-and two existing Stage 1 precision/multiplicity/membership checks also pass. The
-local Node v24.19.0 runner requires `--test-isolation=none` to expose individual
-checks; no broad suite was run. Companion SQL checks compare canonical/migration
-definitions and restrict privileges/policy to SELECT; no SQL was executed.
+Discovery remains explicit `--discover recent|resweep --from UTC --to UTC`, at most
+seven days and 16 events/page (default 4). `--process` processes events and is
+mandatory in retain discovery. Cursor files contain the previous page's complete
+`next` tuple for the same mode/window. `accepted_at` is insertion time, never
+commit order or canonical precedence. Repeat overlapping recent windows and
+periodic historical resweeps from their beginnings to recover late visibility.
+Discovery always reports incomplete world coverage; no one-way high-water mark,
+acknowledgement, event counter or source-row update is introduced.
 
-Before-payload implementation archives cover the two changed active consumer
-modules and the configuration mapping; schema has its own canonical SQL snapshot.
-Existing PR #111 archives remain untouched. `git diff --check` passes.
+Detailed JSON requires an explicit local path and is atomically written mode0600.
+Logs expose bounded counts, opaque IDs and safe failure codes, never credentials,
+URLs, observations or evidence bytea. Exit 2 means incomplete/reconciliation-required;
+help and confirmed registration exit successfully.
 
-Chat-mode handover: document this executable **read-only safe boundary**, private
-outbox discovery/replay and source verification, prospective partition plans, new
-reader role/configuration prerequisites, and the two precise original authority
-gaps. **Do not describe Stage 3B VERIFIED receipt retention or registration as
-complete.** No real outbox, pending R2 object, signer or Prune operation was read
-or run. Structural checks are not integrated TEST acceptance. No system-doc edit,
-deployment, migration apply, configuration change, workflow dispatch or LIVE work
-occurred. Rollback is reverting these code/schema definitions before application;
-do not delete durable original events or pending sources.
+No new configuration is added in this completion. Reuse
+`UK_AQ_JSONGEN_PRUNE_READER_DB_URL`, `UK_AQ_ENV_NAME=TEST`, existing `SUPABASE_URL`
+and `UK_AQ_COMPRESSED_CHART_R2_*`. The reader key remains local-only in
+`config/uk_aq_github_env_targets.csv`; the operator-owned ignored
+`env-vars-master.csv` is absent locally and requires its existing key definition
+when separately provisioning. Derived credentials need existing namespace
+GET/conditional PUT for retain mode. No credential is provisioned here.
 
-Remaining work: accepted original before/binding evidence or versioned contract;
-strict receipt construction and immutable retention/readback; complete partition
-CAS registration and write/crash recovery; later current canonical-scope
-authority/supersession; authenticated monthly baselines and PM context; paired
-observation/AQI generation and publication CAS; eventual explicitly authorised
-chart integration. `selectManagedPublications()` and default serving stay disabled.
+[Schema PR #12](https://github.com/TEST-uk-aq/uk-aq-schema/pull/12) was reviewed:
+NOLOGIN `uk_aq_jsongen_prune_reader`, schema USAGE, outbox SELECT and the
+TEST/`prune_daily_v3`/connector-1 SELECT RLS policy match the consumer's checks.
+No mismatch or additional schema change was identified. Its merge/apply status
+is not assumed. Applying its migration and provisioning a restricted INHERIT
+login with read-only defaults remain separate operational prerequisites.
+
+## Validation, limits and Chat-mode handover
+
+Targeted offline checks pass: seven consumer checks cover compressed original
+authentication, 1,024 scopes/2,048 duplicate rows through eight receipts and full
+registration, source/authority conflicts, late visibility, partial retention,
+immutable conflict/readback, CAS/ambiguous outcomes and reconciliation loss of
+original input. Six existing Stage 2 precision/membership/continuity/report/CAS
+checks and the existing isolated private-reader check pass (14 total).
+
+```sh
+node --test --test-isolation=none --test-reporter=tap tests/jsongen_prune_consumer.test.mjs
+node --test --test-isolation=none --test-reporter=tap --test-name-pattern='receipt and gzip identities|complete-scope membership|malformed provenance|CAS conflict rereads|valid original-byte report|schema-2 continuity accepts' tests/jsongen_stage2.test.mjs
+node --test --test-isolation=none --test-reporter=tap --test-name-pattern='isolated private reader' tests/jsongen_prune_pending_source.test.mjs
+```
+
+Changed active Node modules pass `node --check`; CLI help and `git diff --check`
+pass. Fixtures are local synthetic adapters, not TEST operational acceptance.
+No broad suite, signer invocation, Prune run, operational DB/R2 access, write-mode
+CLI operation, workflow dispatch, migration apply, deployment, credential or
+scheduler change occurred. The enabled pending-source variable and paused Prune
+scheduler remain untouched. LIVE was not accessed.
+
+Existing dated archive copies are preserved without overwrite. Additional
+pre-change active-code snapshots cover authority, schema, control, inputs,
+reconcile/report validation and the three consumer modules; new modules need no
+predecessor snapshot. PR #113's producer format and canonical safety stay intact.
+
+Chat-mode system-documentation handover: record the original-only Stage 3B
+consumer, schema-1 envelope/schema-2 markers/codec, schema-2 receipt's typed
+PostgreSQL durability authority, exact first-publication before/binding mappings,
+immutable layout, atomic whole-event CAS and deterministic crash replay, private
+reader/migration prerequisites and explicit CLI modes. This is an implementation
+capability with operational acceptance outstanding; no system docs were edited.
+
+No mandatory original-authority or durability implementation gap remains for
+the supported first-publication/schema-3 AURN path. Missing legacy/oversized
+captures cannot be repaired by this consumer and remain ineligible. Next work
+is authenticated current canonical scope/supersession, complete intervening-writer
+coverage, authenticated monthly baselines and PM context, then paired monthly
+observation/AQI generation and publication CAS. `selectManagedPublications()`
+and chart/default serving remain disabled. After deployment, separately authorised
+TEST checks must exercise real read/retain/replay, immutable permissions and CAS
+readback before operational acceptance. Rollback is reverting consumer code and
+schema-2 admission before operation; preserve durable originals, sources and any
+retained receipts/bundles for reconciliation.

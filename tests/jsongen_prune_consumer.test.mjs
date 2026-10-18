@@ -1,19 +1,19 @@
 // Focused admission/coverage/replay boundary checks. No network, canonical
-// reads, database execution, signing or object writes occur in these checks.
+// reads, database execution, signing or operational object writes occur here.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
-import { canonicalJson, BUCKET } from '../scripts/jsongen/schema.mjs';
+import { canonicalJson, CONTROL_KEY, ORDERING_BLOCKER, assertControl, assertReceipt, assertPruneReceiptGroup } from '../scripts/jsongen/schema.mjs';
 import { sha256Hex } from '../workers/shared/r2_sigv4.mjs';
-import { computePruneConnectorSourceIdentity } from '../workers/shared/uk_aq_prune_connector_source_identity.mjs';
-import { describePrunePendingSource } from '../scripts/jsongen/prune-evidence.mjs';
-import { preparePruneOriginalFinalEvidence } from '../scripts/jsongen/prune-final-evidence.mjs';
-import { createPruneOriginalMetadataCapture, preparePruneOriginalMetadataSnapshot } from '../scripts/jsongen/prune-original-metadata.mjs';
 import { connectPruneOutboxReader, originalPruneAcceptance } from '../scripts/jsongen/prune-outbox-reader.mjs';
 import { authenticatePruneHandover, inspectAuthenticatedPruneHandover } from '../scripts/jsongen/prune-consumer-authentication.mjs';
 import { planPruneScopePartitions } from '../scripts/jsongen/prune-consumer-partitions.mjs';
 import { consumePruneAcceptance, runPruneConsumer } from '../scripts/jsongen/prune-consumer.mjs';
+import { buildPruneReceiptGroup, inspectPruneReceiptGroup } from '../scripts/jsongen/prune-receipts.mjs';
+import { decodePruneMetadataEvidence, compactPruneMetadataEvidence } from '../scripts/jsongen/prune-metadata-codec.mjs';
+import { updateManagedControl, selectManagedPublications } from '../scripts/jsongen/control.mjs';
+import { reconcileManagedInputs } from '../scripts/jsongen/reconcile.mjs';
 
 const run = 'ca2a2ad8-c46c-4d65-9ee0-7147f03684eb'; const day = '2026-10-10';
 const key = { environment: 'TEST', writer_identity: 'prune_daily_v3', run_id: run,
@@ -21,114 +21,44 @@ const key = { environment: 'TEST', writer_identity: 'prune_daily_v3', run_id: ru
 const env = { UK_AQ_ENV_NAME: 'TEST', SUPABASE_URL: 'https://aaaaaaaaaaaaaaaaaaaa.supabase.co',
   UK_AQ_JSONGEN_PRUNE_READER_DB_URL: 'postgresql://reader:fixture@db.aaaaaaaaaaaaaaaaaaaa.supabase.co/postgres' };
 
-function sourceAndOriginalEvent(scopes = 1024, { aliasMismatch = false } = {}) {
-  const rows = Array.from({ length: scopes }, (_, i) => ({ connector_id: 1, station_id: i + 1,
-    timeseries_id: i + 1, pollutant_code: 'pm25', observed_at_utc: `${day}T01:02:03.004Z`,
-    observed_at: `${day}T01:02:03.${aliasMismatch ? '005' : '004'}Z`, value: 1.2345678901234567,
-    verification_status: ['P', 'R', null][i % 3] })).flatMap(row => [row, { ...row }]);
-  const source = Buffer.concat(rows.map(canonicalJson)); const compressed = gzipSync(source, { mtime: 0 });
-  const sourceIdentity = computePruneConnectorSourceIdentity(rows);
-  const object = { bucket: BUCKET, key: `managed/jsongen/v1/pending/unverified/prune_daily_v3/connector_id=1/day_utc=${day}`
-    + `/invocation=${run}/compressed_sha256=${sha256Hex(compressed)}/uncompressed_sha256=${sha256Hex(source)}.ndjson.gz`,
-  sha256: sha256Hex(compressed), byte_size: compressed.length, json_sha256: sha256Hex(source), json_byte_size: source.length };
-  const intent = createHash('sha256').update(JSON.stringify(['uk_aq_jsongen_upload_intent_v1', BUCKET, object.key,
-    'prune_daily_v3', run, 'v3', 1, day, 'connector_day_observations_ndjson_gzip', object.byte_size, object.sha256,
-    object.json_byte_size, object.json_sha256, 'connector_day', 1, day])).digest('hex');
-  const unsigned = describePrunePendingSource({ source, compressed, rows, runId: run, dayUtc: day, connectorId: 1, sourceIdentity });
-  const description = { ...unsigned, signed_upload: { intent_id: intent, object, disposition: 'put_acknowledged_unverified' } };
-  const pending = { state: 'put_acknowledged_unverified', intent_id: intent, source: object, pending_evidence: description,
-    source_evidence_sha256: sha256Hex(canonicalJson(unsigned)), preparation_sha256: sha256Hex(canonicalJson(description)) };
-  const capture = createPruneOriginalMetadataCapture();
-  const metadata = (key, value) => {
-    const body = canonicalJson(value); capture.recordPublishedObject({ key, body });
-    return { key, sha256: sha256Hex(body), byte_size: body.length, verified: true, durable: true };
-  };
-  const base = `history/v3/observations/day_utc=${day}/connector_id=1`;
-  const counts = Object.fromEntries(unsigned.scope.physical_timeseries_days.map(s => [s.timeseries_id, s.row_count]));
-  const partition = unsigned.scope.pollutant_partitions[0];
-  const file = { key: `${base}/pollutant_code=pm25/part-0.parquet`, row_count: rows.length,
-    bytes: 100, etag_or_hash: 'd'.repeat(64), timeseries_row_counts: counts };
-  const child = { ...partition, connector_id: 1, day_utc: day, manifest_key: `${base}/pollutant_code=pm25/manifest.json`,
-    manifest_hash: 'b'.repeat(64), timeseries_row_counts: counts, files: [file] };
-  const childRef = metadata(child.manifest_key, child);
-  const manifest = { history_version: 'v2', connector_id: 1, day_utc: day, manifest_key: `${base}/manifest.json`,
-    manifest_hash: 'a'.repeat(64), source_row_count: rows.length, file_count: 1, total_bytes: 100,
-    pollutant_manifests: [{ manifest_key: child.manifest_key, manifest_hash: child.manifest_hash }] };
-  const connectorRef = metadata(manifest.manifest_key, manifest);
-  const index = metadata(`history/_index_v3/observations_timeseries/day_utc=${day}/connector_id=1/pollutant_code=pm25/manifest.json`,
-    { index_generation: 'v3', connector_id: 1, day_utc: day, pollutant_code: 'pm25', history_schema_version: 3,
-      writer_version: 'parquet-wasm-zstd-v3', leaves_by_timeseries_id: Object.fromEntries(Object.keys(counts).map(k => [k, []])) });
-  const d = metadata(`history/v3/observations/day_utc=${day}/manifest.json`, { day_utc: day });
-  const aggregate = metadata('history/v3/observations/_manifests/manifest.json', { kind: 'original_verified_aggregate' });
-  const latest = metadata('history/_index_v3/observations_timeseries_latest.json', { index_generation: 'v3' });
-  const pin = r => ({ key: r.key, sha256: r.sha256, byte_size: r.byte_size });
-  const connector = { manifest_key: manifest.manifest_key, manifest_hash: manifest.manifest_hash,
-    run_id: run, day_utc: day, connector_id: 1, source_row_count: rows.length, file_count: 1, total_bytes: 100,
-    connector_manifest: { ...pin(connectorRef), bucket: 'canonical-test' },
-    pollutant_manifests: [{ ...partition, manifest: { ...pin(childRef), bucket: 'canonical-test', semantic_manifest_hash: child.manifest_hash },
-      files: [{ key: file.key, row_count: file.row_count, byte_size: file.bytes, sha256: file.etag_or_hash, timeseries_row_counts: counts }] }],
-    scoped_roots: [{ scope: { day_utc: day, connector_id: 1, pollutant_code: 'pm25' }, reference: pin(index) }] };
-  const snapshot = preparePruneOriginalMetadataSnapshot({ capture, bucket: 'canonical-test', dayUtc: day, connectorId: 1,
-    runId: run, writerGitSha: '4'.repeat(40), canonicalReferences: [connectorRef, childRef], exactReferences: [index],
-    dayReferences: [d], affectedDaysUtc: [day], aggregateReferences: [aggregate], latestReferences: [latest] });
-  const prepared = preparePruneOriginalFinalEvidence({ pending, connector, runId: run, dayUtc: day, connectorId: 1,
-    writerGitSha: '4'.repeat(40), sourceIdentity, originalMetadataSnapshot: snapshot,
-    finalization: { ok: true, affected_days_utc: [day], day_results: [{ day_utc: day, day_manifest: d }],
-      canonical_aggregate_result: { canonical_aggregate_authority_verified: true, parent_state_reread_under_lock: true,
-        affected_days_utc: [day], aggregate_manifests: [aggregate] },
-      v3_publication: { exact_scopes: [{ ok: true }], latest_global: { ok: true, objects: [latest] } } } });
-  const row = { ...key, event_schema_version: 1, writer_git_sha: '4'.repeat(40), accepted_at: '2026-10-10T02:00:00.123456Z',
-    ...sourceIdentity, history_manifest_key: manifest.manifest_key, history_manifest_hash: manifest.manifest_hash,
-    history_row_count: rows.length, history_file_count: 1, history_total_bytes: 100,
-    gate_history_completed_at: '2026-10-10T02:00:00.000Z', gate_completion_source: 'prune_daily_phase_b',
-    candidate_ready_marker: 'PRUNE_FIRST_DELETE_READY:v1', connector_manifest_byte_sha256: connectorRef.sha256,
-    connector_manifest_byte_size: connectorRef.byte_size, pending_disposition: 'put_acknowledged_unverified',
-    pending_intent_id: intent, pending_bucket: BUCKET, pending_object_key: object.key,
-    pending_compressed_sha256: object.sha256, pending_compressed_byte_size: object.byte_size,
-    pending_ndjson_sha256: object.json_sha256, pending_ndjson_byte_size: object.json_byte_size,
-    original_source_status_provenance: 'original_source_status_unavailable', final_evidence_state: 'prepared_unverified',
-    final_evidence_bytes: prepared.bytes, final_evidence_sha256: prepared.sha256, final_evidence_byte_size: prepared.byte_size };
-  let body = compressed; const queries = []; let visible = true;
-  class Client {
-    async connect() {} async end() {}
-    async query(sql, args) {
-      queries.push({ sql, args });
-      assert.doesNotMatch(sql, /history_candidates|prune_connector_day_gates/);
-      if (sql.startsWith('SELECT current_setting')) return { rows: [{ read_only: true, default_read_only: true,
-        restricted_role: true, reader_membership: true, reader_policy: true, can_read: true, can_mutate: false, can_accept: false }] };
-      if (sql.includes('FROM uk_aq_ops.prune_jsongen_gate_acceptance_outbox')) return { rows: visible ? [{ ...row }] : [] };
-      assert.match(sql, /^(BEGIN READ ONLY|COMMIT|ROLLBACK)$/); return { rows: [] };
-    }
-  }
-  const r2 = { bucket: BUCKET, region: 'auto', endpoint: 'https://41a81f781d3bd7234fde0b25df51e879.r2.cloudflarestorage.com',
-    adapter: { async getObjectBounded({ key: requested }) {
-      assert.equal(requested, object.key); assert.ok(!requested.endsWith('.parquet'));
-      return { body, bytes: body.length };
-    }, async putObjectConditional() { assert.fail('Incomplete authority must never write a bundle, receipt or control'); } } };
-  return { Client, row, r2, queries, setVisible: value => { visible = value; }, setBody: value => { body = value; } };
-}
+import { sourceAndOriginalEvent } from './jsongen_prune_consumer_fixture.mjs';
 
-test('independent original event and 1024 complete scopes yield eight stable plans, never VERIFIED or registration', async () => {
-  const f = sourceAndOriginalEvent(); const reader = await connectPruneOutboxReader({ env, Client: f.Client });
+test('independent compressed original authority yields eight strict 128-scope receipts; read mode never writes or publishes', async () => {
+  const f = await sourceAndOriginalEvent(); const reader = await connectPruneOutboxReader({ env, Client: f.Client });
   try {
     const acceptance = await reader.read(key);
     const proof = await authenticatePruneHandover({ acceptance, derivedR2: f.r2 });
     const p = planPruneScopePartitions({ handover: proof });
+    const group = inspectPruneReceiptGroup(buildPruneReceiptGroup({ handover: proof }));
+    assertPruneReceiptGroup(group.entries.map(e => e.receipt));
+    for (const { receipt } of group.entries) {
+      assertReceipt(receipt); assert.equal(receipt.schema_version, 2);
+      assert.equal(receipt.durability.retained_receipt_authority.relation, 'uk_aq_ops.prune_jsongen_gate_acceptance_outbox');
+      assert.equal(receipt.source.binding_authority.key, 'history/_index_v3/timeseries_binding/_manifests/root.json');
+      assert.ok(receipt.scopes.every(s => s.before.state === 'authoritative_empty' && s.before.row_count === 0));
+    }
+    assert.throws(() => assertPruneReceiptGroup(group.entries.slice(1).map(e => e.receipt)), /missing|incomplete/);
     assert.equal(p.partition_count, 8); assert.equal(p.physical_scope_count, 1024); assert.equal(p.observation_count, 2048);
     assert.deepEqual(planPruneScopePartitions({ handover: proof }), p);
     assert.ok(p.partitions.every(p => p.scope_count === 128 && p.row_count === 256));
     assert.equal(new Set(p.partitions.flatMap(p => p.binding.scopes.map(s => s.timeseries_id))).size, 1024);
-    assert.equal(new Set(p.partitions.map(p => p.prospective_change_id)).size, 8);
+    assert.equal(new Set(p.partitions.map(p => p.change_id)).size, 8);
     assert.deepEqual(p.partitions.flatMap(p => p.binding.scopes).map(s => s.verification_status_counts)
       .reduce((a, c) => ({ P: a.P + c.P, R: a.R + c.R, null: a.null + c.null }), { P: 0, R: 0, null: 0 }),
     { P: 684, R: 682, null: 682 });
     const result = await consumePruneAcceptance({ reader, key, derivedR2: f.r2 });
-    assert.equal(result.state, 'reconciliation_required'); assert.equal(result.receipt_eligible, false);
-    assert.equal(result.registration, 'blocked_missing_original_authority'); assert.equal(result.handover_complete, false);
-    assert.deepEqual(result.missing_authority.map(g => g.field), ['scopes[].before', 'source.binding_authority']);
+    assert.equal(result.state, 'authenticated'); assert.equal(result.receipt_eligible, true);
+    assert.equal(result.registration, 'not_attempted'); assert.equal(result.handover_complete, false);
+    assert.deepEqual(result.missing_authority, []);
     assert.equal(inspectAuthenticatedPruneHandover(proof).result.publication_eligible, false);
+    assert.equal(f.objects.size, 1); assert.throws(selectManagedPublications);
+    const registered = await consumePruneAcceptance({ reader, key, derivedR2: f.r2, mode: 'retain', initializeControl: true });
+    assert.equal(registered.state, 'registered'); assert.equal(registered.handover_complete, true);
+    const control = assertControl(JSON.parse(f.objects.get(CONTROL_KEY)));
+    assert.equal(Object.keys(control.registered_changes).length, 8);
+    assert.equal(Object.values(control.registered_changes).reduce((n, e) => n + e.receipt.bundle.row_count, 0), 2048);
   } finally { await reader.close(); }
-  const invalid = sourceAndOriginalEvent(1, { aliasMismatch: true });
+  const invalid = await sourceAndOriginalEvent(1, { aliasMismatch: true });
   const invalidReader = await connectPruneOutboxReader({ env, Client: invalid.Client });
   try {
     const result = await consumePruneAcceptance({ reader: invalidReader, key, derivedR2: invalid.r2 });
@@ -139,7 +69,7 @@ test('independent original event and 1024 complete scopes yield eight stable pla
 test('caller references, missing original bytes, tampered private bytes and source membership fail closed', async () => {
   assert.throws(() => originalPruneAcceptance({ ...key, verified: true }), { code: 'unauthenticated_original_outbox' });
   await assert.rejects(runPruneConsumer([], { env }), { code: 'invalid_consumer_arguments' });
-  const f = sourceAndOriginalEvent(2); const reader = await connectPruneOutboxReader({ env, Client: f.Client });
+  const f = await sourceAndOriginalEvent(2); const reader = await connectPruneOutboxReader({ env, Client: f.Client });
   try {
     const original = f.row.final_evidence_bytes;
     f.setBody(Buffer.from('corrupt'));
@@ -164,7 +94,7 @@ test('caller references, missing original bytes, tampered private bytes and sour
 });
 
 test('late visibility is recovered by repeating a window; no discovery result acknowledges complete coverage', async () => {
-  const f = sourceAndOriginalEvent(1); const reader = await connectPruneOutboxReader({ env, Client: f.Client });
+  const f = await sourceAndOriginalEvent(1); const reader = await connectPruneOutboxReader({ env, Client: f.Client });
   const window = { from: '2026-10-10T00:00:00.000Z', to: '2026-10-11T00:00:00.000Z', mode: 'resweep', limit: 1 };
   try {
     f.setVisible(false); assert.equal((await reader.discover(window)).events.length, 0);
@@ -184,5 +114,99 @@ test('late visibility is recovered by repeating a window; no discovery result ac
       }
     }
     await assert.rejects(connectPruneOutboxReader({ env, Client: Elevated }), { code: 'reader_privilege_rejected' });
+  } finally { await reader.close(); }
+});
+
+test('legacy codec, marker disagreement and contradictory original lock/before/Core authority fail before writes', async () => {
+  const f = await sourceAndOriginalEvent(2), reader = await connectPruneOutboxReader({ env, Client: f.Client });
+  const original = JSON.parse(f.row.final_evidence_bytes);
+  try {
+    for (const mutate of [
+      e => { delete e.original_metadata_evidence; e.original_metadata_snapshot.schema_version = 1; },
+      e => { e.original_metadata_evidence.bytes_base64 = 'AAAA' + e.original_metadata_evidence.bytes_base64.slice(4); },
+      e => { e.original_metadata_snapshot.evidence_sha256 = '0'.repeat(64); },
+      e => { const d = decodePruneMetadataEvidence(e); d.original_authority_extension.lock.run_id = randomUUID(); Object.assign(e, d); compactPruneMetadataEvidence(e); },
+      e => { const d = decodePruneMetadataEvidence(e); d.original_authority_extension.before.scopes.pop(); Object.assign(e, d); compactPruneMetadataEvidence(e); },
+      e => { const d = decodePruneMetadataEvidence(e); d.original_authority_extension.binding.source_fingerprint = '0'.repeat(64); Object.assign(e, d); compactPruneMetadataEvidence(e); },
+    ]) {
+      const e = structuredClone(original); mutate(e); f.setEnvelope(e);
+      const result = await consumePruneAcceptance({ reader, key, derivedR2: f.r2, mode: 'retain' });
+      assert.equal(result.state, 'reconciliation_required'); assert.equal(result.handover_complete, false);
+      assert.equal(f.objects.size, 1);
+    }
+  } finally { await reader.close(); }
+});
+
+test('partial partition retention is replayable and never registers an arbitrary subset', async () => {
+  const f = await sourceAndOriginalEvent(129), reader = await connectPruneOutboxReader({ env, Client: f.Client }); let receipts = 0;
+  f.setHook(args => { if (args.key.includes('/receipts/') && ++receipts === 2) throw new Error('lost response before storage'); });
+  try {
+    let result = await consumePruneAcceptance({ reader, key, derivedR2: f.r2, mode: 'retain', initializeControl: true });
+    assert.equal(result.handover_complete, false); assert.equal(result.reason, 'ambiguous_r2_write_outcome');
+    assert.equal(f.objects.has(CONTROL_KEY), false);
+    const expected = result.expected_receipts;
+    f.setHook(null);
+    result = await consumePruneAcceptance({ reader, key, derivedR2: f.r2, mode: 'retain', initializeControl: true });
+    assert.equal(result.state, 'registered'); assert.equal(result.handover_complete, true);
+    assert.deepEqual(result.expected_receipts, expected);
+    const control = assertControl(JSON.parse(f.objects.get(CONTROL_KEY)));
+    assert.equal(Object.keys(control.registered_changes).length, 2);
+    const incomplete = structuredClone(control); delete incomplete.registered_changes[expected[0].change_id];
+    assert.throws(() => assertControl(incomplete), /missing|incomplete/);
+    const replay = await consumePruneAcceptance({ reader, key, derivedR2: f.r2, mode: 'retain' });
+    assert.equal(replay.registration_outcome, 'already_retained'); assert.equal(replay.control_operation.revision, control.revision);
+    await assert.rejects(updateManagedControl({ r2: f.r2, command: { type: 'retain_receipt',
+      ...Object.values(control.registered_changes)[0] } }), /complete atomic/);
+  } finally { await reader.close(); }
+});
+
+test('ambiguous immutable/control writes and CAS conflicts resolve without losing unrelated registered changes', async () => {
+  const f = await sourceAndOriginalEvent(2), other = await sourceAndOriginalEvent(1, { runId: randomUUID(), dayUtc: '2026-10-11' });
+  for (const [k, v] of other.objects) f.objects.set(k, v);
+  const reader = await connectPruneOutboxReader({ env, Client: f.Client }), otherReader = await connectPruneOutboxReader({ env, Client: other.Client });
+  try {
+    assert.equal((await consumePruneAcceptance({ reader: otherReader, key: other.key, derivedR2: f.r2,
+      mode: 'retain', initializeControl: true })).state, 'registered');
+    let conflict = true, ambiguous = true;
+    f.setHook(args => {
+      if (args.key === CONTROL_KEY && conflict) {
+        conflict = false; const old = f.objects.get(CONTROL_KEY), current = JSON.parse(old);
+        current.previous = { revision: current.revision, operation_id: current.operation_id, sha256: sha256Hex(old) };
+        current.revision++; current.operation_id = randomUUID(); current.updated_at_utc = new Date().toISOString();
+        current.failure = { code: ORDERING_BLOCKER, state: 'reconcile_required', at_utc: current.updated_at_utc, detail: 'unrelated concurrent state' };
+        f.objects.set(CONTROL_KEY, canonicalJson(assertControl(current))); return { status: 412 };
+      }
+      if (ambiguous && args.key !== CONTROL_KEY) { ambiguous = false; f.objects.set(args.key, Buffer.from(args.body)); throw new Error('lost immutable response'); }
+      if (args.key === CONTROL_KEY && !conflict) { f.objects.set(args.key, Buffer.from(args.body)); throw new Error('lost control response'); }
+    });
+    const result = await consumePruneAcceptance({ reader, key, derivedR2: f.r2, mode: 'retain' });
+    assert.equal(result.state, 'registered'); assert.equal(result.registration_outcome, 'confirmed_after_ambiguous_write');
+    const control = assertControl(JSON.parse(f.objects.get(CONTROL_KEY)));
+    assert.equal(Object.keys(control.registered_changes).length, 2); assert.equal(control.failure.detail, 'unrelated concurrent state');
+    f.objects.set(result.expected_receipts[0].bundle.key, Buffer.from('conflicting bytes'));
+    const rejected = await consumePruneAcceptance({ reader, key, derivedR2: f.r2, mode: 'retain' });
+    assert.equal(rejected.reason, 'ambiguous_r2_write_outcome'); assert.equal(rejected.handover_complete, false);
+  } finally { await reader.close(); await otherReader.close(); }
+});
+
+test('reconciliation reauthenticates original receipts and fails closed when original recovery input disappears', async () => {
+  const f = await sourceAndOriginalEvent(2), reader = await connectPruneOutboxReader({ env, Client: f.Client });
+  try {
+    assert.equal((await consumePruneAcceptance({ reader, key, derivedR2: f.r2,
+      mode: 'retain', initializeControl: true })).state, 'registered');
+    const control = assertControl(JSON.parse(f.objects.get(CONTROL_KEY)));
+    const options = { derivedR2: f.r2, control };
+    let report = await reconcileManagedInputs(options);
+    assert.equal(report.changes[0].authentication.authenticated, false);
+    report = await reconcileManagedInputs({ ...options, pruneReader: reader });
+    assert.equal(report.changes[0].authentication.state, 'original_prune_event_authenticated');
+    assert.equal(report.changes[0].authentication.authenticated, true);
+    assert.equal(report.complete_change_coverage, false); assert.equal(report.publication_selection, 'disabled');
+    const pending = Object.values(control.registered_changes)[0].receipt.origin.pending_source;
+    f.objects.delete(pending.key);
+    report = await reconcileManagedInputs({ ...options, pruneReader: reader });
+    assert.equal(report.changes[0].authentication.authenticated, false);
+    assert.equal(report.state, 'reconciliation_required');
+    assert.ok(report.changes[0].diagnostics.some(d => d.detail.startsWith('Original event/private source authentication failed')));
   } finally { await reader.close(); }
 });

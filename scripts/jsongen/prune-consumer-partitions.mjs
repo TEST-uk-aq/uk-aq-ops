@@ -1,13 +1,18 @@
-// Complete-scope planning only. These bytes cannot be retained as VERIFIED
-// bundles until the mandatory receipt authorities are supplied and accepted.
+// Deterministic authenticated complete-scope bundles, before durable retention.
 import { gzipSync } from 'node:zlib';
 import { verifiedPrunePendingRows } from './prune-pending-verification.mjs';
 import { inspectAuthenticatedPruneHandover } from './prune-consumer-authentication.mjs';
-import { BUCKET, ROOT, assertIdentity, canonicalJson, same } from './schema.mjs';
+import { BUCKET, ROOT, assertIdentity, assertBundleRecord, canonicalJson, same } from './schema.mjs';
+import { prunePhysicalKey } from './prune-original-authority.mjs';
 import { LIMITS, createBudget, evidence, freeze } from './limits.mjs';
 import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
 
 const physicalKey = s => `${s.pollutant_code}:${s.timeseries_id}:${s.station_id}:${s.day_utc}`;
+const artifacts = new WeakMap();
+export function prunePartitionArtifacts(plan) {
+  evidence(artifacts.has(plan), 'unauthenticated_partition_plan', 'Authenticated complete partition construction required');
+  return artifacts.get(plan).map(a => ({ ...a, body: Buffer.from(a.body), records: structuredClone(a.records) }));
+}
 
 export function planPruneScopePartitions({ handover, budget = createBudget() }) {
   const proof = inspectAuthenticatedPruneHandover(handover);
@@ -38,20 +43,22 @@ export function planPruneScopePartitions({ handover, budget = createBudget() }) 
     evidence(observations.length === scope.row_count && observations.length > 0,
       'incomplete_partition_coverage', 'Physical scope is incomplete; absence is not an empty replacement');
     const record = { identity, day_utc: scope.day_utc, state: 'present', rows: observations };
+    assertBundleRecord(record, proof.scopes[prunePhysicalKey(scope)]);
     const body = canonicalJson(record);
     evidence(body.length <= LIMITS.record_bytes, 'resource_limit', 'One complete physical scope exceeds the record cap; cannot split it');
-    return { scope, key: physicalKey(scope), body, row_count: observations.length };
+    return { scope, record, key: physicalKey(scope), body, row_count: observations.length };
   }).sort((a, b) => a.key.localeCompare(b.key));
   const groups = []; let group = []; let length = 0; let count = 0;
   for (const record of records) {
-    if (group.length && (group.length === LIMITS.scopes || length + record.body.length > LIMITS.uncompressed_bytes
+    if (group.length && (group[0].scope.pollutant_code !== record.scope.pollutant_code
+      || group.length === LIMITS.scopes || length + record.body.length > LIMITS.uncompressed_bytes
       || count + record.row_count > LIMITS.rows)) {
       groups.push(group); group = []; length = 0; count = 0;
     }
     group.push(record); length += record.body.length; count += record.row_count;
   }
   if (group.length) groups.push(group);
-  const partitions = [];
+  const partitions = []; const bodies = [];
   const encode = records => {
     budget.check();
     const body = Buffer.concat(records.map(record => record.body));
@@ -68,20 +75,24 @@ export function planPruneScopePartitions({ handover, budget = createBudget() }) 
       pending_source: pending.source, original_scope_count: expected.length,
       original_observation_count: rows.length, scopes };
     const id = sha256Hex(canonicalJson(binding));
-    partitions.push({ partition_id: id, prospective_change_id: `prune:${id}`, binding,
+    partitions.push({ partition_id: id, change_id: `prune:${id}`, binding,
       scope_count: records.length, row_count: records.reduce((n, record) => n + record.row_count, 0),
       format: 'complete_scope_ndjson_gzip', object: { bucket: BUCKET,
         key: `${ROOT}/bundles/${sha256Hex(compressed)}.ndjson.gz`, sha256: sha256Hex(compressed), byte_size: compressed.length,
         json_sha256: sha256Hex(body), json_byte_size: body.length },
-      retention: 'not_attempted_missing_receipt_authority' });
+      retention: 'pending' });
+    bodies.push({ partition_id: id, body: compressed, records: records.map(r => r.record),
+      scopes: records.map(r => proof.scopes[prunePhysicalKey(r.scope)]) });
   };
   groups.forEach(encode);
   const actual = partitions.flatMap(p => p.binding.scopes.map(physicalKey)).sort();
   evidence(same(actual, expected.map(physicalKey).sort()) && new Set(actual).size === expected.length
     && partitions.reduce((n, p) => n + p.row_count, 0) === rows.length,
   'incomplete_partition_coverage', 'Partition plan does not cover the complete original connector-day exactly once');
-  budget.rows(rows.length);
-  return freeze({ state: 'incomplete', coverage: 'complete_source_partition_plan_only',
+  evidence(partitions.length <= LIMITS.receipt_references, 'resource_limit', 'Complete event exceeds receipt reference limit');
+  const plan = freeze({ state: 'authenticated', coverage: 'complete_original_event_partition_set',
     partition_count: partitions.length, physical_scope_count: expected.length, observation_count: rows.length,
     partitions, receipt_coverage_complete: false, handover_complete: false });
+  artifacts.set(plan, bodies);
+  return plan;
 }

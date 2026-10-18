@@ -1,6 +1,7 @@
 import { flushPhaseBServiceEgressMetrics } from "./pg_source_egress_diagnostic.mjs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { randomUUID } from 'node:crypto';
 import {
   observationsGlobalOperationLockContext,
 } from "../shared/uk_aq_r2_history_writer.mjs";
@@ -116,7 +117,7 @@ export async function runPruneDailyJobWithGlobalLock({
     throw new Error("Prune Daily received an invalid observations global operation lock context");
   }
   if (lockContext.valid) return await runJob({ env });
-  const runId = `prune-daily:${String(env.GITHUB_RUN_ID || process.pid)}:${String(env.GITHUB_RUN_ATTEMPT || "local")}`;
+  const runId = randomUUID();
   return {
     delegated: true,
     exitCode: await runLockedCommand({

@@ -9,9 +9,18 @@ import { authenticateFinalPublication } from './writer-authentication.mjs';
 import { createBudget, evidence, freeze, JSONgenEvidenceError } from './limits.mjs';
 import { controlSnapshot } from './control-snapshot.mjs';
 import { assertReconciliationReport } from './report-validation.mjs';
+import { authenticatePruneHandover } from './prune-consumer-authentication.mjs';
+
+// Event-scoped replay is independent of the 128-scope current-metadata inspector.
+// It reconstructs all partitions from the original outbox/private pending source,
+// and can repair retention/registration only in explicitly requested retain mode.
+export async function reconcilePruneAcceptance(options) {
+  const { consumePruneAcceptance } = await import('./prune-consumer.mjs');
+  return consumePruneAcceptance(options);
+}
 
 export async function reconcileManagedInputs({ derivedR2, control, controlRead = null, retainedReceipts = [],
-  canonical, requestedScopes = [], writerKinds = {}, budget = createBudget() }) {
+  canonical, requestedScopes = [], writerKinds = {}, pruneReader = null, budget = createBudget() }) {
   control = structuredClone(control); assertControl(control);
   const controlBytes = canonicalJson(control);
   evidence(controlBytes.length <= MAX_CONTROL_BYTES, 'resource_limit', 'control admission size exceeded');
@@ -27,7 +36,7 @@ export async function reconcileManagedInputs({ derivedR2, control, controlRead =
     refs.set(ref.key, structuredClone(ref));
   }
   evidence(refs.size <= budget.limits.receipt_references, 'resource_limit', 'combined receipt reference budget exceeded');
-  const changes = []; const scopes = new Map(); const ids = new Map();
+  const changes = []; const scopes = new Map(); const ids = new Map(); const originalEvents = new Map();
   const addScope = scope => {
     scopes.set(scopeKey(scope), scope);
     evidence(scopes.size <= budget.limits.scopes, 'resource_limit', 'combined canonical scope budget exceeded');
@@ -65,9 +74,28 @@ export async function reconcileManagedInputs({ derivedR2, control, controlRead =
       }
       change.bundle_integrity = 'verified';
       change.logical_identities = bundle.logical;
-      change.authentication = authenticateFinalPublication({ input: { receipt, receipt_object: ref, bundle }, writerKind: writerKinds[receipt.writer.identity] });
-      change.diagnostics.push({ code: 'writer_authentication_unavailable',
-        detail: 'Immutable bundle bytes do not authenticate the original final writer publication or effective status.' });
+      let pruneHandover = null;
+      try {
+        if (receipt.schema_version === 2 && pruneReader) {
+          const id = receipt.origin.authority.event_id;
+          if (!originalEvents.has(id)) {
+            const acceptance = await pruneReader.read(receipt.origin.authority.key);
+            evidence(acceptance, 'missing_original_authority', 'Original PostgreSQL event is unavailable for receipt replay');
+            originalEvents.set(id, await authenticatePruneHandover({ acceptance, derivedR2, budget }));
+          }
+          pruneHandover = originalEvents.get(id);
+        }
+        change.authentication = authenticateFinalPublication({ input: { receipt, receipt_object: ref, bundle },
+          writerKind: writerKinds[receipt.writer.identity], pruneHandover });
+      } catch (error) {
+        change.authentication = authenticateFinalPublication({ input: { receipt, receipt_object: ref, bundle },
+          writerKind: writerKinds[receipt.writer.identity] });
+        change.diagnostics.push({ code: error.code || 'original_event_authentication_unavailable',
+          detail: 'Original event/private source authentication failed; retain reconciliation-required state without a canonical observation fallback.' });
+      }
+      change.diagnostics.push(change.authentication.authenticated
+        ? { code: 'original_prune_event_authenticated', detail: 'Original event and complete bundle authenticated; current canonical dominance and intervening writer coverage remain unresolved.' }
+        : { code: 'writer_authentication_unavailable', detail: 'Immutable bytes require independent original writer authentication.' });
     } catch (error) {
       change.diagnostics.push({ code: error.status === 404 ? 'missing_retained_receipt' : error.code || 'invalid_receipt', detail: error.message });
     }

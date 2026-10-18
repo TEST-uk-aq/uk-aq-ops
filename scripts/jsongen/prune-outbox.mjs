@@ -20,10 +20,16 @@ export function describePruneGateOutboxEvidence({ pending, connector, finalPrepa
     throw new Error('Acknowledged Prune pending source lacks its intent');
   }
   const manifest = connector?.connector_manifest;
+  const snapshot = finalPreparation?.envelope?.original_metadata_snapshot;
+  const pack = finalPreparation?.envelope?.original_metadata_evidence;
   // Retain final bytes only when every required writer-produced metadata byte
   // was captured. The DB row can still retain gate acceptance without them.
   const bytes = manifest?.sha256 && manifest?.byte_size
-    && finalPreparation?.envelope?.original_metadata_snapshot?.completeness ===
+    && (snapshot?.schema_version === 1 || (snapshot?.schema_version === 2
+      && snapshot.representation === 'inline_original_metadata_gzip_v1'
+      && pack?.schema_version === 1 && pack.codec === 'canonical_json_gzip_v1'
+      && snapshot.evidence_sha256 === pack.json_sha256))
+    && snapshot?.completeness ===
       'exact_writer_metadata_captured_unverified'
     ? finalPreparation?.bytes ?? null : null;
   return {

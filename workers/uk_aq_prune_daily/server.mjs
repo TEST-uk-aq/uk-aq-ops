@@ -6,6 +6,7 @@ import {
   fetchBackupDoneConnectorDays,
   resolvePhaseBRuntimeConfig,
   runPhaseBBackup,
+  resolvePrunePhaseBRunId,
 } from "./phase_b_history_r2.mjs";
 import { connectorDayGateKey } from "../shared/uk_aq_connector_day_gate.mjs";
 import { groupFingerprintRechecksByHour } from "./fingerprint_recheck.mjs";
@@ -2859,7 +2860,7 @@ async function runPrune(config, adapters = {}) {
 
   const phaseARecentSummary = await runPhaseARecentAdapter(config);
 
-  const phaseBRunId = randomUUID();
+  const phaseBRunId = resolvePrunePhaseBRunId();
   const phaseBHistorySummary = await runPhaseBBackupAdapter({
     dryRun: config.dryRun,
     phaseB: config.phaseB,

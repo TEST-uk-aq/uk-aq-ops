@@ -1,15 +1,18 @@
-// Manual-only, read-only Stage 3B safe boundary. No import starts remote work.
+// Manual-only Stage 3B. Read-only is separate from explicit retention/CAS mode.
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { connectPruneOutboxReader, assertPruneAcceptanceKey, originalPruneAcceptance } from './prune-outbox-reader.mjs';
 import { authenticatePruneHandover, inspectAuthenticatedPruneHandover } from './prune-consumer-authentication.mjs';
-import { planPruneScopePartitions } from './prune-consumer-partitions.mjs';
-import { managedR2Config } from './control.mjs';
+import { buildPruneReceiptGroup, inspectPruneReceiptGroup, retainPruneReceiptGroup, retainedPruneEvent } from './prune-receipts.mjs';
+import { managedR2Config, updateManagedControl, JSONgenControlError } from './control.mjs';
 import { createBudget, evidence, JSONgenEvidenceError } from './limits.mjs';
 
-export async function consumePruneAcceptance({ reader, key, derivedR2, budget = createBudget() }) {
+export async function consumePruneAcceptance({ reader, key, derivedR2, mode = 'read-only', initializeControl = false,
+  budget = createBudget() }) {
+  evidence(['read-only', 'retain'].includes(mode) && (!initializeControl || mode === 'retain'),
+    'invalid_consumer_arguments', 'Explicit retain mode required for derived writes or initialization');
   key = structuredClone(assertPruneAcceptanceKey(key));
   const result = { schema_version: 1, kind: 'uk_aq_jsongen_prune_consumer_result', key,
     state: 'pending', discovery: 'original_primary_key_replay', original_evidence: 'pending',
@@ -30,32 +33,50 @@ export async function consumePruneAcceptance({ reader, key, derivedR2, budget = 
     Object.assign(result, { original_evidence: authentication.original_final_evidence,
       pending_source: authentication.pending_source, physical_scope_count: authentication.physical_scope_count,
       observation_count: authentication.observation_count, authentication,
-      missing_authority: authentication.missing_authority });
-    result.partitions = planPruneScopePartitions({ handover, budget });
-    // The immutable original event and confirmed pending object already survive
-    // interruption. Do not create a parallel receipt register or mint weakened
-    // Stage 1 receipts to work around missing original writer authority.
-    return { ...result, state: 'reconciliation_required', reason: 'mandatory_original_receipt_authority_missing',
-      registration: 'blocked_missing_original_authority', retry: 'requires_writer_evidence_or_accepted_versioned_contract',
-      recovery: 'replay_existing_original_event_and_pending_source_without_prune_rerun', resources: budget.snapshot() };
+      receipt_eligible: authentication.receipt_eligible, missing_authority: authentication.missing_authority });
+    const group = inspectPruneReceiptGroup(buildPruneReceiptGroup({ handover, budget }));
+    result.partitions = group.plan;
+    result.expected_receipts = group.entries.map(e => ({ change_id: e.receipt.change_id, receipt: e.receipt_object,
+      bundle: e.receipt.bundle.object }));
+    result.group_sha256 = group.group_sha256;
+    if (mode === 'read-only') return { ...result, state: 'authenticated', reason: 'read_only_no_retention_attempted', resources: budget.snapshot() };
+    result.retention_progress = []; result.bundle_retention = 'incomplete'; result.receipt_retention = 'incomplete';
+    const retainedToken = await retainPruneReceiptGroup({ handover, r2: derivedR2, budget,
+      progress: progress => { result.retention_progress[progress.partition_index] = progress; } });
+    const stored = retainedPruneEvent(retainedToken);
+    Object.assign(result, { state: 'retained', bundle_retention: 'retained', receipt_retention: 'verified_pending',
+      receipt_coverage_complete: stored.receipt_coverage_complete, registration: 'pending' });
+    if (initializeControl) await updateManagedControl({ r2: derivedR2, command: { type: 'initialize' }, budget });
+    const registration = await updateManagedControl({ r2: derivedR2, command: { type: 'retain_prune_event' },
+      authenticatedPruneEvent: retainedToken, budget });
+    return { ...result, state: 'registered', registration: 'registered', registration_outcome: registration.outcome,
+      control_operation: { revision: registration.latest.control.revision, operation_id: registration.latest.control.operation_id,
+        sha256: registration.latest.sha256 }, handover_complete: true, retry: 'none',
+      recovery: 'deterministic_original_event_replay', resources: budget.snapshot() };
   } catch (error) {
     // Never include PG errors, original bytea, observation rows or R2 URLs.
     return { ...result, state: 'reconciliation_required',
-      reason: error instanceof JSONgenEvidenceError ? error.code : 'consumer_boundary_rejected',
-      detail: error instanceof JSONgenEvidenceError ? error.message : 'Input rejected at the independent consumer boundary',
+      reason: error instanceof JSONgenEvidenceError || error instanceof JSONgenControlError ? error.code : 'consumer_boundary_rejected',
+      detail: error instanceof JSONgenEvidenceError || error instanceof JSONgenControlError ? error.message : 'Input rejected at the independent consumer boundary',
+      retry: 'replay_original_event_after_resolving_failure', control_operation: error.attempted || null,
       resources: budget.snapshot() };
   }
 }
 
-const USAGE = `Manual TEST-only independent Prune consumer (read-only; no schedule).
+const USAGE = `Manual TEST-only independent Prune consumer (no automatic execution or schedule).
   --help
   --execute-read-only --event-key-file PATH --output PATH
   --execute-read-only --discover recent|resweep --from UTC --to UTC
     [--limit 1..16] [--cursor-file PATH] [--process] --output PATH
+  --execute-retain --event-key-file PATH [--initialize-control] --output PATH
+  --execute-retain --discover recent|resweep --from UTC --to UTC --process
+    [--limit 1..16] [--cursor-file PATH] [--initialize-control] --output PATH
 Keys contain the full immutable primary key. Cursor files contain next from a
 previous page in the SAME window. Repeated windows and historical resweeps are
 mandatory: accepted_at is insertion time, never a safe commit-order checkpoint.
-No VERIFIED receipt can be created from the currently retained schema-1 proof.`;
+Only complete authenticated original first-publication evidence qualifies.
+Retain mode writes immutable derived bundles/receipts and registers the WHOLE
+event through control CAS. It never selects or generates monthly publications.`;
 
 async function jsonFile(filename) {
   const stat = await fs.stat(filename);
@@ -64,7 +85,7 @@ async function jsonFile(filename) {
 }
 export async function runPruneConsumer(argv, { env = process.env } = {}) {
   if (argv.length === 1 && argv[0] === '--help') return { help: USAGE };
-  const options = {}; const flags = new Set(['execute-read-only', 'process']);
+  const options = {}; const flags = new Set(['execute-read-only', 'execute-retain', 'initialize-control', 'process']);
   const values = new Set(['event-key-file', 'discover', 'from', 'to', 'limit', 'cursor-file', 'output']);
   for (let i = 0; i < argv.length; i++) {
     const name = argv[i].slice(2);
@@ -76,8 +97,12 @@ export async function runPruneConsumer(argv, { env = process.env } = {}) {
       options[name] = argv[++i];
     }
   }
-  evidence(options['execute-read-only'] && Boolean(options['event-key-file']) !== Boolean(options.discover),
-    'invalid_consumer_arguments', 'Explicit read-only execution and exactly one event/discovery mode required');
+  evidence(Boolean(options['execute-read-only']) !== Boolean(options['execute-retain'])
+    && Boolean(options['event-key-file']) !== Boolean(options.discover),
+    'invalid_consumer_arguments', 'Exactly one explicit read/retain execution mode and event/discovery mode required');
+  evidence(!options['initialize-control'] || options['execute-retain'], 'invalid_consumer_arguments', 'Control initialization requires retain mode');
+  evidence(!options['execute-retain'] || options['event-key-file'] || options.process,
+    'invalid_consumer_arguments', 'Retain discovery requires explicit event processing');
   evidence(options.output, 'invalid_consumer_arguments', 'Explicit private local result path required');
   evidence(env.UK_AQ_ENV_NAME === 'TEST', 'unapproved_environment', 'TEST environment required');
   if (options['event-key-file']) evidence(!options.process && !options.from && !options.to && !options.limit && !options['cursor-file'],
@@ -89,9 +114,10 @@ export async function runPruneConsumer(argv, { env = process.env } = {}) {
   const after = options['cursor-file'] ? await jsonFile(options['cursor-file']) : null;
   const derivedR2 = key || options.process ? managedR2Config(env) : null;
   const reader = await connectPruneOutboxReader({ env });
+  const execution = { mode: options['execute-retain'] ? 'retain' : 'read-only', initializeControl: Boolean(options['initialize-control']) };
   try {
     let report;
-    if (key) report = await consumePruneAcceptance({ reader, key, derivedR2 });
+    if (key) report = await consumePruneAcceptance({ reader, key, derivedR2, ...execution });
     else {
       const discovery = await reader.discover({ from: options.from, to: options.to, after,
         limit: Number(options.limit || 4), mode: options.discover });
@@ -99,9 +125,10 @@ export async function runPruneConsumer(argv, { env = process.env } = {}) {
       // One page/invocation, serial bounded events, each with its own 60s cap.
       // Never advance a cursor to acknowledge processing or infer precedence.
       if (options.process) for (const event of discovery.events)
-        results.push(await consumePruneAcceptance({ reader, key: event.key, derivedR2 }));
+        results.push(await consumePruneAcceptance({ reader, key: event.key, derivedR2, ...execution }));
       report = { schema_version: 1, kind: 'uk_aq_jsongen_prune_consumer_discovery', discovery, results,
-        state: 'reconciliation_required', handover_complete: false, publication_eligible: false };
+        state: results.length && results.every(r => r.handover_complete) ? 'registered' : 'reconciliation_required',
+        handover_complete: false, discovery_coverage_complete: false, publication_eligible: false };
     }
     if (options.output) {
       const reportBody = `${JSON.stringify(report, null, 2)}\n`;
@@ -129,8 +156,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
       partition_count: report.partitions?.partition_count ?? null,
       missing_authority: report.missing_authority?.map(g => g.code) || [],
       registration: report.registration || 'not_attempted', retry: report.retry || 'overlap_and_resweep',
-      handover_complete: false, publication_eligible: false }));
-    if (!report.help) process.exitCode = 2; // Read success is not a completed handover.
+      handover_complete: report.handover_complete === true, publication_eligible: false }));
+    if (!report.help && report.state !== 'registered') process.exitCode = 2;
   } catch (error) {
     console.error(JSON.stringify({ state: 'reconciliation_required',
       reason: error instanceof JSONgenEvidenceError ? error.code : 'consumer_unavailable',

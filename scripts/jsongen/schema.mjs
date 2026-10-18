@@ -160,10 +160,10 @@ export function affectedMonths(scopes) {
 }
 export function assertReceipt(value) {
   fields(value, ['schema_version', 'kind', 'change_id', 'writer', 'source', 'scopes',
-    'affected_months', 'rolling_aqi', 'bundle', 'verification', 'durability']);
-  header(value, 'verified_change');
+    'affected_months', 'rolling_aqi', 'bundle', 'verification', 'durability'], value.schema_version === 2 ? ['origin'] : []);
+  requireValid([1, 2].includes(value.schema_version) && value.kind === 'uk_aq_jsongen_verified_change', 'receipt schema/kind mismatch');
   requireValid(changeId(value.change_id), 'invalid stable change ID');
-  fields(value.writer, ['identity', 'invocation_id']);
+  fields(value.writer, ['identity', 'invocation_id'], value.schema_version === 2 ? ['attempt_id', 'git_sha'] : []);
   requireValid(text(value.writer.identity) && text(value.writer.invocation_id), 'writer invocation required');
   assertSource(value.source);
   requireValid(Array.isArray(value.scopes) && value.scopes.length > 0, 'complete replacement scopes required');
@@ -183,11 +183,95 @@ export function assertReceipt(value) {
   requireValid(value.bundle.object.key === `${ROOT}/bundles/${value.bundle.object.sha256}.ndjson.gz`, 'bundle must be immutable');
   fields(value.verification, ['state', 'authority', 'provenance_authority', 'scope_completeness_authority']);
   requireValid(value.verification.state === 'canonical_final_verified', 'provisional changes are ineligible');
-  for (const field of ['authority', 'provenance_authority', 'scope_completeness_authority']) assertReference(value.verification[field]);
+  assertReference(value.verification.authority);
+  if (value.schema_version === 1) for (const field of ['provenance_authority', 'scope_completeness_authority']) assertReference(value.verification[field]);
   fields(value.durability, ['state', 'retained_receipt_authority']);
   requireValid(value.durability.state === 'verified_pending', 'immutable receipt must describe verified pending handoff');
-  assertReference(value.durability.retained_receipt_authority);
+  if (value.schema_version === 1) assertReference(value.durability.retained_receipt_authority);
+  else {
+    assertPruneReceiptOrigin(value);
+    for (const authority of [value.verification.provenance_authority, value.verification.scope_completeness_authority,
+      value.durability.retained_receipt_authority]) requireValid(same(authority, value.origin.authority),
+    'original PostgreSQL authority must not be substituted by an R2 reference');
+  }
   return value;
+}
+
+// Version 2 preserves Stage 1 rows/scopes/bundles. Only original gate/provenance
+// authority is typed PostgreSQL evidence, never a fabricated R2 object or copy.
+export function assertPruneAcceptanceAuthority(a) {
+  fields(a, ['schema_version', 'kind', 'relation', 'key', 'event_id', 'writer_git_sha',
+    'final_evidence_sha256', 'final_evidence_byte_size', 'post_commit_reference_sha256']);
+  fields(a.key, ['environment', 'writer_identity', 'run_id', 'attempt_id', 'day_utc', 'connector_id']);
+  requireValid(a.schema_version === 1 && a.kind === 'uk_aq_jsongen_prune_acceptance_authority'
+    && a.relation === 'uk_aq_ops.prune_jsongen_gate_acceptance_outbox'
+    && a.key.environment === 'TEST' && a.key.writer_identity === 'prune_daily_v3' && a.key.connector_id === 1
+    && uuid(a.key.run_id) && a.key.attempt_id === a.key.run_id && day(a.key.day_utc)
+    && a.event_id === digest(a.key) && /^[a-f0-9]{40}$/.test(a.writer_git_sha)
+    && sha(a.final_evidence_sha256) && id(a.final_evidence_byte_size) && a.final_evidence_byte_size <= 1024 ** 2
+    && sha(a.post_commit_reference_sha256), 'invalid original PostgreSQL acceptance authority');
+  return a;
+}
+export function pruneScopeCoverage(scopes) {
+  return digest([...scopes].sort((a, b) => scopeKey(a).localeCompare(scopeKey(b))));
+}
+export function pruneGroupDigest(origin) {
+  const { partition_index: _index, group_sha256: _hash, ...group } = origin;
+  return digest(group);
+}
+function assertPruneReceiptOrigin(receipt) {
+  const o = receipt.origin;
+  fields(o, ['authority', 'pending_source', 'source_identity', 'source_status', 'global_lock',
+    'coverage_sha256', 'partition_index', 'partitions', 'scope_count', 'row_count', 'group_sha256']);
+  assertPruneAcceptanceAuthority(o.authority); assertReference(o.pending_source, { managed: true, gzip: true });
+  fields(o.source_identity, ['source_content_hash', 'source_content_hash_contract_version', 'source_content_hash_row_count']);
+  requireValid(sha(o.source_identity.source_content_hash) && o.source_identity.source_content_hash_contract_version === 1
+    && o.source_identity.source_content_hash_row_count === o.row_count && id(o.row_count) && o.row_count <= 100000,
+  'invalid original frozen source identity');
+  requireValid(o.source_status?.schema_version === 1 && o.source_status.classification === 'original_source_status_unavailable'
+    && o.source_status.source_status === null && o.source_status.null_meaning === 'no_original_provider_status_asserted',
+  'original AURN provider status must remain explicitly unavailable');
+  fields(o.source_status, ['schema_version', 'classification', 'source_boundary', 'source_status', 'null_meaning']);
+  requireValid(o.source_status.source_boundary === 'uk_aq_phase_b_history_compact_rows_v1.status', 'unrecognized original source-status boundary');
+  fields(o.global_lock, ['logical_identity', 'owner', 'run_id']);
+  requireValid(same(o.global_lock, { logical_identity: 'uk_aq:r2_history:v2:observations_global_operation',
+    owner: 'prune_daily', run_id: o.authority.key.run_id }), 'original global lock identity mismatch');
+  requireValid(receipt.writer.identity === 'prune_daily_v3' && receipt.writer.invocation_id === o.authority.key.run_id
+    && receipt.writer.attempt_id === o.authority.key.attempt_id && receipt.writer.git_sha === o.authority.writer_git_sha
+    && receipt.scopes.length <= 128 && receipt.scopes.every(s => s.identity.connector_id === 1
+      && s.day_utc === o.authority.key.day_utc && s.before.state === 'authoritative_empty' && s.after.state === 'present'),
+  'version-2 receipts require authenticated original AURN first publication');
+  requireValid(id(o.scope_count) && o.scope_count <= 1024 && sha(o.coverage_sha256)
+    && Array.isArray(o.partitions) && o.partitions.length > 0 && o.partitions.length <= 32
+    && integer(o.partition_index) && o.partition_index < o.partitions.length
+    && new Set(o.partitions.map(p => p.change_id)).size === o.partitions.length, 'invalid complete original partition set');
+  for (const p of o.partitions) {
+    fields(p, ['change_id', 'scope_count', 'row_count', 'coverage_sha256', 'bundle_sha256']);
+    requireValid(changeId(p.change_id) && id(p.scope_count) && p.scope_count <= 128
+      && id(p.row_count) && p.row_count <= 100000 && sha(p.coverage_sha256) && sha(p.bundle_sha256), 'invalid original partition identity');
+  }
+  const p = o.partitions[o.partition_index];
+  requireValid(p.change_id === receipt.change_id && p.scope_count === receipt.scopes.length
+    && p.row_count === receipt.bundle.row_count && p.coverage_sha256 === pruneScopeCoverage(receipt.scopes)
+    && p.bundle_sha256 === receipt.bundle.object.sha256
+    && o.partitions.reduce((n, p) => n + p.scope_count, 0) === o.scope_count
+    && o.partitions.reduce((n, p) => n + p.row_count, 0) === o.row_count
+    && o.group_sha256 === pruneGroupDigest(o), 'receipt partition/group coverage mismatch');
+}
+export function assertPruneReceiptGroup(receipts) {
+  requireValid(Array.isArray(receipts) && receipts.length > 0 && receipts.length <= 32, 'complete original event receipts required');
+  receipts.forEach(assertReceipt);
+  const ordered = [...receipts].sort((a, b) => a.origin?.partition_index - b.origin?.partition_index);
+  const origin = ordered[0].origin;
+  requireValid(ordered.every((r, i) => r.schema_version === 2 && r.origin.partition_index === i
+    && r.origin.group_sha256 === origin.group_sha256 && same(r.origin.authority, origin.authority))
+    && ordered.length === origin.partitions.length, 'missing, duplicate or conflicting original event partition');
+  const scopes = ordered.flatMap(r => r.scopes);
+  requireValid(new Set(scopes.map(scopeKey)).size === origin.scope_count && scopes.length === origin.scope_count
+    && pruneScopeCoverage(scopes) === origin.coverage_sha256
+    && ordered.reduce((n, r) => n + r.bundle.row_count, 0) === origin.row_count,
+  'incomplete whole-connector-day registration');
+  return ordered;
 }
 // One NDJSON record per complete UTC-day scope. Validate without normalising,
 // rounding, sorting, deduplicating, filling hours or dropping null row stations.
@@ -307,7 +391,8 @@ export function assertControl(value) {
       && entry.receipt_object.byte_size === canonicalJson(entry.receipt).length, 'receipt evidence mismatch');
     requireValid(eventId === entry.receipt.change_id && instant(entry.registered_at_utc)
       && LIFECYCLE_STATES.includes(entry.state) && entry.state !== 'selected'
-      && entry.ordering_state === 'unresolved' && entry.authentication_state === 'pending_writer_adapter', 'invalid unresolved-scope registered change');
+      && entry.ordering_state === 'unresolved' && entry.authentication_state === (entry.receipt.schema_version === 2
+        ? 'original_prune_event_authenticated' : 'pending_writer_adapter'), 'invalid unresolved-scope registered change');
     requireValid(entry.receipt_object.key === `${ROOT}/receipts/${entry.receipt_object.sha256}.json`, 'immutable receipt reference required');
     for (const m of entry.receipt.affected_months) {
       const k = monthKey(m.identity, m.month_utc);
@@ -315,6 +400,13 @@ export function assertControl(value) {
       expected.get(k).push(eventId);
     }
   }
+  const groups = new Map();
+  for (const entry of Object.values(value.registered_changes)) if (entry.receipt.schema_version === 2) {
+    const id = entry.receipt.origin.authority.event_id;
+    if (!groups.has(id)) groups.set(id, []);
+    groups.get(id).push(entry.receipt);
+  }
+  for (const receipts of groups.values()) assertPruneReceiptGroup(receipts);
   for (const [k, entry] of Object.entries(value.months)) {
     fields(entry, ['identity', 'month_utc', 'desired_change_ids', 'applied_change_ids', 'selected', 'state', 'failure']);
     requireValid(k === monthKey(entry.identity, entry.month_utc), 'month map identity mismatch');

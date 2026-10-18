@@ -1,0 +1,87 @@
+name: Upload non-active v3 observations Version URL
+
+# Only the observations Worker has independently verified inbound authentication.
+# Station-history has no inbound auth: do not expose its Version URLs until Access-protected.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  upload-version:
+    runs-on: ubuntu-latest
+    env:
+      SELECTED_GENERATION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
+      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME || '' }}
+      OBS_WORKER_NAME: ${{ vars.UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME || '' }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Validate identity and isolation
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_R2_CLOUDFLARE_API_TOKEN || '' }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || '' }}
+          UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REPOSITORY_OWNER}:${UKAQ_ENV_NAME}" in
+            TEST-uk-aq:TEST|UK-AQ:LIVE) ;;
+            *) echo "Repository owner and environment identity disagree."; exit 1 ;;
+          esac
+          case "${SELECTED_GENERATION}" in
+            v2|v3) ;;
+            *) echo "Persistent generation is not an accepted v2/v3 authority."; exit 1 ;;
+          esac
+          [[ "${OBS_WORKER_NAME}" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] ||
+            { echo "Invalid stable Worker identity."; exit 1; }
+          [[ "${OBS_WORKER_NAME}" != *-candidate ]] ||
+            { echo "Candidate Worker identities are prohibited."; exit 1; }
+          test -n "${CFLARE_R2_BUCKET}" &&
+            test -n "${CLOUDFLARE_API_TOKEN}" &&
+            test -n "${CLOUDFLARE_ACCOUNT_ID}" &&
+            test -n "${UPSTREAM_SECRET}"
+          echo "Uploading a version only; persistent generation remains ${SELECTED_GENERATION}."
+
+      - name: Install repository dependencies
+        run: npm ci
+
+      - name: Upload authenticated v3 observations version without deploying
+        working-directory: workers/uk_aq_observs_history_r2_api_worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_R2_CLOUDFLARE_API_TOKEN || '' }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || '' }}
+          UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          npm ci
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync } from "node:fs";
+          const original = readFileSync("wrangler.toml", "utf8");
+          const markers = ["__UK_AQ_R2_HISTORY_VERSION__", "__CFLARE_R2_BUCKET__"];
+          for (const marker of markers) {
+            if (original.split(marker).length !== 2) throw new Error("Expected exactly one " + marker);
+          }
+          const config = original.replace(markers[0], "v3")
+            .replace(markers[1], process.env.CFLARE_R2_BUCKET);
+          if (config.includes("__UK_AQ_") || config.includes("__CFLARE_")) {
+            throw new Error("Unresolved Wrangler placeholder");
+          }
+          writeFileSync("wrangler.version-upload.toml", config, { mode: 0o600 });
+          NODE
+          jq -n --arg secret "${UPSTREAM_SECRET}" \
+            '{UK_AQ_EDGE_UPSTREAM_SECRET:$secret}' > "${RUNNER_TEMP}/uk_aq_obs_preview_secrets.json"
+          trap 'rm -f wrangler.version-upload.toml "${RUNNER_TEMP}/uk_aq_obs_preview_secrets.json"' EXIT
+          npx --yes wrangler@4.130.0 versions upload \
+            --config wrangler.version-upload.toml \
+            --name "${OBS_WORKER_NAME}" \
+            --secrets-file "${RUNNER_TEMP}/uk_aq_obs_preview_secrets.json"
+          echo "Non-active observations v3 Version URL uploaded. No public deployment or selector change."
