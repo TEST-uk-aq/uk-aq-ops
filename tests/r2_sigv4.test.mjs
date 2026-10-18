@@ -92,6 +92,18 @@ test("fetchWithTimeout keeps the timeout active while consuming a response body"
   assert.equal(observedBodyAbort, true);
 });
 
+test('fetchWithTimeout propagates caller cancellation through response consumption', async () => {
+  const controller = new AbortController(); const reason = new Error('optional capture cancelled');
+  let bodyAborted = false;
+  const fetch = async (_url, init) => ({ arrayBuffer: () => new Promise((_, reject) => {
+    init.signal.addEventListener('abort', () => { bodyAborted = true; reject(init.signal.reason); }, { once: true });
+    queueMicrotask(() => controller.abort(reason));
+  }) });
+  await assert.rejects(fetchWithTimeout('https://example.invalid/optional-metadata', { signal: controller.signal },
+    1000, fetch, response => response.arrayBuffer()), error => error === reason);
+  assert.equal(bodyAborted, true);
+});
+
 test("r2GetObject retries a retryable response-body transport failure", async () => {
   const restoreSleep = installImmediateSleep();
   const originalFetch = globalThis.fetch;

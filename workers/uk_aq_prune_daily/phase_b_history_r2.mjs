@@ -83,6 +83,7 @@ import {
   readParentManifestForBoundedRecovery,
   runCanonicalDayFinalizer,
   withConnectorDayHistoryLock,
+  observationsGlobalOperationLockContext,
 } from "../shared/uk_aq_r2_history_writer.mjs";
 import { runCanonicalObservationsGlobalFinalizer } from "../shared/uk_aq_r2_observations_global_finalizer.mjs";
 import { validateCanonicalHistoryV2Manifest } from "../shared/uk_aq_r2_history_manifest_validation.mjs";
@@ -4137,8 +4138,11 @@ async function writeFrozenCandidateObservationsToV2({
   admitSnapshot = admitPruneFrozenConnectorSnapshot,
   cleanupFrozenSource = cleanupPhaseBTargetDaySourceTemp,
   uploadPendingSource = uploadPrunePendingSource,
+  readAdmissionObject = r2GetObject,
+  originalAuthorityLockEnv = process.env,
 }) {
   let jsongenPendingSource = null;
+  let jsongenOriginalAuthority = null;
   try {
     resolvePruneHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version });
     const replayStartedAtMs = Date.now();
@@ -4166,12 +4170,30 @@ async function writeFrozenCandidateObservationsToV2({
       throw new Error(`Frozen source replay row count mismatch for day=${candidate.day_utc} connector=${candidate.connector_id}`);
     }
     if (runtime.history_write_version === "v3") {
+      if (runtime.environment === 'TEST' && isPrunePendingSourceConnector(candidate.connector_id)) {
+        jsongenOriginalAuthority = optionalJsongenMetadataCapture(runtime, candidate.connector_id)
+          ?.beginOriginalAuthority({ environment: 'TEST', index_generation: 'v3',
+            canonical_bucket: runtime.r2?.bucket,
+            writer: { identity: 'prune_daily_v3', invocation_id: runtime.run_id,
+              attempt_id: runtime.run_id, git_sha: runtime.writer_git_sha },
+            connector_id: candidate.connector_id, day_utc: candidate.day_utc,
+            source_identity: frozen.sourceIdentity,
+          }, originalAuthorityLockEnv) || null;
+      }
       const admission = await admitSnapshot({
         r2: runtime.r2,
         observationsPrefix: runtime.committed_prefix,
         dayUtc: candidate.day_utc,
         connectorId: candidate.connector_id,
         rows,
+        ...(jsongenOriginalAuthority ? {
+          getObject: async args => {
+            const object = await readAdmissionObject(args);
+            if (object?.body != null) jsongenOriginalAuthority.recordBeforeObject({ key: args.key, body: object.body });
+            return object;
+          },
+          onOriginalAuthority: value => jsongenOriginalAuthority.recordBeforeAdmission(value),
+        } : {}),
       });
       logPhaseB(runtime, "INFO", "phase_b_history_v3_frozen_source_admitted", {
         day_utc: candidate.day_utc,
@@ -4207,6 +4229,7 @@ async function writeFrozenCandidateObservationsToV2({
           reason: "insufficient_headroom",
         });
       } else {
+        const optionalDeadlineAtMs = Date.now() + PRUNE_SIGNED_UPLOAD_DEADLINE_MS;
         try {
           if (runtime.jsongen_pending_source.config_error) {
             const error = new Error("Prune signer configuration unavailable");
@@ -4228,6 +4251,14 @@ async function writeFrozenCandidateObservationsToV2({
             source_preparation_sha256: jsongenPendingSource.preparation_sha256,
             original_source_status_provenance: jsongenPendingSource.pending_evidence?.original_source_status?.classification,
             eligibility: "unverified",
+          });
+          // The remaining ORIGINAL optional 15-second episode, never a new
+          // reserve or a network operation in the later protected gate tx.
+          // Core binding publication uses the same global operation lock.
+          await jsongenOriginalAuthority?.captureBindings({
+            physicalScopes: jsongenPendingSource.pending_evidence?.scope?.physical_timeseries_days,
+            r2: runtime.r2, deadlineAtMs: optionalDeadlineAtMs,
+            admitRequest: () => hasBudgetFor(runtime, requiredMs - PRUNE_SIGNED_UPLOAD_DEADLINE_MS),
           });
         } catch (error) {
           const hasIntent = Boolean(error.intent_id && error.reference);
@@ -4259,6 +4290,12 @@ async function writeFrozenCandidateObservationsToV2({
         delivery_state: 'not_attempted', ready_for_independent_authentication: false,
       });
     }
+    if (jsongenOriginalAuthority) {
+      logJsongenPhaseB(runtime, 'INFO', 'phase_b_jsongen_prepublication_authority', {
+        run_id: runtime.run_id, day_utc: candidate.day_utc, connector_id: candidate.connector_id,
+        ...jsongenOriginalAuthority.diagnostics(), authority_state: 'unverified',
+      });
+    }
     assertBudget(runtime, "observation_connector_publication", {
       day_utc: candidate.day_utc, connector_id: candidate.connector_id,
       replayed_row_count: rows.length,
@@ -4283,6 +4320,7 @@ async function writeFrozenCandidateObservationsToV2({
       ...(emitV3Diagnostics ? { jsongen_pending_source: jsongenPendingSource } : {}),
       observation_history_writer_generation: runtime.history_write_version,
       observation_history_index_generation: runtime.history_write_version,
+      ...(jsongenOriginalAuthority ? { jsongen_original_authority: jsongenOriginalAuthority } : {}),
     };
   } catch (error) {
     if (jsongenPendingSource && isPrunePendingSourceConnector(candidate.connector_id)) {
@@ -4516,9 +4554,11 @@ async function finalizePublishedPhaseBConnectors({
               connectorId: candidate.connector_id, writerGitSha: runtime.writer_git_sha,
               sourceIdentity: exportResult.source_identity,
               originalMetadataSnapshot,
+              originalAuthorityCapture: exportResult.jsongen_original_authority,
             });
             const retainedMetadata = published.jsongen_final_evidence_preparation.envelope
               .original_metadata_snapshot;
+            const originalAuthority = published.jsongen_final_evidence_preparation.envelope.original_authority_extension;
             logJsongenPhaseB(runtime, 'INFO', 'phase_b_jsongen_original_final_evidence_prepared', {
               day_utc: candidate.day_utc, connector_id: candidate.connector_id,
               preparation_sha256: published.jsongen_final_evidence_preparation.sha256,
@@ -4530,12 +4570,20 @@ async function finalizePublishedPhaseBConnectors({
               metadata_required_keys_preview: retainedMetadata.required_keys_preview || [],
               complete_envelope_byte_size: retainedMetadata.complete_envelope_byte_size || null,
               preparation_byte_size: published.jsongen_final_evidence_preparation.byte_size,
+              original_authority_completeness: originalAuthority?.completeness || 'unavailable',
+              before_membership_state: originalAuthority?.before?.state || 'unavailable',
+              before_membership_reason: originalAuthority?.before?.reason || null,
+              authoritative_previous_absence: originalAuthority?.before?.state === 'captured'
+                && originalAuthority.before.admission === 'first_publication',
+              binding_authority_state: originalAuthority?.binding?.state || 'unavailable',
+              binding_authority_reason: originalAuthority?.binding?.reason || null,
+              independent_consumer_authentication: 'outstanding',
             });
           } catch (error) {
             logJsongenPhaseB(runtime, 'WARNING', 'phase_b_jsongen_original_final_evidence_unavailable', {
               day_utc: candidate.day_utc, connector_id: candidate.connector_id,
-              reason: error?.message === 'JSONgen final preparation exceeds bounded metadata size'
-                ? 'metadata_payload_exceeds_1mib' : 'incomplete_original_evidence_preparation',
+              reason: error?.original_authority_code || (error?.message === 'JSONgen final preparation exceeds bounded metadata size'
+                ? 'metadata_payload_exceeds_1mib' : 'incomplete_original_evidence_preparation'),
             });
           }
         }
@@ -4606,6 +4654,9 @@ async function finalizePublishedPhaseBConnectors({
               outbox_state: published.jsongen_outbox.outbox_state,
               final_evidence_state: outbox.evidence?.final_evidence_state || 'not_captured',
               metadata_completeness: published.jsongen_metadata_completeness,
+              original_authority_completeness: published.jsongen_final_evidence_preparation?.envelope
+                ?.original_authority_extension?.completeness || 'unavailable',
+              independent_consumer_authentication: 'outstanding',
               notification_state: handover?.state || 'not_prepared',
               notification_sha256: handover?.sha256 || null,
               acceptance_reference: handover?.message?.acceptance || null,
@@ -7029,12 +7080,20 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
   };
 }
 
+// Reuse the UUID of the existing supervised operation. Old/non-UUID or absent
+// contexts keep canonical behaviour but cannot qualify optional original proof.
+export function resolvePrunePhaseBRunId(env = process.env) {
+  const context = observationsGlobalOperationLockContext({ env, expectedOwner: 'prune_daily' });
+  return context.valid && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(context.run_id)
+    ? context.run_id : randomUUID();
+}
+
 export async function runPhaseBBackup({
   dryRun,
   phaseB,
   ingestRetentionDays = DEFAULT_INGESTDB_RETENTION_DAYS,
   logStructured,
-  runId = randomUUID(),
+  runId = resolvePrunePhaseBRunId(),
   nowUtc = nowIso(),
   nowMs = Date.now,
   createPgClient = (config) => new Client(config),

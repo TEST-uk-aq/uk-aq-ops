@@ -10,6 +10,7 @@ import { BUCKET } from '../scripts/jsongen/schema.mjs';
 import { preparePrunePendingSource } from '../scripts/jsongen/prune-pending-source.mjs';
 import { uploadPrunePendingSource } from '../scripts/jsongen/prune-signed-upload.mjs';
 import { preparePruneOriginalFinalEvidence } from '../scripts/jsongen/prune-final-evidence.mjs';
+import { decodePruneMetadataEvidence } from '../scripts/jsongen/prune-metadata-codec.mjs';
 import { describePruneGateOutboxEvidence, preparePrunePostCommitHandover } from '../scripts/jsongen/prune-outbox.mjs';
 import { createPruneOriginalMetadataCapture, preparePruneOriginalMetadataSnapshot } from '../scripts/jsongen/prune-original-metadata.mjs';
 import { canonicalJson } from '../scripts/jsongen/schema.mjs';
@@ -294,7 +295,7 @@ test('pre-commit final preparation and outbox description retain only unverified
     assert.equal(evidence.pending_disposition, 'put_acknowledged_unverified');
     assert.equal(evidence.original_source_status_provenance, 'original_source_status_unavailable');
     assert.equal(evidence.connector_manifest_byte_sha256, metadata.entries[0].reference.sha256);
-    assert.equal(finalPreparation.envelope.original_metadata_snapshot.objects.length, 6);
+    assert.equal(decodePruneMetadataEvidence(finalPreparation.envelope).original_metadata_snapshot.objects.length, 6);
     assert.deepEqual(finalPreparation.envelope.pending.source_evidence.scope,
       prepared.evidence.scope);
     const acceptance = { event_schema_version: 1, environment: 'TEST', writer_identity: 'prune_daily_v3',
@@ -330,7 +331,7 @@ test('pre-commit final preparation and outbox description retain only unverified
           ? { ...object, bytes_base64: 'a'.repeat(1024 * 1024) } : object) },
     });
     assert.equal(overLimit.envelope.original_metadata_snapshot.completeness, 'not_captured');
-    assert.equal(overLimit.envelope.original_metadata_snapshot.reason, 'metadata_payload_exceeds_1mib');
+    assert.equal(overLimit.envelope.original_metadata_snapshot.reason, 'contradictory_original_metadata_encoding');
     assert.equal(describePruneGateOutboxEvidence({ pending, connector,
       finalPreparation: overLimit }).final_evidence_state, 'not_captured');
     assert.throws(() => preparePruneOriginalFinalEvidence({
