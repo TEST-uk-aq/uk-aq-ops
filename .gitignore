@@ -24,3 +24,4 @@ beta_sync_to_live.sh
 venv/
 ./venv
 .superpowers/
+workers/uk_aq_jsongen_signer/wrangler.deploy.toml
