@@ -6,6 +6,7 @@ import { createBudget, evidence, freeze, parseJson } from './limits.mjs';
 import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
 import { decodePruneMetadataEvidence } from './prune-metadata-codec.mjs';
 import { authenticatePruneOriginalAuthority, prunePhysicalKey } from './prune-original-authority.mjs';
+import { physicalScopeDigest } from './scope-authority.mjs';
 import { validateR2HistoryV2ObservationsAggregateManifest, serializeR2HistoryV2ObservationsAggregateManifest }
   from '../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs';
 import { validateCanonicalHistoryV2Manifest } from '../../workers/shared/uk_aq_r2_history_manifest_validation.mjs';
@@ -277,7 +278,9 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
   const original = authenticatePruneOriginalAuthority({ envelope: e, row, source: unsigned, budget });
   const bucket = root.bucket;
   const pin = r => ({ bucket: r.bucket || bucket, key: r.key, sha256: r.sha256, byte_size: r.byte_size });
-  const sources = {}; const scopes = {};
+  const sources = {}; const scopes = {}; const scopeAuthorities = {};
+  const originalBindings = new Map(e.original_authority_extension.binding.bindings.map(b =>
+    [prunePhysicalKey({ identity: b.identity, day_utc: row.day_utc }), b.authority]));
   for (const partition of unsigned.scope.pollutant_partitions) {
     const child = c.pollutant_manifests.find(p => p.pollutant_code === partition.pollutant_code);
     const index = pin(c.scoped_roots.find(p => p.scope.pollutant_code === partition.pollutant_code).reference);
@@ -289,6 +292,13 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
       const identity = { connector_id: 1, timeseries_id: s.timeseries_id, station_id: s.station_id, pollutant_code: s.pollutant_code };
       scopes[prunePhysicalKey(s)] = { identity, day_utc: row.day_utc, before: original.beforeScopes[prunePhysicalKey(s)],
         after: { state: 'present', row_count: s.row_count, authority: pin(child.manifest) } };
+      const indexValue = metadata.objects.get(index.key).value;
+      const tuple = indexValue.leaves_by_timeseries_id[String(s.timeseries_id)];
+      const leaf = metadata.objects.get(tuple[0]);
+      scopeAuthorities[prunePhysicalKey(s)] = {
+        scope_key: prunePhysicalKey(s), physical_sha256: physicalScopeDigest(scopes[prunePhysicalKey(s)], leaf.value),
+        leaf: pin(leaf), index, binding: originalBindings.get(prunePhysicalKey(s)),
+        effective_status: 'original_schema3_embedded_status_bound' };
     }
   }
   const authority = { schema_version: 1, kind: 'uk_aq_jsongen_prune_acceptance_authority',
@@ -305,7 +315,7 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
     current_canonical_authority: 'not_inspected', publication_eligible: false });
   // Keep actual rows out of public machine-readable results and log summaries.
   const token = Object.freeze({ event_id: result.event_id });
-  authenticated.set(token, freeze({ result, pending, authority, sources, scopes, writer: e.writer,
+  authenticated.set(token, freeze({ result, pending, authority, sources, scopes, scopeAuthorities, writer: e.writer,
     original_source_status: unsigned.original_source_status, source_identity: unsigned.source_identity,
     original_global_lock: original.lock, original_evidence_sha256: row.final_evidence_sha256,
     post_commit_reference_sha256: acceptance.post_commit_reference.sha256 }));

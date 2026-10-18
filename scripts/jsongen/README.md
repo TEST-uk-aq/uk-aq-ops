@@ -1,12 +1,21 @@
 # Managed JSONgen foundations and pending Prune source
 
+The manual read-only [Stage 3C currentness/coverage assessment](currentness-coverage-handover.md)
+extends the existing reconciler with shared selected-v3 metadata inspection pages,
+physical-scope comparison, schema-2 diagnostic reports and explicit original-event,
+receipt/registration and missing writer-inventory coverage. Matching metadata
+does not establish complete writer coverage or enable publication. The explicit
+manual interface is `scripts/jsongen/reconcile-cli.mjs`; it has not been run
+against operational TEST services. No schedule, generator or selector is enabled.
+
 The manual-only [independent Prune consumer](prune-consumer-handover.md) implements
 Stage 3B for original TEST/AURN first publication: private outbox discovery/replay,
 compressed original before/binding/final-authority authentication, strict version-2
 VERIFIED receipts, immutable bundle/receipt retention and whole-event atomic
 control registration with deterministic crash recovery. Read-only diagnostics
 remain separate from explicit `--execute-retain`. This authenticates original
-Prune changes; currentness, supersession and monthly publication remain unresolved.
+Prune changes; Stage 3C separately assesses current metadata and coverage gaps.
+Monthly publication remains blocked.
 No schedule or publication is activated. Run
 `node scripts/jsongen/prune-consumer.mjs --help` for the explicit CLI.
 
