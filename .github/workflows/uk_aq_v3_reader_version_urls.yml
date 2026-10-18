@@ -118,7 +118,7 @@ jobs:
           NODE
           jq -n --arg secret "${UPSTREAM_SECRET}"             '{UK_AQ_EDGE_UPSTREAM_SECRET:$secret}' > "${RUNNER_TEMP}/uk_aq_obs_preview_secrets.json"
           trap 'rm -f wrangler.version-upload.toml "${RUNNER_TEMP}/uk_aq_obs_preview_secrets.json"' EXIT
-          npx --yes wrangler$4.130.0 versions upload             --config wrangler.version-upload.toml             --name "${OBS_WORKER_NAME}"             --secrets-file "${RUNNER_TEMP}/uk_aq_obs_preview_secrets.json"
+          npx --yes wrangler@4.130.0 versions upload             --config wrangler.version-upload.toml             --name "${OBS_WORKER_NAME}"             --secrets-file "${RUNNER_TEMP}/uk_aq_obs_preview_secrets.json"
           echo "Observations v3 version uploaded; active deployment and GitHub selector unchanged."
 
       - name: Upload station-history v3 version without deployment
@@ -133,6 +133,6 @@ jobs:
           test -n "${CLOUDFLARE_API_TOKEN}" && test -n "${CLOUDFLARE_ACCOUNT_ID}"
           jq -n             --arg generation "v3"             --arg observationsUrl "${OBSERVATIONS_VERSION_URL}"             '{UK_AQ_R2_HISTORY_VERSION:$generation, UK_AQ_OBSERVS_HISTORY_R2_API_URL:$observationsUrl}'             > "${RUNNER_TEMP}/uk_aq_station_preview_secrets.json"
           trap 'rm -f "${RUNNER_TEMP}/uk_aq_station_preview_secrets.json"' EXIT
-          npx --yes wrangler$4.130.0 versions upload             --config wrangler.toml             --name "${STATION_WORKER_NAME}"             --secrets-file "${RUNNER_TEMP}/uk_aq_station_preview_secrets.json"
+          npx --yes wrangler@4.130.0 versions upload             --config wrangler.toml             --name "${STATION_WORKER_NAME}"             --secrets-file "${RUNNER_TEMP}/uk_aq_station_preview_secrets.json"
           echo "Station v3 version uploaded, pointing only to the supplied observation v3 Version URL."
           echo "No cache version/Service Binding has been retargeted and no production deployment occurred."
