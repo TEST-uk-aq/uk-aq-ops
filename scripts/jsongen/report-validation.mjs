@@ -4,7 +4,7 @@ import { validateObservationContentHashMetadata } from '../../workers/shared/uk_
 import { DAQI_PM_ROLLING24H_WINDOW_HOURS, DAQI_PM_ROLLING24H_REQUIRED_HOURS } from '../../lib/aqi/aqi_levels.mjs';
 import { getObservationHistoryGeneration } from '../../workers/shared/uk_aq_observation_history_generation.mjs';
 import { ROOT, BUCKET, ALGORITHM, assertIdentity, assertReference, assertScope,
-  assertSource, affectedMonths, monthKey, same, scopeKey } from './schema.mjs';
+  assertSource, assertPruneAcceptanceAuthority, affectedMonths, monthKey, same, scopeKey } from './schema.mjs';
 import { LIMITS, evidence } from './limits.mjs';
 import { assertControlSnapshot, controlSnapshot } from './control-snapshot.mjs';
 
@@ -125,17 +125,25 @@ export function assertReconciliationReport(report, { controlRead = null } = {}) 
     'invalid_report', 'partial or invented bundle authentication evidence');
     if (change.bundle_integrity !== undefined) {
       keys(change.authentication, ['state', 'authenticated', 'writer', 'change_id', 'receipt',
-        'bundle', 'declared_final_publication', 'missing_proof', 'inspected_seam', 'action']);
+        'bundle', 'declared_final_publication', 'missing_proof', 'inspected_seam', 'action'], ['original_acceptance']);
       keys(change.authentication.writer, ['identity', 'invocation_id']);
       assertReference(change.authentication.bundle, { managed: true, gzip: true });
       canonicalReference(change.authentication.declared_final_publication);
+      const originalOnly = change.authentication.authenticated === true
+        && change.authentication.state === 'original_prune_event_authenticated'
+        && change.authentication.writer.identity === 'prune_daily_v3';
+      if (originalOnly) {
+        assertPruneAcceptanceAuthority(change.authentication.original_acceptance);
+        evidence(change.authentication.original_acceptance.key.run_id === change.authentication.writer.invocation_id,
+          'invalid_report', 'Original receipt authentication has contradictory writer invocation');
+      }
       evidence(change.bundle_integrity === 'verified' && object(change.authentication)
-        && change.authentication.authenticated === false
-        && change.authentication.state === 'reconciliation_required'
+        && (originalOnly || (change.authentication.authenticated === false
+          && change.authentication.state === 'reconciliation_required'))
         && change.authentication.change_id === change.change_id
         && same(change.authentication.receipt, change.receipt)
         && Array.isArray(change.authentication.missing_proof)
-        && change.authentication.missing_proof.length > 0
+        && (originalOnly ? change.authentication.missing_proof.length === 0 : change.authentication.missing_proof.length > 0)
         && change.authentication.missing_proof.length <= 16
         && change.authentication.missing_proof.every(x => typeof x === 'string' && x.length > 0 && x.length <= 128)
         && typeof change.authentication.writer.identity === 'string'
