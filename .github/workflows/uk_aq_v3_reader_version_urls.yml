@@ -1,0 +1,138 @@
+name: Upload non-active v3 reader Version URL
+
+on:
+  workflow_dispatch:
+    inputs:
+      role:
+        description: "Which existing stable Worker receives a NON-ACTIVE v3 version?"
+        required: true
+        type: choice
+        options:
+          - observations
+          - station
+      observations_version_url:
+        description: "Required for station: exact authenticated observations Version URL from previous run"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  upload-version:
+    runs-on: ubuntu-latest
+    env:
+      OPERATOR_ROLE: ${{ inputs.role }}
+      OBSERVATIONS_VERSION_URL: ${{ inputs.observations_version_url || '' }}
+      SELECTED_GENERATION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
+      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME || '' }}
+      OBS_WORKER_NAME: ${{ vars.UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME || '' }}
+      STATION_WORKER_NAME: ${{ vars.UK_AQ_STATION_HISTORY_WORKER_NAME || '' }}
+      STABLE_OBSERVATIONS_URL: ${{ vars.UK_AQ_OBSERVS_HISTORY_R2_API_URL || '' }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout$v4
+
+      - name: Set up Node
+        uses: actions/setup-node$v4
+        with:
+          node-version: "22"
+
+      - name: Verify identity and version-only scope
+        run: |
+          set -euo pipefail
+          case "${GITHUB_REPOSITORY_OWNER}:${UKAQ_ENV_NAME}" in
+            TEST-uk-aq:TEST|UK-AQ:LIVE) ;;
+            *) echo "Repository owner and environment identity disagree."; exit 1 ;;
+          esac
+          case "${SELECTED_GENERATION}" in
+            v2|v3) ;;
+            *) echo "Persistent generation is not an accepted v2/v3 authority."; exit 1 ;;
+          esac
+          for worker in "${OBS_WORKER_NAME}" "${STATION_WORKER_NAME}"; do
+            [[ "${worker}" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || { echo "Invalid stable Worker name."; exit 1; }
+            [[ "${worker}" != *-v3-candidate ]] || { echo "Candidate Worker identity is prohibited."; exit 1; }
+          done
+          case "${OPERATOR_ROLE}" in
+            observations)
+              test -z "${OBSERVATIONS_VERSION_URL}" || { echo "Do not supply station-only Version URL for observations."; exit 1; }
+              ;;
+            station)
+              test -n "${OBSERVATIONS_VERSION_URL}" || { echo "Missing observations Version URL."; exit 1; }
+              node --input-type=module <<'NODE'
+          const stable = new URL(process.env.STABLE_OBSERVATIONS_URL || "");
+          const target = new URL(process.env.OBSERVATIONS_VERSION_URL || "");
+          const name = process.env.OBS_WORKER_NAME;
+          const prefix = name + ".";
+          if (stable.protocol !== "https:" || stable.username || stable.password ||
+              stable.port || stable.pathname !== "/" || stable.search || stable.hash ||
+              !stable.hostname.startsWith(prefix) || !stable.hostname.endsWith(".workers.dev")) {
+            throw new Error("Existing stable observations URL is not a clean authenticated workers.dev origin");
+          }
+          const subdomain = stable.hostname.slice(prefix.length);
+          const suffix = "-" + name + "." + subdomain;
+          const versionPrefix = target.hostname.endsWith(suffix)
+            ? target.hostname.slice(0, -suffix.length) : "";
+          if (target.protocol !== "https:" || target.username || target.password ||
+              target.port || target.pathname !== "/" || target.search || target.hash ||
+              !/^[a-z0-9-]{1,80}$/.test(versionPrefix)) {
+            throw new Error("Version URL is not for this environment's stable observations Worker");
+          }
+          NODE
+              ;;
+            *) exit 1 ;;
+          esac
+          echo "Version-only upload; persistent selector remains ${SELECTED_GENERATION}. No deployment or route update."
+
+      - name: Install repository dependencies
+        run: npm ci
+
+      - name: Upload observations v3 version without deployment
+        if: ${{ inputs.role == 'observations' }}
+        working-directory: workers/uk_aq_observs_history_r2_api_worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_R2_CLOUDFLARE_API_TOKEN || '' }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || '' }}
+          UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "${CLOUDFLARE_API_TOKEN}" && test -n "${CLOUDFLARE_ACCOUNT_ID}" &&
+            test -n "${CFLARE_R2_BUCKET}" && test -n "${UPSTREAM_SECRET}"
+          npm ci
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync } from "node:fs";
+          const original = readFileSync("wrangler.toml", "utf8");
+          const markers = ["__UK_AQ_R2_HISTORY_VERSION__", "__CFLARE_R2_BUCKET__"];
+          for (const marker of markers) {
+            if (original.split(marker).length !== 2) throw new Error("Expected exactly one " + marker);
+          }
+          const config = original.replace(markers[0], "v3")
+            .replace(markers[1], process.env.CFLARE_R2_BUCKET);
+          if (config.includes("__UK_AQ_") || config.includes("__CFLARE_")) {
+            throw new Error("Unresolved Wrangler placeholder");
+          }
+          writeFileSync("wrangler.version-upload.toml", config, { mode: 0o600 });
+          NODE
+          jq -n --arg secret "${UPSTREAM_SECRET}"             '{UK_AQ_EDGE_UPSTREAM_SECRET:$secret}' > "${RUNNER_TEMP}/uk_aq_obs_preview_secrets.json"
+          trap 'rm -f wrangler.version-upload.toml "${RUNNER_TEMP}/uk_aq_obs_preview_secrets.json"' EXIT
+          npx --yes wrangler$4.130.0 versions upload             --config wrangler.version-upload.toml             --name "${OBS_WORKER_NAME}"             --secrets-file "${RUNNER_TEMP}/uk_aq_obs_preview_secrets.json"
+          echo "Observations v3 version uploaded; active deployment and GitHub selector unchanged."
+
+      - name: Upload station-history v3 version without deployment
+        if: ${{ inputs.role == 'station' }}
+        working-directory: workers/uk_aq_station_history
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || secrets.UK_AQ_CACHE_CLOUDFLARE_API_TOKEN || '' }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || vars.UK_AQ_CACHE_CLOUDFLARE_ACCOUNT_ID || '' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "${CLOUDFLARE_API_TOKEN}" && test -n "${CLOUDFLARE_ACCOUNT_ID}"
+          jq -n             --arg generation "v3"             --arg observationsUrl "${OBSERVATIONS_VERSION_URL}"             '{UK_AQ_R2_HISTORY_VERSION:$generation, UK_AQ_OBSERVS_HISTORY_R2_API_URL:$observationsUrl}'             > "${RUNNER_TEMP}/uk_aq_station_preview_secrets.json"
+          trap 'rm -f "${RUNNER_TEMP}/uk_aq_station_preview_secrets.json"' EXIT
+          npx --yes wrangler$4.130.0 versions upload             --config wrangler.toml             --name "${STATION_WORKER_NAME}"             --secrets-file "${RUNNER_TEMP}/uk_aq_station_preview_secrets.json"
+          echo "Station v3 version uploaded, pointing only to the supplied observation v3 Version URL."
+          echo "No cache version/Service Binding has been retargeted and no production deployment occurred."
