@@ -1,211 +1,247 @@
-# Stage 3C current canonical metadata and writer coverage
+# Stage 3C currentness, coverage and capacity handover
 
-Implementation handover, 18 October 2026. TEST code only. The authoritative
-[verification boundary](https://github.com/TEST-uk-aq/uk-aq-system-docs/blob/main/system_docs/station_charts/jsongen_prune_verification_handover_quick_reference.md)
-and its current contracts remain authoritative. No `system_docs` were edited.
+TEST code only, 18 October 2026, existing PR #114. The authoritative
+[Prune verification boundary](https://github.com/TEST-uk-aq/uk-aq-system-docs/blob/main/system_docs/station_charts/jsongen_prune_verification_handover_quick_reference.md)
+and its current linked contracts still govern. No authoritative system docs were
+edited. This hardens reviewed commit `b54196aa`; it does not activate a publisher.
 
-## Implemented boundary and reuse
+## Problems found and inspection strategy
 
-`reconcileManagedInputs()` now emits reconciliation schema 2, with a `stage3c`
-assessment. It reuses the existing selected-generation descriptor, canonical
-manifest hierarchy validators, exact-leaf daily metadata reader, aligned-index
-validators, binding root/range validators, continuity validator and status reader.
-It reuses the independent private PostgreSQL reader, original Prune handover
-authentication, deterministic complete-event receipt group and separate immutable
-derived receipt/bundle readbacks. There is no parallel canonical authority tree.
+The old 256-GET allowance could not inspect 128 ordinary distinct series: exact
+leaves and physical bindings alone require 256 initial GETs and 256 rechecks.
+Shared hierarchy, indexes, Core completion and status metadata add more. The
+existing cache deduplicated GETs, but hierarchy, scoped membership, aligned shard,
+Core root/range and status validation were repeated for many scopes. The detailed
+1,024-scope report also exceeded 4 MiB through repeated physical identities,
+metadata references, receipt/event authority, source-as-of descriptions and
+identical diagnostic prose.
 
-The original event remains historically authentic after metadata drift. The
-immutable receipt is never rewritten, removed or demoted. Original PostgreSQL
-acceptance stays typed database authority; it is not represented as an R2 object.
-Receipt schema 1 and schema 2 and existing complete-scope bundle formats remain
-unchanged. Report schema 1 remains supported with its earlier strict validation;
-its positive-authentication restrictions are not relaxed. Control/CAS schemas,
-registration semantics and the explicit selector blocker remain unchanged.
+The hardened inspector processes **one deterministic selection of at most 128
+whole physical scopes per invocation**, while accounting for the entire declared
+set of up to 1,024. It reuses the existing metadata reader and validators; it does
+not implement a second authority tree. Inspection-local memoization shares
+hierarchy, scoped membership, aligned shard, Core root/range and status validation.
+Per-leaf validation remains in the existing exact reader. All source buffers and
+validation caches end with that inspection; they are never reused as current
+across unrelated invocations.
 
-## Metadata authority and physical comparison
+## Request, memory and time model
 
-The inspector authenticates the selected **complete-v3** root, year, month, day,
-connector and pollutant path, complete child aliases, exact scoped membership,
-leaf and aligned shard, canonical file identities/counts and physical schema.
-Observation latest/global remains discovery, not an authentication parent.
-404s never prove empty physical membership; only a complete linked parent's
-missing child or authenticated exact/canonical member sets establish absence.
+`createBudget()` retains its legacy 256-GET ceiling. The Stage 3C reconciler/CLI
+uses `createInspectionBudget()` with a **selected-key-derived** allowance:
 
-Selected-v3 bindings require root/range/unit identity, exact physical
-connector/timeseries/station/pollutant and continuity, plus matching Core-owned
-source-state and refresh-state completion fingerprints/root identity. V2 physical
-binding prefixes are rejected; their v2 payload semantics are retained.
+```text
+K = distinct deterministic metadata keys required by the selected scopes
+C = distinct selected connectors (one possible immutable status manifest each)
+initial GET allowance = K + C
+operation metadata GET allowance = 2 * (K + C) + 1
+```
 
-Currentness compares a per-physical-scope digest of the authenticated exact leaf's
-schema/writer/layout, count, interval, files and ordered segments, plus the exact
-physical binding. The digest excludes replaceable parent/aligned-shard references.
-An unrelated root/parent/sibling update cannot alone mark the scope replaced.
-A changed shared physical file remains conservatively changed even if a future
-writer might prove its selected rows unchanged; metadata is not a row rescan.
+The second term reserves every initial identity/missing-object recheck; the final
+one reserves the closing observations-root GET. The fixed profile ceiling is
+`2 * (13 * 128 + 4) + 1 = 3,337`, a conservative structural ceiling for all
+hierarchy/index/leaf/shard/binding/status keys in 128 scopes. It is **lowered to
+that invocation's actual key plan** and never increased for concurrency. Invalid
+unplanned dependencies fail before a GET. Unknown status-manifest keys are bounded
+by their selected connector and immutable SHA-addressed namespace.
 
-Current AURN schema-3 effective P/R/null stays bound to original writer evidence
-and identical selected physical file authority. Missing future overlay latest
-alone does not reject legitimate schema-3 evidence. Its absence is rechecked.
-Stage 3C does **not** accept an overlay transition from a mode string, namespace
-or pointer. A selected AURN overlay or schema-4 scope remains unresolved: an
-independent connector-specific accepted-transition adapter and original/final
-overlay writer evidence are still missing. The earlier Stage 2 reader retains
-its existing separately accepted-mode API; Stage 3C does not promote that API's
-caller strings into new transition authority. Original provider status remains
-explicitly unavailable where not retained; no P/R/null value is manufactured.
+The ordinary dense 128-series synthetic fixture uses **541 actual GETs** under a
+543-GET plan: 270 distinct initial keys, their 270 rechecks, and one closing root.
+The two unused requests reserve a possible connector status manifest. A cache hit
+or shared in-flight request is not charged as another GET. Successful, failed,
+missing-object and aborted request starts are counted. Rechecks have no exemption.
+The report records actual initial/recheck key sets and all three request counts.
+It separately records initial, recheck and closing-root body bytes, alongside the
+prior retained-original-metadata counters. Validation reconstructs successful
+inspection byte totals from the exact references and rejects counter mismatches.
 
-## Shared source-as-of boundary and bounds
+Four fixed workers share one operation budget and first-read/in-flight cache.
+Output order and scope partitions are deterministic. A shared abort controller
+uses the **remaining original operation deadline**, not a fresh timeout per page.
+Capacity exhaustion, request timeout or observed metadata drift aborts the shared
+inspection. Bounded GETs receive that signal; workers settle before evidence is
+returned, byte reservations are released, and a closed session rejects late cache
+or evidence writes, including adapters that ignore cancellation.
 
-`readCanonicalScopePages()` partitions whole physical scopes at the existing
-128-scope inspector cap, accounting for up to 1,024 scopes across the operation.
-All pages use one first-read cache and one final recheck of every observed object,
-including binding completion and status authority. Observed 404s are separately
-rechecked; the root is checked again after the final recheck. No canonical lock
-is acquired, and canonical writer ordering is unchanged.
+Unchanged bounds include 60 seconds for the operation, 64 MiB cumulative data,
+200,000 rows, 32 receipt references, 128 scopes per receipt/bundle, 8 MiB per
+metadata object and 4 MiB per serialized report. The shared **raw metadata cache**
+is separately capped at 8 MiB. Concurrent requests reserve available bytes before
+starting and charge returned bodies once. Report encoding/expansion is bounded by
+4 MiB wire/32 MiB expanded bytes; artifact admission also checks data counters plus
+expanded and wire serialization against the 64 MiB envelope and the shared deadline.
+These are byte/object/row safeguards, not a measurement of peak JavaScript heap or
+real R2 latency. Interrupted transport bytes are not supplied by the existing GET
+adapter; the attempted request remains accounted and the inspection is incomplete.
 
-The schema-2 inspection records the selected generation, all exact metadata
-references, unavailable metadata keys, physical scope keys, a deterministic
-SHA-256 of that boundary, start/end times and explicit consistency limitations.
-Drift, disappearing/appearing metadata or exhaustion during recheck invalidates
-the entire shared boundary and requires a fresh inspection. Report validation
-rejects contradictory scope references, boundary digests or positive coverage.
+## Scope accounting and source-as-of consistency
 
-Identical endpoint reads are **bounded observational evidence**, not a transaction
-or proof that no intervening/ABA writer ran. No complete writer-owned freshness
-fence exists here. Absolute latest-canonical freshness is never claimed.
+`selection` contains the complete sorted scope set, its hash, every exact partition
+membership/hash, total scope/partition counts and the selected partition index.
+Original connector-day registration and receipt groups remain complete and
+separate. For an event of 1,024 scopes, default selections are indices `0..7`.
+One invocation can establish current metadata for 128, with the other **896
+explicitly uninspected**. It never trims original receipts or bundles.
 
-The existing whole-operation 256 metadata GET, 64 MiB byte, 200,000 row, 60-second,
-32 receipt-reference and 4 MiB report limits remain. Receipt/bundle caps remain
-128 scopes each. A 1,024-scope event is completely accounted, not truncated to
-128; it need not fit a successful currentness inspection under those caps.
-When the GET/deadline/byte budget is exhausted, remaining scopes stay unresolved
-and a successful coherent inspection is forbidden. Oversize reports cannot be
-retained/output. Bounds are protective, not real full-AURN capacity acceptance.
+Every inspected scope authenticates selected complete-v3 root/year/month/day/
+connector/pollutant membership, exact/scoped/aligned physical authority, selected-v3
+binding and matching Core source/refresh completion, plus applicable status.
+Observation latest remains discovery, not an authentication parent. Only complete
+linked membership proves absence; 404s do not prove empty physical scopes.
 
-## Classifications and supersession
+All selected scopes share one first-read cache, exact byte identities and a final
+recheck of **every attempted/observed identity**, including rechecks of missing
+objects and a closing root confirmation. Recheck evidence identifies matched,
+changed, unavailable and not-rechecked objects. A changed, failed or incomplete
+recheck cannot produce `read_consistent=true`. Source-as-of identity covers the
+exact generation, selected physical-scope set, metadata references and unavailable
+metadata keys, with explicit start/end times and ABA/freshness limitations.
 
-`stage3c.scopes[]` separates `original_authentication`, `current_metadata_match`,
-`authenticated_supersession`, `writer_coverage`, `registration_coverage`,
-`source_as_of`, `freshness`, `reconciliation_state` and `publication_eligible`.
-Diagnostics distinguish matching original physical authority, changed metadata
-with unknown later writer, missing original authority and unavailable current
-scope/status/binding. Canonical per-scope diagnostics retain the precise cause.
+Per-scope assessment distinguishes fully inspected, metadata unavailable, resource-
+limited, unselected and incompatible source-as-of evidence, independently from
+original authentication, metadata match/difference, supersession and registration.
+Unselected scopes have no current source-as-of identity and cannot be current.
 
-A genuine later supersession requires independently authenticated writer final
-evidence, a different original event, an exact authenticated before-to-original-
-after authority link, and a final scope matching current metadata. Multiple
-contradictory candidates stay unresolved. Root changes, timestamps, accepted_at,
-control revisions, run order and caller success flags cannot supply that proof.
-The present authentic adapter admits only AURN **first publications**; it cannot
-prove replacement/removal of an earlier present scope. Thus this stage truthfully
-reports those later Integrity/SOS-light/IFW changes as **unproven**, rather than
-claiming a new successful replacement adapter. A structured supersession result
-does not grant any new writer permission or receipt format.
+**A complete coherent 1,024-scope currentness inspection is not implemented.**
+Separate invocations have separate caches, deadlines and source-as-of identities.
+Even eight individually successful passes are not combined as one snapshot.
+Generation labels, close timestamps, common event IDs, identical root key names
+or even matching endpoint root bytes cannot establish a new aggregate boundary.
+Binding/status authority and all relevant dependencies need a trustworthy shared
+boundary too. The selection explicitly says cross-invocation consistency is not
+established. Missing, overlapping, contradictory or foreign-partition authority
+is rejected; no import/merge shortcut is provided. A future complete aggregate
+needs independently authenticated cross-partition authority/fencing. No canonical
+lock is acquired; identical endpoint checks never exclude an intervening ABA writer.
 
-## Coverage accounting and precise missing contracts
+## Lossless report schema 3
 
-Replaying one schema-2 receipt discovers its whole deterministic original event
-group and separately reads every expected immutable receipt/bundle. The report
-lists missing retention, missing registration, authenticated retained-but-
-unregistered receipts, registered original groups, current scopes without matching
-authenticated registered authority and discovered outbox events still awaiting
-confirmed consumption. Missing partitions never turn into invented receipts.
+`reconcileManagedInputs()` returns expanded schema 3. `reconciliationArtifact()`
+and the manual CLI serialize it as schema 3 with `encoding=interned_json_tree_v1`.
+A single immutable JSON object contains a deterministic bottom-up `nodes` table,
+root index, expanded SHA-256 and exact expanded byte size. Nodes are scalar values,
+arrays of backward indices, or objects with sorted field-name/index pairs.
+Repeated metadata references, physical identities, original PostgreSQL acceptance,
+source-as-of objects, diagnostic text and scalar strings are stored once. Every
+meaningful field of the expanded report is preserved. No observation rows or
+credentials enter this diagnostic format.
 
-Optional bounded private discovery remains one page per invocation, with its
-window, continuation and explicit incomplete-coverage/repeat-overlap/resweep state.
-`accepted_at` is insertion time; an exhausted page is not an inventory watermark.
-Registered group completeness proves only that original connector-day handover.
+`decodeCompactReport()` expands the wire representation; `assertReconciliationReport()`
+accepts either representation and applies full semantic validation after expansion.
+It rejects missing/forward/cyclic references, duplicate/unused/reordered nodes,
+wrong hashes/sizes, expansion bombs, missing scopes or partitions, conflicting
+source pins, absent rechecks, resource bypasses, unsupported status authority,
+false writer completeness and publication eligibility. Partition membership and
+request allowances are independently reconstructed from supplied scope identities.
+Only one report file is needed; no external partition files or second mutable
+source of truth are introduced. The 1,024-scope fixture now serializes to
+**2,636,246 bytes** from **5,264,766 expanded bytes**, below 4 MiB without removing
+evidence, including unresolved and uninspected scopes. Its selected 128 scopes
+span two physical ranges and use 545 GETs within a 547-GET plan. These byte/count
+results describe synthetic fixtures only.
 
-All-writer coverage and freshness remain `unknown`, with exact writer seam gaps:
+**Legacy report schemas 1 and 2 retain their existing strict meanings and limits.**
+Their bytes are not silently reinterpreted as the new encoding. Receipt schemas
+1/2, bundle formats, managed control/CAS and original Stage 3B authority are
+unchanged. Existing optional immutable diagnostic retention still uses exact
+SHA-addressed identity, conditional writes and readback; it is not activated here.
 
-- Prune: optional original outbox insertion can fail after valid canonical work;
-  it is AURN-only and provides no complete publication inventory or commit fence.
-  Missing contract: durable writer-owned inventory covering every applicable
-  completed publication, including missing handovers, with an independently
-  authenticated scope/source-as-of completeness and freshness fence.
-- Integrity/SOS-light: independent complete resolved final-source/status/binding,
-  replacement/removal receipt authority and durable complete inventories/fences
-  are missing. SQLite, local journals, raw overlays and logs are not replacements.
-- IFW: accepted canonical repair publication/handover and equivalent durable
-  inventory/fence remain unavailable.
-- Accepted overlay transitions and later binding/status publications require
-  their actual authority and relevant complete inventory; metadata observation
-  alone cannot establish complete receipt coverage for those changes.
+## Preserved authority and publication boundaries
 
-The report explicitly bounds known scope keys and the unknown intervening-
-publication window, including original gate-completion/inspection timestamps
-without promoting them to event order, and leaves outside-selected-scope coverage unassessed.
-No numeric cross-writer sequence or new writer acknowledgement is introduced.
+Prune remains the sole canonical observation verifier. There is no canonical
+Parquet download, observation rescan, new verification/deletion gate, canonical
+writer modification, SQLite/journal/overlay/log reconstruction or fabricated event.
+Original schema-2 receipts are authenticated through the actual immutable private
+PostgreSQL outbox and retained pending gzip; separate immutable receipt/bundle
+readbacks and deterministic whole-event registration semantics remain intact.
+Original receipt history is never rewritten or removed after drift.
 
-## Manual interface and configuration
+Currentness compares exact physical file/segment/schema identity and binding,
+excluding unrelated parent/aligned-shard references. Changed shared files remain
+conservatively changed. AURN schema-3 P/R/null and unavailable raw provider status
+are preserved. A selected overlay/schema-4 or unsupported transition stays
+unresolved; a mode string or namespace cannot supply accepted transition evidence.
+Genuine later supersession requires independently authenticated final writer
+proof and an exact before-to-original-after link. The current first-publication
+AURN adapter cannot prove later replacement/removal of a present scope.
 
-`reconcile-cli.mjs` is an inert-on-import wrapper of the existing reconciler.
-For later separately authorised TEST operation only:
+Known original receipts, retained/unregistered receipts, missing retention,
+missing registration, unmatched current scopes and pending outbox discovery remain
+separate. Optional AURN outbox inserts can miss valid canonical publications.
+Overlapping discovery and historical resweeps remain necessary; accepted_at is
+insertion time, never canonical event order or a completeness watermark. Integrity,
+SOS-light and IFW complete handovers/inventories/fences remain unavailable.
+Writer coverage, all-required-receipt retention/registration and freshness stay
+`unknown`; publication eligibility stays **false** even for 128 matching scopes.
+
+## Manual operation and configuration
+
+For a later separately authorised TEST operation only:
 
 ```sh
 node scripts/jsongen/reconcile-cli.mjs --execute-read-only \
   --scopes-file work/physical-scopes.json \
   --retained-receipts-file work/retained-references.json \
-  --discover resweep --from 2026-10-10T00:00:00.000Z \
-  --to 2026-10-11T00:00:00.000Z --limit 4 \
-  --output work/currentness-report.json
+  --inspection-partition 0 --output work/currentness-partition-0.json
 ```
 
-Scope files contain an array of `{identity:{connector_id,timeseries_id,station_id,
-pollutant_code},day_utc}`. Receipt files contain immutable receipt descriptors.
-Both are optional; all receipts already in the bounded control are inspected.
-Discovery and its cursor are optional and never acknowledge processing. The
-output is atomically written locally mode 0600; logs expose only counts/codes.
-Exit 2 denotes reconciliation required, even when known metadata matches.
+The report itself carries the complete partition manifest; use distinct explicit
+output paths for later partition invocations. Scope files contain an array of
+`{identity:{connector_id,timeseries_id,station_id,pollutant_code},day_utc}`. Receipt
+files contain exact immutable descriptors. Existing control receipts are always
+accounted. Duplicate explicit selections are rejected. Optional `--discover`
+continues bounded overlapping/resweep discovery. The local schema-3 output is
+atomically renamed from a mode-0600 temporary file only after full admission.
+Logs contain counts/codes, not credentials or observations. Exit 2 still means
+reconciliation required. Importing modules does not execute the interface.
 
-Reuse `UK_AQ_ENV_NAME=TEST`, `UK_AQ_R2_HISTORY_VERSION=v3`, existing canonical
-`CFLARE_R2_*`/`R2_*` configuration, `UK_AQ_COMPRESSED_CHART_R2_*`, and optional
-`UK_AQ_JSONGEN_PRUNE_READER_DB_URL`/`SUPABASE_URL`. Use appropriately restricted
-GET-only storage credentials and the existing restricted private reader. No new
-configuration key or credential is introduced. An absent real control blocks;
-the CLI does not initialize/synthesize control or write any remote object.
-The manual interface was **not executed**, including help, during implementation.
+Existing TEST/v3 canonical and derived R2 configuration and the restricted private
+reader URL are reused. No credentials, environment keys, SQL schema or service is
+added. An absent real control blocks rather than initializing it. No automatic
+remote write, retention, dispatch, schedule, generator or chart route is added.
+The manual interface was not executed during implementation.
 
-## Validation, operational acceptance and next section
+## Validation, remaining limits and Stage 3D handover
 
-Targeted offline checks cover authenticated metadata matching, unrelated root/
-aligned-parent changes, unproven later changes, mixed/stale snapshot rejection,
-missing Core completion, appearing status metadata, shared partitions, complete
-1,024-scope/eight-receipt accounting and explicit retention/registration/resource
-gaps. Existing narrowly selected receipt precision/membership, report rejection,
-original-byte retention and original PostgreSQL reauthentication checks remain.
-These use synthetic adapters, not real SQL/R2 or operational acceptance.
+The narrow synthetic checks cover positive 128-series inspection, exact GET/cache/
+recheck accounting, bounded concurrency, timeout/cancellation and late-response
+rejection; complete 1,024-scope accounting and compact roundtrip; missing/overlapping
+partitions and incompatible foreign authority; strict exhaustion, legacy reports,
+original evidence gaps and the unchanged publication blocker. Fixture storage is
+populated directly: no consumer write mode is executed. Syntax and diff checks
+are local. These are structural checks, not operational R2 benchmarks or real
+AURN timing/throughput acceptance.
 
-The final bounded run passed **10 checks**: five Stage 3C checks, one existing
-original PostgreSQL reauthentication check and four existing precision/membership/
-report checks. The 1,024-scope detailed fixture also confirms that the unchanged
-4 MiB report cap rejects oversized output instead of omitting scopes. Example
-local-only checks (not the manual remote inspection interface):
+Final validation passed seven focused currentness/capacity checks and two existing
+receipt precision/membership checks (nine total). Active changed/new modules and
+the check file pass `node --check`; `git diff --check` passes. Exact commands:
 
 ```sh
 node --test --test-isolation=none --test-reporter=tap tests/jsongen_currentness.test.mjs
-node --check scripts/jsongen/reconcile-cli.mjs
-git diff --check
+node --test --test-isolation=none --test-reporter=tap --test-name-pattern='receipt and gzip identities|complete-scope membership' tests/jsongen_stage2.test.mjs
 ```
 
-Syntax and diff checks pass. No broad suite, operational metadata/Parquet read,
-Prune/Integrity/signer run, migration, real control mutation, dispatch, schedule,
-deployment, monthly JSON/AQI output or LIVE operation occurs. Existing dated
-archive snapshots were reused without overwrite. The enabled pending-source
-flag and operator-reported paused Prune schedule remain untouched.
+Remaining practical limits are the same byte/row/time/report caps, original
+metadata capture limits and a maximum 128 scopes inspected in one coherent
+operation. Actual latency, full-source sizes and throughput require separately
+authorised real TEST acceptance. Do not infer 1,024-scope coherent capacity from
+compact report capacity or concatenate separately inspected partitions.
 
-Later authorised TEST acceptance must apply Schema #12/provision the restricted
-reader separately, verify actual TLS/ACL/RLS and GET permissions, and exercise
-real original authentication, read-consistent inspection/drift/replay and bounded
-capacity. The task adds no operational authorization. Rollback is reverting the
-Stage 3C reader/report code; preserve all original receipts, bundles and outbox.
+Exact remaining prerequisites for Stage 3D: restricted Schema #12 reader setup
+and real TLS/ACL/RLS/GET acceptance; integrated original Prune/outbox/consumer
+acceptance; writer-owned complete publication inventory and scope-bound freshness
+fences covering missing handovers; genuine later-writer/overlay authority;
+authenticated full-month baselines and adjacent-month PM context. A larger coherent
+inspection needs a real cross-partition authority boundary. Paired JSON/AQI
+generation/readback and publication CAS/real TEST acceptance remain later gates.
+`selectManagedPublications()` stays disabled; pending-source true and paused
+Prune scheduling are untouched. No migration, operational SQL/R2, Prune/Integrity/
+signer, dispatch, deployment, monthly product, merge or LIVE operation occurred.
 
-Chat-mode system-doc handover: record schema-2 reconciliation and inspection,
-metadata-only scope digest/binding/status checks, source-as-of limitations and
-explicit inventory gaps. No receipt, SQL, environment-catalogue or deployment
-schema changes are required. Monthly publication remains blocked by unsupported
-later-writer/overlay authority, complete inventories/freshness fences, accepted
-full-month baselines, adjacent-month PM context, paired generation/readback and
-publication CAS/real TEST acceptance. Next implement those writer-owned authority
-gaps and authenticated monthly baseline/context prerequisites before paired
-monthly generation/selection. `selectManagedPublications()` remains disabled.
+Chat-mode system-doc handover: record the dedicated key-derived inspection budget,
+128-scope selection with complete-event accounting, four-worker cancellation and
+explicit recheck evidence, and lossless schema-3 reports with strict legacy
+compatibility. Original canonical verification, receipt authority, writer coverage
+and publication conditions are unchanged. Rollback is reverting this reader/report
+hardening; retain original outbox, bundles, receipts and diagnostic evidence. The
+existing 18 October archives were reused and newly touched files archived once.

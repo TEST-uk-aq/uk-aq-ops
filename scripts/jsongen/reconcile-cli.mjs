@@ -3,21 +3,24 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
-import { reconcileManagedInputs } from './reconcile.mjs';
+import { reconcileManagedInputs, reconciliationArtifact } from './reconcile.mjs';
 import { readManagedControl, managedR2Config } from './control.mjs';
 import { connectPruneOutboxReader } from './prune-outbox-reader.mjs';
 import { resolveObservationHistoryGeneration } from '../../workers/shared/uk_aq_observation_history_generation.mjs';
 import { resolveR2HistoryIndexConfig } from '../../workers/shared/uk_aq_r2_history_index.mjs';
 import { hasRequiredR2Config } from '../../workers/shared/r2_sigv4.mjs';
-import { createBudget, evidence, JSONgenEvidenceError } from './limits.mjs';
+import { createInspectionBudget, evidence, JSONgenEvidenceError } from './limits.mjs';
 
 const USAGE = `Manual TEST-only JSONgen Stage 3C reconciliation (read-only).
 --execute-read-only --output PATH [--scopes-file PATH] [--retained-receipts-file PATH]
+  [--inspection-partition 0..7]
   [--discover recent|resweep --from UTC --to UTC --limit 1..16 [--cursor-file PATH]]
 Scope JSON is an array of {identity:{connector_id,timeseries_id,station_id,
 pollutant_code},day_utc}, at most 1,024. Receipts are exact immutable descriptors,
 at most 32 including control and discovered original partitions. Each metadata
-page has at most 128 scopes; all pages share a single bounded source-as-of check.
+invocation inspects one deterministic partition of at most 128 scopes. All other
+scopes stay explicitly uninspected. Separate invocations have separate source-as-of
+boundaries and must not be merged as one complete consistent inspection.
 Uses existing TEST canonical/derived R2 configuration and optional restricted
 private Prune reader. Requires an existing managed control; never initializes it.
 Discovery is one overlapping page, never a completeness watermark. Repeat
@@ -34,7 +37,7 @@ async function jsonFile(filename) {
 
 export async function runReconciliationInspection(argv, { env = process.env } = {}) {
   if (argv.length === 1 && argv[0] === '--help') return { help: USAGE };
-  const options = {}, names = new Set(['output', 'scopes-file', 'retained-receipts-file', 'discover', 'from', 'to', 'limit', 'cursor-file']);
+  const options = {}, names = new Set(['output', 'scopes-file', 'retained-receipts-file', 'discover', 'from', 'to', 'limit', 'cursor-file', 'inspection-partition']);
   for (let i = 0; i < argv.length; i++) {
     const name = argv[i].slice(2);
     evidence(argv[i].startsWith('--') && !Object.hasOwn(options, name), 'invalid_inspection_arguments', 'Unknown or repeated inspection option');
@@ -46,6 +49,8 @@ export async function runReconciliationInspection(argv, { env = process.env } = 
     }
   }
   evidence(options['execute-read-only'] && options.output, 'invalid_inspection_arguments', 'Explicit read-only execution and private local output required');
+  evidence(!options['inspection-partition'] || /^[0-7]$/.test(options['inspection-partition']),
+    'invalid_inspection_arguments', 'Inspection partition must be 0..7');
   evidence(env.UK_AQ_ENV_NAME === 'TEST' && (!env.GITHUB_REPOSITORY || env.GITHUB_REPOSITORY === 'TEST-uk-aq/uk-aq-ops'),
     'unapproved_environment', 'Manual inspection is TEST Ops only');
   evidence(options.discover ? ['recent', 'resweep'].includes(options.discover) && options.from && options.to
@@ -60,7 +65,7 @@ export async function runReconciliationInspection(argv, { env = process.env } = 
     && /^[a-f0-9]{32}\.r2\.cloudflarestorage\.com$/.test(endpoint.hostname)
     && endpoint.pathname === '/' && !endpoint.search && !endpoint.hash && !endpoint.username && !endpoint.password,
   'invalid_canonical_configuration', 'Existing private canonical R2 configuration required');
-  const derivedR2 = managedR2Config(env), budget = createBudget();
+  const derivedR2 = managedR2Config(env), budget = createInspectionBudget();
   const requestedScopes = options['scopes-file'] ? await jsonFile(options['scopes-file']) : [];
   const retainedReceipts = options['retained-receipts-file'] ? await jsonFile(options['retained-receipts-file']) : [];
   const pruneDiscovery = options.discover ? { from: options.from, to: options.to, mode: options.discover,
@@ -73,8 +78,9 @@ export async function runReconciliationInspection(argv, { env = process.env } = 
   try {
     if (env.UK_AQ_JSONGEN_PRUNE_READER_DB_URL) reader = await connectPruneOutboxReader({ env });
     const report = await reconcileManagedInputs({ derivedR2, control: controlRead.control, controlRead,
-      canonical: { r2, generation }, requestedScopes, retainedReceipts, pruneReader: reader, pruneDiscovery, budget });
-    const body = Buffer.from(`${JSON.stringify(report, null, 2)}\n`);
+      canonical: { r2, generation }, requestedScopes, retainedReceipts, pruneReader: reader, pruneDiscovery,
+      inspectionPartition: Number(options['inspection-partition'] || 0), budget });
+    const { body } = reconciliationArtifact(report, budget);
     evidence(body.length <= budget.limits.report_bytes, 'resource_limit', 'Private report exceeds existing output limit');
     await fs.mkdir(path.dirname(options.output), { recursive: true });
     const temporary = `${options.output}.${randomUUID()}.tmp`;

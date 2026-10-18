@@ -37,10 +37,12 @@ export function assessStage3C({ changes, canonical, originalGroups = [], discove
       : supersession.state === 'authenticated' ? 'authenticated_later_supersession'
       : candidates.length > 1 ? 'contradictory_later_writer_authority' : 'physical_metadata_changed_later_writer_unknown';
     return { change_id: change.change_id, scope_key: item.scope_key,
+      ...(canonical?.schema_version === 3 ? { inspection_state: scopeInspectionState(canonical.scopes.find(s => s.scope_key === item.scope_key), canonical) } : {}),
       original_authentication: change.authentication?.authenticated ? 'authenticated' : 'unavailable',
       current_metadata_match: match, authenticated_supersession: supersession,
       writer_coverage: 'unknown', registration_coverage: change.registered ? 'registered_in_inspected_control' : 'missing_registration',
-      source_as_of: canonical?.source_as_of.identity_sha256 || null,
+      source_as_of: canonical?.schema_version === 3 && !canonical.selection.selected_scope_keys.includes(item.scope_key)
+        ? null : canonical?.source_as_of.identity_sha256 || null,
       freshness: 'unknown', reconciliation_state: 'reconciliation_required', publication_eligible: false,
       diagnostic: code };
   }));
@@ -88,4 +90,14 @@ export function assessStage3C({ changes, canonical, originalGroups = [], discove
     source_as_of: canonical?.source_as_of || null,
     freshness: 'unknown', reconciliation_state: 'reconciliation_required', publication_eligible: false,
   };
+}
+
+export function scopeInspectionState(scope, canonical) {
+  if (!scope) return 'not_inspected';
+  if (scope.state === 'not_inspected_partition') return 'not_inspected_partition';
+  if (scope.state === 'not_inspected_resource_limit') return 'not_inspected_resource_limit';
+  if (!canonical.read_consistent) return 'incompatible_source_as_of';
+  return scope.physical && scope.binding && !scope.diagnostics.length
+    && ['embedded_status_requires_writer_evidence', 'not_applicable_to_absent_scope'].includes(scope.verification?.state)
+    ? 'fully_inspected' : 'metadata_unavailable';
 }

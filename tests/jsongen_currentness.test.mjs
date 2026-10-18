@@ -3,7 +3,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { sourceAndOriginalEvent } from './jsongen_prune_consumer_fixture.mjs';
-import { consumePruneAcceptance } from '../scripts/jsongen/prune-consumer.mjs';
+import { authenticatePruneHandover } from '../scripts/jsongen/prune-consumer-authentication.mjs';
+import { buildPruneReceiptGroup, inspectPruneReceiptGroup } from '../scripts/jsongen/prune-receipts.mjs';
+import { prunePartitionArtifacts } from '../scripts/jsongen/prune-consumer-partitions.mjs';
 import { connectPruneOutboxReader } from '../scripts/jsongen/prune-outbox-reader.mjs';
 import { decodePruneMetadataEvidence } from '../scripts/jsongen/prune-metadata-codec.mjs';
 import { reconcileManagedInputs, reconciliationArtifact } from '../scripts/jsongen/reconcile.mjs';
@@ -11,8 +13,9 @@ import { readCanonicalScopePages } from '../scripts/jsongen/authority.mjs';
 import { physicalScopeDigest } from '../scripts/jsongen/scope-authority.mjs';
 import { assertReconciliationReport } from '../scripts/jsongen/report-validation.mjs';
 import { readManagedControl, selectManagedPublications } from '../scripts/jsongen/control.mjs';
-import { canonicalJson } from '../scripts/jsongen/schema.mjs';
-import { createBudget } from '../scripts/jsongen/limits.mjs';
+import { canonicalJson, createControl, assertControl, monthKey, CONTROL_KEY } from '../scripts/jsongen/schema.mjs';
+import { createBudget, createInspectionBudget } from '../scripts/jsongen/limits.mjs';
+import { encodeCompactReport, decodeCompactReport } from '../scripts/jsongen/report-codec.mjs';
 import { getObservationHistoryGeneration } from '../workers/shared/uk_aq_observation_history_generation.mjs';
 import { buildR2HistoryV2ObservationsRootManifest } from '../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs';
 import { buildObservationVerificationLatest, encodeObservationVerificationJson,
@@ -38,8 +41,26 @@ function canonicalFixture(f) {
 
 async function setup(count = 2) {
   const f = await sourceAndOriginalEvent(count), reader = await connectPruneOutboxReader({ env, Client: f.Client });
-  const result = await consumePruneAcceptance({ reader, key: f.key, derivedR2: f.r2, mode: 'retain', initializeControl: true });
-  assert.equal(result.state, 'registered');
+  const handover = await authenticatePruneHandover({ acceptance: await reader.read(f.key), derivedR2: f.r2 });
+  const group = inspectPruneReceiptGroup(buildPruneReceiptGroup({ handover }));
+  const artifacts = prunePartitionArtifacts(group.plan), control = createControl();
+  for (let i = 0; i < group.entries.length; i++) {
+    const e = group.entries[i];
+    // Synthetic storage is populated directly. No consumer retention/write
+    // mode, registration command or remote mutation interface is run.
+    f.objects.set(e.receipt_object.key, canonicalJson(e.receipt));
+    f.objects.set(e.receipt.bundle.object.key, artifacts[i].body);
+    control.registered_changes[e.receipt.change_id] = { ...e, registered_at_utc: '2026-10-10T02:00:00.000Z',
+      state: 'verified_pending', ordering_state: 'unresolved', authentication_state: 'original_prune_event_authenticated' };
+    for (const m of e.receipt.affected_months) {
+      const k = monthKey(m.identity, m.month_utc);
+      control.months[k] ||= { ...m, desired_change_ids: [], applied_change_ids: [], selected: null, state: 'pending', failure: null };
+      control.months[k].desired_change_ids.push(e.receipt.change_id);
+    }
+  }
+  Object.values(control.months).forEach(m => m.desired_change_ids.sort());
+  f.objects.set(CONTROL_KEY, canonicalJson(assertControl(control)));
+  f.r2.adapter.putObjectConditional = async () => { assert.fail('No write-mode interface may run'); };
   const controlRead = await readManagedControl(f.r2), canonical = canonicalFixture(f);
   return { f, reader, canonical, options: { derivedR2: f.r2, control: controlRead.control, controlRead, canonical, pruneReader: reader },
     scopes: Object.values(controlRead.control.registered_changes).flatMap(e => e.receipt.scopes) };
@@ -50,7 +71,7 @@ test('authenticated original matches exact current scope, while all-writer cover
   try {
     const r = await reconcileManagedInputs({ ...s.options, pruneDiscovery: {
       from: '2026-10-10T00:00:00.000Z', to: '2026-10-11T00:00:00.000Z', mode: 'resweep' } });
-    assert.equal(r.schema_version, 2); assert.equal(r.canonical.read_consistent, true);
+    assert.equal(r.schema_version, 3); assert.equal(r.canonical.read_consistent, true);
     assert.ok(r.stage3c.scopes.every(s => s.original_authentication === 'authenticated' && s.current_metadata_match === 'matches'));
     assert.equal(r.stage3c.original_events[0].original_receipts_registered, true);
     assert.ok(reconciliationArtifact(r).body.length <= 4 * 1024 ** 2);
@@ -61,9 +82,14 @@ test('authenticated original matches exact current scope, while all-writer cover
     const legacy = structuredClone(r); legacy.schema_version = 1; delete legacy.stage3c;
     for (const c of legacy.changes) { delete c.original_scope_authorities; delete c.original_verified_at_utc; }
     legacy.canonical.schema_version = 1;
-    for (const k of ['source_as_of', 'page_count', 'page_scope_limit']) delete legacy.canonical[k];
+    for (const k of ['source_as_of', 'page_count', 'page_scope_limit', 'selection', 'recheck_evidence', 'closing_root', 'capacity']) delete legacy.canonical[k];
     for (const s of legacy.canonical.scopes) delete s.physical.scope_sha256;
     assertReconciliationReport(legacy);
+    const version2 = structuredClone(r); version2.schema_version = 2; version2.canonical.schema_version = 2;
+    for (const k of ['selection', 'recheck_evidence', 'closing_root', 'capacity']) delete version2.canonical[k];
+    version2.stage3c.scopes.forEach(scope => { delete scope.inspection_state; });
+    version2.stage3c.original_events.forEach(group => { delete group.expected_scope_keys; });
+    assertReconciliationReport(version2);
     assert.throws(selectManagedPublications);
     const falseComplete = structuredClone(r); falseComplete.stage3c.writer_coverage = 'complete';
     assert.throws(() => assertReconciliationReport(falseComplete), { code: 'invalid_report' });
@@ -106,11 +132,12 @@ test('changed current physical files and a bare later-writer claim cannot authen
   } finally { await s.reader.close(); }
 });
 
-test('all partitions share one source-as-of recheck; changed root, new selector or missing Core completion fails closed', async () => {
+test('one selection rechecks shared authority; changed root, new selector or missing Core completion fails closed', async () => {
   const s = await setup();
   try {
     const result = await readCanonicalScopePages({ ...s.canonical, scopes: s.scopes, budget: createBudget({ scopes: 1 }) });
     assert.equal(result.page_count, 2); assert.equal(result.scopes.length, 2); assert.equal(result.read_consistent, true);
+    assert.equal(result.scopes.filter(s => s.state === 'not_inspected_partition').length, 1);
     assert.equal(s.canonical.counts.get(G.observations_root_key), 3);
     const drift = canonicalFixture(s.f);
     drift.setHook((key, n) => { if (key === G.observations_root_key && n === 2) drift.bodies.set(key, Buffer.from('{}')); });
@@ -137,19 +164,37 @@ test('all partitions share one source-as-of recheck; changed root, new selector 
   } finally { await s.reader.close(); }
 });
 
-test('multi-partition original events are fully accounted, missing retention/registration and exhausted metadata stay explicit', async () => {
+test('multi-partition original events are fully accounted, missing retention/registration and exhausted metadata stay explicit', async t => {
   const s = await setup(1024);
   try {
     const entries = Object.values(s.options.control.registered_changes);
     assert.equal(entries.length, 8);
-    const r = await reconcileManagedInputs({ ...s.options, budget: createBudget({ metadata_gets: 20 }) });
+    const r = await reconcileManagedInputs(s.options);
     assert.equal(r.changes.reduce((n, c) => n + c.scopes.length, 0), 1024);
     assert.equal(r.canonical.scopes.length, 1024); assert.equal(r.canonical.page_count, 8);
-    assert.equal(r.canonical.read_consistent, false); assert.equal(r.stage3c.original_events[0].scope_count, 1024);
+    assert.equal(r.canonical.read_consistent, true); assert.equal(r.stage3c.original_events[0].scope_count, 1024);
+    assert.equal(r.stage3c.scopes.filter(s => s.current_metadata_match === 'matches').length, 128);
+    assert.equal(r.stage3c.scopes.filter(s => s.inspection_state === 'not_inspected_partition').length, 896);
+    assert.equal(r.stage3c.current_metadata_inspected, false);
     assert.equal(r.stage3c.original_events[0].original_receipts_registered, true);
-    // Preserve the existing cap even when the full detailed 1,024-scope report
-    // exceeds it; never trim scopes to manufacture a retainable report.
-    assert.throws(() => reconciliationArtifact(r), { code: 'resource_limit' });
+    const artifact = reconciliationArtifact(r), wire = JSON.parse(artifact.body);
+    assert.ok(artifact.body.length <= 4 * 1024 ** 2);
+    assert.deepEqual(decodeCompactReport(wire), JSON.parse(canonicalJson(r)));
+    assertReconciliationReport(wire);
+    t.diagnostic(JSON.stringify({ accounted_scopes: 1024, inspected_scopes: 128,
+      compact_bytes: artifact.body.length, expanded_bytes: wire.expanded_byte_size,
+      metadata_gets: r.resources.metadata_gets, get_allowance: r.canonical.capacity.metadata_get_limit }));
+    const missingPartition = structuredClone(r); missingPartition.canonical.selection.partitions.pop();
+    assert.throws(() => assertReconciliationReport(missingPartition), { code: 'invalid_report' });
+    const overlapping = structuredClone(r);
+    overlapping.canonical.selection.partitions[1].scope_keys[0] = overlapping.canonical.selection.partitions[0].scope_keys[0];
+    assert.throws(() => assertReconciliationReport(overlapping), { code: 'invalid_report' });
+    const another = await readCanonicalScopePages({ ...s.canonical, scopes: s.scopes, partitionIndex: 1 });
+    assert.equal(another.selection.selected_partition, 1); assert.equal(another.read_consistent, true);
+    const combined = structuredClone(r);
+    const foreign = another.scopes.find(x => x.state === 'metadata_only');
+    combined.canonical.scopes[combined.canonical.scopes.findIndex(x => x.scope_key === foreign.scope_key)] = foreign;
+    assert.throws(() => assertReconciliationReport(combined), { code: 'invalid_report' });
     const controlRead = await readManagedControl(s.f.r2);
     // Use a real empty synthetic control from before registration, rather than
     // inventing partial schema-2 registration (which assertControl rejects).
@@ -163,4 +208,67 @@ test('multi-partition original events are fully accounted, missing retention/reg
     assert.equal(missing.stage3c.retained_unregistered.length, 7);
     assert.equal(controlRead.control.revision, s.options.control.revision);
   } finally { await s.reader.close(); }
+});
+
+test('128 distinct series fit the planned GET envelope with deduplicated four-worker reads and complete rechecks', async t => {
+  const s = await setup(128);
+  try {
+    let active = 0, peak = 0;
+    const original = s.canonical.r2.adapter.getObjectBounded;
+    s.canonical.r2.adapter.getObjectBounded = async args => {
+      active++; peak = Math.max(peak, active);
+      try { await new Promise(resolve => setTimeout(resolve, 1)); return await original(args); }
+      finally { active--; }
+    };
+    const r = await reconcileManagedInputs(s.options), c = r.canonical;
+    assert.equal(c.read_consistent, true); assert.equal(r.stage3c.current_metadata_inspected, true);
+    assert.equal(r.stage3c.scopes.filter(s => s.current_metadata_match === 'matches').length, 128);
+    assert.ok(c.resources.metadata_gets > 512); assert.ok(c.capacity.metadata_get_allowance > 512);
+    assert.equal(c.resources.metadata_gets, s.canonical.gets.length);
+    assert.equal(c.capacity.initial_gets * 2 + 1, c.resources.metadata_gets);
+    assert.equal(c.resources.metadata_gets, 541); assert.equal(c.capacity.metadata_get_allowance, 543);
+    assert.equal(c.capacity.initial_bytes, c.capacity.recheck_bytes);
+    assert.equal(c.resources.metadata_bytes - c.capacity.previous_metadata_bytes,
+      c.capacity.initial_bytes * 2 + c.capacity.closing_root_bytes);
+    assert.equal(c.capacity.initial_gets, new Set(s.canonical.gets).size);
+    assert.ok(peak > 1 && peak <= 4); assert.equal(c.capacity.peak_concurrency, peak);
+    assert.ok(c.recheck_evidence.every(e => e.state === 'matched'));
+    for (const [key, count] of s.canonical.counts) assert.equal(count, key === G.observations_root_key ? 3 : 2);
+    const noRechecks = structuredClone(r); noRechecks.canonical.recheck_evidence.pop();
+    assert.throws(() => assertReconciliationReport(noRechecks), { code: 'invalid_report' });
+    const bypass = structuredClone(r); bypass.canonical.capacity.initial_gets--;
+    assert.throws(() => assertReconciliationReport(bypass), { code: 'invalid_report' });
+    const byteBypass = structuredClone(r); byteBypass.canonical.capacity.recheck_bytes--;
+    assert.throws(() => assertReconciliationReport(byteBypass), { code: 'invalid_report' });
+    const compact = encodeCompactReport(r);
+    assertReconciliationReport(compact);
+    t.diagnostic(JSON.stringify({ scopes: 128, metadata_gets: c.resources.metadata_gets,
+      get_allowance: c.capacity.metadata_get_limit, max_concurrency: peak, compact_bytes: canonicalJson(compact).length }));
+    const missing = structuredClone(compact); missing.nodes.pop();
+    assert.throws(() => assertReconciliationReport(missing), { code: 'invalid_report' });
+    const badHash = structuredClone(compact); badHash.expanded_sha256 = 'f'.repeat(64);
+    assert.throws(() => assertReconciliationReport(badHash), { code: 'invalid_report' });
+    const falseReady = structuredClone(r); falseReady.publication_selection = 'enabled';
+    assert.throws(() => assertReconciliationReport(encodeCompactReport(falseReady)), { code: 'invalid_report' });
+    assert.throws(selectManagedPublications);
+  } finally { await s.reader.close(); }
+});
+
+test('shared timeout aborts concurrent requests, drains workers and rejects late cache/evidence writes', async () => {
+  const f = await sourceAndOriginalEvent(8), c = canonicalFixture(f);
+  const decoded = decodePruneMetadataEvidence(JSON.parse(f.row.final_evidence_bytes));
+  const scopes = decoded.original_authority_extension.before.scopes.map(s => ({ identity: s.identity, day_utc: s.day_utc }));
+  const original = c.r2.adapter.getObjectBounded, pending = []; let aborted = 0;
+  c.r2.adapter.getObjectBounded = async args => {
+    if (!args.key.includes('/timeseries_id=')) return original(args);
+    args.signal.addEventListener('abort', () => { aborted++; }, { once: true });
+    return new Promise(resolve => pending.push(() => resolve({ body: c.bodies.get(args.key), bytes: c.bodies.get(args.key).length })));
+  };
+  const result = await readCanonicalScopePages({ ...c, scopes, budget: createInspectionBudget({ duration_ms: 200 }) });
+  assert.equal(result.read_consistent, false); assert.equal(result.source_as_of.state, 'fresh_inspection_required');
+  assert.ok(aborted > 1 && aborted <= 4); assert.ok(pending.length <= 4);
+  assert.ok(result.scopes.some(s => s.state === 'not_inspected_resource_limit'));
+  const before = canonicalJson(result);
+  pending.forEach(resolve => resolve()); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(canonicalJson(result), before);
 });

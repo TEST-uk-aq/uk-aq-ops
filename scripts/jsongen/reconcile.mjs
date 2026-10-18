@@ -6,13 +6,14 @@ import { MAX_CONTROL_BYTES, updateManagedControl } from './control.mjs';
 import { readReceipt, readBundle, readImmutable, admitDerived } from './inputs.mjs';
 import { readCanonicalScopePages } from './authority.mjs';
 import { authenticateFinalPublication } from './writer-authentication.mjs';
-import { createBudget, evidence, freeze, JSONgenEvidenceError, PRUNE_PENDING_SOURCE_LIMITS } from './limits.mjs';
+import { createBudget, createInspectionBudget, evidence, freeze, JSONgenEvidenceError, PRUNE_PENDING_SOURCE_LIMITS } from './limits.mjs';
 import { controlSnapshot } from './control-snapshot.mjs';
 import { assertReconciliationReport } from './report-validation.mjs';
 import { authenticatePruneHandover, inspectAuthenticatedPruneHandover } from './prune-consumer-authentication.mjs';
 import { buildPruneReceiptGroup, inspectPruneReceiptGroup } from './prune-receipts.mjs';
 import { assessStage3C, currentScopeMatch } from './currentness.mjs';
 import { assertInspectionScope } from './scope-authority.mjs';
+import { encodeCompactReport } from './report-codec.mjs';
 
 // Event-scoped replay is independent of the 128-scope current-metadata inspector.
 // It reconstructs all partitions from the original outbox/private pending source,
@@ -23,7 +24,8 @@ export async function reconcilePruneAcceptance(options) {
 }
 
 export async function reconcileManagedInputs({ derivedR2, control, controlRead = null, retainedReceipts = [],
-  canonical, requestedScopes = [], writerKinds = {}, pruneReader = null, pruneDiscovery = null, budget = createBudget() }) {
+  canonical, requestedScopes = [], writerKinds = {}, pruneReader = null, pruneDiscovery = null,
+  inspectionPartition = 0, budget = createInspectionBudget() }) {
   control = structuredClone(control); assertControl(control);
   const controlBytes = canonicalJson(control);
   evidence(controlBytes.length <= MAX_CONTROL_BYTES, 'resource_limit', 'control admission size exceeded');
@@ -47,6 +49,9 @@ export async function reconcileManagedInputs({ derivedR2, control, controlRead =
     evidence(scopes.size <= PRUNE_PENDING_SOURCE_LIMITS.scopes, 'resource_limit', 'combined 1,024 physical scope budget exceeded');
   };
   evidence(Array.isArray(requestedScopes) && requestedScopes.length <= PRUNE_PENDING_SOURCE_LIMITS.scopes, 'resource_limit', 'requested scope budget exceeded');
+  requestedScopes.forEach(assertInspectionScope);
+  evidence(new Set(requestedScopes.map(scopeKey)).size === requestedScopes.length,
+    'invalid_scope', 'Duplicate explicitly requested physical inspection scope');
   requestedScopes.forEach(addScope);
   registered.forEach(([, e]) => e.receipt.scopes.forEach(addScope));
   for (const ref of refs.values()) {
@@ -95,6 +100,7 @@ export async function reconcileManagedInputs({ derivedR2, control, controlRead =
           const group = inspectPruneReceiptGroup(buildPruneReceiptGroup({ handover: pruneHandover, budget }));
           originalGroups.set(id, { event_id: id, authority: proof.authority,
             scope_count: group.plan.physical_scope_count, group_sha256: group.group_sha256,
+            expected_scope_keys: group.entries.flatMap(e => e.receipt.scopes.map(scopeKey)).sort(),
             expected_changes: group.entries.map(e => e.receipt.change_id) });
           evidence(new Set([...refs.keys(), ...group.entries.map(e => e.receipt_object.key)]).size <= budget.limits.receipt_references,
             'resource_limit', 'Complete event partition reference budget exceeded');
@@ -136,7 +142,7 @@ export async function reconcileManagedInputs({ derivedR2, control, controlRead =
   const diagnostics = [{ code: 'unknown_receipt_coverage',
     detail: 'No independently authenticated durable writer outbox/inventory establishes complete change coverage. An unchanged control revision proves neither coverage nor canonical freshness.' }];
   if (scopes.size) {
-    try { current = await readCanonicalScopePages({ ...canonical, scopes: [...scopes.values()], budget }); }
+    try { current = await readCanonicalScopePages({ ...canonical, scopes: [...scopes.values()], partitionIndex: inspectionPartition, budget }); }
     catch (error) { diagnostics.push({ code: error.code || 'canonical_metadata_unavailable', detail: error.message }); }
   } else diagnostics.push({ code: 'unknown_scope_coverage', detail: 'No bounded canonical scope set was supplied or declared.' });
   for (const change of changes) for (const scope of change.scopes) {
@@ -179,7 +185,7 @@ export async function reconcileManagedInputs({ derivedR2, control, controlRead =
       selected_source: null, context: [], retained_change_ids: [], state: 'reconciliation_required', context_authentication: 'not_established' });
     months.get(k).retained_change_ids.push(c.change_id);
   }
-  const report = { schema_version: 2, kind: 'uk_aq_jsongen_reconciliation', inspected_at_utc: new Date().toISOString(),
+  const report = { schema_version: 3, kind: 'uk_aq_jsongen_reconciliation', inspected_at_utc: new Date().toISOString(),
     control_snapshot: controlSnapshot(control, controlRead),
     state: 'reconciliation_required', publication_selection: 'disabled', complete_change_coverage: false,
     freshness: 'unknown', changes, canonical: current, stage3c: assessment, uncovered_scopes: uncovered,
@@ -194,9 +200,16 @@ export async function reconcileManagedInputs({ derivedR2, control, controlRead =
 
 // Durable immutable diagnostics, with no new mutable state or Stage 1 schema.
 export function reconciliationArtifact(report, budget = createBudget()) {
-  assertReconciliationReport(report);
-  const body = canonicalJson(report);
+  report = assertReconciliationReport(report);
+  const wire = report.schema_version === 3 ? encodeCompactReport(report) : report;
+  const body = canonicalJson(wire);
   evidence(body.length <= budget.limits.report_bytes, 'resource_limit', 'reconciliation report admission exceeded');
+  const expandedBytes = report.schema_version === 3 ? wire.expanded_byte_size : body.length;
+  evidence(expandedBytes <= budget.limits.uncompressed_bytes
+    && report.resources.derived_bytes + report.resources.metadata_bytes + report.resources.decompressed_bytes
+      + expandedBytes + body.length <= budget.limits.total_bytes,
+  'resource_limit', 'Report serialization exceeds shared byte envelope');
+  budget.check();
   const hash = sha256Hex(body);
   return { body, reference: { bucket: BUCKET, key: `${ROOT}/evidence/${hash}.json`, sha256: hash, byte_size: body.length } };
 }
@@ -223,7 +236,7 @@ export async function retainReconciliationReport({ r2, report, budget = createBu
 export async function recordReconciliationRequired({ r2, report, budget = createBudget() }) {
   // If retention fails or is ambiguous, there is no control update. If control
   // CAS fails, the immutable report survives. Neither outcome marks work complete.
-  assertReconciliationReport(report);
+  report = assertReconciliationReport(report);
   evidence(report.control_snapshot.byte_provenance === 'exact_read', 'invalid_control_snapshot',
     'failure recording requires an original-byte control inspection');
   const retained = await retainReconciliationReport({ r2, report, budget });

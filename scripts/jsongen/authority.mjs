@@ -18,7 +18,9 @@ import { physicalScopeDigest, assertInspectionScope } from './scope-authority.mj
 import { OBSERVATION_VERIFICATION_LATEST_KEY, validateObservationVerificationLatest,
   validateObservationVerificationConnectorManifest, encodeObservationVerificationJson } from '../../workers/shared/uk_aq_observation_verification_overlay.mjs';
 import { assertScope, assertReference, scopeKey, same, canonicalJson, BUCKET } from './schema.mjs';
-import { createBudget, evidence, parseJson, freeze, PRUNE_PENDING_SOURCE_LIMITS } from './limits.mjs';
+import { createBudget, createInspectionBudget, evidence, parseJson, freeze, INSPECTION_CONCURRENCY, JSONgenEvidenceError } from './limits.mjs';
+import { planInspection, planMetadataRequests } from './inspection-plan.mjs';
+import { inspectionMap } from './inspection-runtime.mjs';
 
 const inspectionSessions = new WeakSet();
 
@@ -130,6 +132,15 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
   const indexRoot = generation.observations_timeseries_index_prefix;
   const cache = session?.cache || new Map(); const provenance = session?.provenance || new Map();
   const missing = session?.missing || new Map();
+  const memo = (key, operation) => {
+    if (!session) return operation();
+    if (!session.memo.has(key)) session.memo.set(key, Promise.resolve().then(operation));
+    return session.memo.get(key);
+  };
+  const inspectIndex = object => {
+    if (session?.indexed.has(object)) return;
+    canonicalIndex(object); session?.indexed.add(object);
+  };
   const allowed = key => key.endsWith('.json') && (
     key.startsWith(`${base}/`) || key.startsWith(`${indexRoot}/`) ||
     (bindingPrefix && key.startsWith(`${bindingPrefix}/`)) ||
@@ -137,18 +148,57 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
   const read = async (key, fresh = false) => {
     evidence(allowed(key) && !key.includes('/../') && !key.includes('/./') && !/[\\\x00-\x20?#%]/.test(key),
       'invalid_canonical_metadata', 'metadata key outside explicitly configured domains');
+    if (session) evidence(session.plannedKeys.has(key)
+      || [...session.connectors].some(id => new RegExp(`^history/v3/verification/connector_id=${id}/manifests/[a-f0-9]{64}\\.json$`).test(key)),
+    'invalid_canonical_metadata', 'Metadata dependency is outside the bounded requested-scope plan');
+    if (session?.closed) throw session.failure || new JSONgenEvidenceError('resource_limit', 'Metadata inspection closed');
+    if (!fresh && session?.inflight.has(key)) return session.inflight.get(key);
     if (!fresh && cache.has(key)) return cache.get(key);
     if (!fresh && missing.has(key)) throw missing.get(key);
-    const maxBytes = Math.min(budget.limits.metadata_bytes, budget.remainingBytes());
-    evidence(maxBytes > 0, 'resource_limit', 'canonical metadata byte budget exhausted');
-    budget.get('metadata');
-    let object;
-    try { object = await r2GetObjectBounded({ r2, key, max_bytes: maxBytes, timeout_ms: budget.timeout() }); }
-    catch (error) { if (!fresh && error.status === 404) missing.set(key, error); throw error; }
-    budget.bytes('metadata', object.bytes);
-    const result = { body: object.body, value: parseJson(object.body), reference: descriptor(r2.bucket, key, object.body) };
-    if (!fresh) { cache.set(key, result); provenance.set(key, result.reference); }
-    return result;
+    const acquire = async () => {
+      let release = () => {}, active = false;
+      try {
+        const maxBytes = Math.min(budget.limits.metadata_bytes, budget.remainingBytes());
+        evidence(maxBytes > 0, 'resource_limit', 'canonical metadata byte budget exhausted');
+        release = budget.reserveBytes(maxBytes);
+        budget.get('metadata');
+        if (session) {
+          session.stats[session.phase]++; session.active++;
+          if (session.phase === 'initial_gets') session.initialKeys.add(key);
+          if (session.phase === 'recheck_gets') session.recheckKeys.add(key);
+          session.stats.peak_concurrency = Math.max(session.stats.peak_concurrency, session.active); active = true;
+        }
+        const object = await r2GetObjectBounded({ r2, key, max_bytes: maxBytes, timeout_ms: budget.timeout(), signal: session?.controller.signal });
+        release(); release = () => {};
+        if (session?.closed) throw session.failure;
+        budget.bytes('metadata', object.bytes);
+        if (session) session.stats[session.phase.replace('_gets', '_bytes')] += object.bytes;
+        const result = { body: object.body, reference: descriptor(r2.bucket, key, object.body) };
+        if (!fresh) {
+          if (session) {
+            evidence(session.stats.cache_bytes + object.bytes <= budget.limits.metadata_bytes,
+              'resource_limit', 'Shared raw metadata cache byte cap exceeded');
+            session.stats.cache_bytes += object.bytes;
+          }
+          // Record bytes even if JSON parsing fails; every observed identity
+          // must participate in the final recheck, not only parseable objects.
+          provenance.set(key, result.reference);
+          result.value = parseJson(object.body); cache.set(key, result);
+        }
+        return result;
+      } catch (error) {
+        if (!fresh && !session?.closed) missing.set(key, error);
+        if (session && (error.code === 'resource_limit' || session.controller.signal.aborted
+          || /deadline|timeout|aborted/i.test(error.message))) session.cancel(error);
+        throw error;
+      } finally { release(); if (active) session.active--; }
+    };
+    const pending = acquire();
+    if (!fresh && session) {
+      session.inflight.set(key, pending);
+      try { return await pending; } finally { session.inflight.delete(key); }
+    }
+    return pending;
   };
   if (session) session.read = read;
   const pinned = async reference => {
@@ -158,7 +208,7 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
     evidence(same(ref, object.reference), 'invalid_canonical_metadata', `metadata byte identity mismatch: ${ref.key}`);
     return object;
   };
-  const hierarchy = async scope => {
+  const hierarchy = scope => memo(`hierarchy:${scope.day_utc}:${scope.identity.connector_id}:${scope.identity.pollutant_code}`, async () => {
     const day = scope.day_utc; const id = scope.identity;
     const keys = [generation.observations_root_key,
       `${base}/_manifests/year=${day.slice(0, 4)}/manifest.json`,
@@ -185,6 +235,7 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
         evidence(i === 0 ? !Object.hasOwn(value, 'year') : String(value.year) === day.slice(0, 4),
           'invalid_canonical_metadata', `wrong aggregate level: ${kinds[i]}`);
         if (i === 2) evidence(String(value.month).padStart(2, '0') === day.slice(5, 7), 'invalid_canonical_metadata', 'wrong aggregate month');
+        if (i === 0 && session) session.rootAuthenticated = true;
       } else {
         const kind = i === 3 ? 'day' : i === 4 ? 'connector' : 'pollutant';
         assertV2ObservationsChildManifest(value, { key, kind, dayUtc: day, connectorId: i > 3 ? id.connector_id : null });
@@ -195,11 +246,11 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
       chain.push({ ...object.reference, logical_hash: value[hashField] }); parent = value;
     }
     return { membership: 'partition_present', chain, pollutant: parent };
-  };
+  });
   const exact = async (scope, h) => {
     const id = scope.identity; const suffix = `day_utc=${scope.day_utc}/connector_id=${id.connector_id}/pollutant_code=${id.pollutant_code}`;
-    const manifest = await read(`${indexRoot}/${suffix}/manifest.json`); canonicalIndex(manifest);
-    const aligned = await pinned(manifest.value.source_aligned_scoped_manifest); canonicalIndex(aligned);
+    const manifest = await read(`${indexRoot}/${suffix}/manifest.json`); inspectIndex(manifest);
+    const aligned = await pinned(manifest.value.source_aligned_scoped_manifest); inspectIndex(aligned);
     evidence(aligned.reference.key === `${indexRoot}/_aligned/${suffix}/manifest.json`, 'invalid_canonical_metadata', 'wrong aligned scope');
     const source = aligned.value.canonical_source_manifest;
     const pollutant = h.chain.at(-1);
@@ -221,15 +272,17 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
     });
     evidence(metadata.coverage_complete, 'invalid_canonical_metadata', 'incomplete exact physical membership');
     const counts = h.pollutant.timeseries_row_counts;
-    evidence(counts && typeof counts === 'object' && !Array.isArray(counts)
+    await memo(`canonical_exact_members:${manifest.reference.key}`, () => {
+      evidence(counts && typeof counts === 'object' && !Array.isArray(counts)
       && Object.values(counts).every(n => Number.isSafeInteger(n) && n > 0)
       && Object.values(counts).reduce((a, b) => a + b, 0) === h.pollutant.row_count,
     'invalid_canonical_metadata', 'complete canonical timeseries counts unavailable');
+      evidence(same(Object.keys(manifest.value.leaves_by_timeseries_id).sort(), Object.keys(counts).sort()), 'invalid_canonical_metadata', 'exact/canonical physical member sets disagree');
+    });
     const leafSet = manifest.value.leaves_by_timeseries_id;
-    evidence(same(Object.keys(leafSet).sort(), Object.keys(counts).sort()), 'invalid_canonical_metadata', 'exact/canonical physical member sets disagree');
     const tuple = leafSet[String(id.timeseries_id)];
     if (!tuple) return { membership: 'authoritative_absent', row_count: 0, index: manifest.reference };
-    const leaf = await pinned({ key: tuple[0], byte_size: tuple[1], sha256: tuple[2] }); canonicalIndex(leaf);
+    const leaf = await pinned({ key: tuple[0], byte_size: tuple[1], sha256: tuple[2] }); inspectIndex(leaf);
     evidence(metadata.rows.length === 1 && metadata.rows[0].row_count === counts[String(id.timeseries_id)],
       'invalid_canonical_metadata', 'exact/canonical row count mismatch');
     const alignedChild = leaf.value.source_aligned_child;
@@ -243,7 +296,7 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
       && descriptor.sha256 === alignedChild.sha256 && descriptor.byte_size === alignedChild.byte_size
       && descriptor.range_start === range.range_start && descriptor.range_end === range.range_end,
     'invalid_canonical_metadata', 'leaf is not an exact member of its aligned scope');
-    const shard = await pinned(alignedChild); canonicalIndex(shard);
+    const shard = await pinned(alignedChild); inspectIndex(shard);
     const payload = shard.value;
     evidence(payload.kind === 'observation_timeseries_aligned_source_shard'
       && payload.key === alignedChild.key && payload.day_utc === scope.day_utc
@@ -256,22 +309,24 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
     const expectedIds = Object.keys(counts).map(Number)
       .filter(n => n >= range.range_start && n <= range.range_end).sort((a, b) => a - b);
     const shardFileKeys = new Set(Array.isArray(payload.files) ? payload.files.map(f => f.key) : []);
-    evidence(Array.isArray(payload.timeseries)
+    await memo(`aligned_members:${alignedChild.key}`, () => {
+      evidence(Array.isArray(payload.timeseries)
       && same(payload.timeseries.map(t => t.timeseries_id), expectedIds)
       && payload.timeseries.every(t => Number.isSafeInteger(t.row_count) && t.row_count > 0
         && t.row_count === counts[String(t.timeseries_id)] && Array.isArray(t.segments)
         && t.segments.length > 0 && t.segments.every(s => Number.isSafeInteger(s.row_count)
           && s.row_count > 0 && shardFileKeys.has(s.file_key))
-        && t.segments.reduce((n, s) => n + s.row_count, 0) === t.row_count)
-      && payload.timeseries.find(t => t.timeseries_id === id.timeseries_id)?.row_count === leaf.value.row_count,
+        && t.segments.reduce((n, s) => n + s.row_count, 0) === t.row_count),
     'invalid_canonical_metadata', 'aligned shard timeseries membership or row counts disagree');
-    evidence(Array.isArray(payload.files) && leaf.value.files.every(f => payload.files.some(s =>
-      s.key === f.key && s.sha256 === f.sha256 && s.byte_size === f.byte_size))
-      && payload.files.every(f => h.pollutant.files.some(s => {
+      evidence(Array.isArray(payload.files) && payload.files.every(f => h.pollutant.files.some(s => {
         const identity = classifyManifestFileIdentity(s.etag_or_hash, { objectKey: f.key });
         return s.key === f.key && s.bytes === f.byte_size
           && identity.type === 'sha256' && identity.value === f.sha256;
       })), 'invalid_canonical_metadata', 'aligned shard file identity disagrees with exact/canonical files');
+    });
+    evidence(payload.timeseries.find(t => t.timeseries_id === id.timeseries_id)?.row_count === leaf.value.row_count
+      && leaf.value.files.every(f => payload.files.some(s => s.key === f.key && s.sha256 === f.sha256 && s.byte_size === f.byte_size)),
+    'invalid_canonical_metadata', 'Selected exact scope contradicts authenticated aligned membership');
     // Check file identity membership without ever fetching Parquet.
     for (const file of leaf.value.files) {
       const canonical = h.pollutant.files.find(f => f.key === file.key);
@@ -293,7 +348,8 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
       index: manifest.reference, leaf: leaf.reference, aligned_shard: shard.reference };
   };
   const binding = async identity => {
-    const root = validateTimeseriesBindingSourceRootManifest((await read(timeseriesBindingSourceRootKey(bindingPrefix))).value);
+    const root = await memo('binding_completed_root', async () => {
+      const root = validateTimeseriesBindingSourceRootManifest((await read(timeseriesBindingSourceRootKey(bindingPrefix))).value);
     evidence(root.source_prefix === bindingPrefix, 'invalid_binding_authority', 'wrong binding root');
     if (session) {
       const state = (await read(`${bindingPrefix}/_source_state.json`)).value;
@@ -309,9 +365,12 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
         && refresh.source_fingerprint === state.source_fingerprint && refresh.source_root_hash === root.source_root_hash,
       'invalid_binding_authority', 'Completed selected-generation Core binding source/refresh authority unavailable or contradictory');
     }
+      return root;
+    });
     const rangeRef = root.ranges.find(r => r.range_start <= identity.timeseries_id && r.range_end >= identity.timeseries_id);
     evidence(rangeRef, 'invalid_binding_authority', 'physical binding range is not authoritative');
-    const range = validateTimeseriesBindingSourceRangeManifest((await read(rangeRef.manifest_key)).value);
+    const range = await memo(`binding_range:${rangeRef.manifest_key}`, () => read(rangeRef.manifest_key)
+      .then(object => validateTimeseriesBindingSourceRangeManifest(object.value)));
     evidence(range.source_prefix === bindingPrefix && range.source_range_hash === rangeRef.source_range_hash
       && range.units.length === rangeRef.unit_count && range.range_start === rangeRef.range_start && range.range_end === rangeRef.range_end,
     'invalid_binding_authority', 'binding root/range mismatch');
@@ -340,15 +399,19 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
     // A known overlay cut-over must resolve its selected latest and exact manifest.
     // Only independently accepted pre-overlay mode can tolerate a missing pointer.
     let latestObject;
-    try { latestObject = await read(OBSERVATION_VERIFICATION_LATEST_KEY); }
+    try { latestObject = await memo('validated_verification_latest', async () => {
+      const object = await read(OBSERVATION_VERIFICATION_LATEST_KEY);
+      const latest = validateObservationVerificationLatest(object.value);
+      evidence(Buffer.from(encodeObservationVerificationJson(latest)).equals(object.body), 'invalid_verification_authority', 'verification selector encoding mismatch');
+      return { ...object, latest };
+    }); }
     catch (error) {
       if (error.status === 404 && mode === 'pre_overlay_accepted')
         return { state: selectVerificationStatusAuthority({ physicalIdentity: physical.physical_identity,
           acceptedMode: mode }) };
       throw error;
     }
-    const latest = validateObservationVerificationLatest(latestObject.value);
-    evidence(Buffer.from(encodeObservationVerificationJson(latest)).equals(latestObject.body), 'invalid_verification_authority', 'verification selector encoding mismatch');
+    const latest = latestObject.latest;
     const ref = latest.connectors.find(c => c.connector_id === identity.connector_id);
     if (!ref) {
       return { state: selectVerificationStatusAuthority({ physicalIdentity: physical.physical_identity,
@@ -368,8 +431,7 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
       acceptedMode: mode, selectedOverlay: true }), manifest: object.reference, entry,
       scope_sha256: sha256Hex(canonicalJson(entry)) };
   };
-  const results = [];
-  for (const scope of scopes) {
+  const inspectScope = async scope => {
     const result = { scope_key: scopeKey(scope), identity: scope.identity, day_utc: scope.day_utc, diagnostics: [] };
     try {
       const h = await hierarchy(scope); result.observations = { membership: h.membership, chain: h.chain, absent_at: h.absent_at ?? null };
@@ -388,8 +450,15 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
             ? 'overlay_authoritative_connector_unresolved' : 'unknown_verification_transition_state' };
       }
     }
-    result.state = 'metadata_only'; results.push(result);
-  }
+    result.state = session?.closed ? 'not_inspected_resource_limit' : 'metadata_only'; return result;
+  };
+  const results = session
+    ? await inspectionMap(scopes, inspectScope, { concurrency: INSPECTION_CONCURRENCY, stopped: () => session.closed })
+    : await inspectionMap(scopes, inspectScope, { concurrency: 1 });
+  for (let i = 0; i < results.length; i++) if (!results[i]) results[i] = {
+    scope_key: scopeKey(scopes[i]), identity: scopes[i].identity, day_utc: scopes[i].day_utc,
+    diagnostics: [{ code: 'resource_limit', detail: 'Scope not inspected after shared capacity/deadline cancellation' }],
+    state: 'not_inspected_resource_limit' };
   // No lock and no transaction: recheck every observed metadata object, not just
   // the root, since verification/binding and unpublished children can change too.
   let stable = true;
@@ -404,56 +473,93 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
     provenance: [...provenance.values()], diagnostics, resources: budget.snapshot() });
 }
 
-// Whole-scope partitions share ONE cache and ONE final recheck, including Core
-// completion/status selectors and observed 404s. No lock, new writer ordering or
-// claim that identical reads exclude an intervening/ABA publication is made.
-export async function readCanonicalScopePages({ scopes, budget = createBudget(), ...canonical }) {
-  evidence(Array.isArray(scopes) && scopes.length > 0 && scopes.length <= PRUNE_PENDING_SOURCE_LIMITS.scopes,
-    'resource_limit', 'Whole inspection is limited to 1,024 physical scopes');
-  scopes.forEach(assertInspectionScope);
-  evidence(new Set(scopes.map(scopeKey)).size === scopes.length, 'invalid_scope', 'Duplicate inspection scope');
-  const session = { cache: new Map(), provenance: new Map(), missing: new Map() };
+// One bounded selection shares a cache and final recheck, including Core/status
+// authority and 404s. The complete manifest also accounts for unselected scopes.
+// Separate invocations cannot be promoted to one coherent source snapshot.
+export async function readCanonicalScopePages({ scopes, budget = createInspectionBudget(), partitionIndex = 0, ...canonical }) {
+  const selection = planInspection(scopes, partitionIndex, budget.limits.scopes);
+  const byKey = new Map(scopes.map(s => [scopeKey(s), s]));
+  const selected = selection.selected_scope_keys.map(key => byKey.get(key));
+  const requestPlan = planMetadataRequests(selected, canonical.generation);
+  budget.configureMetadataLimit(requestPlan.metadata_get_allowance);
+  const session = { cache: new Map(), provenance: new Map(), missing: new Map(), inflight: new Map(),
+    memo: new Map(), indexed: new WeakSet(), controller: new AbortController(), closed: false, failure: null,
+    phase: 'initial_gets', active: 0, initialKeys: new Set(), recheckKeys: new Set(),
+    stats: { initial_gets: 0, recheck_gets: 0, closing_root_gets: 0,
+      initial_bytes: 0, recheck_bytes: 0, closing_root_bytes: 0, cache_bytes: 0, peak_concurrency: 0 } };
+  session.plannedKeys = new Set(requestPlan.deterministic_keys);
+  session.connectors = new Set(selected.map(s => s.identity.connector_id));
+  const previousMetadataGets = budget.snapshot().metadata_gets;
+  const previousMetadataBytes = budget.snapshot().metadata_bytes;
+  session.cancel = error => {
+    if (session.closed) return;
+    session.failure = error?.code ? error : new JSONgenEvidenceError('resource_limit', 'Metadata request deadline/cancellation boundary reached');
+    session.closed = true; session.controller.abort(session.failure);
+  };
   inspectionSessions.add(session);
-  const started = new Date().toISOString(), results = [];
-  let pageCount = 0, first;
-  for (let i = 0; i < scopes.length; i += budget.limits.scopes) {
-    const page = await readCanonicalScopes({ ...canonical, scopes: scopes.slice(i, i + budget.limits.scopes), budget, session });
-    first ||= page; results.push(...page.scopes); pageCount++;
-  }
-  let stable = session.cache.has(first.generation.observations_root_key);
-  const diagnostics = [];
+  const started = new Date().toISOString();
+  const timer = setTimeout(() => session.cancel(new JSONgenEvidenceError('resource_limit', 'Shared operation deadline exceeded')), budget.remainingMs());
+  let page, stable = false, closingRoot = null;
+  const diagnostics = [], rechecks = new Map();
   try {
-    evidence(stable, 'canonical_metadata_unavailable', 'No authenticated observations root was read');
-    for (const [key, original] of session.cache) {
-      const current = await session.read(key, true);
-      evidence(same(original.reference, current.reference), 'canonical_metadata_changed_during_read', key);
+    page = await readCanonicalScopes({ ...canonical, scopes: selected, budget, session });
+    const rootKey = canonical.generation.observations_root_key;
+    const observed = [...session.initialKeys].sort();
+    for (const key of observed) rechecks.set(key, { key, state: 'not_rechecked', current: null });
+    session.phase = 'recheck_gets';
+    await inspectionMap(observed, async key => {
+      try {
+        const first = session.provenance.get(key);
+        const wasAbsent = session.missing.get(key)?.status === 404;
+        let current = null, absent = false;
+        try { current = (await session.read(key, true)).reference; }
+        catch (error) { if (error.status === 404) absent = true; else throw error; }
+        const matched = first ? same(first, current) : wasAbsent && absent;
+        rechecks.set(key, { key, state: matched ? 'matched' : 'changed', current });
+        if (!matched) session.cancel(new JSONgenEvidenceError('canonical_metadata_changed_during_read', 'Observed metadata identity changed or was unavailable at its first read'));
+      } catch (error) {
+        rechecks.set(key, { key, state: 'unavailable', current: null }); session.cancel(error);
+      }
+    }, { concurrency: INSPECTION_CONCURRENCY, stopped: () => session.closed });
+    if (!session.closed) {
+      evidence(session.rootAuthenticated, 'canonical_metadata_unavailable', 'No authenticated selected observations root was inspected');
+      session.phase = 'closing_root_gets';
+      closingRoot = (await session.read(rootKey, true)).reference;
+      evidence(same(session.provenance.get(rootKey), closingRoot), 'canonical_metadata_changed_during_read', 'Observations root changed during the closing recheck');
+      budget.check(); stable = true;
     }
-    for (const key of session.missing.keys()) {
-      let absent = false;
-      try { await session.read(key, true); } catch (error) { if (error.status === 404) absent = true; else throw error; }
-      evidence(absent, 'canonical_metadata_changed_during_read', 'Previously unavailable metadata appeared during inspection');
-    }
-    const rootKey = first.generation.observations_root_key;
-    evidence(same(session.cache.get(rootKey).reference, (await session.read(rootKey, true)).reference),
-      'canonical_metadata_changed_during_read', 'Observations root changed during the final metadata recheck');
-  } catch (error) {
-    stable = false; diagnostics.push({ code: error.code || 'canonical_metadata_unavailable', detail: error.message });
-  }
+  } catch (error) { session.cancel(error); }
+  finally { clearTimeout(timer); }
+  if (session.failure) diagnostics.push({ code: session.failure.code || 'canonical_metadata_unavailable', detail: session.failure.message });
+  // Every worker/request has settled or been aborted by the bounded GET wrapper.
+  // Closing the session prevents a late adapter response from mutating evidence.
+  session.closed = true;
+  const selectedResults = new Map((page?.scopes || []).map(s => [s.scope_key, s]));
+  const results = [...byKey.keys()].sort().map(key => selectedResults.get(key) || {
+    scope_key: key, identity: byKey.get(key).identity, day_utc: byKey.get(key).day_utc,
+    diagnostics: [], state: selection.selected_scope_keys.includes(key) ? 'not_inspected_resource_limit' : 'not_inspected_partition' });
   const provenance = [...session.provenance.values()].sort((a, b) => a.key.localeCompare(b.key));
-  const unavailable = [...session.missing.keys()].sort();
-  const boundary = { generation: first.generation, scope_keys: results.map(s => s.scope_key).sort(),
+  const unavailable = [...session.missing].filter(([, error]) => error.status === 404).map(([key]) => key).sort();
+  const boundary = { generation: { ...canonical.generation }, scope_keys: selection.selected_scope_keys,
     metadata: provenance, unavailable_metadata_keys: unavailable };
   const source_as_of = { state: stable ? 'bounded_metadata_recheck_passed' : 'fresh_inspection_required',
     identity_sha256: sha256Hex(canonicalJson(boundary)), boundary,
-    observations_root: session.provenance.get(first.generation.observations_root_key) || null,
+    observations_root: session.provenance.get(canonical.generation.observations_root_key) || null,
     started_at_utc: started, finished_at_utc: new Date().toISOString(),
-    consistency: 'shared_first_read_cache_then_all_observed_metadata_rechecked',
-    completeness_fence: 'unavailable',
+    consistency: 'shared_first_read_cache_then_all_observed_metadata_rechecked', completeness_fence: 'unavailable',
     limitations: ['No transactional snapshot or canonical lock; an intervening writer or ABA change can escape identical endpoint reads.',
       'No writer-owned complete inventory/freshness fence; source-as-of metadata cannot prove absolute latest canonical freshness.'] };
-  return freeze({ ...first, schema_version: 2, read_consistent: stable, scopes: results,
-    provenance, diagnostics, source_as_of, page_count: pageCount, page_scope_limit: budget.limits.scopes,
-    resources: budget.snapshot() });
+  return freeze({ schema_version: 3, kind: 'uk_aq_jsongen_canonical_inspection', generation: { ...canonical.generation },
+    binding_prefix: canonical.generation.timeseries_binding_index_prefix, read_consistent: stable,
+    authority_complete: false, freshness: 'source_as_of_only', scopes: results, provenance, diagnostics, source_as_of,
+    page_count: selection.partition_count, page_scope_limit: selection.partition_size, selection,
+    recheck_evidence: [...rechecks.values()].sort((a, b) => a.key.localeCompare(b.key)), closing_root: closingRoot,
+    capacity: { ...requestPlan, metadata_get_limit: budget.metadataLimit(), ...session.stats,
+      previous_metadata_gets: previousMetadataGets,
+      previous_metadata_bytes: previousMetadataBytes,
+      initial_keys: [...session.initialKeys].sort(), recheck_keys: [...session.recheckKeys].sort(),
+      concurrency_limit: INSPECTION_CONCURRENCY, cache_byte_limit: budget.limits.metadata_bytes,
+      elapsed_ms: budget.elapsedMs(), duration_limit_ms: budget.limits.duration_ms }, resources: budget.snapshot() });
 }
 
 // This intentionally has no "authenticated" result. Different metadata pins

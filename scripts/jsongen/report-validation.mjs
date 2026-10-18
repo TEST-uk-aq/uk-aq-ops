@@ -5,12 +5,14 @@ import { DAQI_PM_ROLLING24H_WINDOW_HOURS, DAQI_PM_ROLLING24H_REQUIRED_HOURS } fr
 import { getObservationHistoryGeneration } from '../../workers/shared/uk_aq_observation_history_generation.mjs';
 import { ROOT, BUCKET, ALGORITHM, assertIdentity, assertReference, assertScope,
   assertSource, assertPruneAcceptanceAuthority, affectedMonths, monthKey, same, scopeKey } from './schema.mjs';
-import { LIMITS, evidence, PRUNE_PENDING_SOURCE_LIMITS } from './limits.mjs';
+import { LIMITS, evidence, PRUNE_PENDING_SOURCE_LIMITS, INSPECTION_MAX_METADATA_GETS, INSPECTION_CONCURRENCY } from './limits.mjs';
 import { assertControlSnapshot, controlSnapshot } from './control-snapshot.mjs';
 import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
 import { canonicalJson } from './schema.mjs';
 import { assessStage3C, currentScopeMatch } from './currentness.mjs';
 import { assertPruneAcceptanceKey, pruneAcceptanceId, OUTBOX_PAGE_LIMIT } from './prune-outbox-reader.mjs';
+import { decodeCompactReport } from './report-codec.mjs';
+import { planInspection, planMetadataRequests } from './inspection-plan.mjs';
 
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const sha = /^[a-f0-9]{64}$/;
@@ -57,12 +59,15 @@ function inspectLogical(value, scopes) {
 }
 
 export function assertReconciliationReport(report, { controlRead = null } = {}) {
-  const stage3c = report.schema_version === 2;
+  report = decodeCompactReport(report);
+  const modern = report.schema_version === 3;
+  const stage3c = modern || report.schema_version === 2;
+  const getLimit = modern ? INSPECTION_MAX_METADATA_GETS : LIMITS.metadata_gets;
   const scopeLimit = stage3c ? PRUNE_PENDING_SOURCE_LIMITS.scopes : LIMITS.scopes;
   keys(report, ['schema_version', 'kind', 'inspected_at_utc', 'control_snapshot', 'state',
     'publication_selection', 'complete_change_coverage', 'freshness', 'changes', 'canonical',
     'uncovered_scopes', 'months', 'diagnostics', 'resources', 'actions'], stage3c ? ['stage3c'] : []);
-  evidence([1, 2].includes(report.schema_version) && report.kind === 'uk_aq_jsongen_reconciliation'
+  evidence([1, 2, 3].includes(report.schema_version) && report.kind === 'uk_aq_jsongen_reconciliation'
     && instant(report.inspected_at_utc) && report.state === 'reconciliation_required'
     && report.publication_selection === 'disabled' && report.complete_change_coverage === false
     && report.freshness === 'unknown', 'invalid_report', 'unsupported or unsafe reconciliation state');
@@ -191,16 +196,17 @@ export function assertReconciliationReport(report, { controlRead = null } = {}) 
     const c = report.canonical;
     keys(c, ['schema_version', 'kind', 'generation', 'binding_prefix', 'read_consistent',
       'authority_complete', 'freshness', 'scopes', 'provenance', 'diagnostics', 'resources'],
-    stage3c ? ['source_as_of', 'page_count', 'page_scope_limit'] : []);
+    stage3c ? ['source_as_of', 'page_count', 'page_scope_limit',
+      ...(modern ? ['selection', 'recheck_evidence', 'closing_root', 'capacity'] : [])] : []);
     evidence(c.generation?.version === 'v3'
       && same(c.generation, getObservationHistoryGeneration('v3')),
     'invalid_report', 'canonical inspection must identify the exact selected v3 generation');
-    evidence(c.schema_version === (stage3c ? 2 : 1) && c.kind === 'uk_aq_jsongen_canonical_inspection'
+    evidence(c.schema_version === (modern ? 3 : stage3c ? 2 : 1) && c.kind === 'uk_aq_jsongen_canonical_inspection'
       && c.generation.version === 'v3' && c.authority_complete === false
       && c.freshness === 'source_as_of_only' && typeof c.read_consistent === 'boolean'
       && c.binding_prefix === c.generation.timeseries_binding_index_prefix
       && Array.isArray(c.scopes) && c.scopes.length <= scopeLimit
-      && Array.isArray(c.provenance) && c.provenance.length <= LIMITS.metadata_gets
+      && Array.isArray(c.provenance) && c.provenance.length <= getLimit
       && c.provenance.every(r => (canonicalReference(r), true))
       && Array.isArray(c.diagnostics) && c.diagnostics.length <= LIMITS.metadata_gets
       && c.diagnostics.every(diagnostic),
@@ -215,7 +221,8 @@ export function assertReconciliationReport(report, { controlRead = null } = {}) 
       assertIdentity(item.identity);
       evidence(scopeId.test(item.scope_key) && item.scope_key === `${monthKey(item.identity, item.day_utc.slice(0, 7))}:${item.day_utc}`
         && instant(`${item.day_utc}T00:00:00.000Z`)
-        && item.state === 'metadata_only' && !canonicalScopes.has(item.scope_key)
+        && (modern ? ['metadata_only', 'not_inspected_partition', 'not_inspected_resource_limit'].includes(item.state)
+          : item.state === 'metadata_only') && !canonicalScopes.has(item.scope_key)
         && Array.isArray(item.diagnostics) && item.diagnostics.length <= LIMITS.metadata_gets
         && item.diagnostics.every(diagnostic)
         && (item.physical === undefined || ['present', 'authoritative_absent'].includes(item.physical.membership))
@@ -253,6 +260,8 @@ export function assertReconciliationReport(report, { controlRead = null } = {}) 
       }
       if (item.binding !== undefined) canonicalReference(item.binding);
       if (item.verification !== undefined) {
+        evidence(!modern || item.verification.state !== 'overlay_metadata_verified',
+          'invalid_report', 'Stage 3C has no independently authenticated accepted-overlay transition adapter');
         keys(item.verification, ['state'], ['manifest', 'entry', 'scope_sha256']);
         evidence(['embedded_status_requires_writer_evidence', 'overlay_metadata_verified',
           'overlay_authoritative_connector_unresolved', 'unknown_verification_transition_state',
@@ -274,6 +283,7 @@ export function assertReconciliationReport(report, { controlRead = null } = {}) 
       canonicalScopes.set(item.scope_key, item);
     }
     if (stage3c) assertSourceAsOf(c, report);
+    if (modern) assertInspectionCapacity(c, report);
   }
   const hasRegisteredAuthority = s => report.changes.some(c => c.registered && c.scopes.some(x =>
     x.scope_key === s.scope_key && (!stage3c || currentScopeMatch(c, x, report.canonical) === 'matches')));
@@ -325,7 +335,7 @@ export function assertReconciliationReport(report, { controlRead = null } = {}) 
     evidence(same(m.retained_change_ids, expected), 'invalid_report', 'month retained-change membership is contradictory');
   }
   evidence(Object.values(report.resources).every(safe)
-    && report.resources.metadata_gets <= LIMITS.metadata_gets
+    && report.resources.metadata_gets <= getLimit
     && report.resources.derived_gets <= (stage3c ? 3 : 2) * LIMITS.receipt_references
     && report.resources.derived_bytes + report.resources.metadata_bytes + report.resources.decompressed_bytes <= LIMITS.total_bytes
     && report.resources.rows <= LIMITS.total_rows
@@ -365,8 +375,8 @@ function assertSourceAsOf(c, report) {
   evidence(s.state === (c.read_consistent ? 'bounded_metadata_recheck_passed' : 'fresh_inspection_required')
     && s.identity_sha256 === sha256Hex(canonicalJson(s.boundary))
     && same(s.boundary.generation, c.generation) && same(s.boundary.metadata, c.provenance)
-    && same(s.boundary.scope_keys, c.scopes.map(x => x.scope_key).sort())
-    && set(s.boundary.unavailable_metadata_keys) && s.boundary.unavailable_metadata_keys.length <= LIMITS.metadata_gets
+    && same(s.boundary.scope_keys, c.schema_version === 3 ? c.selection?.selected_scope_keys : c.scopes.map(x => x.scope_key).sort())
+    && set(s.boundary.unavailable_metadata_keys) && s.boundary.unavailable_metadata_keys.length <= (c.schema_version === 3 ? INSPECTION_MAX_METADATA_GETS : LIMITS.metadata_gets)
     && same(c.provenance.map(r => r.key), [...new Set(c.provenance.map(r => r.key))].sort())
     && !s.boundary.unavailable_metadata_keys.some(key => c.provenance.some(r => r.key === key))
     && instant(s.started_at_utc) && instant(s.finished_at_utc) && s.started_at_utc <= s.finished_at_utc
@@ -411,7 +421,8 @@ function assertStage3C(report) {
         'invalid_report', 'Complete original event drops or duplicates physical scopes');
     }
     return { event_id: g.event_id, authority: g.authority, scope_count: g.scope_count,
-      group_sha256: g.group_sha256, expected_changes: g.expected_changes };
+      group_sha256: g.group_sha256, expected_changes: g.expected_changes,
+      ...(report.schema_version === 3 ? { expected_scope_keys: g.expected_scope_keys } : {}) };
   });
   const d = result.discovery;
   if (d !== null) {
@@ -436,4 +447,82 @@ function assertStage3C(report) {
   }
   evidence(same(result, assessStage3C({ changes: report.changes, canonical: report.canonical, originalGroups, discovery: d })),
     'invalid_report', 'Stage 3C currentness/coverage contradicts its independently inspectable evidence');
+}
+
+function assertInspectionCapacity(c, report) {
+  evidence(Array.isArray(report.stage3c?.original_events), 'invalid_report', 'Original event coverage table required');
+  const wanted = planInspection(c.scopes.map(s => ({ identity: s.identity, day_utc: s.day_utc })),
+    c.selection?.selected_partition, c.page_scope_limit);
+  evidence(same(c.selection, wanted), 'invalid_report', 'Missing, overlapping or contradictory inspection partitions');
+  const selected = new Set(wanted.selected_scope_keys), all = new Set(c.scopes.map(s => s.scope_key));
+  for (const change of report.changes) for (const s of change.scopes)
+    evidence(all.has(s.scope_key), 'invalid_report', 'Original receipt scope omitted from full inspection accounting');
+  for (const group of report.stage3c.original_events) {
+    evidence(set(group.expected_scope_keys) && group.expected_scope_keys.length === group.scope_count
+      && group.expected_scope_keys.every(key => scopeId.test(key) && all.has(key)),
+    'invalid_report', 'Complete original event membership omitted from inspection accounting');
+    const authenticated = report.changes.filter(change => change.authentication?.original_acceptance?.event_id === group.event_id
+      && change.authentication.authenticated).flatMap(change => change.scopes.map(s => s.scope_key));
+    evidence(authenticated.every(key => group.expected_scope_keys.includes(key)), 'invalid_report', 'Original group physical scope identity mismatch');
+  }
+  for (const s of c.scopes) evidence(selected.has(s.scope_key) ? s.state !== 'not_inspected_partition'
+    : s.state === 'not_inspected_partition' && s.diagnostics.length === 0 && !s.physical && !s.binding && !s.verification && !s.observations,
+  'invalid_report', 'Unselected scopes cannot carry current-inspection authority');
+  const p = planMetadataRequests(c.scopes.filter(s => selected.has(s.scope_key)), c.generation), cap = c.capacity;
+  keys(cap, ['deterministic_keys', 'status_manifest_allowance', 'initial_get_allowance', 'metadata_get_allowance',
+    'metadata_get_limit', 'initial_gets', 'recheck_gets', 'closing_root_gets', 'cache_bytes', 'peak_concurrency',
+    'initial_bytes', 'recheck_bytes', 'closing_root_bytes', 'previous_metadata_bytes',
+    'previous_metadata_gets', 'initial_keys', 'recheck_keys', 'concurrency_limit', 'cache_byte_limit', 'elapsed_ms', 'duration_limit_ms']);
+  evidence(Object.entries(p).every(([key, value]) => same(cap[key], value))
+    && set(cap.initial_keys) && set(cap.recheck_keys) && cap.initial_gets === cap.initial_keys.length
+    && cap.recheck_gets === cap.recheck_keys.length && cap.recheck_keys.every(key => cap.initial_keys.includes(key))
+    && [0, 1].includes(cap.closing_root_gets) && safe(cap.previous_metadata_gets)
+    && Number.isSafeInteger(cap.metadata_get_limit) && cap.metadata_get_limit > 0
+    && cap.metadata_get_limit <= p.metadata_get_allowance && cap.metadata_get_limit <= INSPECTION_MAX_METADATA_GETS
+    && c.resources.metadata_gets === cap.previous_metadata_gets + cap.initial_gets + cap.recheck_gets + cap.closing_root_gets
+    && [cap.previous_metadata_bytes, cap.initial_bytes, cap.recheck_bytes, cap.closing_root_bytes].every(safe)
+    && c.resources.metadata_bytes === cap.previous_metadata_bytes + cap.initial_bytes + cap.recheck_bytes + cap.closing_root_bytes
+    && c.resources.metadata_gets <= cap.metadata_get_limit
+    && cap.concurrency_limit === INSPECTION_CONCURRENCY && safe(cap.peak_concurrency) && cap.peak_concurrency <= cap.concurrency_limit
+    && cap.cache_byte_limit === LIMITS.metadata_bytes && safe(cap.cache_bytes) && cap.cache_bytes <= cap.cache_byte_limit
+    && cap.cache_bytes <= c.resources.metadata_bytes && safe(cap.elapsed_ms)
+    && Number.isSafeInteger(cap.duration_limit_ms) && cap.duration_limit_ms > 0 && cap.duration_limit_ms <= LIMITS.duration_ms
+    && (!c.read_consistent || cap.elapsed_ms <= cap.duration_limit_ms),
+  'invalid_report', 'Metadata plan, concurrency, cache, deadline or GET accounting bypass');
+  const connectorIds = new Set(c.scopes.filter(s => selected.has(s.scope_key)).map(s => s.identity.connector_id));
+  const overlay = key => [...connectorIds].some(id => new RegExp(`^history/v3/verification/connector_id=${id}/manifests/[a-f0-9]{64}\\.json$`).test(key));
+  evidence(cap.initial_keys.every(key => p.deterministic_keys.includes(key) || overlay(key))
+    && cap.initial_keys.filter(overlay).length <= p.status_manifest_allowance
+    && c.provenance.every(ref => cap.initial_keys.includes(ref.key))
+    && c.source_as_of.boundary.unavailable_metadata_keys.every(key => cap.initial_keys.includes(key)),
+  'invalid_report', 'Metadata read outside selected physical-scope plan');
+  evidence(Array.isArray(c.recheck_evidence)
+    && same(c.recheck_evidence.map(e => e.key), cap.initial_keys), 'invalid_report', 'Missing or duplicate metadata recheck evidence');
+  const originals = new Map(c.provenance.map(ref => [ref.key, ref]));
+  const absent = new Set(c.source_as_of.boundary.unavailable_metadata_keys);
+  for (const e of c.recheck_evidence) {
+    keys(e, ['key', 'state', 'current']);
+    evidence(['matched', 'changed', 'unavailable', 'not_rechecked'].includes(e.state)
+      && (cap.recheck_keys.includes(e.key) || e.state === 'not_rechecked'), 'invalid_report', 'Invented metadata recheck');
+    if (e.current !== null) {
+      canonicalReference(e.current); evidence(e.current.key === e.key, 'invalid_report', 'Recheck changed object key');
+    }
+    if (e.state === 'matched') evidence(originals.has(e.key) ? same(originals.get(e.key), e.current)
+      : absent.has(e.key) && e.current === null, 'invalid_report', 'Recheck identity does not match initial byte authority');
+    if (e.state === 'changed') evidence(originals.has(e.key) ? !same(originals.get(e.key), e.current)
+      : !absent.has(e.key) || e.current !== null, 'invalid_report', 'False metadata drift');
+    if (['unavailable', 'not_rechecked'].includes(e.state)) evidence(e.current === null, 'invalid_report', 'Unavailable recheck claims byte authority');
+  }
+  if (c.closing_root !== null) {
+    canonicalReference(c.closing_root);
+    evidence(cap.closing_root_gets === 1 && c.closing_root.key === c.generation.observations_root_key,
+      'invalid_report', 'Missing closing root GET');
+  }
+  if (c.read_consistent) evidence(c.recheck_evidence.every(e => e.state === 'matched')
+    && same(cap.initial_keys, cap.recheck_keys) && cap.closing_root_gets === 1
+    && same(c.closing_root, c.source_as_of.observations_root)
+    && cap.initial_bytes === c.provenance.reduce((n, ref) => n + ref.byte_size, 0)
+    && cap.cache_bytes === cap.initial_bytes && cap.recheck_bytes === cap.initial_bytes
+    && cap.closing_root_bytes === c.closing_root.byte_size,
+  'invalid_report', 'Incomplete rechecks or contradictory byte accounting cannot establish source-as-of consistency');
 }
