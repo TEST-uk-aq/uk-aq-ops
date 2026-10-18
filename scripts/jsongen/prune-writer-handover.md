@@ -12,6 +12,9 @@ binding closure to a versioned extension of the same schema-1 final envelope.
 It supersedes the earlier missing-before/binding capture boundary for eligible
 new first-publication events only. Legacy/incomplete events remain blocked;
 PR #112 still needs its independent extension decoder before receipt creation.
+The hardened representation uses nested version-2 markers and a shared bounded
+gzip metadata payload inside the unchanged outer schema-1 envelope. See that
+amendment for eight-worker capture, UUID lock binding and capacity priority.
 
 ## Capacity and complete source
 

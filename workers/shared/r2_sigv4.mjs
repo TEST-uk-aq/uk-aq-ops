@@ -261,6 +261,9 @@ export async function fetchWithTimeout(
     ? Math.trunc(Number(timeoutMs))
     : DEFAULT_FETCH_TIMEOUT_MS;
   const controller = new AbortController();
+  const abortFromCaller = () => controller.abort(init.signal.reason);
+  if (init.signal?.aborted) abortFromCaller();
+  else init.signal?.addEventListener('abort', abortFromCaller, { once: true });
   const method = String(init.method || "GET").toUpperCase();
   let timedOut = false;
   const timer = setTimeout(() => {
@@ -293,6 +296,7 @@ export async function fetchWithTimeout(
     throw error;
   } finally {
     clearTimeout(timer);
+    init.signal?.removeEventListener('abort', abortFromCaller);
   }
 }
 
@@ -673,7 +677,7 @@ export async function r2HeadObject({ r2, key, accept_encoding_identity = false, 
 // One-attempt bounded GET, including response-body consumption. Existing buffered
 // callers are unchanged. Adapters must explicitly implement bounded acquisition;
 // falling back to getObject would allocate an unbounded body before admission.
-export async function r2GetObjectBounded({ r2, key, max_bytes, timeout_ms = R2_REQUEST_TIMEOUT_MS }) {
+export async function r2GetObjectBounded({ r2, key, max_bytes, timeout_ms = R2_REQUEST_TIMEOUT_MS, signal }) {
   if (!Number.isSafeInteger(max_bytes) || max_bytes <= 0 ||
       !Number.isSafeInteger(timeout_ms) || timeout_ms <= 0 || timeout_ms > R2_REQUEST_TIMEOUT_MS) {
     throw new TypeError("Bounded R2 GET requires positive byte and timeout budgets");
@@ -691,21 +695,30 @@ export async function r2GetObjectBounded({ r2, key, max_bytes, timeout_ms = R2_R
     }
     const controller = new AbortController();
     let timer;
+    let rejectAbort;
+    const abortFromCaller = () => {
+      controller.abort(signal.reason);
+      rejectAbort?.(signal.reason || new Error('Bounded R2 GET aborted'));
+    };
     try {
+      const aborted = new Promise((_, reject) => { rejectAbort = reject; });
+      if (signal?.aborted) throw signal.reason || new Error('Bounded R2 GET aborted');
+      signal?.addEventListener('abort', abortFromCaller, { once: true });
       return validate(await Promise.race([
         r2.adapter.getObjectBounded({ key, max_bytes, signal: controller.signal }),
+        aborted,
         new Promise((_, reject) => { timer = setTimeout(() => {
           controller.abort();
           reject(new Error("Bounded R2 GET deadline exceeded"));
         }, timeout_ms); }),
       ]));
-    } finally { clearTimeout(timer); }
+    } finally { clearTimeout(timer); signal?.removeEventListener('abort', abortFromCaller); }
   }
   const request = buildAwsSignedRequest({ method: "GET", endpoint: r2.endpoint,
     region: r2.region, accessKeyId: r2.access_key_id, secretAccessKey: r2.secret_access_key,
     bucket: r2.bucket, objectKey: key });
   return await fetchWithTimeout(request.url, {
-    method: "GET", headers: request.headers, redirect: "error",
+    method: "GET", headers: request.headers, redirect: "error", signal,
   }, timeout_ms, globalThis.fetch, async (response) => {
     if (!response.ok) {
       await response.body?.cancel();

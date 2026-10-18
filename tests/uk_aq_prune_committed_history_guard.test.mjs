@@ -19,6 +19,16 @@ import { preparePruneOriginalAuthorityExtension, createPruneOriginalMetadataCapt
 import { describePrunePendingSource } from '../scripts/jsongen/prune-evidence.mjs';
 import { preparePruneOriginalFinalEvidence } from '../scripts/jsongen/prune-final-evidence.mjs';
 import { describePruneGateOutboxEvidence } from '../scripts/jsongen/prune-outbox.mjs';
+import { decodePruneMetadataEvidence, compactPruneMetadataEvidence } from '../scripts/jsongen/prune-metadata-codec.mjs';
+import { observationsGlobalOperationLockIdentity, OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV } from '../workers/shared/uk_aq_r2_history_writer.mjs';
+
+function originalLockEnv(runId) {
+  const identity = observationsGlobalOperationLockIdentity();
+  const values = { held: 'true', owner: 'prune_daily', runId, logicalIdentity: identity.logical_identity,
+    classId: String(identity.class_id), objectId: String(identity.object_id), nonce: 'test-nonce',
+    acquired: 'true', waitMs: '0', outcome: 'held' };
+  return Object.fromEntries(Object.entries(values).map(([key, value]) => [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV[key], value]));
+}
 import { buildTimeseriesBindingSourceRootManifest, buildTimeseriesBindingSourceRangeManifest,
   timeseriesBindingSourceRangeManifestKey, TIMESERIES_BINDING_SOURCE_REFRESH_STATE_KIND,
 } from '../scripts/backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs';
@@ -178,26 +188,30 @@ test("first publication ignores unreferenced connector objects and can reach wri
 
 // Small metadata-only fixture for the existing real admission and bounded GET
 // seams. No signer, Parquet, database or network is involved.
-async function originalAuthorityPublication(bindingFailure = null) {
+async function originalAuthorityPublication(bindingFailure = null, scopeCount = 1) {
   const prior = history([{ ...row('pm25', 801), connector_id: 8 }], 8);
   const objects = prior.objects;
-  const frozenRow = { ...row('pm25', 102), connector_id: 1 };
-  const sourceIdentity = computePruneConnectorSourceIdentity([frozenRow]);
-  const scopes = [{ timeseries_id: 102, station_id: 71, pollutant_code: 'pm25', day_utc: dayUtc, row_count: 1 }];
+  const frozenRows = Array.from({ length: scopeCount }, (_, i) => ({ ...row('pm25', 102 + i), connector_id: 1 }));
+  const frozenRow = frozenRows[0];
+  const sourceIdentity = computePruneConnectorSourceIdentity(frozenRows);
+  const scopes = frozenRows.map(r => ({ timeseries_id: r.timeseries_id, station_id: r.station_id, pollutant_code: r.pollutant_code, day_utc: dayUtc, row_count: 1 }));
   const bindingPrefix = 'history/_index_v3/timeseries_binding';
   const bindingKey = `${bindingPrefix}/timeseries_id=102.json`;
-  const bindingBody = canonicalJson({ schema_version: 1, history_version: 'v2', index_kind: 'timeseries_binding',
-    connector_id: 1, timeseries_id: 102, station_id: bindingFailure === 'identity' ? 99 : 71, pollutant_code: 'pm25' });
-  const range = buildTimeseriesBindingSourceRangeManifest({ bindingPrefix, rangeStart: 0,
-    units: [{ timeseries_id: 102, relative_path: bindingKey, sha256: sha256Hex(bindingBody), size: bindingBody.length }] });
+  const units = scopes.map(scope => {
+    const key = `${bindingPrefix}/timeseries_id=${scope.timeseries_id}.json`;
+    const body = canonicalJson({ schema_version: 1, history_version: 'v2', index_kind: 'timeseries_binding',
+      connector_id: 1, timeseries_id: scope.timeseries_id, station_id: bindingFailure === 'identity' ? 99 : 71, pollutant_code: 'pm25' });
+    objects.set(key, body);
+    return { timeseries_id: scope.timeseries_id, relative_path: key, sha256: sha256Hex(body), size: body.length };
+  });
+  const range = buildTimeseriesBindingSourceRangeManifest({ bindingPrefix, rangeStart: 0, units });
   const rangeKey = timeseriesBindingSourceRangeManifestKey(bindingPrefix, 0);
   const root = buildTimeseriesBindingSourceRootManifest({ bindingPrefix,
-    ranges: [{ range_start: 0, range_end: 999, manifest_key: rangeKey, source_range_hash: range.source_range_hash, unit_count: 1 }] });
+    ranges: [{ range_start: 0, range_end: 999, manifest_key: rangeKey, source_range_hash: range.source_range_hash, unit_count: scopeCount }] });
   const source = buildTimeseriesBindingSourceState({ bindingPrefix, sourceSchema: 'uk_aq_core',
-    sourceFingerprint: 'f'.repeat(64), authoritativeTimeseriesCount: 1,
-    sourceTables: ['timeseries', 'phenomena', 'observed_properties'].map(table => ({ table, row_count: 1, sha256_uncompressed: 'd'.repeat(64) })) });
+    sourceFingerprint: 'f'.repeat(64), authoritativeTimeseriesCount: scopeCount,
+    sourceTables: ['timeseries', 'phenomena', 'observed_properties'].map(table => ({ table, row_count: table === 'timeseries' ? scopeCount : 1, sha256_uncompressed: 'd'.repeat(64) })) });
   const bindingRootKey = `${bindingPrefix}/_manifests/root.json`;
-  objects.set(bindingKey, bindingBody);
   objects.set(rangeKey, canonicalJson(range));
   objects.set(bindingRootKey, canonicalJson(root));
   objects.set(`${bindingPrefix}/_source_state.json`, canonicalJson(source));
@@ -206,33 +220,40 @@ async function originalAuthorityPublication(bindingFailure = null) {
     source_root_hash: root.source_root_hash, source_fingerprint: source.source_fingerprint }));
   if (bindingFailure === 'missing') objects.delete(bindingRootKey);
   if (bindingFailure === 'oversized') objects.set(bindingRootKey, Buffer.alloc(1024 ** 2 + 1));
+  if (bindingFailure === 'core') objects.set(`${bindingPrefix}/_manifests/_refresh_state.json`, canonicalJson({ schema_version: 1,
+    kind: TIMESERIES_BINDING_SOURCE_REFRESH_STATE_KIND, history_version: 'v2', source_prefix: bindingPrefix,
+    source_root_hash: root.source_root_hash, source_fingerprint: '0'.repeat(64) }));
   const calls = [];
+  let inFlight = 0; let maxInFlight = 0;
   const beforeBytes = (await getObjectFrom(objects)({ key: prior.rootKey })).body;
   const runId = 'ca2a2ad8-c46c-4d65-9ee0-7147f03684eb';
   const result = await writeFrozenCandidateObservationsToV2ForTest({
-    candidate: { day_utc: dayUtc, connector_id: 1, expected_row_count: 1n },
+    candidate: { day_utc: dayUtc, connector_id: 1, expected_row_count: BigInt(scopeCount) },
     runtime: { run_id: runId, environment: 'TEST', writer_git_sha: 'a'.repeat(40),
       history_write_version: 'v3', committed_prefix: prefix,
       run_budget: createPhaseBRunBudgetForTest({ nowMs: () => 0, startedAtMs: 0, maxSecondsPerRun: 1740, stopBeforeTimeoutSeconds: 60 }),
       jsongen_pending_source: { enabled: true, signer: {} }, logStructured: () => {},
       r2: { bucket: 'canonical-test', adapter: { async getObjectBounded({ key }) {
         if (bindingFailure === 'deadline') throw new Error('Bounded R2 GET deadline exceeded');
-        calls.push(key); const object = await getObjectFrom(objects)({ key });
-        return { ...object, bytes: object.body.length };
+        calls.push(key); inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
+        try {
+          if (bindingFailure === 'concurrent') await new Promise(resolve => setImmediate(resolve));
+          const object = await getObjectFrom(objects)({ key });
+          return { ...object, bytes: object.body.length };
+        } finally { inFlight--; }
       } } } },
     streamClient: {}, frozen: { temp: { ndjsonPath: 'unused' }, counts: {}, sourceIdentity },
-    originalAuthorityLockContext: { valid: true, owner: 'prune_daily', run_id: 'original-lock-session',
-      logical_identity: 'uk_aq:r2_history:v2:observations_global_operation' },
+    originalAuthorityLockEnv: originalLockEnv(runId),
     admitSnapshot: args => admitPruneFrozenConnectorSnapshot({ ...args,
       ...(bindingFailure === 'before' ? { onOriginalAuthority: undefined } : {}) }),
     readAdmissionObject: async args => { calls.push(args.key); return getObjectFrom(objects)(args); },
-    readFrozenRows: async function* () { yield frozenRow; },
+    readFrozenRows: async function* () { yield* frozenRows; },
     uploadPendingSource: async () => { calls.push('upload'); return { state: 'put_acknowledged_unverified',
       pending_evidence: { scope: { physical_timeseries_days: scopes } } }; },
     connectorPublisher: async () => { calls.push('publish'); objects.set(prior.rootKey, Buffer.from('{"new":"root"}'));
       return { file_count: 1, total_bytes: 100n }; }, cleanupFrozenSource: () => {},
   });
-  return { result, calls, beforeBytes, runId, scopes, sourceIdentity, frozenRow, bindingKey, bindingRootKey, rootKey: prior.rootKey };
+  return { result, calls, beforeBytes, runId, scopes, sourceIdentity, frozenRow, frozenRows, bindingKey, bindingRootKey, rootKey: prior.rootKey, objects, maxInFlight };
 }
 
 test('original authority captures admitted absence and selected-v3 Core closure before replacement', async () => {
@@ -300,23 +321,24 @@ test('original authority captures admitted absence and selected-v3 Core closure 
       v3_publication: { exact_scopes: [{ ok: true }], latest_global: { ok: true } } } };
   const final = preparePruneOriginalFinalEvidence(finalArgs);
   assert.equal(final.envelope.schema_version, 1);
-  assert.equal(final.envelope.original_authority_extension.schema_version, 1);
+  assert.equal(final.envelope.original_authority_extension.schema_version, 2);
+  const decoded = decodePruneMetadataEvidence(final.envelope);
   assert.equal(final.envelope.original_authority_extension.completeness, 'captured');
-  assert.equal(final.envelope.original_authority_extension.publication.pending_preparation_sha256, pending.preparation_sha256);
-  assert.equal(final.envelope.original_authority_extension.publication.original_final_batch_sha256,
+  assert.equal(decoded.original_authority_extension.publication.pending_preparation_sha256, pending.preparation_sha256);
+  assert.equal(decoded.original_authority_extension.publication.original_final_batch_sha256,
     sha256Hex(canonicalJson(final.envelope.original_final_batch)));
   assert.equal(describePruneGateOutboxEvidence({ pending, connector, finalPreparation: final }).final_evidence_state, 'prepared_unverified');
   assert.deepEqual(JSON.parse(final.bytes).original_authority_extension, final.envelope.original_authority_extension);
   const oversized = preparePruneOriginalFinalEvidence({ ...finalArgs, originalAuthorityCapture: {
     snapshot: () => ({ ...original, objects: [{ ...original.objects[0], bytes_base64: 'a'.repeat(1024 ** 2) }] }) } });
-  assert.equal(oversized.envelope.original_authority_extension.completeness, 'oversized');
+  assert.equal(oversized.envelope.original_metadata_snapshot.completeness, 'not_captured');
   assert.equal(oversized.envelope.original_authority_extension.before.state, 'unavailable');
   assert.equal(oversized.envelope.original_authority_extension.objects, undefined);
   assert.ok(oversized.byte_size <= 1024 ** 2);
 });
 
 test('unavailable contradictory and oversized original authority evidence preserve canonical publication', async () => {
-  for (const [failure, state] of [['missing', 'unavailable'], ['identity', 'contradictory'], ['oversized', 'oversized'], ['before', 'unavailable'], ['deadline', 'unavailable']]) {
+  for (const [failure, state] of [['missing', 'unavailable'], ['identity', 'contradictory'], ['core', 'contradictory'], ['oversized', 'oversized'], ['before', 'unavailable'], ['deadline', 'unavailable']]) {
     const f = await originalAuthorityPublication(failure);
     const original = f.result.jsongen_original_authority.snapshot();
     assert.equal(f.calls.at(-1), 'publish');
@@ -326,6 +348,111 @@ test('unavailable contradictory and oversized original authority evidence preser
     assert.equal(original.completeness, state);
     if (failure === 'deadline') assert.equal(original.binding.reason, 'original_binding_capture_deadline');
   }
+});
+
+test('bounded concurrent original capture covers 433 scopes and lossless inline metadata capacity', async t => {
+  const f = await originalAuthorityPublication('concurrent', 433);
+  const original = f.result.jsongen_original_authority.snapshot();
+  assert.equal(original.completeness, 'captured');
+  assert.equal(original.binding.bindings.length, 433);
+  assert.ok(f.maxInFlight > 1 && f.maxInFlight <= 8);
+  const bindingCalls = f.calls.filter(key => key.startsWith('history/_index_v3/timeseries_binding/'));
+  assert.equal(bindingCalls.length, 433 + 4);
+  assert.equal(new Set(bindingCalls).size, bindingCalls.length);
+  assert.deepEqual(original.binding.bindings.map(b => b.identity.timeseries_id), f.scopes.map(s => s.timeseries_id));
+  // One large but admitted canonical JSON object demonstrates combined capacity;
+  // these synthetic bytes establish no real AURN throughput/size distribution.
+  const body = canonicalJson({ metadata: 'canonical-byte-evidence:'.repeat(30000) });
+  const value = { schema_version: 1, pending_scope_membership: f.scopes,
+    original_metadata_snapshot: { schema_version: 1, completeness: 'exact_writer_metadata_captured_unverified',
+      required_object_count: 1, required_raw_byte_size: body.length,
+      objects: [{ canonical_bucket: 'canonical-test', key: `${prefix}/large.json`, byte_size: body.length,
+        sha256: sha256Hex(body), bytes_base64: body.toString('base64'), roles: ['canonical_manifest'] }] },
+    original_authority_extension: original };
+  const expanded = canonicalJson(value);
+  assert.ok(expanded.length > 1024 ** 2);
+  compactPruneMetadataEvidence(value);
+  const compact = canonicalJson(value);
+  assert.ok(compact.length < 1024 ** 2);
+  const decoded = decodePruneMetadataEvidence(value);
+  assert.deepEqual(decoded.original_authority_extension, original);
+  assert.deepEqual(Buffer.from(decoded.original_metadata_snapshot.objects[0].bytes_base64, 'base64'), body);
+  const repeated = JSON.parse(expanded);
+  compactPruneMetadataEvidence(repeated);
+  assert.deepEqual(value, repeated);
+  assert.throws(() => decodePruneMetadataEvidence({ ...value, original_metadata_evidence:
+    { ...value.original_metadata_evidence, codec: 'unknown' } }), /unsupported_original_metadata_encoding/);
+  assert.throws(() => decodePruneMetadataEvidence({ ...value, original_metadata_evidence:
+    { ...value.original_metadata_evidence, sha256: '0'.repeat(64) } }), /contradictory_original_metadata_encoding/);
+  t.diagnostic(JSON.stringify({ synthetic_scopes: 433, retained_raw_metadata_bytes: body.length + original.required_raw_byte_size,
+    expanded_inline_bytes: expanded.length, compressed_metadata_bytes: value.original_metadata_evidence.byte_size,
+    compact_inline_bytes: compact.length, maximum_concurrency: f.maxInFlight }));
+});
+
+test('original capture deadline aborts in-flight reads and late responses cannot mutate evidence', async () => {
+  const f = await originalAuthorityPublication('concurrent', 40);
+  const manager = createPruneOriginalMetadataCapture();
+  const capture = manager.beginOriginalAuthority(f.result.jsongen_original_authority.snapshot().identity, originalLockEnv(f.runId));
+  const late = []; let aborted = 0;
+  await capture.captureBindings({ physicalScopes: f.scopes, deadlineAtMs: Date.now() + 100,
+    r2: { adapter: { getObjectBounded({ key, signal }) {
+      if (key.includes('/timeseries_id=')) return new Promise(resolve => {
+        signal.addEventListener('abort', () => { aborted++; }, { once: true });
+        late.push(() => { const body = f.objects.get(key); resolve({ body, bytes: body.length }); });
+      });
+      const body = f.objects.get(key); return Promise.resolve({ body, bytes: body.length });
+    } } } });
+  assert.ok(late.length > 0 && late.length <= 8);
+  assert.equal(aborted, late.length);
+  assert.equal(capture.snapshot().binding.reason, 'original_binding_capture_deadline');
+  const settled = canonicalJson(capture.snapshot()); const accounting = manager.statistics();
+  for (const resolve of late) resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(canonicalJson(capture.snapshot()), settled);
+  assert.deepEqual(manager.statistics(), accounting);
+  assert.equal(accounting.retained_bytes, 0);
+});
+
+test('original capture capacity protects final bytes and requires the same validated lock invocation', async () => {
+  const f = await originalAuthorityPublication();
+  const identity = f.result.jsongen_original_authority.snapshot().identity;
+  for (const env of [{ valid: true, owner: 'prune_daily', run_id: f.runId }, originalLockEnv('another-run'),
+    { ...originalLockEnv(f.runId), [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.held]: 'false' }]) {
+    const manager = createPruneOriginalMetadataCapture(); const capture = manager.beginOriginalAuthority(identity, env);
+    let reads = 0;
+    await capture.captureBindings({ physicalScopes: f.scopes, deadlineAtMs: Date.now() + 1000,
+      getObject: async () => { reads++; throw new Error('forbidden'); } });
+    assert.equal(reads, 0); assert.equal(capture.snapshot().binding.reason, 'original_global_lock_context_unavailable');
+  }
+  const contradictory = createPruneOriginalMetadataCapture().beginOriginalAuthority({ ...identity,
+    source_identity: computePruneConnectorSourceIdentity([f.frozenRow, { ...f.frozenRow, station_id: 999 }]) }, originalLockEnv(f.runId));
+  let physicalReads = 0;
+  await contradictory.captureBindings({ physicalScopes: [f.scopes[0], { ...f.scopes[0], station_id: 999 }],
+    deadlineAtMs: Date.now() + 1000,
+    getObject: async ({ key }) => { if (key === f.bindingKey) physicalReads++; return { body: f.objects.get(key) }; } });
+  // Full scopes are distinct; the one canonical binding object contradicts one
+  // of them. Reject that contradiction, without a timeseries-only scope rule.
+  assert.equal(physicalReads, 1);
+  assert.equal(contradictory.snapshot().binding.reason, 'contradictory_binding_authority');
+  const manager = createPruneOriginalMetadataCapture();
+  const capture = manager.beginOriginalAuthority(identity, originalLockEnv(f.runId));
+  const key = `${prefix}/same-key.json`; const old = canonicalJson({ state: 'original' }); const final = canonicalJson({ state: 'final' });
+  capture.recordBeforeObject({ key, body: old });
+  manager.recordPublishedObject({ key, body: final });
+  assert.deepEqual(Buffer.from(capture.snapshot().objects[0].bytes_base64, 'base64'), old);
+  const accounting = manager.statistics();
+  manager.recordPublishedObject({ key, body: Buffer.alloc(1024 ** 2 + 1) });
+  assert.equal(manager.body(key), null); assert.deepEqual(manager.statistics(), accounting);
+  manager.recordPublishedObject({ key, body: final });
+  const mib = Buffer.from('"' + 'x'.repeat(1024 ** 2 - 2) + '"');
+  for (let i = 0; i < 5; i++) capture.recordBeforeObject({ key: `${prefix}/original-${i}.json`, body: mib });
+  assert.ok(manager.statistics().optional_bytes <= 4 * 1024 ** 2);
+  for (let i = 0; i < 7; i++) manager.recordPublishedObject({ key: `${prefix}/final-${i}.json`, body: mib });
+  assert.deepEqual(manager.statistics(), { retained_bytes: 7 * 1024 ** 2 + final.length, retained_objects: 8,
+    optional_bytes: 0, optional_objects: 0 });
+  assert.equal(capture.snapshot().completeness, 'oversized');
+  assert.equal(capture.snapshot().binding.reason, 'final_metadata_capacity_priority_limit');
+  assert.deepEqual(manager.body(key), final);
 });
 
 test("v3 signed source upload precedes publication and remains unverified", async () => {

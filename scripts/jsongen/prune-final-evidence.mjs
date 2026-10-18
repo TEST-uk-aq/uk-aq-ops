@@ -3,6 +3,7 @@
 import { BUCKET, canonicalJson } from './schema.mjs';
 import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
 import { preparePruneOriginalAuthorityExtension } from './prune-original-metadata.mjs';
+import { compactPruneMetadataEvidence } from './prune-metadata-codec.mjs';
 
 const same = (a, b) => canonicalJson(a).equals(canonicalJson(b));
 const reference = value => value && typeof value.key === 'string'
@@ -154,32 +155,28 @@ export function preparePruneOriginalFinalEvidence({ pending, connector, finaliza
   });
   if (envelope.original_authority_extension.completeness !== 'captured')
     envelope.unresolved.push('original_before_or_binding_authority_not_completely_captured');
-  let bytes = canonicalJson(envelope);
-  if (bytes.length > 1024 * 1024 && envelope.original_authority_extension.objects?.length) {
+  const discardMetadata = (reason, completeSize = null) => {
     const original = envelope.original_authority_extension;
-    envelope.original_authority_extension = {
-      schema_version: 1, kind: original.kind, completeness: 'oversized',
-      reason: 'inline_final_evidence_limit', identity: original.identity,
-      required_object_count: original.required_object_count,
-      required_raw_byte_size: original.required_raw_byte_size,
-      complete_envelope_byte_size: bytes.length,
-      before: { state: 'unavailable', reason: 'original_bytes_exceed_inline_limit' },
-      binding: { state: 'unavailable', reason: 'original_bytes_exceed_inline_limit' },
-    };
-    envelope.unresolved.push('original_before_or_binding_authority_not_completely_captured');
-    bytes = canonicalJson(envelope);
-  }
-  if (bytes.length > 1024 * 1024 &&
-    envelope.original_metadata_snapshot.completeness === 'exact_writer_metadata_captured_unverified') {
-    envelope.original_metadata_snapshot = {
-      schema_version: 1, completeness: 'not_captured',
-      reason: 'metadata_payload_exceeds_1mib',
-      required_object_count: originalMetadataSnapshot.required_object_count,
-      required_raw_byte_size: originalMetadataSnapshot.required_raw_byte_size,
-      required_keys_preview: originalMetadataSnapshot.objects.slice(0, 10).map(object => object.key),
-      complete_envelope_byte_size: bytes.length,
-    };
-    envelope.unresolved.push('original_canonical_metadata_bytes_not_completely_captured');
+    envelope.original_metadata_snapshot = { schema_version: 1, completeness: 'not_captured', reason,
+      required_object_count: originalMetadataSnapshot?.required_object_count ?? null,
+      required_raw_byte_size: originalMetadataSnapshot?.required_raw_byte_size ?? null,
+      complete_envelope_byte_size: completeSize };
+    envelope.original_authority_extension = { schema_version: 1, kind: original.kind,
+      completeness: reason.includes('limit') || reason.includes('exceeds') ? 'oversized'
+        : reason.includes('contradictory') ? 'contradictory' : 'unavailable', reason,
+      before: { state: 'unavailable', reason }, binding: { state: 'unavailable', reason } };
+    delete envelope.original_metadata_evidence;
+    envelope.unresolved.push('original_canonical_metadata_bytes_not_completely_captured',
+      'original_before_or_binding_authority_not_completely_captured');
+  };
+  // Preserve exact outer schema-1 identity fields required by SQL. Nested v2
+  // markers explicitly require the versioned bounded decoder; old readers fail
+  // closed. Compression includes BOTH original and final metadata together.
+  try { compactPruneMetadataEvidence(envelope); }
+  catch (error) { discardMetadata(error.original_authority_code || 'original_metadata_encoding_unavailable'); }
+  let bytes = canonicalJson(envelope);
+  if (bytes.length > 1024 * 1024) {
+    discardMetadata('metadata_payload_exceeds_1mib', bytes.length);
     bytes = canonicalJson(envelope);
   }
   if (bytes.length > 1024 * 1024)

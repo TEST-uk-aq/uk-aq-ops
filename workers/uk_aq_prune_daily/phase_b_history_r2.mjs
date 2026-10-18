@@ -4139,7 +4139,7 @@ async function writeFrozenCandidateObservationsToV2({
   cleanupFrozenSource = cleanupPhaseBTargetDaySourceTemp,
   uploadPendingSource = uploadPrunePendingSource,
   readAdmissionObject = r2GetObject,
-  originalAuthorityLockContext = observationsGlobalOperationLockContext({ expectedOwner: 'prune_daily' }),
+  originalAuthorityLockEnv = process.env,
 }) {
   let jsongenPendingSource = null;
   let jsongenOriginalAuthority = null;
@@ -4178,7 +4178,7 @@ async function writeFrozenCandidateObservationsToV2({
               attempt_id: runtime.run_id, git_sha: runtime.writer_git_sha },
             connector_id: candidate.connector_id, day_utc: candidate.day_utc,
             source_identity: frozen.sourceIdentity,
-          }, originalAuthorityLockContext) || null;
+          }, originalAuthorityLockEnv) || null;
       }
       const admission = await admitSnapshot({
         r2: runtime.r2,
@@ -7080,12 +7080,20 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
   };
 }
 
+// Reuse the UUID of the existing supervised operation. Old/non-UUID or absent
+// contexts keep canonical behaviour but cannot qualify optional original proof.
+export function resolvePrunePhaseBRunId(env = process.env) {
+  const context = observationsGlobalOperationLockContext({ env, expectedOwner: 'prune_daily' });
+  return context.valid && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(context.run_id)
+    ? context.run_id : randomUUID();
+}
+
 export async function runPhaseBBackup({
   dryRun,
   phaseB,
   ingestRetentionDays = DEFAULT_INGESTDB_RETENTION_DAYS,
   logStructured,
-  runId = randomUUID(),
+  runId = resolvePrunePhaseBRunId(),
   nowUtc = nowIso(),
   nowMs = Date.now,
   createPgClient = (config) => new Client(config),

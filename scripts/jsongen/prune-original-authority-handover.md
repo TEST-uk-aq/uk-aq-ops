@@ -51,7 +51,21 @@ from the published source. Original and final versions of the same key occupy
 separate capture slots. Exact bodies are copied before replacement, with canonical
 bucket/key, length and SHA-256. Retention callbacks cannot alter admission.
 
-The schema-1 final envelope has one additive field:
+The outer final envelope and SQL event remain schema 1. The wire representation
+now uses nested **schema-2 markers** for `original_metadata_snapshot` and
+`original_authority_extension`, each naming `inline_original_metadata_gzip_v1`
+and the uncompressed evidence digest. `original_metadata_evidence` is a version-1
+`canonical_json_gzip_v1` descriptor with compressed/uncompressed SHA-256 and lengths,
+and base64 of the gzip bytes. It contains both complete logical metadata objects
+in one deterministic canonical-JSON payload; repeated identities/references and
+base64 bodies compress together without losing a byte. No mutable-key lookup or
+external store substitutes for original bytes.
+
+`decodePruneMetadataEvidence()` validates codec/version, exact compressed bytes,
+bounded decompression, canonical JSON, marker agreement, every raw object's
+size/SHA/base64 and the combined raw byte/object counts. It returns the original
+schema-1 logical snapshot and extension. It is a transport decoder, not writer
+or canonical authentication. The decoded logical extension is:
 
 ```text
 original_authority_extension
@@ -85,8 +99,14 @@ An entirely unavailable or oversized extension can contain only its version,
 kind, reason and bounded diagnostics. A consumer must require the complete form.
 `captured` means original bytes and relationships were retained, not independent
 authentication or VERIFIED. The final-batch hash uses existing `canonicalJson`.
-Source/event identities are unchanged. Original P/R/null and explicit unavailable
-provider source-status provenance are unchanged.
+The source hash semantics and existing event/reference schemas are unchanged;
+old events are never rewritten. New supervised runs generate a UUID before
+acquiring the existing lock and reuse it for Phase B. The real inherited lock
+context is validated with `expectedOwner=prune_daily` and the exact original
+Prune UUID, including held/acquired, nonce, lock IDs and outcome. A caller's
+`valid=true`, wrong invocation or legacy nonmatching supervisor ID is insufficient.
+The supervisor's existing session-loss termination is unchanged; there is no new
+lock or query. Original P/R/null and unavailable provider provenance are unchanged.
 
 ## Binding ownership and closure
 
@@ -98,9 +118,13 @@ Snapshot chain in `uk_aq_core_snapshot_to_r2.mjs`,
 semantics; the selected-v3 physical prefix is exclusively
 `history/_index_v3/timeseries_binding/`.
 
-That separate publisher owns the same global operation lock. It reconciles
-physical bindings, publishes ranges/root, then refresh state, and commits its
-`_source_state.json` completion marker last. The original Prune writer now takes
+That separate publisher owns the same global operation lock. Reviewed actual
+order: physical reconciliation, changed ranges, root, refresh state, then source
+state PUT/readback **when a new eligible Core proposal is being committed**.
+`refreshAndCommitTimeseriesBindingSource` can instead reuse an already committed
+matching source state; it does not unconditionally rewrite that marker last.
+Both branches require the retained source fingerprint and refresh/root hash to
+agree. A hierarchy-only refresh is not a new Core reconciliation attestation. The original Prune writer now takes
 a bounded metadata-only snapshot after pending PUT acknowledgement and before
 canonical observation replacement, while its original global lock remains held:
 
@@ -123,29 +147,62 @@ repair to an already incomplete original event.
 
 ## Resource and failure behaviour
 
-Before, binding and final metadata share the original **8 MiB raw / 4,096 object /
-1 MiB per object** capture envelope, counting distinct retained versions of a key.
-The final evidence remains **1 MiB total**, including base64 and source membership.
-Base64 adds roughly one third; per-scope references also consume inline capacity.
-The pending source remains 1,024 scopes, 100,000 rows, 32 MiB raw and 8 MiB gzip;
-the general receipt/consumer limit remains 128 scopes.
+Before, binding and final metadata still share **8 MiB raw / 4,096 retained
+versions / 1 MiB per object**. Original capture has an explicit shared allocation
+of at most **4 MiB / 2,048 versions**, leaving at least half initially available
+for final metadata. Final canonical metadata has priority: if necessary, the
+capture releases whole original groups, marks them `oversized` with
+`final_metadata_capacity_priority_limit`, and admits final bytes within the
+unchanged global limits. No partial original group remains complete. Failed
+replacement is atomic: retained bytes/counts are unchanged and stale final bytes
+are hidden until a valid replacement is admitted. Original/final versions of
+mutable keys stay separate; contradictory original rereads cannot overwrite them.
 
-Binding capture makes only bounded JSON GETs: at most `3 + distinct ranges +
-physical scopes`, with caching inside the attempt. No listing, HEAD, PUT, Core
-table read or Parquet access occurs. GETs use `r2GetObjectBounded`, the remaining
-capture byte allowance and the remaining time in the **same original 15-second
-optional signer/PUT episode**. Existing canonical publication/finalisation headroom
-is rechecked before requests. No new reserve or deadline extension is introduced.
-Large daily sources may fail the time/byte envelope; accepted maximum throughput
-and full-AURN sizes have not been measured by this code-only task.
+The immutable outbox remains **1 MiB total**, including the source description,
+outer identities/relationships, codec descriptor and compressed metadata base64.
+The codec separately bounds its canonical JSON representation to **16 MiB**:
+this accounts for base64/descriptor expansion of the existing 8 MiB raw envelope,
+not an increase in raw capture or outbox capacity. Decoding checks the same
+8 MiB / 4,096 / 1 MiB raw limits. If the entire encoded envelope cannot fit, all
+required metadata is classified `not_captured`, final bytea is null, and the
+optional gate-only event may still commit. No partial payload is presented as
+complete. Unknown encodings, corrupt bytes and incomplete authority fail closed.
 
-Failure states distinguish unavailable bytes/lock context, genuinely absent
-binding metadata, contradictory physical/closure identities, deadlines and size
-limits. None establishes an empty before-state. On inline overflow the entire
-authority payload is replaced with explicit `oversized` diagnostics; no subset is
-presented as complete. Legacy final evidence may still fit and be retained, with
-this event ineligible for receipts. If legacy metadata also exceeds its existing
-limit, the existing `not_captured` / null-bytea outbox behaviour remains.
+A deterministic synthetic 433-scope check with one large admitted canonical JSON
+object retained **882,649 raw metadata bytes**. Its expanded inline form was
+**1,725,771 bytes**, its compressed metadata **79,779 bytes**, and its compact
+illustrative envelope **151,052 bytes**. These exact structural sizes show the
+codec benefit for that fixture; they establish neither real AURN distributions
+nor a guaranteed maximum. Incompressible bytes, large continuity objects, very
+large parents, many ranges and the rest of the source/envelope still compete for
+capacity. **1,024 scopes are not guaranteed to fit.** Pending limits remain
+1,024 scopes, 100,000 rows, 32 MiB raw / 8 MiB gzip; downstream receipts remain
+128 scopes with their existing coupled operation/byte limits.
+
+Binding collection uses **eight fixed workers**, first deduplicating/validating
+applicable ranges, then collecting physical bindings. Root/source/refresh reads
+are a fixed group of three. Reads and parses are memoized by exact key; original
+byte identities are cached. Binding requests total at most `3 + distinct ranges
++ distinct physical keys`. Full `(connector, timeseries, station, pollutant, day)`
+scope identity and exact complete source row totals are checked. There is no
+upfront timeseries-only scope uniqueness rule. The namespace has one physical
+binding key per timeseries; every declared full scope must match that same
+root/range-pinned object, so conflicting station/pollutant claims are rejected.
+
+Every request uses `r2GetObjectBounded`, its known physical size where available,
+remaining allocation and the remaining time in the **same original 15-second
+optional signer/PUT episode**. Existing canonical headroom is rechecked around
+requests. There is no extra reserve or deadline extension. A shared deadline or
+any collection error aborts outstanding requests; HTTP and adapter paths now
+propagate caller cancellation. Uncooperative adapters are rejected by the capture
+race and an active-state check before retention. Late responses cannot mutate a
+settled capture; partial binding allocations are released. Binding becomes
+captured only after every required object and physical scope validates.
+
+Failure diagnostics distinguish absent metadata, invalid/mismatched lock context,
+unknown prior membership, contradictory Core/root/range/binding identity, timeout,
+and raw/encoded capacity. None establishes an empty before-state. No LIST, HEAD,
+PUT, Core table read, Parquet read or observation re-verification was introduced.
 
 After normal finalisation the extension is bound in memory to the exact original
 source, pending intent preparation, connector publication and final-batch digest.
@@ -159,17 +216,24 @@ and independent authentication outstanding without metadata bodies or source row
 
 ## Exact PR #112 consumer handover
 
-The SQL event, final envelope and post-COMMIT reference remain schema 1. Existing
-strict SQL validations accept the additional field without changing their meaning.
-No new schema migration or Schema PR is necessary. The current PR #112 decoder
-can continue authenticating its legacy snapshot, whose object namespaces and roles
-are unchanged. Its unconditional `PRUNE_RECEIPT_AUTHORITY_GAPS` remains fail closed
-until that PR explicitly implements this extension's independent decoder:
+The SQL event, outer final envelope and post-COMMIT reference remain schema 1;
+all SQL-validated writer/source/gate identity fields remain directly available.
+Existing strict SQL validators are unchanged. No migration or new Schema PR is
+necessary. Nested metadata markers are now version 2 and their codec descriptor
+version 1: PR #112's current strict schema-1 snapshot decoder deliberately rejects
+these new events until it adopts the bounded decoder. Legacy version-1 events
+remain recognizable, with missing or mismatched original authority still blocked.
+The PR #112 branch is unchanged. Its required decoder/admission changes are:
 
-1. Authenticate the immutable original outbox SELECT and all existing source,
-   bytea, writer, pending-private-byte, status and finalisation checks unchanged.
+1. Authenticate the immutable original outbox SELECT and exact outer bytea first.
+   Recognize nested marker version 2 / codec version 1 and use the bounded
+   `decodePruneMetadataEvidence` transport decoder; account compressed, decoded
+   JSON and raw metadata within existing consumer budgets. Then apply existing
+   source, writer, pending-private-byte, status and finalisation checks to the
+   decoded logical snapshot/extension. Do not use decoded shape/hashes as origin
+   proof or weaken existing validators. Unsupported versions remain blocked.
 2. Require extension version/kind, complete states, original event/source identity,
-   original lock relationship, exact source physical scope coverage and publication
+   original lock UUID equal to the Prune invocation/attempt, exact full physical scope coverage and publication
    hashes. Unknown versions, missing extensions and incomplete states stay blocked.
 3. Hash/size-check every retained exact body with bounded accounting. Keep original
    before objects separate from final objects even when their keys match. Never
@@ -187,8 +251,8 @@ Field mapping after those checks:
 
 | Stage 1 field | Retained original representation |
 | --- | --- |
-| `scopes[i].before` | Exact matching `extension.before.scopes[].before` |
-| `source.binding_authority` | `extension.binding.root` (standard four-field byte reference); root/range/physical closure is retained in this authenticated original extension |
+| `scopes[i].before` | Exact matching decoded `extension.before.scopes[].before` |
+| `source.binding_authority` | Decoded `extension.binding.root` (standard four-field byte reference); root/range/physical closure is retained in this authenticated original extension |
 | Final scope/status/source | Existing PR #112 publication/source decoder, additionally bound to `extension.publication` |
 
 No Stage 1 receipt wire-version change is needed for these two fields. Hash/shape
@@ -207,25 +271,30 @@ is issued by this writer.
 
 ## Structural validation and Chat-mode documentation handover
 
-Changed active modules and the focused test file pass `node --check`.
+All eight changed/new active modules and four focused test files pass `node --check`.
 Focused existing checks (Node v24, `--test-isolation=none --test-reporter=tap`):
 
 ```sh
 node --test --test-isolation=none --test-reporter=tap \
-  --test-name-pattern='(original authority captures|unavailable contradictory and oversized|first publication ignores|prior committed 100-row)' \
+  --test-name-pattern='(original authority captures|unavailable contradictory and oversized|bounded concurrent original|original capture deadline|original capture capacity|first publication ignores|prior committed 100-row)' \
   tests/uk_aq_prune_committed_history_guard.test.mjs
 node --test --test-isolation=none --test-reporter=tap \
   --test-name-pattern='(pre-commit final preparation|mismatched signer metadata)' \
   tests/jsongen_prune_pending_source.test.mjs
 UK_AQ_R2_HISTORY_VERSION=v3 node --test --test-isolation=none --test-reporter=tap \
-  --test-name-pattern='(optional Prune outbox|optional evidence constraint|duplicate immutable event|candidate mismatch|unrecoverable outbox|default-off Prune|lost or ROLLBACK|Phase B accepts the real v3|default-off v3|Phase B v3 finalization validation)' \
+  --test-name-pattern='(optional Prune outbox|optional evidence constraint|duplicate immutable event|candidate mismatch|unrecoverable outbox|default-off Prune|lost or ROLLBACK|Phase B accepts the real v3|default-off v3|Phase B v3 finalization validation|Prune Daily CLI orchestration|Prune Daily locked child)' \
   tests/uk_aq_prune_history_gate.test.mjs
+node --test --test-isolation=none --test-reporter=tap \
+  --test-name-pattern='fetchWithTimeout' tests/r2_sigv4.test.mjs
 ```
 
-Results: **4 + 2 + 20 passed**, no failures, cancellations or reported skips.
+Results: **7 + 2 + 22 + 3 = 34 passed**, no failures, cancellations or reported skips.
 Other tests were excluded by name filters. No broad regression suite was run,
 following this task's explicit validation scope. `git diff --check` and new archive
 equivalence checks pass. Existing dated archives were reused without modification.
+The protected candidate/gate/COMMIT function and mandatory v3 finalisation
+validator remain byte-identical to main. Node built-ins provide compression;
+there is no new dependency, configuration name or environment setting.
 
 ChatGPT in Chat mode should document the original pre-PUT admitted-absence capture,
 Core-owned v3 binding closure snapshot, additive versioned extension, shared limits,

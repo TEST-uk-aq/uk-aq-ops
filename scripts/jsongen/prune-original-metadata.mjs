@@ -3,6 +3,7 @@
 import { sha256Hex, r2GetObjectBounded } from '../../workers/shared/r2_sigv4.mjs';
 import { getObservationHistoryGeneration } from '../../workers/shared/uk_aq_observation_history_generation.mjs';
 import { canonicalJson } from './schema.mjs';
+import { observationsGlobalOperationLockContext } from '../../workers/shared/uk_aq_r2_history_writer.mjs';
 import { validateTimeseriesBindingSourceRootManifest, validateTimeseriesBindingSourceRangeManifest,
   TIMESERIES_BINDING_SOURCE_REFRESH_STATE_KIND } from '../backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs';
 import { validTimeseriesBindingSourceState } from '../backup_r2/lib/timeseries_binding_source_state_v2.mjs';
@@ -11,19 +12,36 @@ const SHA = /^[0-9a-f]{64}$/;
 const MAX_CAPTURE_BYTES = 8 * 1024 * 1024;
 const MAX_OBJECT_BYTES = 1024 * 1024;
 const MAX_CAPTURE_OBJECTS = 4096;
+export const PRUNE_BINDING_CAPTURE_CONCURRENCY = 8;
+const OPTIONAL_CAPTURE_BYTES = MAX_CAPTURE_BYTES / 2;
+const OPTIONAL_CAPTURE_OBJECTS = MAX_CAPTURE_OBJECTS / 2;
 
 export function createPruneOriginalMetadataCapture() {
   const bodies = new Map();
+  const groups = new Map();
+  const invalidFinal = new Set();
   let retainedBytes = 0;
+  let optionalBytes = 0;
+  let optionalObjects = 0;
   let originalSequence = 0;
-  const retain = (id, value) => {
+  const release = (id, optional = false) => {
+    const bytes = bodies.get(id);
+    if (!bytes) return;
+    retainedBytes -= bytes.length;
+    if (optional) { optionalBytes -= bytes.length; optionalObjects--; }
+    bodies.delete(id);
+  };
+  const retain = (id, value, optional = false) => {
     const previous = bodies.get(id);
     const size = value?.body?.byteLength ?? Buffer.byteLength(value?.body || '');
     if (!size || size > MAX_OBJECT_BYTES || (!previous && bodies.size >= MAX_CAPTURE_OBJECTS)
-      || retainedBytes - (previous?.byteLength || 0) + size > MAX_CAPTURE_BYTES) return false;
+      || retainedBytes - (previous?.byteLength || 0) + size > MAX_CAPTURE_BYTES
+      || (optional && (optionalBytes - (previous?.length || 0) + size > OPTIONAL_CAPTURE_BYTES
+        || (!previous && optionalObjects >= OPTIONAL_CAPTURE_OBJECTS)))) return false;
     const bytes = Buffer.from(value.body);
     bodies.set(id, bytes);
     retainedBytes += size - (previous?.byteLength || 0);
+    if (optional) { optionalBytes += size - (previous?.length || 0); if (!previous) optionalObjects++; }
     return true;
   };
   return {
@@ -32,22 +50,51 @@ export function createPruneOriginalMetadataCapture() {
         const key = value?.key;
         const body = value?.body;
         if (typeof key !== 'string' || !key.endsWith('.json') || body == null) return;
-        if (!retain(key, { body })) {
-          retainedBytes -= bodies.get(key)?.byteLength || 0;
-          bodies.delete(key);
+        const size = body.byteLength ?? Buffer.byteLength(body);
+        // Final canonical metadata has priority over optional original capture.
+        // Evict whole original groups, explicitly revoking their completeness.
+        if (size > 0 && size <= MAX_OBJECT_BYTES) {
+          for (const [id, group] of groups) {
+            if (retainedBytes - (bodies.get(key)?.length || 0) + size <= MAX_CAPTURE_BYTES
+              && (bodies.has(key) || bodies.size < MAX_CAPTURE_OBJECTS)) break;
+            group.capture.invalidate('final_metadata_capacity_priority_limit');
+            for (const slot of group.slots) release(slot, true);
+            groups.delete(id);
+          }
         }
+        if (!retain(key, { body })) {
+          // Failed replacement keeps accounting atomic, but the old bytes
+          // cannot stand in for the newly offered final version.
+          invalidFinal.add(key);
+        } else invalidFinal.delete(key);
       } catch {
         // Optional evidence capture cannot change a canonical PUT result.
       }
     },
-    body(key) { return bodies.get(key) || null; },
-    beginOriginalAuthority(identity, lockContext) {
+    body(key) { return invalidFinal.has(key) ? null : bodies.get(key) || null; },
+    statistics() { return { retained_bytes: retainedBytes, retained_objects: bodies.size,
+      optional_bytes: optionalBytes, optional_objects: optionalObjects }; },
+    beginOriginalAuthority(identity, lockEnv = process.env) {
       const prefix = `original:${++originalSequence}:`;
-      return originalAuthorityCapture({ identity, lockContext,
-        retain: (phase, value) => retain(`${prefix}${phase}:${value.key}`, value),
+      const group = { slots: new Set(), capture: null };
+      const lockContext = observationsGlobalOperationLockContext({ env: lockEnv,
+        expectedOwner: 'prune_daily', expectedRunId: identity.writer.invocation_id });
+      group.capture = originalAuthorityCapture({ identity, lockContext,
+        retain: (phase, value) => {
+          const slot = `${prefix}${phase}:${value.key}`;
+          if (!retain(slot, value, true)) return false;
+          group.slots.add(slot); return true;
+        },
+        releasePhase: phase => {
+          for (const slot of group.slots) if (slot.startsWith(`${prefix}${phase}:`)) {
+            release(slot, true); group.slots.delete(slot);
+          }
+        },
         body: (phase, key) => bodies.get(`${prefix}${phase}:${key}`) || null,
-        remainingBytes: () => MAX_CAPTURE_BYTES - retainedBytes,
-        remainingObjects: () => MAX_CAPTURE_OBJECTS - bodies.size });
+        remainingBytes: () => Math.min(MAX_CAPTURE_BYTES - retainedBytes, OPTIONAL_CAPTURE_BYTES - optionalBytes),
+        remainingObjects: () => Math.min(MAX_CAPTURE_OBJECTS - bodies.size, OPTIONAL_CAPTURE_OBJECTS - optionalObjects) });
+      groups.set(prefix, group);
+      return group.capture;
     },
   };
 }
@@ -65,29 +112,42 @@ const failureState = reason => reason?.includes('limit') ? 'oversized'
 const physicalIdentity = (scope, connectorId) => ({ connector_id: connectorId,
   timeseries_id: scope.timeseries_id, station_id: scope.station_id, pollutant_code: scope.pollutant_code });
 
-function originalAuthorityCapture({ identity, lockContext, retain, body, remainingBytes, remainingObjects }) {
+function originalAuthorityCapture({ identity, lockContext, retain, body, releasePhase, remainingBytes, remainingObjects }) {
   identity = JSON.parse(JSON.stringify(identity));
   // The existing supervisor owns the session and kills protected children on
   // lock loss. Do not add another lock or claim a local boolean acquired it.
-  const lock = lockContext?.valid === true && lockContext.owner === 'prune_daily'
+  const lock = lockContext?.valid === true && lockContext.held && lockContext.acquired
+    && lockContext.owner === 'prune_daily' && lockContext.run_id === identity.writer.invocation_id
     ? { logical_identity: lockContext.logical_identity, owner: lockContext.owner, run_id: lockContext.run_id }
     : null;
   const keys = new Map();
+  const pins = new Map();
   let admission = null;
   let beforeFailure = null;
   let binding = { state: 'unavailable', reason: 'binding_capture_not_attempted' };
   let scopes = null;
+  let scopeMembershipValid = false;
+  let revoked = null;
+  let bindingJob = null;
+  let beforeOpen = true;
+  let abortCapture = null;
   const record = (phase, value) => {
+    requireOriginal(!revoked, revoked || 'original_capture_closed');
+    const previous = body(phase, value.key);
+    requireOriginal(!previous || previous.equals(Buffer.from(value.body)), 'contradictory_original_metadata_replacement');
+    if (previous) return;
     if (!retain(phase, value)) throw originalError('original_metadata_capture_limit');
     keys.set(`${phase}:${value.key}`, { phase, key: value.key });
   };
   const reference = (phase, key) => {
     const bytes = body(phase, key);
     if (!bytes) throw originalError('original_metadata_bytes_unavailable');
-    return { bucket: identity.canonical_bucket, key, byte_size: bytes.length, sha256: sha256Hex(bytes) };
+    const id = `${phase}:${key}`;
+    if (!pins.has(id)) pins.set(id, { bucket: identity.canonical_bucket, key, byte_size: bytes.length, sha256: sha256Hex(bytes) });
+    return pins.get(id);
   };
   const before = () => {
-    if (!lock || beforeFailure || !admission || !scopes) return { state: failureState(beforeFailure),
+    if (!lock || beforeFailure || !admission || !scopeMembershipValid) return { state: failureState(beforeFailure),
       reason: !lock ? 'original_global_lock_context_unavailable'
         : beforeFailure || 'admitted_original_membership_unavailable' };
     try {
@@ -115,6 +175,10 @@ function originalAuthorityCapture({ identity, lockContext, retain, body, remaini
       reason: error.original_authority_code || 'original_before_unavailable' }; }
   };
   return {
+    invalidate(reason) {
+      revoked = reason; beforeOpen = false; abortCapture?.(); keys.clear(); pins.clear();
+      beforeFailure = reason; binding = { state: failureState(reason), reason };
+    },
     diagnostics() {
       const originalBefore = before();
       return { before_membership_state: originalBefore.state,
@@ -124,104 +188,167 @@ function originalAuthorityCapture({ identity, lockContext, retain, body, remaini
         independent_consumer_authentication: 'outstanding' };
     },
     recordBeforeObject(value) {
+      if (!beforeOpen || !lock) return;
       try { record('before', value); }
       catch (error) { beforeFailure ||= error.original_authority_code || 'original_before_unavailable'; }
     },
     recordBeforeAdmission(value) {
+      if (!beforeOpen || !lock) return;
       try {
         if (admission) throw originalError('contradictory_before_admission');
         admission = JSON.parse(JSON.stringify(value));
       } catch (error) { beforeFailure ||= error.original_authority_code || 'original_before_unavailable'; }
     },
-    async captureBindings({ physicalScopes, r2, deadlineAtMs, admitRequest = () => true,
+    captureBindings({ physicalScopes, r2, deadlineAtMs, admitRequest = () => true,
       getObject = r2GetObjectBounded, nowMs = Date.now }) {
-      try {
-        requireOriginal(lock, 'original_global_lock_context_unavailable');
-        requireOriginal(Array.isArray(physicalScopes) && physicalScopes.length > 0
-          && physicalScopes.length <= 1024, 'original_scope_membership_unavailable');
-        scopes = JSON.parse(JSON.stringify(physicalScopes));
-        const seen = new Set();
-        for (const scope of scopes) {
-          requireOriginal(scope.day_utc === identity.day_utc && Number.isSafeInteger(scope.timeseries_id)
-            && scope.timeseries_id > 0 && Number.isSafeInteger(scope.station_id) && scope.station_id > 0
-            && typeof scope.pollutant_code === 'string' && Number.isSafeInteger(scope.row_count) && scope.row_count > 0
-            && !seen.has(scope.timeseries_id), 'contradictory_physical_scope_membership');
-          seen.add(scope.timeseries_id);
-        }
-        const read = async key => {
-          requireOriginal(key.startsWith(`${GENERATION.timeseries_binding_index_prefix}/`), 'wrong_binding_generation');
-          const cached = body('binding', key);
-          if (!cached) {
-            const timeout = Math.min(15_000, Math.trunc(deadlineAtMs - nowMs()));
-            requireOriginal(timeout > 0 && admitRequest(), 'original_binding_capture_deadline');
-            requireOriginal(remainingObjects() > 0 && remainingBytes() > 0, 'original_metadata_capture_limit');
-            const object = await getObject({ r2, key, max_bytes: Math.min(MAX_OBJECT_BYTES, remainingBytes()), timeout_ms: timeout });
-            record('binding', { key, body: object.body });
-          }
-          let value;
-          try { value = JSON.parse(body('binding', key).toString('utf8')); }
-          catch { throw originalError('contradictory_binding_metadata_json'); }
-          return { value, reference: reference('binding', key) };
+      if (bindingJob) return bindingJob;
+      beforeOpen = false;
+      bindingJob = (async () => {
+        const controller = new AbortController();
+        const reads = new Map();
+        let active = true;
+        let timer;
+        let rejectDeadline;
+        const checkActive = () => requireOriginal(active && !revoked && !controller.signal.aborted
+          && nowMs() < deadlineAtMs && admitRequest(), revoked || 'original_binding_capture_deadline');
+        abortCapture = () => {
+          controller.abort();
+          rejectDeadline?.(originalError(revoked || 'original_binding_capture_deadline'));
         };
-        const prefix = GENERATION.timeseries_binding_index_prefix;
-        const root = await read(`${prefix}/_manifests/root.json`);
-        let rootValue;
-        try { rootValue = validateTimeseriesBindingSourceRootManifest(root.value); }
-        catch { throw originalError('contradictory_binding_root'); }
-        requireOriginal(rootValue.source_prefix === prefix);
-        const source = await read(`${prefix}/_source_state.json`);
-        const refresh = await read(`${prefix}/_manifests/_refresh_state.json`);
-        // Core writes source state LAST, only after its reconciliation and
-        // root/range publication. A loose physical key or root alone is not
-        // evidence that this separate publisher completed a matching chain.
-        requireOriginal(typeof source.value.source_schema === 'string' && source.value.source_schema.length > 0
-          && validTimeseriesBindingSourceState(source.value, { bindingPrefix: prefix, sourceSchema: source.value.source_schema })
-          && Number.isSafeInteger(source.value.authoritative_timeseries_count) && source.value.authoritative_timeseries_count >= 0
-          && source.value.source_tables.length === 3
-          && ['timeseries', 'phenomena', 'observed_properties'].every(table => source.value.source_tables
-            .filter(t => t.table === table && Number.isSafeInteger(t.row_count) && t.row_count >= 0
-              && SHA.test(t.sha256_uncompressed || '')).length === 1)
-          && refresh.value.schema_version === 1 && refresh.value.history_version === 'v2'
-          && refresh.value.kind === TIMESERIES_BINDING_SOURCE_REFRESH_STATE_KIND
-          && refresh.value.source_prefix === prefix
-          && refresh.value.source_root_hash === rootValue.source_root_hash
-          && refresh.value.source_fingerprint === source.value.source_fingerprint,
-        'binding_publisher_completion_unavailable_or_contradictory');
-        const bindings = [];
-        for (const scope of scopes) {
-          const rangeRef = rootValue.ranges.find(r => r.range_start <= scope.timeseries_id && r.range_end >= scope.timeseries_id);
-          requireOriginal(rangeRef, 'physical_binding_not_in_selected_root');
-          const range = await read(rangeRef.manifest_key);
-          let rangeValue;
-          try { rangeValue = validateTimeseriesBindingSourceRangeManifest(range.value); }
-          catch { throw originalError('contradictory_binding_range'); }
-          requireOriginal(rangeValue.source_prefix === prefix && rangeValue.range_start === rangeRef.range_start
-            && rangeValue.range_end === rangeRef.range_end && rangeValue.source_range_hash === rangeRef.source_range_hash
-            && rangeValue.units.length === rangeRef.unit_count);
-          const unit = rangeValue.units.find(u => u.timeseries_id === scope.timeseries_id);
-          requireOriginal(unit?.relative_path === `${prefix}/timeseries_id=${scope.timeseries_id}.json`, 'physical_binding_not_in_selected_range');
-          const object = await read(unit.relative_path);
-          const physical = physicalIdentity(scope, identity.connector_id);
-          requireOriginal(object.reference.sha256 === unit.sha256 && object.reference.byte_size === unit.size
-            && [1, 2].includes(object.value.schema_version) && object.value.history_version === 'v2'
-            && object.value.index_kind === 'timeseries_binding'
-            && Object.entries(physical).every(([k, v]) => object.value[k] === v)
-            && (object.value.schema_version !== 1 || !Object.hasOwn(object.value, 'continuity')));
-          bindings.push({ identity: physical, authority: object.reference, range: range.reference });
+        try {
+          requireOriginal(lock, 'original_global_lock_context_unavailable');
+          requireOriginal(Number.isSafeInteger(deadlineAtMs) && deadlineAtMs - nowMs() <= 15_000,
+            'original_binding_capture_deadline');
+          requireOriginal(Array.isArray(physicalScopes) && physicalScopes.length > 0
+            && physicalScopes.length <= 1024, 'original_scope_membership_unavailable');
+          scopes = JSON.parse(JSON.stringify(physicalScopes));
+          const seen = new Set();
+          for (const scope of scopes) {
+            const physicalKey = canonicalJson({ ...physicalIdentity(scope, identity.connector_id), day_utc: scope.day_utc }).toString();
+            requireOriginal(scope.day_utc === identity.day_utc
+              && (scope.connector_id === undefined || scope.connector_id === identity.connector_id)
+              && Number.isSafeInteger(scope.timeseries_id) && scope.timeseries_id > 0
+              && Number.isSafeInteger(scope.station_id) && scope.station_id > 0
+              && typeof scope.pollutant_code === 'string' && Number.isSafeInteger(scope.row_count) && scope.row_count > 0
+              && !seen.has(physicalKey), 'contradictory_physical_scope_membership');
+            seen.add(physicalKey);
+          }
+          const rowCount = scopes.reduce((sum, scope) => sum + scope.row_count, 0);
+          requireOriginal(Number.isSafeInteger(rowCount) && rowCount <= 100000
+            && rowCount === identity.source_identity.source_content_hash_row_count,
+          'contradictory_complete_source_scope_membership');
+          scopeMembershipValid = true;
+          checkActive();
+          binding = { state: 'unavailable', reason: 'binding_capture_in_progress' };
+          const read = async (key, expectedSize = MAX_OBJECT_BYTES) => {
+            checkActive();
+            requireOriginal(key.startsWith(`${GENERATION.timeseries_binding_index_prefix}/`), 'wrong_binding_generation');
+            if (reads.has(key)) return reads.get(key);
+            const promise = (async () => {
+              const timeout = Math.min(15_000, Math.trunc(deadlineAtMs - nowMs()));
+              requireOriginal(timeout > 0, 'original_binding_capture_deadline');
+              requireOriginal(remainingObjects() > 0 && remainingBytes() > 0, 'original_metadata_capture_limit');
+              const object = await getObject({ r2, key, max_bytes: Math.min(MAX_OBJECT_BYTES, expectedSize, remainingBytes()),
+                timeout_ms: timeout, signal: controller.signal });
+              checkActive(); // No late response may mutate settled evidence.
+              record('binding', { key, body: object.body });
+              let value;
+              try { value = JSON.parse(body('binding', key).toString('utf8')); }
+              catch { throw originalError('contradictory_binding_metadata_json'); }
+              return { value, reference: reference('binding', key) };
+            })();
+            reads.set(key, promise);
+            return promise;
+          };
+          const pool = async (items, callback) => {
+            let next = 0;
+            // Promise.all is bounded by WORKERS, never by source cardinality.
+            await Promise.all(Array.from({ length: Math.min(PRUNE_BINDING_CAPTURE_CONCURRENCY, items.length) }, async () => {
+              while (next < items.length) { checkActive(); const index = next++; await callback(items[index], index); }
+            }));
+          };
+          const work = (async () => {
+            const prefix = GENERATION.timeseries_binding_index_prefix;
+            const [root, source, refresh] = await Promise.all([
+              read(`${prefix}/_manifests/root.json`), read(`${prefix}/_source_state.json`), read(`${prefix}/_manifests/_refresh_state.json`),
+            ]);
+            let rootValue;
+            try { rootValue = validateTimeseriesBindingSourceRootManifest(root.value); }
+            catch { throw originalError('contradictory_binding_root'); }
+            requireOriginal(rootValue.source_prefix === prefix);
+            // New proposals write source state after root/refresh. Reused state
+            // is also valid only when the SAME fingerprint/root closure agrees.
+            requireOriginal(typeof source.value.source_schema === 'string' && source.value.source_schema.length > 0
+              && validTimeseriesBindingSourceState(source.value, { bindingPrefix: prefix, sourceSchema: source.value.source_schema })
+              && Number.isSafeInteger(source.value.authoritative_timeseries_count) && source.value.authoritative_timeseries_count >= 0
+              && source.value.source_tables.length === 3
+              && ['timeseries', 'phenomena', 'observed_properties'].every(table => source.value.source_tables
+                .filter(t => t.table === table && Number.isSafeInteger(t.row_count) && t.row_count >= 0
+                  && SHA.test(t.sha256_uncompressed || '')).length === 1)
+              && refresh.value.schema_version === 1 && refresh.value.history_version === 'v2'
+              && refresh.value.kind === TIMESERIES_BINDING_SOURCE_REFRESH_STATE_KIND
+              && refresh.value.source_prefix === prefix && refresh.value.source_root_hash === rootValue.source_root_hash
+              && refresh.value.source_fingerprint === source.value.source_fingerprint,
+            'binding_publisher_completion_unavailable_or_contradictory');
+            const roots = new Map(rootValue.ranges.map(r => [r.range_start, r]));
+            const requiredRanges = new Map();
+            for (const scope of scopes) {
+              const rootRef = roots.get(Math.floor(scope.timeseries_id / 1000) * 1000);
+              requireOriginal(rootRef && scope.timeseries_id <= rootRef.range_end, 'physical_binding_not_in_selected_root');
+              requiredRanges.set(rootRef.manifest_key, rootRef);
+            }
+            const ranges = new Map();
+            await pool([...requiredRanges.values()], async rangeRef => {
+              const range = await read(rangeRef.manifest_key);
+              let value;
+              try { value = validateTimeseriesBindingSourceRangeManifest(range.value); }
+              catch { throw originalError('contradictory_binding_range'); }
+              requireOriginal(value.source_prefix === prefix && value.range_start === rangeRef.range_start
+                && value.range_end === rangeRef.range_end && value.source_range_hash === rangeRef.source_range_hash
+                && value.units.length === rangeRef.unit_count);
+              ranges.set(rangeRef.range_start, { reference: range.reference, units: new Map(value.units.map(u => [u.timeseries_id, u])) });
+            });
+            const bindings = new Array(scopes.length);
+            await pool(scopes, async (scope, index) => {
+              const range = ranges.get(Math.floor(scope.timeseries_id / 1000) * 1000);
+              const unit = range.units.get(scope.timeseries_id);
+              requireOriginal(unit?.relative_path === `${prefix}/timeseries_id=${scope.timeseries_id}.json`, 'physical_binding_not_in_selected_range');
+              const object = await read(unit.relative_path, unit.size);
+              const physical = physicalIdentity(scope, identity.connector_id);
+              requireOriginal(object.reference.sha256 === unit.sha256 && object.reference.byte_size === unit.size
+                && [1, 2].includes(object.value.schema_version) && object.value.history_version === 'v2'
+                && object.value.index_kind === 'timeseries_binding'
+                && Object.entries(physical).every(([k, v]) => object.value[k] === v)
+                && (object.value.schema_version !== 1 || !Object.hasOwn(object.value, 'continuity')));
+              checkActive();
+              bindings[index] = { identity: physical, authority: object.reference, range: range.reference };
+            });
+            checkActive();
+            requireOriginal(bindings.length === scopes.length && bindings.every(Boolean), 'original_binding_membership_incomplete');
+            binding = { state: 'captured', publisher: 'core_snapshot_binding_publication',
+              relationship: 'completed_core_binding_metadata_snapshot_not_prune_reconciliation',
+              root: root.reference, source_state: source.reference, refresh_state: refresh.reference,
+              source_root_hash: rootValue.source_root_hash, source_fingerprint: source.value.source_fingerprint, bindings };
+          })();
+          const expired = new Promise((_, reject) => {
+            rejectDeadline = reject;
+            timer = setTimeout(() => { controller.abort(); reject(originalError('original_binding_capture_deadline')); },
+              Math.max(0, Math.trunc(deadlineAtMs - nowMs())));
+          });
+          await Promise.race([work, expired]);
+        } catch (error) {
+          active = false; controller.abort();
+          const reason = revoked || error.original_authority_code || (Number(error.status) === 404 ? 'binding_metadata_absent'
+            : /byte budget|content length exceeds/.test(error.message || '') ? 'original_metadata_capture_limit'
+              : /deadline|timeout|timed out/i.test(error.message || '') ? 'original_binding_capture_deadline' : 'binding_metadata_unavailable_or_invalid');
+          binding = { state: failureState(reason), reason };
+          releasePhase('binding');
+          for (const [key, entry] of keys) if (entry.phase === 'binding') keys.delete(key);
+        } finally {
+          active = false; clearTimeout(timer); controller.abort(); abortCapture = null; reads.clear();
         }
-        requireOriginal(nowMs() <= deadlineAtMs && admitRequest(), 'original_binding_capture_deadline');
-        binding = { state: 'captured', publisher: 'core_snapshot_binding_publication',
-          relationship: 'completed_core_binding_metadata_snapshot_not_prune_reconciliation',
-          root: root.reference, source_state: source.reference, refresh_state: refresh.reference,
-          source_root_hash: rootValue.source_root_hash, source_fingerprint: source.value.source_fingerprint,
-          bindings };
-      } catch (error) {
-        const reason = error.original_authority_code || (Number(error.status) === 404
-          ? 'binding_metadata_absent' : /byte budget|content length exceeds/.test(error.message || '')
-            ? 'original_metadata_capture_limit' : /deadline|timeout|timed out/i.test(error.message || '')
-              ? 'original_binding_capture_deadline' : 'binding_metadata_unavailable_or_invalid');
-        binding = { state: failureState(reason), reason };
-      }
+      })();
+      return bindingJob;
     },
     snapshot() {
       const originalBefore = before();
@@ -306,8 +433,7 @@ export function preparePruneOriginalMetadataSnapshot({
   const ordered = [...expected.values()].sort((a, b) => Buffer.compare(
     Buffer.from(a.key), Buffer.from(b.key)));
   const requiredByteSize = ordered.reduce((sum, entry) => sum + entry.byte_size, 0);
-  // Base64 alone would fill the database's 1 MiB field above this bound.
-  if (requiredByteSize > 786432) reason ||= 'metadata_payload_exceeds_1mib';
+  if (requiredByteSize > MAX_CAPTURE_BYTES || ordered.length > MAX_CAPTURE_OBJECTS) reason ||= 'original_metadata_capture_limit';
   const objects = [];
   const missing = [];
   if (!reason) {
