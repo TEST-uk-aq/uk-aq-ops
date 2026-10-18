@@ -3129,6 +3129,30 @@ export default {
       : upstreamFunction === TIMESERIES_UPSTREAM_FUNCTION && stationHistoryRouting.timeseries && progressiveStationHistoryChunk
       ? "/v1/observations-history"
       : null;
+    // v3 has one observation-history authority. Retire the legacy v2
+    // stitching/Origin path and persisted-AQI public route before cache lookup:
+    // disabling the v2 feature flag alone would otherwise fall through to
+    // uk_aq_timeseries (Supabase) rather than to the selected v3 reader.
+    if (upstreamFunction === TIMESERIES_UPSTREAM_FUNCTION || usingExternalAqiHistoryUpstream) {
+      let historyGeneration;
+      try {
+        historyGeneration = resolveObservationHistoryGeneration({
+          UK_AQ_R2_HISTORY_VERSION: await readSecret(env.UK_AQ_R2_HISTORY_VERSION),
+        }).version;
+      } catch (_error) {
+        return makeErrorResponse(500, "invalid_observation_history_generation", requestOrigin, allowedOrigins);
+      }
+      if (historyGeneration === "v3") {
+        if (usingExternalAqiHistoryUpstream
+          || String(url.searchParams.get("v") ?? "").trim() === TIMESERIES_V2_VERSION
+          || stationHistoryInternalRoute !== "/v1/observations-history") {
+          return makeErrorResponse(410, "legacy_history_route_retired_for_v3", requestOrigin, allowedOrigins);
+        }
+        if (!env.STATION_HISTORY) {
+          return makeErrorResponse(503, "station_history_binding_unavailable", requestOrigin, allowedOrigins);
+        }
+      }
+    }
     const stationHistoryStaleConfig = stationHistoryStaleCache.resolveStaleCacheConfig({
       UK_AQ_STATION_HISTORY_STALE_FALLBACK_ENABLED: await readSecret(env.UK_AQ_STATION_HISTORY_STALE_FALLBACK_ENABLED),
       UK_AQ_STATION_HISTORY_RECENT_BUNDLE_FRESH_TTL_SECONDS: await readSecret(env.UK_AQ_STATION_HISTORY_RECENT_BUNDLE_FRESH_TTL_SECONDS),
