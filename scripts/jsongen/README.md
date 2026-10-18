@@ -1,5 +1,10 @@
 # Managed JSONgen foundations and pending Prune source
 
+The [Prune-to-JSONgen first TEST acceptance readiness handover](prune-integration-readiness.md)
+records current blockers, restricted-reader setup and the ordered manual
+acceptance procedure. It documents the next TEST operation; it does not authorize
+or execute it.
+
 The manual read-only [Stage 3C currentness/coverage assessment](currentness-coverage-handover.md)
 extends the existing reconciler with a key-derived budget and four-worker selected-v3
 metadata inspection, physical-scope comparison, compact schema-3 reports and explicit original-event,
