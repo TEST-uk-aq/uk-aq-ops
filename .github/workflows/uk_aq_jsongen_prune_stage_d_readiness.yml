@@ -1,0 +1,148 @@
+name: UK AQ JSONgen Prune Stage D readiness (read-only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-jsongen-prune-stage-d-readiness
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      UK_AQ_ENV_NAME: TEST
+      UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
+      UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED: ${{ vars.UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED || 'false' }}
+      UK_AQ_JSONGEN_PRUNE_SIGNER_URL: ${{ vars.UK_AQ_JSONGEN_PRUNE_SIGNER_URL || '' }}
+      INGESTDB_PRUNE_DRY_RUN: ${{ vars.INGESTDB_PRUNE_DRY_RUN || 'true' }}
+      UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN || '500' }}
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+
+    steps:
+      - name: Checkout TEST Ops main
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install existing pg dependency
+        run: npm ci --ignore-scripts
+
+      - name: Check the effective Prune configuration and PostgreSQL privileges (no writes)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { Client } from 'pg';
+
+          const env = process.env;
+          const config = {
+            environment_is_test: env.UK_AQ_ENV_NAME === 'TEST',
+            selected_history_v3: env.UK_AQ_R2_HISTORY_VERSION === 'v3',
+            pending_source_disabled:
+              env.UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED === 'false',
+            signer_url_expected:
+              env.UK_AQ_JSONGEN_PRUNE_SIGNER_URL ===
+                'https://jsongen-signer-test.sleepercar.co.uk/v1/upload-intents',
+            database_url_present: Boolean(env.SUPABASE_DB_URL),
+          };
+
+          console.log('TEST Prune GitHub Actions configuration checks:');
+          for (const [name, passed] of Object.entries(config)) {
+            console.log(`${passed ? 'PASS' : 'FAIL'}: ${name}`);
+          }
+
+          const maxCandidates = Number(
+            env.UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN || '500'
+          );
+          console.log(
+            'Configured candidate limit:',
+            Number.isSafeInteger(maxCandidates) ? maxCandidates : 'invalid'
+          );
+          console.log(
+            'Default dry-run variable:',
+            ['true', 'false'].includes(env.INGESTDB_PRUNE_DRY_RUN)
+              ? env.INGESTDB_PRUNE_DRY_RUN : 'unexpected'
+          );
+
+          if (!Object.values(config).every(Boolean)) {
+            console.error('FAIL: GitHub Actions Prune configuration is not ready');
+            process.exitCode = 1;
+          } else {
+            const client = new Client({
+              connectionString: env.SUPABASE_DB_URL,
+              connectionTimeoutMillis: 10000,
+              query_timeout: 15000,
+              application_name: 'uk_aq_jsongen_prune_stage_d_readonly',
+            });
+            let connected = false;
+            let transactionOpen = false;
+            try {
+              await client.connect();
+              connected = true;
+              await client.query('BEGIN READ ONLY');
+              transactionOpen = true;
+              await client.query("SET LOCAL statement_timeout = '10s'");
+              const { rows } = await client.query(`
+                SELECT
+                  session_user AS login_role,
+                  current_user AS effective_role,
+                  current_database() AS database_name,
+                  current_setting('transaction_read_only') AS read_only,
+                  has_schema_privilege(current_user, 'uk_aq_ops', 'USAGE')
+                    AS schema_access,
+                  to_regprocedure(
+                    'uk_aq_ops.insert_prune_jsongen_gate_acceptance(date,integer,uuid,text,jsonb,bytea)'
+                  ) IS NOT NULL AS function_exists,
+                  COALESCE(
+                    has_function_privilege(
+                      current_user,
+                      to_regprocedure(
+                        'uk_aq_ops.insert_prune_jsongen_gate_acceptance(date,integer,uuid,text,jsonb,bytea)'
+                      ),
+                      'EXECUTE'
+                    ),
+                    false
+                  ) AS function_execute
+              `);
+              const row = rows[0];
+              const grants = {
+                read_only: row.read_only === 'on',
+                schema_access: row.schema_access === true,
+                function_exists: row.function_exists === true,
+                function_execute: row.function_execute === true,
+              };
+              console.log('GitHub Actions database:', row.database_name);
+              console.log('GitHub Actions session role:', row.login_role);
+              console.log('GitHub Actions effective role:', row.effective_role);
+              for (const [name, passed] of Object.entries(grants)) {
+                console.log(`${passed ? 'PASS' : 'FAIL'}: ${name}`);
+              }
+              if (!Object.values(grants).every(Boolean)) {
+                console.error('FAIL: Actual GitHub Actions database permission check');
+                process.exitCode = 1;
+              } else {
+                console.log('PASS: Actual GitHub Actions database permission check');
+              }
+            } catch (error) {
+              // Never emit the connection string, SQL statement, secret, or unbounded error.
+              console.error('FAIL: Database check:', error?.code || error?.name || 'error');
+              process.exitCode = 1;
+            } finally {
+              if (transactionOpen) {
+                try { await client.query('ROLLBACK'); } catch {}
+              }
+              if (connected) {
+                try { await client.end(); } catch {}
+              }
+            }
+          }
+          console.log('No Prune invocation, SQL writes, R2 operations or deployments.');
+          NODE
