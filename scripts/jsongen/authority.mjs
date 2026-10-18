@@ -23,7 +23,7 @@ const descriptor = (bucket, key, body) => ({ bucket, key, byte_size: body.length
 const validUtcDay = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)
   && Number.isFinite(Date.parse(`${value}T00:00:00.000Z`))
   && new Date(`${value}T00:00:00.000Z`).toISOString().slice(0, 10) === value;
-function validContinuity(continuity, identity) {
+export function validContinuity(continuity, identity) {
   const c = continuity;
   if (!c || typeof c !== 'object' || Array.isArray(c)
     || c.schema_version !== 1 || c.source !== 'sos_station_timeseries_site_refs'

@@ -3,11 +3,13 @@
 // status can mint authenticated writer evidence through this interface.
 import { assertReceipt } from './schema.mjs';
 import { freeze, evidence } from './limits.mjs';
+import { inspectAuthenticatedPruneHandover } from './prune-consumer-authentication.mjs';
+import { authenticatePruneReceiptInput } from './prune-receipts.mjs';
 export const WRITER_SEAMS = freeze({
   prune_daily_v3: {
     boundary: 'workers/uk_aq_prune_daily/phase_b_history_r2.mjs:finalizePublishedPhaseBConnectors after validatePhaseBV3RunFinalizationResult',
-    blockers: ['frozen_source_removed_before_final_batch_verification', 'durable_final_publication_to_bundle_binding_missing'],
-    action: 'Writer must retain and hash its complete frozen canonical source before cleanup, then bind that source and bundle to the validated final batch while preserving existing deletion gates.',
+    blockers: ['independent_original_outbox_and_private_source_authentication_required'],
+    action: 'Authenticate the original outbox, compressed original before/binding evidence and private pending source. Only the original first-publication version-2 receipt path qualifies; currentness remains separate.',
   },
   integrity_v3: {
     boundary: 'scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py:run_v2_final_verification after complete APPLY/parent/index publication',
@@ -25,12 +27,20 @@ export const WRITER_SEAMS = freeze({
     action: 'Do not activate a handover or trigger before the IFW canonical repair publication contract is accepted.',
   },
 });
-export function authenticateFinalPublication({ input, writerKind = null }) {
+export function authenticateFinalPublication({ input, writerKind = null, pruneHandover = null }) {
   assertReceipt(input.receipt);
   evidence(input.bundle?.integrity === 'verified', 'unverified_bundle', 'complete bundle integrity must be verified first');
+  writerKind ??= input.receipt.schema_version === 2 ? 'prune_daily_v3' : null;
   const seam = Object.hasOwn(WRITER_SEAMS, writerKind) ? WRITER_SEAMS[writerKind] : null;
+  if (writerKind === 'prune_daily_v3' && pruneHandover) {
+    const { result } = inspectAuthenticatedPruneHandover(pruneHandover);
+    evidence(input.receipt.writer.identity === 'prune_daily_v3'
+      && input.receipt.writer.invocation_id === result.key.run_id,
+    'contradictory_original_evidence', 'Receipt invocation differs from authenticated original Prune event');
+    return authenticatePruneReceiptInput({ input, handover: pruneHandover });
+  }
   return freeze({ state: 'reconciliation_required', authenticated: false,
-    writer: { ...input.receipt.writer }, change_id: input.receipt.change_id,
+    writer: { identity: input.receipt.writer.identity, invocation_id: input.receipt.writer.invocation_id }, change_id: input.receipt.change_id,
     receipt: input.receipt_object, bundle: input.receipt.bundle.object,
     declared_final_publication: input.receipt.source.final_publication,
     missing_proof: ['independent_originating_writer_and_invocation', 'original_final_verified_canonical_generation',

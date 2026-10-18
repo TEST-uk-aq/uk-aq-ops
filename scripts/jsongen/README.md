@@ -1,5 +1,15 @@
 # Managed JSONgen foundations and pending Prune source
 
+The manual-only [independent Prune consumer](prune-consumer-handover.md) implements
+Stage 3B for original TEST/AURN first publication: private outbox discovery/replay,
+compressed original before/binding/final-authority authentication, strict version-2
+VERIFIED receipts, immutable bundle/receipt retention and whole-event atomic
+control registration with deterministic crash recovery. Read-only diagnostics
+remain separate from explicit `--execute-retain`. This authenticates original
+Prune changes; currentness, supersession and monthly publication remain unresolved.
+No schedule or publication is activated. Run
+`node scripts/jsongen/prune-consumer.mjs --help` for the explicit CLI.
+
 The common [UK AQ JSONgen workflow](../../.github/workflows/uk_aq_jsongen.yml)
 now has a **Stage A manual, local-only diagnostic**. See [Stage A operation](#stage-a-manual-diagnostic-operation)
 below. It is executable code, but it is not an enabled managed monthly publisher.
@@ -49,7 +59,8 @@ Source cleanup and canonical deletion gates keep their existing rules. There
 is no approved automatic expiry, complete-source receipt or publication
 eligibility from an upload intent or PUT acknowledgment.
 
-**Verified Stage 3A receipt creation is blocked.** The compact source's
+The writer does not issue VERIFIED receipts; the independent Stage 3B consumer
+now supplies that boundary using merged PR #113 original authority. The compact source's
 `status` is projected to effective `verification_status`; it is not authenticated
 original provider status. The version-1 pending description classifies original
 status as `original_source_status_unavailable`, with `source_status: null`
@@ -90,25 +101,34 @@ records `final_evidence_state=not_captured`; the run logs the coverage gap. The
 8 MiB / 4,096-object transient capture ceiling prevents unbounded writer memory use. A
 bounded snapshot remains `prepared_unverified` until a separate reader
 authenticates its bytes, relationships, original source and canonical authority.
-The Stage 1 receipt
-additionally requires independently meaningful before/after,
-binding, provenance, scope-completeness and retained-receipt authority
-references. Current Prune finalisation returns verified aggregate/index/latest
+Merged PR #113 additionally retains original first-publication absence, Core-owned
+selected-v3 binding completion and their original lock/source/publication relationships.
+Its schema-1 outer envelope carries nested schema-2 markers and the bounded
+`canonical_json_gzip_v1` metadata representation. The independent consumer decodes
+and authenticates these bytes without changing the writer format. Strict version-2
+receipts preserve Stage 1 source/scopes/bundles and represent original provenance,
+scope completeness and durability with a typed immutable PostgreSQL outbox authority.
+See the [original authority handover](prune-original-authority-handover.md) and
+[consumer handover](prune-consumer-handover.md) for exact mappings and limits.
+Current Prune finalisation returns verified aggregate/index/latest
 control-flow evidence; the optional snapshot and outbox may now retain exact
 writer-produced metadata, but do not independently authenticate it. PostgreSQL gate-only
-recovery remains disabled by its own contract. This code therefore does not
+recovery remains disabled by its own contract. The producer therefore does not
 produce a bundle or receipt, promote `authenticateFinalPublication()`, mutate
 managed control, dispatch JSONgen, or select monthly publication. After an explicit
 PostgreSQL `COMMIT` command acknowledgement, a retained row can produce the small
 version-1 post-commit reference described in the [writer interface](prune-writer-handover.md).
 It can be reconstructed from the immutable original row after a crash. It is
 `reference_prepared`, with delivery `not_attempted`, and never a VERIFIED receipt.
-Stage 3B must implement independently authenticated outbox discovery/replay,
-private pending readback, original metadata/status/scope and current authority
-authentication, receipt lifecycle and missing-registration detection. Oversized
-original metadata remains `not_captured`; any external overflow snapshot needs
-its own reviewed design and retention/readback authority. The existing
-`selectManagedPublications()` blocker remains.
+Stage 3B now independently authenticates the original outbox/private pending source,
+constructs all complete-scope partitions (1,024 source scopes, 128 per receipt),
+retains/readback-verifies immutable bundles and receipts, and registers their complete
+set in one existing control CAS transition. Schema-2 receipts cannot register
+individually. Replay recovers partial retention, missing registration, conditional
+conflicts and ambiguous writes without a Prune rerun. This does not establish
+current canonical precedence, supersession or all-writer coverage. Legacy incomplete
+or oversized original metadata remains ineligible; any external overflow snapshot
+needs its own reviewed authority. `selectManagedPublications()` remains disabled.
 The [original gate durability review](../../docs/investigations/jsongen_prune_final_evidence_durability_boundary.md)
 traces the mutable candidate/gate schema, READY-to-CONSUMED transition and
 commit-to-delivery crash window. It identifies a separately reviewed
@@ -142,8 +162,10 @@ and failure reporting. These modules import only Node built-ins, the existing R2
 helper and existing AQI constants. They never read canonical Parquet, Integrity
 SQLite/journals or index_v2 observations. They never write canonical history.
 
-**Authenticated canonical-scope precedence, complete receipt coverage and
-final-source authentication remain unresolved.**
+**Current canonical-scope precedence and complete intervening-writer receipt
+coverage remain unresolved.** Original source/final-authority authentication is now
+implemented for the supported AURN first-publication path; other writer adapters
+remain fail closed.
 `selectManagedPublications()` always fails with
 `verified_event_ordering_unavailable`. No public mutator can set a selection,
 change an applied dependency set, resolve canonical precedence, or declare absolute freshness.

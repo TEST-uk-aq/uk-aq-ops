@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SELECTED_GENERATION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
-      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME || '' }}
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME || '' }}
       OBS_WORKER_NAME: ${{ vars.UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME || '' }}
       CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
     steps:
@@ -32,7 +32,7 @@ jobs:
           UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
         run: |
           set -euo pipefail
-          case "${GITHUB_REPOSITORY_OWNER}:${UKAQ_ENV_NAME}" in
+          case "${GITHUB_REPOSITORY_OWNER}:${UK_AQ_ENV_NAME}" in
             TEST-uk-aq:TEST|UK-AQ:LIVE) ;;
             *) echo "Repository owner and environment identity disagree."; exit 1 ;;
           esac
