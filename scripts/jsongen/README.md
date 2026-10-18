@@ -1,5 +1,13 @@
 # Managed JSONgen foundations and pending Prune source
 
+The manual-only [independent Prune consumer](prune-consumer-handover.md) now
+provides private outbox discovery/replay, original retained-attestation and
+pending-gzip authentication, and complete-scope partition plans. Its read-only
+safe boundary reports missing original before-membership and selected-v3 binding
+authority. **VERIFIED receipt retention and registration remain blocked.**
+No schedule, automatic execution, canonical reads or publication is activated.
+Run `node scripts/jsongen/prune-consumer.mjs --help` for the explicit CLI.
+
 The common [UK AQ JSONgen workflow](../../.github/workflows/uk_aq_jsongen.yml)
 now has a **Stage A manual, local-only diagnostic**. See [Stage A operation](#stage-a-manual-diagnostic-operation)
 below. It is executable code, but it is not an enabled managed monthly publisher.

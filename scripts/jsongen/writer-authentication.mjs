@@ -3,11 +3,12 @@
 // status can mint authenticated writer evidence through this interface.
 import { assertReceipt } from './schema.mjs';
 import { freeze, evidence } from './limits.mjs';
+import { inspectAuthenticatedPruneHandover, PRUNE_RECEIPT_AUTHORITY_GAPS } from './prune-consumer-authentication.mjs';
 export const WRITER_SEAMS = freeze({
   prune_daily_v3: {
     boundary: 'workers/uk_aq_prune_daily/phase_b_history_r2.mjs:finalizePublishedPhaseBConnectors after validatePhaseBV3RunFinalizationResult',
-    blockers: ['frozen_source_removed_before_final_batch_verification', 'durable_final_publication_to_bundle_binding_missing'],
-    action: 'Writer must retain and hash its complete frozen canonical source before cleanup, then bind that source and bundle to the validated final batch while preserving existing deletion gates.',
+    blockers: PRUNE_RECEIPT_AUTHORITY_GAPS.map(gap => gap.code),
+    action: 'Replay the original immutable outbox and private pending source through prune-consumer.mjs. Schema-1 proof lacks original before-membership and selected-v3 binding authority; retain those writer-side fields or agree a versioned contract before minting receipts.',
   },
   integrity_v3: {
     boundary: 'scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity_impl.py:run_v2_final_verification after complete APPLY/parent/index publication',
@@ -25,10 +26,23 @@ export const WRITER_SEAMS = freeze({
     action: 'Do not activate a handover or trigger before the IFW canonical repair publication contract is accepted.',
   },
 });
-export function authenticateFinalPublication({ input, writerKind = null }) {
+export function authenticateFinalPublication({ input, writerKind = null, pruneHandover = null }) {
   assertReceipt(input.receipt);
   evidence(input.bundle?.integrity === 'verified', 'unverified_bundle', 'complete bundle integrity must be verified first');
   const seam = Object.hasOwn(WRITER_SEAMS, writerKind) ? WRITER_SEAMS[writerKind] : null;
+  if (writerKind === 'prune_daily_v3' && pruneHandover) {
+    const { result } = inspectAuthenticatedPruneHandover(pruneHandover);
+    evidence(input.receipt.writer.identity === 'prune_daily_v3'
+      && input.receipt.writer.invocation_id === result.key.run_id,
+    'contradictory_original_evidence', 'Receipt invocation differs from authenticated original Prune event');
+    // Authenticated original completion and private bytes do not fill the
+    // mandatory Stage 1 before/binding fields. Receipt/CAS validation stays strict.
+    return freeze({ state: 'reconciliation_required', authenticated: false,
+      original_event_authenticated: true, event_id: result.event_id,
+      writer: { ...input.receipt.writer }, change_id: input.receipt.change_id,
+      missing_proof: PRUNE_RECEIPT_AUTHORITY_GAPS.map(gap => gap.code), inspected_seam: seam,
+      action: seam.action });
+  }
   return freeze({ state: 'reconciliation_required', authenticated: false,
     writer: { ...input.receipt.writer }, change_id: input.receipt.change_id,
     receipt: input.receipt_object, bundle: input.receipt.bundle.object,
