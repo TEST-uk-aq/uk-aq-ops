@@ -167,7 +167,7 @@ function missingRanges(expected, present) {
   }));
 }
 
-export async function buildCalculatedHistory({ request, continuity, env, outputStartMs, outputEndMs, ingestRows = [], ingestComplete = false, ingestFetchCount = 0, guideline = null, observationReadBudget = null, observationProvider = null } = {}) {
+export async function buildCalculatedHistory({ request, continuity, env, outputStartMs, outputEndMs, ingestRows = [], ingestComplete = false, ingestFetchCount = 0, guideline = null, observationReadBudget = null, observationProvider = null, ingestReader = null } = {}) {
   const includeObservations = request.includeObservations !== false;
   const contextHours = request.includeAqi && ["pm25", "pm10"].includes(request.pollutant) ? 23 : 0;
   const requiredStartMs = outputStartMs - contextHours * HOUR_MS;
@@ -222,7 +222,21 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
     })));
   }
   const r2Rows = reads.flatMap((entry) => entry.result.rows);
-  const rows = mergePhysicalObservations(r2Rows, ingestRows, selection.segments, requiredStartMs, requiredEndExclusiveMs);
+  let effectiveIngestRows = ingestRows;
+  let effectiveIngestFetchCount = ingestFetchCount;
+  let effectiveIngestComplete = ingestFetchCount === 0 || ingestComplete === true;
+  if (ingestReader !== null) {
+    if (typeof ingestReader !== "function") throw new Error("station_history_ingest_reader_invalid");
+    const recovery = await ingestReader({ reads, requiredStartMs, requiredEndExclusiveMs });
+    if (!recovery || !Array.isArray(recovery.rows) || typeof recovery.response_complete !== "boolean"
+      || !Number.isSafeInteger(recovery.fetch_count) || recovery.fetch_count < 0) {
+      throw new Error("station_history_ingest_recovery_result_invalid");
+    }
+    effectiveIngestRows = [...ingestRows, ...recovery.rows];
+    effectiveIngestFetchCount += recovery.fetch_count;
+    effectiveIngestComplete = effectiveIngestComplete && recovery.response_complete;
+  }
+  const rows = mergePhysicalObservations(r2Rows, effectiveIngestRows, selection.segments, requiredStartMs, requiredEndExclusiveMs);
   const visibleRows = [];
   const observationPresent = new Set();
   const sourceCounts = { r2: 0, ingest: 0, ...(observationProvider ? { json: 0 } : {}) };
@@ -256,8 +270,7 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
       && entry.result.has_gap !== true && entry.result.partial_reasons.length === 0);
   // IngestDB can fill only timestamps proven absent from committed R2. A
   // completed ingest window cannot certify unread canonical pages or context.
-  const sourceComplete = !readBudgetExceeded && r2Complete
-    && (ingestFetchCount === 0 || ingestComplete === true);
+  const sourceComplete = !readBudgetExceeded && r2Complete && effectiveIngestComplete;
   const observationsComplete = includeObservations && sourceComplete && visibleSelection.gaps.length === 0;
   const evaluatedStatus = (status, reason) => status === "ok"
     || (status === "insufficient_samples" && reason === "insufficient_rolling_24h_hours")
@@ -330,7 +343,7 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
     } : { enabled: false, calculation_source: null, rows: [], response_complete: false, has_gap: false, gap_ranges: [], partial_reasons: [] },
     source: {
       mode: observationProvider ? "experimental_compressed_json_calculated_observations" : "continuity_calculated_observations",
-      ingest_fetch_count: ingestFetchCount,
+      ingest_fetch_count: effectiveIngestFetchCount,
       r2_observation_fetch_count: observationProvider ? 0 : reads.reduce((sum, entry) => sum + entry.result.fetch_count, 0),
       ...(observationProvider ? { json_observation_fetch_count: reads.reduce((sum, entry) => sum + entry.result.fetch_count, 0) } : {}),
       required_context_start_utc: new Date(requiredStartMs).toISOString(),
