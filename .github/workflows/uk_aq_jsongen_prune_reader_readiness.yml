@@ -1,0 +1,86 @@
+name: UK AQ JSONgen Prune reader readiness (read-only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-jsongen-prune-reader-readiness
+  cancel-in-progress: false
+
+jobs:
+  reader-readiness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
+      UK_AQ_GITHUB_REPO: ${{ vars.UK_AQ_GITHUB_REPO }}
+      SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+      UK_AQ_JSONGEN_PRUNE_READER_DB_URL: ${{ secrets.UK_AQ_JSONGEN_PRUNE_READER_DB_URL }}
+    steps:
+      - name: Checkout TEST Ops source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies without install scripts
+        run: npm ci --ignore-scripts
+
+      - name: Configure officially obtained Supabase CA if supplied
+        env:
+          APPROVED_CA_PEM: ${{ secrets.UK_AQ_JSONGEN_SUPABASE_CA_PEM }}
+        run: |
+          set -euo pipefail
+          if [ -n "$APPROVED_CA_PEM" ]; then
+            printf '%s\n' "$APPROVED_CA_PEM" > "$RUNNER_TEMP/uk-aq-supabase-ca.pem"
+            chmod 600 "$RUNNER_TEMP/uk-aq-supabase-ca.pem"
+            printf 'NODE_EXTRA_CA_CERTS=%s\n' "$RUNNER_TEMP/uk-aq-supabase-ca.pem" >> "$GITHUB_ENV"
+          fi
+
+      - name: Verify independent private reader and bounded discovery
+        run: |
+          set -euo pipefail
+          timeout --kill-after=5s 60s node --input-type=module <<'NODE'
+          import { connectPruneOutboxReader } from './scripts/jsongen/prune-outbox-reader.mjs';
+          const required = [
+            'UK_AQ_ENV_NAME', 'UK_AQ_GITHUB_REPO',
+            'SUPABASE_URL', 'UK_AQ_JSONGEN_PRUNE_READER_DB_URL'
+          ];
+          const missing = required.filter(name => !process.env[name]);
+          if (missing.length) {
+            console.error('Reader configuration unavailable (variable names only):', missing.join(', '));
+            process.exit(1);
+          }
+          let reader;
+          try {
+            // The existing reader checks TEST identity, verified TLS, group
+            // inheritance, outbox RLS, read-only defaults and no writer rights.
+            reader = await connectPruneOutboxReader();
+            const end = new Date();
+            const start = new Date(end.valueOf() - 24 * 60 * 60 * 1000);
+            const page = await reader.discover({
+              from: start.toISOString(),
+              to: end.toISOString(),
+              limit: 1,
+              mode: 'recent',
+            });
+            console.log('PASS: TEST JSONgen independent PostgreSQL reader accepted.');
+            console.log('PASS: Bounded read-only outbox discovery accepted.');
+            console.log('Events visible on first bounded page:', page.events.length);
+            console.log('No receipts, R2 writes or canonical operations were performed.');
+          } catch (error) {
+            // Do not disclose PostgreSQL error strings, credentials, URLs or rows.
+            console.error('FAIL: Independent reader admission/connection:',
+              typeof error?.code === 'string' ? error.code : 'reader_unavailable');
+            process.exitCode = 1;
+          } finally {
+            if (reader) await reader.close().catch(() => {});
+          }
+          NODE
