@@ -46,6 +46,7 @@ import {
 } from "./r2_observations.mjs";
 import { resolveStationHistoryPolicy } from "./policy.mjs";
 import { buildCalculatedHistory } from "./calculated_history.mjs";
+import { readHistoricalIngestRecovery } from "./historical_ingest_recovery.mjs";
 import { publicContinuity, resolveTimeseriesBinding, selectContinuitySegments } from "./continuity.mjs";
 import { shouldValidateAqi, validateCalculatedAqiAgainstR2 } from "./aqi_validation.mjs";
 import { handleRecentAqiPrototype } from "./recent_aqi_prototype.mjs";
@@ -718,10 +719,18 @@ async function handleObservationHistoryChunk(request, env, ctx) {
         outputStartMs: chunk.startMs,
         outputEndMs: chunk.endMs,
         observationReadBudget,
+        // R2 remains authoritative; only incomplete canonical history may
+        // trigger bounded supplementary ingestion reads.
+        ingestReader: ({ reads }) => readHistoricalIngestRecovery({
+          reads, env, nowMs: Date.now(), timeoutMs: policy.obsAqiDbTimeoutMs,
+        }),
       });
-      const complete = (!chunk.includeObservations || combined.observations.response_complete === true)
+      // Unpublished ingest history must never become an immutable chunk.
+      const provisionalIngest = (combined.observations?.source_counts?.ingest ?? 0) > 0;
+      const complete = !provisionalIngest
+        && (!chunk.includeObservations || combined.observations.response_complete === true)
         && (!parsed.includeAqi || combined.aqi.response_complete === true);
-      const immutable = chunk.endMs <= Date.now() - 120 * HOUR_MS;
+      const immutable = !provisionalIngest && chunk.endMs <= Date.now() - 120 * HOUR_MS;
       const body = {
         ...combined,
         rows: chunk.includeObservations ? combined.observations.rows : [],
@@ -734,6 +743,7 @@ async function handleObservationHistoryChunk(request, env, ctx) {
           ...(!parsed.includeAqi || combined.aqi.response_complete ? [] : combined.aqi.partial_reasons),
           ...(!chunk.includeObservations || combined.observations.response_complete ? [] : ["observations_incomplete"]),
           ...(!parsed.includeAqi || combined.aqi.response_complete ? [] : [policy.calculatedHistoryAqiEnabled ? "calculated_aqi_incomplete" : "calculated_aqi_disabled"]),
+          ...(provisionalIngest ? ["unpublished_ingest_history"] : []),
         ])),
         chunk: {
           direction: "newest_first", row_order: "ascending", start_utc: chunk.startUtc, end_utc: chunk.endUtc,
