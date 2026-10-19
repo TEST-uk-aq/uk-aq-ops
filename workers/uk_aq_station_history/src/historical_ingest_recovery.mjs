@@ -13,12 +13,20 @@ const R2_BUDGET_REASONS = new Set([
   STATION_HISTORY_V3_OBSERVATION_ROW_BUDGET_REASON,
   STATION_HISTORY_V3_PHYSICAL_PAGE_BUDGET_REASON,
 ]);
+// Absence of a daily publication scope is distinct from an unread or broken
+// published R2 leaf. Never let provisional ingestion mask the latter.
+const UNPUBLISHED_SCOPE_REASONS = new Set([
+  "missing_day_manifest",
+  "required_physical_leaf_scope_missing",
+]);
 const empty = () => ({ rows: [], response_complete: true, fetch_count: 0 });
 
-function unresolvedR2(read) {
+function unpublishedScopeOnly(read) {
   const result = read?.result;
-  return result && (result.response_complete !== true || result.has_gap === true
-    || (Array.isArray(result.partial_reasons) && result.partial_reasons.length > 0));
+  const reasons = result?.partial_reasons;
+  return result?.response_complete === false && result?.has_gap === true
+    && Array.isArray(reasons) && reasons.length > 0
+    && reasons.every((reason) => UNPUBLISHED_SCOPE_REASONS.has(reason));
 }
 
 export async function readHistoricalIngestRecovery({ reads, env, nowMs = Date.now(), timeoutMs }) {
@@ -30,7 +38,7 @@ export async function readHistoricalIngestRecovery({ reads, env, nowMs = Date.no
     return empty();
   }
   const earliestMs = nowMs - LOOKBACK_MS;
-  const pending = reads.filter(unresolvedR2).map(({ segment }) => ({
+  const pending = reads.filter(unpublishedScopeOnly).map(({ segment }) => ({
     segment,
     startMs: Math.max(segment.startMs, earliestMs),
     endMs: Math.min(segment.endMs, nowMs),
