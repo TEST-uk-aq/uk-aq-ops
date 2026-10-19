@@ -630,6 +630,11 @@ async function buildFeatureStationSeries(request, bindingContext, env, policy, n
     ingestFetchCount: directReads.length,
     guideline: directReads.find((entry) => entry.guideline)?.guideline ?? null,
     observationReadBudget,
+    // Recover older PM context within the recent head only when R2 proves
+    // an unpublished source scope. Ordinary direct-ingest rows are retained.
+    ingestReader: ({ reads }) => readHistoricalIngestRecovery({
+      reads, env, nowMs, timeoutMs: policy.obsAqiDbTimeoutMs,
+    }),
   });
   if (request.includeObservations) {
     combined.observations.stable_head_start_utc = new Date(outputStartMs).toISOString();

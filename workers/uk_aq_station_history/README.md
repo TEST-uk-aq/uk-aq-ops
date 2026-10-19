@@ -98,12 +98,16 @@ variable or public pagination control.
 
 ## Recovery when Prune has not published recent days
 
-For the calculated/continuity `GET /v1/observations-history` path, canonical R2
-is read first. A recent historical chunk whose R2 read explicitly reports
+For calculated/continuity `GET /v1/observations-history` older chunks and
+`GET /v1/station-series` recent heads, the normal source reads remain in
+place. After checking canonical R2, a request whose R2 read explicitly reports
 `missing_day_manifest` (v2) or `required_physical_leaf_scope_missing`
-(v3) can request eligible direct IngestDB observations from the existing
-`uk_aq_timeseries_rpc`. A missing published leaf, paging/budget failure,
-or other ambiguous R2 incompleteness is **not** a recovery trigger.
+(v3) may additionally recover eligible IngestDB observations using the
+existing `uk_aq_timeseries_rpc`. This includes the older 23-hour PM context
+needed by a recent-head DAQI calculation when normal recent ingestion covers
+only a shorter window. Recovered rows are merged before AQI calculation; a
+missing published leaf, paging/budget failure or other ambiguous R2
+incompleteness is **not** a recovery trigger.
 
 The recovery lookback is conservatively limited to the last 29 days, inside
 the RPC's supported 30-day maximum; at most eight physical-member reads are
@@ -112,8 +116,9 @@ response remains incomplete and `Cache-Control: no-store` while source
 publication is unresolved; it is never labelled immutable merely because the
 visible observation hours were filled from IngestDB.
 
-This is TEST code only until separately deployed and accepted. It does not
-resume Prune, publish R2, rewrite observations, change the selected history
+Changes to this recovery remain subject to separate TEST operational
+acceptance and separately authorised LIVE promotion. It does not resume
+Prune, publish R2, rewrite observations, change the selected history
 generation or promise recovery once IngestDB no longer retains the rows.
 
 ## Isolated recent AQI CPU prototype (TEST only)
