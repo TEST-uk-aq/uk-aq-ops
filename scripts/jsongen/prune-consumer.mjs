@@ -6,13 +6,17 @@ import { randomUUID } from 'node:crypto';
 import { connectPruneOutboxReader, assertPruneAcceptanceKey, originalPruneAcceptance } from './prune-outbox-reader.mjs';
 import { authenticatePruneHandover, inspectAuthenticatedPruneHandover } from './prune-consumer-authentication.mjs';
 import { buildPruneReceiptGroup, inspectPruneReceiptGroup, retainPruneReceiptGroup, retainedPruneEvent } from './prune-receipts.mjs';
-import { managedR2Config, updateManagedControl, JSONgenControlError } from './control.mjs';
+import { managedR2ReadConfig, managedR2WriteConfig, updateManagedControl, JSONgenControlError }
+  from './control.mjs';
+import { assertManagedR2CredentialMode } from './r2-config.mjs';
 import { createBudget, evidence, JSONgenEvidenceError } from './limits.mjs';
 
 export async function consumePruneAcceptance({ reader, key, derivedR2, mode = 'read-only', initializeControl = false,
   budget = createBudget() }) {
   evidence(['read-only', 'retain'].includes(mode) && (!initializeControl || mode === 'retain'),
     'invalid_consumer_arguments', 'Explicit retain mode required for derived writes or initialization');
+  try { assertManagedR2CredentialMode(derivedR2, mode === 'retain' ? 'write' : 'read'); }
+  catch { evidence(false, 'invalid_r2_configuration', 'Operation-specific JSONgen R2 credentials required'); }
   key = structuredClone(assertPruneAcceptanceKey(key));
   const result = { schema_version: 1, kind: 'uk_aq_jsongen_prune_consumer_result', key,
     state: 'pending', discovery: 'original_primary_key_replay', original_evidence: 'pending',
@@ -112,7 +116,8 @@ export async function runPruneConsumer(argv, { env = process.env } = {}) {
   'invalid_consumer_arguments', 'Explicit bounded discovery window required');
   const key = options['event-key-file'] ? assertPruneAcceptanceKey(await jsonFile(options['event-key-file'])) : null;
   const after = options['cursor-file'] ? await jsonFile(options['cursor-file']) : null;
-  const derivedR2 = key || options.process ? managedR2Config(env) : null;
+  const accessConfig = options['execute-retain'] ? managedR2WriteConfig : managedR2ReadConfig;
+  const derivedR2 = key || options.process ? accessConfig(env) : null;
   const reader = await connectPruneOutboxReader({ env });
   const execution = { mode: options['execute-retain'] ? 'retain' : 'read-only', initializeControl: Boolean(options['initialize-control']) };
   try {

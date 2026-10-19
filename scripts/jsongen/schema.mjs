@@ -8,7 +8,11 @@ import { assertObservationHistoryGeneration, getObservationHistoryGeneration }
 
 export const ROOT = 'managed/jsongen/v1';
 export const CONTROL_KEY = `${ROOT}/control/current.json`;
-export const BUCKET = 'uk-aq-chart-history-json-test';
+// The JSONgen bucket is deployment configuration, never a TEST/LIVE source pin.
+// An empty value cannot authenticate managed references; runtime admission also
+// requires the complete explicit endpoint/bucket configuration.
+export const BUCKET = typeof process.env.UK_AQ_JSONGEN_R2_BUCKET === 'string'
+  ? process.env.UK_AQ_JSONGEN_R2_BUCKET.trim() : '';
 export const ALGORITHM = AQI_ALGORITHM_VERSION;
 // Retained identifier for Stage 1 control compatibility. It denotes unverified
 // canonical scope precedence/receipt coverage, not a missing global event counter.

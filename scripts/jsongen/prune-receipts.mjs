@@ -8,6 +8,7 @@ import { LIMITS, createBudget, evidence, freeze, JSONgenEvidenceError } from './
 import { admitDerived, readImmutable, readReceipt, readBundle } from './inputs.mjs';
 import { inspectAuthenticatedPruneHandover } from './prune-consumer-authentication.mjs';
 import { planPruneScopePartitions, prunePartitionArtifacts } from './prune-consumer-partitions.mjs';
+import { assertManagedR2CredentialMode } from './r2-config.mjs';
 
 const groups = new WeakMap(); const cache = new WeakMap(); const retained = new WeakMap();
 export function inspectPruneReceiptGroup(token) {
@@ -105,6 +106,7 @@ async function retainImmutable({ r2, reference, body, contentType, budget }) {
 }
 
 export async function retainPruneReceiptGroup({ handover, r2, budget = createBudget(), progress = () => {} }) {
+  assertManagedR2CredentialMode(r2, 'write');
   admitDerived(r2);
   const token = buildPruneReceiptGroup({ handover, budget }), group = groups.get(token);
   const outcomes = [];

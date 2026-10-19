@@ -3,13 +3,14 @@ import { createGunzip } from 'node:zlib';
 import { Readable } from 'node:stream';
 import { r2GetObjectBounded, sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
 import { computeObservationContentHash, computeObservationMeasurementContentHash, computeEmptyObservationContentHash, computeEmptyObservationMeasurementContentHash } from '../../workers/shared/uk_aq_observation_content_hash.mjs';
-import { BUCKET, ROOT, assertReference, assertReceipt, assertBundleRecord,
+import { ROOT, assertReference, assertReceipt, assertBundleRecord,
   canonicalJson, same, scopeKey } from './schema.mjs';
 import { createBudget, evidence, parseJson, freeze } from './limits.mjs';
+import { assertManagedR2Target } from './r2-config.mjs';
 
 export function admitDerived(r2) {
-  evidence(r2?.bucket === BUCKET && r2.endpoint === 'https://41a81f781d3bd7234fde0b25df51e879.r2.cloudflarestorage.com'
-    && r2.region === 'auto', 'unapproved_storage', 'private Sleepercar TEST derived storage required');
+  try { assertManagedR2Target(r2); }
+  catch { evidence(false, 'unapproved_storage', 'explicit private JSONgen R2 target required'); }
 }
 export async function readImmutable({ r2, reference, maxBytes, budget, domain = 'derived' }) {
   reference = structuredClone(reference);

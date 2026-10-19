@@ -1,12 +1,15 @@
 // Inert library: no CLI, scheduler, canonical reads, bootstrap or upload path.
 import { randomUUID } from 'node:crypto';
 import { r2GetObject, r2GetObjectBounded, r2PutObjectConditional, sha256Hex, isStrongR2Etag } from '../../workers/shared/r2_sigv4.mjs';
-import { ROOT, CONTROL_KEY, BUCKET, ORDERING_BLOCKER, assertControl, createControl,
+import { ROOT, CONTROL_KEY, ORDERING_BLOCKER, assertControl, createControl,
   assertReceipt, assertPruneReceiptGroup, assertReference, assertFailure, canonicalJson, same, monthKey, requireValid } from './schema.mjs';
 import { assertControlSnapshot } from './control-snapshot.mjs';
 import { retainedPruneEvent } from './prune-receipts.mjs';
 import { readReceipt } from './inputs.mjs';
 import { createBudget } from './limits.mjs';
+import { assertManagedR2Target, assertManagedR2CredentialMode } from './r2-config.mjs';
+
+export { managedR2ReadConfig, managedR2WriteConfig } from './r2-config.mjs';
 
 export const MAX_CONTROL_BYTES = 4 * 1024 ** 2; // Admission cap, not an accepted operational scale.
 export class JSONgenControlError extends Error {
@@ -19,23 +22,8 @@ export class JSONgenControlError extends Error {
     this.attempted = attempted;
   }
 }
-export function managedR2Config(env = process.env) {
-  requireValid(env.UK_AQ_ENV_NAME === 'TEST', 'TEST environment required');
-  const endpoint = new URL(env.UK_AQ_COMPRESSED_CHART_R2_ENDPOINT);
-  requireValid(endpoint.origin === 'https://41a81f781d3bd7234fde0b25df51e879.r2.cloudflarestorage.com'
-    && endpoint.pathname === '/' && !endpoint.search && !endpoint.hash && !endpoint.username && !endpoint.password,
-  'Sleepercar TEST derived endpoint required');
-  requireValid(env.UK_AQ_COMPRESSED_CHART_R2_ACCESS_KEY_ID && env.UK_AQ_COMPRESSED_CHART_R2_SECRET_ACCESS_KEY
-    && env.UK_AQ_COMPRESSED_CHART_R2_ACCESS_KEY_ID !== env.CFLARE_R2_ACCESS_KEY_ID,
-  'dedicated existing derived-bucket credentials required');
-  return { endpoint: endpoint.origin, bucket: BUCKET, region: 'auto',
-    access_key_id: env.UK_AQ_COMPRESSED_CHART_R2_ACCESS_KEY_ID,
-    secret_access_key: env.UK_AQ_COMPRESSED_CHART_R2_SECRET_ACCESS_KEY };
-}
 function admit(r2) {
-  requireValid(r2?.bucket === BUCKET, 'managed control must use the TEST derived bucket');
-  requireValid(r2.endpoint === 'https://41a81f781d3bd7234fde0b25df51e879.r2.cloudflarestorage.com'
-    && r2.region === 'auto', 'managed control must use Sleepercar TEST');
+  assertManagedR2Target(r2);
   if (r2.adapter) requireValid(typeof r2.adapter.getObject === 'function'
     && typeof r2.adapter.putObjectConditional === 'function', 'atomic read/CAS adapter required');
 }
@@ -123,6 +111,7 @@ export function selectManagedPublications() {
 }
 export async function updateManagedControl({ r2, command, maxConflicts = 3, authenticatedPruneEvent = null,
   budget = null }) {
+  assertManagedR2CredentialMode(r2, 'write');
   admit(r2);
   const bounded = budget !== null || command?.type === 'retain_prune_event';
   budget ||= createBudget();

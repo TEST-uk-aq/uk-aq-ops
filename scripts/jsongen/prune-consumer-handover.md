@@ -215,9 +215,10 @@ Logs expose bounded counts, opaque IDs and safe failure codes, never credentials
 URLs, observations or evidence bytea. Exit 2 means incomplete/reconciliation-required;
 help and confirmed registration exit successfully.
 
-No new configuration name is added. Reuse
-`UK_AQ_JSONGEN_PRUNE_READER_DB_URL`, `UK_AQ_ENV_NAME=TEST`, existing `SUPABASE_URL`
-and `UK_AQ_COMPRESSED_CHART_R2_*`. PR #114's configuration review also requires
+The consumer uses `UK_AQ_JSONGEN_PRUNE_READER_DB_URL`, `UK_AQ_ENV_NAME=TEST`,
+existing `SUPABASE_URL`, `UK_AQ_JSONGEN_R2_ENDPOINT`, `UK_AQ_JSONGEN_R2_BUCKET`,
+`UK_AQ_JSONGEN_R2_READ_ACCESS_KEY_ID` and
+`UK_AQ_JSONGEN_R2_READ_SECRET_ACCESS_KEY`. PR #114's configuration review also requires
 the existing sourced `UK_AQ_GITHUB_REPO=OWNER/REPO` before the private reader
 connects. Missing or malformed repository configuration fails closed. Supplied
 GitHub repository metadata must match; Actions execution additionally requires

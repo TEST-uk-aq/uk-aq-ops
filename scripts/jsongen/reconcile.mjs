@@ -4,6 +4,7 @@ import { assertControl, canonicalJson, inspectSourceGeneration, same, scopeKey, 
 import { getObservationHistoryGeneration } from '../../workers/shared/uk_aq_observation_history_generation.mjs';
 import { MAX_CONTROL_BYTES, updateManagedControl } from './control.mjs';
 import { readReceipt, readBundle, readImmutable, admitDerived } from './inputs.mjs';
+import { assertManagedR2CredentialMode } from './r2-config.mjs';
 import { readCanonicalScopePages } from './authority.mjs';
 import { authenticateFinalPublication } from './writer-authentication.mjs';
 import { createBudget, createInspectionBudget, evidence, freeze, JSONgenEvidenceError, PRUNE_PENDING_SOURCE_LIMITS } from './limits.mjs';
@@ -214,6 +215,7 @@ export function reconciliationArtifact(report, budget = createBudget()) {
   return { body, reference: { bucket: BUCKET, key: `${ROOT}/evidence/${hash}.json`, sha256: hash, byte_size: body.length } };
 }
 export async function retainReconciliationReport({ r2, report, budget = createBudget() }) {
+  assertManagedR2CredentialMode(r2, 'write');
   admitDerived(r2);
   const { body, reference } = reconciliationArtifact(report, budget);
   let outcome = 'written';

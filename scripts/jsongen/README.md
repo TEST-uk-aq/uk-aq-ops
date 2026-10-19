@@ -211,7 +211,7 @@ reconciliation, never a reconstructed empty source or Parquet fallback.
 The only mutable object is:
 
 ```text
-bucket: uk-aq-chart-history-json-test
+bucket: <UK_AQ_JSONGEN_R2_BUCKET>
 key:    managed/jsongen/v1/control/current.json
 ```
 
@@ -247,19 +247,31 @@ window, not an observation timestamp precision rule. If accepted canonical
 observation precision later becomes finer, the bundle format must preserve it
 through an authorised update or fail closed until it can.
 
-`managedR2Config()` reuses the existing dedicated variables:
+Managed JSONgen storage requires explicit environment configuration:
 
 - `UK_AQ_ENV_NAME=TEST`
-- `UK_AQ_COMPRESSED_CHART_R2_ENDPOINT`
-- `UK_AQ_COMPRESSED_CHART_R2_ACCESS_KEY_ID`
-- `UK_AQ_COMPRESSED_CHART_R2_SECRET_ACCESS_KEY`
+- variables `UK_AQ_JSONGEN_R2_ENDPOINT` and `UK_AQ_JSONGEN_R2_BUCKET`
+- read-only operations use `UK_AQ_JSONGEN_R2_READ_ACCESS_KEY_ID` and
+  `UK_AQ_JSONGEN_R2_READ_SECRET_ACCESS_KEY` through `managedR2ReadConfig()`
+- explicitly requested retention/write operations use
+  `UK_AQ_JSONGEN_R2_WRITE_ACCESS_KEY_ID` and
+  `UK_AQ_JSONGEN_R2_WRITE_SECRET_ACCESS_KEY` through `managedR2WriteConfig()`
 
-It pins the existing Sleepercar TEST endpoint/account and private derived bucket,
-uses region `auto`, and rejects reuse of a supplied canonical access key. There
-are no new secrets, environment names, dependencies or infrastructure. Credentials
-must eventually permit managed-prefix GET and conditional PutObject. Actual R2
-conditional support **with the scoped TEST credential** is not verified here;
-that requires the separately authorised targeted remote check. No such check was run.
+There is no credential fallback between access modes. The manual read-only
+consumer and Stage 3C inspection require only the READ pair. The explicit
+`--execute-retain` mode requires only the WRITE pair for bundle/receipt
+retention and control CAS. The read-only GitHub Actions workflow does not receive
+the WRITE pair or the signer's credentials. The existing signer configuration
+continues to use `UK_AQ_JSONGEN_SIGNER_R2_ACCESS_KEY_ID` and
+`UK_AQ_JSONGEN_SIGNER_R2_SECRET_ACCESS_KEY`; it is independent of both consumer
+credential paths. All operations remain admitted to TEST by `UK_AQ_ENV_NAME`.
+The configured account-scoped HTTPS R2 endpoint is checked without embedding an
+account ID or bucket name in shared code; region remains `auto`. Credentials
+must permit only their intended operations. TEST values must still resolve to
+the private derived target selected by the active station-chart contract.
+Actual scoped R2 conditional-write
+support is not verified here and still requires the separately authorised
+targeted remote check. No such check was run.
 The 4 MiB control admission cap is a protective library limit, not accepted scale
 or retention policy; GET currently uses the existing buffered R2 client.
 

@@ -4,7 +4,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { reconcileManagedInputs, reconciliationArtifact } from './reconcile.mjs';
-import { readManagedControl, managedR2Config } from './control.mjs';
+import { readManagedControl, managedR2ReadConfig } from './control.mjs';
 import { connectPruneOutboxReader } from './prune-outbox-reader.mjs';
 import { assertTestOpsEnvironment } from './admission.mjs';
 import { resolveObservationHistoryGeneration } from '../../workers/shared/uk_aq_observation_history_generation.mjs';
@@ -67,7 +67,7 @@ export async function runReconciliationInspection(argv, { env = process.env } = 
     && /^[a-f0-9]{32}\.r2\.cloudflarestorage\.com$/.test(endpoint.hostname)
     && endpoint.pathname === '/' && !endpoint.search && !endpoint.hash && !endpoint.username && !endpoint.password,
   'invalid_canonical_configuration', 'Existing private canonical R2 configuration required');
-  const derivedR2 = managedR2Config(env), budget = createInspectionBudget();
+  const derivedR2 = managedR2ReadConfig(env), budget = createInspectionBudget();
   const requestedScopes = options['scopes-file'] ? await jsonFile(options['scopes-file']) : [];
   const retainedReceipts = options['retained-receipts-file'] ? await jsonFile(options['retained-receipts-file']) : [];
   const pruneDiscovery = options.discover ? { from: options.from, to: options.to, mode: options.discover,

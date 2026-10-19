@@ -36,10 +36,11 @@ jobs:
       UK_AQ_GITHUB_REPO: ${{ vars.UK_AQ_GITHUB_REPO || '' }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL || '' }}
       UK_AQ_JSONGEN_PRUNE_READER_DB_URL: ${{ secrets.UK_AQ_JSONGEN_PRUNE_READER_DB_URL || '' }}
-      # Bind only the existing private derived-R2 configuration; do not inject canonical Prune or signer credentials.
-      UK_AQ_COMPRESSED_CHART_R2_ENDPOINT: ${{ vars.UK_AQ_COMPRESSED_CHART_R2_ENDPOINT || '' }}
-      UK_AQ_COMPRESSED_CHART_R2_ACCESS_KEY_ID: ${{ secrets.UK_AQ_COMPRESSED_CHART_R2_ACCESS_KEY_ID || '' }}
-      UK_AQ_COMPRESSED_CHART_R2_SECRET_ACCESS_KEY: ${{ secrets.UK_AQ_COMPRESSED_CHART_R2_SECRET_ACCESS_KEY || '' }}
+      # Bind only the explicit read-only derived-R2 token; never expose WRITE or signer credentials here.
+      UK_AQ_JSONGEN_R2_ENDPOINT: ${{ vars.UK_AQ_JSONGEN_R2_ENDPOINT || '' }}
+      UK_AQ_JSONGEN_R2_BUCKET: ${{ vars.UK_AQ_JSONGEN_R2_BUCKET || '' }}
+      UK_AQ_JSONGEN_R2_READ_ACCESS_KEY_ID: ${{ secrets.UK_AQ_JSONGEN_R2_READ_ACCESS_KEY_ID || '' }}
+      UK_AQ_JSONGEN_R2_READ_SECRET_ACCESS_KEY: ${{ secrets.UK_AQ_JSONGEN_R2_READ_SECRET_ACCESS_KEY || '' }}
       INPUT_WINDOW_START_UTC: ${{ inputs.window_start_utc }}
       INPUT_WINDOW_END_UTC: ${{ inputs.window_end_utc }}
       INPUT_DISCOVERY_MODE: ${{ inputs.discovery_mode }}
@@ -68,9 +69,10 @@ jobs:
             UK_AQ_GITHUB_REPO \
             SUPABASE_URL \
             UK_AQ_JSONGEN_PRUNE_READER_DB_URL \
-            UK_AQ_COMPRESSED_CHART_R2_ENDPOINT \
-            UK_AQ_COMPRESSED_CHART_R2_ACCESS_KEY_ID \
-            UK_AQ_COMPRESSED_CHART_R2_SECRET_ACCESS_KEY \
+            UK_AQ_JSONGEN_R2_ENDPOINT \
+            UK_AQ_JSONGEN_R2_BUCKET \
+            UK_AQ_JSONGEN_R2_READ_ACCESS_KEY_ID \
+            UK_AQ_JSONGEN_R2_READ_SECRET_ACCESS_KEY \
             INPUT_WINDOW_START_UTC \
             INPUT_WINDOW_END_UTC \
             INPUT_DISCOVERY_MODE; do

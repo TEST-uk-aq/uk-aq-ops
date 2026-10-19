@@ -28,6 +28,8 @@ jobs:
       UK_AQ_ENV_NAME: TEST
       UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED: ${{ vars.UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED || 'false' }}
       UK_AQ_JSONGEN_PRUNE_SIGNER_URL: ${{ vars.UK_AQ_JSONGEN_PRUNE_SIGNER_URL || '' }}
+      UK_AQ_JSONGEN_R2_ENDPOINT: ${{ vars.UK_AQ_JSONGEN_R2_ENDPOINT || '' }}
+      UK_AQ_JSONGEN_R2_BUCKET: ${{ vars.UK_AQ_JSONGEN_R2_BUCKET || '' }}
       UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN: ${{ secrets.UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN }}
       UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_ID: ${{ secrets.UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_ID }}
       UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_SECRET: ${{ secrets.UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_SECRET }}
@@ -112,6 +114,9 @@ jobs:
               CFLARE_R2_ACCESS_KEY_ID
               CFLARE_R2_SECRET_ACCESS_KEY
             )
+          fi
+          if [ "${UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED}" = "true" ]; then
+            required_values+=(UK_AQ_JSONGEN_R2_ENDPOINT UK_AQ_JSONGEN_R2_BUCKET)
           fi
           missing=0
           for key in "${required_values[@]}"; do

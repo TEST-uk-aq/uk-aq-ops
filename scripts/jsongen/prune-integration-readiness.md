@@ -192,19 +192,19 @@ existing variables and secrets; do not print secret values into reports or logs.
 
 | Component | Existing configuration to verify | Current review status |
 | --- | --- | --- |
-| Prune Actions | `UK_AQ_ENV_NAME=TEST`; `UK_AQ_R2_HISTORY_VERSION=v3`; operator-reported `UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED=true`; `UK_AQ_JSONGEN_PRUNE_SIGNER_URL`; secrets `UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN`, `UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_ID`, `UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_SECRET`; existing `SUPABASE_URL`, `SUPABASE_DB_URL`, `CFLARE_R2_BUCKET`, `CFLARE_R2_ENDPOINT`, `CFLARE_R2_REGION`, `CFLARE_R2_ACCESS_KEY_ID`, `CFLARE_R2_SECRET_ACCESS_KEY`. | Names are wired by the local workflow. Actual remote values, secret presence and TEST target are unverified. Preserve the flag as reported. |
+| Prune Actions | `UK_AQ_ENV_NAME=TEST`; `UK_AQ_R2_HISTORY_VERSION=v3`; operator-reported `UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED=true`; `UK_AQ_JSONGEN_PRUNE_SIGNER_URL`; variables `UK_AQ_JSONGEN_R2_ENDPOINT`, `UK_AQ_JSONGEN_R2_BUCKET`; secrets `UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN`, `UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_ID`, `UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_SECRET`; existing `SUPABASE_URL`, `SUPABASE_DB_URL`, canonical `CFLARE_R2_*`. | Names are wired by the local workflow. The derived endpoint and bucket are required only when the optional pending-source handover is enabled; Prune receives no JSONgen R2 API credentials. Actual remote values, secret presence and TEST target are unverified. Preserve the flag as reported. |
 | Prune mode and scope | `INGESTDB_PRUNE_DRY_RUN`, workflow `dry_run`, `INGESTDB_RETENTION_DAYS`, `MAX_HOURS_PER_RUN`, delete batch/cap settings, Phase A/Phase B controls, `UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN`. | No remote values inspected. The workflow checkbox can force dry-run only. An unchecked input uses the repo variable, defaulting to true when absent. |
 | Signer Worker | Reviewed TEST `/v1/upload-intents` HTTPS route; writer bearer; Cloudflare Access service identity; connector-1 admission; TEST account/bucket; bucket-scoped signing key; unique rate-limit namespace (10 per writer per location per 10 seconds). | Source wiring reviewed; remote deployment, route, policy and namespace unverified. The credential scope needs explicit operator risk acceptance. |
-| Private consumer and Stage 3C | Sourced `UK_AQ_ENV_NAME=TEST`; existing `UK_AQ_GITHUB_REPO=TEST-uk-aq/uk-aq-ops`; `UK_AQ_JSONGEN_PRUNE_READER_DB_URL`; existing `SUPABASE_URL`; existing canonical `CFLARE_R2_*`; existing derived `UK_AQ_COMPRESSED_CHART_R2_ENDPOINT`, `UK_AQ_COMPRESSED_CHART_R2_ACCESS_KEY_ID`, `UK_AQ_COMPRESSED_CHART_R2_SECRET_ACCESS_KEY`. | `config/uk_aq_github_env_targets.csv` already maps these local-purpose settings, but `UK_AQ_GITHUB_REPO` and reader URL are missing from local `env-vars-master.csv`; relevant shell variables are not sourced. Prepare them through the existing private local environment process before manual operation. |
-| Derived JSONgen R2 | Existing private TEST bucket `uk-aq-chart-history-json-test` and existing credential resolver. It must permit the consumer's bounded private GETs and, only in retain mode, immutable conditional PUT/readback and managed-control CAS. | Local source pins fail closed to TEST; actual endpoint, bucket, credential permissions and existing control object are unverified. Confirm exact TEST target. |
+| Private consumer and Stage 3C | Sourced `UK_AQ_ENV_NAME=TEST`; existing `UK_AQ_GITHUB_REPO=TEST-uk-aq/uk-aq-ops`; `UK_AQ_JSONGEN_PRUNE_READER_DB_URL`; existing `SUPABASE_URL`; variables `UK_AQ_JSONGEN_R2_ENDPOINT` and `UK_AQ_JSONGEN_R2_BUCKET`; secrets `UK_AQ_JSONGEN_R2_READ_ACCESS_KEY_ID` and `UK_AQ_JSONGEN_R2_READ_SECRET_ACCESS_KEY`. | Configuration names are mapped in `config/uk_aq_github_env_targets.csv`. Provide the explicit TEST target and read-only token through the existing private environment process before manual operation. The consumer and Stage 3C inspection need no WRITE credentials. |
+| Derived JSONgen R2 | Explicit `UK_AQ_JSONGEN_R2_ENDPOINT` and `UK_AQ_JSONGEN_R2_BUCKET`; READ credentials for bounded private GETs; WRITE credentials only for explicitly requested immutable conditional PUT/readback and managed-control CAS. | Shared code checks the configured target and requires the credential pair for the selected operation. Actual endpoint, bucket, credential permissions and existing control object remain unverified. |
 
-The Stage A diagnostic and the shared derived-storage code contain existing
-repository/account/bucket pins. They are not blockers to this bounded TEST-only
-acceptance because the current paths enforce the TEST environment and exact
-storage target. They remain portability work before shared-code/LIVE reuse; do
-not expand this change into a general environment refactor or add cross-environment
-fallbacks. The separate currentness readiness workflow is stale for this
-acceptance and must not be used as a substitute for the manual reader path.
+The Stage A diagnostic retains its existing repository-specific admission. The
+managed JSONgen shared-storage code now reads its endpoint and bucket from the
+explicit variables above and has no embedded account or bucket pin. Its manual
+consumer and inspection entry points remain explicitly TEST-only. Do not add
+cross-environment fallbacks or a LIVE activation path. The separate currentness
+readiness workflow is stale for this acceptance and must not be used as a
+substitute for the manual reader path.
 
 ## Restricted PostgreSQL reader operator checklist
 

@@ -3,8 +3,8 @@ import { BUCKET, canonicalJson } from './schema.mjs';
 import { preparePrunePendingSource } from './prune-pending-source.mjs';
 import { isIP } from 'node:net';
 import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
+import { managedR2TargetConfig } from './r2-config.mjs';
 
-const HOST = '41a81f781d3bd7234fde0b25df51e879.r2.cloudflarestorage.com';
 const PREFIX = 'managed/jsongen/v1/pending/unverified/prune_daily_v3';
 const SHA = /^[a-f0-9]{64}$/;
 export const PRUNE_SIGNED_UPLOAD_DEADLINE_MS = 15_000;
@@ -16,6 +16,8 @@ export const isPrunePendingSourceConnector = connectorId =>
 
 export function resolvePruneSignerConfig(env) {
   if (env.UK_AQ_ENV_NAME !== 'TEST') throw new Error('TEST environment required for Prune signer handover');
+  const derivedTarget = managedR2TargetConfig(env);
+  if (derivedTarget.bucket !== BUCKET) throw new Error('UK_AQ_JSONGEN_R2_BUCKET must be set before process launch');
   let url;
   try { url = new URL(String(env.UK_AQ_JSONGEN_PRUNE_SIGNER_URL || '').trim()); }
   catch { throw new Error('Prune signer URL required'); }
@@ -26,11 +28,12 @@ export function resolvePruneSignerConfig(env) {
   const writerToken = String(env.UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN || '');
   const accessId = String(env.UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_ID || '');
   const accessSecret = String(env.UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_SECRET || '');
+  const suppliedR2Secrets = [env.CFLARE_R2_SECRET_ACCESS_KEY, env.UK_AQ_JSONGEN_R2_READ_SECRET_ACCESS_KEY]
+    .filter(value => typeof value === 'string' && value.length > 0);
   if (writerToken.length < 32 || !accessId || !accessSecret
-    || [env.CFLARE_R2_SECRET_ACCESS_KEY, env.UK_AQ_COMPRESSED_CHART_R2_SECRET_ACCESS_KEY].includes(writerToken)
-    || [env.CFLARE_R2_SECRET_ACCESS_KEY, env.UK_AQ_COMPRESSED_CHART_R2_SECRET_ACCESS_KEY].includes(accessSecret))
+    || suppliedR2Secrets.includes(writerToken) || suppliedR2Secrets.includes(accessSecret))
     throw new Error('Dedicated Prune signer token and Access credentials required');
-  return { endpoint: url.href, writerToken, accessId, accessSecret };
+  return { endpoint: url.href, writerToken, accessId, accessSecret, derivedTarget };
 }
 
 function failure(code, message) { const error = new Error(message); error.code = code; return error; }
@@ -52,7 +55,7 @@ async function boundedJson(response) {
   catch { throw failure('invalid_signer_response', 'Signer metadata is invalid JSON'); }
 }
 
-function validateIntent(intent, prepared, candidate) {
+function validateIntent(intent, prepared, candidate, derivedTarget) {
   const { runId, dayUtc, connectorId } = candidate;
   const key = `${PREFIX}/connector_id=${connectorId}/day_utc=${dayUtc}`
     + `/invocation=${encodeURIComponent(runId)}/compressed_sha256=${prepared.compressed_sha256}`
@@ -61,7 +64,7 @@ function validateIntent(intent, prepared, candidate) {
   const headers = intent?.required_headers;
   const checksum = Buffer.from(prepared.compressed_sha256, 'hex').toString('base64');
   if (intent?.state !== 'signed_upload_intent' || !SHA.test(intent?.intent_id)
-    || object?.bucket !== BUCKET || object?.key !== key
+    || object?.bucket !== derivedTarget.bucket || object?.key !== key
     || object?.sha256 !== prepared.compressed_sha256 || object?.byte_size !== prepared.compressed_byte_size
     || object?.json_sha256 !== prepared.uncompressed_sha256 || object?.json_byte_size !== prepared.uncompressed_byte_size
     || !headers || Object.keys(headers).length !== 3 || headers['Content-Type'] !== 'application/gzip'
@@ -75,8 +78,9 @@ function validateIntent(intent, prepared, candidate) {
     ? Date.parse(`${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6, 8)}T${date.slice(9, 11)}:${date.slice(11, 13)}:${date.slice(13, 15)}Z`) : NaN;
   const expires = Date.parse(intent.expires_at_utc);
   const credential = url.searchParams.get('X-Amz-Credential') || '';
-  if (url.protocol !== 'https:' || url.hostname !== HOST || url.port || url.username || url.password
-    || decodeURIComponent(url.pathname) !== `/${BUCKET}/${key}` || url.hash
+  if (url.protocol !== 'https:' || url.hostname !== new URL(derivedTarget.endpoint).hostname
+    || url.port || url.username || url.password
+    || decodeURIComponent(url.pathname) !== `/${derivedTarget.bucket}/${key}` || url.hash
     || url.searchParams.size !== 6
     || url.searchParams.get('X-Amz-Algorithm') !== 'AWS4-HMAC-SHA256'
     || !new RegExp(`^[^/]+/${date.slice(0, 8)}/auto/s3/aws4_request$`).test(credential)
@@ -125,7 +129,7 @@ export async function uploadPrunePendingSource({ signer, fetchImpl = fetch,
       await response.body?.cancel().catch(() => {});
       throw failure(code, `Signer returned HTTP ${response.status}`);
     }
-    const intent = validateIntent(await boundedJson(response), prepared, candidate);
+    const intent = validateIntent(await boundedJson(response), prepared, candidate, signer.derivedTarget);
     transport.signer_intent_state = 'accepted';
     const putFailure = (code, message) => Object.assign(failure(code, message),
       { reference: intent.object, intent_id: intent.intent_id });
