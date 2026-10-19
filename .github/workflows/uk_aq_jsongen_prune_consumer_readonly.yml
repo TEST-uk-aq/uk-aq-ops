@@ -1,0 +1,315 @@
+name: UK AQ JSONgen Prune Consumer (read-only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      window_start_utc:
+        description: "Discovery start in UTC (YYYY-MM-DDTHH:mm:ss.SSSZ)"
+        required: true
+        type: string
+      window_end_utc:
+        description: "Discovery end in UTC (YYYY-MM-DDTHH:mm:ss.SSSZ); window must be at most seven days"
+        required: true
+        type: string
+      discovery_mode:
+        description: "Bounded original-event discovery mode"
+        required: true
+        type: choice
+        default: recent
+        options:
+          - recent
+          - resweep
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-jsongen-prune-consumer-readonly
+  cancel-in-progress: false
+
+jobs:
+  consume:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME || '' }}
+      UK_AQ_GITHUB_REPO: ${{ vars.UK_AQ_GITHUB_REPO || '' }}
+      SUPABASE_URL: ${{ vars.SUPABASE_URL || '' }}
+      UK_AQ_JSONGEN_PRUNE_READER_DB_URL: ${{ secrets.UK_AQ_JSONGEN_PRUNE_READER_DB_URL || '' }}
+      # Bind only the existing private derived-R2 configuration; do not inject canonical Prune or signer credentials.
+      UK_AQ_COMPRESSED_CHART_R2_ENDPOINT: ${{ vars.UK_AQ_COMPRESSED_CHART_R2_ENDPOINT || '' }}
+      UK_AQ_COMPRESSED_CHART_R2_ACCESS_KEY_ID: ${{ secrets.UK_AQ_COMPRESSED_CHART_R2_ACCESS_KEY_ID || '' }}
+      UK_AQ_COMPRESSED_CHART_R2_SECRET_ACCESS_KEY: ${{ secrets.UK_AQ_COMPRESSED_CHART_R2_SECRET_ACCESS_KEY || '' }}
+      INPUT_WINDOW_START_UTC: ${{ inputs.window_start_utc }}
+      INPUT_WINDOW_END_UTC: ${{ inputs.window_end_utc }}
+      INPUT_DISCOVERY_MODE: ${{ inputs.discovery_mode }}
+
+    steps:
+      - name: Checkout TEST Ops source
+        id: checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check required TEST reader, CA, and private R2 configuration
+        id: preflight
+        env:
+          APPROVED_CA_PEM: ${{ secrets.UK_AQ_JSONGEN_SUPABASE_CA_PEM || '' }}
+        run: |
+          set -euo pipefail
+          report_dir="$RUNNER_TEMP/uk-aq-jsongen-prune-consumer"
+          mkdir -p "$report_dir"
+          chmod 700 "$report_dir"
+          : > "$report_dir/preflight-failure.txt"
+          : > "$report_dir/missing-config.txt"
+          missing=()
+          for name in \
+            UK_AQ_ENV_NAME \
+            UK_AQ_GITHUB_REPO \
+            SUPABASE_URL \
+            UK_AQ_JSONGEN_PRUNE_READER_DB_URL \
+            UK_AQ_COMPRESSED_CHART_R2_ENDPOINT \
+            UK_AQ_COMPRESSED_CHART_R2_ACCESS_KEY_ID \
+            UK_AQ_COMPRESSED_CHART_R2_SECRET_ACCESS_KEY \
+            INPUT_WINDOW_START_UTC \
+            INPUT_WINDOW_END_UTC \
+            INPUT_DISCOVERY_MODE; do
+            if [[ -z "${!name:-}" ]]; then missing+=("$name"); fi
+          done
+          if [[ -z "$APPROVED_CA_PEM" ]]; then missing+=(UK_AQ_JSONGEN_SUPABASE_CA_PEM); fi
+          if (( ${#missing[@]} > 0 )); then
+            printf '%s\n' "${missing[@]}" > "$report_dir/missing-config.txt"
+            printf '%s\n' 'missing_required_configuration' > "$report_dir/preflight-failure.txt"
+            printf 'Missing required TEST Actions configuration (names only): %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+          if [[ "$UK_AQ_ENV_NAME" != "TEST" ]]; then
+            printf '%s\n' 'unapproved_environment' > "$report_dir/preflight-failure.txt"
+            echo 'Refusing consumer run: UK_AQ_ENV_NAME must admit TEST.' >&2
+            exit 1
+          fi
+          case "$INPUT_DISCOVERY_MODE" in
+            recent|resweep) ;;
+            *)
+              printf '%s\n' 'invalid_discovery_mode' > "$report_dir/preflight-failure.txt"
+              echo 'Invalid discovery mode; choose recent or resweep.' >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Set up Node.js
+        id: setup_node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies without install scripts
+        id: install
+        run: npm ci --ignore-scripts
+
+      - name: Configure approved Supabase CA for strict Node TLS
+        id: configure_ca
+        env:
+          APPROVED_CA_PEM: ${{ secrets.UK_AQ_JSONGEN_SUPABASE_CA_PEM || '' }}
+        run: |
+          set -euo pipefail
+          ca_file="$RUNNER_TEMP/uk-aq-supabase-ca.pem"
+          printf '%s\n' "$APPROVED_CA_PEM" > "$ca_file"
+          chmod 600 "$ca_file"
+          if ! openssl x509 -in "$ca_file" -noout >/dev/null 2>&1; then
+            echo 'Configured Supabase CA is not a readable PEM certificate.' >&2
+            exit 1
+          fi
+          printf 'NODE_EXTRA_CA_CERTS=%s\n' "$ca_file" >> "$GITHUB_ENV"
+          echo 'Approved CA installed in runner temp; strict TLS verification remains enabled.'
+
+      - name: Discover and authenticate at most one original event (read-only)
+        id: consumer
+        run: |
+          set -euo pipefail
+          report_dir="$RUNNER_TEMP/uk-aq-jsongen-prune-consumer"
+          mkdir -p "$report_dir"
+          chmod 700 "$report_dir"
+          report_file="$report_dir/report.json"
+          stdout_file="$report_dir/consumer.stdout"
+          stderr_file="$report_dir/consumer.stderr"
+          exit_file="$report_dir/consumer.exit"
+          set +e
+          timeout --kill-after=5s 90s node scripts/jsongen/prune-consumer.mjs \
+            --execute-read-only \
+            --discover "$INPUT_DISCOVERY_MODE" \
+            --from "$INPUT_WINDOW_START_UTC" \
+            --to "$INPUT_WINDOW_END_UTC" \
+            --limit 1 \
+            --process \
+            --output "$report_file" \
+            >"$stdout_file" 2>"$stderr_file"
+          consumer_exit=$?
+          set -e
+          printf '%s\n' "$consumer_exit" > "$exit_file"
+          chmod 600 "$stdout_file" "$stderr_file" "$exit_file"
+
+      - name: Write bounded read-only outcome report
+        if: ${{ always() }}
+        env:
+          RUNNER_TEMP_DIR: ${{ runner.temp }}
+          PREFLIGHT_OUTCOME: ${{ steps.preflight.outcome }}
+          NODE_SETUP_OUTCOME: ${{ steps.setup_node.outcome }}
+          DEPENDENCY_INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          CA_SETUP_OUTCOME: ${{ steps.configure_ca.outcome }}
+          CONSUMER_STEP_OUTCOME: ${{ steps.consumer.outcome }}
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+
+          const dir = path.join(process.env.RUNNER_TEMP_DIR, 'uk-aq-jsongen-prune-consumer');
+          const reportPath = path.join(dir, 'report.json');
+          const summaryPath = path.join(dir, 'summary.md');
+          const readText = file => { try { return fs.readFileSync(file, 'utf8'); } catch { return ''; } };
+          const safeCode = value => typeof value === 'string' && /^[a-z0-9_]{1,80}$/.test(value)
+            ? value : 'unclassified';
+          const safeUtc = value => typeof value === 'string'
+            && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.(?:\d{3}|\d{6})Z$/.test(value)
+            ? value : 'invalid UTC timestamp';
+          const parseJsonFile = file => {
+            try {
+              const stat = fs.statSync(file);
+              if (!stat.isFile() || stat.size > 4 * 1024 ** 2) return null;
+              return JSON.parse(fs.readFileSync(file, 'utf8'));
+            } catch { return null; }
+          };
+          const report = parseJsonFile(reportPath);
+          const preflightFailure = safeCode(readText(path.join(dir, 'preflight-failure.txt')).trim());
+          const missingConfig = readText(path.join(dir, 'missing-config.txt')).split(/\r?\n/)
+            .filter(name => /^[A-Z0-9_]{1,100}$/.test(name));
+          const exitText = readText(path.join(dir, 'consumer.exit')).trim();
+          const consumerExit = /^\d+$/.test(exitText) ? Number(exitText) : null;
+          const cliLines = [...readText(path.join(dir, 'consumer.stdout')).split(/\r?\n/),
+            ...readText(path.join(dir, 'consumer.stderr')).split(/\r?\n/)];
+          let cliError = null;
+          for (const line of cliLines.reverse()) {
+            try {
+              const candidate = JSON.parse(line);
+              if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+                cliError = candidate;
+                break;
+              }
+            } catch {}
+          }
+
+          const lines = [
+            '# UK AQ JSONgen Prune Consumer (read-only)',
+            '',
+            `- TEST configuration preflight: ${process.env.PREFLIGHT_OUTCOME || 'not run'}`,
+            `- Node setup: ${process.env.NODE_SETUP_OUTCOME || 'not run'}`,
+            `- Dependency install: ${process.env.DEPENDENCY_INSTALL_OUTCOME || 'not run'}`,
+            `- CA setup: ${process.env.CA_SETUP_OUTCOME || 'not run'}`,
+          ];
+
+          if (report?.kind === 'uk_aq_jsongen_prune_consumer_discovery' && report.discovery) {
+            const discovery = report.discovery;
+            const events = Array.isArray(discovery.events) ? discovery.events : [];
+            const results = Array.isArray(report.results) ? report.results : [];
+            lines.push(
+              '- Database connection and reader authentication: **PASS** (the consumer completed strict-TLS connection, restricted-role/RLS checks, and the bounded discovery query).',
+              `- Original outbox discovery: **${events.length}** event(s) on this page; mode ${safeCode(discovery.mode)}; window ${safeUtc(discovery.from)} to ${safeUtc(discovery.to)}.`,
+              `- Discovery coverage: **incomplete/replay required**; window pass finished: ${discovery.window_pass_finished === true ? 'yes' : 'no'}; coverage_complete: ${discovery.coverage_complete === true ? 'yes' : 'no'}.`
+            );
+            if (events.length === 0) {
+              lines.push(
+                '- Original event authentication: **not run**; no matching original event was visible in this bounded query.',
+                '- Private pending-source verification: **not run**.',
+                '- Missing or unsupported evidence: not evaluated because there was no event.',
+                '- Operational errors: none reported by the completed discovery.',
+                '- Handover result: **no event authenticated; this is not a successful handover**.'
+              );
+            } else {
+              const authenticated = results.filter(result => result?.state === 'authenticated');
+              const pendingVerified = results.filter(result => result?.pending_source === 'source_bytes_verified');
+              const resultCodes = results.map(result => result?.reason).filter(Boolean).map(safeCode);
+              const evidenceCodes = [...new Set(resultCodes.filter(code =>
+                /^(missing_|unsupported_|invalid_|contradictory_|unauthenticated_|stable_.*mismatch)/.test(code)))];
+              const operationalCodes = [...new Set(resultCodes.filter(code =>
+                ['consumer_boundary_rejected', 'outbox_connection_unavailable', 'outbox_read_unavailable',
+                  'reader_privilege_rejected', 'resource_limit'].includes(code)))];
+              lines.push(
+                `- Original event authentication: **${authenticated.length}/${events.length} authenticated**; ${results.length < events.length ? 'some discovered events were not processed' : 'all returned events were processed'}.`,
+                `- Private pending-source verification: **${pendingVerified.length}/${events.length} verified** by bounded private-R2 readback and byte/source authentication.`,
+                `- Missing or unsupported evidence: ${evidenceCodes.length ? evidenceCodes.join(', ') : 'none reported by the consumer'}.`,
+                `- Operational errors: ${operationalCodes.length ? operationalCodes.join(', ') : 'none reported by the consumer'}.`
+              );
+              if (authenticated.length) {
+                lines.push('- Read-only boundary: authentication only; no VERIFIED receipt was retained, no control was initialized or registered, and publication remains ineligible.');
+              } else {
+                lines.push(`- Event result: reconciliation required; reason code(s): ${resultCodes.length ? [...new Set(resultCodes)].join(', ') : 'not supplied'}.`);
+              }
+            }
+            lines.push(`- Consumer exit status: ${consumerExit === null ? 'not recorded' : consumerExit}; the consumer's incomplete/reconciliation-required status is preserved.`);
+          } else {
+            const reason = safeCode(cliError?.reason);
+            lines.push('- Missing or unsupported evidence: not assessed; the consumer did not complete event authentication.');
+            if (preflightFailure !== 'unclassified') lines.push(`- Preflight failure code: ${preflightFailure}.`);
+            if (missingConfig.length) lines.push(`- Missing configuration names: ${[...new Set(missingConfig)].join(', ')}.`);
+            if (reason === 'outbox_connection_unavailable') {
+              lines.push('- Database connection and reader authentication: **FAIL**; the strict-TLS PostgreSQL reader connection was not established. Raw connection details were withheld.');
+              lines.push('- Original outbox discovery and event authentication: not run.');
+              lines.push('- Operational error: outbox_connection_unavailable.');
+            } else if (reason === 'reader_privilege_rejected') {
+              lines.push('- Database connection: **PASS**; reader authorization/RLS/least-privilege check: **FAIL**.');
+              lines.push('- Original outbox discovery and event authentication: not run.');
+              lines.push('- Operational/security error: reader_privilege_rejected.');
+            } else if (reason === 'outbox_read_unavailable') {
+              lines.push('- Database connection and reader authorization: **PASS**; bounded outbox read: **FAIL**.');
+              lines.push('- Original event authentication and private pending-source verification: not run.');
+              lines.push('- Operational error: outbox_read_unavailable.');
+            } else {
+              lines.push(`- Database connection and reader authentication: **not established** (${reason}).`);
+              lines.push('- Original outbox discovery, event authentication, and private pending-source verification: not established.');
+              if (process.env.PREFLIGHT_OUTCOME !== 'success') {
+                lines.push('- Operational/setup error: required TEST configuration or admission preflight failed; inspect its step for missing names only.');
+              } else if (process.env.CONSUMER_STEP_OUTCOME !== 'success') {
+                lines.push('- Operational/setup error: the consumer step did not complete; raw process output was withheld.');
+              } else {
+                lines.push('- Operational error: consumer did not produce the bounded discovery report; inspect the safe failure code above.');
+              }
+            }
+            if (cliError?.reason) lines.push(`- Safe consumer failure code: ${reason}.`);
+            if (consumerExit !== null) lines.push(`- Consumer exit status: ${consumerExit}.`);
+          }
+
+          lines.push('', 'No canonical Parquet was reread; no Prune operation, R2 write, receipt retention, control registration, monthly generation, publication, or database mutation was performed.', '');
+          const markdown = `${lines.join('\n')}\n`;
+          fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+          fs.writeFileSync(summaryPath, markdown, { mode: 0o600 });
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, markdown);
+          console.log('Wrote bounded outcome summary; detailed consumer output is not printed to Actions logs.');
+          NODE
+
+      - name: Upload bounded consumer report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: uk-aq-jsongen-prune-consumer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/uk-aq-jsongen-prune-consumer/report.json
+            ${{ runner.temp }}/uk-aq-jsongen-prune-consumer/summary.md
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Preserve consumer incomplete/reconciliation-required exit status
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          exit_file="$RUNNER_TEMP/uk-aq-jsongen-prune-consumer/consumer.exit"
+          if [[ ! -f "$exit_file" ]]; then
+            echo 'Consumer exit status was not recorded; this run is not an authenticated handover.' >&2
+            exit 1
+          fi
+          consumer_exit="$(cat "$exit_file")"
+          if [[ "$consumer_exit" != "0" ]]; then
+            printf 'Consumer exit status %s preserved; incomplete/reconciliation-required is not success.\n' "$consumer_exit" >&2
+            exit "$consumer_exit"
+          fi
+          echo 'Unexpected zero exit from a read-only discovery invocation; review the report before treating it as complete.' >&2
+          exit 1
