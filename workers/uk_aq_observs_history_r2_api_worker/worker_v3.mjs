@@ -174,7 +174,20 @@ export function parseObservationRequest(url) {
       error: `diagnostics must be ${[...EXACT_HISTORY_DIAGNOSTIC_MODES].join(" or ")} when provided.`,
     };
   }
-  return { ok: true, timeseriesId, connectorId, pollutantCode, startIso, endIso, physicalCursor, diagnosticMode };
+  // Strictly diagnostic: never bypass authority for routine reads or AURN/WHO.
+  const bypassVerificationOverlay = url.searchParams.has("verification_overlay");
+  if (bypassVerificationOverlay && (
+    url.searchParams.get("verification_overlay") !== "bypass" ||
+    diagnosticMode !== EXACT_HISTORY_CPU_DIAGNOSTIC_MODE ||
+    connectorId !== 10
+  )) {
+    return {
+      ok: false,
+      status: 400,
+      error: "verification_overlay=bypass requires diagnostics=cpu_v1 and connector_id=10.",
+    };
+  }
+  return { ok: true, timeseriesId, connectorId, pollutantCode, startIso, endIso, physicalCursor, diagnosticMode, bypassVerificationOverlay };
 }
 
 
@@ -461,6 +474,7 @@ function diagnosticRequestContext(request, params) {
     mode: params.diagnosticMode,
     request_id: globalThis.crypto.randomUUID(),
     cloudflare_ray_id: required(request.headers.get("cf-ray")) || null,
+    verification_overlay: params.bypassVerificationOverlay ? "bypassed" : "enabled",
   };
 }
 
@@ -472,6 +486,7 @@ function diagnosticPayload(context, details = {}) {
     request_id: context.request_id,
     cloudflare_ray_id: context.cloudflare_ray_id,
     cache_bypassed: true,
+    verification_overlay: context.verification_overlay,
     cpu_time_ms: null,
     cpu_time_source: "cloudflare_invocation_logs_or_analytics",
     ...details,
@@ -640,6 +655,7 @@ async function handleObservations(
       event: "observation_history_v3_physical_leaf_cpu_measurement",
       diagnostic_request_id: diagnosticContext.request_id,
       cloudflare_ray_id: diagnosticContext.cloudflare_ray_id,
+      verification_overlay: diagnosticContext.verification_overlay,
       ...structuralSummary,
     }));
   }
@@ -733,11 +749,13 @@ export default {
             physical_cursor_supplied: Boolean(params.physicalCursor),
           }));
         }
-        const verificationAuthority = await loadObservationVerificationAuthority({
-          bucket: env.UK_AQ_HISTORY_BUCKET,
-          connectorId: params.connectorId,
-          cache: caches.default,
-        });
+        const verificationAuthority = params.bypassVerificationOverlay
+          ? { overlay_authoritative: false }
+          : await loadObservationVerificationAuthority({
+            bucket: env.UK_AQ_HISTORY_BUCKET,
+            connectorId: params.connectorId,
+            cache: caches.default,
+          });
         return withCacheHeaders(
           await handleObservations(
             params,
