@@ -96,6 +96,26 @@ Optional TEST tuning uses safe in-code defaults when absent:
 The index_v3 physical-page budget is a fixed safety bound, not an environment
 variable or public pagination control.
 
+## Recovery when Prune has not published recent days
+
+For the calculated/continuity `GET /v1/observations-history` path, canonical R2
+is read first. A recent historical chunk whose R2 read explicitly reports
+`missing_day_manifest` (v2) or `required_physical_leaf_scope_missing`
+(v3) can request eligible direct IngestDB observations from the existing
+`uk_aq_timeseries_rpc`. A missing published leaf, paging/budget failure,
+or other ambiguous R2 incompleteness is **not** a recovery trigger.
+
+The recovery lookback is conservatively limited to the last 29 days, inside
+the RPC's supported 30-day maximum; at most eight physical-member reads are
+attempted per chunk. R2 wins at identical physical timestamps. The combined
+response remains incomplete and `Cache-Control: no-store` while source
+publication is unresolved; it is never labelled immutable merely because the
+visible observation hours were filled from IngestDB.
+
+This is TEST code only until separately deployed and accepted. It does not
+resume Prune, publish R2, rewrite observations, change the selected history
+generation or promise recovery once IngestDB no longer retains the rows.
+
 ## Isolated recent AQI CPU prototype (TEST only)
 
 The additional six-hour `recent-hourly-prototype` route is documented in
