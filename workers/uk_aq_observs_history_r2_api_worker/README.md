@@ -139,3 +139,13 @@ cd workers/uk_aq_observs_history_r2_api_worker
 ## Serving generation descriptor
 
 `GET /v1/history-generation` uses the existing `x-uk-aq-upstream-auth` authentication and returns the immutable shared generation selected by the stable service, with `Cache-Control: no-store`. It does not read or list R2. Dashboard clients use this endpoint rather than their own deployment-time history selector. See the active `system_docs/r2_history/generation_descriptor_contract.md` in the system-docs repository for the wire contract and failure semantics.
+
+## Temporary v3 concentration-only verification switch
+
+`UK_AQ_OBSERVS_HISTORY_R2_VERIFICATION_OVERLAY_ENABLED` is a **required deployment-time** plain-text Worker variable: `true` or `false`. The GitHub Actions deploy workflow reads the matching GitHub repository variable and rejects missing/invalid values; the v3 observation route also fails explicitly for missing/invalid runtime configuration. Use `false` for the temporary concentration-only mode on the v3 read-side cut-over. The application code and Wrangler template are identical across TEST and LIVE; operators set the value in each environment's deployment configuration.
+
+- `false`: normal `/v1/observations` and both authenticated diagnostics avoid verification discovery, connector-wide manifest reads/validation and per-row verification lookup. They return `verification_status: null`, meaning **not projected**, not `P`, `R` or changed R2 evidence. This applies to all connectors only for concentration-only observation responses.
+- `true`: restore the existing verification-authority path for `/v1/observations`. Cached responses are separated by explicit verification mode and the bumped response cache generation. The existing `diagnostics=cpu_v1&verification_overlay=bypass` option for connector 10 remains diagnostic-only.
+- `/v1/daily-validation-provenance` remains an independent, authenticated, authoritative P/R path; WHO provenance logic and verification manifest publication/storage are not altered. Do not treat concentration-only `verification_status: null` as source P/R, and do not enable a new status-dependent consumer without restoring accepted trusted provenance first.
+
+Changing this setting requires a separate Worker deployment and subsequent real TEST chart/API checks. It does not authorise LIVE operations or change canonical R2 history. The feature flag is **not** a request parameter and cannot be set by callers.

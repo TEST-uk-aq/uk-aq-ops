@@ -24,7 +24,7 @@ const ALIGNED_ROW_CAP = 1024;
 const V3 = getObservationHistoryGeneration("v3");
 const ALIGNED_INDEX_PREFIX = `${V3.observations_timeseries_index_prefix}/_aligned`;
 const ALIGNED_DATA_PREFIX = V3.observations_prefix;
-const RESPONSE_CACHE_GENERATION = "side-by-side-v3-exact-leaf-4";
+const RESPONSE_CACHE_GENERATION = "side-by-side-v3-exact-leaf-5";
 const TIMESERIES_BINDING_CACHE_GENERATION = "3";
 const DEFAULT_MUTABLE_CACHE_SECONDS = 300;
 const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
@@ -118,6 +118,16 @@ function assertGenerationConfiguration(env) {
   if (resolveObservationHistoryGeneration(env) !== V3) throw new Error("Exact history requires generation v3");
   if (!env.UK_AQ_HISTORY_BUCKET) throw new Error("Missing UK_AQ_HISTORY_BUCKET");
   return V3.observations_timeseries_index_prefix;
+}
+
+// Concentration-only v3 responses do not assert effective P/R provenance.
+// The independent authenticated daily-provenance route keeps its own authority.
+function verificationOverlayEnabled(env) {
+  const value = required(env.UK_AQ_OBSERVS_HISTORY_R2_VERIFICATION_OVERLAY_ENABLED);
+  if (value !== "true" && value !== "false") {
+    throw new Error("Missing or invalid UK_AQ_OBSERVS_HISTORY_R2_VERIFICATION_OVERLAY_ENABLED (true|false).");
+  }
+  return value === "true";
 }
 
 export function observationHistoryV3ReaderIndex(indexRoot) {
@@ -467,14 +477,14 @@ export function deriveAurnDailyValidationStatus({
   ) ? "P" : "R";
 }
 
-function diagnosticRequestContext(request, params) {
+function diagnosticRequestContext(request, params, overlayEnabled) {
   if (!params.diagnosticMode) return null;
   return {
     schema_version: 1,
     mode: params.diagnosticMode,
     request_id: globalThis.crypto.randomUUID(),
     cloudflare_ray_id: required(request.headers.get("cf-ray")) || null,
-    verification_overlay: params.bypassVerificationOverlay ? "bypassed" : "enabled",
+    verification_overlay: params.bypassVerificationOverlay ? "bypassed" : (overlayEnabled ? "enabled" : "disabled"),
   };
 }
 
@@ -520,10 +530,16 @@ function cachePolicy(endIso) {
   return { scope: immutable ? "immutable" : "recent", seconds: immutable ? DEFAULT_IMMUTABLE_CACHE_SECONDS : DEFAULT_MUTABLE_CACHE_SECONDS };
 }
 
-function cacheKey(requestUrl, generation, verificationIdentity = null, env = {}) {
+function cacheKey(requestUrl, generation, verificationIdentity = null, env = {}, verificationMode = null) {
   const url = historyCacheKeyUrl(requestUrl, env);
   url.searchParams.set("__ukaq_observs_history_read_v", generation);
   url.searchParams.set("__ukaq_observs_history_cache_gen", generation === INDEX_GENERATION ? RESPONSE_CACHE_GENERATION : TIMESERIES_BINDING_CACHE_GENERATION);
+  if (generation === INDEX_GENERATION) {
+    if (verificationMode !== "enabled" && verificationMode !== "disabled") {
+      throw new Error("Missing or invalid v3 observation cache verification mode.");
+    }
+    url.searchParams.set("__ukaq_verification_mode", verificationMode);
+  }
   if (verificationIdentity) {
     url.searchParams.set("__ukaq_verification_identity", verificationIdentity);
   }
@@ -625,12 +641,14 @@ async function handleObservations(
   const rows = result.rows.map((row) => ({
     observed_at: row.observed_at_utc,
     value: row.value,
-    verification_status: resolveEffectiveObservationVerificationStatus({
-      authority: verificationAuthority,
-      timeseriesId: params.timeseriesId,
-      observedAtUtc: row.observed_at_utc,
-      legacyStatus: row.verification_status,
-    }),
+    verification_status: verificationAuthority
+      ? resolveEffectiveObservationVerificationStatus({
+          authority: verificationAuthority,
+          timeseriesId: params.timeseriesId,
+          observedAtUtc: row.observed_at_utc,
+          legacyStatus: row.verification_status,
+        })
+      : null,
   }));
   const partialReasons = result.partial_reasons;
   const complete = result.response_complete === true;
@@ -734,7 +752,8 @@ export default {
       }
       const params = parseObservationRequest(url);
       if (!params.ok) return jsonResponse({ ok: false, ...(params.error_code ? { error_code: params.error_code } : {}), error: params.error }, { status: params.status, noStore: true });
-      context = diagnosticRequestContext(request, params);
+      const overlayEnabled = verificationOverlayEnabled(env);
+      context = diagnosticRequestContext(request, params, overlayEnabled);
       if (context) {
         if (context.mode === EXACT_HISTORY_WORKLOAD_DIAGNOSTIC_MODE) {
           console.info(JSON.stringify({
@@ -749,8 +768,8 @@ export default {
             physical_cursor_supplied: Boolean(params.physicalCursor),
           }));
         }
-        const verificationAuthority = params.bypassVerificationOverlay
-          ? { overlay_authoritative: false }
+        const verificationAuthority = !overlayEnabled || params.bypassVerificationOverlay
+          ? null
           : await loadObservationVerificationAuthority({
             bucket: env.UK_AQ_HISTORY_BUCKET,
             connectorId: params.connectorId,
@@ -767,28 +786,37 @@ export default {
           RESPONSE_CACHE_GENERATION,
         );
       }
-      const verificationDiscovery = await loadObservationVerificationDiscovery({
-        bucket: env.UK_AQ_HISTORY_BUCKET,
-        cache: caches.default,
-      });
-      const verificationManifestIdentity = observationVerificationManifestIdentityForConnector({
-        discovery: verificationDiscovery,
-        connectorId: params.connectorId,
-      });
+      // Keep concentration-only reads independent of verification discovery and
+      // isolate cached content from older or newly re-enabled status-bearing reads.
+      const verificationDiscovery = overlayEnabled
+        ? await loadObservationVerificationDiscovery({
+            bucket: env.UK_AQ_HISTORY_BUCKET,
+            cache: caches.default,
+          })
+        : null;
+      const verificationManifestIdentity = verificationDiscovery
+        ? observationVerificationManifestIdentityForConnector({
+            discovery: verificationDiscovery,
+            connectorId: params.connectorId,
+          })
+        : null;
       const key = cacheKey(
         request.url,
         INDEX_GENERATION,
         verificationManifestIdentity?.sha256 || null,
         env,
+        overlayEnabled ? "enabled" : "disabled",
       );
       const cached = await caches.default.match(key);
       if (cached && (!historyCacheEnabled(env) || authenticatedHistoryTags(cached.headers, env))) return withCacheHeaders(cached, "HIT", RESPONSE_CACHE_GENERATION);
-      const verificationAuthority = await loadObservationVerificationAuthority({
-        bucket: env.UK_AQ_HISTORY_BUCKET,
-        connectorId: params.connectorId,
-        discovery: verificationDiscovery,
-        cache: caches.default,
-      });
+      const verificationAuthority = overlayEnabled
+        ? await loadObservationVerificationAuthority({
+            bucket: env.UK_AQ_HISTORY_BUCKET,
+            connectorId: params.connectorId,
+            discovery: verificationDiscovery,
+            cache: caches.default,
+          })
+        : null;
       let response = await handleObservations(
         params,
         env,
