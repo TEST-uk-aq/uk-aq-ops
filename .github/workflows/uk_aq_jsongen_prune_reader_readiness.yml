@@ -48,7 +48,72 @@ jobs:
         run: |
           set -euo pipefail
           timeout --kill-after=5s 60s node --input-type=module <<'NODE'
+          import pg from 'pg';
           import { connectPruneOutboxReader } from './scripts/jsongen/prune-outbox-reader.mjs';
+
+          // Report fixed error categories only. Never print exception messages,
+          // URLs, PostgreSQL identities, credentials, query text or row contents.
+          function safeFailureCategory(error) {
+            const code = typeof error?.code === 'string' ? error.code : '';
+            const message = typeof error?.message === 'string' ? error.message : '';
+            if (code === 'SELF_SIGNED_CERT_IN_CHAIN' || code === 'DEPTH_ZERO_SELF_SIGNED_CERT'
+              || code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE'
+              || code === 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY'
+              || code === 'CERT_HAS_EXPIRED' || code === 'ERR_TLS_CERT_ALTNAME_INVALID'
+              || code.startsWith('ERR_TLS_')
+              || /self.signed certificate|unable to verify.*certificate|certificate.*verify failed/i.test(message)) {
+              return 'tls_certificate_verification';
+            }
+            if (code === '28P01' || code === '28000'
+              || /password authentication failed|role .* does not exist|authentication failed/i.test(message)) {
+              return 'postgres_authentication';
+            }
+            if (code === '08P01' || code === '0A000'
+              || /unsupported startup parameter|invalid startup parameter/i.test(message)) {
+              return 'pooler_or_postgres_startup';
+            }
+            if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return 'dns_resolution';
+            if (['ETIMEDOUT', 'ECONNREFUSED', 'ECONNRESET', 'EHOSTUNREACH', 'ENETUNREACH'].includes(code)) {
+              return 'network_connection';
+            }
+            if (code === '42501') return 'database_permission_denied';
+            if (code === '42P01' || code === '3F000') return 'database_object_unavailable';
+            if (code === '3D000') return 'database_name_rejected';
+            return 'unclassified_connection_or_database_error';
+          }
+
+          // Observe the real reader attempt without bypassing its TEST identity
+          // admission, strict TLS, read-only SQL or privilege enforcement.
+          class DiagnosticClient extends pg.Client {
+            async connect() {
+              try {
+                await super.connect();
+                console.log('PASS: Verified-TLS database connection and login accepted.');
+              } catch (error) {
+                console.error('FAIL: TLS/authentication/startup:', safeFailureCategory(error));
+                throw error;
+              }
+            }
+
+            async query(...args) {
+              const sql = typeof args[0] === 'string' ? args[0] : '';
+              const stage = sql === 'BEGIN READ ONLY' ? 'read_only_transaction'
+                : sql.startsWith("SELECT current_setting('transaction_read_only')")
+                  ? 'reader_privilege_query'
+                  : sql.includes('FROM uk_aq_ops.prune_jsongen_gate_acceptance_outbox')
+                    ? 'bounded_outbox_query' : null;
+              try {
+                const result = await super.query(...args);
+                if (stage === 'reader_privilege_query') {
+                  console.log('PASS: Reader privilege query executed.');
+                }
+                return result;
+              } catch (error) {
+                if (stage) console.error('FAIL: ' + stage + ':', safeFailureCategory(error));
+                throw error;
+              }
+            }
+          }
           const required = [
             'UK_AQ_ENV_NAME', 'UK_AQ_GITHUB_REPO',
             'SUPABASE_URL', 'UK_AQ_JSONGEN_PRUNE_READER_DB_URL'
@@ -62,7 +127,7 @@ jobs:
           try {
             // The existing reader checks TEST identity, verified TLS, group
             // inheritance, outbox RLS, read-only defaults and no writer rights.
-            reader = await connectPruneOutboxReader();
+            reader = await connectPruneOutboxReader({ Client: DiagnosticClient });
             const end = new Date();
             const start = new Date(end.valueOf() - 24 * 60 * 60 * 1000);
             const page = await reader.discover({
@@ -77,8 +142,13 @@ jobs:
             console.log('No receipts, R2 writes or canonical operations were performed.');
           } catch (error) {
             // Do not disclose PostgreSQL error strings, credentials, URLs or rows.
-            console.error('FAIL: Independent reader admission/connection:',
-              typeof error?.code === 'string' ? error.code : 'reader_unavailable');
+            const safeReaderCodes = new Set([
+              'reader_configuration_required', 'unapproved_environment',
+              'reader_privilege_rejected', 'outbox_connection_unavailable',
+              'outbox_read_unavailable', 'invalid_discovery_window'
+            ]);
+            console.error('FAIL: Reader admission/verification:',
+              safeReaderCodes.has(error?.code) ? error.code : 'reader_unavailable');
             process.exitCode = 1;
           } finally {
             if (reader) await reader.close().catch(() => {});
