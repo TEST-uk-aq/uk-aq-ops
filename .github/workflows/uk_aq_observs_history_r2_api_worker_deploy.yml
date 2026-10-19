@@ -93,25 +93,28 @@ jobs:
           PYDOMAIN
           fi
 
-      - name: Set Worker secrets
+      # Include secrets in the code deployment; a separate secret update
+      # can fail when a more recent Worker version is uploaded but inactive.
+      - name: Deploy Worker with secrets
         working-directory: workers/uk_aq_observs_history_r2_api_worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ env.UK_AQ_R2_CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ env.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID }}
+          UK_AQ_EDGE_UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
         run: |
           set -euo pipefail
-          secrets_json="$(jq -n \
-            --arg UK_AQ_EDGE_UPSTREAM_SECRET "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" \
-            '{UK_AQ_EDGE_UPSTREAM_SECRET: $UK_AQ_EDGE_UPSTREAM_SECRET} | with_entries(select(.value != ""))')"
-          if [ "$(printf '%s' "$secrets_json" | jq 'length')" -gt 0 ]; then
-            printf "%s" "$secrets_json" | ./node_modules/.bin/wrangler secret bulk --name "${UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}"
+          secrets_file=""
+          secrets_args=()
+          trap 'if [ -n "$secrets_file" ]; then rm -f "$secrets_file"; fi' EXIT
+
+          if [ -n "${UK_AQ_EDGE_UPSTREAM_SECRET}" ]; then
+            umask 077
+            secrets_file="$(mktemp "${RUNNER_TEMP}/uk-aq-observs-history-secrets.XXXXXXXX")"
+            jq -n --arg UK_AQ_EDGE_UPSTREAM_SECRET "${UK_AQ_EDGE_UPSTREAM_SECRET}" \
+              '{UK_AQ_EDGE_UPSTREAM_SECRET: $UK_AQ_EDGE_UPSTREAM_SECRET}' > "$secrets_file"
+            secrets_args+=(--secrets-file "$secrets_file")
           else
-            echo "No Worker secrets to set."
+            echo "No new Worker secrets provided; preserving existing Worker secrets."
           fi
 
-      - name: Deploy Worker
-        working-directory: workers/uk_aq_observs_history_r2_api_worker
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ env.UK_AQ_R2_CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ env.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID }}
-        run: ./node_modules/.bin/wrangler deploy --name "${UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}"
+          ./node_modules/.bin/wrangler deploy --name "${UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME}" "${secrets_args[@]}"
