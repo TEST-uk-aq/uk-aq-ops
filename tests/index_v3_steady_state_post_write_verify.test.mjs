@@ -35,6 +35,7 @@ import { CONTROLLED_PHASE_B_SOURCE_TABLES } from "../scripts/index_v3_migration/
 const DAY = "2026-08-21";
 const RUN_ID = "test-index-v3-controlled-phaseb-20260821";
 const ACCEPTANCE_GIT_SHA = "a".repeat(40);
+const OBSERVATIONS_PREFIX = "history/v3/observations";
 
 function sourceRow(overrides = {}) {
   return {
@@ -74,6 +75,7 @@ function acceptanceReport(overrides = {}) {
     environment: "TEST",
     run_id: RUN_ID,
     repository_git_sha: ACCEPTANCE_GIT_SHA,
+    observation_generation: "v3",
     logical_history_version: "v2",
     observation_history_index_version: "v3",
     rollback_data_preservation_mode: "retain_upstream_source",
@@ -127,7 +129,7 @@ function accepted() {
 }
 
 function canonicalHierarchyFixture() {
-  const prefix = "history/v2/observations";
+  const prefix = OBSERVATIONS_PREFIX;
   const writerGitSha = "d".repeat(40);
   const backedUpAtUtc = "2026-08-30T00:00:00.000Z";
   const partition = (connectorId, pollutantCode, timeseriesId) =>
@@ -210,7 +212,7 @@ function controlState(overrides = {}) {
       connector_id: 1,
       status: "complete",
       run_id: RUN_ID,
-      manifest_key: `history/v2/observations/day_utc=${DAY}/connector_id=1/manifest.json`,
+      manifest_key: buildHistoryV2ConnectorManifestKey(OBSERVATIONS_PREFIX, DAY, 1),
       history_row_count: "1",
       history_file_count: 1,
       history_total_bytes: "100",
@@ -223,7 +225,7 @@ function controlState(overrides = {}) {
       connector_id: 1,
       history_done: true,
       history_run_id: RUN_ID,
-      history_manifest_key: `history/v2/observations/day_utc=${DAY}/connector_id=1/manifest.json`,
+      history_manifest_key: buildHistoryV2ConnectorManifestKey(OBSERVATIONS_PREFIX, DAY, 1),
       history_manifest_hash: "b".repeat(64),
       history_row_count: "1",
       history_file_count: 1,
@@ -266,6 +268,10 @@ test("acceptance-report exact identity mismatch fails closed", () => {
     () => validateAcceptanceReport(acceptanceReport(), expected({ run_id: "different-run" })),
     /acceptance run_id mismatch/,
   );
+  assert.throws(
+    () => validateAcceptanceReport(acceptanceReport({ observation_generation: "v2" }), expected()),
+    /acceptance observation generation mismatch/,
+  );
 });
 
 test("parsed repositoryGitSha maps to control repository_git_sha and still fails on a real mismatch", async () => {
@@ -285,19 +291,14 @@ test("parsed repositoryGitSha maps to control repository_git_sha and still fails
       working_tree_clean: true,
       default_branch_current: true,
       repository_git_sha_exact: true,
-      loaded_history_v2: true,
-      loaded_index_v3: true,
-      persistent_history_v2: true,
-      persistent_index_v3: true,
+      loaded_history_v3: true,
+      persistent_history_v3: true,
       loaded_integrity_v2: true,
-      maintenance_on: true,
       three_scheduler_jobs_disabled: true,
       no_active_prune: true,
       no_active_backup: true,
-      writer_freeze_valid: true,
-      v2_runtime_rollback_record_valid: true,
-      cache_to_station_candidate_exact: true,
-      station_to_observation_candidate_exact: true,
+      cache_to_station_exact: true,
+      station_to_observation_exact: true,
     }));
     const options = {
       ...expected(),
@@ -408,22 +409,24 @@ test("new TEST and LIVE steady-state scope both reject legacy recovery ordering"
   );
 });
 
-test("report output cannot overwrite input, recovery, Dropbox or operator evidence", () => {
+test("report output cannot overwrite input, recovery, relocated migration, Dropbox or operator evidence", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uk-aq-steady-report-"));
   try {
     const checkpoint = path.join(root, "checkpoint.json");
     const recoveryRoot = `${checkpoint}.recovery`;
     const dropboxRoot = path.join(root, "Dropbox");
+    const evidenceRoot = path.join(root, "relocated-migration");
     const acceptance = path.join(root, "acceptance.json");
     const freeze = path.join(root, "writer-freeze.json");
-    for (const directory of [recoveryRoot, dropboxRoot]) fs.mkdirSync(directory, { recursive: true });
+    for (const directory of [recoveryRoot, dropboxRoot, evidenceRoot]) fs.mkdirSync(directory, { recursive: true });
     for (const file of [checkpoint, acceptance, freeze]) fs.writeFileSync(file, "{}\n");
     const args = {
-      evidencePaths: [acceptance, freeze], checkpoint, recoveryRoot, dropboxRoot,
+      evidencePaths: [acceptance, freeze], checkpoint, recoveryRoot, dropboxRoot, evidenceRoot,
     };
     assert.throws(() => assertSafeLocalReportPath({ ...args, reportOut: acceptance }), /equals protected input/);
     assert.throws(() => assertSafeLocalReportPath({ ...args, reportOut: path.join(recoveryRoot, "report.json") }), /protected evidence directory/);
     assert.throws(() => assertSafeLocalReportPath({ ...args, reportOut: path.join(dropboxRoot, "report.json") }), /protected evidence directory/);
+    assert.throws(() => assertSafeLocalReportPath({ ...args, reportOut: path.join(evidenceRoot, "report.json") }), /protected evidence directory/);
     assert.equal(
       assertSafeLocalReportPath({ ...args, reportOut: path.join(root, "reports", "result.json") }),
       path.join(fs.realpathSync(root), "reports", "result.json"),
