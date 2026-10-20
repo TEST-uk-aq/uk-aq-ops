@@ -23,7 +23,8 @@ Usage:
     --expected-source-content-hash SHA256 \
     --expected-source-hash-contract-version N \
     --expected-pollutant-count N \
-    --plan-report PATH \
+    (--plan-report PATH | \
+     --expected-migration-run-id ID --expected-plan-sha256 SHA256) \
     --checkpoint PATH \
     --required-unchanged-day YYYY-MM-DD \
     --site-url URL \
@@ -81,6 +82,8 @@ EXPECTED_SOURCE_CONTENT_HASH=""
 EXPECTED_SOURCE_HASH_CONTRACT_VERSION=""
 EXPECTED_POLLUTANT_COUNT=""
 PLAN_REPORT=""
+EXPECTED_MIGRATION_RUN_ID=""
+EXPECTED_PLAN_SHA256=""
 CHECKPOINT=""
 EVIDENCE_ROOT=""
 REQUIRED_UNCHANGED_DAY=""
@@ -109,6 +112,8 @@ while [ "$#" -gt 0 ]; do
     --expected-source-hash-contract-version) EXPECTED_SOURCE_HASH_CONTRACT_VERSION="${2:-}"; shift 2 ;;
     --expected-pollutant-count) EXPECTED_POLLUTANT_COUNT="${2:-}"; shift 2 ;;
     --plan-report) PLAN_REPORT="${2:-}"; shift 2 ;;
+    --expected-migration-run-id) EXPECTED_MIGRATION_RUN_ID="${2:-}"; shift 2 ;;
+    --expected-plan-sha256) EXPECTED_PLAN_SHA256="${2:-}"; shift 2 ;;
     --checkpoint) CHECKPOINT="${2:-}"; shift 2 ;;
     --evidence-root) EVIDENCE_ROOT="${2:-}"; shift 2 ;;
     --required-unchanged-day) REQUIRED_UNCHANGED_DAY="${2:-}"; shift 2 ;;
@@ -125,13 +130,26 @@ done
 
 ENVIRONMENT="$(printf '%s' "$ENVIRONMENT" | tr '[:lower:]' '[:upper:]')"
 case "$ENVIRONMENT" in TEST|LIVE) ;; *) fail "--environment must be TEST or LIVE" ;; esac
-for value_name in EXPECTED_REPOSITORY EXPECTED_BUCKET ACCEPTANCE_REPORT EXPECTED_RUN_ID PLAN_REPORT CHECKPOINT SITE_URL CACHE_URL EXPECTED_STATION_HISTORY_WORKER EXPECTED_OBSERVATION_HISTORY_WORKER REPORT_OUT; do
+for value_name in EXPECTED_REPOSITORY EXPECTED_BUCKET ACCEPTANCE_REPORT EXPECTED_RUN_ID CHECKPOINT SITE_URL CACHE_URL EXPECTED_STATION_HISTORY_WORKER EXPECTED_OBSERVATION_HISTORY_WORKER REPORT_OUT; do
   [ -n "${!value_name}" ] || fail "required argument is empty: $value_name"
 done
 for sha_value in "$EXPECTED_REPOSITORY_GIT_SHA" "$EXPECTED_ACCEPTANCE_GIT_SHA"; do
   printf '%s' "$sha_value" | grep -Eq '^[0-9a-f]{40}$' || fail "expected Git identities must be full lower-case SHA-1"
 done
-for sha_value in "$EXPECTED_ACCEPTANCE_REPORT_SHA256" "$EXPECTED_SOURCE_CONTENT_HASH"; do
+if [ -n "$PLAN_REPORT" ]; then
+  [ -z "$EXPECTED_MIGRATION_RUN_ID" ] && [ -z "$EXPECTED_PLAN_SHA256" ] ||
+    fail "supply --plan-report OR explicit migration run/plan identity, not both"
+  MIGRATION_ID_ARGS=(--plan-report "$PLAN_REPORT")
+else
+  [ -n "$EXPECTED_MIGRATION_RUN_ID" ] && [ -n "$EXPECTED_PLAN_SHA256" ] ||
+    fail "both explicit migration identities are required without --plan-report"
+  [ "${#EXPECTED_MIGRATION_RUN_ID}" -le 256 ] &&
+    [ "$EXPECTED_MIGRATION_RUN_ID" = "$(printf '%s' "$EXPECTED_MIGRATION_RUN_ID" | tr -d '\r\n')" ] ||
+    fail "invalid explicit migration run identity"
+  MIGRATION_ID_ARGS=(--expected-migration-run-id "$EXPECTED_MIGRATION_RUN_ID"
+                     --expected-plan-sha256 "$EXPECTED_PLAN_SHA256")
+fi
+for sha_value in "$EXPECTED_ACCEPTANCE_REPORT_SHA256" "$EXPECTED_SOURCE_CONTENT_HASH" "${EXPECTED_PLAN_SHA256:-$EXPECTED_SOURCE_CONTENT_HASH}"; do
   printf '%s' "$sha_value" | grep -Eq '^[0-9a-f]{64}$' || fail "expected content identities must be lower-case SHA-256"
 done
 for day_value in "$EXPECTED_DAY_UTC" "$REQUIRED_UNCHANGED_DAY"; do
@@ -150,7 +168,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null)" || fail "repository root cannot be derived from Git"
 cd -- "$REPO_ROOT"
 
-for file in "$ACCEPTANCE_REPORT" "$PLAN_REPORT" "$CHECKPOINT"; do
+for file in "$ACCEPTANCE_REPORT" "$CHECKPOINT" "${PLAN_REPORT:-$CHECKPOINT}"; do
   [ -f "$file" ] || fail "required evidence file is missing: $file"
 done
 [ -d "$CHECKPOINT.recovery" ] || fail "authenticated recovery journal is missing: $CHECKPOINT.recovery"
@@ -179,7 +197,7 @@ REPORT_OUT="$("$NODE_BIN" "$RUNNER" --check-report-path \
   --report-out "$REPORT_OUT" \
   --acceptance-report "$ACCEPTANCE_REPORT" \
   --control-evidence "$CONTROL_EVIDENCE" \
-  --plan-report "$PLAN_REPORT" \
+  "${MIGRATION_ID_ARGS[@]}" \
   --checkpoint "$CHECKPOINT" \
   "${EVIDENCE_ROOT_ARGS[@]}")" || fail "report output path protection failed"
 REPORT_OUT_SAFE="true"
@@ -371,7 +389,7 @@ jq -n \
   --expected-source-hash-contract-version "$EXPECTED_SOURCE_HASH_CONTRACT_VERSION" \
   --expected-pollutant-count "$EXPECTED_POLLUTANT_COUNT" \
   --control-evidence "$CONTROL_EVIDENCE" \
-  --plan-report "$PLAN_REPORT" \
+  "${MIGRATION_ID_ARGS[@]}" \
   --checkpoint "$CHECKPOINT" \
   --required-unchanged-day "$REQUIRED_UNCHANGED_DAY" \
   --site-url "$SITE_URL" \
