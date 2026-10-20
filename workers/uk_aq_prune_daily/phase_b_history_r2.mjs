@@ -3815,9 +3815,10 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
 
   const publicationGetObject = async ({ r2, key }) => {
     assertPublicationRequestBudget("v3_publication_r2_read", 1, { key });
-    const object = await r2GetObject({ r2: r2 || runtime.r2, key });
-    metadataCapture?.recordPublishedObject({ key, body: object?.body });
-    return object;
+    // Read-only discovery/readback bodies are not original writer metadata
+    // evidence. Exact final bytes are retained from the successful writer
+    // input below; canonical verification still performs its normal reads.
+    return await r2GetObject({ r2: r2 || runtime.r2, key });
   };
 
   const publicationPutIfChanged = async (object) => {
@@ -4049,9 +4050,9 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
   };
   const finalizationGetObject = async ({ r2, key }) => {
     assertFinalizationRequestBudget("v3_run_finalization_r2_read", 1, { key });
-    const object = await r2GetObject({ r2: r2 || runtime.r2, key });
-    metadataCapture?.recordPublishedObject({ key, body: object?.body });
-    return object;
+    // Keep only the exact bytes offered to the original writer, not unrelated
+    // historical metadata bodies encountered during parent discovery.
+    return await r2GetObject({ r2: r2 || runtime.r2, key });
   };
   const finalizationPutIfChanged = async (object) => {
     // HEAD + PUT + GET is one retry-safe idempotent publication operation.
@@ -4567,10 +4568,13 @@ async function finalizePublishedPhaseBConnectors({
               metadata_reason: retainedMetadata.reason || null,
               metadata_object_count: retainedMetadata.required_object_count,
               metadata_raw_byte_size: retainedMetadata.required_raw_byte_size,
-              metadata_required_keys_preview: retainedMetadata.required_keys_preview || [],
+              metadata_missing_object_count: retainedMetadata.missing_object_count ?? 0,
+              metadata_missing_reason_counts: retainedMetadata.missing_reason_counts || {},
+              metadata_capture_statistics: retainedMetadata.capture_statistics || null,
               complete_envelope_byte_size: retainedMetadata.complete_envelope_byte_size || null,
               preparation_byte_size: published.jsongen_final_evidence_preparation.byte_size,
               original_authority_completeness: originalAuthority?.completeness || 'unavailable',
+              original_authority_reason: originalAuthority?.reason || null,
               before_membership_state: originalAuthority?.before?.state || 'unavailable',
               before_membership_reason: originalAuthority?.before?.reason || null,
               authoritative_previous_absence: originalAuthority?.before?.state === 'captured'
@@ -6943,6 +6947,9 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
   }
 
   return {
+    // Carry the configured environment into Phase B so optional evidence
+    // admission can enforce its existing TEST-only boundary.
+    environment: String(env.UK_AQ_ENV_NAME || '').trim().toUpperCase(),
     enabled: String(env.UK_AQ_R2_HISTORY_PHASE_B_ENABLED || "true").trim().toLowerCase() !== "false",
     jsongen_pending_source: jsongenPendingSource,
     supabase_db_url: String(env.SUPABASE_DB_URL || "").trim(),

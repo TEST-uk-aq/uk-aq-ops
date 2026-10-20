@@ -20,6 +20,7 @@ export function createPruneOriginalMetadataCapture() {
   const bodies = new Map();
   const groups = new Map();
   const invalidFinal = new Set();
+  const finalCaptureFailures = new Map();
   let retainedBytes = 0;
   let optionalBytes = 0;
   let optionalObjects = 0;
@@ -34,20 +35,23 @@ export function createPruneOriginalMetadataCapture() {
   const retain = (id, value, optional = false) => {
     const previous = bodies.get(id);
     const size = value?.body?.byteLength ?? Buffer.byteLength(value?.body || '');
-    if (!size || size > MAX_OBJECT_BYTES || (!previous && bodies.size >= MAX_CAPTURE_OBJECTS)
-      || retainedBytes - (previous?.byteLength || 0) + size > MAX_CAPTURE_BYTES
-      || (optional && (optionalBytes - (previous?.length || 0) + size > OPTIONAL_CAPTURE_BYTES
-        || (!previous && optionalObjects >= OPTIONAL_CAPTURE_OBJECTS)))) return false;
+    if (!size) return 'empty_object';
+    if (size > MAX_OBJECT_BYTES) return 'per_object_limit';
+    if (!previous && bodies.size >= MAX_CAPTURE_OBJECTS) return 'object_count_limit';
+    if (retainedBytes - (previous?.byteLength || 0) + size > MAX_CAPTURE_BYTES) return 'byte_limit';
+    if (optional && (!previous && optionalObjects >= OPTIONAL_CAPTURE_OBJECTS)) return 'optional_object_count_limit';
+    if (optional && optionalBytes - (previous?.length || 0) + size > OPTIONAL_CAPTURE_BYTES) return 'optional_byte_limit';
     const bytes = Buffer.from(value.body);
     bodies.set(id, bytes);
     retainedBytes += size - (previous?.byteLength || 0);
     if (optional) { optionalBytes += size - (previous?.length || 0); if (!previous) optionalObjects++; }
-    return true;
+    return null;
   };
   return {
     recordPublishedObject(value) {
+      let key;
       try {
-        const key = value?.key;
+        key = value?.key;
         const body = value?.body;
         if (typeof key !== 'string' || !key.endsWith('.json') || body == null) return;
         const size = body.byteLength ?? Buffer.byteLength(body);
@@ -62,18 +66,41 @@ export function createPruneOriginalMetadataCapture() {
             groups.delete(id);
           }
         }
-        if (!retain(key, { body })) {
+        const failure = retain(key, { body });
+        if (failure) {
           // Failed replacement keeps accounting atomic, but the old bytes
           // cannot stand in for the newly offered final version.
           invalidFinal.add(key);
-        } else invalidFinal.delete(key);
+          finalCaptureFailures.set(key, failure);
+        } else {
+          invalidFinal.delete(key);
+          finalCaptureFailures.delete(key);
+        }
       } catch {
         // Optional evidence capture cannot change a canonical PUT result.
+        if (typeof key === 'string') {
+          invalidFinal.add(key);
+          finalCaptureFailures.set(key, 'capture_internal_failure');
+        }
       }
     },
     body(key) { return invalidFinal.has(key) ? null : bodies.get(key) || null; },
+    inspectFinalObject(key, expectedByteSize, expectedSha256) {
+      if (invalidFinal.has(key)) {
+        const failure = finalCaptureFailures.get(key);
+        return { body: null, reason: ['byte_limit', 'object_count_limit', 'per_object_limit'].includes(failure)
+          ? 'capture_resource_limit_exhaustion' : 'captured_object_invalidated' };
+      }
+      const bytes = bodies.get(key);
+      if (!bytes) return { body: null, reason: 'required_object_never_captured' };
+      if (bytes.byteLength !== expectedByteSize) return { body: null, reason: 'captured_byte_size_mismatch' };
+      if (sha256Hex(bytes) !== expectedSha256) return { body: null, reason: 'captured_sha256_mismatch' };
+      return { body: bytes, reason: null };
+    },
     statistics() { return { retained_bytes: retainedBytes, retained_objects: bodies.size,
-      optional_bytes: optionalBytes, optional_objects: optionalObjects }; },
+      optional_bytes: optionalBytes, optional_objects: optionalObjects,
+      final_capture_failure_counts: Object.fromEntries([...finalCaptureFailures.values()]
+        .reduce((counts, reason) => counts.set(reason, (counts.get(reason) || 0) + 1), new Map())) }; },
     beginOriginalAuthority(identity, lockEnv = process.env) {
       const prefix = `original:${++originalSequence}:`;
       const group = { slots: new Set(), capture: null };
@@ -82,7 +109,7 @@ export function createPruneOriginalMetadataCapture() {
       group.capture = originalAuthorityCapture({ identity, lockContext,
         retain: (phase, value) => {
           const slot = `${prefix}${phase}:${value.key}`;
-          if (!retain(slot, value, true)) return false;
+          if (retain(slot, value, true)) return false;
           group.slots.add(slot); return true;
         },
         releasePhase: phase => {
@@ -136,7 +163,7 @@ function originalAuthorityCapture({ identity, lockContext, retain, body, release
     const previous = body(phase, value.key);
     requireOriginal(!previous || previous.equals(Buffer.from(value.body)), 'contradictory_original_metadata_replacement');
     if (previous) return;
-    if (!retain(phase, value)) throw originalError('original_metadata_capture_limit');
+    if (retain(phase, value, true)) throw originalError('original_metadata_capture_limit');
     keys.set(`${phase}:${value.key}`, { phase, key: value.key });
   };
   const reference = (phase, key) => {
@@ -435,18 +462,23 @@ export function preparePruneOriginalMetadataSnapshot({
   const requiredByteSize = ordered.reduce((sum, entry) => sum + entry.byte_size, 0);
   if (requiredByteSize > MAX_CAPTURE_BYTES || ordered.length > MAX_CAPTURE_OBJECTS) reason ||= 'original_metadata_capture_limit';
   const objects = [];
-  const missing = [];
+  const missingReasonCounts = new Map();
   if (!reason) {
     for (const entry of ordered) {
-      const body = capture?.body(entry.key);
-      if (!body || body.byteLength !== entry.byte_size || sha256Hex(body) !== entry.sha256) {
-        missing.push(entry.key);
+      const inspected = capture?.inspectFinalObject(entry.key, entry.byte_size, entry.sha256)
+        || { body: null, reason: 'required_object_never_captured' };
+      if (!inspected.body) {
+        const missingReason = inspected.reason || 'required_object_never_captured';
+        missingReasonCounts.set(missingReason, (missingReasonCounts.get(missingReason) || 0) + 1);
         continue;
       }
-      objects.push({ ...entry, body });
+      objects.push({ ...entry, body: inspected.body });
     }
   }
-  if (missing.length) reason ||= 'original_bytes_unavailable';
+  const missingObjectCount = [...missingReasonCounts.values()].reduce((sum, count) => sum + count, 0);
+  const reasonPriority = ['capture_resource_limit_exhaustion', 'captured_object_invalidated',
+    'captured_byte_size_mismatch', 'captured_sha256_mismatch', 'required_object_never_captured'];
+  if (missingObjectCount) reason ||= reasonPriority.find(code => missingReasonCounts.has(code)) || 'original_bytes_unavailable';
   const base = {
     schema_version: 1, day_utc: dayUtc, affected_days_utc: affectedDaysUtc,
     connector_id: connectorId,
@@ -459,9 +491,10 @@ export function preparePruneOriginalMetadataSnapshot({
       ...base, completeness: 'not_captured',
       reason: reason || 'missing_original_identity',
       missing_roles: missingGroups,
-      missing_keys_preview: missing.slice(0, 10),
-      required_keys_preview: ordered.slice(0, 10).map(entry => entry.key),
       captured_object_count: objects.length,
+      missing_object_count: missingObjectCount,
+      missing_reason_counts: Object.fromEntries(missingReasonCounts),
+      capture_statistics: capture?.statistics?.() || null,
     };
   }
   return {
