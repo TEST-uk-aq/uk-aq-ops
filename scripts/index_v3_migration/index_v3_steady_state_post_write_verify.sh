@@ -318,10 +318,10 @@ STATION_RUN_ID="$(verify_current_successful_deploy uk_aq_station_history_deploy.
 # source drift. Keep cache-owned code, config and shared dependencies pinned.
 CACHE_RUN_ID="$(verify_current_successful_deploy uk_aq_cache_proxy_deploy.yml '.github/workflows/uk_aq_cache_proxy_deploy.yml workers/uk_aq_cache_proxy workers/shared config/uk_aq_history_cache.json' 'cache')"
 CACHE_LOG="$(gh run view "$CACHE_RUN_ID" --repo "$REPO_SLUG" --log 2>/dev/null)" || fail "cache deployment log could not be read"
-printf '%s\n' "$CACHE_LOG" | grep -Fq "Resolved STATION_HISTORY Service Binding target: $STATION_WORKER" || fail "cache deployment did not bind the expected stable station Worker"
-printf '%s\n' "$CACHE_LOG" | grep -Fq 'Persistent observation-history authority: v3' || fail "cache deployment did not record v3 authority"
+grep -Fq "Resolved STATION_HISTORY Service Binding target: $STATION_WORKER" <<< "$CACHE_LOG" || fail "cache deployment did not bind the expected stable station Worker"
+grep -Fq 'Persistent observation-history authority: v3' <<< "$CACHE_LOG" || fail "cache deployment did not record v3 authority"
 STATION_LOG="$(gh run view "$STATION_RUN_ID" --repo "$REPO_SLUG" --log 2>/dev/null)" || fail "station deployment log could not be read"
-printf '%s\n' "$STATION_LOG" | grep -Fq "Resolved observation-history Worker target: $OBSERVATION_WORKER" || fail "station deployment target differs from the expected stable observation Worker"
+grep -Fq "Resolved observation-history Worker target: $OBSERVATION_WORKER" <<< "$STATION_LOG" || fail "station deployment target differs from the expected stable observation Worker"
 for deploy_id in "$STATION_RUN_ID" "$OBS_RUN_ID"; do
   DEPLOY_LOG="$(gh run view "$deploy_id" --repo "$REPO_SLUG" --log 2>/dev/null)" || fail "history deployment log could not be read"
   grep -Fq 'Persistent observation-history authority: v3' <<< "$DEPLOY_LOG" ||
