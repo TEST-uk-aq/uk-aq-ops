@@ -36,7 +36,13 @@ export function assertBoundedOperatorIdentity({ plan, checkpoint, manifest, plan
   const hasExplicitIdentity = expectedMigrationRunId !== undefined && expectedPlanSha256 !== undefined;
   demand((hasReport && expectedMigrationRunId === undefined && expectedPlanSha256 === undefined) ||
     (!hasReport && hasExplicitIdentity), 'Choose exactly one complete operator migration identity source');
-  const expectedRunId = hasReport ? planReport?.result?.migration_run_id : expectedMigrationRunId;
+  // Historical exceptional-recovery audits record migration_run_id in audit
+  // rather than result. Both identities must agree when both are present.
+  const resultRunId = planReport?.result?.migration_run_id;
+  const auditRunId = planReport?.audit?.migration_run_id;
+  demand(!hasReport || resultRunId === undefined || auditRunId === undefined ||
+    resultRunId === auditRunId, 'Operator result/audit migration run identities disagree');
+  const expectedRunId = hasReport ? (resultRunId ?? auditRunId) : expectedMigrationRunId;
   const expectedPlan = hasReport ? planReport?.result?.plan_sha256 : expectedPlanSha256;
   demand(expectedRunId === plan.migration_run_id && expectedRunId === checkpoint.migration_run_id &&
     expectedRunId === manifest.payload.migration_run_id && expectedPlan === plan.plan_sha256 &&
