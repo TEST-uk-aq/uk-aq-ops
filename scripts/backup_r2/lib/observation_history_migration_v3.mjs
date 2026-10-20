@@ -281,6 +281,15 @@ function updateRecoveryReplayDigest(hash, value) {
   throw new TypeError(`Unsupported recovery replay digest value type: ${typeof value}`);
 }
 
+const RECOVERY_DIGEST_ASCII_KEY = /^[\\x00-\\x7f]*$/;
+function compareRecoveryReplayKeys(left, right) {
+  if (left === right) return 0;
+  if (RECOVERY_DIGEST_ASCII_KEY.test(left) && RECOVERY_DIGEST_ASCII_KEY.test(right)) {
+    return left < right ? -1 : 1;
+  }
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
 function addRecoveryReplayDigestRecord(hash, name, value) {
   updateRecoveryReplayDigest(hash, name);
   updateRecoveryReplayDigest(hash, value);
@@ -308,13 +317,16 @@ export function buildObservationHistoryV3RecoveryReplayStateSha256(checkpoint, d
     addRecoveryReplayDigestRecord(hash, "preparation_order_entry", [index, unitId]);
   }
 
-  const preparedEntries = diskEntries?.preparedEntries || (checkpoint?.prepared_units &&
+  // The replay digest orders keys by their UTF-8 bytes. An array of keys
+  // avoids allocating a second array of [key, large-record] pairs, and the
+  // ASCII fast path avoids two temporary Buffers per sort comparison.
+  // Non-ASCII strings retain the exact historical Buffer.compare ordering.
+  const preparedKeys = diskEntries?.preparedEntries ? null : (checkpoint?.prepared_units &&
       typeof checkpoint.prepared_units === "object" &&
       !Array.isArray(checkpoint.prepared_units)
-    ? Object.entries(checkpoint.prepared_units).sort(([left], [right]) =>
-      Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"))
-    )
+    ? Object.keys(checkpoint.prepared_units).sort(compareRecoveryReplayKeys)
     : []);
+  const preparedEntries = diskEntries?.preparedEntries || preparedKeys;
   addRecoveryReplayDigestRecord(
     hash,
     "prepared_units_valid",
@@ -323,7 +335,9 @@ export function buildObservationHistoryV3RecoveryReplayStateSha256(checkpoint, d
       !Array.isArray(checkpoint.prepared_units),
   );
   addRecoveryReplayDigestRecord(hash, "prepared_units_count", preparedEntries.length);
-  for (const [unitId, record] of preparedEntries) {
+  for (const entry of preparedEntries) {
+    const unitId = preparedKeys === null ? entry[0] : entry;
+    const record = preparedKeys === null ? entry[1] : checkpoint.prepared_units[entry];
     addRecoveryReplayDigestRecord(hash, "prepared_unit_id", unitId);
     addRecoveryReplayDigestRecord(
       hash,
@@ -357,13 +371,12 @@ export function buildObservationHistoryV3RecoveryReplayStateSha256(checkpoint, d
     addRecoveryReplayDigestRecord(hash, "staging_ref_count", stagingRefCount);
   }
 
-  const completedEntries = diskEntries?.completedEntries || (checkpoint?.completed_objects &&
+  const completedKeys = diskEntries?.completedEntries ? null : (checkpoint?.completed_objects &&
       typeof checkpoint.completed_objects === "object" &&
       !Array.isArray(checkpoint.completed_objects)
-    ? Object.entries(checkpoint.completed_objects).sort(([left], [right]) =>
-      Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"))
-    )
+    ? Object.keys(checkpoint.completed_objects).sort(compareRecoveryReplayKeys)
     : []);
+  const completedEntries = diskEntries?.completedEntries || completedKeys;
   addRecoveryReplayDigestRecord(
     hash,
     "completed_objects_valid",
@@ -372,7 +385,9 @@ export function buildObservationHistoryV3RecoveryReplayStateSha256(checkpoint, d
       !Array.isArray(checkpoint.completed_objects),
   );
   addRecoveryReplayDigestRecord(hash, "completed_objects_count", completedEntries.length);
-  for (const [key, evidence] of completedEntries) {
+  for (const entry of completedEntries) {
+    const key = completedKeys === null ? entry[0] : entry;
+    const evidence = completedKeys === null ? entry[1] : checkpoint.completed_objects[entry];
     addRecoveryReplayDigestRecord(hash, "completed_object", { key, evidence });
   }
   addRecoveryReplayDigestRecord(
