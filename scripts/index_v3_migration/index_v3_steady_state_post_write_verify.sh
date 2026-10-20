@@ -241,9 +241,82 @@ verify_current_successful_deploy() {
   printf '%s' "$run" | jq -r '.databaseId'
 }
 
-OBS_RUN_ID="$(verify_current_successful_deploy uk_aq_observs_history_r2_api_worker_deploy.yml '.github/workflows/uk_aq_observs_history_r2_api_worker_deploy.yml workers/uk_aq_observs_history_r2_api_worker workers/shared' 'observation history')"
+# The observation Worker can deploy directly or as a called job of the
+# observations-history/dashboard orchestration workflow. GitHub run list for
+# the reusable workflow alone does not include the invoking caller's runs.
+# Admit the newest actual observation deployment, not a dashboard-only run.
+verify_observation_history_deploy() {
+  local direct_runs combined_runs candidates candidate source run_id job_name job
+  local run_sha drift
+
+  direct_runs="$(gh run list --repo "$REPO_SLUG" \
+    --workflow uk_aq_observs_history_r2_api_worker_deploy.yml \
+    --branch "$DEFAULT_BRANCH" --limit 50 \
+    --json databaseId,status,conclusion,headSha,headBranch,createdAt 2>/dev/null)" ||
+    fail "direct observation history deployment history could not be read"
+  combined_runs="$(gh run list --repo "$REPO_SLUG" \
+    --workflow uk_aq_observs_history_dashboard_workers_deploy.yml \
+    --branch "$DEFAULT_BRANCH" --limit 50 \
+    --json databaseId,status,conclusion,headSha,headBranch,createdAt 2>/dev/null)" ||
+    fail "combined observation history deployment history could not be read"
+
+  candidates="$(jq -cn --argjson direct "$direct_runs" --argjson combined "$combined_runs" '
+    [($direct[] | . + {source:"direct"}), ($combined[] | . + {source:"combined"})]
+    | sort_by(.createdAt) | reverse | .[]
+  ')" || fail "observation history deployment candidates could not be ordered"
+  [ -n "$candidates" ] || fail "no observation history deployment runs were found"
+
+  while IFS= read -r candidate; do
+    source="$(printf '%s' "$candidate" | jq -r '.source')"
+    run_id="$(printf '%s' "$candidate" | jq -r '.databaseId')"
+    if [ "$source" = "combined" ]; then
+      job_name="deploy_observations_history / deploy-worker"
+    else
+      job_name="deploy-worker"
+    fi
+    job="$(gh run view "$run_id" --repo "$REPO_SLUG" --json jobs 2>/dev/null |
+      jq -c --arg name "$job_name" '
+        [.jobs[] | select(.name == $name)]
+        | if length == 1 then .[0] else empty end
+      ')" || fail "observation history deployment job evidence could not be read"
+    [ -n "$job" ] || fail "observation history deployment job is missing or ambiguous in run $run_id"
+
+    # A combined dashboard-only run has no observation publication and is
+    # irrelevant to the observation Worker freshness frontier.
+    if [ "$source" = "combined" ] &&
+       [ "$(printf '%s' "$job" | jq -r '.conclusion')" = "skipped" ]; then
+      continue
+    fi
+    printf '%s' "$candidate" | jq -e --arg branch "$DEFAULT_BRANCH" '
+      .status == "completed" and .conclusion == "success" and
+      .headBranch == $branch and (.headSha | type == "string")
+    ' >/dev/null || fail "observation history deployment run $run_id was not a successful default-branch run"
+    printf '%s' "$job" | jq -e '
+      .status == "completed" and .conclusion == "success"
+    ' >/dev/null || fail "observation history deployment job did not complete successfully in run $run_id"
+
+    run_sha="$(printf '%s' "$candidate" | jq -r '.headSha')"
+    git merge-base --is-ancestor "$run_sha" HEAD ||
+      fail "observation history deployment SHA is not an ancestor of current HEAD"
+    drift="$(git diff --name-only "$run_sha" HEAD -- \
+      .github/workflows/uk_aq_observs_history_r2_api_worker_deploy.yml \
+      .github/workflows/uk_aq_observs_history_dashboard_workers_deploy.yml \
+      workers/uk_aq_observs_history_r2_api_worker workers/shared \
+      config/uk_aq_history_cache.json package.json package-lock.json)"
+    [ -z "$drift" ] || fail "observation history deployment is stale relative to relevant current code"
+    printf '%s\n' "$run_id"
+    return 0
+  done <<< "$candidates"
+
+  fail "no completed observation history deployment job was found"
+}
+
+OBS_RUN_ID="$(verify_observation_history_deploy)"
 STATION_RUN_ID="$(verify_current_successful_deploy uk_aq_station_history_deploy.yml '.github/workflows/uk_aq_station_history_deploy.yml workers/uk_aq_station_history workers/shared' 'station history')"
-CACHE_RUN_ID="$(verify_current_successful_deploy uk_aq_cache_proxy_deploy.yml '.github/workflows/uk_aq_cache_proxy_deploy.yml workers/uk_aq_cache_proxy workers/uk_aq_station_history workers/shared' 'cache')"
+# The cache binds to a stable independently deployed station Worker.
+# Station implementation changes are checked by STATION_RUN_ID, not as cache
+# source drift. Keep cache-owned code, config and shared dependencies pinned.
+CACHE_RUN_ID="$(verify_current_successful_deploy uk_aq_cache_proxy_deploy.yml '.github/workflows/uk_aq_cache_proxy_deploy.yml workers/uk_aq_cache_proxy workers/shared config/uk_aq_history_cache.json' 'cache')"
 CACHE_LOG="$(gh run view "$CACHE_RUN_ID" --repo "$REPO_SLUG" --log 2>/dev/null)" || fail "cache deployment log could not be read"
 printf '%s\n' "$CACHE_LOG" | grep -Fq "Resolved STATION_HISTORY Service Binding target: $STATION_WORKER" || fail "cache deployment did not bind the expected stable station Worker"
 printf '%s\n' "$CACHE_LOG" | grep -Fq 'Persistent observation-history authority: v3' || fail "cache deployment did not record v3 authority"
@@ -251,7 +324,14 @@ STATION_LOG="$(gh run view "$STATION_RUN_ID" --repo "$REPO_SLUG" --log 2>/dev/nu
 printf '%s\n' "$STATION_LOG" | grep -Fq "Resolved observation-history Worker target: $OBSERVATION_WORKER" || fail "station deployment target differs from the expected stable observation Worker"
 for deploy_id in "$STATION_RUN_ID" "$OBS_RUN_ID"; do
   DEPLOY_LOG="$(gh run view "$deploy_id" --repo "$REPO_SLUG" --log 2>/dev/null)" || fail "history deployment log could not be read"
-  printf '%s\n' "$DEPLOY_LOG" | grep -Fq 'Persistent observation-history authority: v3' || fail "history deployment did not record v3 authority"
+  grep -Fq 'Persistent observation-history authority: v3' <<< "$DEPLOY_LOG" ||
+    fail "history deployment did not record v3 authority"
+  if [ "$deploy_id" = "$OBS_RUN_ID" ]; then
+    grep -Fq "Uploaded $OBSERVATION_WORKER (" <<< "$DEPLOY_LOG" ||
+      fail "observation history deployment did not upload the expected stable Worker"
+    grep -Fq "Deployed $OBSERVATION_WORKER triggers (" <<< "$DEPLOY_LOG" ||
+      fail "observation history deployment did not deploy the expected stable Worker"
+  fi
 done
 
 jq -n \
