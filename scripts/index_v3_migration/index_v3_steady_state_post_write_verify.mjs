@@ -4,7 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { Client } from "pg";
 import { VerificationStore, GiB } from "./bounded_verify_store.mjs";
@@ -992,13 +992,13 @@ function requireAuthenticatedCompletedPlanIdentity(completed, expected, label) {
   return identity;
 }
 
-async function verifyHierarchyDelta({ getObject, planReport, planReportPath, checkpointPath, evidenceRoot, accepted, requiredUnchangedDay, environment, bucket }) {
+async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, evidenceRoot, accepted, requiredUnchangedDay, environment, bucket }) {
   // The historical migration plan includes more than a million publication
   // records. Authenticate it using the existing SQLite-backed bounded verifier
   // rather than materialising all journal entries and reconstructing a giant
   // JavaScript plan. This is scratch data, never migration/evidence authority.
   const scratchDirectory = process.env.UK_AQ_V3_VERIFY_SCRATCH_DIRECTORY || os.tmpdir();
-  const repositoryRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
+  const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
   const store = await VerificationStore.open({
     scratchDirectory,
     evidenceDirectory: path.dirname(path.resolve(checkpointPath)),
@@ -1034,7 +1034,7 @@ async function verifyHierarchyDelta({ getObject, planReport, planReportPath, che
     if (complete(dayKey)) fail("accepted day already exists in the authenticated pre-steady-state baseline");
     const requiredDay = exactDay(requiredUnchangedDay, "required unchanged day");
     const requiredDayKey = buildHistoryV2DayManifestKey(GENERATION.observations_prefix, requiredDay);
-    if (!complete(requiredDayKey)) fail(\`required unchanged day lacks authenticated post-migration evidence: \${requiredDay}\`);
+    if (!complete(requiredDayKey)) fail(`required unchanged day lacks authenticated post-migration evidence: ${requiredDay}`);
 
     const branchKeys = new Set([
       buildR2HistoryV2ObservationsMonthManifestKey(GENERATION.observations_prefix, accepted.day_utc.slice(0, 4), accepted.day_utc.slice(5, 7)),
@@ -1047,7 +1047,7 @@ async function verifyHierarchyDelta({ getObject, planReport, planReportPath, che
     const eachObject = async (where, visit) => {
       let after = "";
       for (;;) {
-        const rows = store.statement(\`SELECT key,size,sha,stage FROM objects WHERE \${where} AND key>? ORDER BY key COLLATE BINARY LIMIT 128\`).all(after);
+        const rows = store.statement(`SELECT key,size,sha,stage FROM objects WHERE ${where} AND key>? ORDER BY key COLLATE BINARY LIMIT 128`).all(after);
         if (!rows.length) break;
         for (const row of rows) await visit(row);
         after = rows.at(-1).key;
@@ -1059,23 +1059,23 @@ async function verifyHierarchyDelta({ getObject, planReport, planReportPath, che
     let unaffectedAggregateCount = 0;
     await eachObject("v3=0 AND external=0", async (object) => {
       const key = object.key;
-      if (!key.startsWith(\`\${GENERATION.observations_prefix}/\`) || !key.endsWith("/manifest.json") || branchKeys.has(key)) return;
+      if (!key.startsWith(`${GENERATION.observations_prefix}/`) || !key.endsWith("/manifest.json") || branchKeys.has(key)) return;
       const isDay = /\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(key);
       const isAggregate = key.includes("/_manifests/");
       if (!isDay && !isAggregate) return;
       const expected = complete(key);
       if (!expected || expected.byte_size !== object.size || expected.sha256 !== object.sha) {
-        fail(\`canonical baseline object lacks exact authenticated completion: \${key}\`);
+        fail(`canonical baseline object lacks exact authenticated completion: ${key}`);
       }
       const current = await getIdentity(getObject, key);
       if (classifyDependencyIdentity(current, expected).classification !== "EXACT") {
-        fail(\`unaffected post-migration hierarchy identity changed: \${key}\`);
+        fail(`unaffected post-migration hierarchy identity changed: ${key}`);
       }
       if (isDay) unaffected.push({ key, byte_size: current.byte_size, sha256: current.sha256 });
       else unaffectedAggregateCount++;
     });
     const requiredUnchangedIdentity = unaffected.find((entry) => entry.key === requiredDayKey);
-    if (!requiredUnchangedIdentity) fail(\`required unchanged day was not exact: \${requiredDay}\`);
+    if (!requiredUnchangedIdentity) fail(`required unchanged day was not exact: ${requiredDay}`);
 
     const aggregates = [];
     for (const key of branchKeys) {
@@ -1092,7 +1092,7 @@ async function verifyHierarchyDelta({ getObject, planReport, planReportPath, che
     const baselineParent = (key) => {
       const parent = baseline.steadyStateAggregates.find((entry) => entry.key === key);
       if (!parent || !Array.isArray(parent.children) || !complete(key)) {
-        fail(\`authenticated migration baseline parent is unavailable: \${key}\`);
+        fail(`authenticated migration baseline parent is unavailable: ${key}`);
       }
       return parent.children;
     };
@@ -1110,12 +1110,12 @@ async function verifyHierarchyDelta({ getObject, planReport, planReportPath, che
     await eachObject("v3=1 AND external=0", async (object) => {
       const expected = complete(object.key);
       if (!expected || expected.byte_size !== object.size || expected.sha256 !== object.sha) {
-        fail(\`v3 baseline object lacks exact authenticated completion: \${object.key}\`);
+        fail(`v3 baseline object lacks exact authenticated completion: ${object.key}`);
       }
       if (object.key === DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY) return;
       const current = await getIdentity(getObject, object.key);
       if (current.byte_size !== expected.byte_size || current.sha256 !== expected.sha256) {
-        fail(\`unaffected authenticated v3 authority changed: \${object.key}\`);
+        fail(`unaffected authenticated v3 authority changed: ${object.key}`);
       }
       unaffectedV3Count++;
     });
