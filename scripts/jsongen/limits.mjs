@@ -9,6 +9,16 @@ export const LIMITS = Object.freeze({
   total_bytes: 64 * 1024 ** 2, total_rows: 200_000,
   report_bytes: 4 * 1024 ** 2, duration_ms: 60_000,
 });
+// Only original Prune handover decoding gets this larger still-bounded profile:
+// 32 MiB compressed bundle + 64 MiB JSON + 32 MiB pinned metadata bodies +
+// 8 MiB pending gzip + 32 MiB pending NDJSON fit under the 192 MiB total.
+// Ordinary receipts, currentness inspection and legacy inline decoding keep
+// their existing ceilings.
+const PRUNE_HANDOVER_LIMITS = Object.freeze({ ...LIMITS,
+  metadata_bytes: 128 * 1024 ** 2,
+  total_bytes: 192 * 1024 ** 2,
+  duration_ms: 120_000,
+});
 // Only the manual currentness inspector gets this profile. For <=128 scopes,
 // at most 13 keys/scope + four shared keys, initial read + recheck + closing
 // root. The actual operation is lowered to its exact deterministic key plan.
@@ -38,6 +48,9 @@ export function evidence(condition, code, detail) {
 }
 export function createBudget(overrides = {}) {
   return makeBudget(overrides, LIMITS);
+}
+export function createPruneHandoverBudget(overrides = {}) {
+  return makeBudget(overrides, PRUNE_HANDOVER_LIMITS);
 }
 function makeBudget(overrides, ceiling) {
   requireValid(Object.keys(overrides).every(k => Object.hasOwn(LIMITS, k)), 'unknown resource limit');

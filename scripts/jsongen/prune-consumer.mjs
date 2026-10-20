@@ -9,10 +9,10 @@ import { buildPruneReceiptGroup, inspectPruneReceiptGroup, retainPruneReceiptGro
 import { managedR2ReadConfig, managedR2WriteConfig, updateManagedControl, JSONgenControlError }
   from './control.mjs';
 import { assertManagedR2CredentialMode } from './r2-config.mjs';
-import { createBudget, evidence, JSONgenEvidenceError } from './limits.mjs';
+import { createPruneHandoverBudget, evidence, JSONgenEvidenceError } from './limits.mjs';
 
 export async function consumePruneAcceptance({ reader, key, derivedR2, mode = 'read-only', initializeControl = false,
-  budget = createBudget() }) {
+  budget = createPruneHandoverBudget() }) {
   evidence(['read-only', 'retain'].includes(mode) && (!initializeControl || mode === 'retain'),
     'invalid_consumer_arguments', 'Explicit retain mode required for derived writes or initialization');
   try { assertManagedR2CredentialMode(derivedR2, mode === 'retain' ? 'write' : 'read'); }

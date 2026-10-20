@@ -1,6 +1,6 @@
 # AURN Prune v3 writer handover
 
-Implementation handover, 18 October 2026. Authoritative rules remain in the TEST
+Implementation handover, 20 October 2026. Authoritative rules remain in the TEST
 system-docs [quick reference](https://github.com/TEST-uk-aq/uk-aq-system-docs/blob/main/system_docs/station_charts/jsongen_prune_verification_handover_quick_reference.md)
 and its linked contracts. This document describes repository code, not deployment
 or real TEST acceptance. The operator reports the Actions pending-source flag is
@@ -8,13 +8,15 @@ already true and Prune scheduling paused. Neither setting is changed here.
 
 The later [original-authority amendment](prune-original-authority-handover.md)
 adds separately retained pre-PUT admitted absence and selected-v3 Core-owned
-binding closure to a versioned extension of the same schema-1 final envelope.
-It supersedes the earlier missing-before/binding capture boundary for eligible
-new first-publication events only. Legacy/incomplete events remain blocked;
-PR #112 still needs its independent extension decoder before receipt creation.
-The hardened representation uses nested version-2 markers and a shared bounded
-gzip metadata payload inside the unchanged outer schema-1 envelope. See that
-amendment for eight-worker capture, UUID lock binding and capacity priority.
+binding closure. The new local TEST path keeps its bounded version-2 inline
+decoder for existing events and stores new complete evidence in a deterministic
+immutable R2 bundle. A compact schema-1 pointer remains in the existing
+PostgreSQL bytea row; it includes the bundle key, compressed and JSON identities,
+signer intent and original invocation. Prune performs conditional creation and
+exact readback before recording the pointer. The independent consumer fetches
+the bundle and pending source through its explicit private READ client. This is
+code-only and has not been deployed or accepted by a real TEST run. Authoritative
+system-doc changes are handed over separately to ChatGPT in Chat mode.
 
 ## Capacity and complete source
 
@@ -50,11 +52,13 @@ without expanding any byte, row, request, metadata or deadline limit:
 | Complete pending source | 1,024 physical scopes, 100,000 rows including duplicates |
 | Exact original / compressed source | 32 MiB NDJSON / 8 MiB gzip; existing signer and SQL caps agree |
 | Reproducible source description | 1 MiB before signing |
-| Original JSON metadata capture | 8 MiB raw, 4,096 objects, 1 MiB per object |
-| Retained final evidence | 1 MiB total, including source membership and base64 metadata |
+| Original JSON metadata capture | 32 MiB shared raw, 8,192 objects, 8 MiB per object; optional before/binding capture is capped at 16 MiB / 4,096 objects |
+| Compressed evidence bundle | 32 MiB gzip; 64 MiB canonical JSON; 32 MiB combined exact metadata bodies |
+| PostgreSQL final evidence | Existing 1 MiB bytea cap; new row stores only the versioned bundle pointer |
 | Post-commit message | 4,096 bytes |
-| Optional preparation + signer + PUT | Existing 15-second deadline and canonical headroom admission |
-| General consumer budget | Unchanged 128 scopes, 200,000 total rows, 64 MiB total byte accounting |
+| Optional PENDING upload + binding capture | Existing 15-second shared deadline, concurrent within the unchanged canonical headroom admission; eight binding workers |
+| Optional bundle preparation + signer + PUT + readback | One shared 5-second post-finalisation reserve for the run; failure leaves JSONgen incomplete |
+| Consumer resource profile | 192 MiB total byte accounting for bounded Prune handover; 128-scope receipt partitions and row caps remain |
 
 For sizing only, 1,024 scopes at 24 hourly rows each is 24,576 rows. There is no
 one-row-per-hour assumption in validation: duplicates count toward the separate
@@ -68,11 +72,13 @@ source and, where necessary, form multiple independently authenticated complete
 physical-scope receipts within the existing 128-scope receipt bound. They must
 not truncate the connector-day source or its evidence.
 
-Original metadata missing/overflow still yields `not_captured` and null final
+Original metadata missing/overflow, incomplete Core binding capture, or bundle
+preparation/upload/readback failure still yields `not_captured` and null final
 bytea. It cannot be rescued by trimming metadata or a second canonical scan.
-The 8 MiB capture cap is not a peak-process-memory measurement: Buffers, canonical
-rows, encoded metadata and serialization coexist. No claim of accepted maximum
-throughput or real 15-second performance is made by these structural caps.
+These caps bound inputs but are not peak-process-memory measurements: Buffers,
+canonical rows, encoded metadata and serialization coexist. The reported 940
+binding reads and five-second bundle retention window still require real TEST
+measurement; these structural bounds do not prove accepted throughput.
 
 ## Original finalisation and COMMIT seam
 

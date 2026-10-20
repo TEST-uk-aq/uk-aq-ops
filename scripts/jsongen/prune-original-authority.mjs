@@ -15,6 +15,7 @@ import { validateTimeseriesBindingSourceRootManifest, validateTimeseriesBindingS
   from '../backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs';
 import { validTimeseriesBindingSourceState } from '../backup_r2/lib/timeseries_binding_source_state_v2.mjs';
 import { validContinuity } from './authority.mjs';
+import { PRUNE_EVIDENCE_BUNDLE_LIMITS } from './prune-evidence-bundle.mjs';
 
 const G = getObservationHistoryGeneration('v3');
 const check = (ok, field) => evidence(ok, 'invalid_original_scope_authority', `Original scope authority mismatch: ${field}`);
@@ -23,7 +24,7 @@ const pin = object => ({ bucket: object.bucket ?? object.canonical_bucket, key: 
 export const prunePhysicalKey = s => scopeKey({ identity: s.identity ?? { connector_id: 1,
   timeseries_id: s.timeseries_id, station_id: s.station_id, pollutant_code: s.pollutant_code }, day_utc: s.day_utc });
 
-export function authenticatePruneOriginalAuthority({ envelope: e, row, source, budget }) {
+export function authenticatePruneOriginalAuthority({ envelope: e, row, source, budget, bundleMode = false }) {
   const x = e.original_authority_extension;
   check(x?.schema_version === 1 && x.kind === 'uk_aq_prune_original_scope_binding_authority'
     && x.completeness === 'captured' && x.before?.state === 'captured' && x.binding?.state === 'captured', 'complete_extension');
@@ -38,14 +39,18 @@ export function authenticatePruneOriginalAuthority({ envelope: e, row, source, b
     connector_manifest: e.original_connector_publication.connector_manifest,
     original_final_batch_sha256: sha256Hex(canonicalJson(e.original_final_batch)),
     transaction_state: 'prepared_before_original_gate_transaction' }), 'original_publication_relationship');
-  check(Array.isArray(x.objects) && x.objects.length === x.required_object_count, 'object_membership');
+  const objectLimit = bundleMode ? PRUNE_EVIDENCE_BUNDLE_LIMITS.object_count : 4096;
+  const objectByteLimit = bundleMode ? PRUNE_EVIDENCE_BUNDLE_LIMITS.object_bytes : 1024 ** 2;
+  const rawByteLimit = bundleMode ? PRUNE_EVIDENCE_BUNDLE_LIMITS.raw_bytes : 8 * 1024 ** 2;
+  check(Array.isArray(x.objects) && x.objects.length === x.required_object_count
+    && x.objects.length > 0 && x.objects.length <= objectLimit, 'object_membership');
   const objects = new Map(); let bytes = 0;
   for (const object of x.objects) {
     budget.check();
     assertReference(pin(object));
     check(object.bucket === bucket && ['before', 'binding'].includes(object.phase)
       && object.key.startsWith(object.phase === 'before' ? 'history/' : `${G.timeseries_binding_index_prefix}/`)
-      && object.key.endsWith('.json') && object.byte_size <= 1024 ** 2, 'object_namespace');
+      && object.key.endsWith('.json') && object.byte_size <= objectByteLimit, 'object_namespace');
     const id = `${object.phase}:${object.key}`;
     check(!objects.has(id), 'duplicate_original_object');
     const body = Buffer.from(object.bytes_base64, 'base64');
@@ -53,7 +58,7 @@ export function authenticatePruneOriginalAuthority({ envelope: e, row, source, b
     bytes += body.length; budget.bytes('metadata', body.length);
     objects.set(id, { reference: pin(object), value: parseJson(body), body });
   }
-  check(bytes === x.required_raw_byte_size, 'raw_byte_coverage');
+  check(bytes === x.required_raw_byte_size && bytes <= rawByteLimit, 'raw_byte_coverage');
   const used = new Set();
   const get = (phase, reference, expectedKey = reference?.key) => {
     assertReference(reference);

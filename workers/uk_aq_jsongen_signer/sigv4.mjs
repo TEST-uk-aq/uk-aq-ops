@@ -17,7 +17,9 @@ const queryString = entries => Object.entries(entries)
 export async function presignPut({ accountId, accessKeyId, secretAccessKey, bucket, key,
   checksumBase64, contentType, now = new Date(), expiresSeconds = 60 }) {
   if (!/^[a-f0-9]{32}$/.test(accountId) || !accessKeyId || !secretAccessKey
-    || !/^[a-z0-9-]+$/.test(bucket) || !key.startsWith('managed/jsongen/v1/pending/unverified/')
+    || !/^[a-z0-9.-]+$/.test(bucket) || bucket.includes('..')
+    || !['managed/jsongen/v1/pending/unverified/',
+      'managed/jsongen/v1/evidence-bundles/prune_daily_v3/'].some(prefix => key.startsWith(prefix))
     || !Number.isInteger(expiresSeconds) || expiresSeconds < 1 || expiresSeconds > 60)
     throw new TypeError('invalid presigning configuration');
   const host = `${accountId}.r2.cloudflarestorage.com`;
@@ -53,4 +55,35 @@ export async function presignPut({ accountId, accessKeyId, secretAccessKey, buck
     headers: { 'Content-Type': contentType, 'If-None-Match': '*',
       'x-amz-checksum-sha256': checksumBase64 },
   };
+}
+
+export async function presignGet({ accountId, accessKeyId, secretAccessKey, bucket, key,
+  now = new Date(), expiresSeconds = 60 }) {
+  if (!/^[a-f0-9]{32}$/.test(accountId) || !accessKeyId || !secretAccessKey
+    || !/^[a-z0-9.-]+$/.test(bucket) || bucket.includes('..')
+    || !key.startsWith('managed/jsongen/v1/evidence-bundles/prune_daily_v3/')
+    || !Number.isInteger(expiresSeconds) || expiresSeconds < 1 || expiresSeconds > 60)
+    throw new TypeError('invalid presigning configuration');
+  const host = `${accountId}.r2.cloudflarestorage.com`;
+  const path = `/${quote(bucket)}/${key.split('/').map(quote).join('/')}`;
+  const signedAt = new Date(now.getTime());
+  signedAt.setUTCMilliseconds(0);
+  const amzDate = signedAt.toISOString().replace(/[:-]|\.\d{3}/g, '');
+  const scope = `${amzDate.slice(0, 8)}/auto/s3/aws4_request`;
+  const signedHeaders = 'host';
+  const params = {
+    'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+    'X-Amz-Credential': `${accessKeyId}/${scope}`,
+    'X-Amz-Date': amzDate,
+    'X-Amz-Expires': String(expiresSeconds),
+    'X-Amz-SignedHeaders': signedHeaders,
+  };
+  const canonical = ['GET', path, queryString(params), `host:${host}\n`,
+    signedHeaders, 'UNSIGNED-PAYLOAD'].join('\n');
+  const stringToSign = ['AWS4-HMAC-SHA256', amzDate, scope, hex(await sha256(canonical))].join('\n');
+  let signingKey = encoder.encode(`AWS4${secretAccessKey}`);
+  for (const part of [amzDate.slice(0, 8), 'auto', 's3', 'aws4_request']) signingKey = await hmac(signingKey, part);
+  params['X-Amz-Signature'] = hex(await hmac(signingKey, stringToSign));
+  return { url: `https://${host}${path}?${queryString(params)}`,
+    expiresAtUtc: new Date(signedAt.getTime() + expiresSeconds * 1000).toISOString() };
 }

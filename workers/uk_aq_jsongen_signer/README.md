@@ -1,7 +1,7 @@
 # JSONgen Phase 1 TEST signer
 
-This isolated Worker only issues `POST /v1/upload-intents` for a Prune Daily v3
-connector-day pending source. It is **inactive**: `UK_AQ_JSONGEN_SIGNER_ENABLED`
+This isolated Worker issues `POST /v1/upload-intents` for a Prune Daily v3
+connector-day PENDING source or original-evidence bundle. It is **inactive**: `UK_AQ_JSONGEN_SIGNER_ENABLED`
 defaults to `false`; workers.dev and preview URLs are off. The proposed custom
 domain and [manual deployment workflow](../../.github/workflows/uk_aq_jsongen_signer_deploy.yml)
 prepare a disabled TEST deployment only; neither has been applied by this change.
@@ -37,6 +37,12 @@ Prune token currently authorises only connector IDs in the explicit allowlist.
 The invocation ID is validated and pins the key, but its final canonical
 authority is not established by this API.
 
+An evidence-bundle request additionally binds the invocation attempt, writer
+Git SHA, source-evidence and source-identity digests, connector-manifest identity
+and final-batch digest. The Worker derives a separate invocation-and-compressed-
+digest key and returns signed PUT and GET URLs for that same object. Neither
+object body passes through the Worker.
+
 On success the response contains a deterministic opaque intent ID, a private
 bucket/key and declared digest/size reference, `upload_url`, expiry, required
 headers and `state: signed_upload_intent`. The ID is SHA-256 of a domain-tagged
@@ -55,11 +61,19 @@ apply their own safety margin for network latency and clock differences; the
 signer does not shorten the URL to provide that margin. Neither the ID nor key
 is durable confirmation or canonical authority.
 
+Bundle responses also include a short-lived `readback_url` and the validated
+bundle identity. The Prune caller sends the compressed body directly to R2,
+then reads it directly from R2 and compares exact bytes, length and SHA-256
+before it records the pointer in PostgreSQL.
+
 ## Signing boundary
 
 The existing `workers/shared/r2_sigv4.mjs` uses Node crypto and signs immediate
 requests. This Worker uses Web Crypto to construct S3 SigV4 query authentication
-for `PUT` on the exact bucket/key at the fixed Sleepercar TEST R2 S3 endpoint.
+for `PUT` and bundle-only `GET` on exact bucket/keys. The account and bucket
+come from `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID` and `UK_AQ_JSONGEN_R2_BUCKET` in the
+Worker environment; the disabled deployment workflow supplies configured TEST
+GitHub variables and the Worker has no code fallback.
 The canonical signed headers are `host`, `content-type`, `if-none-match` and
 `x-amz-checksum-sha256`. The checksum value is the declared compressed SHA-256
 in S3 base64 form. SigV4 uses `UNSIGNED-PAYLOAD`. [R2 S3 compatibility](https://developers.cloudflare.com/r2/api/s3/api/)
@@ -71,8 +85,10 @@ make the selected single PUT checksum plausible but do **not** establish that
 R2 enforces this exact signed-header combination. Keep the checksum header and
 require a wrong-body rejection check in real TEST.
 
-The 8 MiB compressed and 32 MiB uncompressed limits admit **declared metadata**.
-This Worker never sees the PUT body. The signed checksum fixes a claimed digest,
+Pending-source limits remain 8 MiB compressed and 32 MiB uncompressed. Bundles
+are capped at 32 MiB compressed and 64 MiB canonical JSON, with a separate
+32 MiB combined exact-metadata-body cap, 8,192 objects and 8 MiB per object.
+These are **declared metadata** limits. This Worker never sees the PUT body. The signed checksum fixes a claimed digest,
 subject to real R2 enforcement; it does not fix or prove byte length. The signer
 does not include `Content-Length` in signed headers: Cloudflare's presigned URL
 and S3 compatibility guidance does not establish that doing so would reliably
@@ -81,7 +97,8 @@ This is a deployment validation question, not an implied current guarantee.
 The future private reader must independently verify stored compressed byte
 length and SHA-256, decompress within bounds, and verify uncompressed byte
 length and SHA-256. A matching key, ETag, caller checksum or PUT response is
-not a verified source. This Phase 1 Worker performs no readback.
+not a verified source. The Worker only signs the bundle GET; Prune performs and
+verifies the direct readback.
 
 ## Credential and rate-limit boundaries
 
@@ -126,7 +143,7 @@ Errors contain only a bounded code: `disabled`, `invalid_endpoint`,
 ## Controlled operator handover
 
 The following are **separate decisions**: A code preparation, B disabled
-deployment, C signer activation, D Prune pending-upload activation, and E the
+deployment, C signer activation, D Prune PENDING/bundle handover activation, and E the
 first authorised real TEST operation. Merging A authorises none of B–E.
 The workflow has only `workflow_dispatch`, accepts only this TEST repository's
 `main`, and always deploys with `UK_AQ_ENV_NAME=TEST` and
@@ -298,14 +315,19 @@ arrange separately reviewed schema-owned grants rather than broad table-write
 access. No database query or grant is performed by this change.
 
 Confirm selected complete-v3 Prune configuration (`UK_AQ_R2_HISTORY_VERSION=v3`),
-all URL/Access/writer settings, bounded optional-upload headroom, and a reviewed
-plan for independent private pending readback and original gate evidence. Only
+all URL/Access/writer settings, configured TEST account and bucket variables,
+and bounded optional-operation headroom. The current local code uses a shared
+15-second concurrent PENDING-upload/binding-capture window, then one shared
+five-second post-finalisation bundle prepare/sign/PUT/readback window. It records
+the PostgreSQL pointer only after exact direct R2 readback; JSONgen still must
+independently authenticate the bundle and PENDING bytes. Only
 then, with separate D authority, set repository variable
 `UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED=true`. This authorises the optional
 path on the **next Prune invocation**, including any existing external scheduler;
 coordinate the operational window before changing it. It does not itself run
-Prune. The code's 15-second optional deadline, failure diagnostics and best-effort
-outbox savepoint policy remain unchanged. No new scope selector is introduced:
+Prune. Failure diagnostics and the best-effort outbox savepoint policy remain
+unchanged. Bundle failures leave handover incomplete and do not reverse the
+canonical Prune gate. No new scope selector is introduced:
 the signer admits connector `1`, while any other connector receives no intent
 and the optional handover fails without changing canonical Prune authority.
 

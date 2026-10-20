@@ -4,6 +4,7 @@ import { BUCKET, canonicalJson } from './schema.mjs';
 import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
 import { preparePruneOriginalAuthorityExtension } from './prune-original-metadata.mjs';
 import { compactPruneMetadataEvidence } from './prune-metadata-codec.mjs';
+import { encodePruneEvidenceBundle } from './prune-evidence-bundle.mjs';
 
 const same = (a, b) => canonicalJson(a).equals(canonicalJson(b));
 const reference = value => value && typeof value.key === 'string'
@@ -15,7 +16,7 @@ const references = values => (Array.isArray(values) ? values : [])
 
 export function preparePruneOriginalFinalEvidence({ pending, connector, finalization,
   runId, dayUtc, connectorId, writerGitSha, sourceIdentity, originalMetadataSnapshot = null,
-  originalAuthorityCapture = null }) {
+  originalAuthorityCapture = null, evidenceMode = 'inline' }) {
   if (pending?.state !== 'put_acknowledged_unverified'
     || pending.pending_evidence?.writer?.invocation_id !== runId
     || pending.pending_evidence?.connector_id !== connectorId
@@ -155,6 +156,16 @@ export function preparePruneOriginalFinalEvidence({ pending, connector, finaliza
   });
   if (envelope.original_authority_extension.completeness !== 'captured')
     envelope.unresolved.push('original_before_or_binding_authority_not_completely_captured');
+  if (evidenceMode === 'r2_bundle') {
+    if (envelope.original_metadata_snapshot.completeness !== 'exact_writer_metadata_captured_unverified'
+      || envelope.original_authority_extension.completeness !== 'captured')
+      throw Object.assign(new Error('complete_original_evidence_required'),
+        { original_authority_code: 'complete_original_evidence_required' });
+    const bundle = encodePruneEvidenceBundle(envelope);
+    return { envelope, bytes: null, sha256: null, byte_size: null,
+      bundle, bundle_identity: pruneEvidenceBundleIdentity(envelope),
+      retention_state: 'transient_writer_memory_only' };
+  }
   const discardMetadata = (reason, completeSize = null) => {
     const original = envelope.original_authority_extension;
     envelope.original_metadata_snapshot = { schema_version: 1, completeness: 'not_captured', reason,
@@ -183,4 +194,108 @@ export function preparePruneOriginalFinalEvidence({ pending, connector, finaliza
     throw new Error('JSONgen final preparation exceeds bounded metadata size');
   return { envelope, bytes, sha256: sha256Hex(bytes), byte_size: bytes.length,
     retention_state: 'transient_writer_memory_only' };
+}
+
+export function pruneEvidenceBundleIdentity(envelope) {
+  const scope = { kind: 'connector_day', connector_id: envelope.connector_id,
+    day_utc: envelope.day_utc };
+  return {
+    writer_identity: envelope.writer.identity,
+    environment: envelope.environment,
+    invocation_id: envelope.writer.invocation_id,
+    attempt_id: envelope.writer.attempt_id,
+    writer_git_sha: envelope.writer.git_sha,
+    index_generation: envelope.index_generation,
+    connector_id: envelope.connector_id,
+    day_utc: envelope.day_utc,
+    object_type: 'prune_original_final_evidence_bundle_gzip',
+    source_evidence_sha256: envelope.pending.source_evidence_sha256,
+    source_identity_sha256: sha256Hex(canonicalJson(envelope.pending.source_identity)),
+    connector_manifest_key: envelope.original_connector_publication.manifest_key,
+    connector_manifest_sha256: envelope.original_connector_publication.connector_manifest.sha256,
+    original_final_batch_sha256: sha256Hex(canonicalJson(envelope.original_final_batch)),
+    scope,
+  };
+}
+
+export function attachPruneOriginalEvidenceBundleReference(preparation, reference) {
+  const source = preparation?.envelope;
+  if (!source || !preparation.bundle || !reference
+    || source.original_metadata_snapshot?.completeness !== 'exact_writer_metadata_captured_unverified'
+    || source.original_authority_extension?.completeness !== 'captured')
+    throw Object.assign(new Error('complete_original_evidence_required'),
+      { original_authority_code: 'complete_original_evidence_required' });
+  const identity = preparation.bundle_identity;
+  if (reference.writer_identity !== identity.writer_identity
+    || reference.environment !== identity.environment
+    || reference.invocation_id !== identity.invocation_id
+    || reference.attempt_id !== identity.attempt_id
+    || reference.writer_git_sha !== identity.writer_git_sha
+    || reference.connector_id !== identity.connector_id || reference.day_utc !== identity.day_utc
+    || reference.object_type !== identity.object_type
+    || reference.source_evidence_sha256 !== identity.source_evidence_sha256
+    || reference.source_identity_sha256 !== identity.source_identity_sha256
+    || reference.connector_manifest_key !== identity.connector_manifest_key
+    || reference.connector_manifest_sha256 !== identity.connector_manifest_sha256
+    || reference.original_final_batch_sha256 !== identity.original_final_batch_sha256
+    || reference.compressed_sha256 !== preparation.bundle.sha256
+    || reference.compressed_byte_size !== preparation.bundle.byte_size
+    || reference.uncompressed_sha256 !== preparation.bundle.json_sha256
+    || reference.uncompressed_byte_size !== preparation.bundle.json_byte_size)
+    throw Object.assign(new Error('bundle_reference_identity_mismatch'),
+      { original_authority_code: 'bundle_reference_identity_mismatch' });
+  const bundle = {
+    schema_version: 1,
+    codec: 'immutable_r2_json_gzip_v1',
+    reference: {
+      bucket: reference.bucket, key: reference.key,
+      sha256: reference.compressed_sha256, byte_size: reference.compressed_byte_size,
+      json_sha256: reference.uncompressed_sha256, json_byte_size: reference.uncompressed_byte_size,
+      intent_id: reference.intent_id, object_count: preparation.bundle.object_count,
+      raw_byte_size: preparation.bundle.raw_byte_size,
+      conditional_create: 'if_none_match_star',
+    },
+    identity,
+  };
+  const pointer = {
+    schema_version: 1,
+    kind: source.kind,
+    authority_state: source.authority_state,
+    environment: source.environment,
+    index_generation: source.index_generation,
+    writer: source.writer,
+    connector_id: source.connector_id,
+    day_utc: source.day_utc,
+    pending: {
+      intent_id: source.pending.intent_id,
+      object: source.pending.object,
+      preparation_sha256: source.pending.preparation_sha256,
+      source_evidence_sha256: source.pending.source_evidence_sha256,
+      source_identity: source.pending.source_identity,
+    },
+    original_metadata_snapshot: {
+      schema_version: 3, completeness: 'externalized_unverified',
+      representation: 'immutable_r2_json_gzip_v1',
+      required_object_count: source.original_metadata_snapshot.required_object_count,
+      required_raw_byte_size: source.original_metadata_snapshot.required_raw_byte_size,
+    },
+    original_authority_extension: {
+      schema_version: 3, kind: source.original_authority_extension.kind,
+      completeness: 'externalized_unverified',
+      required_object_count: source.original_authority_extension.required_object_count,
+      required_raw_byte_size: source.original_authority_extension.required_raw_byte_size,
+      before: { state: source.original_authority_extension.before.state },
+      binding: { state: source.original_authority_extension.binding.state },
+    },
+    original_metadata_evidence: bundle,
+    original_candidate_connector_gate: source.original_candidate_connector_gate,
+    unresolved: ['immutable_bundle_requires_independent_authentication'],
+  };
+  const bytes = canonicalJson(pointer);
+  if (bytes.length > 1024 * 1024)
+    throw Object.assign(new Error('bundle_reference_exceeds_outbox_limit'),
+      { original_authority_code: 'bundle_reference_exceeds_outbox_limit' });
+  return { ...preparation, envelope: pointer, bytes, sha256: sha256Hex(bytes),
+    byte_size: bytes.length, bundle_reference: bundle.reference,
+    retention_state: 'reference_prepared_unverified' };
 }

@@ -19,6 +19,8 @@ jobs:
       UK_AQ_ENV_NAME: TEST
       UK_AQ_JSONGEN_SIGNER_ENABLED: 'false'
       CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || '' }}
+      UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || '' }}
+      UK_AQ_JSONGEN_R2_BUCKET: ${{ vars.UK_AQ_JSONGEN_R2_BUCKET || '' }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_R2_CLOUDFLARE_API_TOKEN || '' }}
       UK_AQ_JSONGEN_SIGNER_RATE_LIMIT_NAMESPACE_ID: ${{ vars.UK_AQ_JSONGEN_SIGNER_RATE_LIMIT_NAMESPACE_ID || '' }}
     steps:
@@ -41,8 +43,12 @@ jobs:
           node --input-type=module <<'NODE'
           const e = process.env;
           if (e.CLOUDFLARE_ACCOUNT_ID !== '41a81f781d3bd7234fde0b25df51e879'
+            || e.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID !== e.CLOUDFLARE_ACCOUNT_ID
             || e.UK_AQ_ENV_NAME !== 'TEST' || e.UK_AQ_JSONGEN_SIGNER_ENABLED !== 'false')
             throw new Error('Only disabled deployment to the Sleepercar TEST account is allowed');
+          if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(e.UK_AQ_JSONGEN_R2_BUCKET)
+            || e.UK_AQ_JSONGEN_R2_BUCKET.includes('..'))
+            throw new Error('A configured TEST JSONgen R2 bucket is required');
           if (!e.CLOUDFLARE_API_TOKEN) throw new Error('Missing UK_AQ_R2_CLOUDFLARE_API_TOKEN');
           if (!/^[1-9]\d*$/.test(e.UK_AQ_JSONGEN_SIGNER_RATE_LIMIT_NAMESPACE_ID))
             throw new Error('An operator-allocated positive rate-limit namespace ID is required');
@@ -60,6 +66,9 @@ jobs:
           set -euo pipefail
           cp wrangler.toml wrangler.deploy.toml
           cat >> wrangler.deploy.toml <<EOF
+
+          UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID = "${UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID}"
+          UK_AQ_JSONGEN_R2_BUCKET = "${UK_AQ_JSONGEN_R2_BUCKET}"
 
           [[ratelimits]]
           name = "UK_AQ_JSONGEN_SIGNER_RATE_LIMIT"

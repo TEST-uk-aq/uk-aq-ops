@@ -7,7 +7,8 @@ import { readReceipt, readBundle, readImmutable, admitDerived } from './inputs.m
 import { assertManagedR2CredentialMode } from './r2-config.mjs';
 import { readCanonicalScopePages } from './authority.mjs';
 import { authenticateFinalPublication } from './writer-authentication.mjs';
-import { createBudget, createInspectionBudget, evidence, freeze, JSONgenEvidenceError, PRUNE_PENDING_SOURCE_LIMITS } from './limits.mjs';
+import { createBudget, createInspectionBudget, createPruneHandoverBudget,
+  evidence, freeze, JSONgenEvidenceError, PRUNE_PENDING_SOURCE_LIMITS } from './limits.mjs';
 import { controlSnapshot } from './control-snapshot.mjs';
 import { assertReconciliationReport } from './report-validation.mjs';
 import { authenticatePruneHandover, inspectAuthenticatedPruneHandover } from './prune-consumer-authentication.mjs';
@@ -43,6 +44,9 @@ export async function reconcileManagedInputs({ derivedR2, control, controlRead =
   }
   evidence(refs.size <= budget.limits.receipt_references, 'resource_limit', 'combined receipt reference budget exceeded');
   const changes = []; const scopes = new Map(); const ids = new Map(); const originalEvents = new Map();
+  // The currentness inspector keeps its 64 MiB profile; original outbox/bundle
+  // authentication gets one separately bounded 192 MiB budget per invocation.
+  const pruneHandoverBudget = createPruneHandoverBudget();
   const originalGroups = new Map(), expectedReceipts = new Map();
   const addScope = scope => {
     assertInspectionScope(scope);
@@ -93,7 +97,7 @@ export async function reconcileManagedInputs({ derivedR2, control, controlRead =
             originalEvents.set(id, (async () => {
               budget.check(); const acceptance = await pruneReader.read(receipt.origin.authority.key); budget.check();
               evidence(acceptance, 'missing_original_authority', 'Original PostgreSQL event is unavailable for receipt replay');
-              return authenticatePruneHandover({ acceptance, derivedR2, budget });
+              return authenticatePruneHandover({ acceptance, derivedR2, budget: pruneHandoverBudget });
             })());
           }
           pruneHandover = await originalEvents.get(id);

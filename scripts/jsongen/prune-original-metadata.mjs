@@ -9,9 +9,13 @@ import { validateTimeseriesBindingSourceRootManifest, validateTimeseriesBindingS
 import { validTimeseriesBindingSourceState } from '../backup_r2/lib/timeseries_binding_source_state_v2.mjs';
 
 const SHA = /^[0-9a-f]{64}$/;
-const MAX_CAPTURE_BYTES = 8 * 1024 * 1024;
-const MAX_OBJECT_BYTES = 1024 * 1024;
-const MAX_CAPTURE_OBJECTS = 4096;
+// Separate bounded R2 bundle capacity. The 32 MiB aggregate cap covers the
+// observed ~4.38 MiB before/binding plus ~7.81 MiB final snapshot with margin;
+// 8 MiB/object admits the known >1 MiB latest-global index. Legacy inline
+// decoding retains its independent 8 MiB / 4096 / 1 MiB limits.
+const MAX_CAPTURE_BYTES = 32 * 1024 * 1024;
+const MAX_OBJECT_BYTES = 8 * 1024 * 1024;
+const MAX_CAPTURE_OBJECTS = 8192;
 export const PRUNE_BINDING_CAPTURE_CONCURRENCY = 8;
 const OPTIONAL_CAPTURE_BYTES = MAX_CAPTURE_BYTES / 2;
 const OPTIONAL_CAPTURE_OBJECTS = MAX_CAPTURE_OBJECTS / 2;
@@ -109,8 +113,8 @@ export function createPruneOriginalMetadataCapture() {
       group.capture = originalAuthorityCapture({ identity, lockContext,
         retain: (phase, value) => {
           const slot = `${prefix}${phase}:${value.key}`;
-          if (retain(slot, value, true)) return false;
-          group.slots.add(slot); return true;
+          if (retain(slot, value, true)) return true;
+          group.slots.add(slot); return false;
         },
         releasePhase: phase => {
           for (const slot of group.slots) if (slot.startsWith(`${prefix}${phase}:`)) {
@@ -128,7 +132,7 @@ export function createPruneOriginalMetadataCapture() {
 
 // This is an additive, explicitly versioned schema-1 envelope extension. Old
 // final metadata keeps its original meaning. Same-key BEFORE and AFTER bytes
-// occupy distinct slots in ONE shared 8 MiB / 4096-object capture budget.
+// occupy distinct slots in ONE shared bounded R2-bundle capture budget.
 const GENERATION = getObservationHistoryGeneration('v3');
 const originalError = (code) => Object.assign(new Error(code), { original_authority_code: code });
 const requireOriginal = (ok, code = 'contradictory_binding_authority') => {
@@ -156,6 +160,10 @@ function originalAuthorityCapture({ identity, lockContext, retain, body, release
   let scopeMembershipValid = false;
   let revoked = null;
   let bindingJob = null;
+  let bindingCaptureStartedAtMs = null;
+  let bindingCaptureDurationMs = null;
+  let bindingCaptureUniqueKeyCount = null;
+  let bindingCaptureRetainedObjectCount = null;
   let beforeOpen = true;
   let abortCapture = null;
   const record = (phase, value) => {
@@ -203,7 +211,9 @@ function originalAuthorityCapture({ identity, lockContext, retain, body, release
   };
   return {
     invalidate(reason) {
-      revoked = reason; beforeOpen = false; abortCapture?.(); keys.clear(); pins.clear();
+      revoked = reason; beforeOpen = false; abortCapture?.();
+      releasePhase('before'); releasePhase('binding');
+      keys.clear(); pins.clear();
       beforeFailure = reason; binding = { state: failureState(reason), reason };
     },
     diagnostics() {
@@ -212,6 +222,9 @@ function originalAuthorityCapture({ identity, lockContext, retain, body, release
         before_membership_reason: originalBefore.reason || null,
         authoritative_previous_absence: originalBefore.state === 'captured',
         binding_authority_state: binding.state, binding_authority_reason: binding.reason || null,
+        binding_capture_duration_ms: bindingCaptureDurationMs,
+        binding_capture_unique_key_count: bindingCaptureUniqueKeyCount,
+        binding_capture_retained_object_count: bindingCaptureRetainedObjectCount,
         independent_consumer_authentication: 'outstanding' };
     },
     recordBeforeObject(value) {
@@ -230,6 +243,7 @@ function originalAuthorityCapture({ identity, lockContext, retain, body, release
       getObject = r2GetObjectBounded, nowMs = Date.now }) {
       if (bindingJob) return bindingJob;
       beforeOpen = false;
+      bindingCaptureStartedAtMs = nowMs();
       bindingJob = (async () => {
         const controller = new AbortController();
         const reads = new Map();
@@ -365,6 +379,7 @@ function originalAuthorityCapture({ identity, lockContext, retain, body, release
           await Promise.race([work, expired]);
         } catch (error) {
           active = false; controller.abort();
+          bindingCaptureRetainedObjectCount = [...keys.values()].filter(entry => entry.phase === 'binding').length;
           const reason = revoked || error.original_authority_code || (Number(error.status) === 404 ? 'binding_metadata_absent'
             : /byte budget|content length exceeds/.test(error.message || '') ? 'original_metadata_capture_limit'
               : /deadline|timeout|timed out/i.test(error.message || '') ? 'original_binding_capture_deadline' : 'binding_metadata_unavailable_or_invalid');
@@ -372,6 +387,10 @@ function originalAuthorityCapture({ identity, lockContext, retain, body, release
           releasePhase('binding');
           for (const [key, entry] of keys) if (entry.phase === 'binding') keys.delete(key);
         } finally {
+          bindingCaptureDurationMs = Math.max(0, nowMs() - bindingCaptureStartedAtMs);
+          bindingCaptureUniqueKeyCount = reads.size;
+          if (bindingCaptureRetainedObjectCount === null)
+            bindingCaptureRetainedObjectCount = [...keys.values()].filter(entry => entry.phase === 'binding').length;
           active = false; clearTimeout(timer); controller.abort(); abortCapture = null; reads.clear();
         }
       })();

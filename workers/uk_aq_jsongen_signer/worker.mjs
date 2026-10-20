@@ -1,11 +1,12 @@
-import { presignPut } from './sigv4.mjs';
+import { presignGet, presignPut } from './sigv4.mjs';
 
-const BUCKET = 'uk-aq-chart-history-json-test';
-const PREFIX = 'managed/jsongen/v1/pending/unverified';
-const ACCOUNT_ID = '41a81f781d3bd7234fde0b25df51e879';
+const PENDING_PREFIX = 'managed/jsongen/v1/pending/unverified';
+const BUNDLE_PREFIX = 'managed/jsongen/v1/evidence-bundles';
 const MAX_REQUEST_BYTES = 4096;
 const MAX_COMPRESSED_BYTES = 8 * 1024 * 1024;
 const MAX_UNCOMPRESSED_BYTES = 32 * 1024 * 1024;
+const MAX_BUNDLE_COMPRESSED_BYTES = 32 * 1024 * 1024;
+const MAX_BUNDLE_JSON_BYTES = 64 * 1024 * 1024;
 const WRITER = 'prune_daily_v3';
 const SHA = /^[a-f0-9]{64}$/;
 const INVOCATION = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
@@ -52,7 +53,7 @@ async function readSmallJson(request) {
     return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
   } catch { return undefined; } finally { reader.releaseLock(); }
 }
-function validate(input) {
+function validatePending(input) {
   const fields = ['writer_identity', 'invocation_id', 'index_generation', 'connector_id',
     'day_utc', 'object_type', 'compressed_byte_size', 'compressed_sha256',
     'uncompressed_byte_size', 'uncompressed_sha256', 'scope'];
@@ -69,6 +70,46 @@ function validate(input) {
   return true;
 }
 
+function validateEvidenceBundle(input) {
+  const fields = ['writer_identity', 'invocation_id', 'attempt_id', 'writer_git_sha',
+    'environment', 'index_generation', 'connector_id', 'day_utc', 'object_type',
+    'compressed_byte_size', 'compressed_sha256', 'uncompressed_byte_size',
+    'uncompressed_sha256', 'source_evidence_sha256', 'source_identity_sha256',
+    'connector_manifest_key', 'connector_manifest_sha256',
+    'original_final_batch_sha256', 'scope'];
+  const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
+  return sameFields(input, fields) && input.writer_identity === WRITER
+    && uuid.test(input.invocation_id) && input.attempt_id === input.invocation_id
+    && input.environment === 'TEST'
+    && /^[a-f0-9]{40}$/.test(input.writer_git_sha || '')
+    && input.index_generation === 'v3' && isPositive(input.connector_id) && validDay(input.day_utc)
+    && input.object_type === 'prune_original_final_evidence_bundle_gzip'
+    && isPositive(input.compressed_byte_size) && input.compressed_byte_size <= MAX_BUNDLE_COMPRESSED_BYTES
+    && isPositive(input.uncompressed_byte_size) && input.uncompressed_byte_size <= MAX_BUNDLE_JSON_BYTES
+    && [input.compressed_sha256, input.uncompressed_sha256, input.source_evidence_sha256,
+      input.source_identity_sha256, input.connector_manifest_sha256,
+      input.original_final_batch_sha256].every(value => typeof value === 'string' && SHA.test(value))
+    && input.connector_manifest_key === `history/v3/observations/day_utc=${input.day_utc}`
+      + `/connector_id=${input.connector_id}/manifest.json`
+    && sameFields(input.scope, ['kind', 'connector_id', 'day_utc'])
+    && input.scope.kind === 'connector_day' && input.scope.connector_id === input.connector_id
+    && input.scope.day_utc === input.day_utc;
+}
+
+function bundleIntentIdentity(bucket, key, input) {
+  return [
+    'uk_aq_jsongen_evidence_bundle_intent_v1', bucket, key,
+    input.writer_identity, input.environment, input.invocation_id, input.attempt_id, input.writer_git_sha,
+    input.index_generation, input.connector_id, input.day_utc, input.object_type,
+    input.compressed_byte_size, input.compressed_sha256,
+    input.uncompressed_byte_size, input.uncompressed_sha256,
+    input.source_evidence_sha256, input.source_identity_sha256,
+    input.connector_manifest_key, input.connector_manifest_sha256,
+    input.original_final_batch_sha256,
+    input.scope.kind, input.scope.connector_id, input.scope.day_utc,
+  ];
+}
+
 export default {
   async fetch(request, env) {
     if (env.UK_AQ_JSONGEN_SIGNER_ENABLED !== 'true' || env.UK_AQ_ENV_NAME !== 'TEST')
@@ -81,9 +122,14 @@ export default {
     const secretAccessKey = env.UK_AQ_JSONGEN_SIGNER_R2_SECRET_ACCESS_KEY;
     const writerToken = env.UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN;
     const admitted = env.UK_AQ_JSONGEN_PRUNE_CONNECTOR_IDS;
+    const accountId = env.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID;
+    const bucket = env.UK_AQ_JSONGEN_R2_BUCKET;
     if (typeof accessKeyId !== 'string' || accessKeyId.length < 16
       || typeof secretAccessKey !== 'string' || secretAccessKey.length < 32
       || typeof writerToken !== 'string' || writerToken.length < 32
+      || typeof accountId !== 'string' || !/^[a-f0-9]{32}$/.test(accountId)
+      || typeof bucket !== 'string' || !/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)
+      || bucket.includes('..')
       || typeof admitted !== 'string' || admitted.length > 256
       || !/^\d+(,\d+)*$/.test(admitted)
       || !env.UK_AQ_JSONGEN_SIGNER_RATE_LIMIT?.limit
@@ -101,33 +147,45 @@ export default {
     if (!input || typeof input !== 'object') return error(400, 'invalid_request');
     if (input.writer_identity !== WRITER) return error(403, 'unauthorised_writer');
     if (input.index_generation !== 'v3') return error(400, 'invalid_generation');
-    if (!validate(input)) return error(400, 'invalid_scope_or_object_identity');
+    const isBundle = input.object_type === 'prune_original_final_evidence_bundle_gzip';
+    if (!(isBundle ? validateEvidenceBundle(input) : validatePending(input)))
+      return error(400, 'invalid_scope_or_object_identity');
     if (!admitted.split(',').some(value => Number(value) === input.connector_id))
       return error(403, 'unauthorised_scope');
-    const key = `${PREFIX}/${WRITER}/connector_id=${input.connector_id}/day_utc=${input.day_utc}`
-      + `/invocation=${encodeURIComponent(input.invocation_id)}`
-      + `/compressed_sha256=${input.compressed_sha256}/uncompressed_sha256=${input.uncompressed_sha256}.ndjson.gz`;
+    const prefix = isBundle ? `${BUNDLE_PREFIX}/${WRITER}` : `${PENDING_PREFIX}/${WRITER}`;
+    const key = isBundle
+      ? `${prefix}/connector_id=${input.connector_id}/day_utc=${input.day_utc}`
+        + `/invocation=${encodeURIComponent(input.invocation_id)}`
+        + `/compressed_sha256=${input.compressed_sha256}.json.gz`
+      : `${prefix}/connector_id=${input.connector_id}/day_utc=${input.day_utc}`
+        + `/invocation=${encodeURIComponent(input.invocation_id)}`
+        + `/compressed_sha256=${input.compressed_sha256}/uncompressed_sha256=${input.uncompressed_sha256}.ndjson.gz`;
     try {
       const issuedAt = new Date();
-      const signed = await presignPut({ accountId: ACCOUNT_ID, accessKeyId, secretAccessKey,
-        bucket: BUCKET, key, checksumBase64: checksumBase64(input.compressed_sha256),
+      const signed = await presignPut({ accountId, accessKeyId, secretAccessKey,
+        bucket, key, checksumBase64: checksumBase64(input.compressed_sha256),
         contentType: 'application/gzip', now: issuedAt });
-      // JSON array positions and JSON string escaping make this complete,
-      // validated identity deterministic and unambiguous. The key remains the
-      // existing digest-scoped pending key; an intent is never proof of bytes.
-      const intentIdentity = [
-        'uk_aq_jsongen_upload_intent_v1', BUCKET, key,
+      const readback = isBundle ? await presignGet({ accountId, accessKeyId,
+        secretAccessKey, bucket, key, now: issuedAt }) : null;
+      const intentIdentity = isBundle ? bundleIntentIdentity(bucket, key, input) : [
+        'uk_aq_jsongen_upload_intent_v1', bucket, key,
         input.writer_identity, input.invocation_id, input.index_generation,
         input.connector_id, input.day_utc, input.object_type,
         input.compressed_byte_size, input.compressed_sha256,
         input.uncompressed_byte_size, input.uncompressed_sha256,
         input.scope.kind, input.scope.connector_id, input.scope.day_utc,
       ];
+      // JSON array positions and JSON string escaping make complete validated
+      // request identity deterministic and unambiguous. An intent is never
+      // proof that R2 retained the body.
       const intentId = hex(await crypto.subtle.digest('SHA-256',
         encoder.encode(JSON.stringify(intentIdentity))));
-      return Response.json({ intent_id: intentId, object: { bucket: BUCKET, key,
+      const object = { bucket, key,
         sha256: input.compressed_sha256, byte_size: input.compressed_byte_size,
-        json_sha256: input.uncompressed_sha256, json_byte_size: input.uncompressed_byte_size },
+        json_sha256: input.uncompressed_sha256, json_byte_size: input.uncompressed_byte_size };
+      return Response.json({ intent_id: intentId, object,
+        ...(isBundle ? { bundle_identity: Object.fromEntries(Object.keys(input).map(name => [name, input[name]])),
+          readback_url: readback.url, readback_expires_at_utc: readback.expiresAtUtc } : {}),
         upload_url: signed.url, expires_at_utc: signed.expiresAtUtc,
         required_headers: signed.headers, state: 'signed_upload_intent' },
       { headers: { 'Cache-Control': 'no-store' } });

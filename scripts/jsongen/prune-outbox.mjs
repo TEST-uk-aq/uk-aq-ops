@@ -22,15 +22,30 @@ export function describePruneGateOutboxEvidence({ pending, connector, finalPrepa
   const manifest = connector?.connector_manifest;
   const snapshot = finalPreparation?.envelope?.original_metadata_snapshot;
   const pack = finalPreparation?.envelope?.original_metadata_evidence;
-  // Retain final bytes only when every required writer-produced metadata byte
-  // was captured. The DB row can still retain gate acceptance without them.
-  const bytes = manifest?.sha256 && manifest?.byte_size
-    && (snapshot?.schema_version === 1 || (snapshot?.schema_version === 2
+  const bundle = pack?.codec === 'immutable_r2_json_gzip_v1'
+    ? pack.reference : null;
+  const completeMetadata = snapshot?.schema_version === 1
+    || (snapshot?.schema_version === 2
       && snapshot.representation === 'inline_original_metadata_gzip_v1'
       && pack?.schema_version === 1 && pack.codec === 'canonical_json_gzip_v1'
-      && snapshot.evidence_sha256 === pack.json_sha256))
-    && snapshot?.completeness ===
-      'exact_writer_metadata_captured_unverified'
+      && snapshot.evidence_sha256 === pack.json_sha256)
+    || (snapshot?.schema_version === 3
+      && snapshot.representation === 'immutable_r2_json_gzip_v1'
+      && snapshot.completeness === 'externalized_unverified'
+      && finalPreparation?.envelope?.original_authority_extension?.schema_version === 3
+      && finalPreparation.envelope.original_authority_extension.completeness === 'externalized_unverified'
+      && bundle?.key === finalPreparation.bundle_reference?.key
+      && bundle?.sha256 === finalPreparation.bundle_reference?.sha256
+      && bundle?.byte_size === finalPreparation.bundle_reference?.byte_size
+      && bundle?.intent_id === finalPreparation.bundle_reference?.intent_id
+      && finalPreparation.bundle?.sha256 === bundle?.sha256
+      && finalPreparation.bundle?.byte_size === bundle?.byte_size);
+  // Retain final bytes only when every required writer-produced metadata byte
+  // was captured. The DB row can still retain gate acceptance without them.
+  const evidenceComplete = completeMetadata
+    && ['exact_writer_metadata_captured_unverified', 'externalized_unverified']
+      .includes(snapshot?.completeness);
+  const bytes = manifest?.sha256 && manifest?.byte_size && evidenceComplete
     ? finalPreparation?.bytes ?? null : null;
   return {
     connector_manifest_byte_sha256: manifest?.sha256 || null,

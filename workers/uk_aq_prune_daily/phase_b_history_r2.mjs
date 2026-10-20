@@ -10,8 +10,12 @@ import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
 import { randomUUID } from "node:crypto";
-import { uploadPrunePendingSource, resolvePruneSignerConfig, PRUNE_SIGNED_UPLOAD_DEADLINE_MS, isPrunePendingSourceConnector } from "../../scripts/jsongen/prune-signed-upload.mjs";
-import { preparePruneOriginalFinalEvidence } from "../../scripts/jsongen/prune-final-evidence.mjs";
+import { uploadPrunePendingSource, uploadPruneEvidenceBundle, resolvePruneSignerConfig,
+  PRUNE_SIGNED_UPLOAD_DEADLINE_MS, PRUNE_EVIDENCE_BUNDLE_UPLOAD_DEADLINE_MS,
+  isPrunePendingSourceConnector } from "../../scripts/jsongen/prune-signed-upload.mjs";
+import { preparePrunePendingSource } from "../../scripts/jsongen/prune-pending-source.mjs";
+import { preparePruneOriginalFinalEvidence, attachPruneOriginalEvidenceBundleReference }
+  from "../../scripts/jsongen/prune-final-evidence.mjs";
 import { describePruneGateOutboxEvidence, preparePrunePostCommitHandover } from "../../scripts/jsongen/prune-outbox.mjs";
 import { createPruneOriginalMetadataCapture, preparePruneOriginalMetadataSnapshot } from "../../scripts/jsongen/prune-original-metadata.mjs";
 import { fileURLToPath } from "node:url";
@@ -4213,8 +4217,9 @@ async function writeFrozenCandidateObservationsToV2({
     if (emitV3Diagnostics && runtime.jsongen_pending_source?.enabled === true) {
       jsongenPendingSource = { state: 'not_attempted',
         transport: { handover_attempted: false, signer_intent_state: 'not_attempted', put_state: 'not_attempted' } };
-      // Preserve connector publication plus v3 finalisation headroom even if
-      // the optional signer and PUT consume their entire shared deadline.
+      // Preserve mandatory connector publication/finalisation reserves, the
+      // shared prepublication upload+binding window, and one post-finalisation
+      // bundle PUT/readback window before any optional network work starts.
       const requiredMs = PHASE_B_STAGE_MIN_MS.observation_connector_publication
         + PHASE_B_V3_RUN_FINALIZATION_RESERVE_MS + PRUNE_SIGNED_UPLOAD_DEADLINE_MS + 5_000;
       if (!isPrunePendingSourceConnector(candidate.connector_id)) {
@@ -4237,29 +4242,72 @@ async function writeFrozenCandidateObservationsToV2({
             error.code = "signer_config_unavailable";
             throw error;
           }
-          jsongenPendingSource = await uploadPendingSource({
-            signer: runtime.jsongen_pending_source.signer,
+          const pendingCandidate = {
             path: frozen.temp.ndjsonPath,
             runId: runtime.run_id,
             dayUtc: candidate.day_utc,
             connectorId: candidate.connector_id,
             expectedRowCount: rows.length,
             sourceIdentity: frozen.sourceIdentity,
-          });
+          };
+          // Derive the bounded physical-scope membership from the already
+          // normalized replay rows so the Core binding reads can start before
+          // pending-source validation/compression consumes synchronous time.
+          const bindingScopeCounts = new Map();
+          for (const row of rows) {
+            const key = `${row.timeseries_id}:${row.station_id}:${row.pollutant_code}`;
+            const scope = bindingScopeCounts.get(key) || {
+              connector_id: candidate.connector_id,
+              timeseries_id: row.timeseries_id,
+              station_id: row.station_id,
+              pollutant_code: row.pollutant_code,
+              day_utc: candidate.day_utc,
+              row_count: 0,
+            };
+            scope.row_count += 1;
+            bindingScopeCounts.set(key, scope);
+          }
+          const bindingPhysicalScopes = [...bindingScopeCounts.values()].sort((a, b) =>
+            a.pollutant_code.localeCompare(b.pollutant_code)
+            || a.timeseries_id - b.timeseries_id || a.station_id - b.station_id);
+          // Pending-source upload and Core binding reads share one absolute
+          // 15-second episode. The capture begins immediately; the deadline
+          // is not restarted after local preparation.
+          const bindingCapture = jsongenOriginalAuthority?.captureBindings({
+            physicalScopes: bindingPhysicalScopes,
+            r2: runtime.r2, deadlineAtMs: optionalDeadlineAtMs,
+            admitRequest: () => hasBudgetFor(runtime, requiredMs - PRUNE_SIGNED_UPLOAD_DEADLINE_MS),
+          }) || Promise.resolve(null);
+          let preparedPendingSource;
+          try {
+            preparedPendingSource = preparePrunePendingSource(pendingCandidate);
+          } catch (error) {
+            // The capture handles its own deadline and settles to an explicit
+            // unavailable state; do not leave bounded R2 reads running past
+            // this candidate's failure path.
+            jsongenOriginalAuthority?.invalidate('pending_source_preparation_failed');
+            await bindingCapture;
+            throw error;
+          }
+          try {
+            jsongenPendingSource = await uploadPendingSource({ signer: runtime.jsongen_pending_source.signer,
+              ...pendingCandidate, prepared: preparedPendingSource,
+              deadlineAtMs: optionalDeadlineAtMs });
+          } catch (error) {
+            // Once the PENDING reference is unavailable, original binding
+            // capture cannot contribute to a complete handover. Abort it so
+            // an early signer failure does not spend the remaining window.
+            jsongenOriginalAuthority?.invalidate('pending_source_upload_failed');
+            await bindingCapture;
+            throw error;
+          }
+          await bindingCapture;
           logJsongenPhaseB(runtime, "INFO", "phase_b_jsongen_pending_source_put_acknowledged", {
             run_id: runtime.run_id, day_utc: candidate.day_utc, connector_id: candidate.connector_id,
             intent_id: jsongenPendingSource.intent_id, source: jsongenPendingSource.source,
             source_preparation_sha256: jsongenPendingSource.preparation_sha256,
             original_source_status_provenance: jsongenPendingSource.pending_evidence?.original_source_status?.classification,
             eligibility: "unverified",
-          });
-          // The remaining ORIGINAL optional 15-second episode, never a new
-          // reserve or a network operation in the later protected gate tx.
-          // Core binding publication uses the same global operation lock.
-          await jsongenOriginalAuthority?.captureBindings({
-            physicalScopes: jsongenPendingSource.pending_evidence?.scope?.physical_timeseries_days,
-            r2: runtime.r2, deadlineAtMs: optionalDeadlineAtMs,
-            admitRequest: () => hasBudgetFor(runtime, requiredMs - PRUNE_SIGNED_UPLOAD_DEADLINE_MS),
           });
         } catch (error) {
           const hasIntent = Boolean(error.intent_id && error.reference);
@@ -4527,6 +4575,10 @@ async function finalizePublishedPhaseBConnectors({
   }
   const completed = [];
   const gateFailures = [];
+  // The existing extra headroom after mandatory v3 finalisation is one shared
+  // optional bundle-retention window for this run, never one new reserve per
+  // connector/day and never part of the protected PostgreSQL gate transaction.
+  const evidenceBundleDeadlineAtMs = Date.now() + PRUNE_EVIDENCE_BUNDLE_UPLOAD_DEADLINE_MS;
   for (const published of publishedCandidates) {
     const { candidate, exportResult, connectorGateEvidence } = published;
     try {
@@ -4556,21 +4608,40 @@ async function finalizePublishedPhaseBConnectors({
               sourceIdentity: exportResult.source_identity,
               originalMetadataSnapshot,
               originalAuthorityCapture: exportResult.jsongen_original_authority,
+              evidenceMode: 'r2_bundle',
             });
+            const finalPreparation = published.jsongen_final_evidence_preparation;
+            if (!hasBudgetFor(runtime, PRUNE_EVIDENCE_BUNDLE_UPLOAD_DEADLINE_MS)
+              || Date.now() >= evidenceBundleDeadlineAtMs) {
+              throw Object.assign(new Error('bundle_retention_headroom_unavailable'),
+                { original_authority_code: 'bundle_retention_headroom_unavailable' });
+            }
+            const bundleDeadlineMs = Math.min(PRUNE_EVIDENCE_BUNDLE_UPLOAD_DEADLINE_MS,
+              evidenceBundleDeadlineAtMs - Date.now(), remainingBudgetMs(runtime) ?? PRUNE_EVIDENCE_BUNDLE_UPLOAD_DEADLINE_MS);
+            const retainedBundle = await uploadPruneEvidenceBundle({
+              signer: runtime.jsongen_pending_source.signer,
+              prepared: finalPreparation.bundle,
+              identity: finalPreparation.bundle_identity,
+              deadlineMs: bundleDeadlineMs,
+            });
+            published.jsongen_final_evidence_preparation = attachPruneOriginalEvidenceBundleReference(
+              finalPreparation, retainedBundle);
             const retainedMetadata = published.jsongen_final_evidence_preparation.envelope
               .original_metadata_snapshot;
             const originalAuthority = published.jsongen_final_evidence_preparation.envelope.original_authority_extension;
             logJsongenPhaseB(runtime, 'INFO', 'phase_b_jsongen_original_final_evidence_prepared', {
               day_utc: candidate.day_utc, connector_id: candidate.connector_id,
               preparation_sha256: published.jsongen_final_evidence_preparation.sha256,
-              retention_state: 'transient_writer_memory_only', authority_state: 'precommit_prepared_unverified',
+              retention_state: 'r2_bundle_readback_verified_pointer_prepared', authority_state: 'precommit_prepared_unverified',
               metadata_completeness: retainedMetadata.completeness,
               metadata_reason: retainedMetadata.reason || null,
               metadata_object_count: retainedMetadata.required_object_count,
               metadata_raw_byte_size: retainedMetadata.required_raw_byte_size,
-              metadata_missing_object_count: retainedMetadata.missing_object_count ?? 0,
-              metadata_missing_reason_counts: retainedMetadata.missing_reason_counts || {},
-              metadata_capture_statistics: retainedMetadata.capture_statistics || null,
+              bundle_reference: published.jsongen_final_evidence_preparation.bundle_reference,
+              bundle_compressed_byte_size: finalPreparation.bundle.byte_size,
+              bundle_json_byte_size: finalPreparation.bundle.json_byte_size,
+              bundle_object_count: finalPreparation.bundle.object_count,
+              bundle_transport: retainedBundle.transport,
               complete_envelope_byte_size: retainedMetadata.complete_envelope_byte_size || null,
               preparation_byte_size: published.jsongen_final_evidence_preparation.byte_size,
               original_authority_completeness: originalAuthority?.completeness || 'unavailable',
@@ -4587,7 +4658,8 @@ async function finalizePublishedPhaseBConnectors({
             logJsongenPhaseB(runtime, 'WARNING', 'phase_b_jsongen_original_final_evidence_unavailable', {
               day_utc: candidate.day_utc, connector_id: candidate.connector_id,
               reason: error?.original_authority_code || (error?.message === 'JSONgen final preparation exceeds bounded metadata size'
-                ? 'metadata_payload_exceeds_1mib' : 'incomplete_original_evidence_preparation'),
+                ? 'metadata_payload_exceeds_1mib' : error?.code || 'incomplete_original_evidence_preparation'),
+              transport: error?.transport || null,
             });
           }
         }

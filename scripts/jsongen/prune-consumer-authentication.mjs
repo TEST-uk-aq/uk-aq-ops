@@ -2,9 +2,13 @@
 import { originalPruneAcceptance } from './prune-outbox-reader.mjs';
 import { verifyPrunePendingSource } from './prune-pending-verification.mjs';
 import { BUCKET, canonicalJson, same } from './schema.mjs';
-import { createBudget, evidence, freeze, parseJson } from './limits.mjs';
+import { createPruneHandoverBudget, evidence, freeze, parseJson } from './limits.mjs';
 import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
 import { decodePruneMetadataEvidence } from './prune-metadata-codec.mjs';
+import { decodePruneEvidenceBundle, PRUNE_EVIDENCE_BUNDLE_LIMITS,
+  pruneEvidenceBundleIntentId } from './prune-evidence-bundle.mjs';
+import { pruneEvidenceBundleIdentity } from './prune-final-evidence.mjs';
+import { readImmutable } from './inputs.mjs';
 import { authenticatePruneOriginalAuthority, prunePhysicalKey } from './prune-original-authority.mjs';
 import { physicalScopeDigest } from './scope-authority.mjs';
 import { validateR2HistoryV2ObservationsAggregateManifest, serializeR2HistoryV2ObservationsAggregateManifest }
@@ -21,18 +25,22 @@ export const PRUNE_RECEIPT_AUTHORITY_GAPS = freeze([
     required: 'Original selected-v3 timeseries-binding authority and complete physical station/timeseries binding evidence.' },
 ]);
 const authenticated = new WeakMap();
+const SHA = /^[a-f0-9]{64}$/;
 const check = (condition, field) => evidence(condition, 'contradictory_original_evidence', `Original authority mismatch: ${field}`);
 const present = (condition, field) => evidence(condition, 'missing_original_authority', `Missing retained original authority: ${field}`);
 const positive = n => Number.isSafeInteger(n) && n > 0;
 
-function retainedMetadata(envelope, row, budget) {
+function retainedMetadata(envelope, row, budget, { bundleMode = false } = {}) {
   const s = envelope.original_metadata_snapshot;
   present(s?.completeness === 'exact_writer_metadata_captured_unverified', 'original_metadata_snapshot');
   check(s.schema_version === 1 && s.capture_boundary === 'original_writer_put_bytes_after_verified_finalization'
     && s.writer_identity === row.writer_identity && s.invocation_id === row.run_id
     && s.writer_git_sha === row.writer_git_sha && s.connector_id === row.connector_id && s.day_utc === row.day_utc
     && same(s.affected_days_utc, envelope.original_final_batch.affected_days_utc), 'original_metadata_snapshot.identity');
-  present(Array.isArray(s.objects) && s.objects.length > 0 && s.objects.length <= 4096, 'original_metadata_snapshot.objects');
+  const objectLimit = bundleMode ? PRUNE_EVIDENCE_BUNDLE_LIMITS.object_count : 4096;
+  const objectByteLimit = bundleMode ? PRUNE_EVIDENCE_BUNDLE_LIMITS.object_bytes : 1024 ** 2;
+  const rawByteLimit = bundleMode ? PRUNE_EVIDENCE_BUNDLE_LIMITS.raw_bytes : 8 * 1024 ** 2;
+  present(Array.isArray(s.objects) && s.objects.length > 0 && s.objects.length <= objectLimit, 'original_metadata_snapshot.objects');
   const objects = new Map(); let bytes = 0;
   const bucket = envelope.original_connector_publication.connector_manifest.bucket;
   check(typeof bucket === 'string' && bucket.length > 0 && bucket !== BUCKET, 'canonical_bucket');
@@ -43,7 +51,7 @@ function retainedMetadata(envelope, row, budget) {
         || object.key.startsWith('history/_index_v3/observations_timeseries/')
         || object.key === 'history/_index_v3/observations_timeseries_latest.json')
       && object.key.endsWith('.json') && !object.key.split('/').some(p => !p || p === '.' || p === '..')
-      && !objects.has(object.key) && positive(object.byte_size) && object.byte_size <= 1024 ** 2
+      && !objects.has(object.key) && positive(object.byte_size) && object.byte_size <= objectByteLimit
       && /^[a-f0-9]{64}$/.test(object.sha256 || '') && typeof object.bytes_base64 === 'string'
       && object.bytes_base64.length <= 4 * Math.ceil(object.byte_size / 3)
       && Array.isArray(object.roles) && object.roles.length > 0, 'original_metadata_snapshot.object');
@@ -53,7 +61,7 @@ function retainedMetadata(envelope, row, budget) {
     bytes += body.length; budget.bytes('metadata', body.length);
     objects.set(object.key, { ...object, value: parseJson(body) });
   }
-  check(s.required_object_count === objects.size && s.required_raw_byte_size === bytes && bytes <= 8 * 1024 ** 2,
+  check(s.required_object_count === objects.size && s.required_raw_byte_size === bytes && bytes <= rawByteLimit,
     'original_metadata_snapshot.coverage');
   const lookup = (reference, role) => {
     present(reference && typeof reference.key === 'string', role);
@@ -190,34 +198,113 @@ export function inspectAuthenticatedPruneHandover(value) {
   return result;
 }
 
-export async function authenticatePruneHandover({ acceptance, derivedR2, budget = createBudget() }) {
+export async function authenticatePruneHandover({ acceptance, derivedR2, budget = createPruneHandoverBudget() }) {
   const { row, bytes } = originalPruneAcceptance(acceptance);
   const message = acceptance.post_commit_reference.message;
   present(row.final_evidence_state === 'prepared_unverified' && bytes, 'final_evidence_bytes');
   check(bytes.length === Number(row.final_evidence_byte_size) && bytes.length <= 1024 ** 2
     && sha256Hex(bytes) === row.final_evidence_sha256, 'final_evidence_bytes.sha256');
   budget.bytes('metadata', bytes.length);
-  const e = parseJson(bytes);
+  let e = parseJson(bytes);
   check(canonicalJson(e).equals(bytes) && e.schema_version === 1
     && e.kind === 'uk_aq_jsongen_prune_original_final_evidence_preparation'
     && e.authority_state === 'precommit_prepared_unverified' && e.environment === 'TEST'
     && e.index_generation === 'v3' && same(e.writer, message.writer)
     && e.connector_id === 1 && e.day_utc === row.day_utc, 'final_evidence.original_writer');
-  present(e.original_metadata_evidence && e.original_metadata_snapshot?.schema_version === 2
-    && e.original_authority_extension?.schema_version === 2, 'compressed_original_before_and_binding_authority');
-  evidence(Number.isSafeInteger(e.original_metadata_evidence.json_byte_size)
-    && Number.isSafeInteger(e.original_metadata_evidence.byte_size)
-    && e.original_metadata_evidence.json_byte_size + e.original_metadata_evidence.byte_size <= budget.remainingBytes(),
-  'resource_limit', 'Original compressed metadata exceeds remaining decode budget');
-  let decoded;
-  try { decoded = decodePruneMetadataEvidence(e); } catch (error) {
-    evidence(false, error.original_authority_code || 'invalid_original_metadata_encoding', 'Original compressed metadata failed strict decoding');
+  const bundlePointer = e.original_metadata_evidence?.codec === 'immutable_r2_json_gzip_v1';
+  let bundleMode = false;
+  if (bundlePointer) {
+    const pointer = e.original_metadata_evidence;
+    const ref = pointer.reference;
+    const identity = pointer.identity;
+    present(pointer.schema_version === 1 && e.original_metadata_snapshot?.schema_version === 3
+      && e.original_metadata_snapshot.completeness === 'externalized_unverified'
+      && e.original_metadata_snapshot.representation === 'immutable_r2_json_gzip_v1'
+      && e.original_authority_extension?.schema_version === 3
+      && e.original_authority_extension.completeness === 'externalized_unverified'
+      && e.original_authority_extension.kind === 'uk_aq_prune_original_scope_binding_authority'
+      && ref?.conditional_create === 'if_none_match_star', 'versioned_original_evidence_bundle_reference');
+    check(ref.bucket === derivedR2?.bucket && SHA.test(ref.sha256 || '')
+      && Number.isSafeInteger(ref.byte_size) && ref.byte_size > 0
+      && ref.byte_size <= PRUNE_EVIDENCE_BUNDLE_LIMITS.compressed_bytes
+      && SHA.test(ref.json_sha256 || '') && Number.isSafeInteger(ref.json_byte_size)
+      && ref.json_byte_size > 0 && ref.json_byte_size <= PRUNE_EVIDENCE_BUNDLE_LIMITS.json_bytes
+      && Number.isSafeInteger(ref.object_count) && ref.object_count > 0
+      && ref.object_count <= PRUNE_EVIDENCE_BUNDLE_LIMITS.object_count
+      && Number.isSafeInteger(ref.raw_byte_size) && ref.raw_byte_size > 0
+      && ref.raw_byte_size <= PRUNE_EVIDENCE_BUNDLE_LIMITS.raw_bytes
+      && SHA.test(ref.intent_id || '') && typeof ref.key === 'string'
+      && ref.key === `managed/jsongen/v1/evidence-bundles/prune_daily_v3/connector_id=${row.connector_id}`
+        + `/day_utc=${row.day_utc}/invocation=${encodeURIComponent(row.run_id)}`
+        + `/compressed_sha256=${ref.sha256}.json.gz`, 'immutable_bundle_key_and_bounds');
+    check(identity?.writer_identity === row.writer_identity
+      && identity.environment === 'TEST'
+      && identity.invocation_id === row.run_id && identity.attempt_id === row.attempt_id
+      && identity.writer_git_sha === row.writer_git_sha && identity.index_generation === 'v3'
+      && identity.connector_id === row.connector_id && identity.day_utc === row.day_utc
+      && identity.object_type === 'prune_original_final_evidence_bundle_gzip'
+      && identity.source_evidence_sha256 === e.pending?.source_evidence_sha256
+      && identity.source_identity_sha256 === sha256Hex(canonicalJson(e.pending?.source_identity))
+      && identity.scope?.kind === 'connector_day' && identity.scope.connector_id === row.connector_id
+      && identity.scope.day_utc === row.day_utc
+      && pruneEvidenceBundleIntentId({ bucket: ref.bucket, key: ref.key, identity,
+        compressed_byte_size: ref.byte_size, compressed_sha256: ref.sha256,
+        uncompressed_byte_size: ref.json_byte_size, uncompressed_sha256: ref.json_sha256 }) === ref.intent_id,
+    'bundle_reference_original_invocation_binding');
+    evidence(ref.byte_size + ref.json_byte_size <= budget.remainingBytes(), 'resource_limit',
+      'Evidence bundle exceeds remaining bounded decode budget');
+    const compressed = await readImmutable({ r2: derivedR2,
+      reference: { bucket: ref.bucket, key: ref.key, sha256: ref.sha256, byte_size: ref.byte_size },
+      maxBytes: PRUNE_EVIDENCE_BUNDLE_LIMITS.compressed_bytes, budget, domain: 'metadata' });
+    evidence(ref.json_byte_size <= budget.remainingBytes(), 'resource_limit',
+      'Evidence bundle decompression exceeds remaining bounded decode budget');
+    const decodedBytes = decodePruneEvidenceBundle({ compressed,
+      reference: { byte_size: ref.byte_size, sha256: ref.sha256,
+        json_byte_size: ref.json_byte_size, json_sha256: ref.json_sha256 },
+      expected: { environment: 'TEST', writer_identity: row.writer_identity,
+        invocation_id: row.run_id, attempt_id: row.attempt_id,
+        writer_git_sha: row.writer_git_sha, connector_id: row.connector_id, day_utc: row.day_utc } });
+    budget.bytes('decompressed', ref.json_byte_size);
+    check(same(identity, pruneEvidenceBundleIdentity(decodedBytes))
+      && decodedBytes.pending?.intent_id === e.pending.intent_id
+      && same(decodedBytes.pending?.object, e.pending.object)
+      && decodedBytes.pending?.preparation_sha256 === e.pending.preparation_sha256
+      && decodedBytes.pending?.source_evidence_sha256 === e.pending.source_evidence_sha256
+      && same(decodedBytes.pending?.source_identity, e.pending.source_identity)
+      && same(decodedBytes.original_candidate_connector_gate, e.original_candidate_connector_gate)
+      && decodedBytes.original_metadata_snapshot.required_object_count
+        === e.original_metadata_snapshot.required_object_count
+      && decodedBytes.original_metadata_snapshot.required_raw_byte_size
+        === e.original_metadata_snapshot.required_raw_byte_size
+      && decodedBytes.original_authority_extension.required_object_count
+        === e.original_authority_extension.required_object_count
+      && decodedBytes.original_authority_extension.required_raw_byte_size
+        === e.original_authority_extension.required_raw_byte_size
+      && decodedBytes.original_authority_extension.before.state === e.original_authority_extension.before.state
+      && decodedBytes.original_authority_extension.binding.state === e.original_authority_extension.binding.state
+      && ref.object_count === decodedBytes.original_metadata_snapshot.objects.length
+        + decodedBytes.original_authority_extension.objects.length
+      && ref.raw_byte_size === decodedBytes.original_metadata_snapshot.required_raw_byte_size
+        + decodedBytes.original_authority_extension.required_raw_byte_size,
+    'bundle_pointer_shell_identity');
+    e = decodedBytes;
+    bundleMode = true;
+  } else {
+    present(e.original_metadata_evidence && e.original_metadata_snapshot?.schema_version === 2
+      && e.original_authority_extension?.schema_version === 2, 'compressed_original_before_and_binding_authority');
+    evidence(Number.isSafeInteger(e.original_metadata_evidence.json_byte_size)
+      && Number.isSafeInteger(e.original_metadata_evidence.byte_size)
+      && e.original_metadata_evidence.json_byte_size + e.original_metadata_evidence.byte_size <= budget.remainingBytes(),
+    'resource_limit', 'Original compressed metadata exceeds remaining decode budget');
+    let decoded;
+    try { decoded = decodePruneMetadataEvidence(e); } catch (error) {
+      evidence(false, error.original_authority_code || 'invalid_original_metadata_encoding', 'Original compressed metadata failed strict decoding');
+    }
+    budget.bytes('metadata', e.original_metadata_evidence.byte_size + e.original_metadata_evidence.json_byte_size);
+    // Legacy inline bytes remain decoded and validated under their unchanged codec.
+    e.original_metadata_snapshot = decoded.original_metadata_snapshot;
+    e.original_authority_extension = decoded.original_authority_extension;
   }
-  budget.bytes('metadata', e.original_metadata_evidence.byte_size + e.original_metadata_evidence.json_byte_size);
-  // Only replace local transport markers after exact original bytea validation.
-  // The immutable outer bytes and their digest remain the original authority.
-  e.original_metadata_snapshot = decoded.original_metadata_snapshot;
-  e.original_authority_extension = decoded.original_authority_extension;
   const p = e.pending; const c = e.original_connector_publication; const gate = e.original_candidate_connector_gate;
   check(p?.intent_id === row.pending_intent_id && same(p.object, message.pending.object)
     && same(p.source_identity, message.source_identity) && c?.run_id === row.run_id && c.connector_id === 1
@@ -245,7 +332,7 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
     && Array.isArray(batch.affected_days_utc) && batch.affected_days_utc.includes(row.day_utc)
     && new Set(batch.affected_days_utc).size === batch.affected_days_utc.length,
   'validated_required_v3_finalisation');
-  const metadata = retainedMetadata(e, row, budget);
+  const metadata = retainedMetadata(e, row, budget, { bundleMode });
   for (const [field, role] of [['canonical_aggregate_references', 'aggregate_manifest'],
     ['exact_scope_references', 'exact_v3_index'], ['latest_global_references', 'latest_global_index']]) {
     present(Array.isArray(batch[field]) && batch[field].length > 0, `original_final_batch.${field}`);
@@ -275,7 +362,8 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
   'complete_source_scope_and_status_provenance');
   bindOriginalPublication(e, row, unsigned, metadata);
   const root = authenticateFinalHierarchy(e, row, metadata);
-  const original = authenticatePruneOriginalAuthority({ envelope: e, row, source: unsigned, budget });
+  const original = authenticatePruneOriginalAuthority({ envelope: e, row, source: unsigned,
+    budget, bundleMode });
   const bucket = root.bucket;
   const pin = r => ({ bucket: r.bucket || bucket, key: r.key, sha256: r.sha256, byte_size: r.byte_size });
   const sources = {}; const scopes = {}; const scopeAuthorities = {};
