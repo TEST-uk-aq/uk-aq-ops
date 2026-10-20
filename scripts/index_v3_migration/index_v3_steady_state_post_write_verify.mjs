@@ -1287,6 +1287,9 @@ export async function executeSteadyStatePostWriteVerifier(options, adaptersInput
   diagnosticStage("v3-index-complete; migration-evidence-start");
   const planReport = options.planReport
     ? parseJsonFile(options.planReport, "migration plan report") : null;
+  if (planReport && planReport?.result?.ok !== true) {
+    fail("migration plan report is not successful; choose an independently pinned explicit migration identity instead");
+  }
   const hierarchyDelta = await verifyHierarchyDelta({
     getObject: adapters.getObject,
     planReport,
