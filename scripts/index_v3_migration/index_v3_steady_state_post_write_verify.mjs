@@ -992,7 +992,10 @@ function requireAuthenticatedCompletedPlanIdentity(completed, expected, label) {
   return identity;
 }
 
-async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, evidenceRoot, accepted, requiredUnchangedDay, environment, bucket }) {
+async function verifyHierarchyDelta({
+  getObject, planReport, expectedMigrationRunId, expectedPlanSha256, checkpointPath,
+  evidenceRoot, accepted, requiredUnchangedDay, environment, bucket,
+}) {
   // The historical migration plan includes more than a million publication
   // records. Authenticate it using the existing SQLite-backed bounded verifier
   // rather than materialising all journal entries and reconstructing a giant
@@ -1013,8 +1016,8 @@ async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, evi
   try {
     store.phase = "authenticate-post-migration-baseline";
     const baseline = await readBoundedBaseline({
-      checkpointPath, planReport, evidenceRoot, store, repositoryRoot,
-      environment, bucket,
+      checkpointPath, planReport, expectedMigrationRunId, expectedPlanSha256,
+      evidenceRoot, store, repositoryRoot, environment, bucket,
     });
     // A valid disk replay is the required provenance; never silently fall
     // back to a pre-migration Dropbox root or current R2 reconstruction.
@@ -1282,10 +1285,13 @@ export async function executeSteadyStatePostWriteVerifier(options, adaptersInput
     environment: options.environment,
   });
   diagnosticStage("v3-index-complete; migration-evidence-start");
-  const planReport = parseJsonFile(options.planReport, "migration plan report");
+  const planReport = options.planReport
+    ? parseJsonFile(options.planReport, "migration plan report") : null;
   const hierarchyDelta = await verifyHierarchyDelta({
     getObject: adapters.getObject,
     planReport,
+    expectedMigrationRunId: options.expectedMigrationRunId,
+    expectedPlanSha256: options.expectedPlanSha256,
     checkpointPath: options.checkpoint,
     evidenceRoot: options.evidenceRoot || null,
     recoveryRoot: `${options.checkpoint}.recovery`,
@@ -1353,16 +1359,30 @@ function parseFlagValues(argv) {
 
 function validateReportPathValues(values) {
   for (const name of [
-    "reportOut", "acceptanceReport", "controlEvidence", "planReport", "checkpoint",
+    "reportOut", "acceptanceReport", "controlEvidence", "checkpoint",
   ]) {
     if (!values[name]) fail(`--${name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)} is required`);
+  }
+  const hasReport = Boolean(values.planReport);
+  const hasRunId = Boolean(values.expectedMigrationRunId);
+  const hasPlanSha = Boolean(values.expectedPlanSha256);
+  if (!((hasReport && !hasRunId && !hasPlanSha) ||
+      (!hasReport && hasRunId && hasPlanSha))) {
+    fail("provide either --plan-report or both --expected-migration-run-id and --expected-plan-sha256");
+  }
+  if (!hasReport) {
+    const runId = String(values.expectedMigrationRunId);
+    if (runId !== runId.trim() || runId.length > 256 || /[\u0000-\u001f\u007f]/.test(runId)) {
+      fail("invalid explicit migration run identity");
+    }
+    exactSha256(values.expectedPlanSha256, "expected plan SHA-256");
   }
   values.reportOut = assertSafeLocalReportPath({
     reportOut: values.reportOut,
     evidencePaths: [
       values.acceptanceReport,
       values.controlEvidence,
-      values.planReport,
+      ...(hasReport ? [values.planReport] : []),
     ],
     checkpoint: values.checkpoint,
     recoveryRoot: `${values.checkpoint}.recovery`,
@@ -1380,7 +1400,7 @@ function parseArgs(argv) {
     "acceptanceReport", "expectedAcceptanceReportSha256", "expectedRunId", "expectedDayUtc",
     "expectedConnectorId", "expectedRowCount", "expectedSourceContentHash",
     "expectedSourceHashContractVersion", "expectedPollutantCount", "controlEvidence",
-    "planReport", "checkpoint", "requiredUnchangedDay", "siteUrl", "cacheUrl", "reportOut",
+    "checkpoint", "requiredUnchangedDay", "siteUrl", "cacheUrl", "reportOut",
   ];
   for (const name of required) if (!values[name]) fail(`--${name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)} is required`);
   values.environment = String(values.environment).toUpperCase();
