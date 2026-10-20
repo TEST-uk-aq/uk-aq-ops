@@ -40,7 +40,7 @@ export function assertBoundedOperatorIdentity({ plan, checkpoint, manifest, plan
   // rather than result. Both identities must agree when both are present.
   const resultRunId = planReport?.result?.migration_run_id;
   const auditRunId = planReport?.audit?.migration_run_id;
-  demand(!hasReport || resultRunId === undefined || auditRunId === undefined ||
+  demand(!hasReport || resultRunId == null || auditRunId == null ||
     resultRunId === auditRunId, 'Operator result/audit migration run identities disagree');
   const expectedRunId = hasReport ? (resultRunId ?? auditRunId) : expectedMigrationRunId;
   const expectedPlan = hasReport ? planReport?.result?.plan_sha256 : expectedPlanSha256;
