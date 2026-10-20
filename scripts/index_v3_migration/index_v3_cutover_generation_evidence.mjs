@@ -254,9 +254,18 @@ export function readAuthenticatedCutoverBaseline({ checkpointPath, planReport, e
   const verifierTrust = authenticateCutoverVerifierDependencies({
     repositoryRoot, historicalWriterGitSha: plan.target_writer_git_sha,
   });
+  // Completed exceptional-recovery reports place the run ID in audit rather
+  // than result. Both locations are accepted only when they agree with the
+  // authenticated immutable plan and with each other if both are present.
+  const resultRunId = planReport?.result?.migration_run_id;
+  const auditRunId = planReport?.audit?.migration_run_id;
+  if (resultRunId != null && auditRunId != null && resultRunId !== auditRunId) {
+    throw new Error("Migration report result/audit run identities contradict each other");
+  }
   if (plan.environment.environment !== environment || plan.environment.bucket !== bucket ||
+      planReport?.result?.ok !== true ||
       planReport?.result?.plan_sha256 !== plan.plan_sha256 ||
-      planReport?.result?.migration_run_id !== plan.migration_run_id) {
+      (resultRunId ?? auditRunId) !== plan.migration_run_id) {
     throw new Error("Migration baseline differs from explicit environment/bucket or supplied plan report");
   }
   const authority = recovery.authenticatedRecoveryAuthority;

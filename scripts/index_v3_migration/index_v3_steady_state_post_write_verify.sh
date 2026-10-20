@@ -31,6 +31,7 @@ Usage:
     --expected-station-history-worker NAME \
     --expected-observation-history-worker NAME \
     --report-out PATH \
+    [--evidence-root PATH]
     [--node-bin PATH]
 
 Required loaded environment:
@@ -76,6 +77,7 @@ EXPECTED_SOURCE_HASH_CONTRACT_VERSION=""
 EXPECTED_POLLUTANT_COUNT=""
 PLAN_REPORT=""
 CHECKPOINT=""
+EVIDENCE_ROOT=""
 REQUIRED_UNCHANGED_DAY=""
 SITE_URL=""
 CACHE_URL=""
@@ -103,6 +105,7 @@ while [ "$#" -gt 0 ]; do
     --expected-pollutant-count) EXPECTED_POLLUTANT_COUNT="${2:-}"; shift 2 ;;
     --plan-report) PLAN_REPORT="${2:-}"; shift 2 ;;
     --checkpoint) CHECKPOINT="${2:-}"; shift 2 ;;
+    --evidence-root) EVIDENCE_ROOT="${2:-}"; shift 2 ;;
     --required-unchanged-day) REQUIRED_UNCHANGED_DAY="${2:-}"; shift 2 ;;
     --site-url) SITE_URL="${2:-}"; shift 2 ;;
     --cache-url) CACHE_URL="${2:-}"; shift 2 ;;
@@ -146,6 +149,13 @@ for file in "$ACCEPTANCE_REPORT" "$PLAN_REPORT" "$CHECKPOINT"; do
   [ -f "$file" ] || fail "required evidence file is missing: $file"
 done
 [ -d "$CHECKPOINT.recovery" ] || fail "authenticated recovery journal is missing: $CHECKPOINT.recovery"
+EVIDENCE_ROOT_ARGS=()
+if [ -n "$EVIDENCE_ROOT" ]; then
+  [ -d "$EVIDENCE_ROOT" ] || fail "selected migration evidence root does not exist: $EVIDENCE_ROOT"
+  [ "$(cd -- "$(dirname -- "$CHECKPOINT")" && pwd -P)" = "$(cd -- "$EVIDENCE_ROOT" && pwd -P)" ] ||
+    fail "--evidence-root must be the directory containing the selected checkpoint"
+  EVIDENCE_ROOT_ARGS=(--evidence-root "$EVIDENCE_ROOT")
+fi
 
 if [ -n "$NODE_BIN" ]; then
   [ -x "$NODE_BIN" ] || fail "--node-bin is not executable"
@@ -165,7 +175,8 @@ REPORT_OUT="$("$NODE_BIN" "$RUNNER" --check-report-path \
   --acceptance-report "$ACCEPTANCE_REPORT" \
   --control-evidence "$CONTROL_EVIDENCE" \
   --plan-report "$PLAN_REPORT" \
-  --checkpoint "$CHECKPOINT")" || fail "report output path protection failed"
+  --checkpoint "$CHECKPOINT" \
+  "${EVIDENCE_ROOT_ARGS[@]}")" || fail "report output path protection failed"
 REPORT_OUT_SAFE="true"
 
 CURRENT_SHA="$(git rev-parse HEAD)"
@@ -280,4 +291,5 @@ jq -n \
   --required-unchanged-day "$REQUIRED_UNCHANGED_DAY" \
   --site-url "$SITE_URL" \
   --cache-url "$CACHE_URL" \
-  --report-out "$REPORT_OUT"
+  --report-out "$REPORT_OUT" \
+  "${EVIDENCE_ROOT_ARGS[@]}"

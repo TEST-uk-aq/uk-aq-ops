@@ -174,6 +174,7 @@ export function assertSafeLocalReportPath({
   checkpoint,
   recoveryRoot,
   dropboxRoot,
+  evidenceRoot,
 }) {
   const output = canonicalizeLocalPath(reportOut, "report output path");
   const protectedFiles = [...(evidencePaths || []), checkpoint]
@@ -182,6 +183,7 @@ export function assertSafeLocalReportPath({
   const protectedDirectories = [
     canonicalizeLocalPath(recoveryRoot, "checkpoint recovery directory"),
     ...(dropboxRoot ? [canonicalizeLocalPath(dropboxRoot, "Dropbox root")] : []),
+    ...(evidenceRoot ? [canonicalizeLocalPath(evidenceRoot, "selected migration evidence root")] : []),
   ];
   if (protectedDirectories.some((root) => pathIsWithin(output, root))) {
     fail("report output path is inside a protected evidence directory");
@@ -1313,6 +1315,7 @@ function validateReportPathValues(values) {
     checkpoint: values.checkpoint,
     recoveryRoot: `${values.checkpoint}.recovery`,
     dropboxRoot: values.dropboxRoot,
+    evidenceRoot: values.evidenceRoot,
   });
   values.reportOutSafetyValidated = true;
   return values;
