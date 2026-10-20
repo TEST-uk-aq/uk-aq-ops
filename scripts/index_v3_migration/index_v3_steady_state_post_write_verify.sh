@@ -45,6 +45,11 @@ Required loaded environment:
 The verifier performs Git/GitHub reads, PostgreSQL SELECTs, a D1 SELECT,
 R2 GET/HEAD, local evidence reads, and HTTP GET probes only. It never starts
 Prune or backup and never changes maintenance, schedulers, data, or config.
+
+Bounded historical baseline authentication uses Node 22 node:sqlite and
+disposable SQLite scratch under TMPDIR. At least 40 GiB of free scratch
+space is required by the existing bounded store. A failed verification keeps
+its private scratch for diagnosis; only a successful verification deletes it.
 EOF
 }
 
