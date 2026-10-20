@@ -75,7 +75,11 @@ config = replaceOnce(config, /^UK_AQ_JSONGEN_SIGNER_ENABLED = "false"$/gm,
   'disabled-by-default enablement');
 config += `\n[[ratelimits]]\nname = "UK_AQ_JSONGEN_SIGNER_RATE_LIMIT"\nnamespace_id = ${tomlString(namespaceId)}\nsimple = { limit = 10, period = 10 }\n`;
 
-if (outputPath === basePath || dirname(outputPath) !== workerDirectory)
-  fail('Output must be a deployment-only TOML beside worker.mjs and must not replace wrangler.toml');
+const allowedOutputPaths = new Set([
+  resolve(workerDirectory, 'wrangler.deploy.toml'),
+  resolve(workerDirectory, 'wrangler.activate.toml'),
+]);
+if (!allowedOutputPaths.has(outputPath))
+  fail('Output must be wrangler.deploy.toml or wrangler.activate.toml beside worker.mjs');
 await writeFile(outputPath, config, { mode: 0o600 });
 process.stdout.write(`Rendered TEST signer Wrangler config: ${outputPath}\n`);
