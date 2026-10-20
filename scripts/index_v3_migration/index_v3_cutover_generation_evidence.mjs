@@ -249,6 +249,10 @@ export function readAuthenticatedCutoverBaseline({ checkpointPath, planReport, e
   const plan = buildObservationHistoryV3RerunVerificationPlan({
     checkpoint, allowLegacyRecoveryOrdering: false,
     recoveryAuthority: recovery.authenticatedRecoveryAuthority,
+    // Strictly read-only verification has already authenticated the checkpoint
+    // and journal; retain the large immutable authority by reference instead
+    // of cloning it again during migration-plan reconstruction.
+    reuseAuthenticatedAuthority: true,
   });
   assertSideBySideMigrationPlan(plan);
   const verifierTrust = authenticateCutoverVerifierDependencies({
