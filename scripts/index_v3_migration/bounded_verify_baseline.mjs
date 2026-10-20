@@ -158,6 +158,12 @@ export class BoundedBaseline {
       'Canonical parent hierarchy omits a source scope');
     const days = collectSmall(store.summaries('canonical-day'));
     const aggregate = buildObservationsManifestHierarchy({ observationsPrefix: plan.target_observations_prefix, dayManifests: days });
+    // Authenticated post-migration/pre-write parent child sets for a later
+    // steady-state write. Only the compact month/year/root descriptors survive;
+    // canonical file and publication bodies remain in the bounded disk store.
+    this.steadyStateAggregates = aggregate.objects.map((entry) => ({
+      key: entry.key, level: entry.level, children: entry.manifest.children,
+    }));
     for (const entry of aggregate.objects) {
       const bytes = Buffer.from(entry.body);
       const dependencies = entry.manifest.children.map((child) => {
@@ -175,6 +181,7 @@ export class BoundedBaseline {
       a.connector_id - b.connector_id || Buffer.compare(Buffer.from(a.pollutant_code), Buffer.from(b.pollutant_code)));
     const latest = latestArtifactFromRoots(roots, plan.v3_index_root, plan.v3_latest_key);
     validateObservationHistoryExactLeafIndexV3LatestRegistry({ artifact: latest, indexRoot: plan.v3_index_root, latestKey: plan.v3_latest_key });
+    this.steadyStateLatest = latest.payload;
     const latestSchedule = buildObservationHistoryIndexV3PublicationPlan({ objects: [latest], externalReferences:
       roots.map((entry) => ({ ...compact(entry), verified: true, durable: true, kind: 'scoped_manifest' })) });
     this.addObject(latestSchedule.entries[0], { v3: true });
