@@ -221,8 +221,19 @@ function readCutoverCheckpoint({ checkpointPath, evidenceRoot }) {
   return { checkpoint: { ...original, authority: plan }, bytes };
 }
 
+function diagnosticCutoverStage(stage) {
+  if (process.env.UK_AQ_V3_VERIFY_DIAGNOSTICS !== "1") return;
+  const memory = process.memoryUsage();
+  const mb = (value) => Math.round(value / (1024 * 1024));
+  process.stderr.write(
+    `[v3-cutover-baseline] ${new Date().toISOString()} ${stage} heap=${mb(memory.heapUsed)}MiB rss=${mb(memory.rss)}MiB\n`,
+  );
+}
+
 export function readAuthenticatedCutoverBaseline({ checkpointPath, planReport, environment, bucket, evidenceRoot = null }) {
+  diagnosticCutoverStage("checkpoint-load-start");
   const { checkpoint: original, bytes } = readCutoverCheckpoint({ checkpointPath, evidenceRoot });
+  diagnosticCutoverStage("checkpoint-load-complete; recovery-replay-start");
   let exceptionalRecovery = null;
   const recovery = buildObservationHistoryV3RecoveryProgressContext({
     checkpointPath, checkpoint: original, repositoryRoot,
@@ -232,6 +243,7 @@ export function readAuthenticatedCutoverBaseline({ checkpointPath, planReport, e
     // be repinned to the current verifier checkout.
     requireCurrentImplementation: false,
     readOnly: true,
+    diagnostics: process.env.UK_AQ_V3_VERIFY_DIAGNOSTICS === "1",
     evidenceRoot,
     onAuthenticatedReplay: ({ journal }) => {
       if (original.migration_run_id === EXCEPTIONAL_LIVE_RECOVERY.run_id) {
@@ -242,6 +254,7 @@ export function readAuthenticatedCutoverBaseline({ checkpointPath, planReport, e
       }
     },
   });
+  diagnosticCutoverStage("recovery-replay-complete; reconstruction-start");
   const checkpoint = recovery.checkpoint;
   if (!recovery.fullVerificationComplete || !recovery.cutoverReady) {
     throw new Error("Migration recovery evidence is not fully verified and cut-over ready");
@@ -253,7 +266,9 @@ export function readAuthenticatedCutoverBaseline({ checkpointPath, planReport, e
     // and journal; retain the large immutable authority by reference instead
     // of cloning it again during migration-plan reconstruction.
     reuseAuthenticatedAuthority: true,
+    progressEnabled: process.env.UK_AQ_V3_VERIFY_DIAGNOSTICS === "1",
   });
+  diagnosticCutoverStage("reconstruction-complete");
   assertSideBySideMigrationPlan(plan);
   const verifierTrust = authenticateCutoverVerifierDependencies({
     repositoryRoot, historicalWriterGitSha: plan.target_writer_git_sha,
