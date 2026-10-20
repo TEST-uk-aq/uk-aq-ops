@@ -281,7 +281,7 @@ function updateRecoveryReplayDigest(hash, value) {
   throw new TypeError(`Unsupported recovery replay digest value type: ${typeof value}`);
 }
 
-const RECOVERY_DIGEST_ASCII_KEY = /^[\\x00-\\x7f]*$/;
+const RECOVERY_DIGEST_ASCII_KEY = /^[\x00-\x7f]*$/;
 function compareRecoveryReplayKeys(left, right) {
   if (left === right) return 0;
   if (RECOVERY_DIGEST_ASCII_KEY.test(left) && RECOVERY_DIGEST_ASCII_KEY.test(right)) {
