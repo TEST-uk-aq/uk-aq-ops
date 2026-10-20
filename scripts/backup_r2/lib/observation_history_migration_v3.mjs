@@ -4629,8 +4629,18 @@ export function buildObservationHistoryV3RerunVerificationPlan({
   allowLegacyRecoveryOrdering = false,
   recoveryAuthority = null,
   progressEnabled = false,
+  reuseAuthenticatedAuthority = false,
 }) {
-  const authority = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
+  // The authenticated read-only verifier can reuse the already validated
+  // immutable plan; normal recovery callers retain their independent clone.
+  // Even the reuse path must execute the complete checkpoint identity gate.
+  let authority;
+  if (reuseAuthenticatedAuthority) {
+    buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint, validateOnly: true });
+    authority = checkpoint.authority;
+  } else {
+    authority = buildObservationHistoryV3MigrationPlanFromCheckpoint({ checkpoint });
+  }
   if (checkpoint.progress_format === 'authenticated-journal-v1' && (
       recoveryAuthority?.authenticated !== true || recoveryAuthority.immutable_authority_sha256 !== checkpoint.authority_sha256 ||
       recoveryAuthority.migration_run_id !== checkpoint.migration_run_id || recoveryAuthority.plan_sha256 !== checkpoint.plan_sha256 ||
@@ -5326,9 +5336,13 @@ export function assertSideBySideMigrationPlan(plan) {
       pinnedRoot?.sha256 !== root.sha256 ||
       !sameSemanticJson(identity.transition, plan.transition) ||
       !sameSemanticJson(identity.writer_limits, plan.target.writer_limits) ||
-      !sameSemanticJson(identity.unit_ids, plan.units.map((unit) => unit.unit_id)) ||
-      !sameSemanticJson(identity.bindings, plan.bindings) ||
-      !sameSemanticJson(identity.empty_source_connectors, plan.empty_source_connectors)) {
+      // Streaming SHA-256 uses the identical canonical JSON byte contract
+      // without building multi-megabyte sorted clones and JSON strings.
+      sha256StableMigrationJson(identity.unit_ids) !==
+        sha256StableMigrationJson(plan.units.map((unit) => unit.unit_id)) ||
+      sha256StableMigrationJson(identity.bindings) !== sha256StableMigrationJson(plan.bindings) ||
+      sha256StableMigrationJson(identity.empty_source_connectors) !==
+        sha256StableMigrationJson(plan.empty_source_connectors)) {
     throw new Error("Side-by-side plan contradicts its pinned generation authority");
   }
   assertObservationHistoryGenerationPrefixes(target, {
