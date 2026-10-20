@@ -21,6 +21,9 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || '' }}
       UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || '' }}
       UK_AQ_JSONGEN_R2_BUCKET: ${{ vars.UK_AQ_JSONGEN_R2_BUCKET || '' }}
+      UK_AQ_JSONGEN_R2_ENDPOINT: ${{ vars.UK_AQ_JSONGEN_R2_ENDPOINT || '' }}
+      UK_AQ_JSONGEN_SIGNER_WORKER_NAME: ${{ vars.UK_AQ_JSONGEN_SIGNER_WORKER_NAME || '' }}
+      UK_AQ_JSONGEN_PRUNE_SIGNER_URL: ${{ vars.UK_AQ_JSONGEN_PRUNE_SIGNER_URL || '' }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_R2_CLOUDFLARE_API_TOKEN || '' }}
       UK_AQ_JSONGEN_SIGNER_RATE_LIMIT_NAMESPACE_ID: ${{ vars.UK_AQ_JSONGEN_SIGNER_RATE_LIMIT_NAMESPACE_ID || '' }}
     steps:
@@ -32,7 +35,7 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Validate TEST deployment configuration
+      - name: Validate TEST deployment authorization and credentials
         env:
           UK_AQ_JSONGEN_SIGNER_R2_ACCESS_KEY_ID: ${{ secrets.UK_AQ_JSONGEN_SIGNER_R2_ACCESS_KEY_ID }}
           UK_AQ_JSONGEN_SIGNER_R2_SECRET_ACCESS_KEY: ${{ secrets.UK_AQ_JSONGEN_SIGNER_R2_SECRET_ACCESS_KEY }}
@@ -42,39 +45,25 @@ jobs:
           set -euo pipefail
           node --input-type=module <<'NODE'
           const e = process.env;
-          if (e.CLOUDFLARE_ACCOUNT_ID !== '41a81f781d3bd7234fde0b25df51e879'
-            || e.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID !== e.CLOUDFLARE_ACCOUNT_ID
-            || e.UK_AQ_ENV_NAME !== 'TEST' || e.UK_AQ_JSONGEN_SIGNER_ENABLED !== 'false')
-            throw new Error('Only disabled deployment to the Sleepercar TEST account is allowed');
-          if (!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(e.UK_AQ_JSONGEN_R2_BUCKET)
-            || e.UK_AQ_JSONGEN_R2_BUCKET.includes('..'))
-            throw new Error('A configured TEST JSONgen R2 bucket is required');
+          if (e.UK_AQ_ENV_NAME !== 'TEST' || e.UK_AQ_JSONGEN_SIGNER_ENABLED !== 'false')
+            throw new Error('Only disabled TEST deployment from this repository is allowed');
           if (!e.CLOUDFLARE_API_TOKEN) throw new Error('Missing UK_AQ_R2_CLOUDFLARE_API_TOKEN');
-          if (!/^[1-9]\d*$/.test(e.UK_AQ_JSONGEN_SIGNER_RATE_LIMIT_NAMESPACE_ID))
-            throw new Error('An operator-allocated positive rate-limit namespace ID is required');
           if ((e.UK_AQ_JSONGEN_SIGNER_R2_ACCESS_KEY_ID || '').length < 16
             || (e.UK_AQ_JSONGEN_SIGNER_R2_SECRET_ACCESS_KEY || '').length < 32
             || (e.UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN || '').length < 32
             || e.UK_AQ_JSONGEN_SIGNER_R2_ACCESS_KEY_ID === e.CFLARE_R2_ACCESS_KEY_ID
-            || e.UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN === e.UK_AQ_JSONGEN_SIGNER_R2_SECRET_ACCESS_KEY)
-            throw new Error('Dedicated signer R2 credentials and a separate Prune writer token are required');
+            || e.CLOUDFLARE_API_TOKEN === e.UK_AQ_JSONGEN_SIGNER_R2_ACCESS_KEY_ID
+            || e.UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN === e.UK_AQ_JSONGEN_SIGNER_R2_SECRET_ACCESS_KEY
+            || e.CLOUDFLARE_API_TOKEN === e.UK_AQ_JSONGEN_SIGNER_R2_SECRET_ACCESS_KEY
+            || e.CLOUDFLARE_API_TOKEN === e.UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN)
+            throw new Error('Signer R2, deployment and Prune writer credentials must be present and distinct');
           NODE
 
-      - name: Prepare native rate-limit binding
-        working-directory: workers/uk_aq_jsongen_signer
+      - name: Render TEST Worker deployment configuration
         run: |
           set -euo pipefail
-          cp wrangler.toml wrangler.deploy.toml
-          cat >> wrangler.deploy.toml <<EOF
-
-          UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID = "${UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID}"
-          UK_AQ_JSONGEN_R2_BUCKET = "${UK_AQ_JSONGEN_R2_BUCKET}"
-
-          [[ratelimits]]
-          name = "UK_AQ_JSONGEN_SIGNER_RATE_LIMIT"
-          namespace_id = "${UK_AQ_JSONGEN_SIGNER_RATE_LIMIT_NAMESPACE_ID}"
-          simple = { limit = 10, period = 10 }
-          EOF
+          node scripts/jsongen/render-signer-wrangler-config.mjs \
+            workers/uk_aq_jsongen_signer/wrangler.deploy.toml
 
       - name: Validate Worker deployment package
         working-directory: workers/uk_aq_jsongen_signer
@@ -93,7 +82,7 @@ jobs:
           accountId: ${{ env.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: workers/uk_aq_jsongen_signer
           wranglerVersion: '4.130.0'
-          command: deploy --config wrangler.deploy.toml --name uk-aq-jsongen-signer-test
+          command: deploy --config wrangler.deploy.toml
 
       - name: Set dedicated Worker secrets
         working-directory: workers/uk_aq_jsongen_signer
@@ -103,7 +92,7 @@ jobs:
           UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN: ${{ secrets.UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN }}
         run: |
           set -euo pipefail
-          node --input-type=module <<'NODE' | npx --yes wrangler@4.130.0 secret bulk --config wrangler.deploy.toml --name uk-aq-jsongen-signer-test
+          node --input-type=module <<'NODE' | npx --yes wrangler@4.130.0 secret bulk --config wrangler.deploy.toml
           const names = ['UK_AQ_JSONGEN_SIGNER_R2_ACCESS_KEY_ID',
             'UK_AQ_JSONGEN_SIGNER_R2_SECRET_ACCESS_KEY', 'UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN'];
           process.stdout.write(JSON.stringify(Object.fromEntries(names.map(name => [name, process.env[name]]))));
@@ -116,4 +105,4 @@ jobs:
           accountId: ${{ env.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: workers/uk_aq_jsongen_signer
           wranglerVersion: '4.130.0'
-          command: deploy --config wrangler.deploy.toml --name uk-aq-jsongen-signer-test
+          command: deploy --config wrangler.deploy.toml

@@ -70,7 +70,7 @@ function validatePending(input) {
   return true;
 }
 
-function validateEvidenceBundle(input) {
+function validateEvidenceBundle(input, environment) {
   const fields = ['writer_identity', 'invocation_id', 'attempt_id', 'writer_git_sha',
     'environment', 'index_generation', 'connector_id', 'day_utc', 'object_type',
     'compressed_byte_size', 'compressed_sha256', 'uncompressed_byte_size',
@@ -80,7 +80,7 @@ function validateEvidenceBundle(input) {
   const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
   return sameFields(input, fields) && input.writer_identity === WRITER
     && uuid.test(input.invocation_id) && input.attempt_id === input.invocation_id
-    && input.environment === 'TEST'
+    && input.environment === environment
     && /^[a-f0-9]{40}$/.test(input.writer_git_sha || '')
     && input.index_generation === 'v3' && isPositive(input.connector_id) && validDay(input.day_utc)
     && input.object_type === 'prune_original_final_evidence_bundle_gzip'
@@ -112,7 +112,8 @@ function bundleIntentIdentity(bucket, key, input) {
 
 export default {
   async fetch(request, env) {
-    if (env.UK_AQ_JSONGEN_SIGNER_ENABLED !== 'true' || env.UK_AQ_ENV_NAME !== 'TEST')
+    if (env.UK_AQ_JSONGEN_SIGNER_ENABLED !== 'true'
+      || !['TEST', 'LIVE'].includes(env.UK_AQ_ENV_NAME))
       return error(503, 'disabled');
     const endpoint = new URL(request.url);
     if (endpoint.pathname !== '/v1/upload-intents' || request.method !== 'POST'
@@ -148,7 +149,7 @@ export default {
     if (input.writer_identity !== WRITER) return error(403, 'unauthorised_writer');
     if (input.index_generation !== 'v3') return error(400, 'invalid_generation');
     const isBundle = input.object_type === 'prune_original_final_evidence_bundle_gzip';
-    if (!(isBundle ? validateEvidenceBundle(input) : validatePending(input)))
+    if (!(isBundle ? validateEvidenceBundle(input, env.UK_AQ_ENV_NAME) : validatePending(input)))
       return error(400, 'invalid_scope_or_object_identity');
     if (!admitted.split(',').some(value => Number(value) === input.connector_id))
       return error(403, 'unauthorised_scope');

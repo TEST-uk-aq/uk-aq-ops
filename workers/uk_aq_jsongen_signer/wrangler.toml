@@ -1,19 +1,13 @@
-name = "uk-aq-jsongen-signer-test"
+name = "jsongen-signer"
 main = "worker.mjs"
 compatibility_date = "2026-10-12"
 workers_dev = false
 preview_urls = false
 
-# Proposed TEST custom domain. Protect the entire hostname with Access Service
-# Auth BEFORE manually dispatching the disabled deployment workflow.
-routes = [{ pattern = "jsongen-signer-test.sleepercar.co.uk", custom_domain = true }]
-
 [vars]
-UK_AQ_ENV_NAME = "TEST"
 UK_AQ_JSONGEN_SIGNER_ENABLED = "false"
 UK_AQ_JSONGEN_PRUNE_CONNECTOR_IDS = "1"
 
-# The manual workflow appends the native [[ratelimits]] binding to a deployment
-# copy using UK_AQ_JSONGEN_SIGNER_RATE_LIMIT_NAMESPACE_ID (10 per 10 seconds).
-# No namespace ID is reserved here. The account owner must allocate it first.
-# The Worker fails closed while the binding is absent. See README.md.
+# The TEST workflow renders account, environment, bucket, Worker name, custom
+# hostname and the native rate-limit binding from required deployment settings.
+# This base file deliberately has no account, route or endpoint fallback.
