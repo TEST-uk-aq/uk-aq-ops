@@ -152,6 +152,18 @@ workflow to reconcile the current `${status.url}/run` value directly into D1.
 Normal `jobs.toml` syncs preserve that runtime-owned field while continuing to own
 the schedule, method, body, enabled state, and dry-run state.
 
+The News email `worker_http` job similarly uses
+`worker_http_url_managed_by_deploy = true` rather than committing an
+environment-specific Worker URL. Configure `scheduler_jobs.worker_http_url`
+in each environment's Ops scheduler D1 database to its own deployed email
+Worker's HTTPS `/scheduler/run` endpoint before enabling the job.
+Normal jobs sync preserves the runtime-owned URL and validates that enabled
+jobs do not retain the deployment-pending placeholder. There is no fallback
+to another environment's Worker. The separate
+`UK_AQ_MEDIA_EMAIL_WORKER_HTTP_SECRET` binding must be present on the
+Ops scheduler Worker and match the receiving email Worker before enabling
+the five-minute Daily/recovery job.
+
 ## Local checks
 
 ```bash

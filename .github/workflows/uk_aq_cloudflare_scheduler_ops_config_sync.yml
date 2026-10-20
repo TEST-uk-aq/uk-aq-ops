@@ -215,6 +215,8 @@ jobs:
           expected = json.loads(Path("/tmp/scheduler_jobs_expected.json").read_text(encoding="utf-8"))
           remote = json.loads(Path("/tmp/scheduler_jobs_remote.json").read_text(encoding="utf-8"))
 
+          from urllib.parse import urlsplit
+
           expected_jobs = expected["jobs"]
           actual_jobs = remote[0]["results"]
           actual_by_key = {job["job_key"]: job for job in actual_jobs}
@@ -230,6 +232,24 @@ jobs:
                       f"Remote D1 job {job_key} has invalid deployment-managed cloud_run_url: {actual_url!r}"
                   )
               expected_job["cloud_run_url"] = actual_url
+          for expected_job in expected_jobs:
+              job_key = expected_job["job_key"]
+              if job_key not in expected.get("deployment_managed_worker_http_url_job_keys", []):
+                  continue
+              actual_url = str(actual_by_key.get(job_key, {}).get("worker_http_url") or "")
+              pending_url = "https://deployment-pending.invalid/scheduler/run"
+              parsed = urlsplit(actual_url)
+              valid_url = (
+                  parsed.scheme == "https" and bool(parsed.hostname)
+                  and not parsed.username and not parsed.password
+                  and not parsed.query and not parsed.fragment
+                  and not parsed.hostname.endswith(".invalid")
+              )
+              if not valid_url and not (expected_job["enabled"] == 0 and actual_url == pending_url):
+                  raise SystemExit(
+                      f"Remote D1 job {job_key} requires a valid deployment-managed HTTPS worker_http_url"
+                  )
+              expected_job["worker_http_url"] = actual_url
           if actual_jobs != expected_jobs:
               raise SystemExit(
                   "Remote D1 scheduler_jobs rows do not match jobs.toml\n"

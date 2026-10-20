@@ -1,0 +1,150 @@
+# Canonical job configuration for the ops Cloudflare cron scheduler.
+# Times in UTC
+
+config_version = 1
+scheduler_name = "uk-aq-cron-scheduler-ops"
+
+[jobs.uk_aq_observs_partition_maintenance]
+enabled = true
+cron_expr = "0 3 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_observs_partition_maintenance.yml"
+github_ref = "main"
+dry_run = false
+notes = "Observations partition maintenance via GitHub Actions"
+
+[jobs.uk_aq_prune_daily]
+enabled = false
+cron_expr = "30 2 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_prune_daily.yml"
+github_ref = "main"
+dry_run = false
+notes = "Prune Daily via GitHub Actions"
+
+[jobs.uk_aq_chart_metrics]
+enabled = true
+cron_expr = "0 2 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_chart_metrics.yml"
+github_ref = "main"
+dry_run = false
+notes = "Standalone chart metrics cleanup and daily refresh"
+
+[jobs.uk_aq_supabase_db_dump_backup]
+enabled = true
+cron_expr = "55 0 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_supabase_db_dump_backup.yml"
+github_ref = "main"
+dry_run = false
+notes = "Supabase logical database dumps to Dropbox"
+
+[jobs.uk_aq_supabase_db_dump_backup.github_inputs]
+trigger_mode = "scheduler"
+
+[jobs.uk_aq_r2_core_snapshot]
+enabled = true
+cron_expr = "15 4 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_r2_core_snapshot.yml"
+github_ref = "main"
+dry_run = false
+notes = "R2 core snapshot"
+
+[jobs.uk_aq_who_2021_daily]
+enabled = true
+cron_expr = "30 4,9 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_who_2021_daily.yml"
+github_ref = "main"
+dry_run = false
+notes = "WHO 2021 hourly recalculation and readiness window via GitHub Actions"
+
+[jobs.uk_aq_who_2021_daily.github_inputs]
+run_mode = "daily"
+trigger_mode = "scheduler"
+publish_json = "configured"
+write_parquet = "configured"
+
+[jobs.uk_aq_r2_history_dropbox_backup]
+enabled = true
+cron_expr = "35 4 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_r2_history_dropbox_backup.yml"
+github_ref = "main"
+dry_run = false
+notes = "R2 history Dropbox backup"
+
+[jobs.uk_aq_r2_history_dropbox_backup_force_prune_recheck]
+enabled = true
+cron_expr = "0 22 * * SUN"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_r2_history_dropbox_backup.yml"
+github_ref = "main"
+dry_run = false
+notes = "Weekly forced prune recheck"
+
+[jobs.uk_aq_r2_history_dropbox_backup_force_prune_recheck.github_inputs]
+force_prune_recheck = "true"
+
+[jobs.uk_aq_dropbox_prune_raw]
+enabled = true
+cron_expr = "49 5 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_dropbox_prune_raw.yml"
+github_ref = "main"
+dry_run = false
+notes = "Dropbox raw-data pruning"
+
+[jobs.uk_aq_media_discovery]
+enabled = false
+cron_expr = "0 */2 * * *"
+target_type = "worker_http"
+worker_http_url = "https://uk-aq-media-discovery.uk-aq-media.workers.dev/scheduler/run"
+worker_http_secret_binding = "UK_AQ_MEDIA_WORKER_HTTP_SECRET"
+dry_run = false
+notes = "UK AQ Media discovery"
+
+[jobs.uk_aq_media_gdelt]
+enabled = false
+cron_expr = "10,40 * * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-media"
+github_workflow_file = "uk_aq_media_gdelt.yml"
+github_ref = "main"
+dry_run = false
+notes = "GDELT Web NGrams Media discovery"
+
+[jobs.uk_aq_blog_refresh]
+enabled = false
+cron_expr = "20 6 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/TEST-uk-aq.github.io"
+github_workflow_file = "pages.yml"
+github_ref = "main"
+dry_run = false
+notes = "Refresh UK AQ Blog from Substack and deploy Pages"
+
+[jobs.uk_aq_blog_refresh.github_inputs]
+refresh_blog_feed = "true"
+
+# Future TEST activation only: enable after schema, Queue, Worker and OAuth SMTP readiness.
+# Pro is an optional fallback, not a scheduler dependency.
+[jobs.uk_aq_media_news_email]
+enabled = false
+cron_expr = "*/5 * * * *"
+target_type = "worker_http"
+worker_http_url = "https://uk-aq-media-email.uk-aq-media.workers.dev/scheduler/run"
+worker_http_secret_binding = "UK_AQ_MEDIA_EMAIL_WORKER_HTTP_SECRET"
+dry_run = false
+notes = "AQ NEWS Daily/recovery; separate credential; Media owns due selection and bounded Queue work"

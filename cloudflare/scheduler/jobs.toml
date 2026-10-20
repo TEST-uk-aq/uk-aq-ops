@@ -144,7 +144,8 @@ refresh_blog_feed = "true"
 enabled = false
 cron_expr = "*/5 * * * *"
 target_type = "worker_http"
-worker_http_url = "https://uk-aq-media-email.uk-aq-media.workers.dev/scheduler/run"
+# The actual endpoint is owned by the destination environment's scheduler D1 settings.
+worker_http_url_managed_by_deploy = true
 worker_http_secret_binding = "UK_AQ_MEDIA_EMAIL_WORKER_HTTP_SECRET"
 dry_run = false
 notes = "AQ NEWS Daily/recovery; separate credential; Media owns due selection and bounded Queue work"

@@ -20,6 +20,7 @@ DEFAULT_TIMEZONE = "UTC"
 DEFAULT_GITHUB_REF = "main"
 DEFAULT_CLOUD_RUN_METHOD = "POST"
 DEPLOYMENT_PENDING_CLOUD_RUN_URL = "https://deployment-pending.invalid/run"
+DEPLOYMENT_PENDING_WORKER_HTTP_URL = "https://deployment-pending.invalid/scheduler/run"
 WORKER_HTTP_SECRET_BINDING_PATTERN = re.compile(r"^UK_AQ_[A-Z0-9_]*WORKER_HTTP_SECRET$")
 
 MONTH_NAME_TO_NUMBER = {
@@ -271,6 +272,7 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
         "cloud_run_headers",
         "cloud_run_body",
         "worker_http_url",
+        "worker_http_url_managed_by_deploy",
         "worker_http_secret_binding",
         "worker_http_body",
         "dry_run",
@@ -312,6 +314,7 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
         "dry_run": dry_run,
         "notes": notes,
         "cloud_run_url_managed_by_deploy": False,
+        "worker_http_url_managed_by_deploy": False,
     }
 
     if not job["job_key"]:
@@ -325,7 +328,10 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
         "cloud_run_headers",
         "cloud_run_body",
     }
-    worker_http_fields = {"worker_http_url", "worker_http_secret_binding", "worker_http_body"}
+    worker_http_fields = {
+        "worker_http_url", "worker_http_url_managed_by_deploy",
+        "worker_http_secret_binding", "worker_http_body",
+    }
 
     if target_type == "github_workflow":
         forbidden = (cloud_run_fields | worker_http_fields) & set(raw_job)
@@ -381,10 +387,23 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
             joined = ", ".join(sorted(forbidden))
             raise JobsConfigError(f"Invalid scheduler job {job_key}: worker_http does not use {joined}")
 
-        job["worker_http_url"] = require_absolute_https_url(
-            raw_job.get("worker_http_url"),
-            f"scheduler_jobs.worker_http_url for {job_key}",
-        )
+        managed_url = raw_job.get("worker_http_url_managed_by_deploy", False)
+        if not isinstance(managed_url, bool):
+            raise JobsConfigError(
+                f"Invalid scheduler_jobs.worker_http_url_managed_by_deploy for {job_key}: expected true or false"
+            )
+        if managed_url and "worker_http_url" in raw_job:
+            raise JobsConfigError(
+                f"Invalid scheduler job {job_key}: set worker_http_url or worker_http_url_managed_by_deploy, not both"
+            )
+        if managed_url:
+            job["worker_http_url"] = DEPLOYMENT_PENDING_WORKER_HTTP_URL
+            job["worker_http_url_managed_by_deploy"] = True
+        else:
+            job["worker_http_url"] = require_absolute_https_url(
+                raw_job.get("worker_http_url"),
+                f"scheduler_jobs.worker_http_url for {job_key}",
+            )
         job["worker_http_secret_binding"] = require_worker_http_secret_binding(
             raw_job.get("worker_http_secret_binding"),
             f"scheduler_jobs.worker_http_secret_binding for {job_key}",
@@ -451,6 +470,13 @@ def render_upsert_statement(job: dict[str, Any]) -> str:
         if job.get("cloud_run_url_managed_by_deploy")
         else "  cloud_run_url = excluded.cloud_run_url"
     )
+    worker_http_url_update = (
+        "  worker_http_url = case when scheduler_jobs.target_type = 'worker_http' "
+        "and scheduler_jobs.worker_http_url is not null "
+        "then scheduler_jobs.worker_http_url else excluded.worker_http_url end"
+        if job.get("worker_http_url_managed_by_deploy")
+        else "  worker_http_url = excluded.worker_http_url"
+    )
     update_lines = [
         "  enabled = excluded.enabled",
         "  target_type = excluded.target_type",
@@ -464,7 +490,7 @@ def render_upsert_statement(job: dict[str, Any]) -> str:
         "  cloud_run_method = excluded.cloud_run_method",
         "  cloud_run_headers_json = excluded.cloud_run_headers_json",
         "  cloud_run_body_json = excluded.cloud_run_body_json",
-        "  worker_http_url = excluded.worker_http_url",
+        worker_http_url_update,
         "  worker_http_secret_binding = excluded.worker_http_secret_binding",
         "  worker_http_body_json = excluded.worker_http_body_json",
         "  dry_run = excluded.dry_run",
@@ -512,6 +538,11 @@ def build_expected_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
             job["job_key"]
             for job in manifest["jobs"]
             if job.get("cloud_run_url_managed_by_deploy")
+        ],
+        "deployment_managed_worker_http_url_job_keys": [
+            job["job_key"]
+            for job in manifest["jobs"]
+            if job.get("worker_http_url_managed_by_deploy")
         ],
     }
 
