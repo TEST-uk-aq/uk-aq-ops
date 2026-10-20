@@ -997,7 +997,7 @@ async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, evi
   // records. Authenticate it using the existing SQLite-backed bounded verifier
   // rather than materialising all journal entries and reconstructing a giant
   // JavaScript plan. This is scratch data, never migration/evidence authority.
-  const scratchDirectory = process.env.UK_AQ_V3_VERIFY_SCRATCH_DIRECTORY || os.tmpdir();
+  const scratchDirectory = os.tmpdir(); // Standard TMPDIR controls disposable scratch location.
   const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
   const store = await VerificationStore.open({
     scratchDirectory,
