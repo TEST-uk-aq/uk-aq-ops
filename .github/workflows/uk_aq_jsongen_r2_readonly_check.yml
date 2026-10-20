@@ -1,0 +1,89 @@
+name: UK AQ JSONgen R2 Read Check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    if: >-
+      github.repository == 'TEST-uk-aq/uk-aq-ops' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
+      UK_AQ_JSONGEN_R2_ENDPOINT: ${{ vars.UK_AQ_JSONGEN_R2_ENDPOINT }}
+      UK_AQ_JSONGEN_R2_BUCKET: ${{ vars.UK_AQ_JSONGEN_R2_BUCKET }}
+      UK_AQ_JSONGEN_R2_READ_ACCESS_KEY_ID: ${{ secrets.UK_AQ_JSONGEN_R2_READ_ACCESS_KEY_ID }}
+      UK_AQ_JSONGEN_R2_READ_SECRET_ACCESS_KEY: ${{ secrets.UK_AQ_JSONGEN_R2_READ_SECRET_ACCESS_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify private R2 read credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --kill-after=5s 90s node --input-type=module <<'NODE'
+          import {
+            managedR2ReadConfig,
+            assertManagedR2CredentialMode
+          } from './scripts/jsongen/r2-config.mjs';
+          import {
+            r2ListObjectsV2,
+            r2HeadObject
+          } from './workers/shared/r2_sigv4.mjs';
+
+          try {
+            const r2 = managedR2ReadConfig();
+            assertManagedR2CredentialMode(r2, 'read');
+
+            const page = await r2ListObjectsV2({
+              r2,
+              prefix: '',
+              max_keys: 1
+            });
+
+            if (!Array.isArray(page.entries) ||
+                page.entries.length > 1) {
+              throw new Error('invalid_listing');
+            }
+
+            console.log('PASS: TEST R2 configuration');
+            console.log('PASS: Authenticated ListObjectsV2');
+
+            if (page.entries.length === 1) {
+              const head = await r2HeadObject({
+                r2,
+                key: page.entries[0].key
+              });
+              if (!head.exists) {
+                throw new Error('object_unavailable');
+              }
+              console.log('PASS: Authenticated object HEAD');
+            } else {
+              console.log('No objects listed; HEAD not applicable');
+            }
+
+            console.log('PASS: R2 read credential check');
+            console.log('No R2 writes or object downloads performed');
+          } catch (error) {
+            const message = String(error?.message || '');
+            const http = message.match(
+              /R2 (?:LIST|HEAD) failed \((\d{3})\)/
+            );
+            const reason = http
+              ? `R2 HTTP ${http[1]}`
+              : error?.code === 'invalid_r2_configuration'
+                ? 'Invalid R2 configuration'
+                : 'R2 check failed';
+            console.error('FAIL:', reason);
+            process.exitCode = 1;
+          }
+          NODE
