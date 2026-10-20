@@ -3,9 +3,12 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { pathToFileURL } from "node:url";
 
 import { Client } from "pg";
+import { VerificationStore, GiB } from "./bounded_verify_store.mjs";
+import { readBoundedBaseline } from "./bounded_verify_baseline.mjs";
 
 import {
   DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY,
@@ -989,139 +992,163 @@ function requireAuthenticatedCompletedPlanIdentity(completed, expected, label) {
   return identity;
 }
 
-async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, evidenceRoot, accepted, requiredUnchangedDay, environment, bucket }) {
-  const baseline = readAuthenticatedCutoverBaseline({ checkpointPath, planReport, environment, bucket, evidenceRoot });
-  const baselinePlan = baseline.plan;
-  const journal = { completed_objects: baseline.completedObjects };
-  const provenance = validateSteadyStateBaselineProvenance(baseline.provenance);
-
-  const dayKey = buildHistoryV2DayManifestKey(GENERATION.observations_prefix, accepted.day_utc);
-  if (journal.completed_objects.has(dayKey)) fail("accepted day already exists in the authenticated pre-steady-state baseline");
-  const requiredDay = exactDay(requiredUnchangedDay, "required unchanged day");
-  const requiredDayKey = buildHistoryV2DayManifestKey(GENERATION.observations_prefix, requiredDay);
-  if (!completedIdentity(journal.completed_objects, requiredDayKey)) {
-    fail(`required unchanged day lacks authenticated post-migration evidence: ${requiredDay}`);
-  }
-
-  const branchKeys = new Set([
-    buildR2HistoryV2ObservationsMonthManifestKey(GENERATION.observations_prefix, accepted.day_utc.slice(0, 4), accepted.day_utc.slice(5, 7)),
-    buildR2HistoryV2ObservationsYearManifestKey(GENERATION.observations_prefix, accepted.day_utc.slice(0, 4)),
-    buildR2HistoryV2ObservationsRootManifestKey(GENERATION.observations_prefix),
-  ]);
-  const baselineCanonical = new Map(
-    baselinePlan.canonical_publication_objects.map((object) => [object.key, object]),
-  );
-  for (const object of baselineCanonical.values()) {
-    requireAuthenticatedCompletedPlanIdentity(journal.completed_objects, object, "canonical baseline object");
-  }
-  const unaffected = [];
-  const unaffectedAggregates = [];
-  for (const key of journal.completed_objects.keys()) {
-    if (!key.startsWith(`${GENERATION.observations_prefix}/`) || !key.endsWith("/manifest.json") || branchKeys.has(key)) continue;
-    const identity = completedIdentity(journal.completed_objects, key);
-    if (!identity) continue;
-    const isDay = /\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(key);
-    const isAggregate = key.includes("/_manifests/");
-    if (!isDay && !isAggregate) continue;
-    const current = await getIdentity(getObject, key);
-    const classification = classifyDependencyIdentity(current, identity);
-    if (classification.classification !== "EXACT") fail(`unaffected post-migration hierarchy identity changed: ${key}`);
-    const exact = { key, byte_size: current.byte_size, sha256: current.sha256 };
-    if (isDay) unaffected.push(exact);
-    else unaffectedAggregates.push(exact);
-  }
-  if (!unaffected.some((entry) => entry.key === requiredDayKey)) fail(`required unchanged day was not exact: ${requiredDay}`);
-
-  const aggregates = [];
-  for (const key of branchKeys) {
-    const current = await getIdentity(getObject, key);
-    const payload = JSON.parse(current.body.toString("utf8"));
-    const canonical = validateR2HistoryV2ObservationsAggregateManifest(payload, { basePrefix: GENERATION.observations_prefix });
-    aggregates.push({ key, byte_size: current.byte_size, sha256: current.sha256, content_hash: canonical.content_hash, payload });
-  }
-  const month = aggregates.find((entry) => entry.key.includes("month="));
-  const year = aggregates.find((entry) => /\/_manifests\/year=\d{4}\/manifest\.json$/.test(entry.key));
-  const root = aggregates.find((entry) => entry.key.endsWith("/_manifests/manifest.json"));
-  const dayIdentity = await getIdentity(getObject, dayKey);
-  const dayPayload = JSON.parse(dayIdentity.body.toString("utf8"));
-  const acceptedYear = Number(accepted.day_utc.slice(0, 4));
-  const acceptedMonth = accepted.day_utc.slice(5, 7);
-  const baselineMonthChildren = [...baselineCanonical.values()]
-    .filter((object) => object.publication_stage === "day_manifest" && object.payload.day_utc.startsWith(`${acceptedYear}-${acceptedMonth}`))
-    .map((object) => ({
-      day_utc: object.payload.day_utc,
-      manifest_key: object.key,
-      manifest_hash: object.payload.manifest_hash,
-    }));
-  const baselineYearChildren = [...baselineCanonical.values()]
-    .filter((object) => object.publication_stage === "month_manifest" && Number(object.payload.year) === acceptedYear)
-    .map((object) => ({
-      month: object.payload.month,
-      manifest_key: object.key,
-      content_hash: object.payload.content_hash,
-    }));
-  const baselineRootChildren = [...baselineCanonical.values()]
-    .filter((object) => object.publication_stage === "year_manifest")
-    .map((object) => ({
-      year: Number(object.payload.year),
-      manifest_key: object.key,
-      content_hash: object.payload.content_hash,
-    }));
-  const branchDelta = assertExactAffectedBranchDelta({
-    baselineMonthChildren,
-    baselineYearChildren,
-    baselineRootChildren,
-    currentMonth: { ...month.payload, manifest_key: month.key },
-    currentYear: { ...year.payload, manifest_key: year.key },
-    currentRoot: root.payload,
-    acceptedDay: {
-      day_utc: accepted.day_utc,
-      manifest_key: dayKey,
-      manifest_hash: dayPayload.manifest_hash,
-    },
+async function verifyHierarchyDelta({ getObject, planReport, planReportPath, checkpointPath, evidenceRoot, accepted, requiredUnchangedDay, environment, bucket }) {
+  // The historical migration plan includes more than a million publication
+  // records. Authenticate it using the existing SQLite-backed bounded verifier
+  // rather than materialising all journal entries and reconstructing a giant
+  // JavaScript plan. This is scratch data, never migration/evidence authority.
+  const scratchDirectory = process.env.UK_AQ_V3_VERIFY_SCRATCH_DIRECTORY || os.tmpdir();
+  const repositoryRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
+  const store = await VerificationStore.open({
+    scratchDirectory,
+    evidenceDirectory: path.dirname(path.resolve(checkpointPath)),
+    repositoryRoot,
+    // No lock is claimed by a read-only steady-state verifier. Its wrapper
+    // authenticates the persistent freeze/scheduler state independently.
+    assertHeld: () => {},
+    maxScratchBytes: 32 * GiB,
   });
-
-  const baselineV3Entries = baselinePlan.v3_publication_plan.entries;
-  const unaffectedV3 = [];
-  for (const expected of baselineV3Entries) {
-    const authenticatedIdentity = requireAuthenticatedCompletedPlanIdentity(journal.completed_objects, expected, "v3 baseline object");
-    if (expected.key === DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY) continue;
-    const current = await getIdentity(getObject, expected.key);
-    if (current.byte_size !== authenticatedIdentity.byte_size || current.sha256 !== authenticatedIdentity.sha256) {
-      fail(`unaffected authenticated v3 authority changed: ${expected.key}`);
+  let verified = false;
+  try {
+    store.phase = "authenticate-post-migration-baseline";
+    const baseline = await readBoundedBaseline({
+      checkpointPath, planReport, evidenceRoot, store, repositoryRoot,
+      environment, bucket,
+    });
+    // A valid disk replay is the required provenance; never silently fall
+    // back to a pre-migration Dropbox root or current R2 reconstruction.
+    const provenance = validateSteadyStateBaselineProvenance({
+      ...baseline.provenance,
+      kind: STEADY_STATE_BASELINE_KIND,
+      disk_replay_kind: baseline.provenance.kind,
+      pre_migration_dropbox_source: false,
+    });
+    if (baseline.provenance.kind !== "authenticated_completed_migration_disk_replay") {
+      fail("migration baseline is not authenticated bounded disk replay");
     }
-    unaffectedV3.push({ key: expected.key, byte_size: current.byte_size, sha256: current.sha256 });
-  }
-  const currentLatestIdentity = await getIdentity(getObject, DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY);
-  const currentLatest = exactLatestPayload(currentLatestIdentity.body);
-  const baselineCanonicalDays = [...baselineCanonical.keys()]
-    .filter((key) => /\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(key))
-    .map((key) => key.match(/day_utc=(\d{4}-\d{2}-\d{2})/)[1])
-    .sort();
-  if (!sameSorted(baselinePlan.v3_latest.payload.days || [], baselineCanonicalDays)) {
-    fail("authenticated baseline v3 latest-global days differ from baseline canonical day authority");
-  }
-  const latestDelta = assertExactLatestGlobalDelta({
-    baselineLatest: baselinePlan.v3_latest.payload,
-    currentLatest,
-    acceptedDayUtc: accepted.day_utc,
-  });
+    const complete = (key) => {
+      const row = store.get("SELECT evidence FROM completed WHERE key=?", key);
+      return row ? completedIdentity(new Map([[key, { evidence: JSON.parse(row.evidence) }]]), key) : null;
+    };
+    const dayKey = buildHistoryV2DayManifestKey(GENERATION.observations_prefix, accepted.day_utc);
+    if (complete(dayKey)) fail("accepted day already exists in the authenticated pre-steady-state baseline");
+    const requiredDay = exactDay(requiredUnchangedDay, "required unchanged day");
+    const requiredDayKey = buildHistoryV2DayManifestKey(GENERATION.observations_prefix, requiredDay);
+    if (!complete(requiredDayKey)) fail(\`required unchanged day lacks authenticated post-migration evidence: \${requiredDay}\`);
 
-  return Object.freeze({
-    baseline: provenance,
-    intended_delta: {
-      accepted_day_utc: accepted.day_utc,
-      accepted_day_was_absent: true,
-      allowed_advanced_keys: [...branchKeys].sort(),
-    },
-    unaffected_day_identity_count: unaffected.length,
-    unaffected_aggregate_identity_count: unaffectedAggregates.length,
-    required_unchanged_day: unaffected.find((entry) => entry.key === requiredDayKey),
-    advanced_aggregate_identities: aggregates.map(({ payload: _payload, ...identity }) => identity),
-    affected_branch_exact_delta: branchDelta,
-    unaffected_v3_identity_count: unaffectedV3.length,
-    latest_global_exact_delta: latestDelta,
-  });
+    const branchKeys = new Set([
+      buildR2HistoryV2ObservationsMonthManifestKey(GENERATION.observations_prefix, accepted.day_utc.slice(0, 4), accepted.day_utc.slice(5, 7)),
+      buildR2HistoryV2ObservationsYearManifestKey(GENERATION.observations_prefix, accepted.day_utc.slice(0, 4)),
+      buildR2HistoryV2ObservationsRootManifestKey(GENERATION.observations_prefix),
+    ]);
+
+    // Keyset pagination closes every SQLite iterator before an awaited R2 GET.
+    // Each authenticated expected identity is checked against current bytes.
+    const eachObject = async (where, visit) => {
+      let after = "";
+      for (;;) {
+        const rows = store.statement(\`SELECT key,size,sha,stage FROM objects WHERE \${where} AND key>? ORDER BY key COLLATE BINARY LIMIT 128\`).all(after);
+        if (!rows.length) break;
+        for (const row of rows) await visit(row);
+        after = rows.at(-1).key;
+        store.phase = "compare-unaffected-post-write-objects";
+        await store.boundary(true);
+      }
+    };
+    const unaffected = [];
+    let unaffectedAggregateCount = 0;
+    await eachObject("v3=0 AND external=0", async (object) => {
+      const key = object.key;
+      if (!key.startsWith(\`\${GENERATION.observations_prefix}/\`) || !key.endsWith("/manifest.json") || branchKeys.has(key)) return;
+      const isDay = /\/day_utc=\d{4}-\d{2}-\d{2}\/manifest\.json$/.test(key);
+      const isAggregate = key.includes("/_manifests/");
+      if (!isDay && !isAggregate) return;
+      const expected = complete(key);
+      if (!expected || expected.byte_size !== object.size || expected.sha256 !== object.sha) {
+        fail(\`canonical baseline object lacks exact authenticated completion: \${key}\`);
+      }
+      const current = await getIdentity(getObject, key);
+      if (classifyDependencyIdentity(current, expected).classification !== "EXACT") {
+        fail(\`unaffected post-migration hierarchy identity changed: \${key}\`);
+      }
+      if (isDay) unaffected.push({ key, byte_size: current.byte_size, sha256: current.sha256 });
+      else unaffectedAggregateCount++;
+    });
+    const requiredUnchangedIdentity = unaffected.find((entry) => entry.key === requiredDayKey);
+    if (!requiredUnchangedIdentity) fail(\`required unchanged day was not exact: \${requiredDay}\`);
+
+    const aggregates = [];
+    for (const key of branchKeys) {
+      const current = await getIdentity(getObject, key);
+      const payload = JSON.parse(current.body.toString("utf8"));
+      const canonical = validateR2HistoryV2ObservationsAggregateManifest(payload, { basePrefix: GENERATION.observations_prefix });
+      aggregates.push({ key, byte_size: current.byte_size, sha256: current.sha256, content_hash: canonical.content_hash, payload });
+    }
+    const month = aggregates.find((entry) => entry.key.includes("month="));
+    const year = aggregates.find((entry) => /\/_manifests\/year=\d{4}\/manifest\.json$/.test(entry.key));
+    const root = aggregates.find((entry) => entry.key.endsWith("/_manifests/manifest.json"));
+    const dayIdentity = await getIdentity(getObject, dayKey);
+    const dayPayload = JSON.parse(dayIdentity.body.toString("utf8"));
+    const baselineParent = (key) => {
+      const parent = baseline.steadyStateAggregates.find((entry) => entry.key === key);
+      if (!parent || !Array.isArray(parent.children) || !complete(key)) {
+        fail(\`authenticated migration baseline parent is unavailable: \${key}\`);
+      }
+      return parent.children;
+    };
+    const branchDelta = assertExactAffectedBranchDelta({
+      baselineMonthChildren: baselineParent(month.key),
+      baselineYearChildren: baselineParent(year.key),
+      baselineRootChildren: baselineParent(root.key),
+      currentMonth: { ...month.payload, manifest_key: month.key },
+      currentYear: { ...year.payload, manifest_key: year.key },
+      currentRoot: root.payload,
+      acceptedDay: { day_utc: accepted.day_utc, manifest_key: dayKey, manifest_hash: dayPayload.manifest_hash },
+    });
+
+    let unaffectedV3Count = 0;
+    await eachObject("v3=1 AND external=0", async (object) => {
+      const expected = complete(object.key);
+      if (!expected || expected.byte_size !== object.size || expected.sha256 !== object.sha) {
+        fail(\`v3 baseline object lacks exact authenticated completion: \${object.key}\`);
+      }
+      if (object.key === DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY) return;
+      const current = await getIdentity(getObject, object.key);
+      if (current.byte_size !== expected.byte_size || current.sha256 !== expected.sha256) {
+        fail(\`unaffected authenticated v3 authority changed: \${object.key}\`);
+      }
+      unaffectedV3Count++;
+    });
+    const currentLatestIdentity = await getIdentity(getObject, DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY);
+    const currentLatest = exactLatestPayload(currentLatestIdentity.body);
+    const baselineDays = [...store.summaries("canonical-day")].map((entry) => entry.day_utc).sort();
+    if (!sameSorted(baseline.steadyStateLatest?.days || [], baselineDays)) {
+      fail("authenticated baseline v3 latest-global days differ from baseline canonical day authority");
+    }
+    const latestDelta = assertExactLatestGlobalDelta({
+      baselineLatest: baseline.steadyStateLatest,
+      currentLatest,
+      acceptedDayUtc: accepted.day_utc,
+    });
+    verified = true;
+    return Object.freeze({
+      baseline: provenance,
+      intended_delta: { accepted_day_utc: accepted.day_utc, accepted_day_was_absent: true,
+        allowed_advanced_keys: [...branchKeys].sort() },
+      unaffected_day_identity_count: unaffected.length,
+      unaffected_aggregate_identity_count: unaffectedAggregateCount,
+      required_unchanged_day: requiredUnchangedIdentity,
+      advanced_aggregate_identities: aggregates.map(({ payload: _payload, ...identity }) => identity),
+      affected_branch_exact_delta: branchDelta,
+      unaffected_v3_identity_count: unaffectedV3Count,
+      latest_global_exact_delta: latestDelta,
+    });
+  } finally {
+    store.close();
+    // The scratch DB is disposable, not evidence. On failure retain its
+    // diagnostic progress for the operator; success removes it entirely.
+    if (verified) fs.rmSync(store.root, { recursive: true, force: true });
+  }
 }
 
 async function verifyReadProbe({ httpGet, siteUrl, cacheUrl, bypassSecret, selected }) {
