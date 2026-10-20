@@ -605,7 +605,7 @@ export function validateRecoveryUpdateStructure(updates) {
   }
 }
 
-function applyRecoveryUpdates(checkpoint, updates) {
+function applyRecoveryUpdates(checkpoint, updates, { isolatePreparedStateUpdates = false } = {}) {
   if (updates.clean_target_admission) {
     if (checkpoint.progress_format !== 'authenticated-journal-v1' || checkpoint.clean_target_admission) throw new Error('Clean-start journal evidence redefined or incompatible');
     validateCleanStartEvidence(updates.clean_target_admission, checkpoint.authority);
@@ -621,8 +621,15 @@ function applyRecoveryUpdates(checkpoint, updates) {
     checkpoint.prepared_units[entry.unit_id] = entry.record;
   }
   for (const entry of updates.prepared_state_updates || []) {
-    const record = checkpoint.prepared_units[entry?.unit_id];
+    let record = checkpoint.prepared_units[entry?.unit_id];
     if (!record) throw new Error(`Recovery state references unknown unit: ${entry?.unit_id}`);
+    if (isolatePreparedStateUpdates) {
+      // In a read-only replay, prepared records may still belong to the
+      // authenticated journal. Copy only the updated record so validation
+      // never changes the source evidence or clones every prepared payload.
+      record = { ...record };
+      checkpoint.prepared_units[entry.unit_id] = record;
+    }
     if (entry.files_published === true) record.files_published = true;
     if (entry.remove_staging_refs === true) {
       record.target_file_intents = record.target_file_intents.map(
@@ -837,7 +844,9 @@ function replayRecoveryJournal({ paths, checkpoint, manifest, repairHead = false
       validateRecoveryUpdateStructure(payload.updates);
       interruptedPreparedPlan = validateObservationHistoryV3RecoveryAppend({ checkpoint, updates: payload.updates });
     }
-    applyRecoveryUpdates(checkpoint, payload.updates || {});
+    applyRecoveryUpdates(checkpoint, payload.updates || {}, {
+      isolatePreparedStateUpdates: readOnly,
+    });
     publicationEvidence.push(...(payload.updates?.publication_evidence || []));
     replayProgress.report(index + 1);
   }
@@ -1025,7 +1034,21 @@ export function buildObservationHistoryV3RecoveryProgressContext({
     Array.isArray(checkpoint.preparation_order) && checkpoint.preparation_order.length === 0;
   const freshEmptyJournal = createdManifest && freshCheckpoint && !fs.existsSync(paths.head) &&
     (!fs.existsSync(paths.entries) || fs.readdirSync(paths.entries).length === 0);
-  const recoveredCheckpoint = freshEmptyJournal ? checkpoint : structuredClone(checkpoint);
+  // Read-only inspection needs an independent replay *progress* state, not a
+  // second in-memory copy of the immutable, potentially very large plan.
+  // Copy mutable progress fields only; authority is validated and never
+  // modified by the read-only verifier. Normal writer/resume cloning stays
+  // unchanged. Prepared journal records detach on their first state update.
+  const recoveredCheckpoint = freshEmptyJournal
+    ? checkpoint
+    : readOnly
+      ? {
+          ...checkpoint,
+          prepared_units: structuredClone(checkpoint.prepared_units),
+          completed_objects: structuredClone(checkpoint.completed_objects),
+          preparation_order: structuredClone(checkpoint.preparation_order),
+        }
+      : structuredClone(checkpoint);
   const replay = replayRecoveryJournal({
     paths,
     checkpoint: recoveredCheckpoint,
