@@ -159,12 +159,12 @@ fi
 
 if [ -n "$NODE_BIN" ]; then
   [ -x "$NODE_BIN" ] || fail "--node-bin is not executable"
-elif command -v node >/dev/null 2>&1 && node --version | grep -Eq '^v20\.'; then
+elif command -v node >/dev/null 2>&1 && node --version | grep -Eq '^v22\.'; then
   NODE_BIN="$(command -v node)"
 else
-  NODE_BIN="$(npx --yes node@20 -p 'process.execPath')" || fail "Node 20 could not be resolved"
+  NODE_BIN="$(npx --yes node@22 -p 'process.execPath')" || fail "Node 22 could not be resolved"
 fi
-"$NODE_BIN" --version | grep -Eq '^v20\.' || fail "the verifier requires Node 20"
+"$NODE_BIN" --version | grep -Eq '^v22\.' || fail "the bounded verifier requires Node 22 (node:sqlite)"
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/uk-aq-index-v3-steady-state.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
