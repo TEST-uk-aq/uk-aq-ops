@@ -1,0 +1,39 @@
+name: TEST JSONgen signer intent acceptance (no R2 operations)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-jsongen-signer-intent-readonly
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.repository == 'TEST-uk-aq/uk-aq-ops' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      UK_AQ_ENV_NAME: TEST
+      UK_AQ_JSONGEN_PRUNE_SIGNER_URL: ${{ vars.UK_AQ_JSONGEN_PRUNE_SIGNER_URL }}
+      UK_AQ_JSONGEN_R2_ENDPOINT: ${{ vars.UK_AQ_JSONGEN_R2_ENDPOINT }}
+      UK_AQ_JSONGEN_R2_BUCKET: ${{ vars.UK_AQ_JSONGEN_R2_BUCKET }}
+    steps:
+      - name: Checkout TEST main
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Check authenticated PENDING and evidence-bundle signing (no R2 operations)
+        env:
+          UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_ID: ${{ secrets.UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_ID }}
+          UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_SECRET: ${{ secrets.UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_SECRET }}
+          UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN: ${{ secrets.UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN }}
+        run: node scripts/jsongen/check-signer-intents-readonly.mjs
