@@ -1189,7 +1189,17 @@ function validateControlAuthority(controlInput, expected) {
   return control;
 }
 
+function diagnosticStage(stage) {
+  if (process.env.UK_AQ_V3_VERIFY_DIAGNOSTICS !== "1") return;
+  const memory = process.memoryUsage();
+  const mb = (value) => Math.round(value / (1024 * 1024));
+  process.stderr.write(
+    `[v3-steady-state] ${new Date().toISOString()} ${stage} heap=${mb(memory.heapUsed)}MiB rss=${mb(memory.rss)}MiB external=${mb(memory.external)}MiB\n`,
+  );
+}
+
 export async function executeSteadyStatePostWriteVerifier(options, adaptersInput) {
+  diagnosticStage("start");
   const adapters = assertReadOnlyAdapters(adaptersInput);
   const acceptanceBytes = fs.readFileSync(options.acceptanceReport);
   requireEqual(sha256(acceptanceBytes), options.expectedAcceptanceReportSha256, "acceptance report SHA-256");
@@ -1205,6 +1215,7 @@ export async function executeSteadyStatePostWriteVerifier(options, adaptersInput
     source_content_hash_contract_version: options.expectedSourceHashContractVersion,
     pollutant_count: options.expectedPollutantCount,
   });
+  diagnosticStage("acceptance-authenticated");
   const control = validateControlAuthority(
     parseJsonFile(options.controlEvidence, "control evidence"),
     {
@@ -1214,11 +1225,14 @@ export async function executeSteadyStatePostWriteVerifier(options, adaptersInput
       bucket: options.bucket,
     },
   );
+  diagnosticStage("control-authenticated; database-read-start");
   const state = await readControlState(async (sql, params) => {
     assertReadOnlySql(sql);
     return await adapters.query({ sql, params });
   }, accepted);
+  diagnosticStage("database-read-complete");
   const independent = validateIndependentControlState(state, accepted);
+  diagnosticStage("independent-control-validated; canonical-R2-start");
   const canonical = await verifyCanonicalHierarchy({
     getObject: adapters.getObject,
     headObject: adapters.headObject,
@@ -1226,6 +1240,7 @@ export async function executeSteadyStatePostWriteVerifier(options, adaptersInput
     candidateManifestKey: independent.candidate.manifest_key,
   });
   const controlR2Binding = bindIndependentControlStateToCanonical(independent, canonical);
+  diagnosticStage("canonical-R2-complete; v3-index-start");
   const v3 = await verifyV3Authority({
     getObject: adapters.getObject,
     headObject: adapters.headObject,
@@ -1233,6 +1248,7 @@ export async function executeSteadyStatePostWriteVerifier(options, adaptersInput
     canonical,
     environment: options.environment,
   });
+  diagnosticStage("v3-index-complete; migration-evidence-start");
   const planReport = parseJsonFile(options.planReport, "migration plan report");
   const hierarchyDelta = await verifyHierarchyDelta({
     getObject: adapters.getObject,
@@ -1244,10 +1260,12 @@ export async function executeSteadyStatePostWriteVerifier(options, adaptersInput
     requiredUnchangedDay: options.requiredUnchangedDay,
     environment: options.environment, bucket: options.bucket,
   });
+  diagnosticStage("migration-hierarchy-delta-complete; backup-metadata-start");
   const backupGate = await verifySelectedCutoverMetadata({
     generation: selectedCutoverGeneration(process.env),
     getObject: adapters.getObject, headObject: adapters.headObject,
   });
+  diagnosticStage("backup-metadata-complete; deployed-probe-start");
   const deployedReadProbe = await verifyReadProbe({
     httpGet: adapters.httpGet,
     siteUrl: options.siteUrl,
@@ -1255,6 +1273,7 @@ export async function executeSteadyStatePostWriteVerifier(options, adaptersInput
     bypassSecret: options.cacheBypassSecret,
     selected: v3.selected_probe,
   });
+  diagnosticStage("all-verification-stages-complete");
   return Object.freeze({
     schema_version: 1,
     kind: "index_v3_steady_state_post_write_verification",
