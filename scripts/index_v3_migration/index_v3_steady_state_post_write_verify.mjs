@@ -42,7 +42,7 @@ import {
   stableMigrationJson,
 } from "../backup_r2/lib/observation_history_migration_v3.mjs";
 import {
-  selectedCutoverGeneration, readAuthenticatedCutoverBaseline, verifySelectedCutoverMetadata,
+  selectedCutoverGeneration, verifySelectedCutoverMetadata,
 } from "./index_v3_cutover_generation_evidence.mjs";
 import { getObservationHistoryGeneration, assertObservationHistoryGenerationKey } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 import { CONTROLLED_PHASE_B_SOURCE_TABLES } from "./index_v3_controlled_phase_b_source_freeze.mjs";
@@ -1008,6 +1008,7 @@ async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, evi
     assertHeld: () => {},
     maxScratchBytes: 32 * GiB,
   });
+  process.stderr.write(`Disposable v3 steady-state verification scratch: ${store.root}\n`);
   let verified = false;
   try {
     store.phase = "authenticate-post-migration-baseline";
@@ -1028,7 +1029,12 @@ async function verifyHierarchyDelta({ getObject, planReport, checkpointPath, evi
     }
     const complete = (key) => {
       const row = store.get("SELECT evidence FROM completed WHERE key=?", key);
-      return row ? completedIdentity(new Map([[key, { evidence: JSON.parse(row.evidence) }]]), key) : null;
+      if (!row) return null;
+      const evidence = JSON.parse(row.evidence);
+      if (evidence?.verified !== true || evidence?.durable !== true ||
+          !Number.isSafeInteger(Number(evidence.byte_size)) ||
+          !SHA256_PATTERN.test(String(evidence.sha256 || ""))) return null;
+      return { key, byte_size: Number(evidence.byte_size), sha256: evidence.sha256 };
     };
     const dayKey = buildHistoryV2DayManifestKey(GENERATION.observations_prefix, accepted.day_utc);
     if (complete(dayKey)) fail("accepted day already exists in the authenticated pre-steady-state baseline");
