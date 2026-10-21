@@ -146,10 +146,31 @@ The `identity` section pins endpoint, bucket, lock PostgreSQL project, separate
 `obs_aqidb_project_ref`, and Dropbox root/directory. Runtime values must agree
 exactly. These are reviewed pins, not discovery; verify them together against the
 approved TEST configuration. The Dropbox root's first component must equal TEST.
-The lock URL must select `db.<project-ref>.supabase.co:5432/postgres` with
-`sslmode=require` or `verify-full`; transaction poolers are refused. URL-encode the
-password locally. Resolve direct-endpoint networking rather than substituting
-an unapproved database transport.
+The lock URL in the existing `env.SUPABASE_DB_URL` accepts either the approved
+direct `db.<project-ref>.supabase.co:5432/postgres` endpoint (direct port omission
+also means 5432), or the approved shared Supabase **session** pooler:
+
+```text
+postgresql://postgres.<project-ref>:<URL-encoded-password>@aws-<pooler-number>-<region>.pooler.supabase.com:5432/postgres?sslmode=require
+```
+
+On the MacBook Pro, reuse the existing approved TEST IngestDB session-pooler URL
+in the protected local JSON. Keep its actual pooler hostname and credentials,
+select port **5432** and database `postgres`, and append `?sslmode=require` if it
+has no query. The decoded username must be exactly `postgres.<project-ref>`, with
+the same reviewed `identity.postgres_project_ref`; do not change the pin to make
+a different project pass. URL-encode credentials locally. No new environment key,
+project discovery or direct-endpoint DNS workaround is required.
+
+Both routes require an explicit `sslmode=require` or `sslmode=verify-full` as the
+only query parameter. Duplicate parameters, identity overrides, `ssl`,
+`uselibpqcompat` and other query settings are refused because the PostgreSQL
+driver can otherwise override the validated target or disable certificate checks.
+With the pinned driver, both accepted modes enable TLS with certificate and
+hostname verification; no TLS fallback is added. If additional CA trust is
+needed, use the existing approved `NODE_EXTRA_CA_CERTS` mechanism; never disable
+certificate verification. Transaction pooling (especially port **6543**), other
+ports/hosts, missing credentials and mismatched projects are refused.
 
 Health requires existing names `OBS_AQIDB_SUPABASE_URL` and `OBS_AQIDB_SECRET_KEY`.
 The URL must exactly match the separately pinned ObsAQIDB project. It is never
@@ -269,10 +290,39 @@ automatic evidence deletion or log rotation is introduced.
    to the saved operation UUID. Verify dashboard visibility and exclusion from
    daily missing-task/email expectations; the GitHub task must remain unchanged;
    inspect normal lock diagnostics and 15-second elapsed-time heartbeats.
+   For session-pooler acceptance, retain evidence that the existing coordinator
+   acquires `uk_aq:r2_history:v2:observations_global_operation` in the pinned TEST
+   IngestDB `postgres` database as owner `r2_history_dropbox_backup`. Confirm its
+   five-second same-session heartbeats continue successfully. From the approved
+   TEST database SQL console, take bounded read-only lock/session samples during
+   pack publication, inventory, copy, verification and final checkpoint publication:
+
+   ```sql
+   SELECT a.pid, a.datname, a.application_name,
+          l.classid, l.objid, l.objsubid, l.mode, l.granted
+   FROM pg_stat_activity AS a
+   JOIN pg_locks AS l USING (pid)
+   WHERE a.datname = 'postgres'
+     AND a.application_name = 'uk-aq-observations-global-operation-lock:r2_history_dropbox_backup'
+     AND l.locktype = 'advisory' AND l.objsubid = 2 AND l.granted;
+   ```
+
+   Confirm the same owning backend PID and exclusive granted lock across those
+   stages. Compare `classid`/`objid` with the existing shared helper's derived
+   `class_id`/`object_id` (unsigned 32-bit representation in `pg_locks`) and the
+   coordinator's diagnostics. Confirm explicit release after protected completion.
+   Elapsed-time messages alone do not prove lock ownership. During a separately
+   authorised controlled overlap, use
+   the normal shared coordinator with a harmless protected command to confirm a
+   contender cannot enter and times out/defer cleanly; do not run a second backup
+   or a mutating writer as the contender. Do not force/unlock the owning session.
 3. During justified TEST work, observe interruption/network loss/reboot and login.
    Confirm the same health UUID and authenticated checkpoint resume, no unlocked
    progress and no duplicate logical row. Observe persistent failures through
    bounded breaker behaviour. A deliberate stop is terminal cancellation.
+   Confirm loss of the pooler lock session stops protected descendants, prevents
+   further copy/checkpoint progress and never records completion for the failed
+   attempt. A retry must acquire a fresh lock before any protected work resumes.
 4. Allow a complete backup, inspect accepted report hashes/locked exit and exact
    v3 observation/binding roots plus all required domains. Observe a health outage
    if available: local backup evidence must remain complete while only reporting
@@ -291,6 +341,20 @@ launchd installation was performed during implementation. Rollback stops/uninsta
 only this agent and retains all evidence; settle pending health first where
 possible. Restore only operator-paused schedules. Existing normal backup execution
 can consume authenticated checkpoints. Do not delete packs/bindings/checkpoints.
+If session pooling is not accepted, keep the installation idle and retain its
+protected configuration/state. Revert to the prior merged checkout after stopping
+all descendants; its validator requires a reachable approved direct endpoint.
+Do not weaken TLS or substitute transaction pooling to work around DNS failure.
+
+Chat-mode system-doc handover: update the owning backup contract/runbook to record
+this optional MBPro lock transport: approved direct PostgreSQL or the pinned
+Supabase session pooler on 5432, database `postgres`, exact project-qualified
+pooler username and one explicit secure SSL mode. Implementation changes are only
+`config.mjs`, this README and the focused configuration check, plus the required
+pre-change code archive. There are no schema, shared environment-key, coordinator,
+scheduling or LIVE changes. Local syntax/identity/TLS checks establish structure;
+real TEST lock retention, exclusion and lock-loss acceptance remain required.
+Authoritative `system_docs/` was not edited.
 
 ## Complete future LIVE promotion scope
 
