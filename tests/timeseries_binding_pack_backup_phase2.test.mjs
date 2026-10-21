@@ -11,8 +11,6 @@ import {
 } from "../scripts/backup_r2/lib/hierarchical_backup_v2.mjs";
 import {
   buildTimeseriesBindingPackInventoryReference,
-  ISOLATED_TEST_PACK_BACKUP_DESTINATION,
-  NORMAL_TEST_DROPBOX_BACKUP_DESTINATION,
   normalizeTimeseriesBindingBackupMode,
 } from "../scripts/backup_r2/lib/timeseries_binding_pack_inventory_v1.mjs";
 import {
@@ -42,6 +40,8 @@ import {
   getObservationHistoryGeneration,
 } from "../workers/shared/uk_aq_observation_history_generation.mjs";
 
+const NORMAL_TEST_DROPBOX_BACKUP_DESTINATION = "uk_aq_dropbox:TEST/R2_history_backup";
+const ISOLATED_TEST_PACK_BACKUP_DESTINATION = "uk_aq_dropbox:TEST/R2_history_backup_pack_test";
 const BINDING_PREFIX = "history/_index_v2/timeseries_binding";
 const PACK_PREFIX = "history/_backup_packs_v1/timeseries_binding";
 const V2_GENERATION = getObservationHistoryGeneration("v2");
@@ -275,7 +275,11 @@ function lockedArgs(
     "--inventory-report-out", "tmp/inventory.json",
     "--backup-report-out", "tmp/backup.json",
     ...extra,
-  ]);
+  ], {
+    UK_AQ_DROPBOX_ROOT: "TEST",
+    UK_AQ_R2_HISTORY_DROPBOX_DIR: destRoot === ISOLATED_TEST_PACK_BACKUP_DESTINATION
+      ? "R2_history_backup_pack_test" : "R2_history_backup",
+  });
 }
 
 test("pack inventory is derived from the source and pack roots and reuses exact identity", () => {
@@ -678,7 +682,7 @@ test("pack state validator rejects the individual checkpoint kind", () => {
   );
 });
 
-test("mode validation is exact and pack-only destination allow-list is fail-closed", () => {
+test("mode validation is exact and configured pack destination is fail-closed", () => {
   assert.equal(normalizeTimeseriesBindingBackupMode("individual"), "individual");
   assert.equal(normalizeTimeseriesBindingBackupMode("dual"), "dual");
   assert.equal(normalizeTimeseriesBindingBackupMode("pack"), "pack");
@@ -706,14 +710,14 @@ test("mode validation is exact and pack-only destination allow-list is fail-clos
       "--timeseries-binding-backup-mode", "pack",
       "--allow-experimental-pack-only",
     ], "v2", "uk_aq_dropbox:LIVE/R2_history_backup"),
-    /requires an exact allowed TEST destination/,
+    /must exactly match the configured Dropbox backup root/,
   );
   assert.throws(
     () => lockedArgs([
       "--timeseries-binding-backup-mode", "pack",
       "--allow-experimental-pack-only",
     ], "v2", "uk_aq_dropbox:TEST/arbitrary"),
-    /requires an exact allowed TEST destination/,
+    /must exactly match the configured Dropbox backup root/,
   );
   const isolated = lockedArgs([
     "--timeseries-binding-backup-mode", "pack",
@@ -776,7 +780,7 @@ test("locked wrapper logs coarse stages and orders dual publisher before invento
   assert.match(dualCalls[1][0], /build_backup_inventory\.mjs$/);
   assert.match(dualCalls[2][0], /sync_history_to_dropbox\.mjs$/);
   assert.equal(dualCalls[0].includes("--dry-run"), true);
-  assert.equal(dualCalls[1].includes("--dry-run"), false);
+  assert.equal(dualCalls[1].includes("--dry-run"), true);
   assert.equal(dualCalls[2].includes("--dry-run"), true);
   assert.deepEqual(dualLogs, [
     "[1970-01-01T00:00:00.000Z] R2 history backup stage: building timeseries-binding packs",

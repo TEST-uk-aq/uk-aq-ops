@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
+import { assertHistoryBackupSource, assertHistoryBackupRemotes } from "./lib/history_backup_targets.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -93,7 +94,7 @@ function usage() {
     "    --source-root <rclone-source-root> [options]",
     "",
     "Required:",
-    "  --source-root <root>          Example: uk_aq_r2_test:uk-aq-history-cic-test",
+    "  --source-root <root>          Exact: uk_aq_r2:<configured R2 bucket>",
     "",
     "Options:",
     `  --observations-prefix <p>    Default: ${DEFAULT_OBSERVATIONS_PREFIX}`,
@@ -417,6 +418,8 @@ function scanRunManifests(args, previousShard) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  assertHistoryBackupSource(args.source_root);
+  assertHistoryBackupRemotes({ rcloneBin: args.rclone_bin, dropbox: false });
   const generation = resolveObservationHistoryGeneration(process.env);
   requireLockedHistoryBackupMutation({
     dryRun: args.dry_run,

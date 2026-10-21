@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import fs from "node:fs";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -36,14 +37,24 @@ import {
 } from "../scripts/backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs";
 import { getObservationHistoryGeneration } from "../workers/shared/uk_aq_observation_history_generation.mjs";
 import {
-  NORMAL_TEST_DROPBOX_PACK_SOURCE,
-  NORMAL_TEST_R2_HISTORY_DESTINATION,
-  PHASE4_ISOLATED_TEST_R2_DESTINATION,
-  parseTimeseriesBindingPackRestoreArgs,
+  parseTimeseriesBindingPackRestoreArgs as parseRestoreArgs,
+  createRestoreDestinationObject,
 } from "../scripts/backup_r2/restore_timeseries_binding_packs_to_r2.mjs";
 
+const NORMAL_TEST_DROPBOX_PACK_SOURCE = "uk_aq_dropbox:TEST/R2_history_backup";
+const NORMAL_TEST_R2_HISTORY_DESTINATION = "uk_aq_r2:uk-aq-history-cic-test";
+const PHASE4_ISOLATED_TEST_R2_DESTINATION = "uk_aq_r2:uk-aq-history-cic-test-timeseries-binding-restore-phase4";
+const parseTimeseriesBindingPackRestoreArgs = (argv) => parseRestoreArgs(argv, {
+  CFLARE_R2_ENDPOINT: "https://account.r2.cloudflarestorage.com",
+  CFLARE_R2_BUCKET: "uk-aq-history-cic-test",
+  CFLARE_R2_ACCESS_KEY_ID: "test-access-key",
+  CFLARE_R2_SECRET_ACCESS_KEY: "test-secret-key",
+  UK_AQ_DROPBOX_ROOT: "TEST",
+  UK_AQ_R2_HISTORY_DROPBOX_DIR: "R2_history_backup",
+});
 const V2_GENERATION = getObservationHistoryGeneration("v2");
 const PACK_PREFIX = "history/_backup_packs_v1/timeseries_binding";
+const RESERVATION_KEY = "_ops/restores/timeseries_binding_pack_restore_v1/reservation.json";
 const NOW = "2026-09-04T12:00:00.000Z";
 const h = (value) => createHash("sha256").update(value).digest("hex");
 
@@ -287,7 +298,16 @@ function harness(fixture, { corruptReadbackId = null } = {}) {
       const value = fixture.sourceObjects.get(relativePath);
       return value ? Buffer.from(value) : null;
     },
-    writeDestinationObject: async (relativePath, body) => {
+    listDestinationObjects: async ({ maxKeys, continuationToken = null }) => {
+      const keys = [...destinationObjects.keys()].sort().filter((key) => !continuationToken || key > continuationToken);
+      const selected = keys.slice(0, maxKeys);
+      return { entries: selected.map((key) => ({ key, size: destinationObjects.get(key).byteLength })),
+        is_truncated: keys.length > selected.length,
+        next_token: keys.length > selected.length ? selected.at(-1) : null };
+    },
+    writeDestinationObject: async (relativePath, body, options) => {
+      if (destinationObjects.has(relativePath)) throw new Error("Create-only destination object already exists");
+      assert.equal(options?.ifNoneMatch, "*");
       writes.push(relativePath);
       destinationObjects.set(relativePath, Buffer.from(body));
     },
@@ -310,6 +330,7 @@ async function runRestore(fixture, options = {}) {
     destRoot: PHASE4_ISOLATED_TEST_R2_DESTINATION,
     readSourceObject: io.readSourceObject,
     writeDestinationObject: io.writeDestinationObject,
+    listDestinationObjects: io.listDestinationObjects,
     readDestinationObject: io.readDestinationObject,
     dryRun: options.dryRun ?? true,
     writeConcurrency: options.writeConcurrency || 1,
@@ -358,7 +379,7 @@ test("Phase 4 writes exact bytes, all connectors, range manifests, then source r
   ));
   const rootKey = timeseriesBindingSourceRootKey(TIMESERIES_BINDING_RESTORE_SOURCE_PREFIX);
 
-  assert.deepEqual(io.writes, [...memberKeys, ...rangeKeys, rootKey]);
+  assert.deepEqual(io.writes, [RESERVATION_KEY, ...memberKeys, ...rangeKeys, rootKey]);
   for (const [timeseriesId, body] of fixture.bodies) {
     assert.deepEqual(io.destinationObjects.get(memberPath(timeseriesId)), body);
   }
@@ -533,11 +554,11 @@ test("destination member readback failure prevents all manifest and root publica
 test("write CLI is dry-run by default and exactly guards the isolated TEST target", () => {
   assert.equal(
     NORMAL_TEST_R2_HISTORY_DESTINATION,
-    "uk_aq_r2_test:uk-aq-history-cic-test",
+    "uk_aq_r2:uk-aq-history-cic-test",
   );
   assert.equal(
     PHASE4_ISOLATED_TEST_R2_DESTINATION,
-    "uk_aq_r2_test:uk-aq-history-cic-test-timeseries-binding-restore-phase4",
+    "uk_aq_r2:uk-aq-history-cic-test-timeseries-binding-restore-phase4",
   );
   const base = [
     "--source-root", NORMAL_TEST_DROPBOX_PACK_SOURCE,
@@ -548,7 +569,7 @@ test("write CLI is dry-run by default and exactly guards the isolated TEST targe
 
   assert.throws(
     () => parseTimeseriesBindingPackRestoreArgs([...base, "--write-r2"]),
-    /normal TEST history bucket/,
+    /active history buckets are forbidden/,
   );
   assert.throws(
     () => parseTimeseriesBindingPackRestoreArgs([
@@ -556,14 +577,14 @@ test("write CLI is dry-run by default and exactly guards the isolated TEST targe
       "--dest-root", "uk_aq_r2_live:uk-aq-history-live",
       "--write-r2",
     ]),
-    /exact isolated TEST destination/,
+    /active history buckets are forbidden/,
   );
   assert.throws(
     () => parseTimeseriesBindingPackRestoreArgs([
       "--source-root", NORMAL_TEST_DROPBOX_PACK_SOURCE,
       "--dest-root", PHASE4_ISOLATED_TEST_R2_DESTINATION,
       "--write-r2",
-      "--confirm-isolated-test-dest-root", PHASE4_ISOLATED_TEST_R2_DESTINATION,
+      "--confirm-isolated-dest-root", PHASE4_ISOLATED_TEST_R2_DESTINATION,
     ]),
     /requires both expected source-root and pack-root SHA-256 pins/,
   );
@@ -573,17 +594,162 @@ test("write CLI is dry-run by default and exactly guards the isolated TEST targe
     "--write-r2",
     "--expected-source-root-sha256", "1".repeat(64),
     "--expected-pack-root-sha256", "2".repeat(64),
-    "--confirm-isolated-test-dest-root", PHASE4_ISOLATED_TEST_R2_DESTINATION,
+    "--confirm-isolated-dest-root", PHASE4_ISOLATED_TEST_R2_DESTINATION,
   ]);
   assert.equal(write.writeR2, true);
   assert.equal(write.destRoot, PHASE4_ISOLATED_TEST_R2_DESTINATION);
 });
 
-test("the older generic restore remains limited to its unchanged domains", () => {
-  const source = fs.readFileSync(
-    new URL("../scripts/backup_r2/restore_history_from_dropbox.mjs", import.meta.url),
-    "utf8",
-  );
-  assert.match(source, /DOMAIN_NAMES = Object\.freeze\(\["observations", "aqilevels", "core"\]\)/);
-  assert.doesNotMatch(source, /DOMAIN_NAMES[^\n]*timeseries_binding/);
+test("the older generic restore refuses binding payload before any I/O", () => {
+  const result = spawnSync(process.execPath, [
+    fileURLToPath(new URL("../scripts/backup_r2/restore_history_from_dropbox.mjs", import.meta.url)),
+    "--source-root", "synthetic-source", "--dest-root", "synthetic-destination",
+    "--domain", "timeseries_binding",
+  ], { encoding: "utf8", env: { UK_AQ_R2_HISTORY_VERSION: "v2" } });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Invalid --domain value: timeseries_binding/);
+});
+
+
+test("restore refuses a nonempty unreserved bucket before every destination write", async () => {
+  const fixture = buildFixture();
+  const io = harness(fixture);
+  io.destinationObjects.set("unrelated.txt", Buffer.from("unrelated"));
+  await assert.rejects(runRestore(fixture, { io, dryRun: false }), /not empty/);
+  assert.deepEqual(io.writes, []);
+  assert.deepEqual(io.destinationObjects.get("unrelated.txt"), Buffer.from("unrelated"));
+});
+
+test("restore resumes only an identical reservation with exact existing members", async () => {
+  const fixture = buildFixture();
+  const io = harness(fixture);
+  await runRestore(fixture, { io, dryRun: false });
+  assert.ok(io.destinationObjects.has(RESERVATION_KEY));
+  const rootKey = timeseriesBindingSourceRootKey(TIMESERIES_BINDING_RESTORE_SOURCE_PREFIX);
+  io.destinationObjects.delete(rootKey);
+  io.destinationObjects.delete(memberPath(12));
+  io.writes.length = 0;
+  const { report } = await runRestore(fixture, { io, dryRun: false });
+  assert.equal(report.destination_safety.mode, "resume");
+  assert.deepEqual(io.writes, [memberPath(12), rootKey]);
+  assert.equal(report.members_written, 1);
+  assert.equal(report.members_reused, 2);
+  assert.equal(report.root_published_last, true);
+});
+
+test("restore rejects conflicting reservations and unrelated or corrupt resume content", async () => {
+  for (const scenario of ["reservation", "unrelated", "member", "premature-root"]) {
+    const fixture = buildFixture();
+    const io = harness(fixture);
+    await runRestore(fixture, { io, dryRun: false });
+    const rootKey = timeseriesBindingSourceRootKey(TIMESERIES_BINDING_RESTORE_SOURCE_PREFIX);
+    if (scenario !== "premature-root") io.destinationObjects.delete(rootKey);
+    if (scenario === "reservation") io.destinationObjects.set(RESERVATION_KEY, Buffer.from("wrong reservation"));
+    if (scenario === "unrelated") io.destinationObjects.set("unrelated.txt", Buffer.from("unrelated"));
+    if (scenario === "member") io.destinationObjects.set(memberPath(12), Buffer.from("wrong member"));
+    if (scenario === "premature-root") io.destinationObjects.delete(memberPath(12));
+    io.writes.length = 0;
+    await assert.rejects(runRestore(fixture, { io, dryRun: false }), /reservation|unrelated|identity|incomplete/);
+    assert.deepEqual(io.writes, []);
+  }
+});
+
+test("restore dry-run does not reserve or inspect a destination", async () => {
+  const fixture = buildFixture();
+  const io = harness(fixture);
+  io.listDestinationObjects = () => { throw new Error("dry-run must not inspect destination"); };
+  const { report } = await runRestore(fixture, { io, dryRun: true });
+  assert.equal(report.ok, true);
+  assert.deepEqual(io.writes, []);
+});
+
+
+test("restore PUT signs create-only precondition and never retries or falls back on conflict", async () => {
+  const r2 = { endpoint: "https://account.r2.cloudflarestorage.com", bucket: "history-sandbox-timeseries-binding-restore-test",
+    region: "auto", access_key_id: "synthetic-id", secret_access_key: "synthetic-secret" };
+  const requests = [];
+  const fetchImpl = async (url, init) => {
+    requests.push({ url, init });
+    return new Response(null, { status: 412 });
+  };
+  await assert.rejects(createRestoreDestinationObject({
+    r2, key: "synthetic-object.json", body: Buffer.from("{}"), ifNoneMatch: "*", fetchImpl,
+  }), /create-only write refused/);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].init.headers["if-none-match"], "*");
+  assert.match(requests[0].init.headers.authorization, /SignedHeaders=[^,]*if-none-match/);
+  assert.equal(requests[0].init.redirect, "error");
+  await assert.rejects(createRestoreDestinationObject({ r2, key: "synthetic-object.json", body: Buffer.from("{}"), fetchImpl }), /If-None-Match/);
+  assert.equal(requests.length, 1);
+});
+
+test("resume inspection has a closed-set bound and rejects broken pagination before writes", async () => {
+  const fixture = buildFixture();
+  const io = harness(fixture);
+  await runRestore(fixture, { io, dryRun: false });
+  const originalList = io.listDestinationObjects;
+  const limits = [];
+  io.listDestinationObjects = async (options) => {
+    limits.push(options.maxKeys);
+    return originalList({ ...options, maxKeys: Math.min(2, options.maxKeys) });
+  };
+  io.writes.length = 0;
+  const { report } = await runRestore(fixture, { io, dryRun: false });
+  assert.equal(report.source_root_reused, true);
+  assert.equal(report.destination_safety.objects_inspected, 7);
+  assert.deepEqual(io.writes, []);
+  assert.equal(limits[0], 8);
+  assert.ok(limits.every((limit) => limit > 0 && limit <= 8));
+  assert.ok(limits.length <= 8);
+  assert.equal(report.destination_safety.objects_final_checked, 7);
+  io.listDestinationObjects = async () => ({ entries: [], is_truncated: true, next_token: "stuck" });
+  await assert.rejects(runRestore(fixture, { io, dryRun: false }), /Invalid bounded/);
+  assert.deepEqual(io.writes, []);
+});
+
+test("fresh reservation rejects unrelated objects that appear during admission", async () => {
+  const fixture = buildFixture();
+  const io = harness(fixture);
+  const create = io.writeDestinationObject;
+  io.writeDestinationObject = async (key, body, options) => {
+    await create(key, body, options);
+    if (key === RESERVATION_KEY) io.destinationObjects.set("unrelated.txt", Buffer.from("keep"));
+  };
+  await assert.rejects(runRestore(fixture, { io, dryRun: false }), /unrelated|reservation/);
+  assert.deepEqual(io.writes, [RESERVATION_KEY]);
+  assert.deepEqual(io.destinationObjects.get("unrelated.txt"), Buffer.from("keep"));
+});
+
+test("unrelated objects introduced during restore prevent source-root publication", async () => {
+  const fixture = buildFixture();
+  const io = harness(fixture);
+  const read = io.readDestinationObject;
+  const lastRange = timeseriesBindingSourceRangeManifestKey(TIMESERIES_BINDING_RESTORE_SOURCE_PREFIX, 1000, 1999);
+  io.readDestinationObject = async (key) => {
+    const body = await read(key);
+    if (key === lastRange) io.destinationObjects.set("unrelated.txt", Buffer.from("keep"));
+    return body;
+  };
+  await assert.rejects(runRestore(fixture, { io, dryRun: false }), /unrelated/);
+  assert.equal(io.destinationObjects.has(timeseriesBindingSourceRootKey(TIMESERIES_BINDING_RESTORE_SOURCE_PREFIX)), false);
+  assert.deepEqual(io.destinationObjects.get("unrelated.txt"), Buffer.from("keep"));
+});
+
+test("a committed write with lost acknowledgement resumes only after reservation and byte verification", async () => {
+  const fixture = buildFixture();
+  const io = harness(fixture);
+  const create = io.writeDestinationObject;
+  io.writeDestinationObject = async (key, body, options) => {
+    await create(key, body, options);
+    if (key === memberPath(12)) throw new Error("synthetic interrupted acknowledgement");
+  };
+  await assert.rejects(runRestore(fixture, { io, dryRun: false }), /interrupted acknowledgement/);
+  assert.equal(io.destinationObjects.has(timeseriesBindingSourceRootKey(TIMESERIES_BINDING_RESTORE_SOURCE_PREFIX)), false);
+  io.writeDestinationObject = create;
+  io.writes.length = 0;
+  const { report } = await runRestore(fixture, { io, dryRun: false });
+  assert.equal(report.members_reused, 2);
+  assert.equal(report.members_written, 1);
+  assert.equal(io.writes.includes(memberPath(12)), false);
+  assert.equal(report.source_root_readback_verified, true);
 });

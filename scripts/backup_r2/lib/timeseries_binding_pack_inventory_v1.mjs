@@ -1,3 +1,4 @@
+import { assertHistoryBackupDestination } from "./history_backup_targets.mjs";
 import {
   joinTargetPath,
   rcloneCat,
@@ -24,15 +25,6 @@ export const TIMESERIES_BINDING_BACKUP_MODES = Object.freeze([
   "pack",
 ]);
 export const DEFAULT_TIMESERIES_BINDING_BACKUP_MODE = "individual";
-export const NORMAL_TEST_DROPBOX_BACKUP_DESTINATION =
-  "uk_aq_dropbox:TEST/R2_history_backup";
-export const ISOLATED_TEST_PACK_BACKUP_DESTINATION =
-  "uk_aq_dropbox:TEST/R2_history_backup_pack_test";
-export const EXPERIMENTAL_PACK_ONLY_DESTINATIONS = Object.freeze([
-  NORMAL_TEST_DROPBOX_BACKUP_DESTINATION,
-  ISOLATED_TEST_PACK_BACKUP_DESTINATION,
-]);
-
 function parseJson(text, relativePath) {
   try {
     return JSON.parse(text);
@@ -57,6 +49,7 @@ export function assertExperimentalPackOnlyDestination({
   mode,
   destRoot,
   allowExperimentalPackOnly = false,
+  env = process.env,
 }) {
   const normalizedMode = normalizeTimeseriesBindingBackupMode(mode);
   if (normalizedMode !== "pack") return;
@@ -65,12 +58,7 @@ export function assertExperimentalPackOnlyDestination({
       "Pack-only timeseries binding backup requires --allow-experimental-pack-only",
     );
   }
-  const destination = String(destRoot || "").trim().replace(/\/+$/g, "");
-  if (!EXPERIMENTAL_PACK_ONLY_DESTINATIONS.includes(destination)) {
-    throw new Error(
-      `Pack-only timeseries binding backup requires an exact allowed TEST destination: ${EXPERIMENTAL_PACK_ONLY_DESTINATIONS.join(" or ")}`,
-    );
-  }
+  assertHistoryBackupDestination(destRoot, env);
 }
 
 export function buildTimeseriesBindingPackInventory({
