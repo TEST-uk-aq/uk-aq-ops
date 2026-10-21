@@ -1,174 +1,184 @@
 # Daily Task Health integration and release guide
 
-This is implementation evidence for Ops PR #119 and its linked TEST Schema PR,
-not a replacement for authoritative system documentation. The earlier Started
-idempotency blocker has been addressed in source; real database application and
-TEST operational acceptance remain separate prerequisites.
+Implementation evidence for [Ops PR #119](https://github.com/TEST-uk-aq/uk-aq-ops/pull/119)
+and [TEST Schema PR #15](https://github.com/TEST-uk-aq/uk-aq-schema/pull/15).
+Authoritative system documentation remains separate and read-only to coding agents.
+A source merge never applies SQL. Real TEST application and acceptance are pending.
 
-Ops PR: https://github.com/TEST-uk-aq/uk-aq-ops/pull/119
+## Separate optional MBPro task
 
-Schema PR: https://github.com/TEST-uk-aq/uk-aq-schema/pull/15
+The local supervisor uses `ops.r2_history_dropbox_backup_mbpro`, named
+**R2 history Dropbox backup (MacBook Pro)**, group `ops`, platform `MBPro`.
+It is active and dashboard-visible. Daily-check and email inclusion are false;
+scheduled/due times are NULL because each one-off is optional and explicitly
+initiated. It must not become a missing scheduled task or satisfy the GitHub
+backup's daily expectation. The existing GitHub task
+`ops.r2_history_dropbox_backup`, platform, schedule, history and reporting are
+unchanged. Existing local Integrity retains `ops.history_integrity` and its
+one-argument Started contract. No GitHub execution metadata is fabricated.
 
-No code may assume a source merge applied SQL.
+The package reuses `workers/shared/daily_task_health.mjs`, existing lifecycle RPCs
+and `buildHistoryBackupTaskSummary`. The GitHub-specific reporter and workflow,
+canonical v3/pack/full backup, checkpoint recovery and global lock are unchanged.
 
-## Existing implementation and contract
-
-`workers/shared/daily_task_health.mjs` supplies the lifecycle client. Its new
-optional explicit identity, immutable event timestamps, injected transport and
-per-request timeout are used by the local supervisor. Existing callers retain
-their defaults. The GitHub-specific `scripts/report_daily_task_health.mjs` and
-workflow are unchanged. `buildHistoryBackupTaskSummary` is reused for timings and
-observation-copy details; authoritative backup acceptance remains in reports.mjs.
-
-Local Integrity already uses the same `uk_aq_public` Started/Finished/Failed and
-recompute RPCs, with `OBS_AQIDB_SUPABASE_URL`/`OBS_AQIDB_SECRET_KEY`, genuine
-local source/run identity and optional launchd metadata. Its non-restarting
-one-off wrapper and process-local returned UUID did not provide the stronger
-lost-start-response/reboot recovery required by this backup. Its insert-style
-`report_final` fallback is not used here.
-
-## Canonical non-GitHub Started identity
+## Caller UUID instead of another identity column
 
 Canonical owner:
 `TEST-uk-aq/uk-aq-schema:schemas/obs_aqi_db/uk_aq_daily_task_health_schema.sql`.
-Existing-database transition:
+The existing unapplied PR migration is rewritten in place:
 `schemas/migrations/20261021_003_obs_aqidb_daily_task_started_execution_identity.sql`.
-The previously applied GitHub-idempotency migration is unchanged.
-
-The existing function now has signature:
+Previously applied migrations, including GitHub idempotency, are untouched.
 
 ```text
-uk_aq_public.uk_aq_rpc_daily_task_started(
-  p jsonb,
-  p_execution_identity jsonb DEFAULT NULL
-) RETURNS uuid
+uk_aq_public.uk_aq_rpc_daily_task_started(p jsonb, p_run_id uuid DEFAULT NULL)
+RETURNS uuid
 ```
 
-Existing one-argument callers use the NULL default and retain the exact GitHub
-`(task_key, source_repo, platform_run_id, summary.github_run_attempt)` contract,
-including the legacy insert behaviour for incomplete identities. No GitHub fields
-are manufactured for local runs. A local request sends a separate top-level
-`p_execution_identity` argument, so an old server cannot silently ignore a nested
-field and insert an unprotected row: it rejects the unmatched RPC signature first.
+One durable operation UUID becomes the existing `daily_task_runs.id` and remains
+`platform_run_id`. The supervisor saves it, the configuration fingerprint and
+exact Started payload before requesting Started. The shared client forwards its
+optional `run_id` input as top-level `p_run_id`; old callers omit it. An unmigrated
+PostgREST server rejects this argument before mutation. Never fall back by dropping
+it or by synthesising GitHub fields.
 
-The optional identity is exactly `{key, fingerprint}`: a nonempty bounded string
-key and a 64-character lowercase SHA-256 configuration fingerprint. The local key
-is `launchd:<environment>:<operation UUID>`. Source repo, source worker, platform
-run ID, original scheduled-for date and start timestamp must all be supplied.
-Mixing this identity with a GitHub attempt is rejected. The JSON is stored in one
-nullable column on the existing `daily_task_runs` table, with a partial unique
-index on `(source_repo, execution_identity->>'key')`. No alternative table, service,
-RPC family or task definition is introduced.
+The primary key supplies uniqueness and a global UUID transaction lock serialises
+creation/lookup across even conflicting task/repository claims. Matching replay
+returns the same UUID after a committed-but-lost response, concurrent Started,
+Finished or Failed. It never updates/reopens the factual row. Replay checks task,
+source repo/worker, platform run ID, scheduled date, original Started timestamp and
+any explicitly supplied attempt against existing columns. Explicit source/date/
+start values are required; combining UUID and GitHub attempt identity is refused.
+Task/date allocation is serialised for new runs. Terminal summary replacement
+cannot erase the source/time/attempt columns used for identity.
 
-A transaction advisory lock serialises each repo/key. Replay returns its existing
-UUID, including after Finished/Failed, without replacing the row or summary.
-Changed identity JSON, task, worker, platform run, date/start time or explicitly
-conflicting attempt fails. Terminal RPCs replace summaries as before, but do not
-replace the durable identity column. A task/date allocation lock also prevents
-concurrent new executions from selecting the same date-level attempt number.
-Different source repos have independent key namespaces.
+This removes the proposed execution_identity JSONB column, constraint and unique
+index from desired state and the unapplied migration. No new table or index is
+needed. The configuration fingerprint still protects local source/target identity;
+credentials may rotate without changing it, while target changes fail closed.
 
-## Durable local obligations
+Without the optional UUID, the existing GitHub task/repo/platform-run/attempt
+contract, distinct GitHub attempts and incomplete-identity insert semantics remain.
+Local Integrity is unchanged. The new task registration follows existing manual
+IFW conventions and does not rewrite the GitHub definition or health history.
 
-The operation's `health` record pins the exact source/identity/Started input before
-sending it and saves the returned UUID. A committed-but-lost response is recovered
-by replaying that identity. Health stages consume a durable bounded request budget
-before the request, so crashes cannot reset the breaker. Successful stage progress
-resets only that phase's budget. Automatic backup retries keep the same health run.
+## Durable local obligations and existing recomputation fix
 
-`successful_completion` and accepted reports describe the actual backup. The
-separate health terminal payload/confirmation describes reporting. Accepted JSON
-can recover a crash before active.json publication, after the exact reports and
-locked receipt are revalidated. Terminal payloads pin factual timestamps, the
-original UTC date, source metadata and accepted report identity. Repeated Finished,
-Failed or recompute only repairs that obligation; it never enters the backup
-boundary after acceptance. No stale operation may supply another one's terminal
-identity or report identity. Credential rotation does not change the fingerprint;
-source/health-target changes fail closed for the current operation.
+The health record is version 2. It pins the operation UUID, configuration identity,
+original UTC date/start time, MBPro provenance and exact input before Started.
+Only a response equal to the operation UUID confirms Started; response/local-save
+loss replays that UUID. Request budgets are saved before each request and retain
+bounded retries/backoff across restart. Successful phases reset only their budget.
+Automatic backup retries retain the same health run. An explicit `new` creates a
+fresh operation UUID; a terminal Failed run cannot be reopened by `retry`.
 
-Permanent backup failure, exhausted backup budget and deliberate cancellation
-produce terminal Failed. Reporting outage alone does not replace backup success
-with failure. A recoverable automatic interruption leaves the health run Started.
-After terminal Failed confirmation, `new --operation <previous UUID>` explicitly
-creates a different one-off; `retry` cannot reopen the factual failed run. New
-operations cannot discard unresolved reporting obligations. Stop/uninstall retain
-them; reconcile through the agent after review/reinstallation where necessary.
+Old unreleased version-1 health records are refused for review. Retain their
+accepted-backup and reporting evidence; reconcile any prior task/server revision
+rather than silently reassigning an existing factual run or deleting completion.
 
-## Required release order and manual TEST apply
+`successful_completion`/accepted reports and health delivery remain separate durable
+facts. A zero locked exit and validated reports become durable before Finished is
+queued. The exact terminal input keeps original timestamps, provenance, scheduled
+date and report identity. A crash between accepted.json and active.json is recovered
+by revalidating that invocation's reports/hashes/lock receipt. Reporting outage
+cannot clear successful backup evidence or invoke the accepted backup again.
 
-1. Review both PRs and merge the TEST Schema source first (separate human action).
-2. Apply the new migration to **TEST ObsAQIDB**, using its approved service-role
-   administrative connection, then verify the schema and PostgREST cache. Example
-   from the merged Schema checkout, using an already protected libpq service:
+The existing **acbe964** recomputation fix is preserved. The client suppresses only
+automatic terminal recomputation; its explicit recompute remains enabled. Terminal
+confirmation is saved before the real `uk_aq_rpc_recompute_daily_task_status` call
+for the original scheduled-for UTC date. Recompute becomes confirmed only after a
+successful RPC response. Failed/lost responses retain that separate obligation;
+recovery retries only outstanding health, never the accepted backup or an already
+confirmed terminal update. Full operational confirmation still requires both.
+Shared-client defaults and the pre-existing global recompute-disable switch retain
+their behaviour. Normal local health traffic remains three RPCs per operation plus
+bounded recovery requests, without polling or extra automatic recomputation.
+
+Backup failure/exhaustion/cancellation queues factual Failed. A recoverable backup
+interruption leaves Started. Reporting outage alone never replaces backup success
+with Failed. Stop/uninstall retain unresolved health, which blocks discarding the
+operation. Reconcile through the agent after review/reinstallation where necessary.
+
+## TEST release order and manual apply
+
+1. Review both PRs and merge TEST Schema source first through a separately
+   authorised action. Confirm the earlier unmerged JSONB migration was not applied.
+2. Apply the rewritten migration to **TEST ObsAQIDB** via its approved protected
+   administrative connection, never the IngestDB/global-lock URL:
 
    ```bash
    PGSERVICE=REPLACE_WITH_APPROVED_TEST_OBSAQIDB_SERVICE psql -X -v ON_ERROR_STOP=1 \
      -f schemas/migrations/20261021_003_obs_aqidb_daily_task_started_execution_identity.sql
    ```
 
-   Never use the IngestDB/global-lock URL for this apply. The transaction includes
-   a PostgREST schema reload notification. Read-only verification should confirm
-   the two-argument Started signature with its NULL default, the nullable
-   `execution_identity` JSONB column, its validation constraint and partial unique
-   index, and service-role-only execute privileges. Inspect these exact catalog
-   objects rather than inferring application from a Git merge. No SQL was executed
-   against TEST/LIVE during implementation.
-3. Merge Ops PR #119, install dependencies and the idle agent from its stable
-   merged checkout, and fill both independently reviewed lock/ObsAQIDB pins and
-   protected credentials. Do not start with an old one-argument server; rejection
-   must be treated as an unapplied prerequisite, never a reason to drop identity.
-4. Pause schedules through normal operator controls, initiate actual authorised
-   TEST work and perform the acceptance steps in README.md. Verify a single health
-   UUID after restart/ambiguous response, immutable dates/times and report-only
-   recovery after accepted backup completion. Restoring schedules, migration
-   application, installation and real execution are not performed by these PRs.
+   Verify one defaulted `(jsonb, uuid)` Started signature, service-role-only execute,
+   existing UUID primary key, no additional identity column/index and the MBPro
+   definition flags above. Verify the GitHub definition is unchanged. The Schema
+   [review/apply guide](https://github.com/TEST-uk-aq/uk-aq-schema/blob/codex/local-daily-task-started-identity/schemas/obs_aqi_db/README.daily_task_execution_identity.md)
+   supplies exact read-only catalogue queries. The transaction notifies PostgREST
+   to reload its schema; stale/unmigrated REST must reject safely. If an earlier
+   PR revision was applied, stop for a separately reviewed transition.
+3. Merge Ops and install dependencies plus the idle agent from a stable merged
+   checkout using the exact Mac installation/status commands in README.md.
+   Configure protected TEST-only R2/Dropbox, lock and independently pinned ObsAQIDB
+   credentials. The REST settings are never inherited or inferred from the lock
+   database, and health credentials never enter backup children. No new shared
+   environment variable or env-sync target is introduced. LIVE remains inactive.
+4. Through normal operator controls pause competing schedules, then initiate only
+   authorised real TEST work. Verify the REST cache by the successful new argument,
+   one UUID across restart/response loss, immutable dates/times, MBPro dashboard
+   visibility and daily/email exclusion. Complete README acceptance, including
+   accepted-backup/report-only recovery and actual recompute confirmation. Restore
+   paused schedules after accepted completion. No merge, apply, installation or
+   execution is performed as part of these source changes.
 
-## Focused verification evidence
+## Focused validation
 
-The isolated PostgreSQL check runs the canonical owner and new migration using a
-local Unix socket only. It exercises concurrent independent sessions, a discarded
-committed Started response, Finished/Failed replay, conflicting identity reuse,
-legacy one-argument GitHub calls and legacy incomplete-identity insert semantics.
-It accepts a local binary directory, never a remote database URL or TEST secrets:
+Schema check (disposable PostgreSQL 16.2, isolated Unix socket, no TCP or remote
+connection/credentials; stopped and removed afterwards):
 
 ```bash
 python3 tests/check_daily_task_started_execution_identity.py --pg-bin /absolute/local/postgresql/bin
 ```
 
-The binary used for implementation verification was disposable PostgreSQL 16.2.
-Its built-in gen_random_uuid supplies UUIDs; only the unavailable optional pgcrypto
-extension packaging declaration is skipped in that isolated clean bootstrap.
-The actual canonical function/migration SQL is executed unchanged. The server is
-stopped and its temporary database removed after the check.
+It checks canonical SQL, upgrade from the applied GitHub function, reapplication,
+concurrent identical/conflicting UUID claims, discarded committed response,
+Finished/Failed replay, every identity field, legacy GitHub/Integrity callers and
+MBPro flags/daily-check exclusion. Only the optional pgcrypto packaging declaration
+is skipped in the isolated bootstrap; the actual function/migration runs unchanged.
+Directly relevant GitHub structural checks compare canonical/new migration SQL.
 
-Ops `tests/local_history_backup_health.test.mjs` exercises the same supervisor
-backup/report boundary with a previously accepted backup. A terminal response loss
-and then recompute outage are persisted/reloaded; backup calls remain zero, event
-payload/date/time stay identical, and stale identity is rejected. It also checks
-shared-client optional-argument and timestamp forwarding. Existing Daily Task
-Health deterministic checks remain applicable. These are targeted boundary checks,
-not a speculative functional suite. Real TEST/launchd/REST acceptance is pending.
+Ops `tests/local_history_backup_health.test.mjs` retains the accepted-backup/terminal
+response-loss check and acbe964 real-client recompute check. The latter sends a
+real shared-client request through injected fetch, persists HTTP 503 and lost
+response failures, then confirms only on success, with zero backup calls and no
+repeated Finished. Identity fixtures now use operation UUID = run UUID. A focused
+real-client Started check rehydrates state after response loss and proves exact
+UUID/date/time replay. Optional-argument/timestamp and legacy-argument forwarding
+remain checked. Existing Daily Task Health checks plus syntax/whitespace checks
+complete bounded pre-deployment validation. Real REST/launchd acceptance is pending.
 
-## Rollback, LIVE and Chat-mode handover
+## Rollback, future LIVE scope and system-doc handover
 
-Runtime rollback stops this agent and retains evidence, including pending health.
-The additive database identity support is backward compatible with old callers;
-leave it in place when rolling back the local runtime. Do not delete health rows,
-identity evidence or remote backup checkpoints. A SQL signature downgrade would
-prevent pending local identity replays and requires a separately reviewed plan.
+Stop the agent on runtime rollback and retain all accepted-backup and pending-health
+records. Leave the backward-compatible UUID SQL and MBPro definition in place;
+never delete factual runs/checkpoints or remap a pending MBPro run to GitHub. SQL
+signature downgrade or older local-state rollback needs reviewed reconciliation.
 
-Future LIVE promotion requires the complete identical Ops file list in README.md,
-this canonical owner and the new migration, accepted matching canonical backup
-code and separate LIVE configuration. Promote validation sources where required
-for review; exclude TEST archives and runtime/credential files. Apply/verify the
-LIVE ObsAQIDB contract separately before runtime activation, under future explicit
-authorisation. No LIVE repository was inspected or modified.
+After real TEST acceptance and separate explicit LIVE authorisation, promote the
+complete identical application/dependency list in README.md, this canonical schema
+owner and rewritten migration. Include validation sources for review; exclude TEST
+archives and runtime/credential files. Independently apply/verify LIVE ObsAQIDB and
+REST cache before runtime, review protected LIVE health/lock/R2/Dropbox identities,
+use LIVE/config and explicitly authorise activation. Source promotion does not
+apply SQL or activate an agent. No LIVE repository was inspected or changed.
 
-Authoritative system-doc handover for Chat mode: add optional non-GitHub Started
-identity/replay semantics, key scope/conflict rules, optional RPC argument and
-release/database-cache prerequisites to the task-health contract; document this
-backup's durable Started/Finished/Failed lifecycle, separate accepted-backup and
-reporting obligations, strict status meanings and explicit new-operation recovery
-after Failed. Preserve GitHub identity/timeout behaviour, existing dashboard
-statuses, canonical backup/global-lock/checkpoint authority and low-log bounds.
-No authoritative system_docs files were changed.
+Authoritative system-doc handover for Chat mode: record the optional MBPro task,
+dashboard/daily/email flags, UUID-primary-key Started argument/replay/conflict rules,
+unchanged GitHub/Integrity semantics, original dates/timestamps and durable terminal/
+recompute obligations independent of backup acceptance. Include the acbe964
+confirmation guarantees, version-1 review boundary, release/cache prerequisites and
+real TEST evidence when available. Preserve global-lock/checkpoint, dashboard-status
+and low-log authority. The owning backup contract is
+`system_docs/backup_and_recovery/r2_history_dropbox_backup_contract.md`; add the
+optional local lifecycle there and route it from that area's README as needed.
+No authoritative system_docs files were edited.

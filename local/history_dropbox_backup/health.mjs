@@ -6,14 +6,13 @@ import path from "node:path";
 import fs from "node:fs";
 import { acceptReports } from "./reports.mjs";
 
-export const TASK_KEY = "ops.r2_history_dropbox_backup";
+export const TASK_KEY = "ops.r2_history_dropbox_backup_mbpro";
 export function initialiseHealth(state, c, p) {
   if (state.health) return;
   requireSafe(!state.successful_completion, "legacy_completed_health_review");
   state.started_at ??= now();
   state.health = {
-    version: 1, operation_id: state.operation_id,
-    identity: { key: `launchd:${p.environment}:${state.operation_id}`, fingerprint: c.fingerprint },
+    version: 2, operation_id: state.operation_id, configuration_identity: c.fingerprint,
     input: { task_key: TASK_KEY, source_repo: "uk-aq-ops",
       source_worker: "local/history_dropbox_backup/supervisor.mjs", platform_run_id: state.operation_id,
       scheduled_for_date: state.started_at.slice(0, 10), started_at: state.started_at,
@@ -75,10 +74,16 @@ export function reviewHealth(state) {
 }
 export async function deliverHealth(state, c, save, options = {}) {
   const h = state.health;
-  requireSafe(h?.operation_id === state.operation_id && h.identity.fingerprint === state.configuration_identity
+  requireSafe(h?.version === 2 && h.operation_id === state.operation_id
+    && h.configuration_identity === state.configuration_identity
+    && h.input.task_key === TASK_KEY && h.input.platform_run_id === state.operation_id
+    && h.input.started_at === state.started_at && h.input.scheduled_for_date === state.started_at.slice(0, 10)
+    && (!h.run_id || h.run_id === state.operation_id)
     && c.fingerprint === state.configuration_identity,
     "health_operation_identity");
-  if (h.terminal) requireSafe(h.terminal.input.platform_run_id === state.operation_id
+  if (h.terminal) requireSafe(h.terminal.input.task_key === TASK_KEY
+    && h.terminal.input.started_at === h.input.started_at
+    && h.terminal.input.platform_run_id === state.operation_id
     && h.terminal.input.scheduled_for_date === h.input.scheduled_for_date
     && h.terminal.input.source_repo === h.input.source_repo
     && h.terminal.input.source_worker === h.input.source_worker
@@ -102,8 +107,8 @@ export async function deliverHealth(state, c, save, options = {}) {
     h.attempts += 1; h.attempts_since_review += 1; save(); // A crash consumes its request budget.
     try {
       if (!h.run_id) {
-        const id = await client.dailyTaskStarted({ ...h.input, execution_identity: h.identity });
-        requireSafe(typeof id === "string" && /^[a-f0-9-]{36}$/i.test(id), "health_response_invalid");
+        const id = await client.dailyTaskStarted({ ...h.input, run_id: h.operation_id });
+        requireSafe(id === h.operation_id, "health_response_invalid");
         h.run_id = id;
       } else if (h.terminal && !h.terminal_confirmed) {
         if (h.terminal.kind === "finished") await client.dailyTaskFinished(h.run_id, h.terminal.input);

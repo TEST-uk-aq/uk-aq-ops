@@ -281,7 +281,7 @@ export function createDailyTaskHealthClient(options = {}) {
     const runId = await rpc("uk_aq_rpc_daily_task_started", {
       p: payload,
       // A separate RPC argument fails before mutation against the old one-arg RPC.
-      ...(input.execution_identity ? { p_execution_identity: input.execution_identity } : {}),
+      ...(input.run_id !== undefined ? { p_run_id: input.run_id } : {}),
     });
     return typeof runId === "string" ? runId : null;
   }

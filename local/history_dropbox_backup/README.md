@@ -43,8 +43,12 @@ so death of this local parent tears down the protected process tree.
 
 The package reuses `workers/shared/daily_task_health.mjs` and the existing
 `uk_aq_public` Started, Finished, Failed and recompute RPCs, with task key
-`ops.r2_history_dropbox_backup`. The existing GitHub workflow, task definition,
-dashboard statuses, 345-minute timeout and scheduled configuration are unchanged.
+`ops.r2_history_dropbox_backup_mbpro`, named **R2 history Dropbox backup (MacBook
+Pro)** with platform `MBPro`. This separate active task is dashboard-visible, but
+excluded from daily missing-task checks and email because each backup is optional
+and explicitly initiated; it has no scheduled/due time. The scheduled GitHub task
+`ops.r2_history_dropbox_backup`, its history, workflow, 345-minute timeout and
+configuration are unchanged.
 The established local Integrity reporting path uses the same RPCs and local
 provenance, but did not provide this package's durable lost-response recovery.
 
@@ -55,10 +59,16 @@ launchd label/domain. Before initial reporting the supervisor verifies that the
 registered job PID is its own. No GitHub run IDs, workflow names or URLs are
 fabricated, and no credential/log-file paths are sent in the health summary.
 
-Before any backup attempt, the supervisor atomically saves the local identity
-key/fingerprint, original UTC start time/date and exact Started payload, then
-confirms the Started UUID. The new optional RPC argument enables safe replay if
-the server committed but its response/local save was lost. All automatic backup
+Before any backup attempt, the supervisor atomically saves the operation UUID,
+configuration fingerprint, original UTC start time/date and exact Started payload,
+then sends that UUID through the explicit `p_run_id` RPC argument. The existing
+`daily_task_runs.id` primary key supplies uniqueness; no extra identity column or
+index is needed. Concurrent/repeated requests return that same UUID, including
+after Finished/Failed, without reopening the run. Conflicting task/source/worker/
+platform/date/start/explicit-attempt reuse is rejected. An unmigrated server must
+reject the new argument before insertion. The saved run UUID is accepted only if
+it equals the operation UUID, so a committed response/local-save loss is recovered
+by exact replay. All automatic backup
 attempts remain within this health run. Network/process interruption that remains
 eligible for backup retry does not report terminal Failed.
 
@@ -96,6 +106,11 @@ health run. After Failed is confirmed, recovery requires explicit `new` with the
 previous UUID. That new one-off can reuse canonical authenticated Dropbox
 checkpoints; it does not discard remote progress. A temporary Started-reporting
 outage before backup can be reviewed and retried using the same operation.
+
+The health record is version 2. Earlier unreleased version-1 records are refused
+for review: preserve their evidence and reconcile the prior task/server revision
+before changing versions. Never silently reassign an existing run to the new task
+or erase an accepted backup to repair health reporting.
 
 ## Protected TEST configuration
 
@@ -250,7 +265,9 @@ automatic evidence deletion or log rotation is introduced.
    and PostgREST schema refresh; confirm approved configuration, permissions,
    source generation and writer/scheduler gates. Install idle; no backup should start.
 2. Initiate a real authorised one-off. Confirm exactly one Started row for the
-   existing task key, genuine local provenance, original UTC date and saved UUID;
+   MBPro task key, genuine local provenance, original UTC date and run UUID equal
+   to the saved operation UUID. Verify dashboard visibility and exclusion from
+   daily missing-task/email expectations; the GitHub task must remain unchanged;
    inspect normal lock diagnostics and 15-second elapsed-time heartbeats.
 3. During justified TEST work, observe interruption/network loss/reboot and login.
    Confirm the same health UUID and authenticated checkpoint resume, no unlocked
@@ -267,8 +284,9 @@ automatic evidence deletion or log rotation is introduced.
    the protected process is gone and the operator accepts completion.
 
 Pre-deployment checks are documented in the linked integration guide: syntax,
-JSON/plist/whitespace, existing relevant checks and only the two focused identity
-and accepted-backup reporting boundary checks. No real RPC, migration, backup or
+JSON/plist/whitespace, existing relevant checks and focused UUID recovery,
+accepted-backup reporting and real-client recompute boundary checks. No real RPC,
+migration, backup or
 launchd installation was performed during implementation. Rollback stops/uninstalls
 only this agent and retains all evidence; settle pending health first where
 possible. Restore only operator-paused schedules. Existing normal backup execution

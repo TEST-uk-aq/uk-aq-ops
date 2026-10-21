@@ -177,9 +177,10 @@ export function active(p) {
     && /^[a-f0-9]{64}$/.test(s.last_accepted_report?.report_identity)
     && s.successful_completion.report_identity === s.last_accepted_report.report_identity
     && Number.isFinite(Date.parse(s.completed_at)), "completion_marker_invalid");
-  if (s?.health) requireSafe(s.health.version === 1 && s.health.operation_id === s.operation_id
-    && s.health.identity?.key === `launchd:${p.environment}:${s.operation_id}`
-    && s.health.identity.fingerprint === s.configuration_identity
+  if (s?.health) requireSafe(s.health.version === 2 && s.health.operation_id === s.operation_id
+    && s.health.configuration_identity === s.configuration_identity
+    && s.health.input?.task_key === "ops.r2_history_dropbox_backup_mbpro"
+    && (!s.health.run_id || s.health.run_id === s.operation_id)
     && s.health.input?.platform_run_id === s.operation_id
     && s.health.input.started_at === s.started_at
     && s.health.input.scheduled_for_date === s.started_at.slice(0, 10)
