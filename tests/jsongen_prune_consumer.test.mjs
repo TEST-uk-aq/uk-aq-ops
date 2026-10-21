@@ -82,7 +82,7 @@ test('independent compressed original authority yields eight strict 128-scope re
       .reduce((a, c) => ({ P: a.P + c.P, R: a.R + c.R, null: a.null + c.null }), { P: 0, R: 0, null: 0 }),
     { P: 684, R: 682, null: 682 });
     const result = await consumePruneAcceptance({ reader, key, derivedR2: f.r2 });
-    assert.equal(result.state, 'authenticated'); assert.equal(result.receipt_eligible, true);
+    assert.equal(result.state, 'authenticated_read_only'); assert.equal(result.receipt_eligible, false);
     assert.equal(result.registration, 'not_attempted'); assert.equal(result.handover_complete, false);
     assert.deepEqual(result.missing_authority, []);
     assert.equal(inspectAuthenticatedPruneHandover(proof).result.publication_eligible, false);

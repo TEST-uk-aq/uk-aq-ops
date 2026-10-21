@@ -18,6 +18,7 @@ export async function readImmutable({ r2, reference, maxBytes, budget, domain = 
   evidence(reference.bucket === r2.bucket && reference.byte_size <= maxBytes && reference.byte_size <= budget.remainingBytes(), 'invalid_object_identity', 'object bucket/size admission failed');
   budget.get(domain);
   const stored = await r2GetObjectBounded({ r2, key: reference.key, max_bytes: reference.byte_size, timeout_ms: budget.timeout() });
+  budget.transfer?.(domain, stored.bytes);
   budget.bytes(domain, stored.bytes);
   evidence(stored.bytes === reference.byte_size && sha256Hex(stored.body) === reference.sha256,
     'invalid_object_identity', `exact byte length or SHA-256 mismatch: ${reference.key}`);

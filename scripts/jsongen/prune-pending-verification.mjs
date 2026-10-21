@@ -16,6 +16,13 @@ export function verifiedPrunePendingRows(verification) {
   return structuredClone(verifiedRows.get(verification));
 }
 
+// Share frozen authenticated rows within this invocation without cloning the
+// unsupported observations into every planner/partition. No raw row is reported.
+export function* iterateVerifiedPrunePendingRows(verification) {
+  evidence(verifiedRows.has(verification), 'unverified_pending_source', 'Independent private pending readback required');
+  yield* verifiedRows.get(verification);
+}
+
 export async function verifyPrunePendingSource({ r2, reference, intentId, runId, dayUtc,
   connectorId, expectedRowCount, sourceIdentity, expectedEvidenceSha256 = null,
   budget = createBudget() }) {
@@ -81,6 +88,6 @@ export async function verifyPrunePendingSource({ r2, reference, intentId, runId,
     'invalid_object_identity', 'pending source evidence declaration differs from stored bytes');
   const result = freeze({ state: 'source_bytes_verified', intent_id: intentId, source: reference,
     pending_evidence: pendingEvidence, evidence_sha256: evidenceSha256 });
-  verifiedRows.set(result, rows);
+  verifiedRows.set(result, freeze(rows));
   return result;
 }

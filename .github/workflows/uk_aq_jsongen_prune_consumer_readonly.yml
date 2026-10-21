@@ -137,7 +137,7 @@ jobs:
           stderr_file="$report_dir/consumer.stderr"
           exit_file="$report_dir/consumer.exit"
           set +e
-          timeout --kill-after=5s 90s node scripts/jsongen/prune-consumer.mjs \
+          timeout --kill-after=5s 150s node scripts/jsongen/prune-consumer.mjs \
             --execute-read-only \
             --discover "$INPUT_DISCOVERY_MODE" \
             --from "$INPUT_WINDOW_START_UTC" \
@@ -182,6 +182,10 @@ jobs:
             } catch { return null; }
           };
           const report = parseJsonFile(reportPath);
+          let readOnlySuccess = () => false;
+          try {
+            ({ isReadOnlyPruneSuccess: readOnlySuccess } = await import('./scripts/jsongen/prune-consumer-outcome.mjs'));
+          } catch { /* Setup/import failure cannot establish success. Still write the safe summary. */ }
           const preflightFailure = safeCode(readText(path.join(dir, 'preflight-failure.txt')).trim());
           const missingConfig = readText(path.join(dir, 'missing-config.txt')).split(/\r?\n/)
             .filter(name => /^[A-Z0-9_]{1,100}$/.test(name));
@@ -227,7 +231,7 @@ jobs:
                 '- Handover result: **no event authenticated; this is not a successful handover**.'
               );
             } else {
-              const authenticated = results.filter(result => result?.state === 'authenticated');
+              const authenticated = results.filter(readOnlySuccess);
               const pendingVerified = results.filter(result => result?.pending_source === 'source_bytes_verified');
               const resultCodes = results.map(result => result?.reason).filter(Boolean).map(safeCode);
               const evidenceCodes = [...new Set(resultCodes.filter(code =>
@@ -242,7 +246,19 @@ jobs:
                 `- Operational errors: ${operationalCodes.length ? operationalCodes.join(', ') : 'none reported by the consumer'}.`
               );
               if (authenticated.length) {
-                lines.push('- Read-only boundary: authentication only; no VERIFIED receipt was retained, no control was initialized or registered, and publication remains ineligible.');
+                lines.push('- Read-only boundary: complete original authentication and selected coverage planned in memory; no descriptor/VERIFIED receipt was retained, no control was initialized or registered, and publication remains ineligible.');
+                for (const result of authenticated) {
+                  const c = result.coverage, m = result.metrics;
+                  const count = value => Number.isFinite(value) && value >= 0 ? value : 'unavailable';
+                  lines.push(
+                    `- Original coverage: ${count(c.original.pollutant_count)} pollutants / ${count(c.original.scope_count)} scopes / ${count(c.original.observation_count)} rows.`,
+                    `- Selected coverage: ${count(c.selected.scope_count)} scopes / ${count(c.selected.observation_count)} rows; unsupported: ${count(c.unsupported.scope_count)} scopes / ${count(c.unsupported.observation_count)} rows.`,
+                    `- Plan: ${safeCode(c.state)}; ${count(c.partitions.partition_count)} selected partitions; descriptor preview ${count(c.descriptor_preview.byte_size)} bytes (unretained).`,
+                    `- Authentication elapsed: ${count(m.authentication_elapsed_ms)} ms; processing elapsed: ${count(m.elapsed_ms)} ms; CPU user/system: ${count(m.cpu_user_ms)}/${count(m.cpu_system_ms)} ms.`,
+                    `- Sampled heap high-water: ${count(m.sampled_peak_heap_used_bytes)} bytes (not an exact peak); process-lifetime RSS high-water: ${count(m.process_max_rss_bytes)} bytes.`,
+                    `- Private R2: ${count(m.private_r2_get_attempts)} GET attempts; ${count(m.private_r2_response_body_bytes)} response-body bytes; charged row budget: ${count(result.resources.rows)}.`,
+                  );
+                }
               } else {
                 lines.push(`- Event result: reconciliation required; reason code(s): ${resultCodes.length ? [...new Set(resultCodes)].join(', ') : 'not supplied'}.`);
               }
@@ -313,5 +329,23 @@ jobs:
             printf 'Consumer exit status %s preserved; incomplete/reconciliation-required is not success.\n' "$consumer_exit" >&2
             exit "$consumer_exit"
           fi
-          echo 'Unexpected zero exit from a read-only discovery invocation; review the report before treating it as complete.' >&2
-          exit 1
+          # Zero process exit alone is insufficient. Revalidate the bounded
+          # event-to-discovery and complete coverage proof before job success.
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { assertReadOnlyPruneReport } from './scripts/jsongen/prune-consumer-outcome.mjs';
+          const filename = path.join(process.env.RUNNER_TEMP, 'uk-aq-jsongen-prune-consumer/report.json');
+          try {
+            const stat = fs.statSync(filename);
+            if (!stat.isFile() || stat.size > 4 * 1024 ** 2) throw new Error('bounded_report_required');
+            const report = JSON.parse(fs.readFileSync(filename, 'utf8'));
+            assertReadOnlyPruneReport(report);
+            if (report.kind !== 'uk_aq_jsongen_prune_consumer_discovery'
+              || report.results.length !== 1) throw new Error('one_discovered_event_required');
+            console.log('Complete read-only original authentication and selected planning validated; all durable/publication actions remain unattempted.');
+          } catch {
+            console.error('Zero consumer exit lacks a valid completed read-only coverage report; failing closed.');
+            process.exitCode = 1;
+          }
+          NODE
