@@ -1,7 +1,7 @@
 // Deterministic authenticated complete-scope bundles, before durable retention.
 import { gzipSync } from 'node:zlib';
-import { verifiedPrunePendingRows } from './prune-pending-verification.mjs';
-import { inspectAuthenticatedPruneHandover } from './prune-consumer-authentication.mjs';
+import { iterateVerifiedPrunePendingRows } from './prune-pending-verification.mjs';
+import { inspectAuthenticatedPruneHandover, assertPruneReceiptScopeEligibility } from './prune-consumer-authentication.mjs';
 import { BUCKET, ROOT, assertIdentity, assertBundleRecord, canonicalJson, same } from './schema.mjs';
 import { prunePhysicalKey } from './prune-original-authority.mjs';
 import { LIMITS, createBudget, evidence, freeze } from './limits.mjs';
@@ -16,15 +16,31 @@ export function prunePartitionArtifacts(plan) {
 
 export function planPruneScopePartitions({ handover, budget = createBudget() }) {
   const proof = inspectAuthenticatedPruneHandover(handover);
+  // The existing schema-2 retention path still requires a whole original event.
+  assertPruneReceiptScopeEligibility(proof.pending.pending_evidence);
+  return planPartitions({ handover, budget });
+}
+
+// Read-only selected planning never grants access to retained bundle artifacts.
+export function planPruneSelectedPartitions({ handover, budget, coverage }) {
+  return planPartitions({ handover, budget, coverage });
+}
+
+function planPartitions({ handover, budget, coverage = null }) {
+  const proof = inspectAuthenticatedPruneHandover(handover);
   const { result, pending } = proof;
-  const rows = verifiedPrunePendingRows(pending);
-  const expected = pending.pending_evidence.scope.physical_timeseries_days;
+  const original = pending.pending_evidence.scope.physical_timeseries_days;
+  const expected = coverage ? original.filter(s => ['pm25', 'pm10', 'no2'].includes(s.pollutant_code)) : original;
+  const known = new Set(original.map(physicalKey));
+  const rowCount = expected.reduce((n, s) => n + s.row_count, 0);
   const grouped = new Map(expected.map(scope => [physicalKey(scope), { scope, rows: [] }]));
   evidence(grouped.size === expected.length, 'incomplete_partition_coverage', 'Duplicate declared physical scope');
-  for (const row of rows) {
+  for (const row of iterateVerifiedPrunePendingRows(pending)) {
     budget.check();
-    const group = grouped.get(physicalKey({ ...row, day_utc: result.key.day_utc }));
-    evidence(group, 'incomplete_partition_coverage', 'Source row has no original declared scope');
+    const key = physicalKey({ ...row, day_utc: result.key.day_utc });
+    evidence(known.has(key), 'incomplete_partition_coverage', 'Source row has no original declared scope');
+    const group = grouped.get(key);
+    if (!group && coverage) continue;
     // Same original timestamps, IEEE-754 values, multiplicity and P/R/null.
     // Provider source status is explicitly unavailable in the authenticated
     // source evidence; null makes no original-provider status assertion.
@@ -72,8 +88,10 @@ export function planPruneScopePartitions({ handover, budget = createBudget() }) 
     const scopes = records.map(record => ({ ...record.scope, record_sha256: sha256Hex(record.body) }));
     const binding = { event_id: result.event_id, original_final_evidence_sha256: proof.original_evidence_sha256,
       original_post_commit_reference_sha256: proof.post_commit_reference_sha256,
-      pending_source: pending.source, original_scope_count: expected.length,
-      original_observation_count: rows.length, scopes };
+      pending_source: pending.source, original_scope_count: original.length,
+      original_observation_count: pending.pending_evidence.original_ndjson.row_count, scopes,
+      ...(coverage ? { planning_contract: coverage.contract, policy: coverage.policy,
+        original_coverage_sha256: coverage.original, selected_coverage_sha256: coverage.selected } : {}) };
     const id = sha256Hex(canonicalJson(binding));
     partitions.push({ partition_id: id, change_id: `prune:${id}`, binding,
       scope_count: records.length, row_count: records.reduce((n, record) => n + record.row_count, 0),
@@ -81,18 +99,18 @@ export function planPruneScopePartitions({ handover, budget = createBudget() }) 
         key: `${ROOT}/bundles/${sha256Hex(compressed)}.ndjson.gz`, sha256: sha256Hex(compressed), byte_size: compressed.length,
         json_sha256: sha256Hex(body), json_byte_size: body.length },
       retention: 'pending' });
-    bodies.push({ partition_id: id, body: compressed, records: records.map(r => r.record),
+    if (!coverage) bodies.push({ partition_id: id, body: compressed, records: records.map(r => r.record),
       scopes: records.map(r => proof.scopes[prunePhysicalKey(r.scope)]) });
   };
   groups.forEach(encode);
   const actual = partitions.flatMap(p => p.binding.scopes.map(physicalKey)).sort();
   evidence(same(actual, expected.map(physicalKey).sort()) && new Set(actual).size === expected.length
-    && partitions.reduce((n, p) => n + p.row_count, 0) === rows.length,
+    && partitions.reduce((n, p) => n + p.row_count, 0) === rowCount,
   'incomplete_partition_coverage', 'Partition plan does not cover the complete original connector-day exactly once');
   evidence(partitions.length <= LIMITS.receipt_references, 'resource_limit', 'Complete event exceeds receipt reference limit');
-  const plan = freeze({ state: 'authenticated', coverage: 'complete_original_event_partition_set',
-    partition_count: partitions.length, physical_scope_count: expected.length, observation_count: rows.length,
+  const plan = freeze({ state: 'authenticated', coverage: coverage ? 'selected_original_event_scope_set' : 'complete_original_event_partition_set',
+    partition_count: partitions.length, physical_scope_count: expected.length, observation_count: rowCount,
     partitions, receipt_coverage_complete: false, handover_complete: false });
-  artifacts.set(plan, bodies);
+  if (!coverage) artifacts.set(plan, bodies);
   return plan;
 }

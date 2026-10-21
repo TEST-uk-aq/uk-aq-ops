@@ -18,12 +18,18 @@ export function assertInspectionScope(scope) {
 }
 
 export function physicalScopeDigest(scope, leaf) {
+  return physicalScopeDigestForKey(scope, leaf, scopeKey(scope));
+}
+
+// Shared byte-stable projection only. Each caller supplies its own validated
+// identity/key boundary; currentness retains its receipt-only validation above.
+export function physicalScopeDigestForKey(scope, leaf, physicalKey) {
   evidence(leaf?.timeseries_id === scope.identity.timeseries_id
     && leaf.connector_id === scope.identity.connector_id
     && leaf.pollutant_code === scope.identity.pollutant_code && leaf.day_utc === scope.day_utc
     && Array.isArray(leaf.files) && Array.isArray(leaf.segments),
   'invalid_physical_scope_authority', 'Exact leaf does not describe the requested physical scope');
-  return sha256Hex(canonicalJson({ scope_key: scopeKey(scope),
+  return sha256Hex(canonicalJson({ scope_key: physicalKey,
     history_schema_version: leaf.history_schema_version, writer_version: leaf.writer_version,
     physical_layout_version: leaf.physical_layout_version,
     row_count: leaf.row_count, min_observed_at_utc: leaf.min_observed_at_utc,

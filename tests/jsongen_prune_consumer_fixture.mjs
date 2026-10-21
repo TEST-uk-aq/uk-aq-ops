@@ -6,7 +6,8 @@ import { canonicalJson, BUCKET } from '../scripts/jsongen/schema.mjs';
 import { sha256Hex } from '../workers/shared/r2_sigv4.mjs';
 import { computePruneConnectorSourceIdentity } from '../workers/shared/uk_aq_prune_connector_source_identity.mjs';
 import { describePrunePendingSource } from '../scripts/jsongen/prune-evidence.mjs';
-import { preparePruneOriginalFinalEvidence } from '../scripts/jsongen/prune-final-evidence.mjs';
+import { preparePruneOriginalFinalEvidence, attachPruneOriginalEvidenceBundleReference } from '../scripts/jsongen/prune-final-evidence.mjs';
+import { pruneEvidenceBundleIntentId } from '../scripts/jsongen/prune-evidence-bundle.mjs';
 import { createPruneOriginalMetadataCapture, preparePruneOriginalMetadataSnapshot } from '../scripts/jsongen/prune-original-metadata.mjs';
 import { observationsGlobalOperationLockIdentity, OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV } from '../workers/shared/uk_aq_r2_history_writer.mjs';
 import { buildObservationHistoryV3SteadyStatePartition } from '../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs';
@@ -25,7 +26,7 @@ export async function sourceAndOriginalEvent(scopes = 1024, options = {}) {
   // Spread the 1,024-scope case across original 1,000-ID ranges so no retained
   // shard exceeds the writer's unchanged 1 MiB per-object capture ceiling.
   const rows = Array.from({ length: scopes }, (_, i) => ({ connector_id: 1, station_id: i + 1, timeseries_id: i + 1 + Math.floor(i / 512) * 1000,
-    pollutant_code: 'pm25', observed_at_utc: `${day}T01:02:03.004Z`, observed_at: `${day}T01:02:03.${options.aliasMismatch ? '005' : '004'}Z`,
+    pollutant_code: options.pollutants?.[i % options.pollutants.length] || 'pm25', observed_at_utc: `${day}T01:02:03.004Z`, observed_at: `${day}T01:02:03.${options.aliasMismatch ? '005' : '004'}Z`,
     value: 1.2345678901234567, verification_status: ['P', 'R', null][i % 3] })).flatMap(r => [r, { ...r }]);
   const source = Buffer.concat(rows.map(canonicalJson)), compressed = gzipSync(source, { mtime: 0 });
   const sourceIdentity = computePruneConnectorSourceIdentity(rows);
@@ -43,10 +44,12 @@ export async function sourceAndOriginalEvent(scopes = 1024, options = {}) {
   const common = { domain: 'observations', dayUtc: day, writerGitSha: git, backedUpAtUtc: null };
   const canon = rows.map(({ observed_at, ...r }) => r);
   const partition = r => buildObservationHistoryV3SteadyStatePartition({ source: 'integrity', rows: r, targetWriterGitSha: git, backedUpAtUtc: null });
-  const prior = partition([{ ...canon[0], connector_id: 8, timeseries_id: 9001, station_id: 71 }]), current = partition(canon);
+  const prior = partition([{ ...canon[0], connector_id: 8, timeseries_id: 9001, station_id: 71 }]);
+  const currents = [...new Set(canon.map(r => r.pollutant_code))].sort()
+    .map(code => partition(canon.filter(r => r.pollutant_code === code)));
   const connectorFor = (id, p) => buildHistoryV2ConnectorManifest({ ...common, connectorId: id,
-    manifestKey: `${base}/day_utc=${day}/connector_id=${id}/manifest.json`, pollutantManifests: [p.payload] });
-  const previous = connectorFor(8, prior.canonical_pollutant_manifest), manifest = connectorFor(1, current.canonical_pollutant_manifest);
+    manifestKey: `${base}/day_utc=${day}/connector_id=${id}/manifest.json`, pollutantManifests: [p].flat().map(p => p.payload) });
+  const previous = connectorFor(8, prior.canonical_pollutant_manifest), manifest = connectorFor(1, currents.map(c => c.canonical_pollutant_manifest));
   const hierarchy = connectors => {
     const d = buildHistoryV2DayManifest({ ...common, manifestKey: `${base}/day_utc=${day}/manifest.json`, connectorManifests: connectors });
     const m = buildR2HistoryV2ObservationsMonthManifest({ basePrefix: base, year: day.slice(0, 4), month: day.slice(5, 7), dayManifests: [d] });
@@ -96,25 +99,46 @@ export async function sourceAndOriginalEvent(scopes = 1024, options = {}) {
   assert.equal(original.snapshot().completeness, 'captured');
   const add = o => { const body = Buffer.from(o.body); capture.recordPublishedObject({ key: o.key, body });
     return { key: o.key, sha256: sha256Hex(body), byte_size: body.length, verified: true, durable: true }; };
-  const child = current.canonical_pollutant_manifest, childRef = add(child), connectorRef = add({ key: manifest.manifest_key, body: JSON.stringify(manifest) });
-  const exact = current.v3_hierarchy.publication_objects.map(add), finals = hierarchy([previous, manifest]).map(add);
-  const latest = add(buildObservationHistoryExactLeafIndexV3Latest({ scopedHierarchies: [prior.v3_hierarchy, current.v3_hierarchy] }));
+  const children = currents.map(c => c.canonical_pollutant_manifest), childRefs = children.map(add), connectorRef = add({ key: manifest.manifest_key, body: JSON.stringify(manifest) });
+  const exact = currents.flatMap(c => c.v3_hierarchy.publication_objects.map(add)), finals = hierarchy([previous, manifest]).map(add);
+  const latest = add(buildObservationHistoryExactLeafIndexV3Latest({ scopedHierarchies: [prior.v3_hierarchy, ...currents.map(c => c.v3_hierarchy)] }));
   const pin = r => ({ key: r.key, sha256: r.sha256, byte_size: r.byte_size });
   const connector = { manifest_key: manifest.manifest_key, manifest_hash: manifest.manifest_hash, run_id: run, day_utc: day, connector_id: 1,
     source_row_count: rows.length, file_count: manifest.file_count, total_bytes: manifest.total_bytes,
-    connector_manifest: { bucket, ...pin(connectorRef) }, pollutant_manifests: [{ ...unsigned.scope.pollutant_partitions[0],
-      manifest: { bucket, ...pin(childRef), semantic_manifest_hash: child.payload.manifest_hash }, files: child.payload.files.map(f => ({ key: f.key,
-        row_count: f.row_count, byte_size: f.bytes, sha256: f.etag_or_hash, timeseries_row_counts: f.timeseries_row_counts || null })) }],
-    scoped_roots: [{ scope: { connector_id: 1, day_utc: day, pollutant_code: 'pm25' }, reference: pin(current.v3_hierarchy.scoped_manifest) }] };
+    connector_manifest: { bucket, ...pin(connectorRef) }, pollutant_manifests: children.map((child, i) => ({
+      ...unsigned.scope.pollutant_partitions.find(p => p.pollutant_code === child.payload.pollutant_code),
+      manifest: { bucket, ...pin(childRefs[i]), semantic_manifest_hash: child.payload.manifest_hash }, files: child.payload.files.map(f => ({ key: f.key,
+        row_count: f.row_count, byte_size: f.bytes, sha256: f.etag_or_hash, timeseries_row_counts: f.timeseries_row_counts || null })) })),
+    scoped_roots: currents.map(c => ({ scope: { connector_id: 1, day_utc: day, pollutant_code: c.canonical_pollutant_manifest.payload.pollutant_code },
+      reference: pin(c.v3_hierarchy.scoped_manifest) })) };
   const snapshot = preparePruneOriginalMetadataSnapshot({ capture, bucket, dayUtc: day, connectorId: 1, runId: run, writerGitSha: git,
-    canonicalReferences: [connectorRef, childRef], exactReferences: exact, dayReferences: [finals.at(-1)], affectedDaysUtc: [day],
+    canonicalReferences: [connectorRef, ...childRefs], exactReferences: exact, dayReferences: [finals.at(-1)], affectedDaysUtc: [day],
     aggregateReferences: finals.slice(0, 3), latestReferences: [latest] });
-  const prepared = preparePruneOriginalFinalEvidence({ pending, connector, runId: run, dayUtc: day, connectorId: 1, writerGitSha: git,
+  let prepared = preparePruneOriginalFinalEvidence({ pending, connector, runId: run, dayUtc: day, connectorId: 1, writerGitSha: git,
+    evidenceMode: options.evidenceBundle ? 'r2_bundle' : 'inline',
     sourceIdentity, originalMetadataSnapshot: snapshot, originalAuthorityCapture: original,
     finalization: { ok: true, affected_days_utc: [day], day_results: [{ day_utc: day, day_manifest: finals.at(-1) }],
       canonical_aggregate_result: { canonical_aggregate_authority_verified: true, parent_state_reread_under_lock: true,
         affected_days_utc: [day], aggregate_manifests: finals.slice(0, 3) },
-      v3_publication: { exact_scopes: [{ ok: true }], latest_global: { ok: true, objects: [latest] } } } });
+      v3_publication: { exact_scopes: currents.map(() => ({ ok: true })), latest_global: { ok: true, objects: [latest] } } } });
+  let bundleObject = null;
+  if (options.mutateOriginal) {
+    assert.equal(options.evidenceBundle, true);
+    options.mutateOriginal(prepared.envelope);
+    // Re-encode through the real bundle codec, preserving consistent transport
+    // hashes while leaving semantic authority corruption for the reader to find.
+    const { encodePruneEvidenceBundle } = await import('../scripts/jsongen/prune-evidence-bundle.mjs');
+    prepared.bundle = encodePruneEvidenceBundle(prepared.envelope);
+  }
+  if (options.evidenceBundle) {
+    const b = prepared.bundle, identity = prepared.bundle_identity;
+    const bundleKey = `managed/jsongen/v1/evidence-bundles/prune_daily_v3/connector_id=1/day_utc=${day}/invocation=${run}/compressed_sha256=${b.sha256}.json.gz`;
+    const ref = { ...identity, bucket: BUCKET, key: bundleKey, compressed_byte_size: b.byte_size,
+      compressed_sha256: b.sha256, uncompressed_byte_size: b.json_byte_size, uncompressed_sha256: b.json_sha256 };
+    ref.intent_id = pruneEvidenceBundleIntentId({ ...ref, identity });
+    bundleObject = [bundleKey, b.body];
+    prepared = attachPruneOriginalEvidenceBundleReference(prepared, ref);
+  }
   const row = { ...key, event_schema_version: 1, writer_git_sha: git, accepted_at: `${day}T02:00:00.123456Z`, ...sourceIdentity,
     history_manifest_key: manifest.manifest_key, history_manifest_hash: manifest.manifest_hash, history_row_count: rows.length,
     history_file_count: manifest.file_count, history_total_bytes: manifest.total_bytes, gate_history_completed_at: `${day}T02:00:00.000Z`,
@@ -124,7 +148,7 @@ export async function sourceAndOriginalEvent(scopes = 1024, options = {}) {
     pending_compressed_sha256: object.sha256, pending_compressed_byte_size: object.byte_size, pending_ndjson_sha256: object.json_sha256,
     pending_ndjson_byte_size: object.json_byte_size, original_source_status_provenance: 'original_source_status_unavailable',
     final_evidence_state: 'prepared_unverified', final_evidence_bytes: prepared.bytes, final_evidence_sha256: prepared.sha256, final_evidence_byte_size: prepared.byte_size };
-  let visible = true, hook = null; const objects = new Map([[object.key, compressed]]), queries = [];
+  let visible = true, hook = null; const objects = new Map([[object.key, compressed], ...(bundleObject ? [bundleObject] : [])]), queries = [];
   class Client {
     async connect() {} async end() {}
     async query(sql, args) { queries.push({ sql, args }); assert.doesNotMatch(sql, /history_candidates|prune_connector_day_gates/);
@@ -136,7 +160,7 @@ export async function sourceAndOriginalEvent(scopes = 1024, options = {}) {
   const get = async ({ key }) => { assert.ok(key.startsWith('managed/jsongen/v1/')); assert.ok(!key.endsWith('.parquet'));
     if (!objects.has(key)) throw Object.assign(new Error('fixture missing'), { status: 404 });
     const body = objects.get(key); return { body: Buffer.from(body), bytes: body.length, etag: etag(body) }; };
-  const r2 = { bucket: BUCKET, region: 'auto', endpoint: 'https://41a81f781d3bd7234fde0b25df51e879.r2.cloudflarestorage.com',
+  const r2 = { bucket: BUCKET, region: 'auto', endpoint: options.r2Endpoint || 'https://41a81f781d3bd7234fde0b25df51e879.r2.cloudflarestorage.com',
     adapter: { getObject: get, getObjectBounded: get, async putObjectConditional(args) {
       if (hook) { const result = await hook(args); if (result) return result; }
       const old = objects.get(args.key);

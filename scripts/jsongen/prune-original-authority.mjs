@@ -1,6 +1,7 @@
 // Authenticate retained pre-PUT admission and Core-owned binding metadata.
 // This module has no network adapter and cannot read canonical observations.
-import { BUCKET, assertReference, assertIdentity, canonicalJson, same, scopeKey } from './schema.mjs';
+import { BUCKET, assertReference, canonicalJson, same } from './schema.mjs';
+import { assertPruneOriginalIdentity, pruneOriginalPhysicalKey } from './prune-original-identity.mjs';
 import { evidence, parseJson } from './limits.mjs';
 import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
 import { getObservationHistoryGeneration } from '../../workers/shared/uk_aq_observation_history_generation.mjs';
@@ -21,8 +22,7 @@ const G = getObservationHistoryGeneration('v3');
 const check = (ok, field) => evidence(ok, 'invalid_original_scope_authority', `Original scope authority mismatch: ${field}`);
 const pin = object => ({ bucket: object.bucket ?? object.canonical_bucket, key: object.key,
   sha256: object.sha256, byte_size: object.byte_size });
-export const prunePhysicalKey = s => scopeKey({ identity: s.identity ?? { connector_id: 1,
-  timeseries_id: s.timeseries_id, station_id: s.station_id, pollutant_code: s.pollutant_code }, day_utc: s.day_utc });
+export const prunePhysicalKey = pruneOriginalPhysicalKey;
 
 export function authenticatePruneOriginalAuthority({ envelope: e, row, source, budget, bundleMode = false }) {
   const x = e.original_authority_extension;
@@ -106,12 +106,13 @@ export function authenticatePruneOriginalAuthority({ envelope: e, row, source, b
     payload: discovery.value, body: discovery.body.toString(), byte_size: discovery.body.length, sha256: discovery.reference.sha256 } });
   check(!roots.some(root => root.day_utc === row.day_utc && root.connector_id === 1), 'original_latest_absence_corroboration');
   const expected = source.scope.physical_timeseries_days;
+  const expectedByKey = new Map(expected.map(scope => [prunePhysicalKey(scope), scope]));
   check(Array.isArray(before.scopes) && before.scopes.length === expected.length
     && new Set(before.scopes.map(prunePhysicalKey)).size === expected.length
     && same(before.scopes.map(prunePhysicalKey).sort(), expected.map(prunePhysicalKey).sort()), 'complete_before_membership');
   const beforeScopes = {};
   for (const scope of before.scopes) {
-    assertIdentity(scope.identity);
+    assertPruneOriginalIdentity(scope.identity);
     check(scope.transition === 'first_publication_no_committed_observations'
       && same(scope.before, { state: 'authoritative_empty', row_count: 0, authority: parent.reference }), 'original_empty_scope_authority');
     beforeScopes[prunePhysicalKey(scope)] = scope.before;
@@ -139,10 +140,9 @@ export function authenticatePruneOriginalAuthority({ envelope: e, row, source, b
   'complete_original_bindings');
   const ranges = new Map(); const bindingScopes = new Set();
   for (const binding of b.bindings) {
-    budget.check(); assertIdentity(binding.identity);
+    budget.check(); assertPruneOriginalIdentity(binding.identity);
     const id = binding.identity.timeseries_id, start = Math.floor(id / 1000) * 1000;
-    const target = expected.find(s => same(binding.identity, { connector_id: 1,
-      timeseries_id: s.timeseries_id, station_id: s.station_id, pollutant_code: s.pollutant_code }));
+    const target = expectedByKey.get(prunePhysicalKey({ identity: binding.identity, day_utc: row.day_utc }));
     check(target, 'declared_binding_physical_scope'); bindingScopes.add(prunePhysicalKey(target));
     const rangeKey = timeseriesBindingSourceRangeManifestKey(prefix, start);
     let range = ranges.get(start);

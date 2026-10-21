@@ -10,7 +10,7 @@ import { decodePruneEvidenceBundle, PRUNE_EVIDENCE_BUNDLE_LIMITS,
 import { pruneEvidenceBundleIdentity } from './prune-final-evidence.mjs';
 import { readImmutable } from './inputs.mjs';
 import { authenticatePruneOriginalAuthority, prunePhysicalKey } from './prune-original-authority.mjs';
-import { physicalScopeDigest } from './scope-authority.mjs';
+import { pruneOriginalPhysicalDigest } from './prune-original-identity.mjs';
 import { validateR2HistoryV2ObservationsAggregateManifest, serializeR2HistoryV2ObservationsAggregateManifest }
   from '../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs';
 import { validateCanonicalHistoryV2Manifest } from '../../workers/shared/uk_aq_r2_history_manifest_validation.mjs';
@@ -30,9 +30,9 @@ const check = (condition, field) => evidence(condition, 'contradictory_original_
 const present = (condition, field) => evidence(condition, 'missing_original_authority', `Missing retained original authority: ${field}`);
 const positive = n => Number.isSafeInteger(n) && n > 0;
 
-// The original connector-day is complete. Stage 1 receipts cannot represent
-// other pollutants, so do not let a receipt-only scope key throw TypeError (or
-// silently omit those scopes) while authenticating the original source.
+// The legacy schema-2 receipt boundary still requires the complete original
+// connector-day. Called by receipt planning, after original authentication;
+// the independent read-only planner accounts for unsupported scopes separately.
 export function assertPruneReceiptScopeEligibility(source) {
   const scopes = source?.scope?.physical_timeseries_days;
   present(Array.isArray(scopes) && scopes.length > 0, 'complete_original_source_scopes');
@@ -389,8 +389,6 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
   bindOriginalPublication(e, row, unsigned, metadata, onStage);
   onStage('original_final_hierarchy');
   const root = authenticateFinalHierarchy(e, row, metadata);
-  onStage('original_source_scope_eligibility');
-  assertPruneReceiptScopeEligibility(unsigned);
   onStage('original_physical_scope_binding');
   const original = authenticatePruneOriginalAuthority({ envelope: e, row, source: unsigned,
     budget, bundleMode });
@@ -415,7 +413,7 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
       const tuple = indexValue.leaves_by_timeseries_id[String(s.timeseries_id)];
       const leaf = metadata.objects.get(tuple[0]);
       scopeAuthorities[prunePhysicalKey(s)] = {
-        scope_key: prunePhysicalKey(s), physical_sha256: physicalScopeDigest(scopes[prunePhysicalKey(s)], leaf.value),
+        scope_key: prunePhysicalKey(s), physical_sha256: pruneOriginalPhysicalDigest(scopes[prunePhysicalKey(s)], leaf.value),
         leaf: pin(leaf), index, binding: originalBindings.get(prunePhysicalKey(s)),
         effective_status: 'original_schema3_embedded_status_bound' };
     }
@@ -430,13 +428,14 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
     observation_count: unsigned.original_ndjson.row_count,
     effective_status: 'original_schema3_embedded_status_bound',
     source_status: unsigned.original_source_status.classification,
-    receipt_eligible: true, missing_authority: [],
+    receipt_eligible: false, missing_authority: [],
     current_canonical_authority: 'not_inspected', publication_eligible: false });
   // Keep actual rows out of public machine-readable results and log summaries.
   const token = Object.freeze({ event_id: result.event_id });
   authenticated.set(token, freeze({ result, pending, authority, sources, scopes, scopeAuthorities, writer: e.writer,
     original_source_status: unsigned.original_source_status, source_identity: unsigned.source_identity,
     original_global_lock: original.lock, original_evidence_sha256: row.final_evidence_sha256,
-    post_commit_reference_sha256: acceptance.post_commit_reference.sha256 }));
+    post_commit_reference_sha256: acceptance.post_commit_reference.sha256,
+    original_evidence_bundle: bundlePointer ? parseJson(bytes).original_metadata_evidence.reference : null }));
   return token;
 }
