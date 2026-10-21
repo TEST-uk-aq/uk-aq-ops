@@ -19,9 +19,9 @@ const DAY_MS = 24 * HOUR_MS;
 const DEFAULT_DRY_RUN = true;
 const DEFAULT_MAX_HOURS_PER_RUN = 48;
 const DEFAULT_INGESTDB_RETENTION_DAYS = 5;
-// Preserve today and at least the preceding two full UTC calendar days.
-// Nodes recovery has a rolling 48-hour window, and Prune works in UTC days.
-const MIN_INGESTDB_RETENTION_DAYS = 3;
+// Keep Prune's UTC-midnight deletion cutoff at or before the start of
+// Nodes' maximum rolling 48-hour recovery window (no extra safety margin).
+const MIN_INGESTDB_RETENTION_DAYS = 2;
 const DEFAULT_PHASE_A_ENABLED = true;
 const DEFAULT_PHASE_A_RECENT_DAYS = 3;
 const DEFAULT_DELETE_BATCH_SIZE = 50_000;
