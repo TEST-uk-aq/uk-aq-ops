@@ -73,8 +73,13 @@ to repair reporting. A crash between accepted.json and active.json is recovered
 by revalidating that exact invocation's reports, hashes and locked receipt.
 
 Finished/Failed confirmation and daily-status recompute are separate durable
-progress points. Local operational completion is confirmed only after both
-succeed. Health RPCs have a 15-second timeout. Transient/network/408/429/5xx errors
+progress points. The supervisor suppresses the shared client's automatic terminal
+recompute, then explicitly sends `uk_aq_rpc_recompute_daily_task_status` for the
+original scheduled-for UTC date. Only a successful RPC response confirms that
+obligation; a failed or lost response leaves recompute pending without resending
+the confirmed terminal update or running the accepted backup again. Local
+operational completion is confirmed only after both succeed. Health RPCs have a
+15-second timeout. Transient/network/408/429/5xx errors
 use persistent 300/600/1200/2400/up-to-3600-second delays, bounded by `max_attempts`
 per health phase/review. Other 4xx and identity/configuration failures block for
 review. Unknown responses are never accepted as success. Health attempts do not

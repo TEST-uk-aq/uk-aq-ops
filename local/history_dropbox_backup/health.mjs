@@ -91,9 +91,9 @@ export async function deliverHealth(state, c, save, options = {}) {
   const clock = options.now || Date.now;
   if (h.next_attempt_at && Date.parse(h.next_attempt_at) > clock()) return false;
   const client = options.client || createDailyTaskHealthClient({ env: {}, strict: true,
-    disabled: false, recomputeDisabled: true,
+    disabled: false, recomputeDisabled: false, recomputeAfterTerminal: false,
     supabaseUrl: c.env.OBS_AQIDB_SUPABASE_URL, supabaseKey: c.env.OBS_AQIDB_SECRET_KEY,
-    requestTimeoutMs: 15000, logHealth: () => {} });
+    requestTimeoutMs: 15000, logHealth: () => {}, fetchImpl: options.fetchImpl });
   // At most Started, terminal update, and recompute. Each progress point is durable.
   for (let step = 0; step < 3; step += 1) {
     if (h.attempts_since_review >= c.max_attempts) {

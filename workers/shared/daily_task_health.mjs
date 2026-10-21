@@ -174,6 +174,9 @@ export function createDailyTaskHealthClient(options = {}) {
     options.recomputeDisabled ?? env.DAILY_TASK_HEALTH_RECOMPUTE_DISABLED,
     false,
   );
+  // Durable supervisors can confirm terminal delivery before explicit recompute.
+  // Existing callers still recompute automatically and retain the global disable.
+  const recomputeAfterTerminal = parseBoolean(options.recomputeAfterTerminal, true);
   const rpcSchema = String(options.rpcSchema || env.DAILY_TASK_HEALTH_RPC_SCHEMA || DEFAULT_RPC_SCHEMA).trim();
   const supabaseUrl = resolveSupabaseUrl(env, options);
   const supabaseKey = resolveSupabaseKey(env, options);
@@ -292,7 +295,7 @@ export function createDailyTaskHealthClient(options = {}) {
       p_run_id: runId,
       p: payload,
     });
-    await recomputeDailyTaskStatus(payload.scheduled_for_date);
+    if (recomputeAfterTerminal) await recomputeDailyTaskStatus(payload.scheduled_for_date);
     return result;
   }
 
@@ -311,7 +314,7 @@ export function createDailyTaskHealthClient(options = {}) {
       p_run_id: runId,
       p: payload,
     });
-    await recomputeDailyTaskStatus(payload.scheduled_for_date);
+    if (recomputeAfterTerminal) await recomputeDailyTaskStatus(payload.scheduled_for_date);
     return result;
   }
 
