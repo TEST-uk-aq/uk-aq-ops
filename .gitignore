@@ -26,3 +26,5 @@ venv/
 .superpowers/
 workers/uk_aq_jsongen_signer/wrangler.deploy.toml
 workers/uk_aq_jsongen_signer/wrangler.activate.toml
+
+/.local/
