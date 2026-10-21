@@ -84,8 +84,8 @@ jobs:
       UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN || '50' }}
       UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS: ${{ vars.UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS || '10' }}
       UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS: ${{ vars.UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS || '60' }}
-      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || 'TEST' }}
-      UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || 'R2_history_backup' }}
+      UK_AQ_DROPBOX_ROOT: ${{ vars.UK_AQ_DROPBOX_ROOT || '' }}
+      UK_AQ_R2_HISTORY_DROPBOX_DIR: ${{ vars.UK_AQ_R2_HISTORY_DROPBOX_DIR || '' }}
 
       INPUT_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
       INPUT_HISTORY_GENERATION: ${{ github.event.inputs.history_generation || '' }}
@@ -320,6 +320,7 @@ jobs:
             --checkpoint-flush-seconds "${UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS}"
             --inventory-report-out "tmp/r2_backup_inventory_report.json"
             --backup-report-out "tmp/r2_history_dropbox_backup_report.json"
+            --pack-publisher-report-out "tmp/r2_binding_pack_publisher_report.json"
           )
 
           if [ -n "${INPUT_HISTORY_GENERATION:-}" ]; then
@@ -365,6 +366,7 @@ jobs:
           name: uk-aq-r2-history-dropbox-backup-report
           path: |
             tmp/r2_backup_inventory_report.json
+            tmp/r2_binding_pack_publisher_report.json
             tmp/r2_history_dropbox_backup_report.json
           if-no-files-found: ignore
 

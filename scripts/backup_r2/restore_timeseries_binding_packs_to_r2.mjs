@@ -16,12 +16,8 @@ import {
   restoreTimeseriesBindingPacksToR2,
 } from "./lib/timeseries_binding_pack_restore_v1.mjs";
 
-export const NORMAL_TEST_R2_HISTORY_DESTINATION =
-  "uk_aq_r2_test:uk-aq-history-cic-test";
-export const PHASE4_ISOLATED_TEST_R2_DESTINATION =
-  "uk_aq_r2_test:uk-aq-history-cic-test-timeseries-binding-restore-phase4";
-export const NORMAL_TEST_DROPBOX_PACK_SOURCE =
-  "uk_aq_dropbox:TEST/R2_history_backup";
+import { configuredHistoryDropboxRoot, assertHistoryBackupRemotes, assertIsolatedBindingRestoreDestination } from "./lib/history_backup_targets.mjs";
+import { requireObservationsGlobalOperationLockContext } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
 
 const DEFAULT_RCLONE_BIN = "rclone";
 const DEFAULT_WRITE_CONCURRENCY = 8;
@@ -30,8 +26,8 @@ function usage() {
   process.stdout.write([
     "Usage:",
     "  node scripts/backup_r2/restore_timeseries_binding_packs_to_r2.mjs \\",
-    "    --source-root uk_aq_dropbox:TEST/R2_history_backup \\",
-    "    --dest-root <isolated-test-r2-root> [options]",
+    "    --source-root <configured-dropbox-backup-root> \\",
+    "    --dest-root <isolated-r2-root> [options]",
     "",
     "Default mode is dry-run: the complete checkpoint, pack generation and",
     "reconstructed source hierarchy are verified without destination writes.",
@@ -41,15 +37,16 @@ function usage() {
     "  --write-r2                        Enable writes after all source validation",
     "  --expected-source-root-sha256 <h> Required generation pin for --write-r2",
     "  --expected-pack-root-sha256 <h>   Required generation pin for --write-r2",
-    "  --confirm-isolated-test-dest-root <root>",
+    "  --confirm-isolated-dest-root <root>",
     "                                    Must exactly repeat the allowed destination",
     `  --write-concurrency <n>            Default: ${DEFAULT_WRITE_CONCURRENCY}; maximum: 16`,
     `  --rclone-bin <name>                 Default: ${DEFAULT_RCLONE_BIN}`,
     "  --report-out <file>                Write the structured JSON report locally",
     "  -h, --help",
     "",
-    "The only Phase 4 write destination allowed by this implementation is:",
-    `  ${PHASE4_ISOLATED_TEST_R2_DESTINATION}`,
+    "Writes require the configured Dropbox source and an isolated recovery bucket:",
+    "  uk_aq_r2:<configured bucket>-timeseries-binding-restore-<isolated run id>",
+    "Run writes under the global lock coordinator with owner timeseries_binding_pack_restore.",
   ].join("\n") + "\n");
 }
 
@@ -61,34 +58,21 @@ function requireValue(argv, index, flag) {
   return value;
 }
 
-export function assertPhase4RestoreWriteSafety(args) {
+export function assertPhase4RestoreWriteSafety(args, env = process.env) {
+  if (args.sourceRoot !== configuredHistoryDropboxRoot(env)) {
+    throw new Error("Restore requires the exact configured Dropbox backup source");
+  }
   if (!args.writeR2) return;
-  if (args.sourceRoot !== NORMAL_TEST_DROPBOX_PACK_SOURCE) {
-    throw new Error(
-      `Phase 4 writes require the exact normal TEST Dropbox source: ${NORMAL_TEST_DROPBOX_PACK_SOURCE}`,
-    );
-  }
-  if (args.destRoot === NORMAL_TEST_R2_HISTORY_DESTINATION) {
-    throw new Error("Refusing Phase 4 restore writes to the normal TEST history bucket");
-  }
-  if (args.destRoot !== PHASE4_ISOLATED_TEST_R2_DESTINATION) {
-    throw new Error(
-      `Phase 4 writes require the exact isolated TEST destination: ${PHASE4_ISOLATED_TEST_R2_DESTINATION}`,
-    );
-  }
-  if (args.confirmIsolatedTestDestRoot !== args.destRoot) {
-    throw new Error(
-      "--confirm-isolated-test-dest-root must exactly repeat --dest-root",
-    );
+  assertIsolatedBindingRestoreDestination(args.destRoot, env);
+  if (args.confirmIsolatedDestRoot !== args.destRoot) {
+    throw new Error("--confirm-isolated-dest-root must exactly repeat --dest-root");
   }
   if (!args.expectedSourceRootSha256 || !args.expectedPackRootSha256) {
-    throw new Error(
-      "--write-r2 requires both expected source-root and pack-root SHA-256 pins",
-    );
+    throw new Error("--write-r2 requires both expected source-root and pack-root SHA-256 pins");
   }
 }
 
-export function parseTimeseriesBindingPackRestoreArgs(argv) {
+export function parseTimeseriesBindingPackRestoreArgs(argv, env = process.env) {
   const args = {
     sourceRoot: null,
     destRoot: null,
@@ -96,7 +80,7 @@ export function parseTimeseriesBindingPackRestoreArgs(argv) {
     dryRunExplicit: false,
     expectedSourceRootSha256: null,
     expectedPackRootSha256: null,
-    confirmIsolatedTestDestRoot: null,
+    confirmIsolatedDestRoot: null,
     writeConcurrency: DEFAULT_WRITE_CONCURRENCY,
     rcloneBin: DEFAULT_RCLONE_BIN,
     reportOut: null,
@@ -125,8 +109,8 @@ export function parseTimeseriesBindingPackRestoreArgs(argv) {
           value,
           "expected pack root SHA-256",
         );
-      } else if (flag === "--confirm-isolated-test-dest-root") {
-        args.confirmIsolatedTestDestRoot = value;
+      } else if (flag === "--confirm-isolated-dest-root") {
+        args.confirmIsolatedDestRoot = value;
       } else if (flag === "--write-concurrency") {
         const concurrency = Number(value);
         if (!Number.isSafeInteger(concurrency) || concurrency <= 0 || concurrency > 16) {
@@ -143,7 +127,7 @@ export function parseTimeseriesBindingPackRestoreArgs(argv) {
   if (args.writeR2 && args.dryRunExplicit) {
     throw new Error("Use either --dry-run or --write-r2, not both");
   }
-  assertPhase4RestoreWriteSafety(args);
+  assertPhase4RestoreWriteSafety(args, env);
   return Object.freeze(args);
 }
 
@@ -223,6 +207,8 @@ export async function main({ argv = process.argv.slice(2) } = {}) {
   try {
     args = parseTimeseriesBindingPackRestoreArgs(argv);
     if (!args) return 0;
+    assertHistoryBackupRemotes({ rcloneBin: args.rcloneBin });
+    if (args.writeR2) requireObservationsGlobalOperationLockContext({ expectedOwner: "timeseries_binding_pack_restore" });
     const report = await restoreTimeseriesBindingPacksToR2({
       generation: resolveObservationHistoryGeneration(process.env),
       sourceRoot: args.sourceRoot,

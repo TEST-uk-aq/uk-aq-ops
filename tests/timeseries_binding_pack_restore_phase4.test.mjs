@@ -36,12 +36,20 @@ import {
 } from "../scripts/backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs";
 import { getObservationHistoryGeneration } from "../workers/shared/uk_aq_observation_history_generation.mjs";
 import {
-  NORMAL_TEST_DROPBOX_PACK_SOURCE,
-  NORMAL_TEST_R2_HISTORY_DESTINATION,
-  PHASE4_ISOLATED_TEST_R2_DESTINATION,
-  parseTimeseriesBindingPackRestoreArgs,
+  parseTimeseriesBindingPackRestoreArgs as parseRestoreArgs,
 } from "../scripts/backup_r2/restore_timeseries_binding_packs_to_r2.mjs";
 
+const NORMAL_TEST_DROPBOX_PACK_SOURCE = "uk_aq_dropbox:TEST/R2_history_backup";
+const NORMAL_TEST_R2_HISTORY_DESTINATION = "uk_aq_r2:uk-aq-history-cic-test";
+const PHASE4_ISOLATED_TEST_R2_DESTINATION = "uk_aq_r2:uk-aq-history-cic-test-timeseries-binding-restore-phase4";
+const parseTimeseriesBindingPackRestoreArgs = (argv) => parseRestoreArgs(argv, {
+  CFLARE_R2_ENDPOINT: "https://account.r2.cloudflarestorage.com",
+  CFLARE_R2_BUCKET: "uk-aq-history-cic-test",
+  CFLARE_R2_ACCESS_KEY_ID: "test-access-key",
+  CFLARE_R2_SECRET_ACCESS_KEY: "test-secret-key",
+  UK_AQ_DROPBOX_ROOT: "TEST",
+  UK_AQ_R2_HISTORY_DROPBOX_DIR: "R2_history_backup",
+});
 const V2_GENERATION = getObservationHistoryGeneration("v2");
 const PACK_PREFIX = "history/_backup_packs_v1/timeseries_binding";
 const NOW = "2026-09-04T12:00:00.000Z";
@@ -533,11 +541,11 @@ test("destination member readback failure prevents all manifest and root publica
 test("write CLI is dry-run by default and exactly guards the isolated TEST target", () => {
   assert.equal(
     NORMAL_TEST_R2_HISTORY_DESTINATION,
-    "uk_aq_r2_test:uk-aq-history-cic-test",
+    "uk_aq_r2:uk-aq-history-cic-test",
   );
   assert.equal(
     PHASE4_ISOLATED_TEST_R2_DESTINATION,
-    "uk_aq_r2_test:uk-aq-history-cic-test-timeseries-binding-restore-phase4",
+    "uk_aq_r2:uk-aq-history-cic-test-timeseries-binding-restore-phase4",
   );
   const base = [
     "--source-root", NORMAL_TEST_DROPBOX_PACK_SOURCE,
@@ -548,7 +556,7 @@ test("write CLI is dry-run by default and exactly guards the isolated TEST targe
 
   assert.throws(
     () => parseTimeseriesBindingPackRestoreArgs([...base, "--write-r2"]),
-    /normal TEST history bucket/,
+    /active history buckets are forbidden/,
   );
   assert.throws(
     () => parseTimeseriesBindingPackRestoreArgs([
@@ -556,14 +564,14 @@ test("write CLI is dry-run by default and exactly guards the isolated TEST targe
       "--dest-root", "uk_aq_r2_live:uk-aq-history-live",
       "--write-r2",
     ]),
-    /exact isolated TEST destination/,
+    /active history buckets are forbidden/,
   );
   assert.throws(
     () => parseTimeseriesBindingPackRestoreArgs([
       "--source-root", NORMAL_TEST_DROPBOX_PACK_SOURCE,
       "--dest-root", PHASE4_ISOLATED_TEST_R2_DESTINATION,
       "--write-r2",
-      "--confirm-isolated-test-dest-root", PHASE4_ISOLATED_TEST_R2_DESTINATION,
+      "--confirm-isolated-dest-root", PHASE4_ISOLATED_TEST_R2_DESTINATION,
     ]),
     /requires both expected source-root and pack-root SHA-256 pins/,
   );
@@ -573,7 +581,7 @@ test("write CLI is dry-run by default and exactly guards the isolated TEST targe
     "--write-r2",
     "--expected-source-root-sha256", "1".repeat(64),
     "--expected-pack-root-sha256", "2".repeat(64),
-    "--confirm-isolated-test-dest-root", PHASE4_ISOLATED_TEST_R2_DESTINATION,
+    "--confirm-isolated-dest-root", PHASE4_ISOLATED_TEST_R2_DESTINATION,
   ]);
   assert.equal(write.writeR2, true);
   assert.equal(write.destRoot, PHASE4_ISOLATED_TEST_R2_DESTINATION);

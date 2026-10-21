@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes, assertObservationHistoryGenerationKey } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
+import { assertHistoryBackupSource, assertHistoryBackupDestination, assertHistoryBackupRemotes } from "./lib/history_backup_targets.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -169,15 +170,15 @@ function usage() {
     "    --dest-root <rclone-destination-root> [options]",
     "",
     "Required:",
-    "  --source-root <root>          Example: uk_aq_r2_test:uk-aq-history-cic-test",
-    "  --dest-root <root>            Example: uk_aq_dropbox:TEST/R2_history_backup",
+    "  --source-root <root>          Exact: uk_aq_r2:<configured R2 bucket>",
+    "  --dest-root <root>            Exact configured Dropbox backup root",
     "",
     "Options:",
     `  --inventory-root-prefix <p>  Default: ${DEFAULT_INVENTORY_ROOT_PREFIX}`,
     `  --state-root-prefix <p>      Default: ${DEFAULT_STATE_ROOT_PREFIX}`,
     `  --timeseries-binding-backup-mode <individual|dual|pack> Default: ${DEFAULT_TIMESERIES_BINDING_BACKUP_MODE}`,
     `  --observation-parquet-copy-mode <full|reuse_matching> Default: ${DEFAULT_OBSERVATION_PARQUET_COPY_MODE}`,
-    "  --allow-experimental-pack-only Required for pack mode; isolated TEST destination only",
+    "  --allow-experimental-pack-only Required for pack mode; configured destination only",
     "  --timeseries-binding-packs-only Proving path: sync no other backup domain",
     `  --max-days-per-run <N>       Default: ${DEFAULT_MAX_DAYS}; 0 = unlimited`,
     `  --checkpoint-batch-units <N> Default: ${DEFAULT_CHECKPOINT_BATCH_UNITS}`,
@@ -1348,6 +1349,9 @@ function runForcedObservationPruneRecheck(
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  assertHistoryBackupSource(args.source_root);
+  assertHistoryBackupDestination(args.dest_root);
+  assertHistoryBackupRemotes({ rcloneBin: args.rclone_bin, dropbox: true });
   requireLockedHistoryBackupMutation({
     dryRun: args.dry_run,
     env: process.env,

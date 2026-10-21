@@ -6,7 +6,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
-  hasRequiredR2Config,
   normalizePrefix,
 } from "../../workers/shared/r2_sigv4.mjs";
 import {
@@ -14,8 +13,10 @@ import {
   publishTimeseriesBindingBackupPacksV1,
 } from "./lib/timeseries_binding_backup_pack_v1.mjs";
 
+import { assertHistoryBackupSource, assertHistoryBackupRemotes, resolveHistoryBackupR2 } from "./lib/history_backup_targets.mjs";
+import { requireObservationsGlobalOperationLockContext } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
+
 const DEFAULT_BINDING_PREFIX = "history/_index_v2/timeseries_binding";
-const TEST_R2_BUCKET = "uk-aq-history-cic-test";
 
 function usage() {
   console.log([
@@ -35,7 +36,8 @@ function usage() {
     "  --read-concurrency <n>     Concurrent binding reads for rebuilt packs (default: 16)",
     "  --report-out <file>        Write the deterministic JSON report locally",
     "  --dry-run                  Explicit read-only mode (default)",
-    "  --write-r2                 Publish changed packs and pack root to TEST R2",
+    "  --write-r2                 Publish changed packs and pack root to configured R2",
+    "  --source-root <root>       Required for writes; exact configured R2 source",
     "  -h, --help",
   ].join("\n"));
 }
@@ -50,6 +52,7 @@ function normalizePositiveInteger(raw, flag) {
 
 function parseArgs(argv, env) {
   const args = {
+    sourceRoot: null,
     bindingPrefix: DEFAULT_BINDING_PREFIX,
     packPrefix: DEFAULT_TIMESERIES_BINDING_BACKUP_PACK_PREFIX,
     readConcurrency: 16,
@@ -60,7 +63,9 @@ function parseArgs(argv, env) {
   };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
-    if (flag === "--binding-prefix") {
+    if (flag === "--source-root") {
+      args.sourceRoot = argv[++index];
+    } else if (flag === "--binding-prefix") {
       args.bindingPrefix = normalizePrefix(argv[++index]);
     } else if (flag === "--pack-prefix") {
       args.packPrefix = normalizePrefix(argv[++index]);
@@ -93,28 +98,6 @@ function parseArgs(argv, env) {
   return args;
 }
 
-function r2FromEnv(env = process.env) {
-  return {
-    endpoint: String(env.CFLARE_R2_ENDPOINT || env.R2_ENDPOINT || "").trim(),
-    bucket: String(env.CFLARE_R2_BUCKET || env.R2_BUCKET || "").trim(),
-    region: String(env.CFLARE_R2_REGION || env.R2_REGION || "auto").trim() || "auto",
-    access_key_id: String(
-      env.CFLARE_R2_ACCESS_KEY_ID || env.R2_ACCESS_KEY_ID || "",
-    ).trim(),
-    secret_access_key: String(
-      env.CFLARE_R2_SECRET_ACCESS_KEY || env.R2_SECRET_ACCESS_KEY || "",
-    ).trim(),
-  };
-}
-
-function assertTestWriteTarget(r2) {
-  if (String(r2?.bucket || "").trim() !== TEST_R2_BUCKET) {
-    throw new Error(
-      `Refusing --write-r2 for non-TEST bucket: ${String(r2?.bucket || "").trim() || "(empty)"}`,
-    );
-  }
-}
-
 function writeReport(filename, report) {
   if (!filename) return;
   const output = path.resolve(filename);
@@ -124,12 +107,13 @@ function writeReport(filename, report) {
 
 export async function main(argv = process.argv.slice(2), env = process.env) {
   const args = parseArgs(argv, env);
-  const r2 = r2FromEnv(env);
-  if (!hasRequiredR2Config(r2)) {
-    throw new Error("Missing required R2 configuration (CFLARE_R2_* / R2_*)");
-  }
+  const r2 = resolveHistoryBackupR2(env);
   const writeR2 = args.mode === "write-r2";
-  if (writeR2) assertTestWriteTarget(r2);
+  if (args.sourceRoot || writeR2) assertHistoryBackupSource(args.sourceRoot, env);
+  if (writeR2) {
+    requireObservationsGlobalOperationLockContext({ env, expectedOwner: "r2_history_dropbox_backup" });
+    assertHistoryBackupRemotes({ env, rcloneBin: env.UK_AQ_R2_HISTORY_BACKUP_RCLONE_BIN || "rclone", dropbox: false });
+  }
   const report = await publishTimeseriesBindingBackupPacksV1({
     r2,
     bindingPrefix: args.bindingPrefix,

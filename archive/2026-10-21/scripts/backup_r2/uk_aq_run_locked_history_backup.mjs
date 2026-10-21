@@ -1,0 +1,332 @@
+#!/usr/bin/env node
+
+import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
+import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
+
+import {
+  requireObservationsGlobalOperationLockContext,
+} from "../../workers/shared/uk_aq_r2_history_writer.mjs";
+import {
+  resolveObservationsTimeseriesLatestPath,
+} from "./lib/hierarchical_backup_v2.mjs";
+import {
+  assertExperimentalPackOnlyDestination,
+  normalizeTimeseriesBindingBackupMode,
+} from "./lib/timeseries_binding_pack_inventory_v1.mjs";
+import {
+  DEFAULT_TIMESERIES_BINDING_BACKUP_PACK_PREFIX,
+} from "./lib/timeseries_binding_backup_pack_v1.mjs";
+import {
+  DEFAULT_OBSERVATION_PARQUET_COPY_MODE,
+  normalizeObservationParquetCopyMode,
+} from "./lib/observation_parquet_reuse.mjs";
+
+function requireValue(argv, index, flag) {
+  const value = argv[index + 1];
+  if (!value || value.startsWith("--")) throw new Error(`${flag} requires a value`);
+  return value;
+}
+
+function validateForcePruneMaxDays(value) {
+  if (!/^[1-9]\d*$/.test(String(value)) || !Number.isSafeInteger(Number(value))) {
+    throw new Error("--force-prune-max-days-per-run / UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN must be a positive integer within the safe integer range");
+  }
+  return String(value);
+}
+
+export function parseLockedHistoryBackupArgs(argv) {
+  const args = {
+    sourceRoot: null,
+    destRoot: null,
+    generation: null,
+    observationsPrefix: null,
+    runsPrefix: null,
+    corePrefix: null,
+    timeseriesBindingPrefix: null,
+    timeseriesBindingBackupMode: "individual",
+    observationParquetCopyMode: DEFAULT_OBSERVATION_PARQUET_COPY_MODE,
+    observationParquetCopyModeExplicit: false,
+    timeseriesBindingPackPrefix: null,
+    historyIndexVersion: null,
+    inventoryRootPrefix: null,
+    stateRootPrefix: null,
+    maxDaysPerRun: "0",
+    checkpointBatchUnits: "10",
+    checkpointFlushSeconds: "60",
+    forcePruneMaxDaysPerRun: null,
+    inventoryReportOut: null,
+    backupReportOut: null,
+    dryRun: false,
+    forcePruneRecheck: false,
+    allowExperimentalPackOnly: false,
+    timeseriesBindingPacksOnly: false,
+    packPublisherReportOut: null,
+  };
+  for (let index = 0; index < argv.length; index += 1) {
+    const flag = argv[index];
+    if (flag === "--dry-run") args.dryRun = true;
+    else if (flag === "--force-prune-recheck") args.forcePruneRecheck = true;
+    else if (flag === "--allow-experimental-pack-only") {
+      args.allowExperimentalPackOnly = true;
+    } else if (flag === "--timeseries-binding-packs-only") {
+      args.timeseriesBindingPacksOnly = true;
+    }
+    else {
+      const value = requireValue(argv, index, flag);
+      index += 1;
+      if (flag === "--source-root") args.sourceRoot = value;
+      else if (flag === "--dest-root") args.destRoot = value;
+      else if (flag === "--generation") args.generation = value;
+      else if (flag === "--observations-prefix") args.observationsPrefix = value;
+      else if (flag === "--runs-prefix") args.runsPrefix = value;
+      else if (flag === "--core-prefix") args.corePrefix = value;
+      else if (flag === "--timeseries-binding-prefix") args.timeseriesBindingPrefix = value;
+      else if (flag === "--timeseries-binding-backup-mode") {
+        args.timeseriesBindingBackupMode = normalizeTimeseriesBindingBackupMode(value);
+      } else if (flag === "--observation-parquet-copy-mode") {
+        args.observationParquetCopyMode = normalizeObservationParquetCopyMode(value);
+        args.observationParquetCopyModeExplicit = true;
+      } else if (flag === "--timeseries-binding-pack-prefix") {
+        args.timeseriesBindingPackPrefix = value;
+      }
+      else if (flag === "--history-index-version") args.historyIndexVersion = value;
+      else if (flag === "--inventory-root-prefix") args.inventoryRootPrefix = value;
+      else if (flag === "--state-root-prefix") args.stateRootPrefix = value;
+      else if (flag === "--max-days-per-run") args.maxDaysPerRun = value;
+      else if (flag === "--checkpoint-batch-units") args.checkpointBatchUnits = value;
+      else if (flag === "--checkpoint-flush-seconds") args.checkpointFlushSeconds = value;
+      else if (flag === "--force-prune-max-days-per-run") {
+        args.forcePruneMaxDaysPerRun = value;
+      }
+      else if (flag === "--inventory-report-out") args.inventoryReportOut = value;
+      else if (flag === "--backup-report-out") args.backupReportOut = value;
+      else if (flag === "--pack-publisher-report-out") {
+        args.packPublisherReportOut = value;
+      }
+      else throw new Error(`Unknown argument: ${flag}`);
+    }
+  }
+  for (const [flag, value] of [
+    ["--source-root", args.sourceRoot],
+    ["--dest-root", args.destRoot],
+    ["--inventory-report-out", args.inventoryReportOut],
+    ["--backup-report-out", args.backupReportOut],
+  ]) {
+    if (!value) throw new Error(`${flag} is required`);
+  }
+  for (const [flag, value] of [
+    ["--max-days-per-run", args.maxDaysPerRun],
+    ["--checkpoint-batch-units", args.checkpointBatchUnits],
+    ["--checkpoint-flush-seconds", args.checkpointFlushSeconds],
+  ]) {
+    if (!/^\d+$/.test(String(value))) throw new Error(`${flag} must be a non-negative integer`);
+  }
+  if (args.forcePruneMaxDaysPerRun !== null) {
+    validateForcePruneMaxDays(args.forcePruneMaxDaysPerRun);
+  }
+  if (args.historyIndexVersion !== null) resolveObservationsTimeseriesLatestPath(args.historyIndexVersion);
+  if (args.generation !== null && !["v2", "v3"].includes(args.generation)) {
+    throw new Error("--generation must be exactly v2 or v3");
+  }
+  assertExperimentalPackOnlyDestination({
+    mode: args.timeseriesBindingBackupMode,
+    destRoot: args.destRoot,
+    allowExperimentalPackOnly: args.allowExperimentalPackOnly,
+  });
+  if (
+    args.timeseriesBindingPacksOnly
+    && args.timeseriesBindingBackupMode !== "pack"
+  ) {
+    throw new Error("--timeseries-binding-packs-only requires pack backup mode");
+  }
+  return Object.freeze(args);
+}
+
+function runRequired(command, commandArgs, { env, run = spawnSync }) {
+  const result = run(command, commandArgs, { env, stdio: "inherit" });
+  if (result.error) throw result.error;
+  if (result.signal) throw new Error(`${command} terminated by ${result.signal}`);
+  if (result.status !== 0) {
+    const error = new Error(`${command} exited with status ${String(result.status)}`);
+    error.exitCode = Number(result.status || 1);
+    throw error;
+  }
+}
+
+function reportStageStarted(label, { log, now }) {
+  const startedAtMs = now();
+  log(`[${new Date(startedAtMs).toISOString()}] R2 history backup stage: ${label}`);
+  return startedAtMs;
+}
+
+function reportStageComplete(label, startedAtMs, { log, now }) {
+  const completedAtMs = now();
+  const elapsedSeconds = Math.max(0, completedAtMs - startedAtMs) / 1000;
+  log(
+    `[${new Date(completedAtMs).toISOString()}] R2 history backup stage complete: ${label} `
+    + `(elapsed ${elapsedSeconds.toFixed(1)}s)`,
+  );
+}
+
+export function requireLockedHistoryBackupMutation({
+  dryRun = false,
+  env = process.env,
+} = {}) {
+  if (dryRun) return null;
+  return requireObservationsGlobalOperationLockContext({
+    env,
+    expectedOwner: "r2_history_dropbox_backup",
+  });
+}
+
+export function runLockedHistoryBackup({
+  args,
+  env = process.env,
+  run = spawnSync,
+  log = (message) => console.log(message),
+  now = Date.now,
+} = {}) {
+  const lock = requireObservationsGlobalOperationLockContext({
+    env,
+    expectedOwner: "r2_history_dropbox_backup",
+  });
+  const selectedEnv = args.generation == null ? env : {
+    ...env,
+    UK_AQ_R2_HISTORY_VERSION: args.generation,
+  };
+  const generation = resolveObservationHistoryGeneration(selectedEnv);
+  const backupEnv = args.generation == null ? env : {
+    ...selectedEnv,
+    UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX: generation.observations_prefix,
+    UK_AQ_R2_HISTORY_V2_RUNS_PREFIX: generation.observations_runs_prefix,
+    UK_AQ_R2_HISTORY_V2_CORE_PREFIX: generation.core_prefix,
+    UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX:
+      generation.timeseries_binding_index_prefix,
+    UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: generation.index_root_prefix,
+    UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX:
+      generation.backup_inventory_prefix,
+    UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX:
+      generation.backup_state_prefix,
+  };
+  if (args.generation != null && args.generation !== env.UK_AQ_R2_HISTORY_VERSION &&
+      (args.maxDaysPerRun !== "0" || args.timeseriesBindingPacksOnly)) {
+    throw new Error("Selected non-default generation backup must cover the complete required scope");
+  }
+  args = {
+    ...args,
+    forcePruneMaxDaysPerRun: validateForcePruneMaxDays(
+      args.forcePruneMaxDaysPerRun
+        ?? (String(env.UK_AQ_R2_HISTORY_FORCE_PRUNE_MAX_DAYS_PER_RUN ?? "").trim() || "50"),
+    ),
+    observationsPrefix: args.observationsPrefix ?? (backupEnv.UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX || generation.observations_prefix),
+    runsPrefix: args.runsPrefix ?? (backupEnv.UK_AQ_R2_HISTORY_V2_RUNS_PREFIX || generation.observations_runs_prefix),
+    timeseriesBindingPrefix: args.timeseriesBindingPrefix ?? (backupEnv.UK_AQ_R2_HISTORY_TIMESERIES_BINDING_V2_PREFIX || generation.timeseries_binding_index_prefix),
+    historyIndexVersion: args.historyIndexVersion ?? generation.version,
+    corePrefix: args.corePrefix ?? (backupEnv.UK_AQ_R2_HISTORY_V2_CORE_PREFIX || generation.core_prefix),
+    inventoryRootPrefix: args.inventoryRootPrefix ?? (backupEnv.UK_AQ_R2_HISTORY_HIERARCHICAL_INVENTORY_PREFIX || generation.backup_inventory_prefix),
+    stateRootPrefix: args.stateRootPrefix ?? (backupEnv.UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX || generation.backup_state_prefix),
+    timeseriesBindingPackPrefix: args.timeseriesBindingPackPrefix ?? generation.timeseries_binding_pack_prefix,
+  };
+  assertObservationHistoryGenerationPrefixes(generation, {
+    indexPrefix: backupEnv.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || generation.index_root_prefix,
+    observationsPrefix: args.observationsPrefix, bindingPrefix: args.timeseriesBindingPrefix,
+    corePrefix: args.corePrefix, inventoryPrefix: args.inventoryRootPrefix,
+    statePrefix: args.stateRootPrefix, packPrefix: args.timeseriesBindingPackPrefix,
+    runsPrefix: args.runsPrefix,
+  });
+  if (args.runsPrefix !== generation.observations_runs_prefix || args.historyIndexVersion !== generation.version ||
+      args.corePrefix !== generation.core_prefix) throw new Error("Backup arguments contradict selected complete generation");
+  const node = process.execPath;
+  if (args.timeseriesBindingBackupMode !== "individual") {
+    const packStartedAtMs = reportStageStarted("building timeseries-binding packs", {
+      log,
+      now,
+    });
+    runRequired(node, [
+      "scripts/backup_r2/publish_timeseries_binding_backup_packs.mjs",
+      "--binding-prefix", args.timeseriesBindingPrefix,
+      "--pack-prefix", args.timeseriesBindingPackPrefix,
+      ...(args.packPublisherReportOut
+        ? ["--report-out", args.packPublisherReportOut]
+        : []),
+      args.dryRun ? "--dry-run" : "--write-r2",
+    ], { env: backupEnv, run });
+    reportStageComplete("timeseries-binding packs", packStartedAtMs, { log, now });
+  }
+  const inventoryStartedAtMs = reportStageStarted("building backup inventory", {
+    log,
+    now,
+  });
+  runRequired(node, [
+    "scripts/backup_r2/build_backup_inventory.mjs",
+    "--source-root", args.sourceRoot,
+    "--observations-prefix", args.observationsPrefix,
+    "--runs-prefix", args.runsPrefix,
+    "--core-prefix", args.corePrefix,
+    "--timeseries-binding-prefix", args.timeseriesBindingPrefix,
+    "--timeseries-binding-backup-mode", args.timeseriesBindingBackupMode,
+    "--timeseries-binding-pack-prefix", args.timeseriesBindingPackPrefix,
+    "--history-index-version", args.historyIndexVersion,
+    "--inventory-root-prefix", args.inventoryRootPrefix,
+    "--report-out", args.inventoryReportOut,
+  ], { env: backupEnv, run });
+  reportStageComplete("backup inventory", inventoryStartedAtMs, { log, now });
+  const syncStartedAtMs = reportStageStarted("syncing history to Dropbox", {
+    log,
+    now,
+  });
+  runRequired(node, [
+    "scripts/backup_r2/sync_history_to_dropbox.mjs",
+    "--source-root", args.sourceRoot,
+    "--dest-root", args.destRoot,
+    "--inventory-root-prefix", args.inventoryRootPrefix,
+    "--state-root-prefix", args.stateRootPrefix,
+    "--timeseries-binding-backup-mode", args.timeseriesBindingBackupMode,
+    ...(args.observationParquetCopyModeExplicit
+      ? ["--observation-parquet-copy-mode", args.observationParquetCopyMode]
+      : []),
+    "--max-days-per-run", args.maxDaysPerRun,
+    "--checkpoint-batch-units", args.checkpointBatchUnits,
+    "--checkpoint-flush-seconds", args.checkpointFlushSeconds,
+    "--force-prune-max-days-per-run", args.forcePruneMaxDaysPerRun,
+    "--report-out", args.backupReportOut,
+    ...(args.dryRun ? ["--dry-run"] : []),
+    ...(args.forcePruneRecheck ? ["--force-prune-recheck"] : []),
+    ...(args.allowExperimentalPackOnly ? ["--allow-experimental-pack-only"] : []),
+    ...(args.timeseriesBindingPacksOnly ? ["--timeseries-binding-packs-only"] : []),
+  ], { env: backupEnv, run });
+  reportStageComplete("Dropbox sync", syncStartedAtMs, { log, now });
+  return {
+    ok: true,
+    generation: generation.version,
+    observations_global_operation_lock: {
+      owner: lock.owner,
+      run_id: lock.run_id,
+      logical_identity: lock.logical_identity,
+      acquired: lock.acquired,
+      wait_ms: lock.wait_ms,
+      outcome: lock.outcome,
+      boundary: "inventory_through_copy_verification_and_checkpoint_publication",
+    },
+  };
+}
+
+export function main({ argv = process.argv.slice(2), env = process.env } = {}) {
+  const result = runLockedHistoryBackup({
+    args: parseLockedHistoryBackupArgs(argv),
+    env,
+  });
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  return 0;
+}
+
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  try {
+    process.exitCode = main();
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
+    process.exitCode = Number(error?.exitCode || 1);
+  }
+}

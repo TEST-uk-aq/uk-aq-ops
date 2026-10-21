@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
+import { assertHistoryBackupSource, assertHistoryBackupDestination, assertHistoryBackupRemotes } from "./lib/history_backup_targets.mjs";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
@@ -35,7 +36,7 @@ function validateForcePruneMaxDays(value) {
   return String(value);
 }
 
-export function parseLockedHistoryBackupArgs(argv) {
+export function parseLockedHistoryBackupArgs(argv, env = process.env) {
   const args = {
     sourceRoot: null,
     destRoot: null,
@@ -133,6 +134,7 @@ export function parseLockedHistoryBackupArgs(argv) {
     mode: args.timeseriesBindingBackupMode,
     destRoot: args.destRoot,
     allowExperimentalPackOnly: args.allowExperimentalPackOnly,
+    env,
   });
   if (
     args.timeseriesBindingPacksOnly
@@ -245,6 +247,7 @@ export function runLockedHistoryBackup({
     });
     runRequired(node, [
       "scripts/backup_r2/publish_timeseries_binding_backup_packs.mjs",
+      "--source-root", args.sourceRoot,
       "--binding-prefix", args.timeseriesBindingPrefix,
       "--pack-prefix", args.timeseriesBindingPackPrefix,
       ...(args.packPublisherReportOut
@@ -270,6 +273,7 @@ export function runLockedHistoryBackup({
     "--history-index-version", args.historyIndexVersion,
     "--inventory-root-prefix", args.inventoryRootPrefix,
     "--report-out", args.inventoryReportOut,
+    ...(args.dryRun ? ["--dry-run"] : []),
   ], { env: backupEnv, run });
   reportStageComplete("backup inventory", inventoryStartedAtMs, { log, now });
   const syncStartedAtMs = reportStageStarted("syncing history to Dropbox", {
@@ -313,8 +317,12 @@ export function runLockedHistoryBackup({
 }
 
 export function main({ argv = process.argv.slice(2), env = process.env } = {}) {
+  const args = parseLockedHistoryBackupArgs(argv, env);
+  assertHistoryBackupSource(args.sourceRoot, env);
+  assertHistoryBackupDestination(args.destRoot, env);
+  assertHistoryBackupRemotes({ env, rcloneBin: env.UK_AQ_R2_HISTORY_BACKUP_RCLONE_BIN || "rclone" });
   const result = runLockedHistoryBackup({
-    args: parseLockedHistoryBackupArgs(argv),
+    args,
     env,
   });
   process.stdout.write(`${JSON.stringify(result)}\n`);
