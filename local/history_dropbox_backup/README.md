@@ -1,77 +1,106 @@
 # One-off Mac R2 history backup
 
-This package prepares a real **TEST** acceptance run after merge and installation
-on the always-on MacBook Pro. It does not install itself, start a backup, alter
-schedules or activate LIVE. Use a stable checkout of the merged TEST commit.
-Do not move, update or switch that checkout during an operation.
+This optional package runs one explicitly initiated complete backup under macOS
+launchd. It prepares TEST operational acceptance after merge and installation.
+LIVE remains inactive until separately authorised. Use a stable checkout of the
+merged TEST commit; do not move, update or switch it during an operation.
 
-**Daily Task Health follow-up: blocked on an existing RPC prerequisite.** The
-requested restart-safe local health lifecycle is not implemented yet. The current
-Started RPC deduplicates GitHub attempts only; a local start whose response is
-lost cannot safely be retried under its existing contract. See
-[the investigation and required schema dependency](daily_task_health_dependency.md).
-Do not treat this package as satisfying mandatory Daily Task Health acceptance
-until that dependency and the supervisor integration have been implemented and
-accepted on TEST. Existing install/status commands still describe backup state
-only; they do not confirm a health report.
+**Release prerequisite:** apply and verify the linked TEST ObsAQIDB schema change
+before enabling this health-enabled package. See
+[daily_task_health_dependency.md](daily_task_health_dependency.md) for the exact
+RPC contract, linked PRs, migration and release order. This PR does not apply SQL,
+install itself, alter schedules or start a backup.
 
-The application code is environment independent. The same files derive distinct
-TEST/LIVE labels and private directories from the explicit environment. The
-canonical pack publisher and its shared `history_backup_targets.mjs` identity
-guard already support explicitly configured environments on current TEST main.
-This package reuses those guards unchanged. LIVE requires separate authorisation,
-canonical dependency review/promotion and real TEST acceptance.
+## Canonical backup and global lock
 
-## Existing authority preserved
-
-Read the authoritative sibling `uk-aq-system-docs/system_docs/SYSTEM_OVERVIEW.md`
-and its backup/recovery route. The current complete-generation side-by-side and
-website-cut-over amendments supersede the older mixed v2/v3 backup topology.
-The existing shared generation resolver owns every effective prefix. This runs:
+The existing coordinator owns the PostgreSQL global operation lock with owner
+`r2_history_dropbox_backup`. Each attempt has a distinct run ID containing the
+same durable one-off operation UUID. The complete protected sequence remains:
 
 ```text
-existing PostgreSQL lock coordinator, owner r2_history_dropbox_backup
-  -> existing uk_aq_run_locked_history_backup.mjs --generation v3
-     -> canonical pack publisher (build missing packs automatically)
-     -> canonical hierarchical inventory
-     -> canonical Dropbox sync and checkpoint verification
+existing lock coordinator
+ -> existing uk_aq_run_locked_history_backup.mjs --generation v3
+    -> canonical pack publisher (automatically builds missing v3 packs)
+    -> canonical hierarchical inventory
+    -> canonical Dropbox sync, verification and checkpoint publication
 ```
 
-The selected controls are `pack`, explicit `full` Parquet mode,
-`max-days-per-run=0`, and `--allow-experimental-pack-only`. This is the **complete**
-backup; it does not use the packs-only proving option. Checkpoint batch/flush
-values come from the protected configuration. No alternate transport, backup
-algorithm, source repair, checkpoint deletion, binding deletion, pack cleanup or
-core pruning is introduced. Existing observation stale-Parquet handling remains
-inside the canonical sync.
+Controls are `pack`, `--allow-experimental-pack-only`, explicit `full` Parquet
+copying, `max-days-per-run=0`, and the existing configurable checkpoint batch/flush
+controls. The packs-only proving option is never used. The shared generation
+resolver selects all v3 prefixes, including generation-qualified binding packs
+and Dropbox checkpoint state. No backup algorithm, transport, restore behaviour,
+source repair, checkpoint deletion, pack cleanup, individual binding deletion or
+core pruning is added. Existing observation stale-Parquet handling is preserved.
 
-Each attempt acquires the ordinary database-local global lock with a distinct
-run ID containing the durable operation UUID and attempt number. The lock spans
-publisher, inventory, copy, verification and checkpoint publication. Acquisition
-is bounded at 60 seconds; the existing session check remains at five seconds.
-Contention does not bypass the lock. Lock loss stops descendants and blocks the
-operation for review; no force recovery or SOS-only recovery profile is selected.
-The existing liveness-pipe child supervisor also wraps the lock coordinator, so
-unexpected death of the local supervisor tears down the protected process tree.
+Lock acquisition is bounded at 60 seconds; existing same-session checks remain
+at five seconds. Contention cannot bypass the lock. Lock loss stops protected
+children and fails closed; no force recovery or SOS-specific recovery profile is
+selected. The existing liveness-pipe child supervisor also wraps the coordinator,
+so death of this local parent tears down the protected process tree.
 
-Only the existing lock connection generates Supabase traffic: roughly one
-acquisition/release pair and 720 same-session checks per hour of protected work,
-plus bounded acquisition polling on contention. There are no new database tables,
-RPCs, task-health writes or status polls. Request/log volume is the same as the
-equivalent canonical operation, with at most the configured attempt budget per
-operator review. Actual platform log bytes must be observed during TEST acceptance.
-Local completion does not create a GitHub Daily Task Health success; do not use
-this package as evidence that the dashboard freshness gate has been refreshed.
+## Daily Task Health lifecycle
 
-## Protected configuration
+The package reuses `workers/shared/daily_task_health.mjs` and the existing
+`uk_aq_public` Started, Finished, Failed and recompute RPCs, with task key
+`ops.r2_history_dropbox_backup`. The existing GitHub workflow, task definition,
+dashboard statuses, 345-minute timeout and scheduled configuration are unchanged.
+The established local Integrity reporting path uses the same RPCs and local
+provenance, but did not provide this package's durable lost-response recovery.
 
-Prerequisites: macOS, Node >=20 at a stable absolute executable path, repository
-`npm ci --ignore-scripts` dependencies, and an installed rclone supporting Dropbox
-OAuth refresh. Review the existing TEST source bucket/endpoint, database project
-and normal Dropbox destination with the operator. Installation performs local
-configuration checks only, never a remote connectivity probe.
+A local run records `source_repo=uk-aq-ops`, the repository supervisor path as
+`source_worker`, the real operation UUID as `platform_run_id`, and summary fields
+`execution_source=macbook_pro_launchd`, `platform=MBPro`, environment and actual
+launchd label/domain. Before initial reporting the supervisor verifies that the
+registered job PID is its own. No GitHub run IDs, workflow names or URLs are
+fabricated, and no credential/log-file paths are sent in the health summary.
 
-Run from the merged TEST repository checkout:
+Before any backup attempt, the supervisor atomically saves the local identity
+key/fingerprint, original UTC start time/date and exact Started payload, then
+confirms the Started UUID. The new optional RPC argument enables safe replay if
+the server committed but its response/local save was lost. All automatic backup
+attempts remain within this health run. Network/process interruption that remains
+eligible for backup retry does not report terminal Failed.
+
+After a zero locked exit and acceptance of the current invocation's reports,
+`accepted.json` and local backup completion become durable first. A separate
+Finished obligation contains immutable completion time, accepted report identity,
+verified source/processed-root identities and complete required-domain evidence.
+It reuses the normal supplemental-summary builder for timings/Parquet details.
+Only the missing health update/recompute is retried after an outage. Accepted
+backup evidence is never cleared and the backup cannot be invoked again merely
+to repair reporting. A crash between accepted.json and active.json is recovered
+by revalidating that exact invocation's reports, hashes and locked receipt.
+
+Finished/Failed confirmation and daily-status recompute are separate durable
+progress points. Local operational completion is confirmed only after both
+succeed. Health RPCs have a 15-second timeout. Transient/network/408/429/5xx errors
+use persistent 300/600/1200/2400/up-to-3600-second delays, bounded by `max_attempts`
+per health phase/review. Other 4xx and identity/configuration failures block for
+review. Unknown responses are never accepted as success. Health attempts do not
+consume backup-attempt counts. Normal health traffic is three REST RPCs per
+one-off (Started, terminal, recompute), plus bounded recovery requests. No polling
+or additional task-health table/service is introduced. The existing lock adds
+approximately 720 checks per protected hour; actual platform log bytes need TEST
+observation under the low-log contract.
+
+A permanent backup failure, exhausted backup retry budget or deliberate stop is
+terminal Failed, with its original timestamp/payload retained for reporting.
+`retry` repairs an unconfirmed health obligation without reopening a terminal
+health run. After Failed is confirmed, recovery requires explicit `new` with the
+previous UUID. That new one-off can reuse canonical authenticated Dropbox
+checkpoints; it does not discard remote progress. A temporary Started-reporting
+outage before backup can be reviewed and retried using the same operation.
+
+## Protected TEST configuration
+
+Prerequisites: macOS, Node >=20 at a stable executable path, rclone with normal
+Dropbox OAuth refresh, repository dependencies and an operator-reviewed valid v3
+source. Obtain approved TEST R2, lock database, **ObsAQIDB REST** and Dropbox values
+locally. The global lock's `SUPABASE_DB_URL` is separate from health REST credentials.
+Installation checks local configuration only and makes no remote probe.
+
+From the merged TEST Ops checkout, after the schema prerequisite:
 
 ```bash
 umask 077
@@ -86,247 +115,171 @@ chmod 600 "$BACKUP_HOME/TEST/config/rclone.conf"
 npm ci --ignore-scripts
 ```
 
-Edit `backup.json` in a local editor. Replace **every** placeholder locally; never
-paste credentials into chat, Git, shell arguments or logs. The config file must
-be an absolute canonical path ending `/TEST/config/backup.json` (or `/LIVE/...`
-for separately authorised future activation), outside this checkout. The root
-and configuration directories must be owned by the current user with mode 700;
-configuration files must be owned by that user with mode 600. Symlinked paths
-are refused. Avoid a cloud-synchronised configuration directory.
+Replace every placeholder in a local editor. Never paste credentials into chat,
+Git, command arguments or logs. Configuration must be an explicitly supplied
+absolute canonical path ending `/TEST/config/backup.json`, outside the repository.
+Private directories must be owned by the current user with mode 700 and files
+with mode 600. Symlinked paths are refused. Avoid cloud-synchronised storage.
+JSON is parsed as data; an arbitrary .env file is never executed.
 
-Configuration is JSON, never executable shell or a sourced `.env`. Unknown
-environment keys and arbitrary backup options are rejected. The `identity`
-section pins the reviewed endpoint, bucket, database project ref and Dropbox
-root/directory. Corresponding existing environment keys must agree exactly.
-Pins are an operator-reviewed environment manifest, not automatically discovered
-authority; review them against the existing TEST configuration before filling
-credentials. The Dropbox root's first component must equal `environment`.
-The direct PostgreSQL URL must select `db.<project-ref>.supabase.co:5432/postgres`
-with `sslmode=require` or `verify-full`; transaction poolers are refused. If the
-Mac cannot reach the direct endpoint, resolve that networking prerequisite rather
-than substituting an unapproved pooler. URL-encode the database password locally.
+The `identity` section pins endpoint, bucket, lock PostgreSQL project, separate
+`obs_aqidb_project_ref`, and Dropbox root/directory. Runtime values must agree
+exactly. These are reviewed pins, not discovery; verify them together against the
+approved TEST configuration. The Dropbox root's first component must equal TEST.
+The lock URL must select `db.<project-ref>.supabase.co:5432/postgres` with
+`sslmode=require` or `verify-full`; transaction poolers are refused. URL-encode the
+password locally. Resolve direct-endpoint networking rather than substituting
+an unapproved database transport.
 
-Use the existing `CFLARE_R2_*`, `SUPABASE_DB_URL`, `DROPBOX_APP_KEY`,
-`DROPBOX_APP_SECRET`, `DROPBOX_REFRESH_TOKEN`, `UK_AQ_DROPBOX_ROOT`,
-`UK_AQ_R2_HISTORY_DROPBOX_DIR`, `UK_AQ_R2_HISTORY_VERSION` and checkpoint keys as
-shown in the example. There are no new shared environment variables or env-sync
-targets. Local-only JSON keys select the rclone executable/config, reviewed
-identity, retry budget and inactive-by-default LIVE activation. `max_attempts`
-must be 1–20; five is the recommended starting budget. Credential rotation is
-allowed during a stopped operation without changing its source identity;
-changing identity, destination, installation root, retry budget or checkpoint
-controls requires an explicit new operation.
+Health requires existing names `OBS_AQIDB_SUPABASE_URL` and `OBS_AQIDB_SECRET_KEY`.
+The URL must exactly match the separately pinned ObsAQIDB project. It is never
+inferred from the lock database or an inherited environment. Health credentials
+are excluded from the backup child's environment. All inherited backend, Node,
+rclone, lock-held and debug overrides are excluded. Plists contain only executable,
+repository/config paths, environment label and output paths. No new shared
+repository environment variable or env-sync target is required; the JSON pin is
+local-only because health and lock projects must be reviewed independently.
 
-Configure **only** these two remotes in the dedicated protected file:
+Existing R2/Dropbox/checkpoint key names are retained in the example. A fingerprint
+binds source/destination, installation, generation/mode, both reviewed database
+identities and retry/checkpoint controls. Credential rotation does not change it;
+identity/control changes require a new operation after settling prior reporting.
+`max_attempts` is 1–20 (default example 5). Unreported old backup-only state is not
+silently retrofitted with a fictitious Started event; retain it for operator review.
+
+Configure only these two remotes in the dedicated file:
 
 ```bash
 rclone --config "$BACKUP_HOME/TEST/config/rclone.conf" config
 chmod 600 "$BACKUP_HOME/TEST/config/rclone.conf"
 ```
 
-Enter secrets at the interactive prompts; do not pass them as arguments.
+Enter secrets at interactive prompts. `uk_aq_r2` uses S3/Cloudflare, explicit
+`env_auth=false`, and exactly the JSON's endpoint, region and access/secret keys;
+optional `acl=private` and `no_check_bucket=true` are supported. `uk_aq_dropbox`
+uses the approved app's client ID/secret and token JSON with access token, refresh
+token and expiry. These must match `DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET` and
+`DROPBOX_REFRESH_TOKEN` in protected JSON. Normal OAuth refresh updates this
+writable file; access-token-only or password-prompt encrypted configs are not
+supported. Do not substitute `rclone obscure` output for literal service secrets.
 
-* `uk_aq_r2`: `type=s3`, `provider=Cloudflare`, `env_auth=false`, the same endpoint,
-  region and R2 access/secret keys as the JSON. Optional `acl=private` and
-  `no_check_bucket=true` are supported. No other remote options are accepted.
-* `uk_aq_dropbox`: `type=dropbox`, the existing approved Dropbox application's
-  `client_id`/`client_secret`, and its OAuth `token` JSON containing access token,
-  refresh token and expiry. Complete the usual rclone OAuth consent procedure
-  for the approved account. Existing `DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET` and
-  `DROPBOX_REFRESH_TOKEN` values in `backup.json` must match these rclone settings
-  exactly. The shared canonical guard checks the installed rclone provider schema
-  and the effective literal secret representation; do not insert `rclone obscure`
-  output in place of the actual service secrets. Normal rclone refresh updates this
-  dedicated writable file. Do not configure an access-token-only remote.
+The existing shared remote guard inspects local `config providers` and `config
+dump`, with 15-second bounds, to verify backend credential representation and
+exact effective identities. The dump is captured only in memory, never logged or
+saved. Unsupported account/path/backend overrides fail closed. Review the actual
+Dropbox account and manifest pins; the program cannot infer intent from labels.
 
-Do not use an encrypted rclone config requiring an interactive password here.
-Before every attempt the shared guard uses local-only captured `rclone config
-providers` and `rclone config dump` to validate remote types, supported credential
-representation, the exact R2 endpoint/region/credentials and Dropbox application
-and refresh-token identities. Each local command has a 15-second timeout. The
-dump is never printed or saved. The dedicated Dropbox token/account and manifest pins need operator
-review; the program cannot infer the intended account from a label alone.
-Inherited R2/Dropbox/rclone settings, lock-held variables, arbitrary env overrides,
-Node options and debug settings are not passed to the child. The plist contains
-only executable, repository/config paths, environment label and output paths.
+## Scheduling, installation and operation
 
-## Pause coordination before starting
+Before an extended run, an authorised operator must pause the TEST backup dispatch
+and conflicting scheduled Prune/Integrity/SOS-light/migration operations through
+normal Cloudflare/GitHub controls. Record previous settings and wait for active
+conflicting operations to finish. Coordinate generation-coupled Core/binding
+publishers as required by the normal runbook, and verify any required first-post-v3
+write acceptance gates. This package never changes schedules automatically.
+The global lock remains mandatory despite the pause.
 
-An operator must pause the TEST R2 backup dispatch and conflicting scheduled
-Prune/Integrity/SOS-light/migration operations through their normal authorised
-Cloudflare/GitHub controls before this extended run. Record precisely what was
-paused and its previous values, wait for active conflicting operations to finish,
-and verify any required first-post-v3-write acceptance gates independently.
-Coordinate generation-coupled Core/binding publishers as required by the normal
-runbook. The global lock remains mandatory despite the pause. This package
-never disables a schedule or changes GitHub/Cloudflare settings automatically.
-
-## Install, initiate, inspect and stop TEST
-
-Commands use the installed Node from your interactive PATH. Install records its
-resolved absolute path for launchd. Do not use `sudo`; this is a per-user agent.
+Use the intended Node on your interactive PATH, without sudo. Installation records
+its resolved absolute executable path and leaves the agent idle:
 
 ```bash
-# Write and validate the TEST plist; no bootstrap and no backup.
 ./local/history_dropbox_backup/install.sh --environment TEST --config "$BACKUP_CONFIG"
-
-# Explicitly create the first one-off and bootstrap/kickstart its LaunchAgent.
 node local/history_dropbox_backup/control.mjs start --environment TEST --config "$BACKUP_CONFIG"
-
 ./local/history_dropbox_backup/status.sh --environment TEST --config "$BACKUP_CONFIG"
 launchctl print "gui/$(id -u)/uk.co.ukaq.history-dropbox-backup.test"
 tail -F "$BACKUP_HOME/TEST/launchd/stdout.log" "$BACKUP_HOME/TEST/launchd/stderr.log"
+```
 
-# Publish durable stop intent, boot out only this service, wait for graceful exit.
+Status includes backup status, health status/UUID/original scheduled date, last
+bounded error, next reporting time and `operational_completion_confirmed`.
+A completed backup with pending/blocked health is explicitly distinguished from
+backup-plus-health confirmed. Ready, Running, Retrying, Blocked and Not configured
+remain local backup/config states; they do not invent remote task-health statuses.
+
+```bash
+# Deliberately cancel; retain evidence and queue terminal Failed if backup was active.
 ./local/history_dropbox_backup/stop.sh --environment TEST --config "$BACKUP_CONFIG"
-```
 
-The status JSON gives the current report/log directories, operation UUID, attempt
-counts, last bounded error category, next eligible attempt, timestamps and
-completed report identity. Follow an individual attempt using the paths it prints:
-
-```bash
-tail -F "/absolute/attempt-log-directory/stdout.log" "/absolute/attempt-log-directory/stderr.log"
-```
-
-After operator review and correction, copy the exact UUID from status:
-
-```bash
-# Same one-off, retained attempt count/checkpoints; resets only its review budget.
+# After review, reset only the pending reporting budget when backup is terminal.
 node local/history_dropbox_backup/control.mjs retry --environment TEST --config "$BACKUP_CONFIG" --operation REPLACE_WITH_OPERATION_UUID
 
-# A different backup after a terminal operation; archives previous local state first.
+# Once prior reporting is confirmed, explicitly create another one-off.
 node local/history_dropbox_backup/control.mjs new --environment TEST --config "$BACKUP_CONFIG" --operation REPLACE_WITH_PREVIOUS_OPERATION_UUID
 
-# Stop and remove only this plist, retaining all config, state, reports and logs.
+# Remove only this agent/plist, keeping all configuration, reports and state.
 ./local/history_dropbox_backup/uninstall.sh --environment TEST --config "$BACKUP_CONFIG"
 ```
 
-`retry` accepts only a blocked operation with unchanged identity. `new` accepts
-only a terminal completed/blocked operation and its exact previous UUID. Neither
-can reset an active supervisor. If starting/retrying was interrupted before
-bootstrap, run `start` again. Repeated `start` on a completed task does no work.
-Stop/uninstall do not require working remote credentials. Reinstallation alone
-does not clear the durable stop marker; use reviewed `retry` to resume.
+`new` refuses unresolved prior health obligations. A deliberate bootout stops the
+reporter too: use reviewed `retry` to reconcile its retained obligation before
+creating another one-off or uninstalling. If uninstall is necessary first, reports
+remain pending; reinstall then retry reporting. Starting a completed one-off only
+reconciles pending health or exits; it never repeats accepted backup work. A
+confirmed terminal health run cannot be reopened by `retry`; use `new`.
 
-## Restart, evidence and circuit breaker
-
-Launchd has `RunAtLoad=true`, `KeepAlive={SuccessfulExit=false}`, background
-process type and `ThrottleInterval=300`. It has no total job timeout and never
-unconditionally repeats successful backups. It restarts nonzero/crashed attempts
-after throttling. The supervisor also persists exponential eligibility delays
-of 300, 600, 1200, 2400, then at most 3600 seconds. A start before eligibility
-returns nonzero without contacting any remote. A crash/reboot consumes the
-already-recorded attempt and adds a minimum five-minute delay. A reboot resumes
-the LaunchAgent **after this user logs in**, not necessarily before login.
+Launchd uses RunAtLoad, KeepAlive/SuccessfulExit=false, Background process type,
+300-second throttle and separate stdout/stderr. There is no overall job timeout
+or unconditional successful-backup repetition. Blocked exits zero to quiesce
+launchd; that alone never means operational success. Nonzero/crashed attempts are
+eligible for restart. Backup retry delays are also durable and bounded; a reboot
+consumes the recorded interrupted attempt and adds a five-minute delay. Agents
+resume **after user login**, not necessarily before login following a reboot.
 Keep the Mac powered, awake, online and with adequate private disk space.
 
-Status meanings:
+Private directories are `config/`, `state/`, `reports/<operation>/<UTC_UUID>/`,
+`attempt-logs/<operation>/<UTC_UUID>/` and `launchd/`. `state/active.json` carries
+separate `successful_completion` and `health` evidence; prior operations are
+retained under `state/operations/`. Stop intent and supervision-review markers
+survive reboot. Atomic publications use same-directory temporary files, fsync,
+rename, directory fsync, mode 600 and umask 077. The local boot/PID mutex is not
+the PostgreSQL lock. An incomplete owner record requires stopping and verifying
+all descendants are gone before retaining/renaming the local lock directory;
+never force a remote lock based on it. Normal logs redact known secrets and
+credential-shaped values. Error summaries contain fixed categories. Reports and
+logs remain private evidence; review before sharing. Monitor disk space; no
+automatic evidence deletion or log rotation is introduced.
 
-| Status | Meaning |
-|---|---|
-| Not configured | Protected JSON is absent. |
-| Ready | Valid local config; no active operation, or explicit operation awaiting launch. |
-| Running | An attempt is active. |
-| Retrying | An interrupted/transient failure awaits launchd and its durable delay. |
-| Blocked | Operator stop, permanent/config/auth/lock-loss failure, invalid evidence or exhausted attempt budget; review required. |
-| Completed | This operation's accepted reports and successful completion marker were atomically published. |
+## Post-merge real TEST acceptance and rollback
 
-The circuit breaker stops immediately on detected permanent authentication,
-configuration/identity or lock-loss errors. Other nonzero exits, network errors
-and unclassified failures get at most the configured budget. A novel permanent
-failure that cannot be classified therefore still stops after that budget; no
-endless R2/Dropbox/PostgreSQL retry loop is possible. Blocked runs deliberately
-exit zero to quiesce launchd, so **launchd exit zero alone is not backup success**.
-Status and the completion marker distinguish blocked from completed. Before
-rearming, inspect retained stderr/reports and correct the underlying cause.
+1. Record both merged commits. Separately apply/verify the TEST ObsAQIDB migration
+   and PostgREST schema refresh; confirm approved configuration, permissions,
+   source generation and writer/scheduler gates. Install idle; no backup should start.
+2. Initiate a real authorised one-off. Confirm exactly one Started row for the
+   existing task key, genuine local provenance, original UTC date and saved UUID;
+   inspect normal lock diagnostics and 15-second elapsed-time heartbeats.
+3. During justified TEST work, observe interruption/network loss/reboot and login.
+   Confirm the same health UUID and authenticated checkpoint resume, no unlocked
+   progress and no duplicate logical row. Observe persistent failures through
+   bounded breaker behaviour. A deliberate stop is terminal cancellation.
+4. Allow a complete backup, inspect accepted report hashes/locked exit and exact
+   v3 observation/binding roots plus all required domains. Observe a health outage
+   if available: local backup evidence must remain complete while only reporting
+   retries. Confirm Finished and recompute, immutable completion time, correct
+   summary and `operational_completion_confirmed=true`.
+5. Start/login again: no extra backup attempt. Review Failed/report-only retry,
+   explicit new-operation creation, retention and TEST/LIVE separation. Record
+   actual Supabase log impact and restore precisely the paused schedules after
+   the protected process is gone and the operator accepts completion.
 
-The retry runs the exact canonical command again. Only authenticated current
-Dropbox checkpoints decide what work is already complete; local attempt logs
-never substitute for checkpoint authority. Neither stop nor retry removes remote
-progress. No old report path is reused: every invocation has a fresh timestamped
-UUID directory, a run receipt, distinct logs and report hashes. Completion requires
-zero locked command exit, the same run's lock-held receipt, current publisher and
-inventory success, full non-dry-run v3/pack reports, matching observation and
-binding source/processed roots, verified pack root/checkpoint evidence, complete
-Core/runs/latest-timeseries and any active verification domain. Incomplete, absent,
-contradictory or stale reports block completion.
+Pre-deployment checks are documented in the linked integration guide: syntax,
+JSON/plist/whitespace, existing relevant checks and only the two focused identity
+and accepted-backup reporting boundary checks. No real RPC, migration, backup or
+launchd installation was performed during implementation. Rollback stops/uninstalls
+only this agent and retains all evidence; settle pending health first where
+possible. Restore only operator-paused schedules. Existing normal backup execution
+can consume authenticated checkpoints. Do not delete packs/bindings/checkpoints.
 
-Directories under the environment root are separate:
+## Complete future LIVE promotion scope
 
-```text
-config/                 protected JSON and writable dedicated rclone.conf
-state/active.json       durable one-off identity, attempts, status and completion
-state/operations/       retained prior terminal operation snapshots
-state/stop.json         durable deliberate stop intent
-state/supervision-block.json  fail-closed local supervision errors requiring review
-state/supervisor.lock/  local same-installation exclusion (not the PostgreSQL lock)
-reports/<operation>/<UTC timestamp_UUID>/  invocation, domain reports and acceptance
-attempt-logs/<operation>/<UTC timestamp_UUID>/  redacted stdout/stderr/supervisor logs
-launchd/                separate environment stdout/stderr
-```
-
-State is written by same-directory temporary file, fsync, rename and directory
-fsync with mode 600; private directories use 700 and umask 077. State is retained
-before explicitly initiating a new operation. Same-boot live local-lock owners
-are never displaced; dead owners/previous boot IDs are reclaimable. An incomplete
-local lock owner record fails closed for manual review: boot out the service,
-verify no supervisor/coordinator/backup descendants remain, retain the directory
-as evidence and rename it locally before retrying. Never infer that the remote
-PostgreSQL lock should be broken or recovered from this local record.
-
-Normal logs redact known R2/DB/OAuth secrets and credential-shaped fields; no
-configuration or command environments are dumped. Error summaries contain only
-bounded categories. Reports and logs are still private operational evidence;
-review before sharing. Existing domain reports are retained unchanged in private
-directories. No automatic evidence/log deletion or rotation is added; monitor
-disk capacity and archive retained local evidence only after the run is stopped.
-
-## Post-merge TEST acceptance (operator-authorised real work)
-
-1. Verify merged commit, Node/rclone/dependencies, protected permissions, reviewed
-   TEST identity pins, accepted v3 source and any post-write verification gates.
-   Record scheduler pauses and an initial Dropbox checkpoint identity.
-2. Install idle. Status must be Ready and no backup should start. Initiate one
-   one-off explicitly; confirm Running, fresh per-attempt reports/logs, redacted
-   output, approximately 15-second elapsed-time heartbeats and the expected
-   lock owner/run ID. Inspect existing canonical lock diagnostics; do not add
-   database modifications or broad polling merely for acceptance.
-3. During authorised real TEST work, stop deliberately and verify checkpoint
-   evidence survives. Review and retry the same UUID; verify it resumes through
-   canonical authenticated checkpoints and does not duplicate accepted work.
-   Also observe an unexpected process failure/network interruption and a reboot
-   with login under operator control. Confirm no orphan protected command and
-   no unlocked publisher/inventory/sync progress.
-4. Observe a real contention/failure condition when available. Confirm nonzero
-   attempts are bounded/delayed, lock loss fails closed, persistent/auth failures
-   become Blocked, and manual reviewed retry preserves total attempt history.
-   Do not manufacture a bad credential or change live remote state just to test.
-5. Allow a full real TEST run to finish. Inspect `accepted.json`, its report
-   hashes and `locked-exit.json`; inspect the current generation-scoped Dropbox
-   checkpoint and exact observation/binding roots under the normal runbook.
-   Require all listed domains and verified packs complete, no dry-run/packs-only
-   shortcut, and the matching successful completion marker.
-6. Start/login again: the same one-off must remain Completed without another
-   backup attempt. Review status/stop/retry/uninstall behaviour, retained evidence
-   and TEST/LIVE local separation. Record actual Supabase log impact and any
-   missing acceptance evidence. Restore precisely the paused scheduler settings
-   after the lock is released and the operator accepts completion.
-
-These are post-deployment real-operation acceptance steps, not a speculative
-pre-deployment suite. Implementation verification is limited to Node/shell syntax,
-JSON parsing, plist parsing and whitespace checks; no backup was run for this PR.
-
-## Future LIVE promotion and rollback
-
-After TEST operational acceptance and separate explicit LIVE authorisation, the
-complete new-file promotion scope is exactly:
+Promote identical application files after TEST acceptance and separate explicit
+LIVE authorisation, excluding TEST archives and all credentials/runtime evidence:
 
 ```text
 local/history_dropbox_backup/config.mjs
 local/history_dropbox_backup/control.mjs
 local/history_dropbox_backup/supervisor.mjs
 local/history_dropbox_backup/reports.mjs
+local/history_dropbox_backup/health.mjs
 local/history_dropbox_backup/LaunchAgent.plist.template
 local/history_dropbox_backup/config.example.json
 local/history_dropbox_backup/install.sh
@@ -334,34 +287,21 @@ local/history_dropbox_backup/status.sh
 local/history_dropbox_backup/stop.sh
 local/history_dropbox_backup/uninstall.sh
 local/history_dropbox_backup/README.md
+local/history_dropbox_backup/daily_task_health_dependency.md
+workers/shared/daily_task_health.mjs
 ```
 
-Promote these complete identical files; exclude TEST archives, credentials,
-generated plists, runtime directories and acceptance evidence. The existing
-canonical coordinator, child supervisor, locked backup runner, pack publisher,
-inventory, sync, shared generation/lock helpers and their transitive modules,
-`package.json` and lockfile must already be the accepted matching version in the
-destination checkout. In particular, `scripts/backup_r2/lib/history_backup_targets.mjs`
-and the canonical entrypoint changes documented in
-`scripts/backup_r2/README.shared_binding_pack_promotion.md` must be promoted and
-accepted together before LIVE activation. This PR modifies none of those canonical
-files. Never bypass their provider-schema, credential or remote-identity guards.
+The Schema promotion includes the canonical owner and new migration named in the
+linked guide. Validation sources are `tests/local_history_backup_health.test.mjs`
+in Ops and `tests/check_daily_task_started_execution_identity.py` plus the updated
+`tests/test_daily_task_started_github_idempotency.py` in Schema. Existing canonical
+backup coordinator, child supervisor, runner, publisher, inventory, sync, shared
+generation/lock/remote guards and transitive dependencies/package lock must already
+match the accepted TEST version, including `history_backup_targets.mjs` and the
+changes listed in `scripts/backup_r2/README.shared_binding_pack_promotion.md`.
 
-Only then prepare a separately reviewed protected LIVE config and remotes under
-`LIVE/config`, with LIVE source/database/destination identities and explicit
-`live_activation_authorized=true`. Use the same commands with `--environment LIVE`
-and the LIVE config path. Do not reuse TEST state, rclone files or destination
-paths. LIVE scheduling pause, installation, initiation and acceptance each remain
-part of that future authorised operation; none is performed by this PR.
-
-Rollback: stop/uninstall this one LaunchAgent and retain all evidence. This PR
-changes no existing service or schedule. Restore only the schedules the operator
-paused, after verifying no local protected process remains. Existing normal
-workflow execution can consume the same authenticated remote checkpoints; do
-not delete packs, bindings or completion evidence to roll back the local runner.
-
-System-doc handover for Chat mode: document this optional local one-off execution
-profile, its launchd lifecycle, protected JSON pins, durable breaker/completion
-semantics, preserved global-lock/canonical backup boundary and operational TEST
-acceptance once performed. There are no schema migrations or shared env-sync
-changes. Authoritative `system_docs/` has not been edited.
+LIVE needs its own applied/verified ObsAQIDB migration, independently reviewed
+LIVE lock/health/R2/Dropbox identities, `LIVE/config`, and explicit
+`live_activation_authorized=true`. Source promotion alone does not apply SQL or
+activate the agent. No LIVE repository or service was changed. Chat-mode system-doc
+handover is in the linked guide; authoritative system_docs remains unchanged.

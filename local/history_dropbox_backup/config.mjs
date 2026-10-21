@@ -78,6 +78,7 @@ export function prepare(p) {
 const requiredEnv = ["CFLARE_R2_ENDPOINT", "CFLARE_R2_BUCKET", "CFLARE_R2_REGION",
   "CFLARE_R2_ACCESS_KEY_ID", "CFLARE_R2_SECRET_ACCESS_KEY", "SUPABASE_DB_URL",
   "DROPBOX_APP_KEY", "DROPBOX_APP_SECRET", "DROPBOX_REFRESH_TOKEN",
+  "OBS_AQIDB_SUPABASE_URL", "OBS_AQIDB_SECRET_KEY",
   "UK_AQ_DROPBOX_ROOT", "UK_AQ_R2_HISTORY_DROPBOX_DIR", "UK_AQ_R2_HISTORY_VERSION",
   "UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS", "UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS"];
 export function load(p) {
@@ -92,7 +93,7 @@ export function load(p) {
     && c.env[key].length > 0 && !/[\r\n\0]/.test(c.env[key]));
   requireSafe(c.env.UK_AQ_R2_HISTORY_VERSION === "v3");
   const id = c.identity;
-  requireSafe(id && Object.keys(id).sort().join(",") === "dropbox_directory,dropbox_root,postgres_project_ref,r2_bucket,r2_endpoint");
+  requireSafe(id && Object.keys(id).sort().join(",") === "dropbox_directory,dropbox_root,obs_aqidb_project_ref,postgres_project_ref,r2_bucket,r2_endpoint");
   requireSafe(c.env.CFLARE_R2_BUCKET === id.r2_bucket && /^[a-z0-9][a-z0-9.-]+$/.test(id.r2_bucket));
   const endpoint = new URL(c.env.CFLARE_R2_ENDPOINT);
   requireSafe(endpoint.href === `${id.r2_endpoint}/` && endpoint.protocol === "https:"
@@ -119,6 +120,8 @@ export function load(p) {
   requireSafe(path.dirname(c.rclone_config) === path.dirname(p.config));
   privatePath(c.rclone_config);
   fs.accessSync(c.rclone_bin, fs.constants.X_OK);
+  requireSafe(/^[a-z0-9]{20}$/.test(id.obs_aqidb_project_ref));
+  requireSafe(c.env.OBS_AQIDB_SUPABASE_URL === `https://${id.obs_aqidb_project_ref}.supabase.co`, "health_identity");
   const source = `uk_aq_r2:${resolveHistoryBackupR2(c.env).bucket}`;
   const destination = configuredHistoryDropboxRoot(c.env);
   assertHistoryBackupSource(source, c.env); assertHistoryBackupDestination(destination, c.env);
@@ -136,7 +139,9 @@ export function childEnvironment(c, p) {
     "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS"]) {
     if (process.env[key]) env[key] = process.env[key];
   }
-  return { ...env, ...c.env, PATH: `${path.dirname(process.execPath)}:${path.dirname(c.rclone_bin)}:/usr/bin:/bin:/usr/sbin:/sbin`,
+  const backupEnv = Object.fromEntries(Object.entries(c.env).filter(([key]) =>
+    !["OBS_AQIDB_SUPABASE_URL", "OBS_AQIDB_SECRET_KEY"].includes(key)));
+  return { ...env, ...backupEnv, PATH: `${path.dirname(process.execPath)}:${path.dirname(c.rclone_bin)}:/usr/bin:/bin:/usr/sbin:/sbin`,
     RCLONE_CONFIG: c.rclone_config, UK_AQ_R2_HISTORY_BACKUP_RCLONE_BIN: c.rclone_bin,
     UKAQ_ENV_NAME: p.environment };
 }
@@ -172,6 +177,14 @@ export function active(p) {
     && /^[a-f0-9]{64}$/.test(s.last_accepted_report?.report_identity)
     && s.successful_completion.report_identity === s.last_accepted_report.report_identity
     && Number.isFinite(Date.parse(s.completed_at)), "completion_marker_invalid");
+  if (s?.health) requireSafe(s.health.version === 1 && s.health.operation_id === s.operation_id
+    && s.health.identity?.key === `launchd:${p.environment}:${s.operation_id}`
+    && s.health.identity.fingerprint === s.configuration_identity
+    && s.health.input?.platform_run_id === s.operation_id
+    && s.health.input.started_at === s.started_at
+    && s.health.input.scheduled_for_date === s.started_at.slice(0, 10)
+    && ["pending", "started", "blocked", "confirmed"].includes(s.health.status)
+    && (!s.health.terminal || ["finished", "failed"].includes(s.health.terminal.kind)), "health_state_invalid");
   return s;
 }
 export function bootId() {

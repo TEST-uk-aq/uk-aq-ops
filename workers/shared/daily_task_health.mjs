@@ -161,6 +161,13 @@ export function summarizeForDailyTaskHealth(value) {
 
 export function createDailyTaskHealthClient(options = {}) {
   const env = options.env || process.env;
+  // Opt-in transport controls preserve existing callers' defaults.
+  const fetchImpl = options.fetchImpl || ((...args) => globalThis.fetch(...args));
+  const emitHealth = options.logHealth || logHealth;
+  const requestTimeoutMs = options.requestTimeoutMs ?? 0;
+  if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 0) {
+    throw new Error("Invalid daily task health request timeout");
+  }
   const strict = parseBoolean(options.strict ?? env.DAILY_TASK_HEALTH_STRICT, false);
   const disabled = parseBoolean(options.disabled ?? env.DAILY_TASK_HEALTH_DISABLED, false);
   const recomputeDisabled = parseBoolean(
@@ -188,7 +195,7 @@ export function createDailyTaskHealthClient(options = {}) {
     if (disabled) {
       if (!disabledLogged) {
         disabledLogged = true;
-        logHealth("INFO", "daily_task_health_disabled", {
+        emitHealth("INFO", "daily_task_health_disabled", {
           reason: "DAILY_TASK_HEALTH_DISABLED",
         });
       }
@@ -198,7 +205,7 @@ export function createDailyTaskHealthClient(options = {}) {
       const message = "Daily task health reporting skipped: missing Supabase URL or service role key.";
       if (!missingConfigLogged) {
         missingConfigLogged = true;
-        logHealth("WARNING", "daily_task_health_missing_config", {
+        emitHealth("WARNING", "daily_task_health_missing_config", {
           has_supabase_url: Boolean(supabaseUrl),
           has_supabase_key: Boolean(supabaseKey),
         });
@@ -210,8 +217,10 @@ export function createDailyTaskHealthClient(options = {}) {
     }
 
     const url = `${supabaseUrl}/rest/v1/rpc/${name}`;
+    const controller = requestTimeoutMs ? new AbortController() : null;
+    const timeout = controller ? setTimeout(() => controller.abort(), requestTimeoutMs) : null;
     try {
-      const response = await fetch(url, {
+      const response = await fetchImpl(url, {
         method: "POST",
         headers: {
           apikey: supabaseKey,
@@ -221,10 +230,13 @@ export function createDailyTaskHealthClient(options = {}) {
           "Content-Profile": rpcSchema,
         },
         body: JSON.stringify(jsonSafe(body)),
+        ...(controller ? { signal: controller.signal } : {}),
       });
       const text = await response.text();
       if (!response.ok) {
-        throw new Error(`RPC ${name} failed (${response.status}): ${truncateText(text, 1000)}`);
+        const error = new Error(`RPC ${name} failed (${response.status}): ${truncateText(text, 1000)}`);
+        error.httpStatus = response.status;
+        throw error;
       }
       if (!text.trim()) {
         return null;
@@ -232,7 +244,7 @@ export function createDailyTaskHealthClient(options = {}) {
       return JSON.parse(text);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      logHealth("WARNING", "daily_task_health_rpc_failed", {
+      emitHealth("WARNING", "daily_task_health_rpc_failed", {
         rpc: name,
         error: truncateText(message, DEFAULT_ERROR_TEXT_LIMIT),
       });
@@ -240,6 +252,8 @@ export function createDailyTaskHealthClient(options = {}) {
         throw error;
       }
       return null;
+    } finally {
+      if (timeout) clearTimeout(timeout);
     }
   }
 
@@ -256,11 +270,16 @@ export function createDailyTaskHealthClient(options = {}) {
     const payload = {
       ...baseInput(input),
       task_key: input.task_key || input.taskKey,
+      ...(input.started_at ? { started_at: input.started_at } : {}),
     };
     if (!payload.task_key) {
       throw new Error("daily task health task_key is required");
     }
-    const runId = await rpc("uk_aq_rpc_daily_task_started", { p: payload });
+    const runId = await rpc("uk_aq_rpc_daily_task_started", {
+      p: payload,
+      // A separate RPC argument fails before mutation against the old one-arg RPC.
+      ...(input.execution_identity ? { p_execution_identity: input.execution_identity } : {}),
+    });
     return typeof runId === "string" ? runId : null;
   }
 
@@ -268,7 +287,7 @@ export function createDailyTaskHealthClient(options = {}) {
     if (!runId) {
       return null;
     }
-    const payload = baseInput(input);
+    const payload = { ...baseInput(input), ...(input.finished_at ? { finished_at: input.finished_at } : {}) };
     const result = await rpc("uk_aq_rpc_daily_task_finished", {
       p_run_id: runId,
       p: payload,
@@ -284,6 +303,7 @@ export function createDailyTaskHealthClient(options = {}) {
     const errorJson = formatDailyTaskError(error);
     const payload = {
       ...baseInput(input),
+      ...(input.failed_at ? { failed_at: input.failed_at } : {}),
       error_message: input.error_message || input.errorMessage || errorJson.message,
       error: input.error || errorJson,
     };
