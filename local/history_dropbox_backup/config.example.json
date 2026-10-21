@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "environment": "TEST",
+  "live_activation_authorized": false,
+  "identity": {
+    "r2_endpoint": "https://REPLACE_WITH_ACCOUNT_ID.r2.cloudflarestorage.com",
+    "r2_bucket": "REPLACE_WITH_APPROVED_BUCKET",
+    "postgres_project_ref": "REPLACE_WITH_PROJECT_REF",
+    "dropbox_root": "TEST",
+    "dropbox_directory": "REPLACE_WITH_APPROVED_BACKUP_DIRECTORY",
+    "obs_aqidb_project_ref": "REPLACE_WITH_HEALTH_PROJECT_REF"
+  },
+  "env": {
+    "CFLARE_R2_ENDPOINT": "https://REPLACE_WITH_ACCOUNT_ID.r2.cloudflarestorage.com",
+    "CFLARE_R2_BUCKET": "REPLACE_WITH_APPROVED_BUCKET",
+    "CFLARE_R2_REGION": "auto",
+    "CFLARE_R2_ACCESS_KEY_ID": "REPLACE_LOCALLY",
+    "CFLARE_R2_SECRET_ACCESS_KEY": "REPLACE_LOCALLY",
+    "DROPBOX_APP_KEY": "REPLACE_LOCALLY",
+    "DROPBOX_APP_SECRET": "REPLACE_LOCALLY",
+    "DROPBOX_REFRESH_TOKEN": "REPLACE_LOCALLY",
+    "SUPABASE_DB_URL": "postgresql://postgres:REPLACE_WITH_URL_ENCODED_PASSWORD@db.REPLACE_WITH_PROJECT_REF.supabase.co:5432/postgres?sslmode=require",
+    "UK_AQ_DROPBOX_ROOT": "TEST",
+    "UK_AQ_R2_HISTORY_DROPBOX_DIR": "REPLACE_WITH_APPROVED_BACKUP_DIRECTORY",
+    "UK_AQ_R2_HISTORY_VERSION": "v3",
+    "UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS": "10",
+    "UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS": "60",
+    "OBS_AQIDB_SUPABASE_URL": "https://REPLACE_WITH_HEALTH_PROJECT_REF.supabase.co",
+    "OBS_AQIDB_SECRET_KEY": "REPLACE_LOCALLY"
+  },
+  "rclone_bin": "/opt/homebrew/bin/rclone",
+  "rclone_config": "/Users/REPLACE/Library/Application Support/UK AQ/history-dropbox-backup/TEST/config/rclone.conf",
+  "max_attempts": 5
+}
