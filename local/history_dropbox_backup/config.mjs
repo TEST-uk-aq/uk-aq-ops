@@ -100,12 +100,24 @@ export function load(p) {
     && /^[a-f0-9]{32}\.r2\.cloudflarestorage\.com$/.test(endpoint.hostname)
     && !endpoint.username && !endpoint.password && !endpoint.search && !endpoint.hash);
   // Preserve the stable-session database boundary; transaction poolers are ineligible.
-  const db = new URL(c.env.SUPABASE_DB_URL);
+  let db, username, password;
+  try {
+    db = new URL(c.env.SUPABASE_DB_URL);
+    username = decodeURIComponent(db.username);
+    password = decodeURIComponent(db.password);
+  } catch { requireSafe(false); } // Never expose a malformed credential-bearing URL.
+  const direct = db.hostname === `db.${id.postgres_project_ref}.supabase.co`
+    && (!db.port || db.port === "5432");
+  const sessionPooler = /^aws-[0-9]+-[a-z]{2}(?:-[a-z]+)+-[0-9]+\.pooler\.supabase\.com$/.test(db.hostname)
+    && db.port === "5432" && username === `postgres.${id.postgres_project_ref}`;
+  // pg accepts query overrides for identity and TLS, including uselibpqcompat.
+  // Permit one secure sslmode only, so the URL checked here is the URL pg uses.
   requireSafe(["postgres:", "postgresql:"].includes(db.protocol)
     && /^[a-z0-9]{20}$/.test(id.postgres_project_ref)
-    && db.hostname === `db.${id.postgres_project_ref}.supabase.co`
-    && (!db.port || db.port === "5432") && db.username && db.password
-    && db.pathname === "/postgres" && ["require", "verify-full"].includes(db.searchParams.get("sslmode")));
+    && (direct || sessionPooler) && username.trim() && password.trim()
+    && !/[\s#]/.test(c.env.SUPABASE_DB_URL) && !/[\x00-\x1f\x7f]/.test(username + password)
+    && db.pathname === "/postgres" && db.searchParams.size === 1
+    && ["require", "verify-full"].includes(db.searchParams.get("sslmode")));
   requireSafe(c.env.UK_AQ_DROPBOX_ROOT === id.dropbox_root
     && c.env.UK_AQ_R2_HISTORY_DROPBOX_DIR === id.dropbox_directory);
   // Explicit environment partition; no fallback to another environment's destination.
