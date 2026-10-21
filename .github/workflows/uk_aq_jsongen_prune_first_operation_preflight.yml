@@ -1,0 +1,198 @@
+name: TEST JSONgen Prune first-operation preflight (read-only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-jsongen-prune-first-operation-preflight
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    if: github.repository == 'TEST-uk-aq/uk-aq-ops' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      UK_AQ_ENV_NAME: TEST
+      UK_AQ_R2_HISTORY_VERSION: \${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
+      UK_AQ_R2_HISTORY_PHASE_B_ENABLED: \${{ vars.UK_AQ_R2_HISTORY_PHASE_B_ENABLED || 'true' }}
+      UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED: \${{ vars.UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED || 'false' }}
+      UK_AQ_JSONGEN_PRUNE_SIGNER_URL: \${{ vars.UK_AQ_JSONGEN_PRUNE_SIGNER_URL || '' }}
+      UK_AQ_JSONGEN_R2_ENDPOINT: \${{ vars.UK_AQ_JSONGEN_R2_ENDPOINT || '' }}
+      UK_AQ_JSONGEN_R2_BUCKET: \${{ vars.UK_AQ_JSONGEN_R2_BUCKET || '' }}
+      UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID: \${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || '' }}
+      CFLARE_R2_BUCKET: \${{ vars.CFLARE_R2_BUCKET || '' }}
+      CFLARE_R2_ENDPOINT: \${{ vars.CFLARE_R2_ENDPOINT || '' }}
+      SUPABASE_URL: \${{ vars.SUPABASE_URL || '' }}
+      OBS_AQIDB_SUPABASE_URL: \${{ vars.OBS_AQIDB_SUPABASE_URL || '' }}
+      INGESTDB_PRUNE_DRY_RUN: \${{ vars.INGESTDB_PRUNE_DRY_RUN || 'true' }}
+      INGESTDB_RETENTION_DAYS: \${{ vars.INGESTDB_RETENTION_DAYS || '5' }}
+      OBS_AQIDB_OBSERVS_RETENTION_DAYS: \${{ vars.OBS_AQIDB_OBSERVS_RETENTION_DAYS || '14' }}
+      MAX_HOURS_PER_RUN: \${{ vars.INGESTDB_PRUNE_MAX_HOURS_PER_RUN || '48' }}
+      DELETE_BATCH_SIZE: \${{ vars.INGESTDB_PRUNE_DELETE_BATCH_SIZE || '50000' }}
+      MAX_DELETE_BATCHES_PER_HOUR: \${{ vars.INGESTDB_PRUNE_MAX_DELETE_BATCHES_PER_HOUR || '10' }}
+      REPAIR_ONE_MISMATCH_BUCKET: \${{ vars.INGESTDB_PRUNE_REPAIR_ONE_MISMATCH_BUCKET || 'true' }}
+      INGESTDB_PRUNE_PHASE_A_ENABLED: \${{ vars.INGESTDB_PRUNE_PHASE_A_ENABLED || 'true' }}
+      INGESTDB_PRUNE_PHASE_A_RECENT_DAYS: \${{ vars.INGESTDB_PRUNE_PHASE_A_RECENT_DAYS || '3' }}
+      UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN: \${{ vars.UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN || '500' }}
+    steps:
+      - name: Checkout TEST main
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+      - name: Install existing PostgreSQL dependency
+        run: npm ci --ignore-scripts
+      - name: Inspect effective settings and candidate metadata only
+        shell: bash
+        env:
+          SUPABASE_DB_URL: \${{ secrets.SUPABASE_DB_URL }}
+          SB_SECRET_KEY: \${{ secrets.SB_SECRET_KEY }}
+          OBS_AQIDB_SECRET_KEY: \${{ secrets.OBS_AQIDB_SECRET_KEY }}
+          UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN: \${{ secrets.UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN }}
+          UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_ID: \${{ secrets.UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_ID }}
+          UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_SECRET: \${{ secrets.UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          const e = process.env;
+          const assert = (condition, code) => {
+            if (!condition) throw Object.assign(new Error(code), { preflight_code: code });
+          };
+          const required = key => {
+            const value = e[key];
+            assert(typeof value === 'string' && value.length > 0, 'missing_' + key.toLowerCase());
+            return value;
+          };
+          const positive = (name, fallback, max) => {
+            const n = Number(e[name] || fallback);
+            assert(Number.isSafeInteger(n) && n >= 1 && n <= max, 'invalid_' + name.toLowerCase());
+            return n;
+          };
+          const boolean = (name, fallback) => {
+            const v = e[name] || fallback;
+            assert(v === 'true' || v === 'false', 'invalid_' + name.toLowerCase());
+            return v === 'true';
+          };
+          const output = (name, value) => console.log(name + ': ' + JSON.stringify(value));
+          let db, open = false;
+          try {
+            assert(e.UK_AQ_ENV_NAME === 'TEST' && e.GITHUB_ACTIONS === 'true'
+              && e.GITHUB_REPOSITORY === 'TEST-uk-aq/uk-aq-ops'
+              && e.GITHUB_REF === 'refs/heads/main'
+              && e.GITHUB_EVENT_NAME === 'workflow_dispatch', 'wrong_execution_environment');
+            assert(e.UK_AQ_R2_HISTORY_VERSION === 'v3', 'wrong_history_generation');
+            assert(boolean('UK_AQ_R2_HISTORY_PHASE_B_ENABLED', 'true'), 'phase_b_disabled');
+            assert(boolean('UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED', 'false'), 'pending_capture_disabled');
+            const flags = {
+              dry_run_when_unchecked: boolean('INGESTDB_PRUNE_DRY_RUN', 'true'),
+              phase_a_enabled: boolean('INGESTDB_PRUNE_PHASE_A_ENABLED', 'true'),
+              repair_one_mismatch_bucket: boolean('REPAIR_ONE_MISMATCH_BUCKET', 'true'),
+              retention_days: positive('INGESTDB_RETENTION_DAYS', '5', 3650),
+              obs_aqidb_retention_days: positive('OBS_AQIDB_OBSERVS_RETENTION_DAYS', '14', 3650),
+              max_hours_per_run: positive('MAX_HOURS_PER_RUN', '48', 744),
+              recent_days: positive('INGESTDB_PRUNE_PHASE_A_RECENT_DAYS', '3', 14),
+              delete_batch_size: positive('DELETE_BATCH_SIZE', '50000', 500000),
+              max_delete_batches_per_hour: positive('MAX_DELETE_BATCHES_PER_HOUR', '10', 100),
+              history_candidate_limit: positive('UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN', '500', 50000),
+            };
+            const signer = new URL(required('UK_AQ_JSONGEN_PRUNE_SIGNER_URL'));
+            const privateR2 = new URL(required('UK_AQ_JSONGEN_R2_ENDPOINT'));
+            const canonicalR2 = new URL(required('CFLARE_R2_ENDPOINT'));
+            const accountId = required('UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID');
+            const ingest = new URL(required('SUPABASE_URL'));
+            const observs = new URL(required('OBS_AQIDB_SUPABASE_URL'));
+            assert(/^[a-f0-9]{32}$/.test(accountId)
+              && signer.protocol === 'https:' && signer.pathname === '/v1/upload-intents'
+              && !signer.search && !signer.hash && !signer.username && !signer.password
+              && privateR2.origin === 'https://' + accountId + '.r2.cloudflarestorage.com'
+              && privateR2.pathname === '/' && !privateR2.search && !privateR2.hash
+              && canonicalR2.protocol === 'https:' && canonicalR2.pathname === '/'
+              && ingest.protocol === 'https:' && /^[a-z0-9]{20}\.supabase\.co$/.test(ingest.hostname)
+              && observs.protocol === 'https:' && /^[a-z0-9]{20}\.supabase\.co$/.test(observs.hostname)
+              && ingest.hostname !== observs.hostname
+              && required('UK_AQ_JSONGEN_R2_BUCKET') !== required('CFLARE_R2_BUCKET'),
+              'target_configuration_mismatch');
+            for (const name of ['SUPABASE_DB_URL','SB_SECRET_KEY','OBS_AQIDB_SECRET_KEY',
+              'UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN','UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_ID',
+              'UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_SECRET']) required(name);
+            console.log('PASS: effective TEST Prune v3 settings and required credential presence');
+            output('Effective limits and flags (not an operation authorisation)', flags);
+            const now = new Date();
+            const midnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+            const windowEnd = midnight - flags.retention_days * 86400000;
+            output('Approximate normal hourly deletion inspection window (not a deletion forecast)', {
+              start_utc: new Date(windowEnd - flags.max_hours_per_run * 3600000).toISOString(),
+              end_utc: new Date(windowEnd).toISOString(),
+              phase_a_recent_from_utc: flags.phase_a_enabled
+                ? new Date(midnight + 86400000 - flags.recent_days * 86400000).toISOString() : null,
+            });
+            console.log('Unchecked Prune workflow dry_run uses configured default shown above; checked forces true');
+            const { Client } = await import('pg');
+            db = new Client({ connectionString: required('SUPABASE_DB_URL'),
+              connectionTimeoutMillis: 8000, query_timeout: 12000,
+              application_name: 'uk_aq_jsongen_prune_preflight_readonly' });
+            await db.connect();
+            await db.query('BEGIN READ ONLY');
+            open = true;
+            await db.query("SET LOCAL statement_timeout = '10s'");
+            const one = async sql => (await db.query(sql)).rows;
+            const session = await one("SELECT current_setting('transaction_read_only') = 'on' AS read_only, "
+              + "to_regclass('uk_aq_ops.history_candidates') IS NOT NULL AS candidates, "
+              + "to_regclass('uk_aq_ops.prune_connector_day_gates') IS NOT NULL AS gates, "
+              + "to_regclass('uk_aq_ops.prune_jsongen_gate_acceptance_outbox') IS NOT NULL AS outbox, "
+              + "has_function_privilege(current_user, "
+              + "'uk_aq_ops.insert_prune_jsongen_gate_acceptance(date,integer,uuid,text,jsonb,bytea)', "
+              + "'EXECUTE') AS prune_can_accept");
+            assert(session.length === 1 && session[0].read_only && session[0].candidates
+              && session[0].gates && session[0].outbox, 'readonly_database_schema_missing');
+            output('PostgreSQL Prune login function EXECUTE', session[0].prune_can_accept);
+            console.log('PASS: actual GitHub Prune database connection within BEGIN READ ONLY');
+            output('Pending/failed candidate counts', await one(
+              "SELECT connector_id,status,count(*)::integer AS count "
+              + "FROM uk_aq_ops.history_candidates WHERE status <> 'complete' "
+              + "GROUP BY connector_id,status ORDER BY connector_id,status"));
+            const queue = await one("SELECT c.day_utc::text AS day_utc,c.connector_id,c.status, "
+              + "c.expected_row_count::text AS expected_rows,coalesce(g.history_done,false) AS gate_done, "
+              + "CASE WHEN c.last_error LIKE 'source_identity_canonicalisation_failed%' "
+              + "THEN 'source_identity_canonicalisation_failed' "
+              + "WHEN c.last_error IS NULL THEN NULL ELSE 'other_marker' END AS issue "
+              + "FROM uk_aq_ops.history_candidates c "
+              + "LEFT JOIN uk_aq_ops.prune_connector_day_gates g "
+              + "ON g.day_utc=c.day_utc AND g.connector_id=c.connector_id "
+              + "WHERE c.status <> 'complete' "
+              + "ORDER BY c.day_utc DESC,c.connector_id LIMIT 21");
+            output('Pending/failed preview (max 20)', { truncated: queue.length > 20, rows: queue.slice(0,20) });
+            output('Recent AURN publication/deletion markers (not proof of new first publication)', await one(
+              "SELECT c.day_utc::text AS day_utc,c.status, "
+              + "coalesce(g.history_done,false) AS gate_done, "
+              + "CASE WHEN c.last_error LIKE 'PRUNE_FIRST_DELETE_CONSUMED:%' "
+              + "THEN 'original_deletion_consumed' "
+              + "WHEN c.last_error IS NULL THEN NULL ELSE 'other_marker' END AS marker "
+              + "FROM uk_aq_ops.history_candidates c "
+              + "LEFT JOIN uk_aq_ops.prune_connector_day_gates g "
+              + "ON g.day_utc=c.day_utc AND g.connector_id=c.connector_id "
+              + "WHERE c.connector_id=1 ORDER BY c.day_utc DESC LIMIT 14"));
+            output('Original JSONgen outbox evidence states (max 10)', await one(
+              "SELECT day_utc::text AS day_utc,connector_id,pending_disposition,final_evidence_state "
+              + "FROM uk_aq_ops.prune_jsongen_gate_acceptance_outbox "
+              + "ORDER BY accepted_at DESC LIMIT 10"));
+            console.log('UNVERIFIED: dedicated private reader TLS/login (credential remains local-only)');
+            console.log('UNVERIFIED: Cloudflare D1 scheduler pause (separate live check required)');
+            console.log('UNVERIFIED: genuine new first-publication scope, all scope caps, exact repair/deletion impact');
+            console.log('NO-GO: preflight is informational; it never authorises real Prune or JSONgen retention');
+            console.log('No Prune invocation, SQL writes, R2 reads/writes, scheduler changes or publication');
+          } catch (error) {
+            console.error('FAIL:', error.preflight_code || 'readonly_preflight_unavailable');
+            process.exitCode = 1;
+          } finally {
+            if (open) await db.query('ROLLBACK').catch(() => {});
+            if (db) await db.end().catch(() => {});
+          }
+          NODE
