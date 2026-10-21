@@ -77,7 +77,8 @@ function retainedMetadata(envelope, row, budget, { bundleMode = false } = {}) {
 // This checks original reference/source relationships retained by Prune's
 // successful verifier. It neither recalculates publication success nor reads
 // canonical observations. Missing required source authority still blocks receipts.
-function bindOriginalPublication(e, row, source, metadata) {
+function bindOriginalPublication(e, row, source, metadata, onStage) {
+  onStage('original_connector_manifest');
   const c = e.original_connector_publication;
   const manifest = metadata.lookup(c.connector_manifest, 'canonical_manifest');
   validateCanonicalHistoryV2Manifest(manifest, { manifest_key: row.history_manifest_key,
@@ -95,6 +96,7 @@ function bindOriginalPublication(e, row, source, metadata) {
   check(Array.isArray(manifestChildren) && manifestChildren.length === expected.length,
     'connector_manifest.complete_pollutant_children');
   for (const partition of expected) {
+    onStage('original_pollutant_manifest');
     const p = c.pollutant_manifests.find(p => p.pollutant_code === partition.pollutant_code);
     present(p, 'original_pollutant_publication');
     const m = metadata.lookup(p.manifest, 'canonical_manifest');
@@ -121,6 +123,7 @@ function bindOriginalPublication(e, row, source, metadata) {
     const roots = c.scoped_roots?.filter(r => r.scope.pollutant_code === partition.pollutant_code);
     check(roots?.length === 1 && roots[0].scope.day_utc === row.day_utc && roots[0].scope.connector_id === 1,
       'original_exact_scope');
+    onStage('original_exact_scope');
     const index = metadata.lookup(roots[0].reference, 'exact_v3_index');
     check(index.index_generation === 'v3' && index.day_utc === row.day_utc && index.connector_id === 1
       && index.pollutant_code === partition.pollutant_code
@@ -145,6 +148,7 @@ function bindOriginalPublication(e, row, source, metadata) {
     'original_exact_to_canonical_source_relationship');
     const leaves = [];
     for (const [id, tuple] of Object.entries(index.leaves_by_timeseries_id)) {
+      onStage('original_exact_leaf');
       const reference = { key: tuple[0], byte_size: tuple[1], sha256: tuple[2] };
       const leaf = artifact(reference, 'observation_history_index_v3_exact_leaf', 'child_shard');
       validateObservationHistoryExactLeafArtifactV3({ artifact: leaf });
@@ -158,6 +162,7 @@ function bindOriginalPublication(e, row, source, metadata) {
         && f.etag_or_hash === file.sha256)), 'original_exact_file_identity');
       leaves.push(leaf);
     }
+    onStage('original_exact_scope_membership');
     validateObservationHistoryExactLeafScopedManifestArtifactV3({ artifact: artifact(roots[0].reference,
       'observation_history_index_v3_exact_leaf_scoped_manifest', 'scoped_manifest'), exactLeaves: leaves });
   }
@@ -198,7 +203,9 @@ export function inspectAuthenticatedPruneHandover(value) {
   return result;
 }
 
-export async function authenticatePruneHandover({ acceptance, derivedR2, budget = createPruneHandoverBudget() }) {
+export async function authenticatePruneHandover({ acceptance, derivedR2, budget = createPruneHandoverBudget(),
+  onStage = () => {} }) {
+  onStage('original_outbox_evidence');
   const { row, bytes } = originalPruneAcceptance(acceptance);
   const message = acceptance.post_commit_reference.message;
   present(row.final_evidence_state === 'prepared_unverified' && bytes, 'final_evidence_bytes');
@@ -214,6 +221,7 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
   const bundlePointer = e.original_metadata_evidence?.codec === 'immutable_r2_json_gzip_v1';
   let bundleMode = false;
   if (bundlePointer) {
+    onStage('immutable_bundle_reference');
     const pointer = e.original_metadata_evidence;
     const ref = pointer.reference;
     const identity = pointer.identity;
@@ -253,11 +261,13 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
     'bundle_reference_original_invocation_binding');
     evidence(ref.byte_size + ref.json_byte_size <= budget.remainingBytes(), 'resource_limit',
       'Evidence bundle exceeds remaining bounded decode budget');
+    onStage('immutable_bundle_readback');
     const compressed = await readImmutable({ r2: derivedR2,
       reference: { bucket: ref.bucket, key: ref.key, sha256: ref.sha256, byte_size: ref.byte_size },
       maxBytes: PRUNE_EVIDENCE_BUNDLE_LIMITS.compressed_bytes, budget, domain: 'metadata' });
     evidence(ref.json_byte_size <= budget.remainingBytes(), 'resource_limit',
       'Evidence bundle decompression exceeds remaining bounded decode budget');
+    onStage('immutable_bundle_decode');
     const decodedBytes = decodePruneEvidenceBundle({ compressed,
       reference: { byte_size: ref.byte_size, sha256: ref.sha256,
         json_byte_size: ref.json_byte_size, json_sha256: ref.json_sha256 },
@@ -290,6 +300,7 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
     e = decodedBytes;
     bundleMode = true;
   } else {
+    onStage('inline_evidence_decode');
     present(e.original_metadata_evidence && e.original_metadata_snapshot?.schema_version === 2
       && e.original_authority_extension?.schema_version === 2, 'compressed_original_before_and_binding_authority');
     evidence(Number.isSafeInteger(e.original_metadata_evidence.json_byte_size)
@@ -323,6 +334,7 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
   check(gate.transaction_state === 'not_asserted_in_preparation' && gate.retained_transaction_proof === false,
     'precommit_envelope_boundary');
   const batch = e.original_final_batch;
+  onStage('original_finalization');
   present(batch?.validation?.boundary === 'validatePhaseBV3RunFinalizationResult'
     && batch.observed_boundary === 'validated_v3_run_finalizer_returned'
     && batch.validation.canonical_aggregate_authority_verified === true
@@ -332,7 +344,9 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
     && Array.isArray(batch.affected_days_utc) && batch.affected_days_utc.includes(row.day_utc)
     && new Set(batch.affected_days_utc).size === batch.affected_days_utc.length,
   'validated_required_v3_finalisation');
+  onStage('original_metadata_snapshot');
   const metadata = retainedMetadata(e, row, budget, { bundleMode });
+  onStage('original_finalization_references');
   for (const [field, role] of [['canonical_aggregate_references', 'aggregate_manifest'],
     ['exact_scope_references', 'exact_v3_index'], ['latest_global_references', 'latest_global_index']]) {
     present(Array.isArray(batch[field]) && batch[field].length > 0, `original_final_batch.${field}`);
@@ -351,6 +365,7 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
     && sha256Hex(canonicalJson(p.source_evidence)) === p.preparation_sha256
     && signed?.intent_id === p.intent_id && same(signed.object, p.object)
     && signed.disposition === 'put_acknowledged_unverified', 'original_signed_source_description');
+  onStage('private_pending_source');
   const pending = await verifyPrunePendingSource({ r2: derivedR2, reference: p.object, intentId: p.intent_id,
     runId: row.run_id, dayUtc: row.day_utc, connectorId: 1,
     expectedRowCount: message.source_identity.source_content_hash_row_count,
@@ -360,10 +375,14 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
     && same(p.effective_verification_status, unsigned.effective_verification_status)
     && row.original_source_status_provenance === unsigned.original_source_status.classification,
   'complete_source_scope_and_status_provenance');
-  bindOriginalPublication(e, row, unsigned, metadata);
+  onStage('original_publication_references');
+  bindOriginalPublication(e, row, unsigned, metadata, onStage);
+  onStage('original_final_hierarchy');
   const root = authenticateFinalHierarchy(e, row, metadata);
+  onStage('original_physical_scope_binding');
   const original = authenticatePruneOriginalAuthority({ envelope: e, row, source: unsigned,
     budget, bundleMode });
+  onStage('authenticated_scope_construction');
   const bucket = root.bucket;
   const pin = r => ({ bucket: r.bucket || bucket, key: r.key, sha256: r.sha256, byte_size: r.byte_size });
   const sources = {}; const scopes = {}; const scopeAuthorities = {};
