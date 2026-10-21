@@ -63,7 +63,9 @@ concurrency:
 jobs:
   backup-r2-history-to-dropbox:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    # Keep a 15-minute gap below the six-hour GitHub-hosted runner limit.
+    # Interrupted copies restart from the previously committed Dropbox checkpoint.
+    timeout-minutes: 345
     env:
       CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || '' }}
       CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
