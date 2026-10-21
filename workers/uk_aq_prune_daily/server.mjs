@@ -19,6 +19,9 @@ const DAY_MS = 24 * HOUR_MS;
 const DEFAULT_DRY_RUN = true;
 const DEFAULT_MAX_HOURS_PER_RUN = 48;
 const DEFAULT_INGESTDB_RETENTION_DAYS = 5;
+// Preserve today and at least the preceding two full UTC calendar days.
+// Nodes recovery has a rolling 48-hour window, and Prune works in UTC days.
+const MIN_INGESTDB_RETENTION_DAYS = 3;
 const DEFAULT_PHASE_A_ENABLED = true;
 const DEFAULT_PHASE_A_RECENT_DAYS = 3;
 const DEFAULT_DELETE_BATCH_SIZE = 50_000;
@@ -1626,6 +1629,13 @@ export function buildRunConfig(url) {
     1,
     3650,
   );
+  if (ingestDbRetentionDays < MIN_INGESTDB_RETENTION_DAYS) {
+    // Reject rather than silently clamp: explicit overrides must not
+    // accidentally prune or publish any part of the recovery window.
+    throw new Error(
+      `Prune Daily requires at least ${MIN_INGESTDB_RETENTION_DAYS} UTC calendar days of IngestDB retention; received ${ingestDbRetentionDays}.`,
+    );
+  }
   const deleteBatchSize = parsePositiveInt(
     params.get("deleteBatchSize") ?? process.env.DELETE_BATCH_SIZE,
     DEFAULT_DELETE_BATCH_SIZE,
