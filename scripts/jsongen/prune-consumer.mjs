@@ -25,6 +25,9 @@ export async function consumePruneAcceptance({ reader, key, derivedR2, mode = 'r
     registration: 'not_attempted', retry: 'original_primary_key_replay',
     receipt_eligible: false, handover_complete: false, publication_eligible: false,
     current_canonical_authority: 'not_inspected', supersession: 'not_evaluated' };
+  // Only fixed, code-owned identifiers enter the report. An unexpected error's
+  // message and stack may contain private evidence, SQL or an R2 URL.
+  let failureStage = 'original_outbox_read';
   try {
     const acceptance = await reader.read(key);
     if (!acceptance) return { ...result, state: 'incomplete', reason: 'original_acceptance_not_visible',
@@ -32,12 +35,15 @@ export async function consumePruneAcceptance({ reader, key, derivedR2, mode = 'r
     originalPruneAcceptance(acceptance); // Reject a caller-invented reader result before reporting any authority.
     result.event_id = acceptance.event_id;
     result.original_evidence = 'original_gate_authenticated';
-    const handover = await authenticatePruneHandover({ acceptance, derivedR2, budget });
+    failureStage = 'original_evidence';
+    const handover = await authenticatePruneHandover({ acceptance, derivedR2, budget,
+      onStage: stage => { failureStage = stage; } });
     const { result: authentication } = inspectAuthenticatedPruneHandover(handover);
     Object.assign(result, { original_evidence: authentication.original_final_evidence,
       pending_source: authentication.pending_source, physical_scope_count: authentication.physical_scope_count,
       observation_count: authentication.observation_count, authentication,
       receipt_eligible: authentication.receipt_eligible, missing_authority: authentication.missing_authority });
+    failureStage = 'partition_construction';
     const group = inspectPruneReceiptGroup(buildPruneReceiptGroup({ handover, budget }));
     result.partitions = group.plan;
     result.expected_receipts = group.entries.map(e => ({ change_id: e.receipt.change_id, receipt: e.receipt_object,
@@ -45,11 +51,13 @@ export async function consumePruneAcceptance({ reader, key, derivedR2, mode = 'r
     result.group_sha256 = group.group_sha256;
     if (mode === 'read-only') return { ...result, state: 'authenticated', reason: 'read_only_no_retention_attempted', resources: budget.snapshot() };
     result.retention_progress = []; result.bundle_retention = 'incomplete'; result.receipt_retention = 'incomplete';
+    failureStage = 'receipt_retention';
     const retainedToken = await retainPruneReceiptGroup({ handover, r2: derivedR2, budget,
       progress: progress => { result.retention_progress[progress.partition_index] = progress; } });
     const stored = retainedPruneEvent(retainedToken);
     Object.assign(result, { state: 'retained', bundle_retention: 'retained', receipt_retention: 'verified_pending',
       receipt_coverage_complete: stored.receipt_coverage_complete, registration: 'pending' });
+    failureStage = 'control_registration';
     if (initializeControl) await updateManagedControl({ r2: derivedR2, command: { type: 'initialize' }, budget });
     const registration = await updateManagedControl({ r2: derivedR2, command: { type: 'retain_prune_event' },
       authenticatedPruneEvent: retainedToken, budget });
@@ -59,10 +67,19 @@ export async function consumePruneAcceptance({ reader, key, derivedR2, mode = 'r
       recovery: 'deterministic_original_event_replay', resources: budget.snapshot() };
   } catch (error) {
     // Never include PG errors, original bytea, observation rows or R2 URLs.
+    const recognised = error instanceof JSONgenEvidenceError || error instanceof JSONgenControlError;
+    const errorClass = error instanceof JSONgenEvidenceError ? 'evidence_error'
+      : error instanceof JSONgenControlError ? 'control_error'
+        : error instanceof TypeError ? 'unexpected_type_error'
+          : error instanceof RangeError ? 'unexpected_range_error'
+            : error instanceof SyntaxError ? 'unexpected_syntax_error'
+              : error instanceof Error ? 'unexpected_error' : 'unexpected_non_error';
     return { ...result, state: 'reconciliation_required',
-      reason: error instanceof JSONgenEvidenceError || error instanceof JSONgenControlError ? error.code : 'consumer_boundary_rejected',
-      detail: error instanceof JSONgenEvidenceError || error instanceof JSONgenControlError ? error.message : 'Input rejected at the independent consumer boundary',
-      retry: 'replay_original_event_after_resolving_failure', control_operation: error.attempted || null,
+      reason: recognised ? error.code : 'consumer_boundary_rejected',
+      detail: recognised ? error.message : 'Input rejected at the independent consumer boundary',
+      failure_stage: failureStage, error_class: errorClass,
+      retry: 'replay_original_event_after_resolving_failure',
+      control_operation: error instanceof JSONgenControlError ? error.attempted || null : null,
       resources: budget.snapshot() };
   }
 }

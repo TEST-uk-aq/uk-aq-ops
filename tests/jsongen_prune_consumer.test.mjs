@@ -7,13 +7,16 @@ import { gzipSync } from 'node:zlib';
 import { canonicalJson, CONTROL_KEY, ORDERING_BLOCKER, assertControl, assertReceipt, assertPruneReceiptGroup } from '../scripts/jsongen/schema.mjs';
 import { sha256Hex } from '../workers/shared/r2_sigv4.mjs';
 import { connectPruneOutboxReader, originalPruneAcceptance } from '../scripts/jsongen/prune-outbox-reader.mjs';
-import { authenticatePruneHandover, inspectAuthenticatedPruneHandover } from '../scripts/jsongen/prune-consumer-authentication.mjs';
+import { authenticatePruneHandover, inspectAuthenticatedPruneHandover,
+  assertPruneReceiptScopeEligibility } from '../scripts/jsongen/prune-consumer-authentication.mjs';
 import { planPruneScopePartitions } from '../scripts/jsongen/prune-consumer-partitions.mjs';
 import { consumePruneAcceptance, runPruneConsumer } from '../scripts/jsongen/prune-consumer.mjs';
 import { buildPruneReceiptGroup, inspectPruneReceiptGroup } from '../scripts/jsongen/prune-receipts.mjs';
 import { decodePruneMetadataEvidence, compactPruneMetadataEvidence } from '../scripts/jsongen/prune-metadata-codec.mjs';
 import { updateManagedControl, selectManagedPublications } from '../scripts/jsongen/control.mjs';
 import { reconcileManagedInputs } from '../scripts/jsongen/reconcile.mjs';
+import { managedR2ReadConfig } from '../scripts/jsongen/r2-config.mjs';
+import { JSONgenEvidenceError } from '../scripts/jsongen/limits.mjs';
 
 const run = 'ca2a2ad8-c46c-4d65-9ee0-7147f03684eb'; const day = '2026-10-10';
 const key = { environment: 'TEST', writer_identity: 'prune_daily_v3', run_id: run,
@@ -23,6 +26,37 @@ const env = { UK_AQ_ENV_NAME: 'TEST', UK_AQ_GITHUB_REPO: 'fixture-org/fixture-op
   UK_AQ_JSONGEN_PRUNE_READER_DB_URL: 'postgresql://reader:fixture@db.aaaaaaaaaaaaaaaaaaaa.supabase.co/postgres' };
 
 import { sourceAndOriginalEvent } from './jsongen_prune_consumer_fixture.mjs';
+
+test('complete original source with a non-Stage-1 pollutant fails with a structured scope code', () => {
+  const scope = pollutant_code => ({ pollutant_code, timeseries_id: 1, station_id: 1, day_utc: day, row_count: 1 });
+  assert.doesNotThrow(() => assertPruneReceiptScopeEligibility({ scope: {
+    physical_timeseries_days: [scope('pm25'), scope('pm10'), scope('no2')] } }));
+  assert.throws(() => assertPruneReceiptScopeEligibility({ scope: {
+    physical_timeseries_days: [scope('pm25'), scope('o3')] } }), { code: 'unsupported_receipt_scope' });
+});
+
+test('consumer reports only bounded failure stage and exception class', async () => {
+  const derivedR2 = managedR2ReadConfig({ UK_AQ_ENV_NAME: 'TEST',
+    UK_AQ_JSONGEN_R2_ENDPOINT: 'https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.r2.cloudflarestorage.com',
+    UK_AQ_JSONGEN_R2_BUCKET: 'fixture-derived-bucket',
+    UK_AQ_JSONGEN_R2_READ_ACCESS_KEY_ID: 'fixture-read',
+    UK_AQ_JSONGEN_R2_READ_SECRET_ACCESS_KEY: 'fixture-secret' });
+  const secret = 'private-row-value-and-url';
+  let result = await consumePruneAcceptance({ key, derivedR2,
+    reader: { read: async () => { throw Object.assign(new TypeError(secret), { attempted: { secret } }); } } });
+  assert.equal(result.state, 'reconciliation_required');
+  assert.equal(result.reason, 'consumer_boundary_rejected');
+  assert.equal(result.failure_stage, 'original_outbox_read');
+  assert.equal(result.error_class, 'unexpected_type_error');
+  assert.equal(result.receipt_eligible, false);
+  assert.equal(result.receipt_retention, 'not_attempted');
+  assert.doesNotMatch(JSON.stringify(result), /private-row-value-and-url/);
+  result = await consumePruneAcceptance({ key, derivedR2,
+    reader: { read: async () => { throw new JSONgenEvidenceError('outbox_read_unavailable', 'Read-only outbox unavailable'); } } });
+  assert.equal(result.reason, 'outbox_read_unavailable');
+  assert.equal(result.failure_stage, 'original_outbox_read');
+  assert.equal(result.error_class, 'evidence_error');
+});
 
 test('independent compressed original authority yields eight strict 128-scope receipts; read mode never writes or publishes', async () => {
   const f = await sourceAndOriginalEvent(); const reader = await connectPruneOutboxReader({ env, Client: f.Client });
