@@ -17,6 +17,10 @@ const MAX_CAPTURE_BYTES = 32 * 1024 * 1024;
 const MAX_OBJECT_BYTES = 8 * 1024 * 1024;
 const MAX_CAPTURE_OBJECTS = 8192;
 export const PRUNE_BINDING_CAPTURE_CONCURRENCY = 8;
+// ~940 physical bindings plus root/source/refresh and range metadata cannot fit
+// the pending PUT's 15-second transport budget at observed TEST throughput.
+// Admit this entire optional window before starting; keep each GET at 15s.
+export const PRUNE_BINDING_CAPTURE_DEADLINE_MS = 90_000;
 const OPTIONAL_CAPTURE_BYTES = MAX_CAPTURE_BYTES / 2;
 const OPTIONAL_CAPTURE_OBJECTS = MAX_CAPTURE_OBJECTS / 2;
 
@@ -163,6 +167,7 @@ function originalAuthorityCapture({ identity, lockContext, retain, body, release
   let bindingCaptureStartedAtMs = null;
   let bindingCaptureDurationMs = null;
   let bindingCaptureUniqueKeyCount = null;
+  let bindingCaptureRequiredKeyCount = null;
   let bindingCaptureRetainedObjectCount = null;
   let beforeOpen = true;
   let abortCapture = null;
@@ -224,6 +229,7 @@ function originalAuthorityCapture({ identity, lockContext, retain, body, release
         binding_authority_state: binding.state, binding_authority_reason: binding.reason || null,
         binding_capture_duration_ms: bindingCaptureDurationMs,
         binding_capture_unique_key_count: bindingCaptureUniqueKeyCount,
+        binding_capture_required_key_count: bindingCaptureRequiredKeyCount,
         binding_capture_retained_object_count: bindingCaptureRetainedObjectCount,
         independent_consumer_authentication: 'outstanding' };
     },
@@ -250,6 +256,7 @@ function originalAuthorityCapture({ identity, lockContext, retain, body, release
         let active = true;
         let timer;
         let rejectDeadline;
+        let work;
         const checkActive = () => requireOriginal(active && !revoked && !controller.signal.aborted
           && nowMs() < deadlineAtMs && admitRequest(), revoked || 'original_binding_capture_deadline');
         abortCapture = () => {
@@ -258,7 +265,8 @@ function originalAuthorityCapture({ identity, lockContext, retain, body, release
         };
         try {
           requireOriginal(lock, 'original_global_lock_context_unavailable');
-          requireOriginal(Number.isSafeInteger(deadlineAtMs) && deadlineAtMs - nowMs() <= 15_000,
+          requireOriginal(Number.isSafeInteger(deadlineAtMs)
+            && deadlineAtMs - nowMs() <= PRUNE_BINDING_CAPTURE_DEADLINE_MS,
             'original_binding_capture_deadline');
           requireOriginal(Array.isArray(physicalScopes) && physicalScopes.length > 0
             && physicalScopes.length <= 1024, 'original_scope_membership_unavailable');
@@ -303,12 +311,20 @@ function originalAuthorityCapture({ identity, lockContext, retain, body, release
           };
           const pool = async (items, callback) => {
             let next = 0;
-            // Promise.all is bounded by WORKERS, never by source cardinality.
-            await Promise.all(Array.from({ length: Math.min(PRUNE_BINDING_CAPTURE_CONCURRENCY, items.length) }, async () => {
-              while (next < items.length) { checkActive(); const index = next++; await callback(items[index], index); }
+            let firstFailure;
+            // Drain every worker on failure as well as success. The read cache
+            // still shares one request for any repeated physical key.
+            await Promise.allSettled(Array.from({ length: Math.min(PRUNE_BINDING_CAPTURE_CONCURRENCY, items.length) }, async () => {
+              try {
+                while (next < items.length) { checkActive(); const index = next++; await callback(items[index], index); }
+              } catch (error) {
+                firstFailure ||= error;
+                controller.abort();
+              }
             }));
+            if (firstFailure) throw firstFailure;
           };
-          const work = (async () => {
+          work = (async () => {
             const prefix = GENERATION.timeseries_binding_index_prefix;
             const [root, source, refresh] = await Promise.all([
               read(`${prefix}/_manifests/root.json`), read(`${prefix}/_source_state.json`), read(`${prefix}/_manifests/_refresh_state.json`),
@@ -338,6 +354,8 @@ function originalAuthorityCapture({ identity, lockContext, retain, body, release
               requireOriginal(rootRef && scope.timeseries_id <= rootRef.range_end, 'physical_binding_not_in_selected_root');
               requiredRanges.set(rootRef.manifest_key, rootRef);
             }
+            bindingCaptureRequiredKeyCount = 3 + requiredRanges.size
+              + new Set(scopes.map(scope => scope.timeseries_id)).size;
             const ranges = new Map();
             await pool([...requiredRanges.values()], async rangeRef => {
               const range = await read(rangeRef.manifest_key);
@@ -391,7 +409,11 @@ function originalAuthorityCapture({ identity, lockContext, retain, body, release
           bindingCaptureUniqueKeyCount = reads.size;
           if (bindingCaptureRetainedObjectCount === null)
             bindingCaptureRetainedObjectCount = [...keys.values()].filter(entry => entry.phase === 'binding').length;
-          active = false; clearTimeout(timer); controller.abort(); abortCapture = null; reads.clear();
+          active = false; clearTimeout(timer); controller.abort(); abortCapture = null;
+          // r2GetObjectBounded settles on abort, including its adapter path.
+          // Close mutation first, then drain all reads/work before publication.
+          await Promise.allSettled([...reads.values(), work]);
+          reads.clear();
         }
       })();
       return bindingJob;
