@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { timingSafeEqual } from "node:crypto";
 
 // These are the shared workflow remote names, not environment selectors.
 export const HISTORY_R2_REMOTE = "uk_aq_r2";
@@ -78,20 +79,48 @@ export function assertHistoryBackupDestination(destRoot, env = process.env) {
 
 // Inspect local configuration only. Never log config dump output (it contains
 // credentials), including on failure. Prevent overrides that bypass this check.
-export function assertHistoryBackupRemotes({ rcloneBin = "rclone", env = process.env, dropbox = true } = {}) {
+export function assertHistoryBackupRemotes({ rcloneBin = "rclone", env = process.env, dropbox = true, run = spawnSync } = {}) {
   const r2 = resolveHistoryBackupR2(env);
   if (Object.keys(env).some((key) => key.startsWith("RCLONE_") && key !== "RCLONE_CONFIG")) {
     throw new Error("RCLONE_* overrides other than RCLONE_CONFIG are not allowed for guarded history backup");
   }
-  const result = spawnSync(rcloneBin, ["config", "dump"], {
-    env, encoding: "utf8", timeout: 15_000, maxBuffer: 4 * 1024 * 1024,
-  });
-  if (result.error || result.signal || result.status !== 0) {
-    throw new Error("Cannot inspect local rclone configuration for history backup");
+  function inspect(command, label) {
+    let result;
+    try {
+      result = run(rcloneBin, ["config", command], {
+        env, encoding: "utf8", timeout: 15_000, maxBuffer: 16 * 1024 * 1024,
+      });
+    } catch { throw new Error(`Cannot inspect local rclone ${label}`); }
+    if (result.error || result.signal || result.status !== 0) {
+      throw new Error(`Cannot inspect local rclone ${label}`);
+    }
+    try { return JSON.parse(result.stdout); }
+    catch { throw new Error(`Invalid local rclone ${label} JSON`); }
   }
-  let config;
-  try { config = JSON.parse(result.stdout); }
-  catch { throw new Error("Invalid local rclone configuration JSON"); }
+  const providers = inspect("providers", "credential representation");
+  // S3 and OAuth consume these sensitive options literally, not via Reveal.
+  // Never decode an obscured-looking string and approve a different effective
+  // credential. Unsupported backend representation must fail closed.
+  for (const [providerName, optionName] of [
+    ["s3", "secret_access_key"], ...(dropbox ? [["dropbox", "client_secret"]] : []),
+  ]) {
+    const matches = Array.isArray(providers) ? providers.filter((p) => p.Name === providerName) : [];
+    const options = matches.length === 1 && Array.isArray(matches[0].Options)
+      ? matches[0].Options.filter((o) => o.Name === optionName) : [];
+    if (options.length !== 1 || options[0].IsPassword !== false) {
+      throw new Error("Cannot authenticate rclone credential representation");
+    }
+  }
+  const config = inspect("dump", "configuration");
+  function assertSecretIdentity(actual, expected, label) {
+    const left = Buffer.from(typeof actual === "string" ? actual : "", "utf8");
+    const right = Buffer.from(expected, "utf8");
+    try {
+      if (!left.length || left.length !== right.length || !timingSafeEqual(left, right)) {
+        throw new Error(`${label} credential identity mismatch; refusing mutation`);
+      }
+    } finally { left.fill(0); right.fill(0); }
+  }
   const source = config[HISTORY_R2_REMOTE];
   const allowedSourceKeys = new Set([
     "type", "provider", "env_auth", "access_key_id", "secret_access_key",
@@ -106,6 +135,7 @@ export function assertHistoryBackupRemotes({ rcloneBin = "rclone", env = process
       || String(source.region || "auto") !== r2.region) {
     throw new Error("uk_aq_r2 remote contradicts configured R2 source identity");
   }
+  assertSecretIdentity(source.secret_access_key, r2.secret_access_key, HISTORY_R2_REMOTE);
   if (dropbox) {
     const destination = config[HISTORY_DROPBOX_REMOTE];
     const allowedKeys = new Set(["type", "client_id", "client_secret", "token"]);
@@ -119,6 +149,7 @@ export function assertHistoryBackupRemotes({ rcloneBin = "rclone", env = process
         || token.refresh_token !== required(env, "DROPBOX_REFRESH_TOKEN")) {
       throw new Error("uk_aq_dropbox contradicts configured Dropbox identity or has unsupported path/account overrides");
     }
+    assertSecretIdentity(destination.client_secret, required(env, "DROPBOX_APP_SECRET"), HISTORY_DROPBOX_REMOTE);
   }
 }
 

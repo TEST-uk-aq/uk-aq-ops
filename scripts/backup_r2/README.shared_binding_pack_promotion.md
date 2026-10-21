@@ -31,6 +31,7 @@ Active implementation/workflow:
 .github/workflows/uk_aq_r2_history_dropbox_backup.yml
 scripts/backup_r2/publish_timeseries_binding_backup_packs.mjs
 scripts/backup_r2/lib/history_backup_targets.mjs (new)
+scripts/backup_r2/lib/timeseries_binding_pack_restore_v1.mjs
 scripts/backup_r2/lib/timeseries_binding_pack_inventory_v1.mjs
 scripts/backup_r2/uk_aq_run_locked_history_backup.mjs
 scripts/backup_r2/build_backup_inventory.mjs
@@ -38,17 +39,20 @@ scripts/backup_r2/sync_history_to_dropbox.mjs
 scripts/backup_r2/restore_timeseries_binding_packs_to_r2.mjs
 ```
 
-The two existing checks updated for removed TEST exports, explicit fixture
+The existing checks updated for removed TEST exports, explicit fixture
 configuration, the shared restore-confirmation flag and dry-run propagation are
 `tests/timeseries_binding_pack_backup_phase2.test.mjs` and
-`tests/timeseries_binding_pack_restore_phase4.test.mjs`. This review document is
+`tests/timeseries_binding_pack_restore_phase4.test.mjs`. A targeted credential-guard
+regression file is added at `tests/history_backup_targets.test.mjs`. This review document is
 `scripts/backup_r2/README.shared_binding_pack_promotion.md`.
 
-Seven exact pre-change code/workflow copies are added under
-`archive/2026-10-21/`, retaining the relative paths of the active files above
-except the newly created `history_backup_targets.mjs`. They are reference-only
-and must never be executed by an active path. The archive snapshots are not
-part of the future LIVE promotion set.
+The original seven pre-change code/workflow copies under `archive/2026-10-21/`
+remain untouched. This safety follow-up adds exact snapshots of
+`lib/history_backup_targets.mjs` and `lib/timeseries_binding_pack_restore_v1.mjs`
+beneath that date's `scripts/backup_r2/` subtree. Today's existing restore-CLI
+archive is reused under the once-per-file-per-day rule. All nine snapshots are
+reference-only, must never be executed by active paths and are excluded from the
+future LIVE promotion set.
 
 ## External configuration and identity guards
 
@@ -89,16 +93,51 @@ explicit invocation-scoped folder configuration, not by a built-in TEST exceptio
 Before the normal runner can publish anything, local `rclone config dump` checks:
 
 - `uk_aq_r2` is explicit Cloudflare S3, with the configured endpoint, access-key
-  ID and region, a secret, and no environment-auth fallback; only the workflow's
+  ID and region, the exact configured secret, and no environment-auth fallback; only the workflow's
   S3 config fields are allowed, excluding `download_url` and other read redirects;
 - `uk_aq_dropbox` is Dropbox with the configured `DROPBOX_APP_KEY`, a client
-  secret and the configured `DROPBOX_REFRESH_TOKEN` in its token;
+  secret matching `DROPBOX_APP_SECRET` exactly and the configured
+  `DROPBOX_REFRESH_TOKEN` in its token;
 - Dropbox remote fields outside `type`, `client_id`, `client_secret`, `token`
   are refused, including namespace/account/path redirects;
 - `RCLONE_*` overrides except `RCLONE_CONFIG` are refused, so inspected config
   cannot be superseded by remote/backend overrides.
 
-The inspection is local, bounded to 15 seconds, and never logs config dump output
+### Exact secrets and rclone obscuring
+
+The guard uses the same configured R2 secret and `DROPBOX_APP_SECRET` as the
+workflow. It compares exact UTF-8 credential bytes using `timingSafeEqual`, clears
+the comparison buffers and emits only fixed diagnostics. Missing or contradictory
+secrets fail before a normal runner can publish R2 packs, and every direct
+inventory/sync/publisher/restore CLI applies its transport guard before mutation.
+No secret, dump, decoded value or signed request is written to diagnostics or
+new credential files.
+
+Rclone obscures **password options**, not every sensitive option. Investigation
+of installed rclone `v1.75.2` and its upstream source established that S3
+`secret_access_key` and OAuth `client_secret` are sensitive plain-string options
+(`IsPassword=false`). S3 and OAuth consume these option values literally;
+`config dump` preserves the stored strings. The existing GitHub Actions config
+therefore uses their correct plain representation.
+
+The guard inspects the installed binary's local `config providers` schema and
+requires that exact representation before inspecting the config. An unknown,
+missing, ambiguous or password-encoded option schema fails closed. It does not
+assume that every dump value is plain or auto-decode obscured-looking text:
+accepting its decoded value would approve a different secret from the one these
+backends actually consume. Putting `rclone obscure` output into either field is
+rejected unless that literal text itself is the configured credential. Configured
+secrets are expected to be actual service credentials, not already obscured values.
+There is no decoded-secret persistence or new encoding selector. A future rclone
+representation change requires a separate reviewed compatibility update.
+
+Primary representation references:
+[Rclone S3 options](https://github.com/rclone/rclone/blob/v1.75.2/backend/s3/s3.go),
+[OAuth options/credential consumption](https://github.com/rclone/rclone/blob/v1.75.2/lib/oauthutil/oauthutil.go),
+[config dump](https://github.com/rclone/rclone/blob/v1.75.2/fs/config/config.go),
+[obscuring format](https://github.com/rclone/rclone/blob/v1.75.2/fs/config/obscure/obscure.go).
+
+Each local config/provider inspection is bounded to 15 seconds and never logs config dump output
 or subprocess diagnostics containing credentials. It performs no remote reads.
 Inventory, sync and write-enabled publication also enforce their entrypoint
 guards when invoked directly. The workflow generates both remotes from its
@@ -177,6 +216,61 @@ owner `timeseries_binding_pack_restore`. The old
 Dry-run remains the default, requires the configured source, authenticates the
 complete generation and writes no destination objects. No restore was performed.
 
+### Empty destination, reservation and safe resume
+
+After **all** source packs/members/checkpoints and the reconstructed source root
+have passed verification, the write path establishes destination admission:
+
+1. Read `_ops/restores/timeseries_binding_pack_restore_v1/reservation.json`.
+   If absent, a strict R2 bucket listing with `max-keys=1` must prove emptiness.
+   A nonempty or uninspectable bucket is rejected without any write.
+2. Create that immutable reservation with `If-None-Match: *` and verify its exact
+   bytes. It binds source/destination roots, generation, both expected root pins,
+   object count and the SHA-256 of the exact payload descriptor set. A second
+   `max-keys=2` probe permits only that reservation, detecting a foreign object
+   introduced during the emptiness/reservation window. The reservation contains
+   no credentials and is separate recovery evidence, not backup completion state.
+3. On resume, require the exact same reservation bytes. Walk the whole bucket
+   once, bounded by the authenticated payload count plus the reservation plus one
+   unexpected key, in pages of at most 1,000. Every existing key must belong to
+   the reserved set and match its expected size and exact bytes/SHA-256 before
+   any new write. Unknown keys, missing reservation, conflicting pins, corrupt
+   content, malformed/repeated pagination or a root with missing children fail.
+4. Reuse only exact verified existing payload, and create only missing members,
+   then range manifests, then the source root. Reused children are readback-checked
+   again in the ordinary verification sequence. Immediately before root
+   publication, one final bounded metadata listing requires the exact expected
+   key/size set; unrelated or missing keys prevent root publication. Resume
+   therefore performs one initial exact-byte admission pass plus this final
+   metadata-only pass; the final listing itself does not reread object bodies.
+   Resume does recheck existing payload bytes during both admission and ordinary
+   readback, trading additional recovery-only reads for strict verification.
+   A completed exact destination
+   returns with `source_root_reused=true` and performs no new root publication.
+
+All destination PUTs, including the reservation and source root, are signed
+**create-only** S3 requests with `If-None-Match: *`. An object appearing between
+inspection and creation cannot be overwritten. There is no unconditional PUT,
+`rclone copyto` fallback or automatic write retry after a conflict/ambiguous
+transport outcome. Rerunning the identical pinned restore re-verifies durable
+bytes, including a write that committed just before interruption but whose
+readback was never observed. Conditional semantics are documented by
+[Cloudflare's R2 S3 API](https://developers.cloudflare.com/r2/api/s3/api/).
+
+The gate adds only this one reservation object in the explicitly isolated
+recovery bucket. It does not change canonical binding payload paths, back up
+control products, alter Dropbox checkpoints or delete anything. Dry-run remains
+source-only: no destination listing, reservation or destination writes.
+
+Residual operational limits: use a dedicated recovery bucket with no unrelated
+writers and appropriately scoped credentials. The PostgreSQL lock coordinates
+participating operations, not arbitrary external clients. Create-only requests
+prevent this tool overwriting concurrent objects but cannot stop another client
+adding, modifying or deleting objects after inspection. A pre-existing restore
+from older code without a reservation is intentionally not adopted; preserve it
+and use a separately provisioned empty recovery bucket. Mismatched or corrupt
+reserved destinations also require operator review; the tool never cleans them.
+
 ## LIVE compatibility and exact complete-file promotion set
 
 Read-only baseline: `UK-AQ/uk-aq-ops` commit
@@ -199,7 +293,8 @@ complete implementation files needed against that pinned LIVE baseline are:
 | `scripts/backup_r2/sync_history_to_dropbox.mjs` | Shared guards; existing bounded prune audit and additive verification-domain support |
 | `scripts/backup_r2/lib/hierarchical_backup_v2.mjs` | Existing verification identity/state exports required by these complete inventory/sync files |
 | `scripts/backup_r2/lib/observation_prune_audit.mjs` | Existing audit dependency; absent from baseline |
-| `scripts/backup_r2/restore_timeseries_binding_packs_to_r2.mjs` | Shared isolated restore CLI; absent from baseline |
+| `scripts/backup_r2/restore_timeseries_binding_packs_to_r2.mjs` | Shared isolated restore CLI, strict bounded destination listing and signed create-only transport; absent from baseline |
+| `scripts/backup_r2/lib/timeseries_binding_pack_restore_v1.mjs` | Reservation, closed-set destination admission and safe same-generation resume after complete source verification |
 | `scripts/report_daily_task_health.mjs` | Existing strict workflow health/retry implementation differs from baseline |
 
 Do not promote only the workflow: its flags and imports require the matching
@@ -242,7 +337,6 @@ scripts/backup_r2/lib/observation_parquet_reuse.mjs
 scripts/backup_r2/lib/rclone.mjs
 scripts/backup_r2/lib/stale_parquet_prune.mjs
 scripts/backup_r2/lib/timeseries_binding_backup_pack_v1.mjs
-scripts/backup_r2/lib/timeseries_binding_pack_restore_v1.mjs
 scripts/backup_r2/lib/timeseries_binding_ranges_v2.mjs
 scripts/backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs
 scripts/operations/lib/uk_aq_sos_light_v2_lock_recovery.mjs
@@ -265,6 +359,12 @@ package-lock.json
 Recheck these identities if either repository moves before promotion. No archive
 files or TEST test fixtures belong in the LIVE runtime promotion set. Create no
 LIVE archives as part of promotion.
+
+The promotion set expands from eleven to **twelve complete files** solely because
+the shared restore library must enforce the pre-write/resume gate after source
+validation. Its already-existing signing, timeout and strict listing dependencies
+are present in the pinned comparison baseline; no unrelated shared-helper or
+JSONgen promotion is needed.
 
 ## Prerequisites and outstanding blockers
 
@@ -292,7 +392,11 @@ No commands in this section have been executed by this change.
 1. Review the TEST variable/secret bindings and dedicated rclone configuration.
    Record the accepted current individual backup and retained v2/v3 identities.
    Preserve all old payload/checkpoint/pack evidence.
-2. Deploy the reviewed TEST implementation through the normal authorised process.
+2. Before the real backup, perform separately authorised TEST checks that either
+   mismatched R2/Dropbox secret fails safely before mutation, correctly configured
+   workflow remotes pass, and an unsupported/obscured representation is refused
+   without dumping credentials. Use only disposable TEST configuration; retain
+   production secrets outside logs and artifacts. Deploy the reviewed TEST implementation through the normal authorised process.
    Dispatch the normal TEST backup with `history_generation=v3`,
    `timeseries_binding_backup_mode=pack`, `max_days_per_run=0`,
    `observation_parquet_copy_mode=full`, `dry_run=false`. Do not use packs-only
@@ -329,7 +433,13 @@ No commands in this section have been executed by this change.
    guard and invoke the CLI under the global lock coordinator with owner
    `timeseries_binding_pack_restore`, `--write-r2`, both expected hashes and exact
    `--confirm-isolated-dest-root`. Require member/range readback and root-last
-   publication. Do not target the normal TEST or any active production bucket.
+   publication. Confirm that the first write creates the pinned reservation only
+   after source verification; unrelated nonempty buckets must fail without writes.
+   Interrupt a separately authorised isolated round trip after some child writes,
+   rerun with identical pins and confirm exact-byte reuse and missing-object-only
+   creates. A different reservation/pin, corrupted existing member or unrelated
+   object must refuse resume with zero new writes. Do not repair those objects
+   automatically. Never target the normal TEST or any active production bucket.
 8. Exercise explicit `individual` only when an operator needs rollback proof;
    preserve separate evidence for both representations and require all other
    normal backup domains and task-health behavior in either mode.
@@ -344,10 +454,11 @@ publishing incomplete parent identities.
 ## Local evidence and system-doc handover
 
 Local checks: Node syntax parsing for the 37-module runtime dependency closure
-plus the two updated existing verification files; `actionlint` on the workflow;
-`git diff --check`; four selected existing CLI/runner checks; and local-only
+plus the targeted credential/restore verification files; `actionlint` on the workflow;
+`git diff --check`; focused CLI/runner and credential/restore regression checks (38 passing targeted checks in the safety follow-up); and local-only
 configuration/generation guard checks using a temporary synthetic rclone config.
-No new speculative test suite, dependency install, deployment, DB query, R2/Dropbox
+Only targeted safety regressions were added/adjusted. No speculative suite,
+dependency install, deployment, DB query, R2/Dropbox
 operation, restore or scheduler/settings/secret mutation was performed.
 
 The local guard probe caught an unsupported rclone config-dump flag during
@@ -355,14 +466,17 @@ development; it was removed and the probe rerun successfully. No remote I/O was
 used by that probe.
 
 Initial publication reads authoritative binding bytes and adds derivative pack
-storage/transfer. Unchanged pack behavior is preserved. The new checks add local
-config reads, not database rows or remote scans. The DB-size impact is zero;
+storage/transfer. Unchanged pack behavior is preserved. The credential checks add local config/provider reads; the isolated restore gate
+adds bounded destination inspection and one immutable reservation object. No
+normal backup payload or historical observation scan is added, and no database
+row is added by these guards. The DB-size impact is zero;
 the existing lock and task-health behavior remains. No egress benchmark was run.
 
 Chat-mode system-doc handover: record environment-independent publication and
 Dropbox identity guards, explicit required folders, remote/config restrictions,
 the shared isolated restore target/confirmation flag and lock owner, dry-run
-inventory propagation, the eleven-file future promotion set and the unverified
-health-RPC prerequisite. Keep prior TEST evidence as historical evidence; record
+inventory propagation, the twelve-file future promotion set and the unverified
+health-RPC prerequisite, exact-secret representation checks and reservation/resume
+semantics. Keep prior TEST evidence as historical evidence; record
 new TEST operational acceptance only after the real operator procedure succeeds.
 No authoritative system documentation was edited here.

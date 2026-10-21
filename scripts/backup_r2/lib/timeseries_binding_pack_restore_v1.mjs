@@ -36,6 +36,9 @@ export const TIMESERIES_BINDING_RESTORE_PACK_ROOT_KEY =
     DEFAULT_TIMESERIES_BINDING_BACKUP_PACK_PREFIX,
   );
 
+export const TIMESERIES_BINDING_RESTORE_RESERVATION_KEY =
+  "_ops/restores/timeseries_binding_pack_restore_v1/reservation.json";
+
 function bytes(value, label) {
   if (Buffer.isBuffer(value)) return Buffer.from(value);
   if (value instanceof Uint8Array) return Buffer.from(value);
@@ -154,9 +157,11 @@ function createReport({
     members_verified: 0,
     members_planned: 0,
     members_written: 0,
+    members_reused: 0,
     members_readback_verified: 0,
     range_manifests_planned: 0,
     range_manifests_written: 0,
+    range_manifests_reused: 0,
     range_manifests_readback_verified: 0,
     expected_source_root_hash: null,
     reconstructed_source_root_hash: null,
@@ -165,6 +170,8 @@ function createReport({
       generation.timeseries_binding_index_prefix,
     ),
     source_root_written: false,
+    source_root_reused: false,
+    destination_safety: { mode: "not_inspected", reservation_key: TIMESERIES_BINDING_RESTORE_RESERVATION_KEY, objects_inspected: 0 },
     source_root_readback_verified: false,
     control_products_restored: false,
     control_products_intentionally_not_restored: [
@@ -223,6 +230,123 @@ function verifyReadback(actual, expected, label) {
   }
 }
 
+// Called only after every source pack/member and the reconstructed root pass.
+// The single immutable reservation belongs to this exact pinned closed set.
+async function reserveRestoreDestination({
+  sourceRoot, destRoot, generation, expectedSourceHash, expectedPackHash,
+  objects, readObject, createObject, listObjects, report,
+}) {
+  const descriptors = objects.map(({ key, body }) => ({
+    key, size: body.byteLength, sha256: sha256Hex(body),
+  })).sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+  const reservationBody = Buffer.from(stableJson({
+    schema_version: 1, kind: "uk_aq_timeseries_binding_pack_restore_reservation",
+    observation_generation: generation.version, source_root: sourceRoot, destination_root: destRoot,
+    source_root_sha256: expectedSourceHash, pack_root_sha256: expectedPackHash,
+    object_count: objects.length, object_set_sha256: sha256Hex(stableJson(descriptors)),
+  }));
+  const reservationKey = TIMESERIES_BINDING_RESTORE_RESERVATION_KEY;
+  const reservation = await readObject(reservationKey);
+  const existingKeys = new Set();
+  const expected = new Map(objects.map((object) => [object.key, object.body]));
+  expected.set(reservationKey, reservationBody);
+  const rootKey = timeseriesBindingSourceRootKey(generation.timeseries_binding_index_prefix);
+  function admitted() {
+    return {
+      existingKeys,
+      verifyBeforeRoot: async () => {
+        // A single final bounded metadata pass detects foreign/missing keys
+        // introduced during writes. Exact payload readbacks have just passed.
+        const seen = new Set();
+        const tokens = new Set();
+        const rootAlreadyPresent = existingKeys.has(rootKey);
+        const expectedCount = expected.size - (rootAlreadyPresent ? 0 : 1);
+        let token = null;
+        do {
+          const remaining = expectedCount + 1 - seen.size;
+          if (remaining <= 0) throw new Error("Restore destination exceeds its reserved set before root publication");
+          const listing = await page(Math.min(1000, remaining), token);
+          for (const entry of listing.entries) {
+            if (!entry || seen.has(entry.key) || !expected.has(entry.key)
+                || (!rootAlreadyPresent && entry.key === rootKey)
+                || entry.size !== expected.get(entry.key).byteLength) {
+              throw new Error("Restore destination has unrelated or changed objects before root publication");
+            }
+            seen.add(entry.key);
+          }
+          token = listing.is_truncated ? listing.next_token : null;
+          if (token && tokens.has(token)) throw new Error("Repeated final restore destination listing token");
+          if (token) tokens.add(token);
+        } while (token);
+        if (seen.size !== expectedCount) throw new Error("Restore destination is incomplete before root publication");
+        report.destination_safety.objects_final_checked = seen.size;
+      },
+    };
+  }
+  async function page(maxKeys, continuationToken = null) {
+    const result = await listObjects({ maxKeys, continuationToken });
+    if (!result || !Array.isArray(result.entries) || result.entries.length > maxKeys
+        || typeof result.is_truncated !== "boolean"
+        || (result.is_truncated && (!result.next_token || !result.entries.length))
+        || (!result.is_truncated && result.next_token)) {
+      throw new Error("Invalid bounded restore destination listing");
+    }
+    return result;
+  }
+  if (reservation == null) {
+    const first = await page(1);
+    if (first.entries.length || first.is_truncated) {
+      throw new Error("Restore destination is not empty and has no matching reservation");
+    }
+    await createObject(reservationKey, reservationBody, { ifNoneMatch: "*" });
+    verifyReadback(await readRequired(readObject, reservationKey, "restore reservation"),
+      reservationBody, "Restore reservation");
+    // Close the empty-LIST/reservation-create window with one tiny probe.
+    const reserved = await page(2);
+    if (reserved.is_truncated || reserved.entries.length !== 1
+        || reserved.entries[0]?.key !== reservationKey
+        || reserved.entries[0].size !== reservationBody.byteLength) {
+      throw new Error("Restore reservation admission found unrelated destination content");
+    }
+    report.destination_safety.mode = "fresh";
+    return admitted();
+  }
+  if (!bytes(reservation, "restore reservation").equals(reservationBody)) {
+    throw new Error("Restore reservation identity does not match the authorised pinned restore");
+  }
+  const seenKeys = new Set();
+  const seenTokens = new Set();
+  let token = null;
+  do {
+    // At most the closed-set size plus one unexpected key. No unbounded scan.
+    const remaining = expected.size + 1 - seenKeys.size;
+    if (remaining <= 0) throw new Error("Restore destination exceeds its reserved object set");
+    const listing = await page(Math.min(1000, remaining), token);
+    for (const entry of listing.entries) {
+      if (!entry || typeof entry.key !== "string" || seenKeys.has(entry.key)
+          || !expected.has(entry.key)) {
+        throw new Error("Restore destination contains unrelated or duplicate objects");
+      }
+      seenKeys.add(entry.key);
+      const body = expected.get(entry.key);
+      if (entry.size !== body.byteLength) throw new Error("Restore destination object identity mismatch");
+      verifyReadback(await readRequired(readObject, entry.key, "reserved destination object"),
+        body, "Reserved destination object identity");
+      report.destination_safety.objects_inspected += 1;
+      existingKeys.add(entry.key);
+    }
+    token = listing.is_truncated ? listing.next_token : null;
+    if (token && seenTokens.has(token)) throw new Error("Repeated restore destination listing token");
+    if (token) seenTokens.add(token);
+  } while (token);
+  if (!existingKeys.has(reservationKey)) throw new Error("Restore reservation disappeared during inspection");
+  if (existingKeys.has(rootKey) && existingKeys.size !== expected.size) {
+    throw new Error("Published restore root has incomplete destination children");
+  }
+  report.destination_safety.mode = "resume";
+  return admitted();
+}
+
 export async function restoreTimeseriesBindingPacksToR2({
   generation = getObservationHistoryGeneration("v2"),
   sourceRoot,
@@ -230,6 +354,7 @@ export async function restoreTimeseriesBindingPacksToR2({
   readSourceObject,
   writeDestinationObject = null,
   readDestinationObject = null,
+  listDestinationObjects = null,
   dryRun = true,
   writeConcurrency = 8,
   expectedSourceRootHash = null,
@@ -242,8 +367,9 @@ export async function restoreTimeseriesBindingPacksToR2({
   if (!dryRun && (
     typeof writeDestinationObject !== "function"
     || typeof readDestinationObject !== "function"
+    || typeof listDestinationObjects !== "function"
   )) {
-    throw new Error("write mode requires destination write and read functions");
+    throw new Error("write mode requires destination create-only write, read and bounded listing functions");
   }
   const concurrency = requirePositiveInteger(
     writeConcurrency,
@@ -255,6 +381,9 @@ export async function restoreTimeseriesBindingPacksToR2({
   const expectedPackHash = expectedPackRootSha256
     ? assertSha256(expectedPackRootSha256, "expected pack root SHA-256")
     : null;
+  if (!dryRun && (!expectedSourceHash || !expectedPackHash)) {
+    throw new Error("Restore writes require both explicit source-root and pack-root SHA-256 pins");
+  }
   const report = createReport({
     generation,
     sourceRoot,
@@ -572,9 +701,23 @@ export async function restoreTimeseriesBindingPacksToR2({
       return report;
     }
 
+    const admission = await reserveRestoreDestination({
+      sourceRoot, destRoot, generation, expectedSourceHash, expectedPackHash,
+      objects: [
+        ...restoredMembers.map((member) => ({ key: member.relative_path, body: member.body })),
+        ...reconstructedRanges.map((range) => ({ key: range.manifest_key, body: range.bytes })),
+        { key: report.source_root_path, body: sourceRootBody },
+      ],
+      readObject: readDestinationObject, createObject: writeDestinationObject,
+      listObjects: listDestinationObjects, report,
+    });
+    const { existingKeys } = admission;
     await runBounded(restoredMembers, concurrency, async (member) => {
-      await writeDestinationObject(member.relative_path, member.body);
-      report.members_written += 1;
+      if (existingKeys.has(member.relative_path)) report.members_reused += 1;
+      else {
+        await writeDestinationObject(member.relative_path, member.body, { ifNoneMatch: "*" });
+        report.members_written += 1;
+      }
       const readback = await readRequired(
         readDestinationObject,
         member.relative_path,
@@ -593,8 +736,11 @@ export async function restoreTimeseriesBindingPacksToR2({
     });
 
     for (const range of reconstructedRanges) {
-      await writeDestinationObject(range.manifest_key, range.bytes);
-      report.range_manifests_written += 1;
+      if (existingKeys.has(range.manifest_key)) report.range_manifests_reused += 1;
+      else {
+        await writeDestinationObject(range.manifest_key, range.bytes, { ifNoneMatch: "*" });
+        report.range_manifests_written += 1;
+      }
       const readback = await readRequired(
         readDestinationObject,
         range.manifest_key,
@@ -614,9 +760,13 @@ export async function restoreTimeseriesBindingPacksToR2({
     ) {
       throw new Error("Restore children are incomplete; refusing source root publication");
     }
-    await writeDestinationObject(report.source_root_path, sourceRootBody);
-    report.source_root_written = true;
-    report.root_published_last = true;
+    await admission.verifyBeforeRoot();
+    if (existingKeys.has(report.source_root_path)) report.source_root_reused = true;
+    else {
+      await writeDestinationObject(report.source_root_path, sourceRootBody, { ifNoneMatch: "*" });
+      report.source_root_written = true;
+      report.root_published_last = true;
+    }
     const sourceRootReadback = await readRequired(
       readDestinationObject,
       report.source_root_path,

@@ -2,11 +2,11 @@
 
 import { resolveObservationHistoryGeneration } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
+import { buildAwsSignedRequest, fetchWithTimeout, r2ListObjectsV2, sha256Hex } from "../../workers/shared/r2_sigv4.mjs";
 import { assertSha256 } from "./lib/hierarchical_backup_v2.mjs";
 import {
   isRcloneNotFoundMessage,
@@ -16,7 +16,7 @@ import {
   restoreTimeseriesBindingPacksToR2,
 } from "./lib/timeseries_binding_pack_restore_v1.mjs";
 
-import { configuredHistoryDropboxRoot, assertHistoryBackupRemotes, assertIsolatedBindingRestoreDestination } from "./lib/history_backup_targets.mjs";
+import { configuredHistoryDropboxRoot, assertHistoryBackupRemotes, assertIsolatedBindingRestoreDestination, resolveHistoryBackupR2 } from "./lib/history_backup_targets.mjs";
 import { requireObservationsGlobalOperationLockContext } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
 
 const DEFAULT_RCLONE_BIN = "rclone";
@@ -178,20 +178,32 @@ async function readRcloneObjectMaybe(rcloneBin, root, relativePath) {
   throw new Error(`Failed to read ${target}: ${combined.trim()}`);
 }
 
-async function writeRcloneObject(rcloneBin, root, relativePath, body) {
-  const tempDir = await fs.promises.mkdtemp(
-    path.join(os.tmpdir(), "uk_aq_timeseries_binding_restore_"),
-  );
-  const tempFile = path.join(tempDir, "upload.tmp");
+// Every restore object, including the reservation, is create-only at R2.
+// Do not retry an ambiguous conditional PUT or fall back to rclone copyto.
+export async function createRestoreDestinationObject({
+  r2, key, body, ifNoneMatch, fetchImpl = globalThis.fetch,
+}) {
+  if (ifNoneMatch !== "*") throw new Error("Restore writes require If-None-Match: *");
+  const payload = Buffer.from(body);
+  const request = buildAwsSignedRequest({
+    method: "PUT", endpoint: r2.endpoint, region: r2.region,
+    accessKeyId: r2.access_key_id, secretAccessKey: r2.secret_access_key,
+    bucket: r2.bucket, objectKey: key, payloadHash: sha256Hex(payload),
+    headers: { "content-type": "application/json", "if-none-match": "*" },
+  });
+  let status;
   try {
-    await fs.promises.writeFile(tempFile, Buffer.from(body));
-    await runRcloneBytes(rcloneBin, [
-      "copyto",
-      tempFile,
-      joinTargetPath(root, relativePath),
-    ]);
-  } finally {
-    await fs.promises.rm(tempDir, { recursive: true, force: true });
+    status = await fetchWithTimeout(request.url, {
+      method: "PUT", headers: request.headers, body: payload, redirect: "error",
+    }, 30_000, fetchImpl, async (response) => {
+      await response.body?.cancel();
+      return response.status;
+    });
+  } catch {
+    throw new Error("Restore create-only write outcome is uncertain; rerun the same pinned restore to inspect reservation and bytes");
+  }
+  if (!Number.isInteger(status) || status < 200 || status >= 300) {
+    throw new Error("Restore create-only write refused or uncertain; no overwrite fallback; inspect the same pinned destination before resuming");
   }
 }
 
@@ -209,6 +221,9 @@ export async function main({ argv = process.argv.slice(2) } = {}) {
     if (!args) return 0;
     assertHistoryBackupRemotes({ rcloneBin: args.rcloneBin });
     if (args.writeR2) requireObservationsGlobalOperationLockContext({ expectedOwner: "timeseries_binding_pack_restore" });
+    const destinationR2 = args.writeR2 ? Object.freeze({
+      ...resolveHistoryBackupR2(), bucket: args.destRoot.slice("uk_aq_r2:".length),
+    }) : null;
     const report = await restoreTimeseriesBindingPacksToR2({
       generation: resolveObservationHistoryGeneration(process.env),
       sourceRoot: args.sourceRoot,
@@ -222,14 +237,18 @@ export async function main({ argv = process.argv.slice(2) } = {}) {
         args.sourceRoot,
         relativePath,
       ),
+      listDestinationObjects: args.writeR2
+        ? ({ maxKeys, continuationToken }) => r2ListObjectsV2({
+          r2: destinationR2, prefix: "", max_keys: maxKeys,
+          continuation_token: continuationToken, require_valid_listing: true,
+        }) : null,
       writeDestinationObject: args.writeR2
-        ? (relativePath, body) => writeRcloneObject(
-          args.rcloneBin,
-          args.destRoot,
-          relativePath,
-          body,
-        )
-        : null,
+        ? (relativePath, body, options) => {
+          requireObservationsGlobalOperationLockContext({ expectedOwner: "timeseries_binding_pack_restore" });
+          return createRestoreDestinationObject({
+            r2: destinationR2, key: relativePath, body, ifNoneMatch: options?.ifNoneMatch,
+          });
+        } : null,
       readDestinationObject: args.writeR2
         ? (relativePath) => readRcloneObjectMaybe(
           args.rcloneBin,
