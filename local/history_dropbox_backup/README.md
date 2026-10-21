@@ -5,6 +5,16 @@ on the always-on MacBook Pro. It does not install itself, start a backup, alter
 schedules or activate LIVE. Use a stable checkout of the merged TEST commit.
 Do not move, update or switch that checkout during an operation.
 
+**Daily Task Health follow-up: blocked on an existing RPC prerequisite.** The
+requested restart-safe local health lifecycle is not implemented yet. The current
+Started RPC deduplicates GitHub attempts only; a local start whose response is
+lost cannot safely be retried under its existing contract. See
+[the investigation and required schema dependency](daily_task_health_dependency.md).
+Do not treat this package as satisfying mandatory Daily Task Health acceptance
+until that dependency and the supervisor integration have been implemented and
+accepted on TEST. Existing install/status commands still describe backup state
+only; they do not confirm a health report.
+
 The application code is environment independent. The same files derive distinct
 TEST/LIVE labels and private directories from the explicit environment. The
 canonical pack publisher and its shared `history_backup_targets.mjs` identity
