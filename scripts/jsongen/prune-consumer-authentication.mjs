@@ -30,6 +30,16 @@ const check = (condition, field) => evidence(condition, 'contradictory_original_
 const present = (condition, field) => evidence(condition, 'missing_original_authority', `Missing retained original authority: ${field}`);
 const positive = n => Number.isSafeInteger(n) && n > 0;
 
+// The original connector-day is complete. Stage 1 receipts cannot represent
+// other pollutants, so do not let a receipt-only scope key throw TypeError (or
+// silently omit those scopes) while authenticating the original source.
+export function assertPruneReceiptScopeEligibility(source) {
+  const scopes = source?.scope?.physical_timeseries_days;
+  present(Array.isArray(scopes) && scopes.length > 0, 'complete_original_source_scopes');
+  evidence(scopes.every(scope => ['pm25', 'pm10', 'no2'].includes(scope?.pollutant_code)),
+    'unsupported_receipt_scope', 'Complete original connector-day includes a pollutant outside Stage 1 receipt scope');
+}
+
 function retainedMetadata(envelope, row, budget, { bundleMode = false } = {}) {
   const s = envelope.original_metadata_snapshot;
   present(s?.completeness === 'exact_writer_metadata_captured_unverified', 'original_metadata_snapshot');
@@ -379,6 +389,8 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
   bindOriginalPublication(e, row, unsigned, metadata, onStage);
   onStage('original_final_hierarchy');
   const root = authenticateFinalHierarchy(e, row, metadata);
+  onStage('original_source_scope_eligibility');
+  assertPruneReceiptScopeEligibility(unsigned);
   onStage('original_physical_scope_binding');
   const original = authenticatePruneOriginalAuthority({ envelope: e, row, source: unsigned,
     budget, bundleMode });

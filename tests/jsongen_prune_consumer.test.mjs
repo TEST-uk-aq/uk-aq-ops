@@ -7,7 +7,8 @@ import { gzipSync } from 'node:zlib';
 import { canonicalJson, CONTROL_KEY, ORDERING_BLOCKER, assertControl, assertReceipt, assertPruneReceiptGroup } from '../scripts/jsongen/schema.mjs';
 import { sha256Hex } from '../workers/shared/r2_sigv4.mjs';
 import { connectPruneOutboxReader, originalPruneAcceptance } from '../scripts/jsongen/prune-outbox-reader.mjs';
-import { authenticatePruneHandover, inspectAuthenticatedPruneHandover } from '../scripts/jsongen/prune-consumer-authentication.mjs';
+import { authenticatePruneHandover, inspectAuthenticatedPruneHandover,
+  assertPruneReceiptScopeEligibility } from '../scripts/jsongen/prune-consumer-authentication.mjs';
 import { planPruneScopePartitions } from '../scripts/jsongen/prune-consumer-partitions.mjs';
 import { consumePruneAcceptance, runPruneConsumer } from '../scripts/jsongen/prune-consumer.mjs';
 import { buildPruneReceiptGroup, inspectPruneReceiptGroup } from '../scripts/jsongen/prune-receipts.mjs';
@@ -25,6 +26,14 @@ const env = { UK_AQ_ENV_NAME: 'TEST', UK_AQ_GITHUB_REPO: 'fixture-org/fixture-op
   UK_AQ_JSONGEN_PRUNE_READER_DB_URL: 'postgresql://reader:fixture@db.aaaaaaaaaaaaaaaaaaaa.supabase.co/postgres' };
 
 import { sourceAndOriginalEvent } from './jsongen_prune_consumer_fixture.mjs';
+
+test('complete original source with a non-Stage-1 pollutant fails with a structured scope code', () => {
+  const scope = pollutant_code => ({ pollutant_code, timeseries_id: 1, station_id: 1, day_utc: day, row_count: 1 });
+  assert.doesNotThrow(() => assertPruneReceiptScopeEligibility({ scope: {
+    physical_timeseries_days: [scope('pm25'), scope('pm10'), scope('no2')] } }));
+  assert.throws(() => assertPruneReceiptScopeEligibility({ scope: {
+    physical_timeseries_days: [scope('pm25'), scope('o3')] } }), { code: 'unsupported_receipt_scope' });
+});
 
 test('consumer reports only bounded failure stage and exception class', async () => {
   const derivedR2 = managedR2ReadConfig({ UK_AQ_ENV_NAME: 'TEST',
