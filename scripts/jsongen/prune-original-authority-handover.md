@@ -190,14 +190,28 @@ binding key per timeseries; every declared full scope must match that same
 root/range-pinned object, so conflicting station/pollutant claims are rejected.
 
 Every request uses `r2GetObjectBounded`, its known physical size where available,
-remaining allocation and the remaining time in the **same original 15-second
-optional signer/PUT episode**. Existing canonical headroom is rechecked around
-requests. There is no extra reserve or deadline extension. A shared deadline or
-any collection error aborts outstanding requests; HTTP and adapter paths now
-propagate caller cancellation. Uncooperative adapters are rejected by the capture
-race and an active-state check before retention. Late responses cannot mutate a
-settled capture; partial binding allocations are released. Binding becomes
-captured only after every required object and physical scope validates.
+remaining allocation and at most **15 seconds per GET**. The 21 October correction
+gives binding capture a **90-second absolute window**, starting before pending
+source preparation; the overlapping source preparation/signer/PUT still has its
+own original **15-second** absolute deadline. The complete 90 seconds is admitted
+in addition to the existing mandatory connector-publication and v3-finalisation
+reserves and the five-second bundle allowance. Mandatory headroom is rechecked
+around reads. The global Phase B budget and lock lifetime policy are unchanged.
+
+The 21 October TEST log archive records only 255 requested keys / 247 retained
+objects in 14,995 ms for a 940-scope day. Those counts include completion and range
+metadata, with up to eight in-flight reads; they do not mean eight missing scopes.
+Reads are already cached and overlapped with source preparation. The new budget
+keeps concurrency at eight and permits roughly a minute of observed-throughput
+work with margin; real full-day latency remains to be accepted. Diagnostics now
+include `binding_capture_required_key_count` for the complete deduplicated plan.
+
+A deadline or collection error aborts outstanding requests; HTTP and bounded
+adapter paths propagate cancellation. Workers preserve the first failure and
+drain; capture closes mutation, releases partial binding allocations and awaits
+bounded reads/work before returning to canonical publication. Late raw adapter
+responses cannot mutate settled evidence. Binding becomes captured only after
+every required object and physical scope validates.
 
 Failure diagnostics distinguish absent metadata, invalid/mismatched lock context,
 unknown prior membership, contradictory Core/root/range/binding identity, timeout,

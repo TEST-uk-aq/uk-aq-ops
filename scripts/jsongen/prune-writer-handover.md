@@ -34,7 +34,9 @@ per day. The 71,704 visible observations are consistent with roughly 427 complet
 excluding duplicates or missing hours. This evidence cannot justify keeping a
 128-scope complete-connector source cap.
 
-No current full-AURN daily physical inventory is retained in this workspace.
+The 21 October TEST Prune log archive records 940 physical scopes and 21,748
+observations for AURN on 14 October; that establishes one day's observed size,
+not a maximum inventory across days or pollutants.
 The historical 8 February ingest AURN register contains 201 distinct sites and no
 populated pollutant lists; it cannot establish the number of active physical
 timeseries or the maximum across all pollutants. No operational query, Prune,
@@ -44,8 +46,9 @@ items. Do not treat the partial bootstrap as full-connector operational capacity
 
 The pending connector-day envelope now admits up to **1,024 scopes** separately
 from the unchanged Stage 1 receipt/general consumer cap of **128**. This admits
-the observed 433-identity population with bounded additional scope capacity,
-without expanding any byte, row, request, metadata or deadline limit:
+the observed 433-identity bootstrap and 940-scope Prune day with bounded capacity,
+without expanding byte, row or metadata limits. The 21 October capture correction
+reserves a longer binding window separately from the existing source transport:
 
 | Boundary | Hard limit / behaviour |
 | --- | --- |
@@ -56,7 +59,8 @@ without expanding any byte, row, request, metadata or deadline limit:
 | Compressed evidence bundle | 32 MiB gzip; 64 MiB canonical JSON; 32 MiB combined exact metadata bodies |
 | PostgreSQL final evidence | Existing 1 MiB bytea cap; new row stores only the versioned bundle pointer |
 | Post-commit message | 4,096 bytes |
-| Optional PENDING upload + binding capture | Existing 15-second shared deadline, concurrent within the unchanged canonical headroom admission; eight binding workers |
+| Optional PENDING preparation + signer + PUT | 15-second absolute deadline, overlapping binding capture from the same start |
+| Optional original binding capture | 90-second absolute deadline; eight workers, at most 15 seconds per GET; full window admitted in addition to mandatory canonical reserves |
 | Optional bundle preparation + signer + PUT + readback | One shared 5-second post-finalisation reserve for the run; failure leaves JSONgen incomplete |
 | Consumer resource profile | 192 MiB total byte accounting for bounded Prune handover; 128-scope receipt partitions and row caps remain |
 

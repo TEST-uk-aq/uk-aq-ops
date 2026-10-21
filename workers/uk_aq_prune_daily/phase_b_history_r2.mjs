@@ -17,7 +17,8 @@ import { preparePrunePendingSource } from "../../scripts/jsongen/prune-pending-s
 import { preparePruneOriginalFinalEvidence, attachPruneOriginalEvidenceBundleReference }
   from "../../scripts/jsongen/prune-final-evidence.mjs";
 import { describePruneGateOutboxEvidence, preparePrunePostCommitHandover } from "../../scripts/jsongen/prune-outbox.mjs";
-import { createPruneOriginalMetadataCapture, preparePruneOriginalMetadataSnapshot } from "../../scripts/jsongen/prune-original-metadata.mjs";
+import { createPruneOriginalMetadataCapture, preparePruneOriginalMetadataSnapshot,
+  PRUNE_BINDING_CAPTURE_DEADLINE_MS } from "../../scripts/jsongen/prune-original-metadata.mjs";
 import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import Cursor from "pg-cursor";
@@ -4218,10 +4219,11 @@ async function writeFrozenCandidateObservationsToV2({
       jsongenPendingSource = { state: 'not_attempted',
         transport: { handover_attempted: false, signer_intent_state: 'not_attempted', put_state: 'not_attempted' } };
       // Preserve mandatory connector publication/finalisation reserves, the
-      // shared prepublication upload+binding window, and one post-finalisation
+      // bounded prepublication capture window, and one post-finalisation
       // bundle PUT/readback window before any optional network work starts.
       const requiredMs = PHASE_B_STAGE_MIN_MS.observation_connector_publication
-        + PHASE_B_V3_RUN_FINALIZATION_RESERVE_MS + PRUNE_SIGNED_UPLOAD_DEADLINE_MS + 5_000;
+        + PHASE_B_V3_RUN_FINALIZATION_RESERVE_MS + PRUNE_BINDING_CAPTURE_DEADLINE_MS
+        + PRUNE_EVIDENCE_BUNDLE_UPLOAD_DEADLINE_MS;
       if (!isPrunePendingSourceConnector(candidate.connector_id)) {
         jsongenPendingSource.failure_code = 'connector_not_allowed';
         logJsongenPhaseB(runtime, 'INFO', 'phase_b_jsongen_pending_source_skipped', {
@@ -4235,7 +4237,9 @@ async function writeFrozenCandidateObservationsToV2({
           reason: "insufficient_headroom",
         });
       } else {
-        const optionalDeadlineAtMs = Date.now() + PRUNE_SIGNED_UPLOAD_DEADLINE_MS;
+        const optionalStartedAtMs = Date.now();
+        const uploadDeadlineAtMs = optionalStartedAtMs + PRUNE_SIGNED_UPLOAD_DEADLINE_MS;
+        const bindingDeadlineAtMs = optionalStartedAtMs + PRUNE_BINDING_CAPTURE_DEADLINE_MS;
         try {
           if (runtime.jsongen_pending_source.config_error) {
             const error = new Error("Prune signer configuration unavailable");
@@ -4270,13 +4274,13 @@ async function writeFrozenCandidateObservationsToV2({
           const bindingPhysicalScopes = [...bindingScopeCounts.values()].sort((a, b) =>
             a.pollutant_code.localeCompare(b.pollutant_code)
             || a.timeseries_id - b.timeseries_id || a.station_id - b.station_id);
-          // Pending-source upload and Core binding reads share one absolute
-          // 15-second episode. The capture begins immediately; the deadline
-          // is not restarted after local preparation.
+          // Both start in this original prepublication episode. The source PUT
+          // keeps its 15-second deadline; binding capture may use the separately
+          // admitted 90-second window. Neither restarts after preparation/PUT.
           const bindingCapture = jsongenOriginalAuthority?.captureBindings({
             physicalScopes: bindingPhysicalScopes,
-            r2: runtime.r2, deadlineAtMs: optionalDeadlineAtMs,
-            admitRequest: () => hasBudgetFor(runtime, requiredMs - PRUNE_SIGNED_UPLOAD_DEADLINE_MS),
+            r2: runtime.r2, deadlineAtMs: bindingDeadlineAtMs,
+            admitRequest: () => hasBudgetFor(runtime, requiredMs - PRUNE_BINDING_CAPTURE_DEADLINE_MS),
           }) || Promise.resolve(null);
           let preparedPendingSource;
           try {
@@ -4292,7 +4296,7 @@ async function writeFrozenCandidateObservationsToV2({
           try {
             jsongenPendingSource = await uploadPendingSource({ signer: runtime.jsongen_pending_source.signer,
               ...pendingCandidate, prepared: preparedPendingSource,
-              deadlineAtMs: optionalDeadlineAtMs });
+              deadlineAtMs: uploadDeadlineAtMs });
           } catch (error) {
             // Once the PENDING reference is unavailable, original binding
             // capture cannot contribute to a complete handover. Abort it so
