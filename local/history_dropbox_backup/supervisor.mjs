@@ -179,6 +179,8 @@ try {
   else {
     requireSafe(state.status === "completed" || !read(p.block), "supervision_review");
     const c = load(p);
+    // Node reads extra trust only at startup; a stale plist must not proceed.
+    requireSafe(process.env.NODE_EXTRA_CA_CERTS === c.postgres_ca_file, "postgres_ca_startup");
     requireSafe(c.fingerprint === state.configuration_identity, "configuration_changed");
     requireSafe(p.environment !== "LIVE" || c.live_activation_authorized === true, "live_inactive");
     // A crash after accepted.json but before active.json must not redo completed remote work.
@@ -226,7 +228,11 @@ try {
     process.stderr.write("Existing local supervisor owns this installation\n"); process.exitCode = 0;
   } else if (state && release) {
     let c;
-    try { c = load(p); restoreAcceptedBackup(state, c); } catch { /* Preserve any already accepted evidence. */ }
+    try {
+      const configured = load(p);
+      requireSafe(process.env.NODE_EXTRA_CA_CERTS === configured.postgres_ca_file, "postgres_ca_startup");
+      c = configured; restoreAcceptedBackup(state, c);
+    } catch { /* Preserve any already accepted evidence; do not report with stale CA trust. */ }
     if (state.successful_completion) {
       // Completion is immutable even if reporting or local IO failed later.
       if (c && state.health) {

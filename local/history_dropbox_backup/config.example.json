@@ -19,7 +19,7 @@
     "DROPBOX_APP_KEY": "REPLACE_LOCALLY",
     "DROPBOX_APP_SECRET": "REPLACE_LOCALLY",
     "DROPBOX_REFRESH_TOKEN": "REPLACE_LOCALLY",
-    "SUPABASE_DB_URL": "postgresql://postgres:REPLACE_WITH_URL_ENCODED_PASSWORD@db.REPLACE_WITH_PROJECT_REF.supabase.co:5432/postgres?sslmode=require",
+    "SUPABASE_DB_URL": "postgresql://postgres:REPLACE_WITH_URL_ENCODED_PASSWORD@db.REPLACE_WITH_PROJECT_REF.supabase.co:5432/postgres?sslmode=verify-full",
     "UK_AQ_DROPBOX_ROOT": "TEST",
     "UK_AQ_R2_HISTORY_DROPBOX_DIR": "REPLACE_WITH_APPROVED_BACKUP_DIRECTORY",
     "UK_AQ_R2_HISTORY_VERSION": "v3",
@@ -29,6 +29,7 @@
     "OBS_AQIDB_SECRET_KEY": "REPLACE_LOCALLY"
   },
   "rclone_bin": "/opt/homebrew/bin/rclone",
+  "postgres_ca_file": "/Users/REPLACE/Library/Application Support/UK AQ/history-dropbox-backup/TEST/config/certs/ingestdb/prod-ca-2021.crt",
   "rclone_config": "/Users/REPLACE/Library/Application Support/UK AQ/history-dropbox-backup/TEST/config/rclone.conf",
   "max_attempts": 5
 }

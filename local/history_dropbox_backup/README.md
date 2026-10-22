@@ -128,6 +128,8 @@ export BACKUP_HOME="$HOME/Library/Application Support/UK AQ/history-dropbox-back
 export BACKUP_CONFIG="$BACKUP_HOME/TEST/config/backup.json"
 mkdir -p "$BACKUP_HOME/TEST/config"
 chmod 700 "$BACKUP_HOME/TEST" "$BACKUP_HOME/TEST/config"
+mkdir -p "$BACKUP_HOME/TEST/config/certs/ingestdb"
+chmod 700 "$BACKUP_HOME/TEST/config/certs" "$BACKUP_HOME/TEST/config/certs/ingestdb"
 cp local/history_dropbox_backup/config.example.json "$BACKUP_CONFIG"
 chmod 600 "$BACKUP_CONFIG"
 touch "$BACKUP_HOME/TEST/config/rclone.conf"
@@ -151,24 +153,23 @@ direct `db.<project-ref>.supabase.co:5432/postgres` endpoint (direct port omissi
 also means 5432), or the approved shared Supabase **session** pooler:
 
 ```text
-postgresql://postgres.<project-ref>:<URL-encoded-password>@aws-<pooler-number>-<region>.pooler.supabase.com:5432/postgres?sslmode=require
+postgresql://postgres.<project-ref>:<URL-encoded-password>@aws-<pooler-number>-<region>.pooler.supabase.com:5432/postgres?sslmode=verify-full
 ```
 
 On the MacBook Pro, reuse the existing approved TEST IngestDB session-pooler URL
 in the protected local JSON. Keep its actual pooler hostname and credentials,
-select port **5432** and database `postgres`, and append `?sslmode=require` if it
-has no query. The decoded username must be exactly `postgres.<project-ref>`, with
+select port **5432** and database `postgres`, and use exactly
+`?sslmode=verify-full`. The decoded username must be exactly `postgres.<project-ref>`, with
 the same reviewed `identity.postgres_project_ref`; do not change the pin to make
 a different project pass. URL-encode credentials locally. No new environment key,
 project discovery or direct-endpoint DNS workaround is required.
 
-Both routes require an explicit `sslmode=require` or `sslmode=verify-full` as the
+Both routes require explicit `sslmode=verify-full` as the
 only query parameter. Duplicate parameters, identity overrides, `ssl`,
 `uselibpqcompat` and other query settings are refused because the PostgreSQL
 driver can otherwise override the validated target or disable certificate checks.
-With the pinned driver, both accepted modes enable TLS with certificate and
-hostname verification; no TLS fallback is added. If additional CA trust is
-needed, use the existing approved `NODE_EXTRA_CA_CERTS` mechanism; never disable
+Certificate-chain and hostname verification remain enabled. `require` is now
+refused so this boundary does not depend on driver-version aliases. Never disable
 certificate verification. Transaction pooling (especially port **6543**), other
 ports/hosts, missing credentials and mismatched projects are refused.
 
@@ -177,7 +178,7 @@ The URL must exactly match the separately pinned ObsAQIDB project. It is never
 inferred from the lock database or an inherited environment. Health credentials
 are excluded from the backup child's environment. All inherited backend, Node,
 rclone, lock-held and debug overrides are excluded. Plists contain only executable,
-repository/config paths, environment label and output paths. No new shared
+repository/config/CA paths, environment label and output paths. No new shared
 repository environment variable or env-sync target is required; the JSON pin is
 local-only because health and lock projects must be reviewed independently.
 
@@ -185,6 +186,8 @@ Existing R2/Dropbox/checkpoint key names are retained in the example. A fingerpr
 binds source/destination, installation, generation/mode, both reviewed database
 identities and retry/checkpoint controls. Credential rotation does not change it;
 identity/control changes require a new operation after settling prior reporting.
+CA path/certificate rotation and selecting `verify-full` do not change the
+fingerprint or durable operation UUID; reinstall the plist while safely idle.
 `max_attempts` is 1–20 (default example 5). Unreported old backup-only state is not
 silently retrofitted with a fictitious Started event; retain it for operator review.
 
@@ -210,6 +213,111 @@ exact effective identities. The dump is captured only in memory, never logged or
 saved. Unsupported account/path/backend overrides fail closed. Review the actual
 Dropbox account and manifest pins; the program cannot infer intent from labels.
 
+### Protected PostgreSQL CA
+
+The required top-level `postgres_ca_file` in protected `backup.json` selects the
+operator-approved public CA certificate. There was no equivalent protected field;
+this local JSON setting is separate from `env` and introduces no shared secret or
+environment-sync target. Use an absolute canonical path directly inside the
+selected installation's `config/certs/ingestdb/` directory:
+
+```text
+history-dropbox-backup/
+  TEST/config/backup.json
+  TEST/config/certs/ingestdb/prod-ca-2021.crt
+  LIVE/config/backup.json
+  LIVE/config/certs/ingestdb/prod-ca-2021.crt
+```
+
+Each JSON uses its own absolute path; the example is a placeholder to replace
+locally. TEST and future separately authorised LIVE installations run identical
+code and may hold distinct approved CA files. A path in the other environment,
+outside `certs/ingestdb/`, relative, noncanonical or through a symlink is refused.
+The environment root, config, certs and ingestdb directories must satisfy the
+existing current-user/private-path rules (normally 700); the regular certificate
+file must satisfy the same rules (normally 600). The file must contain exactly
+one PEM CA certificate within its validity period, with no key or bundle.
+Missing, malformed, expired or insecure certificates block configuration; there
+is no inherited-shell or alternative-certificate fallback. This validates local
+structure, not provenance: obtain/review the approved certificate independently.
+
+The existing approved TEST file is `prod-ca-2021.crt`, subject
+`CN=Supabase Root 2021 CA`, valid until 26 April 2031. These are operator reference
+facts, not application constants or automatic discovery rules. For a new install,
+copy only the independently approved public CA into the protected directory and
+set mode 600. Do not copy keys or credentials there or commit certificate contents.
+
+Installation validates the configured file and renders its path into launchd's
+`EnvironmentVariables.NODE_EXTRA_CA_CERTS`. Node reads extra CAs when its process
+starts; setting `process.env` after startup cannot configure the supervisor's TLS
+trust. The plist therefore supplies it before the supervisor starts, including
+after logout/login or reboot. The supervisor blocks with `postgres_ca_startup`
+if its startup environment does not match the protected configured path; it
+does not proceed with stale plist trust. `childEnvironment()` revalidates and pins the same
+protected path for the shared PostgreSQL coordinator and subsequent Node children;
+an inherited `NODE_EXTRA_CA_CERTS` cannot override it. Existing environment
+sanitisation and health-secret exclusions remain. Only the CA path goes into the
+plist; neither certificate contents nor credentials are rendered or logged.
+
+### Update an existing idle TEST installation without starting
+
+This procedure applies to the existing `Ready`, backup attempts `0`, operation
+UUID `null`, task health `not_started` installation. Before replacing its stable
+checkout, use the existing checkout's status command to confirm those values.
+If an operation exists, preserve it and review its state before changing code;
+do not use `new`, delete state, or stop/cancel it as an installation shortcut.
+
+Set these local path variables; they contain no credentials:
+
+```bash
+umask 077
+export BACKUP_HOME="$HOME/Library/Application Support/UK AQ/history-dropbox-backup"
+export BACKUP_CONFIG="$BACKUP_HOME/TEST/config/backup.json"
+export BACKUP_PLIST="$HOME/Library/LaunchAgents/uk.co.ukaq.history-dropbox-backup.test.plist"
+./local/history_dropbox_backup/status.sh --environment TEST --config "$BACKUP_CONFIG"
+```
+
+After confirming that idle state, ensure the job is unregistered before updating
+the checkout or protected configuration. This only unregisters the confirmed idle
+job; it does not invoke the package's cancellation command or create state:
+
+```bash
+if launchctl print "gui/$(id -u)/uk.co.ukaq.history-dropbox-backup.test" >/dev/null 2>&1; then
+  launchctl bootout "gui/$(id -u)/uk.co.ukaq.history-dropbox-backup.test"
+fi
+```
+
+Use a stable TEST Ops checkout containing the merged CA-support PR, with existing
+dependencies installed. In a local editor, update the existing `backup.json` only:
+add `postgres_ca_file` with the absolute canonical path to the **already installed
+approved TEST** certificate, and ensure the existing approved session-pooler URL's
+only query is `sslmode=verify-full`. Keep all project/target pins and credentials.
+Do not replace the JSON with the example or recreate `rclone.conf`.
+
+```bash
+chmod 700 "$BACKUP_HOME/TEST/config/certs" "$BACKUP_HOME/TEST/config/certs/ingestdb"
+chmod 600 "$BACKUP_CONFIG" "$BACKUP_HOME/TEST/config/certs/ingestdb/prod-ca-2021.crt"
+./local/history_dropbox_backup/install.sh --environment TEST --config "$BACKUP_CONFIG"
+plutil -lint "$BACKUP_PLIST"
+/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:NODE_EXTRA_CA_CERTS' "$BACKUP_PLIST"
+./local/history_dropbox_backup/status.sh --environment TEST --config "$BACKUP_CONFIG"
+```
+
+Compare the single printed CA path with the expected protected TEST certificate
+path. This inspects only the CA entry, without printing JSON, credentials or
+certificate contents. Confirm the status is still `Ready`, attempts `0`, operation
+UUID `null`, health `not_started`, and that `launchctl print` reports no registered
+job. Installation only validates and atomically replaces the plist: it does not
+bootstrap, kickstart, run the supervisor, create an operation or send health RPCs.
+All existing state, reports, logs, configuration and rclone OAuth credentials are
+retained. No backup starts until a later separately authorised explicit `start`.
+Reinstall again while safely idle whenever the CA path or certificate is changed.
+
+If installation fails, keep the job unregistered and retain all evidence while
+correcting the reported category. For rollback, retain/restore the prior stable
+checkout and plist while idle; do not start an older version without reviewing its
+CA startup configuration. Never erase an operation or weaken TLS to roll back.
+
 ## Scheduling, installation and operation
 
 Before an extended run, an authorised operator must pause the TEST backup dispatch
@@ -225,6 +333,12 @@ its resolved absolute executable path and leaves the agent idle:
 
 ```bash
 ./local/history_dropbox_backup/install.sh --environment TEST --config "$BACKUP_CONFIG"
+./local/history_dropbox_backup/status.sh --environment TEST --config "$BACKUP_CONFIG"
+```
+
+Only after separate authorisation for the real one-off, explicitly start it:
+
+```bash
 node local/history_dropbox_backup/control.mjs start --environment TEST --config "$BACKUP_CONFIG"
 ./local/history_dropbox_backup/status.sh --environment TEST --config "$BACKUP_CONFIG"
 launchctl print "gui/$(id -u)/uk.co.ukaq.history-dropbox-backup.test"
@@ -346,15 +460,21 @@ protected configuration/state. Revert to the prior merged checkout after stoppin
 all descendants; its validator requires a reachable approved direct endpoint.
 Do not weaken TLS or substitute transaction pooling to work around DNS failure.
 
-Chat-mode system-doc handover: update the owning backup contract/runbook to record
-this optional MBPro lock transport: approved direct PostgreSQL or the pinned
-Supabase session pooler on 5432, database `postgres`, exact project-qualified
-pooler username and one explicit secure SSL mode. Implementation changes are only
-`config.mjs`, this README and the focused configuration check, plus the required
-pre-change code archive. There are no schema, shared environment-key, coordinator,
-scheduling or LIVE changes. Local syntax/identity/TLS checks establish structure;
-real TEST lock retention, exclusion and lock-loss acceptance remain required.
-Authoritative `system_docs/` was not edited.
+Chat-mode system-doc handover: amend the optional MBPro lifecycle in
+`system_docs/backup_and_recovery/r2_history_dropbox_backup_contract.md` and route
+its runbook from the area README as needed. Preserve the approved direct/session
+pooler identity on 5432, database `postgres`, exact project-qualified pooler
+username and shared lock. Record required local `postgres_ca_file`, private
+environment-separated `config/certs/ingestdb/`, fail-closed canonical-path/CA
+validation and explicit `sslmode=verify-full`. launchd sets `NODE_EXTRA_CA_CERTS`
+before supervisor startup; children pin the validated path. CA changes do not
+change operation fingerprints. Idle reinstallation never starts a backup or
+resets state/health. Changes are confined to the backup config/control/supervisor/template,
+example, operator docs, focused configuration check and required code archives.
+There are no schema, shared environment-key, coordinator, Integrity, scheduling or
+LIVE changes and no new Supabase traffic/log cadence. Local syntax, configuration
+and plist checks establish structure; authorised real TEST TLS/lock/backup
+acceptance follows merge and idle update. Authoritative `system_docs/` was not edited.
 
 ## Complete future LIVE promotion scope
 

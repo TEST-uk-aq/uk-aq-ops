@@ -10,6 +10,8 @@
     <string>--environment</string><string>__ENVIRONMENT__</string>
     <string>--config</string><string>__CONFIG__</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>NODE_EXTRA_CA_CERTS</key><string>__POSTGRESCA__</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>300</integer>

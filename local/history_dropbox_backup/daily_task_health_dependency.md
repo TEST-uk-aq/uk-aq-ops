@@ -120,7 +120,12 @@ operation. Reconcile through the agent after review/reinstallation where necessa
 3. Merge Ops and install dependencies plus the idle agent from a stable merged
    checkout using the exact Mac installation/status commands in README.md.
    Configure protected TEST-only R2/Dropbox, lock and independently pinned ObsAQIDB
-   credentials. The REST settings are never inherited or inferred from the lock
+   credentials. Configure the required protected `postgres_ca_file` and use
+   `sslmode=verify-full` in the approved lock URL. Follow README's idle CA-update
+   procedure for an existing installation; reinstalling does not start a backup
+   or reset its operation/health. launchd supplies the validated CA path before
+   Node starts, and backup children pin the same path. The REST settings are never
+   inherited or inferred from the lock
    database, and health credentials never enter backup children. No new shared
    environment variable or env-sync target is introduced. LIVE remains inactive.
 4. Through normal operator controls pause competing schedules, then initiate only
