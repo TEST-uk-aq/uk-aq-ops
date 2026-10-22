@@ -9,8 +9,9 @@ import { active, atomic, atomicText, childEnvironment, load, locations, mutex, n
 import { reportingPending, reviewHealth, queueFailed, restoreAcceptedBackup } from "./health.mjs";
 
 process.umask(0o077);
-const usage = "Usage: node local/history_dropbox_backup/control.mjs <install|start|status|stop|retry|new|uninstall> --environment TEST|LIVE --config /absolute/.../TEST/config/backup.json [--operation UUID]";
-const [command, ...argv] = process.argv.slice(2);
+const usage = "Usage: node local/history_dropbox_backup/control.mjs <install|start|start-new|status|stop|retry|new|uninstall> --environment TEST|LIVE --config /absolute/.../TEST/config/backup.json [--operation UUID]";
+let [command, ...argv] = process.argv.slice(2);
+const startNew = command === "start-new";
 let p;
 function launchctl(args, allowFailure = false) {
   const r = spawnSync("/bin/launchctl", args, { encoding: "utf8", timeout: 15000 });
@@ -35,6 +36,50 @@ function launch() {
   requireSafe(fs.existsSync(p.plist), "install_required");
   if (!loaded()) launchctl(["bootstrap", `gui/${process.getuid()}`, p.plist]);
   else launchctl(["kickstart", `gui/${process.getuid()}/${p.label}`]);
+}
+function selectStartNew(state, previousOperation, c) {
+  // Selection and delegation stay inside the existing supervisor mutex. An
+  // invocation that observed the old UUID must never roll over its replacement.
+  requireSafe((state?.operation_id || null) === previousOperation, "previous_operation_changed");
+  requireSafe(!fs.existsSync(p.active) || Boolean(state), "state_invalid");
+  requireSafe(fs.existsSync(p.plist), "install_required");
+  requireSafe(!fs.existsSync(p.block), "supervision_review");
+  requireSafe(!fs.existsSync(p.stop), "operator_stop_review");
+  if (!state) return "start";
+  requireSafe(state.configuration_identity === c.fingerprint, "configuration_changed");
+  requireSafe(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(state.operation_id), "state_invalid");
+  requireSafe(["completed", "blocked"].includes(state.status) && state.next_attempt_at === null,
+    "previous_operation_unfinished");
+  const h = state.health, terminal = h?.terminal, input = terminal?.input;
+  requireSafe(h?.status === "confirmed" && h.run_id === state.operation_id
+    && h.terminal_confirmed === true && h.recompute_confirmed === true
+    && h.next_attempt_at === null && terminal, "settle_previous_health_first");
+  requireSafe(input?.task_key === h.input.task_key && input.started_at === h.input.started_at
+    && input.platform_run_id === state.operation_id
+    && input.scheduled_for_date === h.input.scheduled_for_date
+    && input.source_repo === h.input.source_repo && input.source_worker === h.input.source_worker
+    && input.summary?.one_off_operation_id === state.operation_id, "health_terminal_identity");
+  if (state.status === "completed") {
+    // active() already authenticates the durable completion/report identities.
+    requireSafe(terminal.kind === "finished" && state.successful_completion
+      && input.finished_at === state.completed_at
+      && input.summary.accepted_report_identity === state.last_accepted_report?.report_identity
+      && state.successful_completion.completed_at === state.completed_at
+      && state.last_failure_category === null, "completion_marker_invalid");
+  } else {
+    requireSafe(terminal.kind === "failed" && !state.successful_completion
+      && !state.last_accepted_report && state.completed_at === null
+      && Number.isFinite(Date.parse(input.failed_at))
+      && input.error_message === state.last_failure_category
+      && input.summary.backup_complete === false, "failure_marker_invalid");
+    // Configuration, lock-loss and evidence failures need reviewed recovery.
+    // Ordinary exhausted backup attempts can start a new checkpoint-reusing run.
+    requireSafe(["command_failed", "unexpected_failure", "interrupted", "retry_budget_exhausted"]
+      .includes(state.last_failure_category), "previous_failure_requires_review");
+    requireSafe(!state.current_invocation || !fs.existsSync(path.join(state.current_invocation.reports,
+      "accepted.json")), "accepted_evidence_requires_review");
+  }
+  return "new";
 }
 async function stop() {
   prepare(p);
@@ -79,8 +124,9 @@ try {
       && argv[i + 1] && !options[argv[i]], "arguments");
     options[argv[i]] = argv[i + 1];
   }
-  requireSafe(["install", "start", "status", "stop", "retry", "new", "uninstall"].includes(command)
+  requireSafe(["install", "start", "start-new", "status", "stop", "retry", "new", "uninstall"].includes(command)
     && options["--environment"] && options["--config"], "arguments");
+  requireSafe(command !== "start-new" || !options["--operation"], "arguments");
   p = locations(options["--environment"], options["--config"]);
   if (command === "status") {
     if (!fs.existsSync(p.config)) console.log("Not configured");
@@ -137,12 +183,19 @@ try {
       }
       console.log(`${command === "stop" ? "Stopped" : "Uninstalled"}; state, reports and logs retained at ${p.root}`);
     } else {
+      // Capture before configuration inspection/acquisition, then compare again
+      // under the mutex, including the no-previous-operation case.
+      const previousOperation = command === "start-new" ? active(p)?.operation_id || null : null;
       const c = configured(); prepare(p);
       // Operator state edits are serialised with the supervisor. They cannot reset an active run.
       const release = mutex(p);
       let shouldLaunch = false;
       try {
         const state = active(p);
+        if (command === "start-new") {
+          command = selectStartNew(state, previousOperation, c);
+          if (command === "new") options["--operation"] = previousOperation;
+        }
         if (command === "install") {
           requireSafe(!loaded(), "stop_before_install");
           import.meta.resolve("pg");
@@ -184,8 +237,13 @@ try {
             }
             atomic(p.active, state);
           }
-          if ((command === "new" || !state.health?.terminal) && fs.existsSync(p.stop)) fs.unlinkSync(p.stop);
-          if (fs.existsSync(p.block)) fs.unlinkSync(p.block);
+          // Automatic rollover never clears review intent, including a marker
+          // published concurrently after selection. Explicit reviewed commands
+          // retain their existing recovery behaviour.
+          if (!startNew) {
+            if ((command === "new" || !state.health?.terminal) && fs.existsSync(p.stop)) fs.unlinkSync(p.stop);
+            if (fs.existsSync(p.block)) fs.unlinkSync(p.block);
+          }
           shouldLaunch = true;
         }
       } finally { release(); }

@@ -102,9 +102,11 @@ observation under the low-log contract.
 A permanent backup failure, exhausted backup retry budget or deliberate stop is
 terminal Failed, with its original timestamp/payload retained for reporting.
 `retry` repairs an unconfirmed health obligation without reopening a terminal
-health run. After Failed is confirmed, recovery requires explicit `new` with the
-previous UUID. That new one-off can reuse canonical authenticated Dropbox
-checkpoints; it does not discard remote progress. A temporary Started-reporting
+health run. After Failed and recompute are confirmed, use `start-new.sh` for an
+ordinary exhausted backup attempt, or reviewed `new --operation UUID` when manual
+review is required. That new one-off can reuse canonical authenticated Dropbox
+checkpoints; it does not discard remote progress or reinterpret failure as success.
+A temporary Started-reporting
 outage before backup can be reviewed and retried using the same operation.
 
 The health record is version 2. Earlier unreleased version-1 records are refused
@@ -320,13 +322,14 @@ CA startup configuration. Never erase an operation or weaken TLS to roll back.
 
 ## Scheduling, installation and operation
 
-Before an extended run, an authorised operator must pause the TEST backup dispatch
-and conflicting scheduled Prune/Integrity/SOS-light/migration operations through
-normal Cloudflare/GitHub controls. Record previous settings and wait for active
-conflicting operations to finish. Coordinate generation-coupled Core/binding
-publishers as required by the normal runbook, and verify any required first-post-v3
-write acceptance gates. This package never changes schedules automatically.
-The global lock remains mandatory despite the pause.
+The shared PostgreSQL global operation lock normally serialises participating
+backup and writer operations. Routine blanket pausing or checking of scheduled
+TEST jobs is not required. Contention remains a visible, bounded failure; never
+bypass the lock. Separately coordinate known non-participating writers and
+incompatible migrations, and retain source-readiness, generation-coupled
+Core/binding and first-post-v3 write acceptance gates. This package never changes
+schedules automatically. This follows the authoritative TEST
+[MacBook Pro lifecycle and concurrency contract](https://github.com/TEST-uk-aq/uk-aq-system-docs/blob/main/system_docs/backup_and_recovery/r2_history_dropbox_backup_contract.md#optional-macbook-pro-supervised-one-off-r2-backup).
 
 Use the intended Node on your interactive PATH, without sudo. Installation records
 its resolved absolute executable path and leaves the agent idle:
@@ -336,7 +339,8 @@ its resolved absolute executable path and leaves the agent idle:
 ./local/history_dropbox_backup/status.sh --environment TEST --config "$BACKUP_CONFIG"
 ```
 
-Only after separate authorisation for the real one-off, explicitly start it:
+Only after separate authorisation for the real one-off, explicitly start the
+first backup (this immediately begins real backup work):
 
 ```bash
 node local/history_dropbox_backup/control.mjs start --environment TEST --config "$BACKUP_CONFIG"
@@ -351,6 +355,58 @@ A completed backup with pending/blocked health is explicitly distinguished from
 backup-plus-health confirmed. Ready, Running, Retrying, Blocked and Not configured
 remain local backup/config states; they do not invent remote task-health statuses.
 
+For subsequent authorised one-offs, the convenience command retrieves the previous
+operation UUID automatically; no copy/paste of the status UUID is needed:
+
+```bash
+# Immediately creates and STARTS one real backup; do not run start afterwards.
+./local/history_dropbox_backup/start-new.sh --environment TEST --config "$BACKUP_CONFIG"
+```
+
+`start-new.sh` delegates to the existing controller. With no previous operation it
+uses `start`, which creates the first UUID. With a completed operation it requires
+the accepted completion/report identities plus confirmed Started, terminal
+Finished and daily recompute. It then uses `new --operation PREVIOUS_UUID`, which
+archives the previous operation and immediately starts exactly one new UUID.
+After an ordinary definitively failed backup (`command_failed`, `unexpected_failure`,
+`interrupted` or `retry_budget_exhausted`), confirmed Started, terminal Failed and
+daily recompute likewise permit a new one-off. The failed UUID, diagnostics and
+reporting evidence remain preserved, and the canonical checkpoint rules can reuse
+previously verified progress.
+
+Selection uses the existing local mutex and configuration fingerprint, with the
+observed previous UUID (including its absence) checked again under that mutex.
+A competing invocation that replaces it causes `previous_operation_changed`,
+without another rollover. An active mutex reports `already_running`; after a new
+operation has been selected, another invocation refuses its unfinished state.
+There is no separate lock, UUID generator, scheduler or automatic backup trigger.
+
+Running, ready, retrying, delayed or non-terminal blocked operations are refused,
+as are pending Started/Finished/Failed/recompute, missing health evidence,
+configuration mismatch, malformed/inconsistent state, and missing installation.
+Any stop or supervision marker requires review, even after confirmed reporting.
+Configuration, authentication, lock-loss or backup-evidence failures also require
+review; `start-new` never clears protections to get past them. Errors expose only
+safe categories such as `previous_operation_unfinished`,
+`settle_previous_health_first`, `operator_stop_review`, `supervision_review`,
+`configuration_changed` or `previous_failure_requires_review`. Inspect private
+status/log/report evidence and use the appropriate reviewed recovery command;
+never delete state or markers just to make this wrapper proceed.
+
+The same interface accepts `--environment LIVE` with its own protected LIVE
+`backup.json`, rclone configuration, CA and explicit activation authorisation.
+This change does not authorise a LIVE installation or run.
+
+Command distinctions:
+
+| Command | Purpose |
+| --- | --- |
+| `start` | First one-off; an already completed backup is never repeated and only pending reporting may be reconciled. |
+| `start-new.sh` | First or subsequent one-off with automatic previous-UUID confirmation and strict automatic-rollover guards; immediately starts real work. |
+| `retry --operation UUID` | Reviewed recovery of the same operation or unresolved reporting; never reopens confirmed terminal health. |
+| `stop.sh` | Deliberate cancellation; retains evidence and stop intent, and queues Failed when applicable. |
+| `new --operation UUID` | Explicit reviewed rollover with manual previous-UUID confirmation; preserves the prior operation and immediately starts a new one. |
+
 ```bash
 # Deliberately cancel; retain evidence and queue terminal Failed if backup was active.
 ./local/history_dropbox_backup/stop.sh --environment TEST --config "$BACKUP_CONFIG"
@@ -358,7 +414,8 @@ remain local backup/config states; they do not invent remote task-health statuse
 # After review, reset only the pending reporting budget when backup is terminal.
 node local/history_dropbox_backup/control.mjs retry --environment TEST --config "$BACKUP_CONFIG" --operation REPLACE_WITH_OPERATION_UUID
 
-# Once prior reporting is confirmed, explicitly create another one-off.
+# Lower-level reviewed rollover, once prior reporting is confirmed.
+# This already STARTS the new operation; do not also run start.
 node local/history_dropbox_backup/control.mjs new --environment TEST --config "$BACKUP_CONFIG" --operation REPLACE_WITH_PREVIOUS_OPERATION_UUID
 
 # Remove only this agent/plist, keeping all configuration, reports and state.
@@ -370,7 +427,8 @@ reporter too: use reviewed `retry` to reconcile its retained obligation before
 creating another one-off or uninstalling. If uninstall is necessary first, reports
 remain pending; reinstall then retry reporting. Starting a completed one-off only
 reconciles pending health or exits; it never repeats accepted backup work. A
-confirmed terminal health run cannot be reopened by `retry`; use `new`.
+confirmed terminal health run cannot be reopened by `retry`; use `start-new.sh`
+when its automatic guards pass, otherwise review before using explicit `new`.
 
 Launchd uses RunAtLoad, KeepAlive/SuccessfulExit=false, Background process type,
 300-second throttle and separate stdout/stderr. There is no overall job timeout
@@ -398,7 +456,8 @@ automatic evidence deletion or log rotation is introduced.
 
 1. Record both merged commits. Separately apply/verify the TEST ObsAQIDB migration
    and PostgREST schema refresh; confirm approved configuration, permissions,
-   source generation and writer/scheduler gates. Install idle; no backup should start.
+   source generation and any separate writer/migration/readiness gates. Install idle;
+   no backup should start.
 2. Initiate a real authorised one-off. Confirm exactly one Started row for the
    MBPro task key, genuine local provenance, original UTC date and run UUID equal
    to the saved operation UUID. Verify dashboard visibility and exclusion from
@@ -444,8 +503,9 @@ automatic evidence deletion or log rotation is introduced.
    summary and `operational_completion_confirmed=true`.
 5. Start/login again: no extra backup attempt. Review Failed/report-only retry,
    explicit new-operation creation, retention and TEST/LIVE separation. Record
-   actual Supabase log impact and restore precisely the paused schedules after
-   the protected process is gone and the operator accepts completion.
+   actual Supabase log impact. Restore any schedules separately paused for a known
+   incompatible operation after the protected process is gone and the operator
+   accepts completion; routine blanket pausing is not required.
 
 Pre-deployment checks are documented in the linked integration guide: syntax,
 JSON/plist/whitespace, existing relevant checks and focused UUID recovery,
