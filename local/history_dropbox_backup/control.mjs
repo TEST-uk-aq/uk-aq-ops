@@ -3,9 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
 import { active, atomic, atomicText, childEnvironment, load, locations, mutex, now,
-  prepare, read, remoteConfiguration, repo, requireSafe } from "./config.mjs";
+  prepare, read, remoteConfiguration, renderLaunchAgent, requireSafe } from "./config.mjs";
 
 import { reportingPending, reviewHealth, queueFailed, restoreAcceptedBackup } from "./health.mjs";
 
@@ -31,7 +30,6 @@ function fresh(c) {
     last_failure_category: null, last_accepted_report: null, successful_completion: null,
     next_attempt_at: null, current_invocation: null };
 }
-function xml(value) { return value.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" })[c]); }
 function loaded() { return launchctl(["print", `gui/${process.getuid()}/${p.label}`], true); }
 function launch() {
   requireSafe(fs.existsSync(p.plist), "install_required");
@@ -149,11 +147,7 @@ try {
           requireSafe(!loaded(), "stop_before_install");
           import.meta.resolve("pg");
           fs.mkdirSync(path.dirname(p.plist), { recursive: true, mode: 0o700 });
-          const template = fs.readFileSync(new URL("./LaunchAgent.plist.template", import.meta.url), "utf8");
-          const values = { LABEL: p.label, NODE: fs.realpathSync(process.execPath),
-            SUPERVISOR: fileURLToPath(new URL("./supervisor.mjs", import.meta.url)),
-            ENVIRONMENT: p.environment, CONFIG: p.config, REPO: repo, OUTPUT: p.output };
-          const rendered = template.replace(/__([A-Z]+)__/g, (_, key) => xml(values[key]));
+          const rendered = renderLaunchAgent(c, p);
           // Validate the exact rendered content before publishing the user's LaunchAgent.
           const candidate = path.join(p.output, "candidate.plist");
           atomicText(candidate, rendered);

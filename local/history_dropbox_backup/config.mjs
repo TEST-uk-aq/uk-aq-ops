@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, X509Certificate } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { assertHistoryBackupSource, assertHistoryBackupDestination, assertHistoryBackupRemotes,
   configuredHistoryDropboxRoot, resolveHistoryBackupR2 } from "../../scripts/backup_r2/lib/history_backup_targets.mjs";
@@ -81,13 +81,42 @@ const requiredEnv = ["CFLARE_R2_ENDPOINT", "CFLARE_R2_BUCKET", "CFLARE_R2_REGION
   "OBS_AQIDB_SUPABASE_URL", "OBS_AQIDB_SECRET_KEY",
   "UK_AQ_DROPBOX_ROOT", "UK_AQ_R2_HISTORY_DROPBOX_DIR", "UK_AQ_R2_HISTORY_VERSION",
   "UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS", "UK_AQ_R2_HISTORY_CHECKPOINT_FLUSH_SECONDS"];
+export function postgresCAFile(c, p) {
+  try {
+    const filename = c.postgres_ca_file;
+    const certs = path.join(path.dirname(p.config), "certs");
+    const ingestdb = path.join(certs, "ingestdb");
+    requireSafe(typeof filename === "string" && path.isAbsolute(filename)
+      && path.resolve(filename) === filename && !/[\x00-\x1f\x7f]/.test(filename)
+      && path.dirname(filename) === ingestdb);
+    for (const dir of [p.root, path.dirname(p.config), certs, ingestdb]) privatePath(dir, true);
+    privatePath(filename);
+    const pem = fs.readFileSync(filename, "utf8");
+    // One public CA certificate only; reject bundles, private keys and trailing data.
+    requireSafe(/^-----BEGIN CERTIFICATE-----\r?\n[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE-----\s*$/.test(pem));
+    const certificate = new X509Certificate(pem);
+    requireSafe(certificate.ca && Date.parse(certificate.validFrom) <= Date.now()
+      && Date.now() < Date.parse(certificate.validTo));
+    return filename;
+  } catch { requireSafe(false, "postgres_ca_file_invalid"); }
+}
+export function renderLaunchAgent(c, p) {
+  const template = fs.readFileSync(new URL("./LaunchAgent.plist.template", import.meta.url), "utf8");
+  const values = { LABEL: p.label, NODE: fs.realpathSync(process.execPath),
+    SUPERVISOR: fileURLToPath(new URL("./supervisor.mjs", import.meta.url)),
+    ENVIRONMENT: p.environment, CONFIG: p.config, REPO: repo, OUTPUT: p.output,
+    POSTGRESCA: postgresCAFile(c, p) };
+  return template.replace(/__([A-Z]+)__/g, (_, key) => values[key].replace(/[&<>"']/g,
+    (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" })[character]));
+}
 export function load(p) {
   privatePath(p.root, true); privatePath(path.dirname(p.config), true);
   privatePath(p.config);
   const c = JSON.parse(fs.readFileSync(p.config, "utf8"));
   requireSafe(c.schema_version === 1 && c.environment === p.environment);
   requireSafe(Object.keys(c).every((k) => ["schema_version", "environment", "identity", "env",
-    "rclone_bin", "rclone_config", "max_attempts", "live_activation_authorized"].includes(k)));
+    "rclone_bin", "rclone_config", "postgres_ca_file", "max_attempts", "live_activation_authorized"].includes(k)));
+  postgresCAFile(c, p);
   requireSafe(c.env && Object.keys(c.env).every((k) => requiredEnv.includes(k)));
   for (const key of requiredEnv) requireSafe(typeof c.env[key] === "string" && c.env[key].trim() === c.env[key]
     && c.env[key].length > 0 && !/[\r\n\0]/.test(c.env[key]));
@@ -117,7 +146,7 @@ export function load(p) {
     && (direct || sessionPooler) && username.trim() && password.trim()
     && !/[\s#]/.test(c.env.SUPABASE_DB_URL) && !/[\x00-\x1f\x7f]/.test(username + password)
     && db.pathname === "/postgres" && db.searchParams.size === 1
-    && ["require", "verify-full"].includes(db.searchParams.get("sslmode")));
+    && db.searchParams.get("sslmode") === "verify-full");
   requireSafe(c.env.UK_AQ_DROPBOX_ROOT === id.dropbox_root
     && c.env.UK_AQ_R2_HISTORY_DROPBOX_DIR === id.dropbox_directory);
   // Explicit environment partition; no fallback to another environment's destination.
@@ -137,7 +166,7 @@ export function load(p) {
   const source = `uk_aq_r2:${resolveHistoryBackupR2(c.env).bucket}`;
   const destination = configuredHistoryDropboxRoot(c.env);
   assertHistoryBackupSource(source, c.env); assertHistoryBackupDestination(destination, c.env);
-  // Credential rotation does not change the durable operation identity.
+  // Credential/CA rotation does not change the durable operation identity.
   const identity = { environment: p.environment, installation_root: p.root, source, destination, ...id, generation: "v3",
     binding_mode: "pack", parquet_mode: "full", max_days: 0,
     checkpoint_batch_units: c.env.UK_AQ_R2_HISTORY_CHECKPOINT_BATCH_UNITS,
@@ -148,12 +177,13 @@ export function load(p) {
 export function childEnvironment(c, p) {
   const env = {};
   for (const key of ["HOME", "TMPDIR", "LANG", "LC_ALL", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY",
-    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS"]) {
+    "SSL_CERT_FILE", "SSL_CERT_DIR"]) {
     if (process.env[key]) env[key] = process.env[key];
   }
   const backupEnv = Object.fromEntries(Object.entries(c.env).filter(([key]) =>
     !["OBS_AQIDB_SUPABASE_URL", "OBS_AQIDB_SECRET_KEY"].includes(key)));
   return { ...env, ...backupEnv, PATH: `${path.dirname(process.execPath)}:${path.dirname(c.rclone_bin)}:/usr/bin:/bin:/usr/sbin:/sbin`,
+    NODE_EXTRA_CA_CERTS: postgresCAFile(c, p),
     RCLONE_CONFIG: c.rclone_config, UK_AQ_R2_HISTORY_BACKUP_RCLONE_BIN: c.rclone_bin,
     UKAQ_ENV_NAME: p.environment };
 }
