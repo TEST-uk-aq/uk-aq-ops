@@ -57,7 +57,7 @@ jobs:
           sed -i "s|__UK_AQ_POSTCODE_R2_PREFIX__|${UK_AQ_POSTCODE_R2_PREFIX}|g" workers/uk_aq_postcode_lookup_r2_api_worker/wrangler.toml
 
       - name: Deploy Worker (base)
-        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0
         with:
           apiToken: ${{ env.UK_AQ_POSTCODE_R2_CLOUDFLARE_API_TOKEN }}
           accountId: ${{ env.UK_AQ_POSTCODE_R2_CLOUDFLARE_ACCOUNT_ID }}
@@ -86,7 +86,7 @@ jobs:
           done
 
       - name: Deploy Worker
-        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0
         with:
           apiToken: ${{ env.UK_AQ_POSTCODE_R2_CLOUDFLARE_API_TOKEN }}
           accountId: ${{ env.UK_AQ_POSTCODE_R2_CLOUDFLARE_ACCOUNT_ID }}

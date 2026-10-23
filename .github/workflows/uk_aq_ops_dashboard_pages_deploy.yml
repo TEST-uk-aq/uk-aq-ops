@@ -66,7 +66,7 @@ jobs:
           cp -R station_snapshot/. _pages/station_snapshot/
 
       - name: Deploy to Cloudflare Pages
-        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0
         with:
           apiToken: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
           accountId: ${{ env.UK_AQ_CF_ACCOUNT_ID_UKAQ }}
