@@ -7,7 +7,7 @@ import { inspectAuthenticatedPruneHandover } from './prune-consumer-authenticati
 import { reconstructPruneSelectedPartitions, prunePartitionArtifacts } from './prune-consumer-partitions.mjs';
 import { retainImmutable } from './prune-receipts.mjs';
 import { readPruneEventDescriptor, readReceipt, readBundle, admitDerived } from './inputs.mjs';
-import { assertManagedR2CredentialMode } from './r2-config.mjs';
+import { assertManagedR2CredentialMode, managedR2Environment } from './r2-config.mjs';
 import { DAQI_PM_ROLLING24H_WINDOW_HOURS, DAQI_PM_ROLLING24H_REQUIRED_HOURS } from '../../lib/aqi/aqi_levels.mjs';
 import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
 import { evidence, freeze, LIMITS } from './limits.mjs';
@@ -59,9 +59,10 @@ export function buildSelectedPruneEvent({ handover, budget = null }) {
 }
 export function authenticateSelectedPruneInput({ input, handover, budget }) {
   const event = buildSelectedPruneEvent({ handover, budget });
-  const i = event.entries.findIndex(e => e.receipt.change_id === input.receipt.change_id);
+  const i = event.entries.findIndex(e => e.receipt.change_id === input?.receipt?.change_id);
+  evidence(i >= 0, 'conflicting_selected_receipt', 'Selected receipt change ID is not in the authenticated descriptor');
   const artifact = constructed.get(handover).artifacts[i];
-  evidence(i >= 0 && same(input.receipt, event.entries[i].receipt)
+  evidence(same(input.receipt, event.entries[i].receipt)
     && same(input.receipt_object, event.entries[i].receipt_object)
     && input.bundle?.integrity === 'verified' && same(input.bundle.records, artifact.records),
   'conflicting_selected_receipt', 'Selected receipt/bundle differs from authenticated descriptor');
@@ -75,6 +76,7 @@ export function authenticateSelectedPruneInput({ input, handover, budget }) {
 export async function retainSelectedPruneEvent({ handover, r2, budget = null, progress = () => {} }) {
   assertManagedR2CredentialMode(r2, 'write'); admitDerived(r2);
   const proof = inspectAuthenticatedPruneHandover(handover);
+  evidence(proof.authority.key.environment === managedR2Environment(r2), 'cross_environment_evidence', 'Retained event differs from configured storage environment');
   budget ||= proof.operationBudget;
   evidence(budget === proof.operationBudget, 'operation_budget_mismatch', 'Retention cannot restart the original authentication budget');
   const event = buildSelectedPruneEvent({ handover, budget });

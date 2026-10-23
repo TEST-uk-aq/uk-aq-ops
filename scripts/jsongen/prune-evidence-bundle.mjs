@@ -1,3 +1,4 @@
+import { isEnvironmentName } from './environment.mjs';
 // Versioned deterministic transport for complete original Prune evidence.
 // Hashes and bounded decoding prove byte identity, not writer or DB authority.
 import { gzipSync, gunzipSync } from 'node:zlib';
@@ -52,13 +53,16 @@ function bodyBytes(object, phase) {
 function validateEvidenceEnvelope(envelope) {
   check(envelope?.schema_version === 1
     && envelope.kind === 'uk_aq_jsongen_prune_original_final_evidence_preparation'
-    && envelope.environment === 'TEST' && envelope.index_generation === 'v3'
+    && isEnvironmentName(envelope.environment) && envelope.index_generation === 'v3'
     && envelope.writer?.identity === 'prune_daily_v3'
     && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(envelope.writer?.invocation_id || '')
     && envelope.writer.attempt_id === envelope.writer.invocation_id
     && /^[a-f0-9]{40}$/.test(envelope.writer.git_sha || '')
     && Number.isSafeInteger(envelope.connector_id) && envelope.connector_id === 1
     && /^\d{4}-\d{2}-\d{2}$/.test(envelope.day_utc || ''), 'bundle_invocation_identity');
+  check(envelope.pending?.source_evidence?.environment === envelope.environment
+    && envelope.original_authority_extension?.identity?.environment === envelope.environment,
+  'evidence_bundle_environment_mismatch');
   const snapshot = envelope.original_metadata_snapshot;
   const original = envelope.original_authority_extension;
   check(snapshot?.schema_version === 1

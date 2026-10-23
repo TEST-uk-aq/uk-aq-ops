@@ -10,6 +10,100 @@ and rebased over two subsequent Node 24 workflow/runtime commits; no JSONgen
 implementation file changed in that base update.
 System docs were read only.
 
+## Follow-up correction to reviewed head a75f696 — 23 October 2026
+
+Unknown or malformed selected receipt inputs now fail with typed
+`conflicting_selected_receipt` **before** partition artifact lookup. Exact receipt,
+immutable reference, complete record and authenticated descriptor comparisons
+and private capabilities are unchanged.
+
+The shared original-event implementation is environment-independent. The same
+complete approved files must eventually be promoted from TEST; LIVE must use
+separate explicit configuration and receive separate operational authorisation.
+No LIVE repository, configuration, deployment, credential or service was used.
+Only the previously authenticated TEST 15 October event has real Stage 1
+acceptance. No real Stage 2 retention or registration is accepted by this PR.
+
+`environment.mjs` validates canonical environment names structurally:
+`[A-Z][A-Z0-9_]{0,31}`. No default, coercion, case conversion or inferred identity
+is allowed. `UK_AQ_ENV_NAME` selects execution identity, `UK_AQ_GITHUB_REPO` pins
+repository identity, and GitHub metadata must match it. Consumer/inspection
+entry points and the private original reader retain `workflow_dispatch` admission
+in Actions. Shared R2 target configuration checks explicit environment/repository
+identity without adding a manual-only gate to the original writer's existing
+transport/scheduling; an R2 configuration alone never grants event authority.
+READ/WRITE modes, explicit retain invocation, source capabilities and existing
+credentials remain the operation boundary. No new environment variables exist.
+
+The private reader captures execution environment before connecting; requested
+primary keys, returned rows and discovery cursors must match it. Discovery now
+binds environment as SQL `$1`, window `$2/$3`, limit `$4`, and resume tuple
+`$5..$9`. Complete primary keys, source hashes, original insertion-time pagination,
+restricted read-only role, RLS privilege checks and strict TLS/project binding
+are preserved. Supabase and R2 hostnames select explicitly configured targets;
+they never determine environment.
+
+Pure acceptance, post-commit, evidence-bundle and receipt validators validate
+historical labels structurally. Runtime authentication proves reader execution
+identity = acceptance environment = handover/envelope environment = original
+bundle identity = pending source environment = original before/Core binding
+authority identity = configured R2 environment. R2 factories retain configured
+identity privately in WeakMaps, outside immutable bytes. Retention, descriptor/
+receipt/bundle reads, managed-control reads and registration also enforce this
+agreement, so a caller cannot switch target context after authentication.
+
+Shared pure source-description helpers accept an explicit historical environment
+when reconstructing source evidence. New writer preparation uses explicit process
+configuration; final envelopes and original-authority extensions preserve the
+pending source's recorded environment. The shared signed-upload config helper
+now uses generic configured admission without changing request/response fields,
+signed bytes, original writer publication logic or the Worker protocol.
+
+Historical TEST preservation was checked against a deterministic vector captured
+twice **before editing a75f696**. The unchanged vector includes acceptance and
+post-commit hashes, original source/evidence bytes, descriptor reference and all
+canonical receipt bytes, partition/bundle identities and complete group hash.
+Its SHA-256 remains
+`2bee3bd8d5a83d67eb50fb896129c0ce48184eea60ad515888c481640b1717bc`.
+Direct pre/post vector byte comparison also passes. This is a synthetic regression
+and structural proof of unchanged TEST derivation; it does not claim a new read
+of the private real event. No historical source is rewritten, re-signed or
+migrated, and no runtime configuration fields enter the descriptor/receipt.
+Descriptor v1, receipt v1/v2/v3, control v1/v2 and reconciliation v1–v4 retain
+wire formats and existing meanings; no version bump is introduced here.
+
+Bounded remaining TEST restrictions are deliberately outside this consumer
+path: Stage A `diagnose.mjs`/`diagnostic-report.mjs`, manual offline Dropbox
+bootstrap, signer transport acceptance checks and the deployment-only Wrangler
+renderer remain TEST-pinned. These are separate tools/contracts, not fallback
+paths. The signer Worker and original Prune writer are unchanged; their later
+LIVE promotion/source-environment setup remains a separate prerequisite. This
+follow-up does not make those operational components LIVE-ready. In particular,
+original writer acceptance/capture environment literals were observed in its
+direct callers and left untouched as required by this task's writer boundary.
+There is no blocker or contract conflict for the bounded consumer/pure-helper
+correction; no end-to-end LIVE acceptance is implied.
+
+Current checks: **24/24** directly relevant environment + Stage 2 + read-only
+planning checks pass. Existing older consumer/Stage 2 fixtures improve from
+**30 pass / 18 fail** to **35 pass / 13 fail** after explicit synthetic
+configuration is installed before static imports and fixture targets use that
+configuration. Only five obsolete environment/reference cases are resolved;
+remaining failing names are a subset of the same baseline. Twelve still stop at
+explicit READ/WRITE capability checks (one expects a later writer-authentication
+diagnostic), and one expects an obsolete binding diagnostic.
+Application credential/authority validation was not weakened to pass fixtures.
+Syntax checks and side-effect-free module imports are recorded in the PR.
+
+The future operator procedure below still applies **only to a separately
+authorised TEST operation**. Source `UK_AQ_ENV_NAME=TEST` with the approved TEST
+repository, database and private R2 settings before process startup. Never label
+TEST evidence as another environment. Do not create a LIVE workflow or run any
+LIVE command from this handover. For authoritative system-doc ownership, record
+the configured/historical/operational identity distinction, generic shared-code
+admission, exact historical digest preservation and unchanged wire versions;
+keep TEST-only acceptance and every LIVE/publication gate explicit.
+
 ## Formats and proof boundary
 
 The previously unused independent durable descriptor family starts at
@@ -282,3 +376,33 @@ Exact pre-change active code copies (reference/rollback only):
 - `archive/2026-10-23/scripts/jsongen/report-validation.mjs`
 - `archive/2026-10-23/scripts/jsongen/schema.mjs`
 - `archive/2026-10-23/scripts/jsongen/writer-authentication.mjs`
+
+## Follow-up file and archive inventory
+
+- `scripts/jsongen/README.md` — documentation/test; no code archive
+- `scripts/jsongen/admission.mjs` — new exact original: `archive/2026-10-23/scripts/jsongen/admission.mjs`
+- `scripts/jsongen/control.mjs` — reuse: `archive/2026-10-23/scripts/jsongen/control.mjs`
+- `scripts/jsongen/environment.mjs` — new implementation file; no pre-change original
+- `scripts/jsongen/inputs.mjs` — reuse: `archive/2026-10-23/scripts/jsongen/inputs.mjs`
+- `scripts/jsongen/prune-consumer-authentication.mjs` — reuse: `archive/2026-10-23/scripts/jsongen/prune-consumer-authentication.mjs`
+- `scripts/jsongen/prune-consumer.mjs` — reuse: `archive/2026-10-23/scripts/jsongen/prune-consumer.mjs`
+- `scripts/jsongen/prune-evidence-bundle.mjs` — new exact original: `archive/2026-10-23/scripts/jsongen/prune-evidence-bundle.mjs`
+- `scripts/jsongen/prune-evidence.mjs` — new exact original: `archive/2026-10-23/scripts/jsongen/prune-evidence.mjs`
+- `scripts/jsongen/prune-final-evidence.mjs` — new exact original: `archive/2026-10-23/scripts/jsongen/prune-final-evidence.mjs`
+- `scripts/jsongen/prune-original-authority.mjs` — new exact original: `archive/2026-10-23/scripts/jsongen/prune-original-authority.mjs`
+- `scripts/jsongen/prune-original-metadata.mjs` — new exact original: `archive/2026-10-23/scripts/jsongen/prune-original-metadata.mjs`
+- `scripts/jsongen/prune-outbox-reader.mjs` — new exact original: `archive/2026-10-23/scripts/jsongen/prune-outbox-reader.mjs`
+- `scripts/jsongen/prune-outbox.mjs` — new exact original: `archive/2026-10-23/scripts/jsongen/prune-outbox.mjs`
+- `scripts/jsongen/prune-pending-verification.mjs` — new exact original: `archive/2026-10-23/scripts/jsongen/prune-pending-verification.mjs`
+- `scripts/jsongen/prune-receipts.mjs` — reuse: `archive/2026-10-23/scripts/jsongen/prune-receipts.mjs`
+- `scripts/jsongen/prune-selected-event.mjs` — new exact original: `archive/2026-10-23/scripts/jsongen/prune-selected-event.mjs`
+- `scripts/jsongen/prune-signed-upload.mjs` — new exact original: `archive/2026-10-23/scripts/jsongen/prune-signed-upload.mjs`
+- `scripts/jsongen/prune-stage2-handover.md` — documentation/test; no code archive
+- `scripts/jsongen/r2-config.mjs` — new exact original: `archive/2026-10-23/scripts/jsongen/r2-config.mjs`
+- `scripts/jsongen/reconcile-cli.mjs` — new exact original: `archive/2026-10-23/scripts/jsongen/reconcile-cli.mjs`
+- `scripts/jsongen/schema.mjs` — reuse: `archive/2026-10-23/scripts/jsongen/schema.mjs`
+- `tests/jsongen_environment.test.mjs` — documentation/test; no code archive
+- `tests/jsongen_prune_consumer.test.mjs` — documentation/test; no code archive
+- `tests/jsongen_prune_consumer_fixture.mjs` — documentation/test; no code archive
+- `tests/jsongen_stage2.test.mjs` — documentation/test; no code archive
+- `tests/jsongen_test_environment.mjs` — documentation/test; no code archive

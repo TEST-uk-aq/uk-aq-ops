@@ -8,8 +8,8 @@ import { retainedPruneEvent } from './prune-receipts.mjs';
 import { retainedSelectedPruneEvent, retainedSelectedPruneBudget } from './prune-selected-event.mjs';
 import { assertDescriptorReceipts, assertSelectedReceiptGroup } from './prune-event-schema.mjs';
 import { readPruneEventDescriptor, readReceipt } from './inputs.mjs';
-import { createBudget } from './limits.mjs';
-import { assertManagedR2Target, assertManagedR2CredentialMode } from './r2-config.mjs';
+import { createBudget, evidence } from './limits.mjs';
+import { assertManagedR2Target, assertManagedR2CredentialMode, managedR2Environment } from './r2-config.mjs';
 
 export { managedR2ReadConfig, managedR2WriteConfig } from './r2-config.mjs';
 
@@ -46,6 +46,11 @@ export async function readManagedControl(r2, { budget = null } = {}) {
     && stored.bytes === stored.body.byteLength && isStrongR2Etag(stored.etag), 'invalid control body/ETag');
   const body = Buffer.from(stored.body);
   const control = assertControl(JSON.parse(body.toString('utf8')));
+  const environment = managedR2Environment(r2);
+  evidence(Object.values(control.registered_changes).every(e => e.receipt.schema_version === 1
+    || e.receipt.origin.authority.key.environment === environment)
+    && Object.values(control.authenticated_events || {}).every(e => e.authority.key.environment === environment),
+  'cross_environment_evidence', 'Managed control source authorities differ from configured environment');
   // Exact bytes participate in revision evidence, including JSON encoding.
   return { control, body, sha256: sha256Hex(body), etag: stored.etag };
 }
@@ -157,11 +162,14 @@ export async function updateManagedControl({ r2, command, maxConflicts = 3, auth
   if (command?.type === 'retain_prune_event') {
     requireValid(Object.keys(command).length === 1, 'event registration accepts only an authenticated retained event token');
     const event = retainedPruneEvent(authenticatedPruneEvent);
+    requireValid(event.original_authority.key.environment === managedR2Environment(r2), 'original event differs from configured control environment');
     command = { type: 'retain_prune_event', entries: event.entries };
   }
   if (command?.type === 'retain_selected_prune_event') {
     requireValid(Object.keys(command).length === 1, 'selected registration accepts only a retained event capability');
-    command = { type: command.type, event: retainedSelectedPruneEvent(authenticatedSelectedEvent) };
+    const event = retainedSelectedPruneEvent(authenticatedSelectedEvent);
+    requireValid(event.original_authority.key.environment === managedR2Environment(r2), 'selected event differs from configured control environment');
+    command = { type: command.type, event };
   }
   command = structuredClone(command);
   requireValid(['initialize', 'retain_receipt', 'retain_prune_event', 'retain_selected_prune_event', 'record_failure'].includes(command?.type), 'unsupported control command');

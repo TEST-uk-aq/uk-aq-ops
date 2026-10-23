@@ -21,8 +21,9 @@ import { buildTimeseriesBindingSourceState } from '../scripts/backup_r2/lib/time
 
 const etag = body => `"${sha256Hex(body)}"`;
 export async function sourceAndOriginalEvent(scopes = 1024, options = {}) {
+  const environment = options.environment ?? 'TEST';
   const run = options.runId || 'ca2a2ad8-c46c-4d65-9ee0-7147f03684eb', day = options.dayUtc || '2026-10-10';
-  const key = { environment: 'TEST', writer_identity: 'prune_daily_v3', run_id: run, attempt_id: run, day_utc: day, connector_id: 1 };
+  const key = { environment, writer_identity: 'prune_daily_v3', run_id: run, attempt_id: run, day_utc: day, connector_id: 1 };
   // Spread the 1,024-scope case across original 1,000-ID ranges so no retained
   // shard exceeds the writer's unchanged 1 MiB per-object capture ceiling.
   const rows = Array.from({ length: scopes }, (_, i) => ({ connector_id: 1, station_id: i + 1, timeseries_id: i + 1 + Math.floor(i / 512) * 1000,
@@ -36,7 +37,7 @@ export async function sourceAndOriginalEvent(scopes = 1024, options = {}) {
   const intent = createHash('sha256').update(JSON.stringify(['uk_aq_jsongen_upload_intent_v1', BUCKET, object.key,
     'prune_daily_v3', run, 'v3', 1, day, 'connector_day_observations_ndjson_gzip', object.byte_size, object.sha256,
     object.json_byte_size, object.json_sha256, 'connector_day', 1, day])).digest('hex');
-  const unsigned = describePrunePendingSource({ source, compressed, rows, runId: run, dayUtc: day, connectorId: 1, sourceIdentity });
+  const unsigned = describePrunePendingSource({ source, compressed, rows, runId: run, dayUtc: day, connectorId: 1, sourceIdentity, environment });
   const description = { ...unsigned, signed_upload: { intent_id: intent, object, disposition: 'put_acknowledged_unverified' } };
   const pending = { state: 'put_acknowledged_unverified', intent_id: intent, source: object, pending_evidence: description,
     source_evidence_sha256: sha256Hex(canonicalJson(unsigned)), preparation_sha256: sha256Hex(canonicalJson(description)) };
@@ -65,7 +66,7 @@ export async function sourceAndOriginalEvent(scopes = 1024, options = {}) {
   const capture = createPruneOriginalMetadataCapture(), lockIdentity = observationsGlobalOperationLockIdentity();
   const lock = { held: 'true', acquired: 'true', owner: 'prune_daily', runId: run, logicalIdentity: lockIdentity.logical_identity,
     classId: String(lockIdentity.class_id), objectId: String(lockIdentity.object_id), nonce: 'fixture-nonce', waitMs: '0', outcome: 'held' };
-  const original = capture.beginOriginalAuthority({ environment: 'TEST', index_generation: 'v3', canonical_bucket: bucket,
+  const original = capture.beginOriginalAuthority({ environment, index_generation: 'v3', canonical_bucket: bucket,
     writer: { identity: 'prune_daily_v3', invocation_id: run, attempt_id: run, git_sha: git }, connector_id: 1, day_utc: day, source_identity: sourceIdentity },
   Object.fromEntries(Object.entries(lock).map(([k, v]) => [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV[k], v])));
   const old = hierarchy([previous]); old.forEach(o => original.recordBeforeObject(o));
@@ -160,7 +161,7 @@ export async function sourceAndOriginalEvent(scopes = 1024, options = {}) {
   const get = async ({ key }) => { assert.ok(key.startsWith('managed/jsongen/v1/')); assert.ok(!key.endsWith('.parquet'));
     if (!objects.has(key)) throw Object.assign(new Error('fixture missing'), { status: 404 });
     const body = objects.get(key); return { body: Buffer.from(body), bytes: body.length, etag: etag(body) }; };
-  const r2 = { bucket: BUCKET, region: 'auto', endpoint: options.r2Endpoint || 'https://41a81f781d3bd7234fde0b25df51e879.r2.cloudflarestorage.com',
+  const r2 = { bucket: BUCKET, region: 'auto', endpoint: options.r2Endpoint || process.env.UK_AQ_JSONGEN_R2_ENDPOINT,
     adapter: { getObject: get, getObjectBounded: get, async putObjectConditional(args) {
       if (hook) { const result = await hook(args); if (result) return result; }
       const old = objects.get(args.key);

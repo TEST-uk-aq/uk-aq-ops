@@ -1,3 +1,4 @@
+import { isEnvironmentName } from './environment.mjs';
 // Transient, bounded copies of exact JSON metadata bytes already offered to the
 // canonical writer. The writer's normal readback/finalization remains authority.
 import { sha256Hex, r2GetObjectBounded } from '../../workers/shared/r2_sigv4.mjs';
@@ -443,7 +444,8 @@ export function preparePruneOriginalAuthorityExtension({ capture, pending, conne
   const result = capture.snapshot();
   requireOriginal(result.schema_version === 1 && result.kind === 'uk_aq_prune_original_scope_binding_authority',
     'unsupported_original_authority_extension');
-  const expected = { environment: 'TEST', index_generation: 'v3', canonical_bucket: connector.connector_manifest.bucket,
+  requireOriginal(isEnvironmentName(pending.pending_evidence.environment), 'invalid_original_environment');
+  const expected = { environment: pending.pending_evidence.environment, index_generation: 'v3', canonical_bucket: connector.connector_manifest.bucket,
     writer: { identity: 'prune_daily_v3', invocation_id: runId, attempt_id: runId, git_sha: writerGitSha },
     connector_id: connectorId, day_utc: dayUtc, source_identity: sourceIdentity };
   requireOriginal(canonicalJson(result.identity).equals(canonicalJson(expected)), 'contradictory_original_authority_identity');

@@ -8,7 +8,7 @@ import { LIMITS, createBudget, evidence, freeze, JSONgenEvidenceError } from './
 import { admitDerived, readImmutable, readReceipt, readBundle } from './inputs.mjs';
 import { inspectAuthenticatedPruneHandover } from './prune-consumer-authentication.mjs';
 import { planPruneScopePartitions, prunePartitionArtifacts } from './prune-consumer-partitions.mjs';
-import { assertManagedR2CredentialMode } from './r2-config.mjs';
+import { assertManagedR2CredentialMode, managedR2Environment } from './r2-config.mjs';
 
 const groups = new WeakMap(); const cache = new WeakMap(); const retained = new WeakMap();
 export function inspectPruneReceiptGroup(token) {
@@ -114,6 +114,9 @@ export async function retainImmutable({ r2, reference, body, contentType, budget
 export async function retainPruneReceiptGroup({ handover, r2, budget = createBudget(), progress = () => {} }) {
   assertManagedR2CredentialMode(r2, 'write');
   admitDerived(r2);
+  const proof = inspectAuthenticatedPruneHandover(handover);
+  evidence(proof.authority.key.environment === managedR2Environment(r2),
+    'cross_environment_evidence', 'Original retained event differs from configured storage environment');
   const token = buildPruneReceiptGroup({ handover, budget }), group = groups.get(token);
   const outcomes = [];
   for (let i = 0; i < group.public.entries.length; i++) {

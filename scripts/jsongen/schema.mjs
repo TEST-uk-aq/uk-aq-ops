@@ -1,3 +1,4 @@
+import { isEnvironmentName } from './environment.mjs';
 // Managed JSONgen wire contracts. Validation checks shape/relationships, not the
 // truth of writer attestations. No canonical reader or scope-dominance checker lives here.
 import { assertSelectedReceiptOrigin, assertSelectedControlEvents } from './prune-event-schema.mjs';
@@ -211,7 +212,7 @@ export function assertPruneAcceptanceAuthority(a) {
   fields(a.key, ['environment', 'writer_identity', 'run_id', 'attempt_id', 'day_utc', 'connector_id']);
   requireValid(a.schema_version === 1 && a.kind === 'uk_aq_jsongen_prune_acceptance_authority'
     && a.relation === 'uk_aq_ops.prune_jsongen_gate_acceptance_outbox'
-    && a.key.environment === 'TEST' && a.key.writer_identity === 'prune_daily_v3' && a.key.connector_id === 1
+    && isEnvironmentName(a.key.environment) && a.key.writer_identity === 'prune_daily_v3' && a.key.connector_id === 1
     && uuid(a.key.run_id) && a.key.attempt_id === a.key.run_id && day(a.key.day_utc)
     && a.event_id === digest(a.key) && /^[a-f0-9]{40}$/.test(a.writer_git_sha)
     && sha(a.final_evidence_sha256) && id(a.final_evidence_byte_size) && a.final_evidence_byte_size <= 1024 ** 2

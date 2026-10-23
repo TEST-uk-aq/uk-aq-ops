@@ -6,7 +6,9 @@ reconciliation v4. This is code only. The existing `--execute-retain` interface
 requires deliberate operator invocation and separate write authorisation;
 read-only remains the default and its workflow retains READ-only credentials.
 Existing receipt v1/v2 and control-v1 state keep their meanings. No monthly
-publisher or automatic retention is enabled.
+publisher or automatic retention is enabled. The shared original-event code is
+environment-independent; see the follow-up environment/identity model in the
+handover. LIVE deployment, execution and promotion remain unauthorised.
 
 The [Prune-to-JSONgen first TEST acceptance readiness handover](prune-integration-readiness.md)
 records current blockers, restricted-reader setup and the ordered manual
@@ -25,7 +27,7 @@ omission. `--inspection-partition 0..7` selects a deterministic subset; other
 scopes remain uninspected. Separate invocations cannot be merged as one coherent
 snapshot. Full-event reports use lossless dictionaries under the unchanged 4 MiB
 wire cap; report schemas 1/2 and verified receipt schemas 1/2 remain supported.
-Admission requires the sourced `UK_AQ_ENV_NAME=TEST` and existing
+Shared admission requires an explicit canonical `UK_AQ_ENV_NAME` and existing
 `UK_AQ_GITHUB_REPO=OWNER/REPO`, plus `--execute-read-only`. Missing repository
 configuration blocks before remote access. GitHub runs must match that configured
 repository and use `workflow_dispatch`; the optional private reader shares this
@@ -257,7 +259,7 @@ through an authorised update or fail closed until it can.
 
 Managed JSONgen storage requires explicit environment configuration:
 
-- `UK_AQ_ENV_NAME=TEST`
+- explicit canonical `UK_AQ_ENV_NAME` and `UK_AQ_GITHUB_REPO`
 - variables `UK_AQ_JSONGEN_R2_ENDPOINT` and `UK_AQ_JSONGEN_R2_BUCKET`
 - read-only operations use `UK_AQ_JSONGEN_R2_READ_ACCESS_KEY_ID` and
   `UK_AQ_JSONGEN_R2_READ_SECRET_ACCESS_KEY` through `managedR2ReadConfig()`
@@ -272,7 +274,10 @@ retention and control CAS. The read-only GitHub Actions workflow does not receiv
 the WRITE pair or the signer's credentials. The existing signer configuration
 continues to use `UK_AQ_JSONGEN_SIGNER_R2_ACCESS_KEY_ID` and
 `UK_AQ_JSONGEN_SIGNER_R2_SECRET_ACCESS_KEY`; it is independent of both consumer
-credential paths. All operations remain admitted to TEST by `UK_AQ_ENV_NAME`.
+credential paths. The original-event consumer and retention libraries use the
+configured environment identity; current operational acceptance remains TEST-only.
+Historical evidence must agree with the configured reader/storage environment.
+A source label never supplies configuration or operational permission.
 The configured account-scoped HTTPS R2 endpoint is checked without embedding an
 account ID or bucket name in shared code; region remains `auto`. Credentials
 must permit only their intended operations. TEST values must still resolve to

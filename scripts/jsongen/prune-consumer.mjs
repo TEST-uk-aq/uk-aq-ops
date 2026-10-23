@@ -9,7 +9,8 @@ import { buildPruneReceiptGroup, inspectPruneReceiptGroup, retainPruneReceiptGro
 import { buildSelectedPruneEvent, retainSelectedPruneEvent, retainedSelectedPruneEvent } from './prune-selected-event.mjs';
 import { managedR2ReadConfig, readManagedControl, managedR2WriteConfig, updateManagedControl, JSONgenControlError }
   from './control.mjs';
-import { assertManagedR2CredentialMode } from './r2-config.mjs';
+import { assertOpsEnvironment } from './admission.mjs';
+import { assertManagedR2CredentialMode, managedR2Environment } from './r2-config.mjs';
 import { readReceipt } from './inputs.mjs';
 import { createPruneHandoverBudget, evidence, JSONgenEvidenceError } from './limits.mjs';
 import { planPruneSelectedCoverage } from './prune-coverage-plan.mjs';
@@ -23,6 +24,7 @@ export async function consumePruneAcceptance({ reader, key, derivedR2, mode = 'r
   try { assertManagedR2CredentialMode(derivedR2, mode === 'retain' ? 'write' : 'read'); }
   catch { evidence(false, 'invalid_r2_configuration', 'Operation-specific JSONgen R2 credentials required'); }
   key = structuredClone(assertPruneAcceptanceKey(key));
+  evidence(key.environment === managedR2Environment(derivedR2), 'cross_environment_evidence', 'Requested source environment differs from configured storage');
   const measurement = measurePruneConsumer(budget);
   budget = measurement.budget;
   const finish = value => ({ ...value, resources: budget.snapshot(), metrics: measurement.finish() });
@@ -142,7 +144,7 @@ export async function consumePruneAcceptance({ reader, key, derivedR2, mode = 'r
   }
 }
 
-const USAGE = `Manual TEST-only independent Prune consumer (no automatic execution or schedule).
+const USAGE = `Manual explicitly configured independent Prune consumer (no automatic execution or schedule).
   --help
   --execute-read-only --event-key-file PATH --output PATH
   --execute-read-only --discover recent|resweep --from UTC --to UTC
@@ -186,7 +188,7 @@ export async function runPruneConsumer(argv, { env = process.env } = {}) {
   evidence(!options['execute-retain'] || options['event-key-file'] || options.process,
     'invalid_consumer_arguments', 'Retain discovery requires explicit event processing');
   evidence(options.output, 'invalid_consumer_arguments', 'Explicit private local result path required');
-  evidence(env.UK_AQ_ENV_NAME === 'TEST', 'unapproved_environment', 'TEST environment required');
+  assertOpsEnvironment(env);
   if (options['event-key-file']) evidence(!options.process && !options.from && !options.to && !options.limit && !options['cursor-file'],
     'invalid_consumer_arguments', 'Event replay cannot include discovery options');
   else evidence(['recent', 'resweep'].includes(options.discover) && options.from && options.to

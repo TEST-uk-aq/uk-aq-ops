@@ -3,7 +3,8 @@ import { PRUNE_GATE_ACCEPTANCE_RELATION, preparePrunePostCommitHandover } from '
 import { canonicalJson } from './schema.mjs';
 import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
 import { evidence, freeze } from './limits.mjs';
-import { assertTestOpsEnvironment } from './admission.mjs';
+import { isEnvironmentName, configuredEnvironment } from './environment.mjs';
+import { assertOpsEnvironment } from './admission.mjs';
 
 export const OUTBOX_PAGE_LIMIT = 16;
 const originals = new WeakMap();
@@ -23,11 +24,11 @@ const projection = `event_schema_version, environment, writer_identity, writer_g
 
 export function assertPruneAcceptanceKey(key) {
   evidence(key && Object.keys(key).length === PK.length && PK.every(k => Object.hasOwn(key, k))
-    && key.environment === 'TEST' && key.writer_identity === 'prune_daily_v3'
+    && isEnvironmentName(key.environment) && key.writer_identity === 'prune_daily_v3'
     && UUID.test(key.run_id) && key.attempt_id === key.run_id && key.connector_id === 1
     && /^\d{4}-\d{2}-\d{2}$/.test(key.day_utc)
     && new Date(`${key.day_utc}T00:00:00.000Z`).toISOString().slice(0, 10) === key.day_utc,
-  'invalid_acceptance_key', 'Complete original TEST AURN acceptance primary key required');
+  'invalid_acceptance_key', 'Complete original AURN acceptance primary key required');
   return key;
 }
 export const pruneAcceptanceKey = row => assertPruneAcceptanceKey(Object.fromEntries(PK.map(k => [k, row[k]])));
@@ -43,11 +44,13 @@ function timestamp(value) {
 export function originalPruneAcceptance(token) {
   const value = originals.get(token);
   evidence(value, 'unauthenticated_original_outbox', 'Original event must be retrieved through the private outbox reader');
-  return { row: structuredClone(value.row), bytes: value.bytes && Buffer.from(value.bytes) };
+  return { row: structuredClone(value.row), bytes: value.bytes && Buffer.from(value.bytes),
+    executionEnvironment: value.environment };
 }
 
 export async function connectPruneOutboxReader({ env = process.env, Client = null } = {}) {
-  assertTestOpsEnvironment(env);
+  assertOpsEnvironment(env);
+  const environment = configuredEnvironment(env);
   evidence(env.UK_AQ_JSONGEN_PRUNE_READER_DB_URL
     && env.UK_AQ_JSONGEN_PRUNE_READER_DB_URL !== env.SUPABASE_DB_URL
     && env.UK_AQ_JSONGEN_PRUNE_READER_DB_URL !== env.UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN,
@@ -62,12 +65,12 @@ export async function connectPruneOutboxReader({ env = process.env, Client = nul
   'reader_configuration_required', 'Authenticated TLS PostgreSQL URL required');
   evidence(target.protocol === 'https:' && /^[a-z0-9]{20}\.supabase\.co$/.test(target.hostname)
     && !target.username && !target.password && target.pathname === '/' && !target.search && !target.hash,
-  'reader_configuration_required', 'Existing TEST SUPABASE_URL project identity required');
+  'reader_configuration_required', 'Existing configured SUPABASE_URL project identity required');
   const project = target.hostname.split('.')[0];
   evidence(url.hostname === `db.${project}.supabase.co`
     || (/^[a-z0-9.-]+\.pooler\.supabase\.com$/.test(url.hostname)
       && decodeURIComponent(url.username).endsWith(`.${project}`)),
-  'reader_configuration_required', 'Reader must target the existing TEST IngestDB project');
+  'reader_configuration_required', 'Reader must target the configured IngestDB project');
   url.search = ''; // Explicit verified TLS below; URL options cannot weaken it.
   Client ??= (await import('pg')).default.Client;
   const client = new Client({ connectionString: url.toString(), ssl: { rejectUnauthorized: true },
@@ -120,6 +123,7 @@ export async function connectPruneOutboxReader({ env = process.env, Client = nul
   return Object.freeze({
     async read(key) {
       key = structuredClone(assertPruneAcceptanceKey(key));
+      evidence(key.environment === environment, 'cross_environment_evidence', 'Acceptance key differs from configured reader environment');
       return transaction(async () => {
         const result = await client.query(`SELECT ${projection}, final_evidence_bytes
           FROM ${PRUNE_GATE_ACCEPTANCE_RELATION}
@@ -134,7 +138,7 @@ export async function connectPruneOutboxReader({ env = process.env, Client = nul
         evidence(canonicalJson(pruneAcceptanceKey(row)).equals(canonicalJson(key)),
           'conflicting_original_event', 'Retrieved event differs from requested original primary key');
         const token = freeze({ key, event_id: pruneAcceptanceId(key), post_commit_reference: reference });
-        originals.set(token, { row: structuredClone(row), bytes: bytes && Buffer.from(bytes) });
+        originals.set(token, { environment, row: structuredClone(row), bytes: bytes && Buffer.from(bytes) });
         return token;
       });
     },
@@ -146,23 +150,25 @@ export async function connectPruneOutboxReader({ env = process.env, Client = nul
       'invalid_discovery_window', 'Discovery requires at most seven days and sixteen events per page');
       if (after) {
         assertPruneAcceptanceKey(after.key); timestamp(after.accepted_at);
+        evidence(after.key.environment === environment, 'cross_environment_evidence', 'Discovery cursor differs from configured reader environment');
         evidence(after.from === from && after.to === to && after.mode === mode
           && Date.parse(after.accepted_at) >= Date.parse(from) && Date.parse(after.accepted_at) <= Date.parse(to),
         'invalid_discovery_window', 'Cursor belongs to a different bounded discovery pass');
       }
       return transaction(async () => {
-        const parameters = [from, to, limit + 1];
+        const parameters = [environment, from, to, limit + 1];
         let resume = '';
         if (after) {
           parameters.push(after.accepted_at, after.key.run_id, after.key.attempt_id, after.key.day_utc, after.key.connector_id);
-          resume = 'AND (accepted_at,run_id,attempt_id,day_utc,connector_id) > ($4::timestamptz,$5::uuid,$6::uuid,$7::date,$8::integer)';
+          resume = 'AND (accepted_at,run_id,attempt_id,day_utc,connector_id) > ($5::timestamptz,$6::uuid,$7::uuid,$8::date,$9::integer)';
         }
         const result = await client.query(`SELECT ${projection}
           FROM ${PRUNE_GATE_ACCEPTANCE_RELATION}
-          WHERE environment='TEST' AND writer_identity='prune_daily_v3' AND connector_id=1
-            AND accepted_at >= $1::timestamptz AND accepted_at <= $2::timestamptz ${resume}
-          ORDER BY accepted_at,run_id,attempt_id,day_utc,connector_id LIMIT $3`, parameters);
+          WHERE environment=$1 AND writer_identity='prune_daily_v3' AND connector_id=1
+            AND accepted_at >= $2::timestamptz AND accepted_at <= $3::timestamptz ${resume}
+          ORDER BY accepted_at,run_id,attempt_id,day_utc,connector_id LIMIT $4`, parameters);
         const rows = result.rows.slice(0, limit);
+        evidence(result.rows.every(row => row.environment === environment), 'cross_environment_evidence', 'Discovery result differs from configured reader environment');
         const events = rows.map(row => ({ key: pruneAcceptanceKey(row), event_id: pruneAcceptanceId(pruneAcceptanceKey(row)),
           reference_sha256: preparePrunePostCommitHandover(row).sha256 }));
         const last = rows.at(-1);

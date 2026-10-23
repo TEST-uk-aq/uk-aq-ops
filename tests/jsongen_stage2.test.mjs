@@ -1,3 +1,4 @@
+import './jsongen_test_environment.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
@@ -34,7 +35,7 @@ const scope = (day, count = 2) => ({ identity, day_utc: day, before: { state: 'p
   after: { state: count ? 'present' : 'authoritative_empty', row_count: count, authority: declared } });
 function store(bucket = BUCKET) {
   const bodies = new Map(); const gets = [];
-  const r2 = { endpoint: 'https://41a81f781d3bd7234fde0b25df51e879.r2.cloudflarestorage.com', bucket, region: 'auto',
+  const r2 = { endpoint: process.env.UK_AQ_JSONGEN_R2_ENDPOINT, bucket, region: 'auto',
     adapter: { async getObjectBounded({ key, max_bytes }) {
       gets.push(key); assert.ok(!key.endsWith('.parquet'), 'metadata processing must never fetch Parquet');
       const body = bodies.get(key); if (!body) throw Object.assign(new Error('fixture object missing'), { status: 404 });

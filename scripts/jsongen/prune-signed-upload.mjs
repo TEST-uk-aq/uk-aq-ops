@@ -10,14 +10,13 @@ const PREFIX = 'managed/jsongen/v1/pending/unverified/prune_daily_v3';
 const SHA = /^[a-f0-9]{64}$/;
 export const PRUNE_SIGNED_UPLOAD_DEADLINE_MS = 15_000;
 export const PRUNE_EVIDENCE_BUNDLE_UPLOAD_DEADLINE_MS = 5_000;
-// Mirrors the currently reviewed TEST signer admission, without changing it or
-// adding a second environment setting. Extend only with reviewed signer support.
+// Preserve the reviewed connector admission and existing signer protocol.
+// Environment/repository admission comes from the shared explicit configuration.
 export const PRUNE_PENDING_SOURCE_CONNECTOR_IDS = Object.freeze([1]);
 export const isPrunePendingSourceConnector = connectorId =>
   PRUNE_PENDING_SOURCE_CONNECTOR_IDS.includes(connectorId);
 
 export function resolvePruneSignerConfig(env) {
-  if (env.UK_AQ_ENV_NAME !== 'TEST') throw new Error('TEST environment required for Prune signer handover');
   const derivedTarget = managedR2TargetConfig(env);
   if (derivedTarget.bucket !== BUCKET) throw new Error('UK_AQ_JSONGEN_R2_BUCKET must be set before process launch');
   let url;
