@@ -1,3 +1,4 @@
+import './jsongen_test_environment.mjs';
 // Focused admission/coverage/replay boundary checks. No network, canonical
 // reads, database execution, signing or operational object writes occur here.
 import test from 'node:test';
@@ -36,7 +37,7 @@ test('complete original source with a non-Stage-1 pollutant fails with a structu
 });
 
 test('consumer reports only bounded failure stage and exception class', async () => {
-  const derivedR2 = managedR2ReadConfig({ UK_AQ_ENV_NAME: 'TEST',
+  const derivedR2 = managedR2ReadConfig({ UK_AQ_ENV_NAME: 'TEST', UK_AQ_GITHUB_REPO: 'fixture-org/fixture-ops',
     UK_AQ_JSONGEN_R2_ENDPOINT: 'https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.r2.cloudflarestorage.com',
     UK_AQ_JSONGEN_R2_BUCKET: 'fixture-derived-bucket',
     UK_AQ_JSONGEN_R2_READ_ACCESS_KEY_ID: 'fixture-read',

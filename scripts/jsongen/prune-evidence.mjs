@@ -1,3 +1,4 @@
+import { configuredEnvironment, isEnvironmentName } from './environment.mjs';
 // Versioned, reproducible description of an early Prune source. It carries no
 // final writer, gate, or current-canonical authority.
 import { computeObservationContentHash } from '../../workers/shared/uk_aq_observation_content_hash.mjs';
@@ -10,7 +11,8 @@ const statusCounts = rows => ({
 });
 
 export function describePrunePendingSource({ source, compressed, rows, runId, dayUtc,
-  connectorId, sourceIdentity }) {
+  connectorId, sourceIdentity, environment = configuredEnvironment() }) {
+  if (!isEnvironmentName(environment)) throw new TypeError('Invalid original source environment');
   const byPollutant = new Map();
   const byPhysicalScope = new Map();
   for (const row of rows) {
@@ -44,7 +46,7 @@ export function describePrunePendingSource({ source, compressed, rows, runId, da
   return {
     schema_version: 1,
     kind: 'uk_aq_jsongen_prune_pending_source_evidence',
-    environment: 'TEST',
+    environment,
     writer: { identity: 'prune_daily_v3', invocation_id: runId, attempt_id: runId },
     index_generation: 'v3',
     connector_id: connectorId, day_utc: dayUtc,

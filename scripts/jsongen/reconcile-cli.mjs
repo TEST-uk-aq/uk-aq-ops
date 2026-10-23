@@ -1,4 +1,4 @@
-// Explicit manual TEST read-only wrapper. Importing this file does no I/O.
+// Explicit manual configured read-only wrapper. Importing this file does no I/O.
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -6,13 +6,13 @@ import { pathToFileURL } from 'node:url';
 import { reconcileManagedInputs, reconciliationArtifact } from './reconcile.mjs';
 import { readManagedControl, managedR2ReadConfig } from './control.mjs';
 import { connectPruneOutboxReader } from './prune-outbox-reader.mjs';
-import { assertTestOpsEnvironment } from './admission.mjs';
+import { assertOpsEnvironment } from './admission.mjs';
 import { resolveObservationHistoryGeneration } from '../../workers/shared/uk_aq_observation_history_generation.mjs';
 import { resolveR2HistoryIndexConfig } from '../../workers/shared/uk_aq_r2_history_index.mjs';
 import { hasRequiredR2Config } from '../../workers/shared/r2_sigv4.mjs';
 import { createInspectionBudget, evidence, JSONgenEvidenceError } from './limits.mjs';
 
-const USAGE = `Manual TEST-only JSONgen Stage 3C reconciliation (read-only).
+const USAGE = `Manual explicitly configured JSONgen Stage 3C reconciliation (read-only).
 --execute-read-only --output PATH [--scopes-file PATH] [--retained-receipts-file PATH]
   [--inspection-partition 0..7]
   [--discover recent|resweep --from UTC --to UTC --limit 1..16 [--cursor-file PATH]]
@@ -22,9 +22,9 @@ at most 32 including control and discovered original partitions. Each metadata
 invocation inspects one deterministic partition of at most 128 scopes. All other
 scopes stay explicitly uninspected. Separate invocations have separate source-as-of
 boundaries and must not be merged as one complete consistent inspection.
-Uses existing TEST canonical/derived R2 configuration and optional restricted
+Uses explicitly configured canonical/derived R2 configuration and optional restricted
 private Prune reader. Requires an existing managed control; never initializes it.
-Requires UK_AQ_ENV_NAME=TEST and the sourced UK_AQ_GITHUB_REPO. GitHub runs must
+Requires explicit valid UK_AQ_ENV_NAME and the sourced UK_AQ_GITHUB_REPO. GitHub runs must
 match that repository and use workflow_dispatch; missing configuration blocks.
 Discovery is one overlapping page, never a completeness watermark. Repeat
 overlapping windows and historical resweeps. Outputs private local JSON only.
@@ -54,7 +54,7 @@ export async function runReconciliationInspection(argv, { env = process.env } = 
   evidence(options['execute-read-only'] && options.output, 'invalid_inspection_arguments', 'Explicit read-only execution and private local output required');
   evidence(!options['inspection-partition'] || /^[0-7]$/.test(options['inspection-partition']),
     'invalid_inspection_arguments', 'Inspection partition must be 0..7');
-  assertTestOpsEnvironment(env);
+  assertOpsEnvironment(env);
   evidence(options.discover ? ['recent', 'resweep'].includes(options.discover) && options.from && options.to
     && (!options.limit || /^[1-9]\d?$/.test(options.limit)) && Number(options.limit || 4) <= 16
     : !options.from && !options.to && !options.limit && !options['cursor-file'],

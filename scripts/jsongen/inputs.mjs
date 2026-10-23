@@ -1,4 +1,5 @@
 // Byte/logical integrity only. No receipt-supplied field grants writer authority.
+import { assertPruneEventDescriptor, assertPruneEventReference } from './prune-event-schema.mjs';
 import { createGunzip } from 'node:zlib';
 import { Readable } from 'node:stream';
 import { r2GetObjectBounded, sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
@@ -6,7 +7,7 @@ import { computeObservationContentHash, computeObservationMeasurementContentHash
 import { ROOT, assertReference, assertReceipt, assertBundleRecord,
   canonicalJson, same, scopeKey } from './schema.mjs';
 import { createBudget, evidence, parseJson, freeze } from './limits.mjs';
-import { assertManagedR2Target } from './r2-config.mjs';
+import { assertManagedR2Target, managedR2Environment } from './r2-config.mjs';
 
 export function admitDerived(r2) {
   try { assertManagedR2Target(r2); }
@@ -32,6 +33,8 @@ export async function readReceipt({ r2, reference, expected = null, budget = cre
   const receipt = parseJson(bytes);
   evidence(Array.isArray(receipt?.scopes) && receipt.scopes.length <= budget.limits.scopes, 'resource_limit', 'declared scope budget exceeded');
   assertReceipt(receipt);
+  if ([2, 3].includes(receipt.schema_version)) evidence(receipt.origin.authority.key.environment === managedR2Environment(r2),
+    'cross_environment_evidence', 'Retained receipt differs from configured storage environment');
   evidence(canonicalJson(receipt).equals(bytes), 'invalid_receipt', 'receipt JSON must have canonical encoding');
   if (expected) evidence(same(receipt, expected), 'stable_change_identity_mismatch', 'retained receipt differs from registered event/writer/invocation');
   evidence(receipt.bundle.row_count <= budget.limits.rows, 'resource_limit', 'declared row budget exceeded');
@@ -59,6 +62,8 @@ async function decompress(bytes, reference, budget) {
 export async function readBundle({ r2, receipt, budget = createBudget() }) {
   receipt = freeze(structuredClone(receipt));
   admitDerived(r2); assertReceipt(receipt);
+  if ([2, 3].includes(receipt.schema_version)) evidence(receipt.origin.authority.key.environment === managedR2Environment(r2),
+    'cross_environment_evidence', 'Bundle receipt source differs from configured storage environment');
   evidence(receipt.scopes.length <= budget.limits.scopes && receipt.bundle.row_count <= budget.limits.rows,
     'resource_limit', 'bundle scope/row admission failed');
   const ref = receipt.bundle.object;
@@ -100,4 +105,15 @@ export async function readWriterInput({ r2, reference, expected = null, budget =
   const receipt = await readReceipt({ r2, reference, expected, budget });
   const bundle = await readBundle({ r2, receipt, budget });
   return freeze({ receipt_object: reference, receipt, bundle });
+}
+
+export async function readPruneEventDescriptor({ r2, reference, expected = null, budget = createBudget() }) {
+  admitDerived(r2); assertPruneEventReference(reference);
+  const bytes = await readImmutable({ r2, reference, maxBytes: budget.limits.metadata_bytes, budget });
+  const descriptor = assertPruneEventDescriptor(parseJson(bytes));
+  evidence(descriptor.coverage.authority.key.environment === managedR2Environment(r2),
+    'cross_environment_evidence', 'Descriptor source differs from configured storage environment');
+  evidence(canonicalJson(descriptor).equals(bytes) && (!expected || same(descriptor, expected)),
+    'invalid_authenticated_event', 'Canonical descriptor readback mismatch');
+  budget.check(); return freeze(descriptor);
 }

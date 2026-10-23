@@ -1,4 +1,5 @@
 // Authenticate retained ORIGINAL Prune evidence, never current canonical R2.
+import { managedR2Environment } from './r2-config.mjs';
 import { originalPruneAcceptance } from './prune-outbox-reader.mjs';
 import { verifyPrunePendingSource } from './prune-pending-verification.mjs';
 import { BUCKET, canonicalJson, same } from './schema.mjs';
@@ -216,7 +217,11 @@ export function inspectAuthenticatedPruneHandover(value) {
 export async function authenticatePruneHandover({ acceptance, derivedR2, budget = createPruneHandoverBudget(),
   onStage = () => {} }) {
   onStage('original_outbox_evidence');
-  const { row, bytes } = originalPruneAcceptance(acceptance);
+  const { row, bytes, executionEnvironment } = originalPruneAcceptance(acceptance);
+  evidence(row.environment === executionEnvironment && managedR2Environment(derivedR2) === executionEnvironment
+    && acceptance.key.environment === executionEnvironment
+    && acceptance.post_commit_reference.message.environment === row.environment,
+  'cross_environment_evidence', 'Original acceptance and configured reader/storage environments must agree');
   const message = acceptance.post_commit_reference.message;
   present(row.final_evidence_state === 'prepared_unverified' && bytes, 'final_evidence_bytes');
   check(bytes.length === Number(row.final_evidence_byte_size) && bytes.length <= 1024 ** 2
@@ -225,7 +230,7 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
   let e = parseJson(bytes);
   check(canonicalJson(e).equals(bytes) && e.schema_version === 1
     && e.kind === 'uk_aq_jsongen_prune_original_final_evidence_preparation'
-    && e.authority_state === 'precommit_prepared_unverified' && e.environment === 'TEST'
+    && e.authority_state === 'precommit_prepared_unverified' && e.environment === row.environment
     && e.index_generation === 'v3' && same(e.writer, message.writer)
     && e.connector_id === 1 && e.day_utc === row.day_utc, 'final_evidence.original_writer');
   const bundlePointer = e.original_metadata_evidence?.codec === 'immutable_r2_json_gzip_v1';
@@ -256,7 +261,7 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
         + `/day_utc=${row.day_utc}/invocation=${encodeURIComponent(row.run_id)}`
         + `/compressed_sha256=${ref.sha256}.json.gz`, 'immutable_bundle_key_and_bounds');
     check(identity?.writer_identity === row.writer_identity
-      && identity.environment === 'TEST'
+      && identity.environment === row.environment
       && identity.invocation_id === row.run_id && identity.attempt_id === row.attempt_id
       && identity.writer_git_sha === row.writer_git_sha && identity.index_generation === 'v3'
       && identity.connector_id === row.connector_id && identity.day_utc === row.day_utc
@@ -281,7 +286,7 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
     const decodedBytes = decodePruneEvidenceBundle({ compressed,
       reference: { byte_size: ref.byte_size, sha256: ref.sha256,
         json_byte_size: ref.json_byte_size, json_sha256: ref.json_sha256 },
-      expected: { environment: 'TEST', writer_identity: row.writer_identity,
+      expected: { environment: row.environment, writer_identity: row.writer_identity,
         invocation_id: row.run_id, attempt_id: row.attempt_id,
         writer_git_sha: row.writer_git_sha, connector_id: row.connector_id, day_utc: row.day_utc } });
     budget.bytes('decompressed', ref.json_byte_size);
@@ -379,7 +384,7 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
   const pending = await verifyPrunePendingSource({ r2: derivedR2, reference: p.object, intentId: p.intent_id,
     runId: row.run_id, dayUtc: row.day_utc, connectorId: 1,
     expectedRowCount: message.source_identity.source_content_hash_row_count,
-    sourceIdentity: message.source_identity, expectedEvidenceSha256: p.source_evidence_sha256, budget });
+    sourceIdentity: message.source_identity, expectedEvidenceSha256: p.source_evidence_sha256, environment: row.environment, budget });
   check(same(pending.pending_evidence, unsigned)
     && same(p.original_source_status, unsigned.original_source_status)
     && same(p.effective_verification_status, unsigned.effective_verification_status)
@@ -432,7 +437,7 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
     current_canonical_authority: 'not_inspected', publication_eligible: false });
   // Keep actual rows out of public machine-readable results and log summaries.
   const token = Object.freeze({ event_id: result.event_id });
-  authenticated.set(token, freeze({ result, pending, authority, sources, scopes, scopeAuthorities, writer: e.writer,
+  authenticated.set(token, freeze({ operationBudget: budget, result, pending, authority, sources, scopes, scopeAuthorities, writer: e.writer,
     original_source_status: unsigned.original_source_status, source_identity: unsigned.source_identity,
     original_global_lock: original.lock, original_evidence_sha256: row.final_evidence_sha256,
     post_commit_reference_sha256: acceptance.post_commit_reference.sha256,

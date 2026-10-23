@@ -1,3 +1,4 @@
+import { managedR2Environment } from './r2-config.mjs';
 // Independent private source reader. Never called by Prune; byte integrity
 // alone cannot qualify a source for a VERIFIED receipt.
 import { gunzipSync } from 'node:zlib';
@@ -25,9 +26,10 @@ export function* iterateVerifiedPrunePendingRows(verification) {
 
 export async function verifyPrunePendingSource({ r2, reference, intentId, runId, dayUtc,
   connectorId, expectedRowCount, sourceIdentity, expectedEvidenceSha256 = null,
-  budget = createBudget() }) {
+  budget = createBudget(), environment = managedR2Environment(r2) }) {
   reference = structuredClone(reference); sourceIdentity = structuredClone(sourceIdentity);
   admitDerived(r2);
+  evidence(environment === managedR2Environment(r2), 'cross_environment_evidence', 'Pending source environment differs from configured storage');
   evidence(connectorId === 1 && Number.isSafeInteger(expectedRowCount)
     && expectedRowCount > 0 && expectedRowCount <= LIMITS.rows,
   'invalid_frozen_source', 'Complete bounded AURN connector-day required');
@@ -82,7 +84,7 @@ export async function verifyPrunePendingSource({ r2, reference, intentId, runId,
   }
   budget.rows(rows.length);
   const pendingEvidence = describePrunePendingSource({ source, compressed,
-    rows, runId, dayUtc, connectorId, sourceIdentity });
+    rows, runId, dayUtc, connectorId, sourceIdentity, environment });
   const evidenceSha256 = sha256Hex(canonicalJson(pendingEvidence));
   evidence(expectedEvidenceSha256 === null || expectedEvidenceSha256 === evidenceSha256,
     'invalid_object_identity', 'pending source evidence declaration differs from stored bytes');

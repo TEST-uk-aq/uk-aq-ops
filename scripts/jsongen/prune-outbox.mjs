@@ -1,3 +1,4 @@
+import { isEnvironmentName } from './environment.mjs';
 // Optional PostgreSQL gate evidence only. This never declares JSONgen VERIFIED.
 import { BUCKET, canonicalJson } from './schema.mjs';
 import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
@@ -78,7 +79,7 @@ export function preparePrunePostCommitHandover(acceptance) {
     || (typeof value === 'string' && /^[1-9]\d*$/.test(value)))
     && Number.isSafeInteger(Number(value)) && Number(value) > 0;
   const reject = () => { throw new Error('Incomplete original Prune acceptance reference'); };
-  if (a?.event_schema_version !== 1 || a.environment !== 'TEST'
+  if (a?.event_schema_version !== 1 || !isEnvironmentName(a.environment)
     || a.writer_identity !== 'prune_daily_v3' || !uuid(a.run_id) || a.attempt_id !== a.run_id
     || !/^[a-f0-9]{40}$/.test(a.writer_git_sha || '')
     || !Number.isSafeInteger(a.connector_id) || a.connector_id <= 0
@@ -116,7 +117,7 @@ export function preparePrunePostCommitHandover(acceptance) {
       : 'ready_for_independent_authentication';
   const message = {
     schema_version: 1, kind: 'uk_aq_jsongen_prune_post_commit_handover',
-    environment: 'TEST', index_generation: 'v3', authority_state: 'requires_independent_authentication',
+    environment: a.environment, index_generation: 'v3', authority_state: 'requires_independent_authentication',
     writer: { identity: a.writer_identity, invocation_id: a.run_id,
       attempt_id: a.attempt_id, git_sha: a.writer_git_sha },
     acceptance: { relation: PRUNE_GATE_ACCEPTANCE_RELATION, event_schema_version: 1,

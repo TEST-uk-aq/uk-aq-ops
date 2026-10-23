@@ -1,3 +1,4 @@
+import { isEnvironmentName } from './environment.mjs';
 // Writer-lifetime preparation only. This is deliberately neither a retained
 // attestation nor an authenticated Stage 1 verified-change receipt.
 import { BUCKET, canonicalJson } from './schema.mjs';
@@ -36,6 +37,7 @@ export function preparePruneOriginalFinalEvidence({ pending, connector, finaliza
     || !finalization.affected_days_utc?.includes(dayUtc))
     throw new Error('JSONgen final preparation lacks the original pending, connector, or batch identity');
   const sourceEvidence = pending.pending_evidence;
+  if (!isEnvironmentName(sourceEvidence.environment)) throw new TypeError('Invalid original source environment');
   const { signed_upload: signedUpload, ...unsignedEvidence } = sourceEvidence;
   const expectedPendingKey = `managed/jsongen/v1/pending/unverified/prune_daily_v3/connector_id=${connectorId}`
     + `/day_utc=${dayUtc}/invocation=${runId}/compressed_sha256=${pending.source?.sha256}`
@@ -92,7 +94,7 @@ export function preparePruneOriginalFinalEvidence({ pending, connector, finaliza
     schema_version: 1,
     kind: 'uk_aq_jsongen_prune_original_final_evidence_preparation',
     authority_state: 'precommit_prepared_unverified',
-    environment: 'TEST', index_generation: 'v3',
+    environment: sourceEvidence.environment, index_generation: 'v3',
     writer: { identity: 'prune_daily_v3', invocation_id: runId, attempt_id: runId,
       git_sha: writerGitSha || null },
     connector_id: connectorId, day_utc: dayUtc,

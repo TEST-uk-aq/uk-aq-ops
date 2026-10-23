@@ -1,5 +1,7 @@
+import { isEnvironmentName } from './environment.mjs';
 // Managed JSONgen wire contracts. Validation checks shape/relationships, not the
 // truth of writer attestations. No canonical reader or scope-dominance checker lives here.
+import { assertSelectedReceiptOrigin, assertSelectedControlEvents } from './prune-event-schema.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { AQI_ALGORITHM_VERSION, DAQI_PM_ROLLING24H_WINDOW_HOURS,
   DAQI_PM_ROLLING24H_REQUIRED_HOURS } from '../../lib/aqi/aqi_levels.mjs';
@@ -164,10 +166,10 @@ export function affectedMonths(scopes) {
 }
 export function assertReceipt(value) {
   fields(value, ['schema_version', 'kind', 'change_id', 'writer', 'source', 'scopes',
-    'affected_months', 'rolling_aqi', 'bundle', 'verification', 'durability'], value.schema_version === 2 ? ['origin'] : []);
-  requireValid([1, 2].includes(value.schema_version) && value.kind === 'uk_aq_jsongen_verified_change', 'receipt schema/kind mismatch');
+    'affected_months', 'rolling_aqi', 'bundle', 'verification', 'durability'], [2, 3].includes(value.schema_version) ? ['origin'] : []);
+  requireValid([1, 2, 3].includes(value.schema_version) && value.kind === 'uk_aq_jsongen_verified_change', 'receipt schema/kind mismatch');
   requireValid(changeId(value.change_id), 'invalid stable change ID');
-  fields(value.writer, ['identity', 'invocation_id'], value.schema_version === 2 ? ['attempt_id', 'git_sha'] : []);
+  fields(value.writer, ['identity', 'invocation_id'], [2, 3].includes(value.schema_version) ? ['attempt_id', 'git_sha'] : []);
   requireValid(text(value.writer.identity) && text(value.writer.invocation_id), 'writer invocation required');
   assertSource(value.source);
   requireValid(Array.isArray(value.scopes) && value.scopes.length > 0, 'complete replacement scopes required');
@@ -193,7 +195,8 @@ export function assertReceipt(value) {
   requireValid(value.durability.state === 'verified_pending', 'immutable receipt must describe verified pending handoff');
   if (value.schema_version === 1) assertReference(value.durability.retained_receipt_authority);
   else {
-    assertPruneReceiptOrigin(value);
+    if (value.schema_version === 2) assertPruneReceiptOrigin(value);
+    else assertSelectedReceiptOrigin(value);
     for (const authority of [value.verification.provenance_authority, value.verification.scope_completeness_authority,
       value.durability.retained_receipt_authority]) requireValid(same(authority, value.origin.authority),
     'original PostgreSQL authority must not be substituted by an R2 reference');
@@ -209,7 +212,7 @@ export function assertPruneAcceptanceAuthority(a) {
   fields(a.key, ['environment', 'writer_identity', 'run_id', 'attempt_id', 'day_utc', 'connector_id']);
   requireValid(a.schema_version === 1 && a.kind === 'uk_aq_jsongen_prune_acceptance_authority'
     && a.relation === 'uk_aq_ops.prune_jsongen_gate_acceptance_outbox'
-    && a.key.environment === 'TEST' && a.key.writer_identity === 'prune_daily_v3' && a.key.connector_id === 1
+    && isEnvironmentName(a.key.environment) && a.key.writer_identity === 'prune_daily_v3' && a.key.connector_id === 1
     && uuid(a.key.run_id) && a.key.attempt_id === a.key.run_id && day(a.key.day_utc)
     && a.event_id === digest(a.key) && /^[a-f0-9]{40}$/.test(a.writer_git_sha)
     && sha(a.final_evidence_sha256) && id(a.final_evidence_byte_size) && a.final_evidence_byte_size <= 1024 ** 2
@@ -371,8 +374,10 @@ export function createControl({ now = new Date().toISOString() } = {}) {
 }
 export function assertControl(value) {
   fields(value, ['schema_version', 'kind', 'control_key', 'control_id', 'revision', 'operation_id',
-    'previous', 'updated_at_utc', 'ordering', 'registered_changes', 'months', 'freshness', 'failure']);
-  header(value, 'control');
+    'previous', 'updated_at_utc', 'ordering', 'registered_changes', 'months', 'freshness', 'failure'],
+  value.schema_version === 2 ? ['authenticated_events'] : []);
+  requireValid([1, 2].includes(value.schema_version) && value.kind === 'uk_aq_jsongen_control', 'control schema/kind mismatch');
+  if (value.schema_version === 2) requireValid(Object.hasOwn(value, 'authenticated_events'), 'control-v2 event map required');
   requireValid(value.control_key === CONTROL_KEY && uuid(value.control_id) && uuid(value.operation_id)
     && integer(value.revision) && instant(value.updated_at_utc), 'invalid control identity');
   if (value.revision === 0) requireValid(value.previous === null, 'initial control has no predecessor');
@@ -395,7 +400,7 @@ export function assertControl(value) {
       && entry.receipt_object.byte_size === canonicalJson(entry.receipt).length, 'receipt evidence mismatch');
     requireValid(eventId === entry.receipt.change_id && instant(entry.registered_at_utc)
       && LIFECYCLE_STATES.includes(entry.state) && entry.state !== 'selected'
-      && entry.ordering_state === 'unresolved' && entry.authentication_state === (entry.receipt.schema_version === 2
+      && entry.ordering_state === 'unresolved' && entry.authentication_state === ([2, 3].includes(entry.receipt.schema_version)
         ? 'original_prune_event_authenticated' : 'pending_writer_adapter'), 'invalid unresolved-scope registered change');
     requireValid(entry.receipt_object.key === `${ROOT}/receipts/${entry.receipt_object.sha256}.json`, 'immutable receipt reference required');
     for (const m of entry.receipt.affected_months) {
@@ -411,6 +416,9 @@ export function assertControl(value) {
     groups.get(id).push(entry.receipt);
   }
   for (const receipts of groups.values()) assertPruneReceiptGroup(receipts);
+  if (value.schema_version === 2) assertSelectedControlEvents(value);
+  else requireValid(Object.values(value.registered_changes).every(e => e.receipt.schema_version !== 3),
+    'selected receipts require control v2');
   for (const [k, entry] of Object.entries(value.months)) {
     fields(entry, ['identity', 'month_utc', 'desired_change_ids', 'applied_change_ids', 'selected', 'state', 'failure']);
     requireValid(k === monthKey(entry.identity, entry.month_utc), 'month map identity mismatch');

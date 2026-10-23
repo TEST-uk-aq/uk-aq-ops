@@ -5,9 +5,11 @@ import { ROOT, CONTROL_KEY, ORDERING_BLOCKER, assertControl, createControl,
   assertReceipt, assertPruneReceiptGroup, assertReference, assertFailure, canonicalJson, same, monthKey, requireValid } from './schema.mjs';
 import { assertControlSnapshot } from './control-snapshot.mjs';
 import { retainedPruneEvent } from './prune-receipts.mjs';
-import { readReceipt } from './inputs.mjs';
-import { createBudget } from './limits.mjs';
-import { assertManagedR2Target, assertManagedR2CredentialMode } from './r2-config.mjs';
+import { retainedSelectedPruneEvent, retainedSelectedPruneBudget } from './prune-selected-event.mjs';
+import { assertDescriptorReceipts, assertSelectedReceiptGroup } from './prune-event-schema.mjs';
+import { readPruneEventDescriptor, readReceipt } from './inputs.mjs';
+import { createBudget, evidence } from './limits.mjs';
+import { assertManagedR2Target, assertManagedR2CredentialMode, managedR2Environment } from './r2-config.mjs';
 
 export { managedR2ReadConfig, managedR2WriteConfig } from './r2-config.mjs';
 
@@ -35,6 +37,7 @@ export async function readManagedControl(r2, { budget = null } = {}) {
       budget.get('derived');
       stored = await r2GetObjectBounded({ r2, key: CONTROL_KEY,
         max_bytes: Math.min(MAX_CONTROL_BYTES, budget.remainingBytes()), timeout_ms: budget.timeout() });
+      budget.transfer?.('derived', stored.bytes);
       budget.bytes('derived', stored.bytes);
     } else stored = await r2GetObject({ r2, key: CONTROL_KEY, max_attempts: 1 });
   }
@@ -43,47 +46,46 @@ export async function readManagedControl(r2, { budget = null } = {}) {
     && stored.bytes === stored.body.byteLength && isStrongR2Etag(stored.etag), 'invalid control body/ETag');
   const body = Buffer.from(stored.body);
   const control = assertControl(JSON.parse(body.toString('utf8')));
+  const environment = managedR2Environment(r2);
+  evidence(Object.values(control.registered_changes).every(e => e.receipt.schema_version === 1
+    || e.receipt.origin.authority.key.environment === environment)
+    && Object.values(control.authenticated_events || {}).every(e => e.authority.key.environment === environment),
+  'cross_environment_evidence', 'Managed control source authorities differ from configured environment');
   // Exact bytes participate in revision evidence, including JSON encoding.
   return { control, body, sha256: sha256Hex(body), etag: stored.etag };
 }
 function reduce(current, command, now) {
   const next = structuredClone(current);
+  if (command.type === 'retain_selected_prune_event') {
+    const event = command.event;
+    assertDescriptorReceipts(event.descriptor, event.descriptor_object, event.entries.map(e => e.receipt));
+    requireValid(!Object.values(next.registered_changes).some(e => e.receipt.schema_version === 2
+      && e.receipt.origin.authority.event_id === event.event_id), 'legacy original event already registered; replay schema 2');
+    const record = { descriptor: event.descriptor_object, authority: event.original_authority, event: event.event,
+      receipt_objects: event.entries.map(e => ({ change_id: e.receipt.change_id, receipt_object: e.receipt_object })) };
+    const old = next.authenticated_events?.[event.event_id];
+    if (old) {
+      const { registered_at_utc: _at, ...prior } = old;
+      requireValid(same(prior, record), 'original event identity reused with different descriptor, source, policy or group');
+      assertControl(next); return null;
+    }
+    // The only v1 -> v2 transition adds the event map to the exact old state.
+    // Revision/previous evidence are assigned by the existing CAS loop below.
+    next.schema_version = 2; next.authenticated_events ||= {};
+    next.authenticated_events[event.event_id] = { ...record, registered_at_utc: now };
+    for (const entry of event.entries) addReceipt(next, entry, now);
+    return next;
+  }
   if (['retain_receipt', 'retain_prune_event'].includes(command.type)) {
     const entries = command.type === 'retain_prune_event' ? command.entries : [command];
-    if (command.type === 'retain_prune_event') assertPruneReceiptGroup(entries.map(e => e.receipt));
+    if (command.type === 'retain_prune_event') {
+      assertPruneReceiptGroup(entries.map(e => e.receipt));
+      requireValid(!next.authenticated_events?.[entries[0].receipt.origin.authority.event_id],
+        'selected event already registered; legacy replay cannot replace it');
+    }
     let changed = false;
     for (const command of entries) {
-      // Version 2 carries authenticated original Prune evidence. Neither receipt
-      // format establishes current canonical dominance or monthly eligibility.
-      assertReceipt(command.receipt);
-      assertReference(command.receipt_object, { managed: true });
-      const bytes = canonicalJson(command.receipt);
-      requireValid(command.receipt_object.key === `${ROOT}/receipts/${sha256Hex(bytes)}.json`
-        && command.receipt_object.sha256 === sha256Hex(bytes) && command.receipt_object.byte_size === bytes.length,
-      'receipt descriptor mismatch');
-      const eventId = command.receipt.change_id;
-      const old = Object.hasOwn(next.registered_changes, eventId) ? next.registered_changes[eventId] : null;
-      if (old) {
-        requireValid(same(old.receipt, command.receipt) && same(old.receipt_object, command.receipt_object),
-          'stable change ID reused for different evidence');
-        continue; // Durable idempotent receipt, regardless of dispatch state.
-      }
-      next.registered_changes[eventId] = { receipt: command.receipt, receipt_object: command.receipt_object,
-        registered_at_utc: now, state: command.receipt.schema_version === 2 ? 'verified_pending' : 'reconcile_required', ordering_state: 'unresolved',
-        authentication_state: command.receipt.schema_version === 2 ? 'original_prune_event_authenticated' : 'pending_writer_adapter' };
-      changed = true;
-      for (const m of command.receipt.affected_months) {
-        const k = monthKey(m.identity, m.month_utc);
-        const entry = next.months[k] ||= { ...m, desired_change_ids: [], applied_change_ids: [],
-          selected: null, state: 'pending', failure: null };
-        entry.desired_change_ids = [...entry.desired_change_ids, eventId].sort();
-        entry.state = 'reconcile_required';
-        entry.failure = { code: ORDERING_BLOCKER, state: 'reconcile_required', at_utc: now,
-          detail: command.receipt.schema_version === 2
-            ? 'Original Prune event authenticated; current canonical dominance, other writer coverage and monthly baselines remain unresolved'
-            : 'Receipt retained; current canonical scope precedence, receipt coverage and final-authority bundle authentication remain unverified' };
-      }
-      next.freshness.state = 'reconcile_required';
+      changed = addReceipt(next, command, now) || changed;
     }
     if (!changed) return null;
   } else if (command.type === 'record_failure') {
@@ -102,6 +104,39 @@ function reduce(current, command, now) {
   } else throw new TypeError('Unsupported Stage 1 control command');
   return next;
 }
+function addReceipt(next, command, now) {
+  // Version 2 carries authenticated original Prune evidence. Neither receipt
+  // format establishes current canonical dominance or monthly eligibility.
+  assertReceipt(command.receipt);
+  assertReference(command.receipt_object, { managed: true });
+  const bytes = canonicalJson(command.receipt);
+  requireValid(command.receipt_object.key === `${ROOT}/receipts/${sha256Hex(bytes)}.json`
+    && command.receipt_object.sha256 === sha256Hex(bytes) && command.receipt_object.byte_size === bytes.length,
+  'receipt descriptor mismatch');
+  const eventId = command.receipt.change_id;
+  const old = Object.hasOwn(next.registered_changes, eventId) ? next.registered_changes[eventId] : null;
+  if (old) {
+    requireValid(same(old.receipt, command.receipt) && same(old.receipt_object, command.receipt_object),
+      'stable change ID reused for different evidence');
+    return false; // Durable replay preserves lifecycle state.
+  }
+  next.registered_changes[eventId] = { receipt: command.receipt, receipt_object: command.receipt_object,
+    registered_at_utc: now, state: [2, 3].includes(command.receipt.schema_version) ? 'verified_pending' : 'reconcile_required', ordering_state: 'unresolved',
+    authentication_state: [2, 3].includes(command.receipt.schema_version) ? 'original_prune_event_authenticated' : 'pending_writer_adapter' };
+  for (const m of command.receipt.affected_months) {
+    const k = monthKey(m.identity, m.month_utc);
+    const entry = next.months[k] ||= { ...m, desired_change_ids: [], applied_change_ids: [],
+      selected: null, state: 'pending', failure: null };
+    entry.desired_change_ids = [...entry.desired_change_ids, eventId].sort();
+    entry.state = 'reconcile_required';
+    entry.failure = { code: ORDERING_BLOCKER, state: 'reconcile_required', at_utc: now,
+      detail: [2, 3].includes(command.receipt.schema_version)
+        ? 'Original Prune event authenticated; current canonical dominance, other writer coverage and monthly baselines remain unresolved'
+        : 'Receipt retained; current canonical scope precedence, receipt coverage and final-authority bundle authentication remain unverified' };
+  }
+  next.freshness.state = 'reconcile_required';
+  return true;
+}
 // Selection has no unsafe substitute. Even a valid/readback-verified descriptor
 // cannot bypass unauthenticated canonical-scope precedence/receipt coverage or
 // the unresolved final-authority-to-bundle seam. No global counter is required.
@@ -110,10 +145,15 @@ export function selectManagedPublications() {
     'Managed selection is disabled until canonical scope dominance, complete receipt coverage and final-authority bundle authentication are established');
 }
 export async function updateManagedControl({ r2, command, maxConflicts = 3, authenticatedPruneEvent = null,
-  budget = null }) {
+  budget = null, authenticatedSelectedEvent = null }) {
   assertManagedR2CredentialMode(r2, 'write');
   admit(r2);
-  const bounded = budget !== null || command?.type === 'retain_prune_event';
+  if (command?.type === 'retain_selected_prune_event') {
+    const operationBudget = retainedSelectedPruneBudget(authenticatedSelectedEvent);
+    requireValid(budget === null || budget === operationBudget, 'selected registration must share original authentication budget');
+    budget = operationBudget;
+  }
+  const bounded = budget !== null || ['retain_prune_event', 'retain_selected_prune_event'].includes(command?.type);
   budget ||= createBudget();
   const readOptions = { budget: bounded ? budget : null };
   requireValid(Number.isInteger(maxConflicts) && maxConflicts >= 0 && maxConflicts <= 5, 'invalid conflict budget');
@@ -122,15 +162,30 @@ export async function updateManagedControl({ r2, command, maxConflicts = 3, auth
   if (command?.type === 'retain_prune_event') {
     requireValid(Object.keys(command).length === 1, 'event registration accepts only an authenticated retained event token');
     const event = retainedPruneEvent(authenticatedPruneEvent);
+    requireValid(event.original_authority.key.environment === managedR2Environment(r2), 'original event differs from configured control environment');
     command = { type: 'retain_prune_event', entries: event.entries };
   }
+  if (command?.type === 'retain_selected_prune_event') {
+    requireValid(Object.keys(command).length === 1, 'selected registration accepts only a retained event capability');
+    const event = retainedSelectedPruneEvent(authenticatedSelectedEvent);
+    requireValid(event.original_authority.key.environment === managedR2Environment(r2), 'selected event differs from configured control environment');
+    command = { type: command.type, event };
+  }
   command = structuredClone(command);
-  requireValid(['initialize', 'retain_receipt', 'retain_prune_event', 'record_failure'].includes(command?.type), 'unsupported control command');
+  requireValid(['initialize', 'retain_receipt', 'retain_prune_event', 'retain_selected_prune_event', 'record_failure'].includes(command?.type), 'unsupported control command');
   if (command.type === 'retain_receipt') requireValid(command.receipt?.schema_version === 1,
     'version-2 Prune receipts require complete atomic event registration');
   if (command.type === 'retain_prune_event') {
     assertPruneReceiptGroup(command.entries.map(e => e.receipt));
     for (const entry of command.entries) await readReceipt({ r2, reference: entry.receipt_object, expected: entry.receipt, budget });
+  }
+  if (command.type === 'retain_selected_prune_event') {
+    const event = command.event;
+    const d = await readPruneEventDescriptor({ r2, reference: event.descriptor_object, expected: event.descriptor, budget });
+    const receipts = [];
+    for (const entry of event.entries) receipts.push(await readReceipt({ r2, reference: entry.receipt_object,
+      expected: entry.receipt, budget }));
+    assertDescriptorReceipts(d, event.descriptor_object, receipts);
   }
   if (command.expected_control_snapshot !== undefined) {
     requireValid(command.type === 'record_failure' && command.month_key === undefined,
@@ -186,6 +241,7 @@ export async function updateManagedControl({ r2, command, maxConflicts = 3, auth
     let outcome; let timer;
     try {
       const timeout = bounded ? budget.timeout() : null;
+      if (bounded) budget.put?.(body.length);
       const write = r2PutObjectConditional({ r2, key: CONTROL_KEY, body, content_type: 'application/json', sha256: expectedHash,
         ...(latest ? { if_match: latest.etag } : { if_none_match: '*' }) });
       if (bounded) await Promise.race([write, new Promise((_, reject) => {
@@ -210,6 +266,15 @@ export async function updateManagedControl({ r2, command, maxConflicts = 3, auth
     catch (cause) { throw new JSONgenControlError('ambiguous_r2_write_outcome',
       'Control readback unavailable; retain operation evidence and reconcile before retry', { attempted, cause }); }
     if (latest?.sha256 === expectedHash && latest.control.operation_id === next.operation_id) return { outcome, latest };
+    if (command.type === 'retain_selected_prune_event' && latest) {
+      const e = command.event, registered = latest.control.authenticated_events?.[e.event_id];
+      if (registered && same(registered.descriptor, e.descriptor_object)
+        && same(registered.authority, e.original_authority) && same(registered.event, e.event)
+        && same(registered.receipt_objects, e.entries.map(x => ({ change_id: x.receipt.change_id, receipt_object: x.receipt_object })))) {
+        assertSelectedReceiptGroup(e.entries.map(x => x.receipt), registered.descriptor, registered.event, registered.authority);
+        return { outcome: 'registered_confirmed_in_newer_control', latest };
+      }
+    }
     if (command.type === 'retain_prune_event' && latest && command.entries.every(entry => {
       const retained = latest.control.registered_changes[entry.receipt.change_id];
       return retained && same(retained.receipt, entry.receipt) && same(retained.receipt_object, entry.receipt_object);

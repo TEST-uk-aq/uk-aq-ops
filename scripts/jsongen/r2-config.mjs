@@ -1,7 +1,10 @@
+import { configuredEnvironment } from './environment.mjs';
+import { assertConfiguredIdentity } from './admission.mjs';
 // Shared private JSONgen R2 target plus operation-specific credentials.
 // Callers must choose READ or WRITE explicitly; there are no credential fallbacks.
 const credentialModes = new WeakMap();
 const configuredTargets = new WeakMap();
+const configuredEnvironments = new WeakMap();
 
 function invalidConfiguration(message) {
   const error = new Error(message);
@@ -10,7 +13,8 @@ function invalidConfiguration(message) {
 }
 
 export function managedR2TargetConfig(env = process.env) {
-  if (env.UK_AQ_ENV_NAME !== 'TEST') invalidConfiguration('UK_AQ_ENV_NAME must admit TEST');
+  try { assertConfiguredIdentity(env); } catch { invalidConfiguration('Explicit environment and configured repository required'); }
+  const environment = configuredEnvironment(env);
   const endpointValue = env.UK_AQ_JSONGEN_R2_ENDPOINT;
   if (typeof endpointValue !== 'string' || !endpointValue || endpointValue !== endpointValue.trim())
     invalidConfiguration('UK_AQ_JSONGEN_R2_ENDPOINT is required');
@@ -29,6 +33,7 @@ export function managedR2TargetConfig(env = process.env) {
     invalidConfiguration('UK_AQ_JSONGEN_R2_BUCKET is required and must be a valid bucket name');
   const target = Object.freeze({ endpoint: endpoint.origin, bucket, region: 'auto' });
   configuredTargets.set(target, target);
+  configuredEnvironments.set(target, environment);
   return target;
 }
 
@@ -54,6 +59,7 @@ function managedR2CredentialConfig(env, accessMode) {
     invalidConfiguration(`${accessName} must be separate from canonical Prune R2 credentials`);
   const config = Object.freeze({ ...target, access_key_id: accessKeyId, secret_access_key: secretAccessKey });
   configuredTargets.set(config, target);
+  configuredEnvironments.set(config, configuredEnvironments.get(target));
   credentialModes.set(config, accessMode);
   return config;
 }
@@ -69,4 +75,11 @@ export function managedR2WriteConfig(env = process.env) {
 export function assertManagedR2CredentialMode(r2, accessMode) {
   if (credentialModes.get(r2) !== accessMode)
     invalidConfiguration(`Explicit JSONgen ${accessMode.toUpperCase()} R2 credentials are required for this operation`);
+}
+
+// Configuration captured by the trusted factory, never taken from source JSON.
+// Plain read adapters still require the same explicit process configuration.
+export function managedR2Environment(r2, env = process.env) {
+  assertManagedR2Target(r2, env);
+  return configuredEnvironments.get(r2) ?? configuredEnvironment(env);
 }

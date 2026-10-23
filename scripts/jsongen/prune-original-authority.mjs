@@ -30,7 +30,8 @@ export function authenticatePruneOriginalAuthority({ envelope: e, row, source, b
     && x.completeness === 'captured' && x.before?.state === 'captured' && x.binding?.state === 'captured', 'complete_extension');
   const bucket = e.original_connector_publication.connector_manifest.bucket;
   check(bucket !== BUCKET && x.capture_boundary === 'original_global_lock_before_canonical_replacement'
-    && same(x.identity, { environment: 'TEST', index_generation: 'v3', canonical_bucket: bucket,
+    && e.environment === row.environment && source.environment === row.environment
+    && same(x.identity, { environment: row.environment, index_generation: 'v3', canonical_bucket: bucket,
       writer: e.writer, connector_id: 1, day_utc: row.day_utc, source_identity: source.source_identity })
     && same(x.lock, { logical_identity: OBSERVATIONS_GLOBAL_OPERATION_LOCK_LOGICAL_IDENTITY,
       owner: 'prune_daily', run_id: row.run_id }), 'writer_source_and_original_global_lock');

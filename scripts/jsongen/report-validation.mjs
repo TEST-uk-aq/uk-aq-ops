@@ -1,5 +1,6 @@
 // Validation of diagnostic evidence, never an authentication shortcut for a
 // writer publication, canonical currentness, or complete receipt coverage.
+import { assertPruneEventReference, assertPruneEventSummary } from './prune-event-schema.mjs';
 import { validateObservationContentHashMetadata } from '../../workers/shared/uk_aq_observation_content_hash.mjs';
 import { DAQI_PM_ROLLING24H_WINDOW_HOURS, DAQI_PM_ROLLING24H_REQUIRED_HOURS } from '../../lib/aqi/aqi_levels.mjs';
 import { getObservationHistoryGeneration } from '../../workers/shared/uk_aq_observation_history_generation.mjs';
@@ -60,14 +61,15 @@ function inspectLogical(value, scopes) {
 
 export function assertReconciliationReport(report, { controlRead = null } = {}) {
   report = decodeCompactReport(report);
-  const modern = report.schema_version === 3;
+  const modern = [3, 4].includes(report.schema_version);
   const stage3c = modern || report.schema_version === 2;
   const getLimit = modern ? INSPECTION_MAX_METADATA_GETS : LIMITS.metadata_gets;
   const scopeLimit = stage3c ? PRUNE_PENDING_SOURCE_LIMITS.scopes : LIMITS.scopes;
   keys(report, ['schema_version', 'kind', 'inspected_at_utc', 'control_snapshot', 'state',
     'publication_selection', 'complete_change_coverage', 'freshness', 'changes', 'canonical',
-    'uncovered_scopes', 'months', 'diagnostics', 'resources', 'actions'], stage3c ? ['stage3c'] : []);
-  evidence([1, 2, 3].includes(report.schema_version) && report.kind === 'uk_aq_jsongen_reconciliation'
+    'uncovered_scopes', 'months', 'diagnostics', 'resources', 'actions',
+    ...(report.schema_version === 4 ? ['authenticated_events'] : [])], stage3c ? ['stage3c'] : []);
+  evidence([1, 2, 3, 4].includes(report.schema_version) && report.kind === 'uk_aq_jsongen_reconciliation'
     && instant(report.inspected_at_utc) && report.state === 'reconciliation_required'
     && report.publication_selection === 'disabled' && report.complete_change_coverage === false
     && report.freshness === 'unknown', 'invalid_report', 'unsupported or unsafe reconciliation state');
@@ -344,6 +346,14 @@ export function assertReconciliationReport(report, { controlRead = null } = {}) 
   'invalid_report', 'invalid processing resource or action evidence');
   if (controlRead !== null) {
     const control = controlRead.control;
+    if (report.schema_version === 4) {
+      evidence(Object.entries(control.authenticated_events || {}).every(([id, record]) =>
+        report.authenticated_events.some(e => e.event_id === id && e.registered && same(e.descriptor, record.descriptor)
+          && same(e.authority, record.authority) && same(e.event, record.event)
+          && same(e.expected_changes, record.receipt_objects.map(r => r.change_id))))
+        && report.authenticated_events.filter(e => e.registered).every(e => control.authenticated_events?.[e.event_id]),
+      'invalid_report', 'Authenticated event registration differs from inspected control');
+    }
     evidence(same(report.months.filter(m => Object.hasOwn(control.months, m.month_key)).map(m => m.month_key).sort(),
       Object.keys(control.months).sort()), 'invalid_report', 'inspected control month omitted');
     for (const change of report.changes.filter(c => c.registered)) {
@@ -399,6 +409,30 @@ function assertSourceAsOf(c, report) {
 
 function assertStage3C(report) {
   const result = report.stage3c;
+  const authenticatedEvents = report.schema_version === 4 ? report.authenticated_events : [];
+  evidence(Array.isArray(authenticatedEvents) && authenticatedEvents.length <= LIMITS.receipt_references
+    && new Set(authenticatedEvents.map(e => e.event_id)).size === authenticatedEvents.length,
+  'invalid_report', 'Invalid authenticated event coverage');
+  for (const e of authenticatedEvents) {
+    keys(e, ['event_id', 'authority', 'descriptor', 'event', 'expected_changes', 'original_authenticated',
+      'descriptor_retained', 'selected_receipts_retained', 'registered', 'diagnostics']);
+    assertPruneAcceptanceAuthority(e.authority); assertPruneEventReference(e.descriptor); assertPruneEventSummary(e.event);
+    evidence(e.event_id === e.authority.event_id && Array.isArray(e.expected_changes)
+      && e.expected_changes.length <= LIMITS.receipt_references && e.expected_changes.every(id => changeId.test(id))
+      && new Set(e.expected_changes).size === e.expected_changes.length
+      && ['original_authenticated', 'descriptor_retained', 'selected_receipts_retained', 'registered'].every(k => typeof e[k] === 'boolean')
+      && Array.isArray(e.diagnostics) && e.diagnostics.every(diagnostic)
+      && (!e.original_authenticated || (e.descriptor_retained && e.expected_changes.length === e.event.partition_count)),
+    'invalid_report', 'Inconsistent original/selected descriptor states');
+    const authenticated = report.changes.filter(c => c.authentication?.authenticated
+      && c.authentication.original_acceptance.event_id === e.event_id);
+    evidence(authenticated.every(c => e.expected_changes.includes(c.change_id))
+      && e.selected_receipts_retained === (e.original_authenticated && e.expected_changes.every(id =>
+        report.changes.some(c => c.change_id === id && c.bundle_integrity === 'verified' && c.authentication?.authenticated))),
+    'invalid_report', 'Selected receipt coverage contradicts original event');
+    if (e.selected_receipts_retained) evidence(authenticated.flatMap(c => c.scopes).length === e.event.selected.scope_count,
+      'invalid_report', 'Selected coverage is not full original coverage');
+  }
   evidence(object(result) && Array.isArray(result.original_events) && result.original_events.length <= LIMITS.receipt_references,
     'invalid_report', 'Stage 3C event coverage required');
   const eventIds = new Set();
@@ -422,7 +456,7 @@ function assertStage3C(report) {
     }
     return { event_id: g.event_id, authority: g.authority, scope_count: g.scope_count,
       group_sha256: g.group_sha256, expected_changes: g.expected_changes,
-      ...(report.schema_version === 3 ? { expected_scope_keys: g.expected_scope_keys } : {}) };
+      ...([3, 4].includes(report.schema_version) ? { expected_scope_keys: g.expected_scope_keys } : {}) };
   });
   const d = result.discovery;
   if (d !== null) {
@@ -445,7 +479,7 @@ function assertStage3C(report) {
       'invalid_report', 'Invalid bounded discovery cursor');
     }
   }
-  evidence(same(result, assessStage3C({ changes: report.changes, canonical: report.canonical, originalGroups, discovery: d })),
+  evidence(same(result, assessStage3C({ changes: report.changes, canonical: report.canonical, originalGroups, discovery: d, authenticatedEvents })),
     'invalid_report', 'Stage 3C currentness/coverage contradicts its independently inspectable evidence');
 }
 
