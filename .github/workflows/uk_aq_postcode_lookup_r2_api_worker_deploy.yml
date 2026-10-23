@@ -24,7 +24,7 @@ jobs:
       UK_AQ_POSTCODE_R2_PREFIX: ${{ vars.UK_AQ_POSTCODE_R2_PREFIX || 'v1' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Validate Cloudflare credentials
         run: |
