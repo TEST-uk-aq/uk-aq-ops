@@ -115,7 +115,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Deno
         uses: denoland/setup-deno@667a34cdef165d8d2b2e98dde39547c9daac7282
@@ -123,9 +123,9 @@ jobs:
           deno-version: v2.7.13
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
 
       - name: Report daily task health (started)
@@ -142,7 +142,7 @@ jobs:
         run: npm ci
 
       - name: Cache Deno dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/deno
           key: deno-${{ runner.os }}-${{ hashFiles('deno.lock') }}
@@ -303,7 +303,7 @@ jobs:
 
       - name: Retain WHO report artefact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: uk-aq-who-2021-daily-report-${{ github.run_id }}-${{ github.run_attempt }}
           path: tmp/uk_aq_who_2021_daily_report.json

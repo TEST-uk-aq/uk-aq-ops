@@ -20,10 +20,10 @@ jobs:
       UK_AQ_CHART_METRICS_RETENTION_DAYS: ${{ vars.UK_AQ_CHART_METRICS_RETENTION_DAYS || '90' }}
       UK_AQ_CHART_METRICS_DAILY_REFRESH_DAYS: ${{ vars.UK_AQ_CHART_METRICS_DAILY_REFRESH_DAYS || '7' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "24"
       - run: npm ci --ignore-scripts
       - name: Validate required configuration
         run: |
@@ -34,7 +34,7 @@ jobs:
         run: timeout --kill-after=30s 5m node workers/uk_aq_chart_metrics/job.mjs
       - name: Upload chart metrics report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: uk-aq-chart-metrics-report
           path: tmp/uk_aq_chart_metrics_report.json

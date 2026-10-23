@@ -48,7 +48,7 @@ jobs:
     steps:
       - name: Checkout TEST Ops source
         id: checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           persist-credentials: false
 
@@ -101,9 +101,9 @@ jobs:
 
       - name: Set up Node.js
         id: setup_node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Install dependencies without install scripts
         id: install
@@ -306,7 +306,7 @@ jobs:
 
       - name: Upload bounded consumer report
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: uk-aq-jsongen-prune-consumer-${{ github.run_id }}-${{ github.run_attempt }}
           path: |

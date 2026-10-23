@@ -22,7 +22,7 @@ jobs:
       UK_AQ_JSONGEN_R2_READ_SECRET_ACCESS_KEY: ${{ secrets.UK_AQ_JSONGEN_R2_READ_SECRET_ACCESS_KEY }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
 
