@@ -26,7 +26,12 @@ export function planPruneSelectedPartitions({ handover, budget, coverage }) {
   return planPartitions({ handover, budget, coverage });
 }
 
-function planPartitions({ handover, budget, coverage = null }) {
+// Stage 2 reconstruction still requires a private authenticated handover. The
+// Stage 1 preview itself never grants artifact access.
+export function reconstructPruneSelectedPartitions({ handover, budget, coverage }) {
+  return planPartitions({ handover, budget, coverage, retainArtifacts: true });
+}
+function planPartitions({ handover, budget, coverage = null, retainArtifacts = false }) {
   const proof = inspectAuthenticatedPruneHandover(handover);
   const { result, pending } = proof;
   const original = pending.pending_evidence.scope.physical_timeseries_days;
@@ -99,7 +104,7 @@ function planPartitions({ handover, budget, coverage = null }) {
         key: `${ROOT}/bundles/${sha256Hex(compressed)}.ndjson.gz`, sha256: sha256Hex(compressed), byte_size: compressed.length,
         json_sha256: sha256Hex(body), json_byte_size: body.length },
       retention: 'pending' });
-    if (!coverage) bodies.push({ partition_id: id, body: compressed, records: records.map(r => r.record),
+    if (!coverage || retainArtifacts) bodies.push({ partition_id: id, body: compressed, records: records.map(r => r.record),
       scopes: records.map(r => proof.scopes[prunePhysicalKey(r.scope)]) });
   };
   groups.forEach(encode);
@@ -111,6 +116,6 @@ function planPartitions({ handover, budget, coverage = null }) {
   const plan = freeze({ state: 'authenticated', coverage: coverage ? 'selected_original_event_scope_set' : 'complete_original_event_partition_set',
     partition_count: partitions.length, physical_scope_count: expected.length, observation_count: rowCount,
     partitions, receipt_coverage_complete: false, handover_complete: false });
-  if (!coverage) artifacts.set(plan, bodies);
+  if (!coverage || retainArtifacts) artifacts.set(plan, bodies);
   return plan;
 }

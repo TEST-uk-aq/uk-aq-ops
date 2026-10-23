@@ -23,7 +23,7 @@ export function measurePruneConsumer(originalBudget) {
       clearInterval(timer); sample();
       const used = process.cpuUsage(cpu);
       return { elapsed_ms: Math.ceil(performance.now() - started), authentication_elapsed_ms: authenticationMs,
-        measurement_scope: 'event_read_authentication_and_planning_excludes_cli_serialization',
+        measurement_scope: 'event_processing_excludes_cli_serialization',
         cpu_user_ms: used.user / 1000, cpu_system_ms: used.system / 1000,
         sampled_peak_heap_used_bytes: heap, heap_samples: samples,
         heap_measurement: 'stage_budget_and_interval_samples_not_exact_peak',

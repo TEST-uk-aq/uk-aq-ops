@@ -1,6 +1,7 @@
 // Explicit fail-closed seam diagnostics for the inspected production writers.
 // No caller-supplied final_verified/ok flag, receipt digest, callback or workflow
 // status can mint authenticated writer evidence through this interface.
+import { authenticateSelectedPruneInput } from './prune-selected-event.mjs';
 import { assertReceipt } from './schema.mjs';
 import { freeze, evidence } from './limits.mjs';
 import { inspectAuthenticatedPruneHandover } from './prune-consumer-authentication.mjs';
@@ -27,17 +28,18 @@ export const WRITER_SEAMS = freeze({
     action: 'Do not activate a handover or trigger before the IFW canonical repair publication contract is accepted.',
   },
 });
-export function authenticateFinalPublication({ input, writerKind = null, pruneHandover = null }) {
+export function authenticateFinalPublication({ input, writerKind = null, pruneHandover = null, budget }) {
   assertReceipt(input.receipt);
   evidence(input.bundle?.integrity === 'verified', 'unverified_bundle', 'complete bundle integrity must be verified first');
-  writerKind ??= input.receipt.schema_version === 2 ? 'prune_daily_v3' : null;
+  writerKind ??= [2, 3].includes(input.receipt.schema_version) ? 'prune_daily_v3' : null;
   const seam = Object.hasOwn(WRITER_SEAMS, writerKind) ? WRITER_SEAMS[writerKind] : null;
   if (writerKind === 'prune_daily_v3' && pruneHandover) {
     const { result } = inspectAuthenticatedPruneHandover(pruneHandover);
     evidence(input.receipt.writer.identity === 'prune_daily_v3'
       && input.receipt.writer.invocation_id === result.key.run_id,
     'contradictory_original_evidence', 'Receipt invocation differs from authenticated original Prune event');
-    return authenticatePruneReceiptInput({ input, handover: pruneHandover });
+    return input.receipt.schema_version === 3 ? authenticateSelectedPruneInput({ input, handover: pruneHandover, budget })
+      : authenticatePruneReceiptInput({ input, handover: pruneHandover });
   }
   return freeze({ state: 'reconciliation_required', authenticated: false,
     writer: { identity: input.receipt.writer.identity, invocation_id: input.receipt.writer.invocation_id }, change_id: input.receipt.change_id,

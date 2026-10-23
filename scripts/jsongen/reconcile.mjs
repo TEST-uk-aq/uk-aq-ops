@@ -3,7 +3,9 @@ import { sha256Hex, r2PutObjectConditional } from '../../workers/shared/r2_sigv4
 import { assertControl, canonicalJson, inspectSourceGeneration, same, scopeKey, monthKey, ROOT, BUCKET } from './schema.mjs';
 import { getObservationHistoryGeneration } from '../../workers/shared/uk_aq_observation_history_generation.mjs';
 import { MAX_CONTROL_BYTES, updateManagedControl } from './control.mjs';
-import { readReceipt, readBundle, readImmutable, admitDerived } from './inputs.mjs';
+import { buildSelectedPruneEvent } from './prune-selected-event.mjs';
+import { assertDescriptorReceipts } from './prune-event-schema.mjs';
+import { readPruneEventDescriptor, readReceipt, readBundle, readImmutable, admitDerived } from './inputs.mjs';
 import { assertManagedR2CredentialMode } from './r2-config.mjs';
 import { readCanonicalScopePages } from './authority.mjs';
 import { authenticateFinalPublication } from './writer-authentication.mjs';
@@ -47,7 +49,7 @@ export async function reconcileManagedInputs({ derivedR2, control, controlRead =
   // The currentness inspector keeps its 64 MiB profile; original outbox/bundle
   // authentication gets one separately bounded 192 MiB budget per invocation.
   const pruneHandoverBudget = createPruneHandoverBudget();
-  const originalGroups = new Map(), expectedReceipts = new Map();
+  const originalGroups = new Map(), expectedReceipts = new Map(), selectedEvents = new Map(), selectedProofs = new Map();
   const addScope = scope => {
     assertInspectionScope(scope);
     scopes.set(scopeKey(scope), scope);
@@ -59,6 +61,49 @@ export async function reconcileManagedInputs({ derivedR2, control, controlRead =
     'invalid_scope', 'Duplicate explicitly requested physical inspection scope');
   requestedScopes.forEach(addScope);
   registered.forEach(([, e]) => e.receipt.scopes.forEach(addScope));
+  const selectedEvent = async (id, record) => {
+    if (selectedProofs.has(id)) return selectedProofs.get(id);
+    const attempt = (async () => {
+      const item = { event_id: id, authority: record.authority, descriptor: record.descriptor, event: record.event,
+        expected_changes: record.receipt_objects?.map(e => e.change_id) || [],
+        original_authenticated: false, descriptor_retained: false, selected_receipts_retained: false,
+        registered: Boolean(control.authenticated_events?.[id]), diagnostics: [] };
+      selectedEvents.set(id, item);
+      try {
+        const descriptor = await readPruneEventDescriptor({ r2: derivedR2, reference: record.descriptor, budget: pruneHandoverBudget });
+        item.descriptor_retained = true;
+        evidence(pruneReader, 'missing_original_authority', 'Original PostgreSQL reader required for selected event authentication');
+        const acceptance = await pruneReader.read(record.authority.key); pruneHandoverBudget.check();
+        evidence(acceptance, 'missing_original_authority', 'Original PostgreSQL selected event unavailable');
+        const handover = await authenticatePruneHandover({ acceptance, derivedR2, budget: pruneHandoverBudget });
+        const group = buildSelectedPruneEvent({ handover, budget: pruneHandoverBudget });
+        evidence(same(descriptor, group.descriptor) && same(record.descriptor, group.descriptor_object)
+          && same(record.authority, group.original_authority) && same(record.event, group.event),
+        'conflicting_selected_event', 'Retained descriptor differs from fresh original authentication');
+        assertDescriptorReceipts(descriptor, record.descriptor, group.entries.map(e => e.receipt));
+        evidence(new Set([...refs.keys(), ...group.entries.map(e => e.receipt_object.key)]).size <= budget.limits.receipt_references,
+          'resource_limit', 'Complete selected receipt references exceed invocation cap');
+        item.original_authenticated = true;
+        item.expected_changes = group.entries.map(e => e.receipt.change_id);
+        for (const e of group.entries) {
+          const prior = refs.get(e.receipt_object.key);
+          evidence(!prior || same(prior, e.receipt_object), 'invalid_object_identity', 'Conflicting selected receipt identity');
+          refs.set(e.receipt_object.key, e.receipt_object); expectedReceipts.set(e.receipt_object.key, e.receipt);
+          e.receipt.scopes.forEach(addScope);
+        }
+        return { handover, group };
+      } catch (error) {
+        item.diagnostics.push({ code: error.code || 'selected_event_authentication_unavailable',
+          detail: 'Selected event descriptor/original authentication unavailable; no canonical observation fallback.' });
+        return null;
+      }
+    })();
+    selectedProofs.set(id, attempt); return attempt;
+  };
+  evidence(Object.keys(control.authenticated_events || {}).length <= budget.limits.receipt_references,
+    'resource_limit', 'Authenticated event reference budget exceeded; partition inspection explicitly');
+  // Includes descriptors proving zero selected coverage, with no dummy receipt.
+  for (const [id, record] of Object.entries(control.authenticated_events || {})) await selectedEvent(id, record);
   for (const ref of refs.values()) {
     const entry = registered.find(([, e]) => e.receipt_object.key === ref.key);
     const change = { change_id: entry?.[0] || expectedReceipts.get(ref.key)?.change_id || null, receipt: ref, registered: Boolean(entry),
@@ -91,6 +136,12 @@ export async function reconcileManagedInputs({ derivedR2, control, controlRead =
       change.logical_identities = bundle.logical;
       let pruneHandover = null;
       try {
+        if (receipt.schema_version === 3) {
+          const o = receipt.origin;
+          const verified = await selectedEvent(o.authority.event_id, { authority: o.authority,
+            descriptor: o.descriptor, event: o.event });
+          if (verified) pruneHandover = verified.handover;
+        }
         if (receipt.schema_version === 2 && pruneReader) {
           const id = receipt.origin.authority.event_id;
           if (!originalEvents.has(id)) {
@@ -124,7 +175,7 @@ export async function reconcileManagedInputs({ derivedR2, control, controlRead =
           evidence(refs.size <= budget.limits.receipt_references, 'resource_limit', 'Complete event partition reference budget exceeded');
         }
         change.authentication = authenticateFinalPublication({ input: { receipt, receipt_object: ref, bundle },
-          writerKind: writerKinds[receipt.writer.identity], pruneHandover });
+          writerKind: writerKinds[receipt.writer.identity], pruneHandover, budget: pruneHandoverBudget });
         if (change.authentication.authenticated) {
           const proof = inspectAuthenticatedPruneHandover(pruneHandover);
           change.original_scope_authorities = receipt.scopes.map(s => proof.scopeAuthorities[scopeKey(s)]);
@@ -171,7 +222,13 @@ export async function reconcileManagedInputs({ derivedR2, control, controlRead =
     } catch (error) { diagnostics.push({ code: error.code || 'outbox_discovery_unavailable',
       detail: 'Bounded original outbox discovery unavailable; repeat overlapping windows and historical resweeps.' }); }
   }
-  const assessment = assessStage3C({ changes, canonical: current, originalGroups: [...originalGroups.values()], discovery });
+  for (const item of selectedEvents.values()) {
+    item.selected_receipts_retained = item.original_authenticated && item.expected_changes.every(id =>
+      changes.some(c => c.change_id === id && c.bundle_integrity === 'verified' && c.authentication?.authenticated));
+  }
+  const authenticatedEvents = [...selectedEvents.values()];
+  const assessment = assessStage3C({ changes, canonical: current, originalGroups: [...originalGroups.values()], discovery,
+    authenticatedEvents });
   const uncovered = (current?.read_consistent ? current.scopes : []).filter(s => s.physical?.membership === 'present'
     && !changes.some(c => c.registered && c.scopes.some(x => x.scope_key === s.scope_key
       && currentScopeMatch(c, x, current) === 'matches'))).map(s => ({ scope_key: s.scope_key,
@@ -190,7 +247,9 @@ export async function reconcileManagedInputs({ derivedR2, control, controlRead =
       selected_source: null, context: [], retained_change_ids: [], state: 'reconciliation_required', context_authentication: 'not_established' });
     months.get(k).retained_change_ids.push(c.change_id);
   }
-  const report = { schema_version: 3, kind: 'uk_aq_jsongen_reconciliation', inspected_at_utc: new Date().toISOString(),
+  const selectedFormat = control.schema_version === 2 || selectedEvents.size > 0;
+  const report = { schema_version: selectedFormat ? 4 : 3,
+    ...(selectedFormat ? { authenticated_events: authenticatedEvents } : {}), kind: 'uk_aq_jsongen_reconciliation', inspected_at_utc: new Date().toISOString(),
     control_snapshot: controlSnapshot(control, controlRead),
     state: 'reconciliation_required', publication_selection: 'disabled', complete_change_coverage: false,
     freshness: 'unknown', changes, canonical: current, stage3c: assessment, uncovered_scopes: uncovered,
@@ -206,10 +265,10 @@ export async function reconcileManagedInputs({ derivedR2, control, controlRead =
 // Durable immutable diagnostics, with no new mutable state or Stage 1 schema.
 export function reconciliationArtifact(report, budget = createBudget()) {
   report = assertReconciliationReport(report);
-  const wire = report.schema_version === 3 ? encodeCompactReport(report) : report;
+  const wire = [3, 4].includes(report.schema_version) ? encodeCompactReport(report) : report;
   const body = canonicalJson(wire);
   evidence(body.length <= budget.limits.report_bytes, 'resource_limit', 'reconciliation report admission exceeded');
-  const expandedBytes = report.schema_version === 3 ? wire.expanded_byte_size : body.length;
+  const expandedBytes = [3, 4].includes(report.schema_version) ? wire.expanded_byte_size : body.length;
   evidence(expandedBytes <= budget.limits.uncompressed_bytes
     && report.resources.derived_bytes + report.resources.metadata_bytes + report.resources.decompressed_bytes
       + expandedBytes + body.length <= budget.limits.total_bytes,

@@ -1,4 +1,5 @@
 // Byte/logical integrity only. No receipt-supplied field grants writer authority.
+import { assertPruneEventDescriptor, assertPruneEventReference } from './prune-event-schema.mjs';
 import { createGunzip } from 'node:zlib';
 import { Readable } from 'node:stream';
 import { r2GetObjectBounded, sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
@@ -100,4 +101,13 @@ export async function readWriterInput({ r2, reference, expected = null, budget =
   const receipt = await readReceipt({ r2, reference, expected, budget });
   const bundle = await readBundle({ r2, receipt, budget });
   return freeze({ receipt_object: reference, receipt, bundle });
+}
+
+export async function readPruneEventDescriptor({ r2, reference, expected = null, budget = createBudget() }) {
+  admitDerived(r2); assertPruneEventReference(reference);
+  const bytes = await readImmutable({ r2, reference, maxBytes: budget.limits.metadata_bytes, budget });
+  const descriptor = assertPruneEventDescriptor(parseJson(bytes));
+  evidence(canonicalJson(descriptor).equals(bytes) && (!expected || same(descriptor, expected)),
+    'invalid_authenticated_event', 'Canonical descriptor readback mismatch');
+  budget.check(); return freeze(descriptor);
 }

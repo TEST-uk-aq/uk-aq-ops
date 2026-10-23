@@ -432,7 +432,7 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
     current_canonical_authority: 'not_inspected', publication_eligible: false });
   // Keep actual rows out of public machine-readable results and log summaries.
   const token = Object.freeze({ event_id: result.event_id });
-  authenticated.set(token, freeze({ result, pending, authority, sources, scopes, scopeAuthorities, writer: e.writer,
+  authenticated.set(token, freeze({ operationBudget: budget, result, pending, authority, sources, scopes, scopeAuthorities, writer: e.writer,
     original_source_status: unsigned.original_source_status, source_identity: unsigned.source_identity,
     original_global_lock: original.lock, original_evidence_sha256: row.final_evidence_sha256,
     post_commit_reference_sha256: acceptance.post_commit_reference.sha256,

@@ -62,6 +62,8 @@ function makeBudget(overrides, ceiling) {
   const check = () => evidence(performance.now() - started < limits.duration_ms, 'resource_limit', 'operation deadline exceeded');
   return {
     limits, check,
+    put(n) { check(); this.bytes('derived', n); used.derived_puts = (used.derived_puts || 0) + 1;
+      used.upload_bytes = (used.upload_bytes || 0) + n; },
     remainingMs() { check(); return Math.max(1, Math.floor(limits.duration_ms - (performance.now() - started))); },
     elapsedMs() { return Math.ceil(performance.now() - started); },
     metadataLimit: () => metadataLimit,

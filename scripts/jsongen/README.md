@@ -1,5 +1,13 @@
 # Managed JSONgen foundations and pending Prune source
 
+The [23 October Stage 2 implementation and operator handover](prune-stage2-handover.md)
+describes descriptor v1, selected receipt v3, atomic control v2 migration, and
+reconciliation v4. This is code only. The existing `--execute-retain` interface
+requires deliberate operator invocation and separate write authorisation;
+read-only remains the default and its workflow retains READ-only credentials.
+Existing receipt v1/v2 and control-v1 state keep their meanings. No monthly
+publisher or automatic retention is enabled.
+
 The [Prune-to-JSONgen first TEST acceptance readiness handover](prune-integration-readiness.md)
 records current blockers, restricted-reader setup and the ordered manual
 acceptance procedure. It documents the next TEST operation; it does not authorize

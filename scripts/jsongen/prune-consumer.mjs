@@ -6,9 +6,11 @@ import { randomUUID } from 'node:crypto';
 import { connectPruneOutboxReader, assertPruneAcceptanceKey, originalPruneAcceptance } from './prune-outbox-reader.mjs';
 import { authenticatePruneHandover, inspectAuthenticatedPruneHandover } from './prune-consumer-authentication.mjs';
 import { buildPruneReceiptGroup, inspectPruneReceiptGroup, retainPruneReceiptGroup, retainedPruneEvent } from './prune-receipts.mjs';
-import { managedR2ReadConfig, managedR2WriteConfig, updateManagedControl, JSONgenControlError }
+import { buildSelectedPruneEvent, retainSelectedPruneEvent, retainedSelectedPruneEvent } from './prune-selected-event.mjs';
+import { managedR2ReadConfig, readManagedControl, managedR2WriteConfig, updateManagedControl, JSONgenControlError }
   from './control.mjs';
 import { assertManagedR2CredentialMode } from './r2-config.mjs';
+import { readReceipt } from './inputs.mjs';
 import { createPruneHandoverBudget, evidence, JSONgenEvidenceError } from './limits.mjs';
 import { planPruneSelectedCoverage } from './prune-coverage-plan.mjs';
 import { measurePruneConsumer } from './prune-consumer-measurements.mjs';
@@ -66,23 +68,57 @@ export async function consumePruneAcceptance({ reader, key, derivedR2, mode = 'r
       return completed;
     }
     failureStage = 'partition_construction';
-    const group = inspectPruneReceiptGroup(buildPruneReceiptGroup({ handover, budget }));
+    // A previous complete schema-2 registration keeps its exact wire identity.
+    // The fresh control check is advisory; CAS rechecks both event families.
+    const before = await readManagedControl(derivedR2, { budget });
+    let legacy = before && Object.values(before.control.registered_changes).some(e =>
+      e.receipt.schema_version === 2 && e.receipt.origin.authority.event_id === result.event_id);
+    let legacyGroup = null;
+    const proof = inspectAuthenticatedPruneHandover(handover);
+    if (!legacy && !before?.control.authenticated_events?.[result.event_id]
+      && proof.pending.pending_evidence.scope.physical_timeseries_days.every(s => ['pm25', 'pm10', 'no2'].includes(s.pollutant_code))) {
+      // Recover partially retained schema-2 handovers too. Deterministic exact
+      // receipt GETs replace listing; missing objects confer no legacy authority.
+      legacyGroup = inspectPruneReceiptGroup(buildPruneReceiptGroup({ handover, budget }));
+      for (const entry of legacyGroup.entries) {
+        try {
+          await readReceipt({ r2: derivedR2, reference: entry.receipt_object, expected: entry.receipt, budget });
+          legacy = true; break;
+        } catch (error) { if (error.status !== 404) throw error; }
+      }
+    }
+    const group = legacy ? legacyGroup || inspectPruneReceiptGroup(buildPruneReceiptGroup({ handover, budget }))
+      : buildSelectedPruneEvent({ handover, budget });
+    if (!legacy) {
+      result.descriptor = group.descriptor_object;
+      result.coverage_summary = group.event;
+    }
     result.partitions = group.plan;
     result.expected_receipts = group.entries.map(e => ({ change_id: e.receipt.change_id, receipt: e.receipt_object,
       bundle: e.receipt.bundle.object }));
     result.group_sha256 = group.group_sha256;
-    result.receipt_eligible = true; // Only the unchanged complete schema-2 group qualifies.
+    result.receipt_eligible = group.entries.length > 0;
     result.retention_progress = []; result.bundle_retention = 'incomplete'; result.receipt_retention = 'incomplete';
-    failureStage = 'receipt_retention';
-    const retainedToken = await retainPruneReceiptGroup({ handover, r2: derivedR2, budget,
-      progress: progress => { result.retention_progress[progress.partition_index] = progress; } });
-    const stored = retainedPruneEvent(retainedToken);
+    failureStage = legacy ? 'receipt_retention' : 'descriptor_retention';
+    if (!legacy) result.descriptor_retention = 'incomplete';
+    const retainedToken = await (legacy ? retainPruneReceiptGroup : retainSelectedPruneEvent)({ handover, r2: derivedR2, budget,
+      progress: progress => {
+        if (progress.descriptor) {
+          result.descriptor_retention = progress.descriptor;
+          result.descriptor_outcome = progress.descriptor_outcome;
+          failureStage = 'receipt_retention';
+        } else result.retention_progress[progress.partition_index] = progress;
+      } });
+    const stored = (legacy ? retainedPruneEvent : retainedSelectedPruneEvent)(retainedToken);
+    if (!legacy) Object.assign(result, { descriptor_retention: 'retained', descriptor_outcome: stored.descriptor_outcome });
     Object.assign(result, { state: 'retained', bundle_retention: 'retained', receipt_retention: 'verified_pending',
       receipt_coverage_complete: stored.receipt_coverage_complete, registration: 'pending' });
+    if (group.entries.length === 0) Object.assign(result, { bundle_retention: 'not_applicable_no_selected_scopes',
+      receipt_retention: 'not_applicable_no_selected_scopes' });
     failureStage = 'control_registration';
     if (initializeControl) await updateManagedControl({ r2: derivedR2, command: { type: 'initialize' }, budget });
-    const registration = await updateManagedControl({ r2: derivedR2, command: { type: 'retain_prune_event' },
-      authenticatedPruneEvent: retainedToken, budget });
+    const registration = await updateManagedControl({ r2: derivedR2, command: { type: legacy ? 'retain_prune_event' : 'retain_selected_prune_event' },
+      ...(legacy ? { authenticatedPruneEvent: retainedToken } : { authenticatedSelectedEvent: retainedToken }), budget });
     return finish({ ...result, state: 'registered', registration: 'registered', registration_outcome: registration.outcome,
       control_operation: { revision: registration.latest.control.revision, operation_id: registration.latest.control.operation_id,
         sha256: registration.latest.sha256 }, handover_complete: true, retry: 'none',
@@ -120,8 +156,9 @@ mandatory: accepted_at is insertion time, never a safe commit-order checkpoint.
 Only complete authenticated original first-publication evidence qualifies.
 Read-only success authenticates the WHOLE original event and plans selected
 coverage in memory; it never creates receipts or completes registration.
-Retain mode writes immutable derived bundles/receipts and registers the WHOLE
-event through control CAS. It never selects or generates monthly publications.`;
+Retain mode writes the all-original descriptor and selected complete-scope
+bundles/receipts, then registers the entire group through one control CAS.
+Existing registered schema-2 events retain their original replay identity. It never selects or generates monthly publications.`;
 
 async function jsonFile(filename) {
   const stat = await fs.stat(filename);

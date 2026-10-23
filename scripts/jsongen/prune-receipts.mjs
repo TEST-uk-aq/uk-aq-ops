@@ -81,8 +81,12 @@ export function authenticatePruneReceiptInput({ input, handover }) {
     inspected_seam: null, action: 'Original event authenticated; current canonical dominance and monthly eligibility remain unresolved.' });
 }
 
-async function retainImmutable({ r2, reference, body, contentType, budget }) {
-  budget.check(); let outcome = 'written'; let timer;
+export async function retainImmutable({ r2, reference, body, contentType, budget }) {
+  assertManagedR2CredentialMode(r2, 'write'); admitDerived(r2);
+  evidence(body.length === reference.byte_size && sha256Hex(body) === reference.sha256,
+    'invalid_object_identity', 'Immutable retention body differs from its declared identity');
+  budget.check(); budget.put?.(body.length);
+  let outcome = 'written'; let timer;
   const timeout = budget.timeout();
   try {
     await Promise.race([
@@ -99,6 +103,8 @@ async function retainImmutable({ r2, reference, body, contentType, budget }) {
     const stored = await readImmutable({ r2, reference, maxBytes: Math.max(LIMITS.compressed_bytes, LIMITS.receipt_bytes), budget });
     evidence(stored.equals(body), 'conflicting_immutable_object', 'Immutable key contains different bytes');
   } catch (cause) {
+    if (cause.code === 'conflicting_immutable_object' || cause.code === 'invalid_object_identity')
+      throw new JSONgenEvidenceError('conflicting_immutable_object', 'Existing immutable object conflicts with expected exact bytes', cause);
     const error = new JSONgenEvidenceError('ambiguous_r2_write_outcome', 'Immutable retention is unconfirmed; replay exact original event and resolve by readback', cause);
     error.reference = reference; throw error;
   }

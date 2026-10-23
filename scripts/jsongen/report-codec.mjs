@@ -1,4 +1,4 @@
-// Lossless schema-3 wire encoding. Repeated references, identities, diagnostics
+// Lossless schema-3/4 wire encoding. Repeated references, identities, diagnostics
 // and scalar strings are interned once. Expansion always precedes semantic
 // validation; table references confer no authority of their own.
 import { canonicalJson } from './schema.mjs';
@@ -10,8 +10,8 @@ const ENCODING = 'interned_json_tree_v1';
 const MAX_NODES = 200_000, MAX_DEPTH = 128;
 
 export function encodeCompactReport(report) {
-  check(report?.schema_version === 3 && report.kind === 'uk_aq_jsongen_reconciliation' && !report.encoding,
-    'Expanded schema-3 reconciliation required');
+  check([3, 4].includes(report?.schema_version) && report.kind === 'uk_aq_jsongen_reconciliation' && !report.encoding,
+    'Expanded schema-3/4 reconciliation required');
   const bytes = canonicalJson(report);
   evidence(bytes.length <= LIMITS.uncompressed_bytes, 'resource_limit', 'Expanded report exceeds decode memory envelope');
   const nodes = [], interned = new Map(), objects = new WeakMap(), visiting = new WeakSet();
@@ -42,7 +42,7 @@ export function encodeCompactReport(report) {
     return id;
   };
   const root = visit(report);
-  const result = { schema_version: 3, kind: report.kind, encoding: ENCODING,
+  const result = { schema_version: report.schema_version, kind: report.kind, encoding: ENCODING,
     expanded_sha256: sha256Hex(bytes), expanded_byte_size: bytes.length, nodes, root };
   evidence(canonicalJson(result).length <= LIMITS.report_bytes, 'resource_limit', 'Compact report exceeds 4 MiB wire envelope');
   return result;
@@ -51,7 +51,7 @@ export function encodeCompactReport(report) {
 export function decodeCompactReport(report) {
   if (!report?.encoding) return report;
   const fields = ['schema_version', 'kind', 'encoding', 'expanded_sha256', 'expanded_byte_size', 'nodes', 'root'];
-  check(report.schema_version === 3 && report.kind === 'uk_aq_jsongen_reconciliation'
+  check([3, 4].includes(report.schema_version) && report.kind === 'uk_aq_jsongen_reconciliation'
     && report.encoding === ENCODING && Object.keys(report).length === fields.length
     && fields.every(k => Object.hasOwn(report, k)) && Array.isArray(report.nodes)
     && report.nodes.length > 0 && report.nodes.length <= MAX_NODES
@@ -116,7 +116,7 @@ export function decodeCompactReport(report) {
   };
   visit(report.root); check(seen.size === report.nodes.length, 'Unused compact report nodes');
   const expanded = values[report.root];
-  check(expanded?.schema_version === 3 && !expanded.encoding && expanded.kind === report.kind,
+  check(expanded?.schema_version === report.schema_version && !expanded.encoding && expanded.kind === report.kind,
     'Compact report cannot reinterpret an older schema');
   const bytes = canonicalJson(expanded);
   check(bytes.length === report.expanded_byte_size && sha256Hex(bytes) === report.expanded_sha256,

@@ -16,7 +16,7 @@ export function currentScopeMatch(change, item, canonical) {
     ? 'matches' : 'differs';
 }
 
-export function assessStage3C({ changes, canonical, originalGroups = [], discovery = null }) {
+export function assessStage3C({ changes, canonical, originalGroups = [], discovery = null, authenticatedEvents = [] }) {
   const scopes = changes.flatMap(change => change.scopes.map(item => {
     const match = currentScopeMatch(change, item, canonical);
     // An exact authenticated before->after publication link is necessary.
@@ -56,7 +56,9 @@ export function assessStage3C({ changes, canonical, originalGroups = [], discove
       original_receipts_registered: registered.length === group.expected_changes.length };
   });
   const authenticated = changes.filter(c => c.authentication?.authenticated);
-  const pending = (discovery?.events || []).filter(e => !events.some(g => g.event_id === e.event_id && g.original_receipts_registered));
+  const pending = (discovery?.events || []).filter(e => !events.some(g => g.event_id === e.event_id && g.original_receipts_registered)
+    && !authenticatedEvents.some(g => g.event_id === e.event_id && g.registered && g.original_authenticated
+      && g.descriptor_retained && g.selected_receipts_retained));
   const knownMissing = changes.some(c => !c.registered) || events.some(g => !g.original_receipts_registered);
   const scopeKeys = canonical?.scopes.map(s => s.scope_key).sort() || [...new Set(changes.flatMap(c => c.scopes.map(s => s.scope_key)))].sort();
   return {

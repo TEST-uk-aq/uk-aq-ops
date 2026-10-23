@@ -70,8 +70,10 @@ test('all 37 original pollutants authenticate, selected coverage is deterministi
     const replay = await consumePruneAcceptance({ reader, key: f.key, derivedR2 });
     assert.deepEqual(replay.coverage, r.coverage);
     const retain = await consumePruneAcceptance({ reader, key: f.key, derivedR2: managedR2WriteConfig(env), mode: 'retain' });
-    assert.equal(retain.reason, 'unsupported_receipt_scope'); assert.equal(retain.receipt_retention, 'not_attempted');
-    assert.equal(writes(), 0); assert.deepEqual([...f.objects.keys()], before);
+    // The Stage 1 fixture refuses Stage 2 PUTs; retain must now reach the
+    // selected path, fail closed, and leave registration untouched.
+    assert.equal(retain.state, 'reconciliation_required'); assert.equal(retain.registration, 'not_attempted');
+    assert.ok(writes() > 0); assert.deepEqual([...f.objects.keys()], before);
   });
 });
 
