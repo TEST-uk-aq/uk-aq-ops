@@ -32,14 +32,17 @@ function admit(r2) {
 export async function readManagedControl(r2, { budget = null } = {}) {
   admit(r2);
   let stored;
+  // CAS needs the stored representation's strong ETag, even when R2 would
+  // otherwise compress JSON and return a weak response validator.
   try {
     if (budget) {
       budget.get('derived');
       stored = await r2GetObjectBounded({ r2, key: CONTROL_KEY,
-        max_bytes: Math.min(MAX_CONTROL_BYTES, budget.remainingBytes()), timeout_ms: budget.timeout() });
+        max_bytes: Math.min(MAX_CONTROL_BYTES, budget.remainingBytes()), timeout_ms: budget.timeout(),
+        accept_encoding_identity: true });
       budget.transfer?.('derived', stored.bytes);
       budget.bytes('derived', stored.bytes);
-    } else stored = await r2GetObject({ r2, key: CONTROL_KEY, max_attempts: 1 });
+    } else stored = await r2GetObject({ r2, key: CONTROL_KEY, max_attempts: 1, accept_encoding_identity: true });
   }
   catch (error) { if (error.status === 404) return null; throw error; }
   requireValid(stored.body instanceof Uint8Array && stored.body.byteLength <= MAX_CONTROL_BYTES

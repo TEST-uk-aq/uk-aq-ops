@@ -677,7 +677,8 @@ export async function r2HeadObject({ r2, key, accept_encoding_identity = false, 
 // One-attempt bounded GET, including response-body consumption. Existing buffered
 // callers are unchanged. Adapters must explicitly implement bounded acquisition;
 // falling back to getObject would allocate an unbounded body before admission.
-export async function r2GetObjectBounded({ r2, key, max_bytes, timeout_ms = R2_REQUEST_TIMEOUT_MS, signal }) {
+export async function r2GetObjectBounded({ r2, key, max_bytes, timeout_ms = R2_REQUEST_TIMEOUT_MS, signal,
+  accept_encoding_identity = false }) {
   if (!Number.isSafeInteger(max_bytes) || max_bytes <= 0 ||
       !Number.isSafeInteger(timeout_ms) || timeout_ms <= 0 || timeout_ms > R2_REQUEST_TIMEOUT_MS) {
     throw new TypeError("Bounded R2 GET requires positive byte and timeout budgets");
@@ -705,7 +706,8 @@ export async function r2GetObjectBounded({ r2, key, max_bytes, timeout_ms = R2_R
       if (signal?.aborted) throw signal.reason || new Error('Bounded R2 GET aborted');
       signal?.addEventListener('abort', abortFromCaller, { once: true });
       return validate(await Promise.race([
-        r2.adapter.getObjectBounded({ key, max_bytes, signal: controller.signal }),
+        r2.adapter.getObjectBounded({ key, max_bytes, signal: controller.signal,
+          ...(accept_encoding_identity ? { accept_encoding_identity: true } : {}) }),
         aborted,
         new Promise((_, reject) => { timer = setTimeout(() => {
           controller.abort();
@@ -716,7 +718,9 @@ export async function r2GetObjectBounded({ r2, key, max_bytes, timeout_ms = R2_R
   }
   const request = buildAwsSignedRequest({ method: "GET", endpoint: r2.endpoint,
     region: r2.region, accessKeyId: r2.access_key_id, secretAccessKey: r2.secret_access_key,
-    bucket: r2.bucket, objectKey: key });
+    bucket: r2.bucket, objectKey: key,
+    // Opt in only for callers requiring the stored representation's validator.
+    ...(accept_encoding_identity ? { headers: { "accept-encoding": "identity" } } : {}) });
   return await fetchWithTimeout(request.url, {
     method: "GET", headers: request.headers, redirect: "error", signal,
   }, timeout_ms, globalThis.fetch, async (response) => {
