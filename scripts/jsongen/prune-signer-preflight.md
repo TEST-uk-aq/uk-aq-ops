@@ -25,6 +25,19 @@ the optional AURN source handover. This correction neither recovers that source
 nor upgrades its incomplete outbox evidence to VERIFIED. Do not replay that event
 or run Prune as a readiness diagnostic.
 
+The first real Actions preflight failed before admission with
+`ERR_MODULE_NOT_FOUND: Cannot find package 'pg'`, imported from
+`workers/shared/uk_aq_r2_history_writer.mjs` through the production admission
+import chain. The preflight workflow now runs `npm ci --ignore-scripts` after
+Node.js setup and before execution, matching Prune Daily. `pg` is already declared
+in `package.json`; no package or lockfile change is needed. Installing dependencies
+does not invoke Prune, data clients or signer transport.
+
+This dependency-install correction receives focused structural validation only;
+functional validation is the next real TEST Actions preflight after merge. To
+roll back this correction, revert its dependency-install step and documentation
+through normal review; that restores the missing-package failure.
+
 ## Configuration and local catalogue
 
 The operator must explicitly configure the **Actions repository variable**
@@ -66,11 +79,13 @@ were changed by this implementation.
 In the TEST Ops repository's Actions tab, select
 **UK AQ Prune signer preflight (TEST)**, choose the reviewed `main` revision and
 **Run workflow**. This dispatch is an operator step; it was not performed during
-implementation. Alternatively, from an explicitly configured local TEST shell:
+implementation. Start a new run from the updated `main`; rerunning the old failed
+job would reuse its original workflow revision. There are no workflow inputs.
+Alternatively:
 
 ```sh
 gh workflow run uk_aq_prune_signer_preflight.yml \
-  --repo "$UK_AQ_GITHUB_REPO" --ref main
+  --repo TEST-uk-aq/uk-aq-ops --ref main
 ```
 
 Expected success: all `PASS` lines, ending with
@@ -89,8 +104,10 @@ The script calls `assertConfiguredIdentity()`, `managedR2TargetConfig()` and the
 actual `resolvePruneSignerConfig()`. It does not call transport functions, create
 data clients, read/write R2, connect to PostgreSQL/Supabase, insert outbox events,
 initialise/update managed control, generate monthly files or execute Prune.
-Checkout and Node setup still use GitHub infrastructure; no data-service request
-is part of the diagnostic. No dependency installation is required.
+Checkout and Node setup use GitHub infrastructure, and `npm ci --ignore-scripts`
+installs the locked repository dependencies needed by the inert production
+admission imports, including `pg`. Lifecycle scripts are disabled; no data-service
+request is part of the diagnostic.
 
 ## Ordered safe TEST acceptance
 
@@ -137,7 +154,8 @@ is part of the diagnostic. No dependency installation is required.
 
 ## Preserved behaviour and rollback
 
-Focused local structural checks passed on Node v24.19.0:
+The earlier identity/admission correction reported these checks on Node v24.19.0
+(the dependency-install correction does not repeat these functional probes):
 
 - `node --check scripts/jsongen/prune-signer-preflight.mjs` and `git diff --check`.
 - YAML parsing and direct comparison of both workflow environments; manual-only
@@ -175,7 +193,13 @@ weaken identity/security checks or alter canonical deletion gates.
 
 ## ChatGPT authoritative-documentation handover
 
-No `system_docs/` file was edited. ChatGPT in Chat mode should update the relevant
+No `system_docs/` file was edited. For the dependency-install correction, record
+that the first real preflight failed on missing `pg`, the workflow now installs
+locked dependencies with lifecycle scripts disabled, and real TEST Actions
+preflight acceptance remains pending. There is no schema, configuration or Worker
+deployment change for this correction.
+
+ChatGPT in Chat mode should update the relevant
 Prune/JSONgen operational status and configuration guidance: explicit repository
 identity is now an Actions variable as well as a sourced local setting; a manual
 local-only Actions signer preflight exists; its pass establishes structural
