@@ -211,10 +211,11 @@ the existing manual diagnostic admission convention. Local operation may omit
 GitHub runtime metadata. Runtime identity, Git remotes and another environment
 are never configuration fallbacks; LIVE and missing environment names are rejected.
 
-`UK_AQ_GITHUB_REPO` is recorded as `local` in
-`config/uk_aq_github_env_targets.csv`, consistent with its sourced-environment
-meaning. No GitHub variable/secret, workflow, credential, SQL schema or service
-is provisioned. The operator-owned ignored `env-vars-master.csv` is absent in this
+`UK_AQ_GITHUB_REPO` is now recorded as `variable` in
+`config/uk_aq_github_env_targets.csv` for Prune Actions admission, while retaining
+its sourced local meaning. See the [manual signer preflight](prune-signer-preflight.md).
+No GitHub setting, credential, SQL schema or service is provisioned by that correction.
+The operator-owned ignored `env-vars-master.csv` is absent in this
 checkout; retain/verify its existing `UK_AQ_GITHUB_REPO` definition when preparing
 the external TEST environment. No value is inferred or automatically supplied.
 The independent consumer also uses the private reader, so it now requires this

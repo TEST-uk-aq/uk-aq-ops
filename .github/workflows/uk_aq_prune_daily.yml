@@ -26,6 +26,7 @@ jobs:
       UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME || 'TEST' }}
       # Optional JSONgen handover only; canonical Prune behaviour is unchanged.
       UK_AQ_ENV_NAME: TEST
+      UK_AQ_GITHUB_REPO: ${{ vars.UK_AQ_GITHUB_REPO }}
       UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED: ${{ vars.UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED || 'false' }}
       UK_AQ_JSONGEN_PRUNE_SIGNER_URL: ${{ vars.UK_AQ_JSONGEN_PRUNE_SIGNER_URL || '' }}
       UK_AQ_JSONGEN_R2_ENDPOINT: ${{ vars.UK_AQ_JSONGEN_R2_ENDPOINT || '' }}

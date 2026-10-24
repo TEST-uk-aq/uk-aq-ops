@@ -316,6 +316,12 @@ Repo-local files:
 - `.env.supabase`
 - `config/uk_aq_github_env_targets.csv`
 
+`UK_AQ_GITHUB_REPO` is an explicit Actions repository **variable** and remains a
+sourced local setting. Keep its existing entry in the private, ignored
+`env-vars-master.csv` aligned with that target. See the
+[manual TEST Prune signer preflight](scripts/jsongen/prune-signer-preflight.md)
+before the next authorised source-consuming Prune operation.
+
 Sync keys to GitHub repo secrets/variables using your alias to the shared sync script:
 
 ```bash
