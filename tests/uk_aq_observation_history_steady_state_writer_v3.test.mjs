@@ -340,10 +340,94 @@ function buildFixture({
     getCalls,
     objects,
     latestKey: initialLatest.key,
+    initialScopedHierarchies: [
+      unrelated.v3_hierarchy,
+      obsoletePruneScope.v3_hierarchy,
+    ],
     unrelatedScopedKey: unrelated.v3_hierarchy.scoped_manifest.key,
     removedScopedKey: obsoletePruneScope.v3_hierarchy.scoped_manifest.key,
     activeLocks,
     globalLockCount: () => globalLockCount,
+  };
+}
+
+function buildMultiReferenceRecoveryFixture({ recoverableConnectorIds = [] } = {}) {
+  const fixture = buildFixture();
+  const recoverableIds = new Set(recoverableConnectorIds);
+  const recoveryArtifactsByKey = new Map();
+  const keyByConnectorId = new Map();
+  const scopedHierarchies = [...fixture.initialScopedHierarchies];
+
+  for (let connectorId = 100; connectorId < 117; connectorId += 1) {
+    const timeseriesId = 20_000 + connectorId;
+    const original = buildObservationHistoryV3SteadyStatePartition({
+      source: "integrity",
+      rows: rows({
+        dayUtc: "2026-08-05",
+        connectorId,
+        pollutantCode: "o3",
+        timeseriesId,
+      }),
+      writerLimits: LIMITS,
+      targetWriterGitSha: TARGET_GIT_SHA,
+      backedUpAtUtc: BACKED_UP_AT_UTC,
+    });
+    const reference = original.v3_hierarchy.scoped_manifest;
+    keyByConnectorId.set(connectorId, reference.key);
+    scopedHierarchies.push(original.v3_hierarchy);
+    fixture.objects.set(reference.key, Buffer.from(reference.body));
+
+    if (recoverableIds.has(connectorId)) {
+      const current = buildObservationHistoryV3SteadyStatePartition({
+        source: "integrity",
+        rows: rows({
+          dayUtc: "2026-08-05",
+          connectorId,
+          pollutantCode: "o3",
+          timeseriesId,
+        }).map((row) => ({ ...row, value: row.value + 1 })),
+        writerLimits: LIMITS,
+        targetWriterGitSha: TARGET_GIT_SHA,
+        backedUpAtUtc: BACKED_UP_AT_UTC,
+      });
+      const currentArtifact = current.v3_hierarchy.scoped_manifest;
+      assert.equal(currentArtifact.key, reference.key);
+      fixture.objects.set(reference.key, Buffer.from(currentArtifact.body));
+      recoveryArtifactsByKey.set(reference.key, currentArtifact);
+    }
+  }
+
+  const initialLatest = buildObservationHistoryIndexV3Latest({
+    scopedHierarchies,
+  });
+  assert.equal(initialLatest.key, fixture.latestKey);
+  fixture.objects.set(initialLatest.key, Buffer.from(initialLatest.body));
+
+  return { fixture, recoveryArtifactsByKey, keyByConnectorId };
+}
+
+function createMultiReferenceRecoveryAdapter(scenario, recoveryCalls) {
+  return async (request) => {
+    recoveryCalls.push(request);
+    const artifact = scenario.recoveryArtifactsByKey.get(request.reference.key);
+    assert.ok(artifact, `missing canonical recovery artifact for ${request.reference.key}`);
+    assert.equal(request.source, "prune_daily");
+    assert.equal(request.latest_scope.key, request.reference.key);
+    assert.equal(request.live_reference.sha256, artifact.sha256);
+    assert.deepEqual(request.live_body, Buffer.from(artifact.body));
+    return {
+      artifact,
+      evidence: {
+        key: artifact.key,
+        byte_size: artifact.byte_size,
+        sha256: artifact.sha256,
+        verified: true,
+        durable: true,
+      },
+      verification_object_count: 3,
+      verification_concurrency: 8,
+      verification_duration_ms: 25,
+    };
   };
 }
 
@@ -1381,6 +1465,264 @@ test("Prune rebuilds latest with a canonically recovered same-key scoped identit
     verification_concurrency: 8,
     verification_duration_ms: 25,
   });
+});
+
+test("Prune recovers stale roots across bounded batches and freshly verifies all dependencies before publication", async () => {
+  const recoverableConnectorIds = [101, 115];
+  const scenario = buildMultiReferenceRecoveryFixture({
+    recoverableConnectorIds,
+  });
+  const { fixture } = scenario;
+  const recoveryCalls = [];
+  const diagnosticEvents = [];
+  const initialGetCounts = new Map();
+  const strictGetCounts = new Map();
+  const baseGetObject = fixture.options.getObject;
+  let activeRequests = 0;
+  let highestActiveRequests = 0;
+  const getObject = async ({ key, onR2GetAdmitted = null }) => {
+    if (typeof onR2GetAdmitted !== "function") {
+      return await baseGetObject({ key });
+    }
+    const phase = recoveryCalls.length === recoverableConnectorIds.length
+      ? "strict"
+      : "initial";
+    onR2GetAdmitted();
+    const counts = phase === "strict" ? strictGetCounts : initialGetCounts;
+    counts.set(key, (counts.get(key) || 0) + 1);
+    activeRequests += 1;
+    highestActiveRequests = Math.max(highestActiveRequests, activeRequests);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      const object = await baseGetObject({ key });
+      if (phase === "strict") {
+        fixture.events.push(`test:strict_get_complete:${key}`);
+      }
+      return object;
+    } finally {
+      activeRequests -= 1;
+    }
+  };
+  const connectorPublication = finalizationEvidence({
+    dayUtc: "2026-08-18",
+    connectorId: 1,
+    pollutantCode: "pm25",
+    timeseriesId: 101,
+    objects: fixture.objects,
+  });
+
+  const result = await runPruneDailyObservationHistoryV3RunFinalization({
+    ...fixture.options,
+    connectorPublications: [connectorPublication],
+    finalizeCanonicalDayManifests: finalizeCanonicalDayV3,
+    getObject,
+    diagnosticLog: (event, fields) => diagnosticEvents.push({ event, fields }),
+    recoverLatestScopedReference: createMultiReferenceRecoveryAdapter(
+      scenario,
+      recoveryCalls,
+    ),
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(
+    recoveryCalls.map(({ latest_scope: scope }) => scope.connector_id),
+    recoverableConnectorIds,
+  );
+  assert.deepEqual(
+    recoveryCalls.map(({ latest_scope: scope }) => scope.pollutant_code),
+    ["o3", "o3"],
+  );
+
+  const publishedLatest = JSON.parse(
+    fixture.objects.get(fixture.latestKey).toString("utf8"),
+  );
+  const publishedKeys = publishedLatest.day_summaries.flatMap((day) =>
+    day.scoped_roots.map((root) => root.key)
+  ).sort();
+  assert.deepEqual([...initialGetCounts.keys()].sort(), publishedKeys);
+  assert.deepEqual([...strictGetCounts.keys()].sort(), publishedKeys);
+  assert.ok([...initialGetCounts.values()].every((count) => count === 1));
+  assert.ok([...strictGetCounts.values()].every((count) => count === 1));
+  assert.equal(highestActiveRequests, 8);
+
+  const latestPublicationIndex = fixture.events.findIndex((event) =>
+    event.startsWith("v3:put:latest_global:")
+  );
+  const strictGetCompletionIndexes = fixture.events
+    .map((event, index) => [event, index])
+    .filter(([event]) => event.startsWith("test:strict_get_complete:"))
+    .map(([, index]) => index);
+  assert.equal(strictGetCompletionIndexes.length, publishedKeys.length);
+  assert.ok(strictGetCompletionIndexes.every((index) =>
+    index < latestPublicationIndex
+  ));
+
+  const complete = diagnosticEvents.find(({ event }) =>
+    event === "run_finalization_complete"
+  ).fields;
+  assert.equal(complete.latest_global_dependency_count, publishedKeys.length);
+  assert.equal(
+    complete.latest_global_dependency_r2_get_count,
+    publishedKeys.length * 2,
+  );
+  assert.equal(complete.accepted_same_run_evidence_reuse_count, 0);
+  assert.equal(complete.recovered_scoped_reference_count, 2);
+  assert.equal(complete.maximum_active_verification_requests, 8);
+});
+
+test("Prune recovers multiple stale roots from one completed dependency batch in order", async () => {
+  const recoverableConnectorIds = [101, 103];
+  const scenario = buildMultiReferenceRecoveryFixture({
+    recoverableConnectorIds,
+  });
+  const { fixture } = scenario;
+  const recoveryCalls = [];
+  const connectorPublication = finalizationEvidence({
+    dayUtc: "2026-08-18",
+    connectorId: 1,
+    pollutantCode: "pm25",
+    timeseriesId: 101,
+    objects: fixture.objects,
+  });
+
+  const result = await runPruneDailyObservationHistoryV3RunFinalization({
+    ...fixture.options,
+    connectorPublications: [connectorPublication],
+    finalizeCanonicalDayManifests: finalizeCanonicalDayV3,
+    recoverLatestScopedReference: createMultiReferenceRecoveryAdapter(
+      scenario,
+      recoveryCalls,
+    ),
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(
+    recoveryCalls.map(({ latest_scope: scope }) => scope.connector_id),
+    recoverableConnectorIds,
+  );
+  const publishedLatest = JSON.parse(
+    fixture.objects.get(fixture.latestKey).toString("utf8"),
+  );
+  const firstBatchKeys = publishedLatest.day_summaries.flatMap((day) =>
+    day.scoped_roots.map((root) => root.key)
+  ).slice(0, 8);
+  assert.ok(firstBatchKeys.includes(scenario.keyByConnectorId.get(101)));
+  assert.ok(firstBatchKeys.includes(scenario.keyByConnectorId.get(103)));
+});
+
+test("a later missing dependency stops batch admission after earlier Prune recovery", async () => {
+  const scenario = buildMultiReferenceRecoveryFixture({
+    recoverableConnectorIds: [101],
+  });
+  const { fixture } = scenario;
+  const missingKey = scenario.keyByConnectorId.get(110);
+  fixture.objects.delete(missingKey);
+  const recoveryCalls = [];
+  const admittedKeys = [];
+  const diagnostics = [];
+  const connectorPublication = finalizationEvidence({
+    dayUtc: "2026-08-18",
+    connectorId: 1,
+    pollutantCode: "pm25",
+    timeseriesId: 101,
+    objects: fixture.objects,
+  });
+
+  await assert.rejects(
+    runPruneDailyObservationHistoryV3RunFinalization({
+      ...fixture.options,
+      connectorPublications: [connectorPublication],
+      finalizeCanonicalDayManifests: finalizeCanonicalDayV3,
+      getObject: async ({ key, onR2GetAdmitted = null }) => {
+        onR2GetAdmitted?.();
+        if (typeof onR2GetAdmitted === "function") admittedKeys.push(key);
+        return await fixture.options.getObject({ key });
+      },
+      diagnosticLog: (event, fields) => diagnostics.push({ event, fields }),
+      recoverLatestScopedReference: createMultiReferenceRecoveryAdapter(
+        scenario,
+        recoveryCalls,
+      ),
+    }),
+    /V3 external publication reference is missing/,
+  );
+
+  assert.deepEqual(
+    recoveryCalls.map(({ latest_scope: scope }) => scope.connector_id),
+    [101],
+  );
+  assert.ok(admittedKeys.includes(missingKey));
+  assert.equal(admittedKeys.includes(scenario.keyByConnectorId.get(115)), false);
+  assert.equal(
+    fixture.publicationCalls.filter((call) => call.stage === "latest_global").length,
+    0,
+  );
+  const failure = diagnostics.find(({ event }) =>
+    event === "run_finalization_failed"
+  ).fields;
+  assert.equal(failure.failure_outcome, "failed_closed");
+  assert.equal(failure.recovered_scoped_reference_count, 1);
+  assert.equal(failure.latest_global_dependency_r2_get_count, 16);
+});
+
+test("Phase B budget exhaustion after a recoverable batch prevents later dependency batches", async () => {
+  const scenario = buildMultiReferenceRecoveryFixture({
+    recoverableConnectorIds: [101],
+  });
+  const { fixture } = scenario;
+  const budgetKey = scenario.keyByConnectorId.get(110);
+  const budgetError = Object.assign(new Error("dependency GET budget exhausted"), {
+    name: "PhaseBHistoryBudgetExhaustedError",
+    code: "PHASE_B_HISTORY_BUDGET_EXHAUSTED",
+    operation: "v3_run_finalization_r2_read",
+  });
+  const recoveryCalls = [];
+  const admittedKeys = [];
+  const diagnostics = [];
+  const connectorPublication = finalizationEvidence({
+    dayUtc: "2026-08-18",
+    connectorId: 1,
+    pollutantCode: "pm25",
+    timeseriesId: 101,
+    objects: fixture.objects,
+  });
+
+  await assert.rejects(
+    runPruneDailyObservationHistoryV3RunFinalization({
+      ...fixture.options,
+      connectorPublications: [connectorPublication],
+      finalizeCanonicalDayManifests: finalizeCanonicalDayV3,
+      getObject: async ({ key, onR2GetAdmitted = null }) => {
+        if (key === budgetKey) throw budgetError;
+        onR2GetAdmitted?.();
+        if (typeof onR2GetAdmitted === "function") admittedKeys.push(key);
+        return await fixture.options.getObject({ key });
+      },
+      diagnosticLog: (event, fields) => diagnostics.push({ event, fields }),
+      recoverLatestScopedReference: createMultiReferenceRecoveryAdapter(
+        scenario,
+        recoveryCalls,
+      ),
+    }),
+    (error) => error === budgetError,
+  );
+
+  assert.deepEqual(
+    recoveryCalls.map(({ latest_scope: scope }) => scope.connector_id),
+    [101],
+  );
+  assert.equal(admittedKeys.includes(budgetKey), false);
+  assert.equal(admittedKeys.includes(scenario.keyByConnectorId.get(115)), false);
+  const failure = diagnostics.find(({ event }) =>
+    event === "run_finalization_failed"
+  ).fields;
+  assert.equal(failure.failure_outcome, "budget_stop");
+  assert.equal(failure.recovered_scoped_reference_count, 1);
+  assert.equal(failure.latest_global_dependency_r2_get_count, 15);
+  assert.equal(
+    fixture.publicationCalls.filter((call) => call.stage === "latest_global").length,
+    0,
+  );
 });
 
 test("Prune emits recovered-scope evidence before the strict final dependency reread", async () => {

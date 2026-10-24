@@ -520,6 +520,7 @@ async function verifyExternalReferencesBounded({
   evidenceCache = null,
   reuseEvidence = true,
   freshKeys = new Set(),
+  onFailureBatch = null,
 }) {
   const concurrency = Math.min(
     DEFAULT_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY,
@@ -534,9 +535,12 @@ async function verifyExternalReferencesBounded({
   };
   const evidenceByKey = new Map();
   const failures = [];
+  let failureFromBatchHandler = null;
+  let batchHandlerFailed = false;
 
   for (let offset = 0; offset < references.length; offset += concurrency) {
     const batch = references.slice(offset, offset + concurrency);
+    const batchFailures = [];
     const batchResults = await Promise.all(batch.map(async (reference, batchIndex) => {
       const position = offset + batchIndex;
       try {
@@ -570,14 +574,14 @@ async function verifyExternalReferencesBounded({
         evidenceCache?.remember(reference, evidence);
         return { position, reference, evidence };
       } catch (error) {
-        return { position, reference, error };
+        return { position, reference, failed: true, error };
       }
     }));
 
     batchResults.sort((left, right) => left.position - right.position);
     for (const result of batchResults) {
-      if (result.error) {
-        failures.push({
+      if (result.failed === true) {
+        batchFailures.push({
           position: result.position,
           reference: result.reference,
           error: result.error,
@@ -586,16 +590,27 @@ async function verifyExternalReferencesBounded({
         evidenceByKey.set(result.reference.key, result.evidence);
       }
     }
-    if (batchResults.some((result) => result.error)) {
-      break;
+    if (batchFailures.length === 0) continue;
+    if (typeof onFailureBatch === "function") {
+      let handled;
+      try {
+        handled = await onFailureBatch(Object.freeze(batchFailures));
+      } catch (error) {
+        failureFromBatchHandler = error;
+        batchHandlerFailed = true;
+      }
+      if (handled === true) continue;
     }
+    failures.push(...batchFailures);
+    break;
   }
   delete metrics._active_verification_requests;
   return Object.freeze({
     evidence_by_key: evidenceByKey,
     metrics: Object.freeze(metrics),
     failures: Object.freeze(failures),
-    failure: failures[0]?.error || null,
+    has_failure: batchHandlerFailed || failures.length > 0,
+    failure: batchHandlerFailed ? failureFromBatchHandler : failures[0]?.error,
   });
 }
 
@@ -1845,6 +1860,7 @@ export async function runObservationHistoryV3RunFinalization({
     latest_global_dependency_count: 0,
     latest_global_dependency_r2_get_count: 0,
     accepted_same_run_evidence_reuse_count: 0,
+    recovered_scoped_reference_count: 0,
     evidence_invalidation_count: runEvidenceCache?.takeInvalidationCount?.() || 0,
     maximum_active_verification_requests: 0,
   };
@@ -2091,17 +2107,7 @@ export async function runObservationHistoryV3RunFinalization({
               assertEvidence(exact, reference, "V3 latest scoped prerequisite");
             }
           }
-          const initialVerification = await verifyExternalReferencesBounded({
-            references: latestReferences,
-            getObject,
-            evidenceCache: runEvidenceCache,
-            freshKeys: new Set(changedScopedEvidenceByKey.keys()),
-          });
-          absorbVerificationMetrics(initialVerification.metrics);
-          for (const [key, evidence] of initialVerification.evidence_by_key) {
-            latestExternalByKey.set(key, evidence);
-          }
-          for (const { reference, error } of initialVerification.failures) {
+          const recoverLatestScopedReferenceFailure = async ({ reference, error }) => {
             const exact = changedScopedEvidenceByKey.get(reference.key);
             if (
               exact ||
@@ -2113,20 +2119,18 @@ export async function runObservationHistoryV3RunFinalization({
               throw error;
             }
             if (!error.actual_reference || !error.actual_body) throw error;
+            const matches = existingLatestRoots.filter((root) =>
+              root.key === reference.key
+            );
+            if (matches.length !== 1) {
+              throw new Error(
+                `Prune latest-global recovery scope evidence is ambiguous: ${reference.key}`,
+              );
+            }
             const recovered = await recoverLatestScopedReference({
               source: normalizedSource,
               reference,
-              latest_scope: (() => {
-                const matches = existingLatestRoots.filter((root) =>
-                  root.key === reference.key
-                );
-                if (matches.length !== 1) {
-                  throw new Error(
-                    `Prune latest-global recovery scope evidence is ambiguous: ${reference.key}`,
-                  );
-                }
-                return matches[0];
-              })(),
+              latest_scope: matches[0],
               live_reference: error.actual_reference,
               live_body: error.actual_body,
               observations_prefix: canonicalObservationsPrefix,
@@ -2149,6 +2153,7 @@ export async function runObservationHistoryV3RunFinalization({
             runEvidenceCache?.invalidateKey(reference.key);
             recoveredScopedManifests.push(artifact);
             latestExternalByKey.set(reference.key, evidence);
+            finalizationMetrics.recovered_scoped_reference_count += 1;
             emitV3PublicationDiagnostic(
               diagnosticLog,
               "latest_global_exact_v3_scoped_reference_recovered",
@@ -2180,6 +2185,25 @@ export async function runObservationHistoryV3RunFinalization({
                   : {}),
               },
             );
+          };
+          const initialVerification = await verifyExternalReferencesBounded({
+            references: latestReferences,
+            getObject,
+            evidenceCache: runEvidenceCache,
+            freshKeys: new Set(changedScopedEvidenceByKey.keys()),
+            onFailureBatch: async (batchFailures) => {
+              for (const failure of batchFailures) {
+                await recoverLatestScopedReferenceFailure(failure);
+              }
+              return true;
+            },
+          });
+          absorbVerificationMetrics(initialVerification.metrics);
+          for (const [key, evidence] of initialVerification.evidence_by_key) {
+            latestExternalByKey.set(key, evidence);
+          }
+          if (initialVerification.has_failure) {
+            throw initialVerification.failure;
           }
           if (recoveredScopedManifests.length > 0) {
             const replacementsByKey = new Map(
@@ -2206,7 +2230,7 @@ export async function runObservationHistoryV3RunFinalization({
               freshKeys: new Set(updatedLatest.dependencies.map((reference) => reference.key)),
             });
             absorbVerificationMetrics(strictReverification.metrics);
-            if (strictReverification.failure) {
+            if (strictReverification.has_failure) {
               throw strictReverification.failure;
             }
             for (const [key, evidence] of strictReverification.evidence_by_key) {
