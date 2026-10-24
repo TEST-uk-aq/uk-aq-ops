@@ -19,7 +19,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "24"
+          node-version: "24.22.1"
 
       # Admission imports are inert and use only local modules/Node built-ins.
       # No dependency installation, upload intent, data client or Prune entry point.
