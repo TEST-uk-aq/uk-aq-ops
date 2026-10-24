@@ -96,6 +96,22 @@ single `UKAQ_ENV_NAME` assignment needed to derive installation identity. The
 Python watchdog validates the complete file before installation without making
 a network request.
 
+## Selecting the Python executable
+
+The installer accepts `--python-bin /absolute/path/to/python3` to select the
+Python interpreter used for both installation-time configuration validation and
+the generated LaunchAgent. The path must be absolute and point to an existing,
+executable file. The installed LaunchAgent retains that choice on subsequent
+restarts. If the option is omitted, the installer retains its previous behaviour
+of selecting `python3` from `PATH` for compatibility. For predictable reinstalls,
+pass `--python-bin` explicitly rather than relying on the shell `PATH` order.
+
+The examples below select MacPorts Python at `/opt/local/bin/python3.14`. Adjust
+the path to the Python executable installed on the Mac. For MacPorts, ensure its
+CA certificate bundle is installed (for example `sudo port install curl-ca-bundle`)
+so HTTPS certificate verification succeeds. No Worker URL or secret belongs in
+the installer argument; those remain in the protected environment file.
+
 ## Cloudflare Cron health detection
 
 For ingest and ops independently, the watchdog reads the structured scheduler
@@ -173,9 +189,9 @@ dedicated scheduler trigger secret, established Dropbox OAuth values and TEST
 inspect:
 
 ```bash
-PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
 scripts/mbpro_scheduler_watchdog/install_launchagent.sh \
-  --config "$TEST_WATCHDOG_CONFIG"
+  --config "$TEST_WATCHDOG_CONFIG" \
+  --python-bin "/opt/local/bin/python3.14"
 
 scripts/mbpro_scheduler_watchdog/status_launchagent.sh \
   --config "$TEST_WATCHDOG_CONFIG"
@@ -207,9 +223,9 @@ Set `UKAQ_ENV_NAME=LIVE`, the LIVE-specific scheduler secret, URLs and
 Then:
 
 ```bash
-PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
 scripts/mbpro_scheduler_watchdog/install_launchagent.sh \
-  --config "$LIVE_WATCHDOG_CONFIG"
+  --config "$LIVE_WATCHDOG_CONFIG" \
+  --python-bin "/opt/local/bin/python3.14"
 scripts/mbpro_scheduler_watchdog/status_launchagent.sh \
   --config "$LIVE_WATCHDOG_CONFIG"
 ```
@@ -260,9 +276,9 @@ maintenance, transition manually:
 3. Install the generic package with `UKAQ_ENV_NAME=TEST`:
 
    ```bash
-   PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
-   scripts/mbpro_scheduler_watchdog/install_launchagent.sh \
-     --config "$TEST_WATCHDOG_CONFIG"
+      scripts/mbpro_scheduler_watchdog/install_launchagent.sh \
+     --config "$TEST_WATCHDOG_CONFIG" \
+     --python-bin "/opt/local/bin/python3.14"
    ```
 
 4. Verify the new job and environment-specific log:

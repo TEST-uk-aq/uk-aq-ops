@@ -5,9 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 . "${SCRIPT_DIR}/watchdog_launchagent_common.sh"
 
 CONFIG_SOURCE=""
+PYTHON_BIN_OVERRIDE=""
 
 usage() {
-  echo "Usage: $0 --config /absolute/path/to/watchdog.env" >&2
+  echo "Usage: $0 --config /absolute/path/to/watchdog.env [--python-bin /absolute/path/to/python3]" >&2
 }
 
 while [ "$#" -gt 0 ]; do
@@ -15,6 +16,12 @@ while [ "$#" -gt 0 ]; do
     --config)
       [ "$#" -ge 2 ] || { usage; exit 2; }
       CONFIG_SOURCE="$2"
+      shift 2
+      ;;
+    --python-bin)
+      [ "$#" -ge 2 ] || { usage; exit 2; }
+      [ -n "$2" ] || { echo "--python-bin requires a non-empty path." >&2; exit 2; }
+      PYTHON_BIN_OVERRIDE="$2"
       shift 2
       ;;
     *) usage; exit 2 ;;
@@ -28,9 +35,22 @@ fi
 
 watchdog_load_identity "$CONFIG_SOURCE"
 
-PYTHON_BIN="$(command -v python3)"
-if [ -z "${PYTHON_BIN}" ]; then
-  echo "python3 is required." >&2
+if [ -n "$PYTHON_BIN_OVERRIDE" ]; then
+  PYTHON_BIN="$PYTHON_BIN_OVERRIDE"
+else
+  PYTHON_BIN="$(command -v python3 || true)"
+fi
+
+if [ -z "$PYTHON_BIN" ]; then
+  echo "python3 is required, or provide --python-bin." >&2
+  exit 1
+fi
+case "$PYTHON_BIN" in
+  /*) ;;
+  *) echo "Python executable path must be absolute: $PYTHON_BIN" >&2; exit 2 ;;
+esac
+if [ ! -f "$PYTHON_BIN" ] || [ ! -x "$PYTHON_BIN" ]; then
+  echo "Python executable does not exist or is not executable: $PYTHON_BIN" >&2
   exit 1
 fi
 
