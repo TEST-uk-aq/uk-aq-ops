@@ -1,14 +1,22 @@
 # Node.js October 2026 TEST remediation: stage 1 report
 
-PR #126 now contains **22 workflow changes and four non-authoritative security documents** in TEST Ops only. It does not include the 12 deployment-affecting runtime changes from the original full batch. Each of those 12 files is restored byte-for-byte to current main `483d333eb0a334dc40a9a8be35ff3014ccffa27c`. They are deferred, not abandoned: their complete patched contents remain at original security commit `5da944d1b0660c8cbe818afcecaebb5b2e350cbd`, which remains an ancestor of the corrective commit. No history rewrite or archive copy is required.
+## Reconciliation with latest TEST main
 
-The file CSV contains only these 26 current PR paths. The promotion assessment contains the separate 12-file deferred manifest, original blob identities and pinned complete-file links. Original cross-repository findings and full-batch reports remain historical evidence at [5da944d1b0660c8cbe818afcecaebb5b2e350cbd](https://github.com/TEST-uk-aq/uk-aq-ops/commit/5da944d1b0660c8cbe818afcecaebb5b2e350cbd); they are not claims about the reduced PR's scope.
+Refreshed main is `2d18e847235cfa58f114597a9ac25839cde73156`; previous PR head is `7ead204f3eb8443700067bcd4185bc9702602711`; their merge base is `483d333eb0a334dc40a9a8be35ff3014ccffa27c`. Main independently added signer repository admission and the manual preflight in PR #127 (`0488eb7a92babcc0769bb7f6f4d51589b4479b04`, merged at the refreshed main). The branches are reconciled by one normal merge commit with the previous PR head as first parent and current main as second parent; no history rewrite. The only overlapping file is Prune Daily, where main's repository-variable addition and the security runtime pin are non-overlapping changes. No material semantic conflict was found.
 
-Baseline main: `483d333eb0a334dc40a9a8be35ff3014ccffa27c`. Corrective-commit parent and full security source: `5da944d1b0660c8cbe818afcecaebb5b2e350cbd`. Publication appends a normal corrective commit on the existing branch; it does not rewrite the original security history. See PR #126 head for the final published commit.
+All nine newer-main file changes are retained: Prune's `UK_AQ_GITHUB_REPO: ${{ vars.UK_AQ_GITHUB_REPO }}` with no fallback, variable target mapping, README and three signer handover documents, the existing dated archive, and the new signer-preflight workflow/implementation. The implementation, configuration mapping, handovers and archive are exact current-main blobs. Prune Daily and the preflight each differ from current main by only `node-version: "24"` to `"24.22.1"`.
+
+The new preflight remains manual-only, contents-read-only, five-minute timeout, checkout with persisted credentials disabled, and the same local admission command/environment/secret references. It does not install dependencies, invoke Prune, contact the signer or data services, upload, or apply configuration. No preflight is dispatched here. A later separately authorised run supplies structural configuration admission only; it cannot establish remote authentication, target ownership, successful handover or VERIFIED evidence. Preserve Prune's existing dry-run defaults, retention/batch bounds, lock/concurrency, temporary timeout, canonical publication/deletion gates and optional JSONgen failure isolation. Main's variable mapping is preserved, not applied to GitHub settings.
+
+PR #126 now contains **23 workflow changes and four non-authoritative security documents** in TEST Ops only. It does not include the 12 deployment-affecting runtime changes from the original full batch. Each of those 12 files is restored byte-for-byte to current main `2d18e847235cfa58f114597a9ac25839cde73156`. They are deferred, not abandoned: their complete patched contents remain at original security commit `5da944d1b0660c8cbe818afcecaebb5b2e350cbd`, which remains an ancestor of the reconciliation commit. No history rewrite or archive copy is required.
+
+The file CSV contains only these 27 current PR paths. The promotion assessment contains the separate 12-file deferred manifest, original blob identities and pinned complete-file links. Original cross-repository findings and full-batch reports remain historical evidence at [5da944d1b0660c8cbe818afcecaebb5b2e350cbd](https://github.com/TEST-uk-aq/uk-aq-ops/commit/5da944d1b0660c8cbe818afcecaebb5b2e350cbd); they are not claims about the reduced PR's scope.
+
+Baseline main: `2d18e847235cfa58f114597a9ac25839cde73156`. First parent: `7ead204f3eb8443700067bcd4185bc9702602711`; second parent: `2d18e847235cfa58f114597a9ac25839cde73156`. Original full security source remains `5da944d1b0660c8cbe818afcecaebb5b2e350cbd`. Publication appends a normal merge commit on the existing branch; it does not rewrite security history. See PR #126 head for the final published commit.
 
 ## Included change and security minimum
 
-All 22 retained workflow runtime selections are exact **Node.js 24.22.1**. Existing explicit 22/24 selections are pinned to 24.22.1; the two retained formerly implicit jobs receive the original setup-node steps in scheduler config validation and JSONgen R2 read-only checking. Those new steps use verified actions/setup-node v7.0.0 commit `820762786026740c76f36085b0efc47a31fe5020` with automatic package-manager caching disabled. Other action references and existing cache settings remain unchanged.
+All 23 in-scope workflow runtime selections are exact **Node.js 24.22.1**. Existing explicit 22/24 selections are pinned to 24.22.1; the two retained formerly implicit jobs receive the original setup-node steps in scheduler config validation and JSONgen R2 read-only checking. Those new steps use verified actions/setup-node v7.0.0 commit `820762786026740c76f36085b0efc47a31fe5020` with automatic package-manager caching disabled. Other action references and existing cache settings remain unchanged. The newly inherited Prune signer preflight retains actions/setup-node@v7 and changes only its Node selection from 24 to 24.22.1.
 
 Exact setup-node resolution fails rather than silently selecting an older patch. Future security releases require a reviewed coordinated pin update. setup-node controls the job's application/tooling Node, not the embedded Node binary used by JavaScript Actions. Referenced action declarations already use node24; actual runner-bundled patch identity still needs independent runtime evidence. Do not claim that the deferred deployment jobs or all repositories now enforce the patch floor.
 
@@ -28,6 +36,7 @@ Exact setup-node resolution fails rather than silently selecting an older patch.
 | `.github/workflows/uk_aq_jsongen_signer_intents_readonly.yml` | 22 | 24.22.1 |
 | `.github/workflows/uk_aq_observs_partition_maintenance.yml` | 24 | 24.22.1 |
 | `.github/workflows/uk_aq_prune_daily.yml` | 24 | 24.22.1 |
+| `.github/workflows/uk_aq_prune_signer_preflight.yml` | 24 | 24.22.1 |
 | `.github/workflows/uk_aq_r2_core_snapshot.yml` | 24 | 24.22.1 |
 | `.github/workflows/uk_aq_r2_history_dropbox_backup.yml` | 24 | 24.22.1 |
 | `.github/workflows/uk_aq_r2_history_inventory_generation_migration.yml` | 24 | 24.22.1 |
@@ -48,16 +57,18 @@ For an isolated merge of the revised PR against the checked main, exactly two au
 
 No deployment workflow or the history/dashboard coordinator matches the revised changed-path set. No Cloudflare Worker, Cloud Run or Pages deployment, D1 migration, secret synchronization, route/IAM change or other remote infrastructure mutation is initiated by this isolated merge. This conclusion depends on the exact checked diff: recheck after any additional file or main change. Repository/workflow availability and existing platform conditions still govern actual check execution.
 
+The new Prune signer preflight remains workflow_dispatch-only and cannot run from this merge. No workflow_run/check_run/check_suite/pull_request_target chain is present. Feature-branch pushes have no matching push workflow; PR updates match the same two validation workflows. CodeQL retains its separate weekly schedule.
+
 Manual dispatch of scheduler config sync is different: it sets `remote_sync=true` and can change D1 job activation/configuration. Do not dispatch it merely to collect Node evidence. No triggers, job conditions, permissions, inputs, environment references or concurrency controls are removed or disabled to achieve this scope.
 
 ## Focused structural verification
 
-- Parse all 37 candidate workflow definitions and all 22 changed YAML files; verify the 22 retained selections equal 24.22.1 and the two retained original setup additions are intact.
+- Parse all 38 candidate workflow definitions and all 23 changed YAML files; verify the 23 in-scope selections equal 24.22.1 and the two retained original setup additions are intact.
 - Compare parsed workflow semantics against current main after normalizing only intended runtime selections/new setup steps. All operational commands, authentication, permissions, inputs, scheduling, concurrency, locks, deletion/failure controls and environment references remain unchanged.
-- Verify each deferred file's exact Git blob/mode equals current main; retained workflows equal the original full security versions byte-for-byte.
-- Verify the complete candidate tree differs from current main only in the 22 retained workflow files and these four documents. Explicitly preserve writer/test, all application and lock/schema/settings blobs.
+- Verify each deferred file's exact Git blob/mode equals current main; the original 22 runtime updates are preserved. Twenty-one retained workflows equal their previous PR versions byte-for-byte; Prune retains main's repository-variable addition plus its original pin, and the new preflight has only the exact pin change.
+- Verify the complete candidate tree differs from current main only in the 23 in-scope workflow files and these four documents. Explicitly preserve writer/test, all application and lock/schema/settings blobs.
 - Recompute merge/branch/PR event matching over all workflow definitions, including unchanged coordinator/reusable-workflow relationships. Confirm jobs.toml is unchanged and remote_sync=false for this isolated push/PR.
-- Check CSV scope (26 unique included-only paths), the 12-file deferred manifest, immutable source links and whitespace/diff. No functional/new test suite, install, Docker build, operational service/database call or workflow dispatch is performed.
+- Check CSV scope (27 unique included-only paths), the 12-file deferred manifest, immutable source links and whitespace/diff. No functional/new test suite, install, Docker build, operational service/database call or workflow dispatch is performed.
 
 ## Outstanding normal TEST acceptance
 

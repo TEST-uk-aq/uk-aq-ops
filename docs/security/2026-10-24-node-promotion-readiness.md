@@ -1,8 +1,16 @@
 # TEST-to-LIVE promotion and deferred rollout: Ops stage 1
 
-PR #126 now contains **22 workflow changes and four non-authoritative security documents** in TEST Ops only. It does not include the 12 deployment-affecting runtime changes from the original full batch. Each of those 12 files is restored byte-for-byte to current main `483d333eb0a334dc40a9a8be35ff3014ccffa27c`. They are deferred, not abandoned: their complete patched contents remain at original security commit `5da944d1b0660c8cbe818afcecaebb5b2e350cbd`, which remains an ancestor of the corrective commit. No history rewrite or archive copy is required.
+## Reconciliation with latest TEST main
 
-The file CSV contains only these 26 current PR paths. The promotion assessment contains the separate 12-file deferred manifest, original blob identities and pinned complete-file links. Original cross-repository findings and full-batch reports remain historical evidence at [5da944d1b0660c8cbe818afcecaebb5b2e350cbd](https://github.com/TEST-uk-aq/uk-aq-ops/commit/5da944d1b0660c8cbe818afcecaebb5b2e350cbd); they are not claims about the reduced PR's scope.
+Refreshed main is `2d18e847235cfa58f114597a9ac25839cde73156`; previous PR head is `7ead204f3eb8443700067bcd4185bc9702602711`; their merge base is `483d333eb0a334dc40a9a8be35ff3014ccffa27c`. Main independently added signer repository admission and the manual preflight in PR #127 (`0488eb7a92babcc0769bb7f6f4d51589b4479b04`, merged at the refreshed main). The branches are reconciled by one normal merge commit with the previous PR head as first parent and current main as second parent; no history rewrite. The only overlapping file is Prune Daily, where main's repository-variable addition and the security runtime pin are non-overlapping changes. No material semantic conflict was found.
+
+All nine newer-main file changes are retained: Prune's `UK_AQ_GITHUB_REPO: ${{ vars.UK_AQ_GITHUB_REPO }}` with no fallback, variable target mapping, README and three signer handover documents, the existing dated archive, and the new signer-preflight workflow/implementation. The implementation, configuration mapping, handovers and archive are exact current-main blobs. Prune Daily and the preflight each differ from current main by only `node-version: "24"` to `"24.22.1"`.
+
+The new preflight remains manual-only, contents-read-only, five-minute timeout, checkout with persisted credentials disabled, and the same local admission command/environment/secret references. It does not install dependencies, invoke Prune, contact the signer or data services, upload, or apply configuration. No preflight is dispatched here. A later separately authorised run supplies structural configuration admission only; it cannot establish remote authentication, target ownership, successful handover or VERIFIED evidence. Preserve Prune's existing dry-run defaults, retention/batch bounds, lock/concurrency, temporary timeout, canonical publication/deletion gates and optional JSONgen failure isolation. Main's variable mapping is preserved, not applied to GitHub settings.
+
+PR #126 now contains **23 workflow changes and four non-authoritative security documents** in TEST Ops only. It does not include the 12 deployment-affecting runtime changes from the original full batch. Each of those 12 files is restored byte-for-byte to current main `2d18e847235cfa58f114597a9ac25839cde73156`. They are deferred, not abandoned: their complete patched contents remain at original security commit `5da944d1b0660c8cbe818afcecaebb5b2e350cbd`, which remains an ancestor of the reconciliation commit. No history rewrite or archive copy is required.
+
+The file CSV contains only these 27 current PR paths. The promotion assessment contains the separate 12-file deferred manifest, original blob identities and pinned complete-file links. Original cross-repository findings and full-batch reports remain historical evidence at [5da944d1b0660c8cbe818afcecaebb5b2e350cbd](https://github.com/TEST-uk-aq/uk-aq-ops/commit/5da944d1b0660c8cbe818afcecaebb5b2e350cbd); they are not claims about the reduced PR's scope.
 
 ## Current first-stage candidates
 
@@ -22,6 +30,7 @@ The file CSV contains only these 26 current PR paths. The promotion assessment c
 | `.github/workflows/uk_aq_jsongen_signer_intents_readonly.yml` | 22 | 24.22.1 |
 | `.github/workflows/uk_aq_observs_partition_maintenance.yml` | 24 | 24.22.1 |
 | `.github/workflows/uk_aq_prune_daily.yml` | 24 | 24.22.1 |
+| `.github/workflows/uk_aq_prune_signer_preflight.yml` | 24 | 24.22.1 |
 | `.github/workflows/uk_aq_r2_core_snapshot.yml` | 24 | 24.22.1 |
 | `.github/workflows/uk_aq_r2_history_dropbox_backup.yml` | 24 | 24.22.1 |
 | `.github/workflows/uk_aq_r2_history_inventory_generation_migration.yml` | 24 | 24.22.1 |
@@ -41,7 +50,7 @@ The original full inventory also includes Ingest/Sensor.Community, both old LIVE
 
 ## Deferred complete-file manifest: excluded from the current PR diff
 
-The following 12 files are identical to main `483d333eb0a334dc40a9a8be35ff3014ccffa27c` in the reduced branch. Each link points to the complete **deferred patched version** at `5da944d1b0660c8cbe818afcecaebb5b2e350cbd`, not the reduced branch. Main and original blob IDs provide exact recovery/provenance checks. Reapply only a separately reviewed file/delta onto then-current TEST main; never restore the whole old tree.
+The following 12 files are identical to main `2d18e847235cfa58f114597a9ac25839cde73156` in the reduced branch. Each link points to the complete **deferred patched version** at `5da944d1b0660c8cbe818afcecaebb5b2e350cbd`, not the reduced branch. Main and original blob IDs provide exact recovery/provenance checks. Reapply only a separately reviewed file/delta onto then-current TEST main; never restore the whole old tree.
 
 | Deferred workflow | Current-main blob restored | Original patched blob retained in Git | Original change |
 |---|---|---|---|
@@ -62,7 +71,7 @@ For any manifest path, the original complete file and bounded runtime diff can b
 
 ```bash
 git show 5da944d1b0660c8cbe818afcecaebb5b2e350cbd:<workflow-path-from-table>
-git diff 483d333eb0a334dc40a9a8be35ff3014ccffa27c 5da944d1b0660c8cbe818afcecaebb5b2e350cbd -- <workflow-path-from-table>
+git diff 2d18e847235cfa58f114597a9ac25839cde73156 5da944d1b0660c8cbe818afcecaebb5b2e350cbd -- <workflow-path-from-table>
 ```
 
 The path placeholders refer to the exact manifest paths above; these are inspection examples, not operational dispatches. Do not include deferred files in the current PR's modified-file inventory.
