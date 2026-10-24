@@ -225,8 +225,9 @@ GitHub repository metadata must match; Actions execution additionally requires
 that metadata and `workflow_dispatch`. Local operation may omit runtime metadata;
 it cannot replace the configured repository. This shared admission is documented
 in the [Stage 3C handover](currentness-coverage-handover.md#manual-operation-and-configuration).
-Both repository identity and the reader key are local-only in
-`config/uk_aq_github_env_targets.csv`; the operator-owned ignored
+Repository identity is also an Actions repository variable in
+`config/uk_aq_github_env_targets.csv`; the reader key remains local-only.
+See the [manual signer preflight](prune-signer-preflight.md). The operator-owned ignored
 `env-vars-master.csv` is absent locally and requires its existing key definition
 when separately provisioning. Derived credentials need existing namespace
 GET/conditional PUT for retain mode. No credential is provisioned here.

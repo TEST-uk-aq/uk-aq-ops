@@ -1,0 +1,40 @@
+name: UK AQ Prune signer preflight (TEST)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  signer-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      # Admission imports are inert and use only local modules/Node built-ins.
+      # No dependency installation, upload intent, data client or Prune entry point.
+      - name: Check signer configuration without contacting services
+        env:
+          UK_AQ_ENV_NAME: TEST
+          UK_AQ_GITHUB_REPO: ${{ vars.UK_AQ_GITHUB_REPO }}
+          UK_AQ_JSONGEN_R2_ENDPOINT: ${{ vars.UK_AQ_JSONGEN_R2_ENDPOINT }}
+          UK_AQ_JSONGEN_R2_BUCKET: ${{ vars.UK_AQ_JSONGEN_R2_BUCKET }}
+          UK_AQ_JSONGEN_PRUNE_SIGNER_URL: ${{ vars.UK_AQ_JSONGEN_PRUNE_SIGNER_URL }}
+          UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN: ${{ secrets.UK_AQ_JSONGEN_PRUNE_WRITER_TOKEN }}
+          UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_ID: ${{ secrets.UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_ID }}
+          UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_SECRET: ${{ secrets.UK_AQ_JSONGEN_SIGNER_ACCESS_CLIENT_SECRET }}
+          # Equality comparison only: preserve the production dedicated-secret check.
+          CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          node scripts/jsongen/prune-signer-preflight.mjs | tee -a "$GITHUB_STEP_SUMMARY"
