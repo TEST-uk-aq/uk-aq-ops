@@ -1,58 +1,102 @@
-# Node.js October 2026 TEST remediation report
+# Node.js October 2026 TEST remediation: stage 1 report
 
-Repository implementation and structural validation are complete. The containing pull request supplies the reviewed commit and publication identity. No LIVE mutation, merge, service deployment, operational workflow dispatch or cloud-resource change is performed.
+PR #126 now contains **22 workflow changes and four non-authoritative security documents** in TEST Ops only. It does not include the 12 deployment-affecting runtime changes from the original full batch. Each of those 12 files is restored byte-for-byte to current main `483d333eb0a334dc40a9a8be35ff3014ccffa27c`. They are deferred, not abandoned: their complete patched contents remain at original security commit `5da944d1b0660c8cbe818afcecaebb5b2e350cbd`, which remains an ancestor of the corrective commit. No history rewrite or archive copy is required.
 
-## Changes and enforcement
+The file CSV contains only these 26 current PR paths. The promotion assessment contains the separate 12-file deferred manifest, original blob identities and pinned complete-file links. Original cross-repository findings and full-batch reports remain historical evidence at [5da944d1b0660c8cbe818afcecaebb5b2e350cbd](https://github.com/TEST-uk-aq/uk-aq-ops/commit/5da944d1b0660c8cbe818afcecaebb5b2e350cbd); they are not claims about the reduced PR's scope.
 
-40 configuration files: six Ingest files and 34 Ops workflows. Non-authoritative repository handovers, this report, a modified-file manifest and a separate promotion assessment accompany them. 2026-10-24-node-modified-files.csv lists every path with before/after runtime, repository, branch, commit and PR.
+Baseline main: `483d333eb0a334dc40a9a8be35ff3014ccffa27c`. Corrective-commit parent and full security source: `5da944d1b0660c8cbe818afcecaebb5b2e350cbd`. Publication appends a normal corrective commit on the existing branch; it does not rewrite the original security history. See PR #126 head for the final published commit.
 
-All 26 previously explicit Node selections (24 in Ingest; 22/24 in Ops) and 12 formerly implicit selections now request exact 24.22.1. No Node 22 compatibility exception remains in these two workflow sets. The exact installer fails rather than falling back below the floor. Previously TEST already contained all 12 LIVE Node-20 workflow corrections at major 24 and both root/container major-24 changes; this patch establishes patch identity rather than repeating those upgrades.
+## Included change and security minimum
 
-Sensor.Community uses node:24.22.1-slim and a build assertion requiring >=24.22.1 <25, reporting patch/platform/arch before COPY. The existing deployment build uses --pull --progress=plain and prints pushed RepoDigests. Official Docker source metadata confirms 24.22.1 in the bookworm-slim variant on amd64/arm64v8/ppc64le. Registry digest/build/runtime observations remain outstanding. Exact pins require a coordinated reviewed update for future security releases; mutable OS layers require retained build/digest evidence.
+All 22 retained workflow runtime selections are exact **Node.js 24.22.1**. Existing explicit 22/24 selections are pinned to 24.22.1; the two retained formerly implicit jobs receive the original setup-node steps in scheduler config validation and JSONgen R2 read-only checking. Those new steps use verified actions/setup-node v7.0.0 commit `820762786026740c76f36085b0efc47a31fe5020` with automatic package-manager caching disabled. Other action references and existing cache settings remain unchanged.
 
-The twelve added setup steps close existing implicit PATH exposure in scheduler, Wrangler, Supabase, JSONgen read-only and latest-snapshot npm preparation jobs. Newly introduced action references use verified setup-node v7.0.0 SHA 820762786026740c76f36085b0efc47a31fe5020; existing action references/cache settings remain intact. Reviewed invoked action definitions already use embedded node24; Supabase is composite. No unsupported embedded Node declaration was found in these current TEST workflows. Actual runner-bundled patch remains unverified, independent of application Node selection.
+Exact setup-node resolution fails rather than silently selecting an older patch. Future security releases require a reviewed coordinated pin update. setup-node controls the job's application/tooling Node, not the embedded Node binary used by JavaScript Actions. Referenced action declarations already use node24; actual runner-bundled patch identity still needs independent runtime evidence. Do not claim that the deferred deployment jobs or all repositories now enforce the patch floor.
 
-Ops root Dockerfile has no tracked active deployment reference or supported current build procedure in the inspected sources. It remains node:24-alpine, unchanged, with external/manual use unverified. It must gain patch enforcement before any supported reuse. No rebuild or retirement is performed.
+| Retained workflow | Current main selection | Stage 1 selection |
+|---|---|---|
+| `.github/workflows/uk_aq_chart_metrics.yml` | 24 | 24.22.1 |
+| `.github/workflows/uk_aq_cloudflare_scheduler_ops_config_sync.yml` | implicit runner PATH | 24.22.1 |
+| `.github/workflows/uk_aq_dropbox_prune_raw.yml` | 24 | 24.22.1 |
+| `.github/workflows/uk_aq_jsongen.yml` | 24 | 24.22.1 |
+| `.github/workflows/uk_aq_jsongen_prune_consumer_readonly.yml` | 24 | 24.22.1 |
+| `.github/workflows/uk_aq_jsongen_prune_first_operation_preflight.yml` | 22 | 24.22.1 |
+| `.github/workflows/uk_aq_jsongen_prune_reader_readiness.yml` | 24 | 24.22.1 |
+| `.github/workflows/uk_aq_jsongen_prune_stage_d_readiness.yml` | 24 | 24.22.1 |
+| `.github/workflows/uk_aq_jsongen_r2_readonly_check.yml` | implicit runner PATH | 24.22.1 |
+| `.github/workflows/uk_aq_jsongen_signer_bundle_r2_transport.yml` | 22 | 24.22.1 |
+| `.github/workflows/uk_aq_jsongen_signer_deploy.yml` | 22 | 24.22.1 |
+| `.github/workflows/uk_aq_jsongen_signer_intents_readonly.yml` | 22 | 24.22.1 |
+| `.github/workflows/uk_aq_observs_partition_maintenance.yml` | 24 | 24.22.1 |
+| `.github/workflows/uk_aq_prune_daily.yml` | 24 | 24.22.1 |
+| `.github/workflows/uk_aq_r2_core_snapshot.yml` | 24 | 24.22.1 |
+| `.github/workflows/uk_aq_r2_history_dropbox_backup.yml` | 24 | 24.22.1 |
+| `.github/workflows/uk_aq_r2_history_inventory_generation_migration.yml` | 24 | 24.22.1 |
+| `.github/workflows/uk_aq_r2_history_restore_from_dropbox.yml` | 24 | 24.22.1 |
+| `.github/workflows/uk_aq_supabase_db_dump_backup.yml` | 24 | 24.22.1 |
+| `.github/workflows/uk_aq_ukair_bc_observation_reconciliation.yml` | 24 | 24.22.1 |
+| `.github/workflows/uk_aq_v3_reader_version_urls.yml` | 22 | 24.22.1 |
+| `.github/workflows/uk_aq_who_2021_daily.yml` | 24 | 24.22.1 |
 
-## Structural checks
+## Verified automatic consequences
 
-- Parsed all 60 current TEST workflows; checked 39 changed YAML files and 38 exact runtime selections in execution order.
-- Parsed before/after equality after removing only the intended Node selections/new setup steps and Sensor build flags/digest output: all triggers, inputs, env, secrets references, permissions, concurrency, timeout, lock/data commands and failure handlers are preserved.
-- Inspected four Sensor Docker COPY sources, Dockerfile-specific allowlist, module import layout, supplier architecture/base-OS identity and unchanged command/environment.
-- node --check passed for all four Sensor modules and the new inline assertion. Running only that assertion on the actual host Node 24.19.0 rejected it as required; no application code was executed.
-- Examined root and two dashboard/history nested lockfile engine constraints with semver for Node 24.22.1. All relevant Linux amd64 packages admit it; only optional Windows/ia32 sharp artifacts exclude it. No install or dependency upgrade was needed.
-- Reviewed branch/PR triggers: privileged deployments are main-push/manual-only; scheduler PR paths validate locally and gate remote D1 work. Ingest env-target validation may run on branch push/PR and CodeQL may run on PR. No operational dispatch is made. Merging later can activate existing main-push deployment/scheduler paths and requires separate coordination.
-- Whitespace/diff and remote changed-path checks are recorded with publication below. No speculative tests, Docker build, package installation or functional validation is claimed. No archive is needed for configuration-only low-risk changes; application sources are unchanged.
+For an isolated merge of the revised PR against the checked main, exactly two automatic workflow definitions match:
 
-## Post-deployment TEST checks (operator only, separately authorized)
+| Workflow | Trigger match | Executed work | Skipped work / mutations |
+|---|---|---|---|
+| `.github/workflows/codeql-noarchive.yml` | `push` to `main`, `.github/workflows/**` matches retained YAML changes | Checkout and CodeQL analysis for Actions, JavaScript/TypeScript and Python; GitHub security-analysis uploads | No cloud deployment or operational data job. Workflow/ref concurrency cancels older matching analysis. |
+| `.github/workflows/uk_aq_cloudflare_scheduler_ops_config_sync.yml` | Its changed workflow path matches `push` to `main` (also PR validation) | Checkout, patched Node, Python, local jobs.toml validation/payload generation, push-range comparison and validation-only report | `jobs.toml` is unchanged, so `remote_sync=false`. Credential checks, remote D1 schema wait, job sync and remote verification remain skipped. Ref-scoped concurrency retains cancellation. |
 
-After review/merge or a separately approved workflow ref, use existing operational workflows. These commands are examples of the exact existing paths and inputs, not actions performed here:
+No deployment workflow or the history/dashboard coordinator matches the revised changed-path set. No Cloudflare Worker, Cloud Run or Pages deployment, D1 migration, secret synchronization, route/IAM change or other remote infrastructure mutation is initiated by this isolated merge. This conclusion depends on the exact checked diff: recheck after any additional file or main change. Repository/workflow availability and existing platform conditions still govern actual check execution.
 
-```bash
-gh workflow run uk_aq_scomm_cloud_run_deploy.yml --repo TEST-uk-aq/uk-aq-ingest --ref main
-gh workflow run uk_aq_stations_daily.yml --repo TEST-uk-aq/uk-aq-ingest --ref main
-gh workflow run uk_aq_prune_daily.yml --repo TEST-uk-aq/uk-aq-ops --ref main -f dry_run=true
-gh workflow run uk_aq_r2_core_snapshot.yml --repo TEST-uk-aq/uk-aq-ops --ref main -f dry_run=true
-gh workflow run uk_aq_r2_history_dropbox_backup.yml --repo TEST-uk-aq/uk-aq-ops --ref main -f dry_run=true
-gh workflow run uk_aq_r2_history_restore_from_dropbox.yml --repo TEST-uk-aq/uk-aq-ops --ref main -f dry_run=true
-gh workflow run uk_aq_supabase_db_dump_backup.yml --repo TEST-uk-aq/uk-aq-ops --ref main
-gh workflow run uk_aq_who_2021_daily.yml --repo TEST-uk-aq/uk-aq-ops --ref main -f run_mode=daily -f trigger_mode=manual
-```
+Manual dispatch of scheduler config sync is different: it sets `remote_sync=true` and can change D1 job activation/configuration. Do not dispatch it merely to collect Node evidence. No triggers, job conditions, permissions, inputs, environment references or concurrency controls are removed or disabled to achieve this scope.
 
-Preserve all existing paused/activation states and verify correct TEST account/resource configuration before authorizing execution. Dry runs can still read services and report health; they do not establish successful writes/deletion. Do not dispatch the LIVE-targeted inventory-generation migration for TEST acceptance. Other changed deployment/diagnostic paths use their existing workflow and authorization inputs; do not blanket-dispatch all workflows for runtime evidence.
+## Focused structural verification
 
-For each accepted actual run retain run URL/source SHA, selected Node version and executable path, action-host Node patch and runner identity. For Sensor retain base/final digests and serving Cloud Run revision/traffic before observing one normal ingest. Check expected task health and artifacts, polling restoration, lock release and failure propagation. Exercise actual protected writes only when independently authorized; retain normal scientific/history/backup/deletion contracts. 2026-10-24-node-promotion-readiness.md details per-operation evidence and complete-file blockers.
+- Parse all 37 candidate workflow definitions and all 22 changed YAML files; verify the 22 retained selections equal 24.22.1 and the two retained original setup additions are intact.
+- Compare parsed workflow semantics against current main after normalizing only intended runtime selections/new setup steps. All operational commands, authentication, permissions, inputs, scheduling, concurrency, locks, deletion/failure controls and environment references remain unchanged.
+- Verify each deferred file's exact Git blob/mode equals current main; retained workflows equal the original full security versions byte-for-byte.
+- Verify the complete candidate tree differs from current main only in the 22 retained workflow files and these four documents. Explicitly preserve writer/test, all application and lock/schema/settings blobs.
+- Recompute merge/branch/PR event matching over all workflow definitions, including unchanged coordinator/reusable-workflow relationships. Confirm jobs.toml is unchanged and remote_sync=false for this isolated push/PR.
+- Check CSV scope (26 unique included-only paths), the 12-file deferred manifest, immutable source links and whitespace/diff. No functional/new test suite, install, Docker build, operational service/database call or workflow dispatch is performed.
 
-## Promotion, rollback and handover
+## Outstanding normal TEST acceptance
 
-The separate 2026-10-24-node-promotion-readiness.md maps all 12 LIVE Node-20 workflows and both Dockerfiles, lists complete Sensor source/context files, identifies other complete-file differences and acceptance gates. Current LIVE files were inspected read-only. No newer LIVE file is overwritten. Prune literal TEST identity/JSONgen wiring and Sensor egress defaults block unqualified complete-file promotion. Restore's newer verification support and partition generation configuration need separate approval if included. Never copy TEST archives.
+Functional acceptance remains outstanding. Merging workflow definitions changes which Node version later **existing external schedules** or separately authorized manual operations use. It does not authorize a new execution. Preserve current runtime scheduler/Prune/JSONgen activation states; canonical jobs.toml is not proof of currently applied D1 state.
 
-Rollback uses a reviewed revert of the relevant TEST commit; leave destructive operations stopped if no patched compatible runtime exists. Reverting source does not undo data writes. Cloud Run rollback must choose an already accepted patched immutable image/revision, not the old Node-20 image. Follow existing operational rollback contracts for stateful jobs.
+- On each next already-authorized normal TEST run, retain source SHA/run URL, setup-node's 24.22.1 log, executable/tool versions when available and independent embedded-action runtime evidence.
+- For existing backup, retention, partition, core, WHO and chart tasks, retain normal task-health/report outputs and unchanged lock, safety, scientific and failure semantics. Do not run destructive paths just for version evidence.
+- Keep paused Prune and independently gated JSONgen paths paused. JSONgen transport/deployment/version-upload workflows can mutate resources despite manual or diagnostic naming; do not blanket-dispatch them.
+- The retained inventory-generation migration still contains LIVE-labelled targeting. Do not use it for TEST acceptance or silently change its target. Generic restore remains limited recovery authority.
+- One historical PR config-validation run at the original full head reported Node 24.22.1, runner 2.338.0 and remote_sync=false ([run 40127332867](https://github.com/TEST-uk-aq/uk-aq-ops/actions/runs/40127332867)). It is installer/validation evidence, not acceptance of this new head, deployed images or operational jobs.
 
-No schema, environment key or authoritative behavioural contract changes. The two repository docs provide a Chat-mode handover for recording runtime floors and deployment evidence; system_docs remains read-only and unchanged.
+## Later rollout and separate prerequisites
 
-Deferred findings: Node 22 major-only selections in TEST Media, Integrity Factory and sensors; website major-only Node 24; shared development host 24.19.0; hosted action-binary patches; inactive Ops image enforcement before reuse; optional Windows/ia32 sharp toolchain; Deno pins, npm affected graphs/SheetJS and Wrangler upgrades from later inventory batches. Other repositories and all LIVE sources remain unchanged. No claim of full-system patch acceptance is made.
+The 12 deferred complete workflow changes must be reapplied only in later independently reviewed TEST PRs. Recommended next deployment-specific PR: the Latest Snapshot R2 API workflow pin alone, after confirming its existing TEST target, authentication, bucket and rollback evidence. Its reader acceptance precedes the later Cloud Run builder rollout. Do not merge the original full batch again or copy the whole old tree over newer main.
 
-## Publication
+| Proposed group | Deferred files | Separate prerequisites / order |
+|---|---|---|
+| Independent readers and metrics | `uk_aq_latest_snapshot_r2_api_worker_deploy.yml`, `uk_aq_postcode_lookup_r2_api_worker_deploy.yml`, `uk_aq_db_r2_metrics_api_worker_deploy.yml`, `uk_aq_blog_feed_worker_deploy.yml` | One mutating merge at a time; verify existing TEST account/resource/bucket/KV identities and rollback evidence. Metrics is a dashboard prerequisite where its service binding is enabled. |
+| AQI legacy deployment | `uk_aq_aqi_history_r2_api_worker_deploy.yml` | Resolve the v1/v2-only validation versus configured v3 history authority under the current AQI-retirement contract. Do not change global history generation merely to pass validation. |
+| Observations provider | `uk_aq_observs_history_r2_api_worker_deploy.yml` | Its child-workflow path triggers the coordinator even without a direct push trigger. Provider acceptance must precede dependent consumers. |
+| Dashboard API, then Pages | `uk_aq_ops_dashboard_api_worker_deploy.yml`, then `uk_aq_ops_dashboard_pages_deploy.yml` | Before the API rollout, use a separate PR for its runtime pin with narrowly reviewed duplicate-trigger correction so automatic API deployment is owned by the existing coordinator, retaining reusable/manual entry points. This corrective merge itself can deploy the API and needs separate authorization. Preserve provider-before-consumer ordering; Pages follows accepted API behavior. |
+| Private station history, then cache | `uk_aq_station_history_deploy.yml`, then `uk_aq_cache_proxy_deploy.yml` | Verify stable observations service and binding. Normal cache deployment sets compressed-chart activation false; verify current state or independently correct preservation before rollout. |
+| Latest Snapshot builder | `uk_aq_latest_snapshot_cloud_run_deploy.yml` | R2 API accepted first. GCP secret preflight must prove the intended effect: helper can destroy old secret versions and update other services' numeric references. Verify full consumer inventory independently, revision/rollback secret usability, singleton/timeout/subscription safety and scheduler state. Node here is tooling; service remains Deno 2.7.13. |
+| Ops scheduler | `uk_aq_cloudflare_scheduler_ops_deploy.yml` | Verify actual D1 identity/schema/migration ledger, no pending migration, recovery evidence, current activation and matching secrets. Migration 0003 rebuilds tables and is not independently repeatable. Observe existing due work without forcing operations or syncing canonical activation values. |
 
-Both TEST repositories use branch `codex/node-october-2026-security` targeting `main`. See each pull request head for the published commit; the completion response records the exact commits and PR URLs. Publication uses GitHub Git-data APIs because the workspace Git HTTP proxy is unavailable; only the bounded changed files are overlaid onto each pinned GitHub base tree. The older provided checkouts remain untouched.
+Existing manual dispatch controls do not suppress future merge-triggered deployments. No later-stage correction, deployment, scheduler change or dependency upgrade is implemented in stage 1.
+
+## Original findings, LIVE restrictions and rollback
+
+No LIVE promotion is recommended by this PR. TEST operational evidence, complete-file comparison and operator approval remain separate. Never overwrite newer LIVE code with an older TEST version or copy TEST archives. Environment values must remain externally configured; do not introduce a separate LIVE implementation or cross-environment fallback.
+
+Retained complete-file blockers include the existing literal TEST identity and JSONgen wiring in Prune; partition-generation mapping/validation differences; newer restore verification-overlay support and its dependency closure; LIVE-labelled inventory migration; TEST-only JSONgen/reconciliation/version tools; and independent review of each file's application/lock/configuration dependencies. The exact runtime pin alone does not make those complete files promotable.
+
+Deferred deployment files retain the dashboard direct/coordinator overlap, scheduler migration/secret effects, GCP secret cleanup/reference effects, cache activation behavior and AQI generation issue. Those are later-stage prerequisites, not fixed or deployed by stage 1.
+
+The original full inventory also includes Ingest/Sensor.Community, both old LIVE Docker selections, Deno, npm/SheetJS/Wrangler graphs, other repositories' major-only selections and shared-host runtime evidence. Sensor promotion still requires its complete Docker/context/module/deploy set and review of existing metrics/environment defaults. Those findings remain open outside this reduced Ops PR. The inactive Ops root Dockerfile is unchanged and requires patch enforcement before any supported reuse. Optional Windows/ia32 tooling and embedded runner patches remain separate evidence/remediation items.
+
+Rollback is a reviewed TEST forward correction or revert that preserves a supported patched runtime; do not downgrade operational runtimes simply to restore an older workflow definition. Reverting source cannot undo any later data writes, secret changes, deployments or migrations. No external rollback action is needed for this rescope itself because none is performed. The deferred originals remain available in immutable Git history.
+
+No application source, dependency manifest/lock, schema, environment setting or authoritative system_docs contract is changed. The observation-history writer and its existing test remain exactly current main. No code-style archive is needed for these ordinary workflow/documentation edits. Documentation handover: record stage 1's runtime scope and acceptance evidence in Chat mode if authoritative deployment documentation needs updating; this PR does not edit it.
+
+Original full reports: [remediation](https://github.com/TEST-uk-aq/uk-aq-ops/blob/5da944d1b0660c8cbe818afcecaebb5b2e350cbd/docs/security/2026-10-24-node-remediation-report.md), [promotion assessment](https://github.com/TEST-uk-aq/uk-aq-ops/blob/5da944d1b0660c8cbe818afcecaebb5b2e350cbd/docs/security/2026-10-24-node-promotion-readiness.md), [full original CSV](https://github.com/TEST-uk-aq/uk-aq-ops/blob/5da944d1b0660c8cbe818afcecaebb5b2e350cbd/docs/security/2026-10-24-node-modified-files.csv). The current [included-only CSV](2026-10-24-node-modified-files.csv) and [stage-aware promotion/deferred manifest](2026-10-24-node-promotion-readiness.md) supersede their scope claims for PR #126.

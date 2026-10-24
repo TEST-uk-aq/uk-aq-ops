@@ -1,46 +1,27 @@
-repository,file,before,after,branch
-TEST-uk-aq/uk-aq-ingest,.github/workflows/uk_aq_cloudflare_scheduler_ingest_config_sync.yml,runner PATH / action host,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ingest,.github/workflows/uk_aq_cloudflare_scheduler_ingest_deploy.yml,runner PATH / action host,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ingest,.github/workflows/uk_aq_observs_edge_deploy.yml,runner PATH / action host,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ingest,.github/workflows/uk_aq_stations_daily.yml,24,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_aqi_history_r2_api_worker_deploy.yml,runner PATH / action host,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_blog_feed_worker_deploy.yml,runner PATH / action host,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_cache_proxy_deploy.yml,22,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_chart_metrics.yml,24,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_cloudflare_scheduler_ops_config_sync.yml,runner PATH / action host,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_cloudflare_scheduler_ops_deploy.yml,runner PATH / action host,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_db_r2_metrics_api_worker_deploy.yml,runner PATH / action host,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_dropbox_prune_raw.yml,24,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_jsongen.yml,24,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_jsongen_prune_consumer_readonly.yml,24,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_jsongen_prune_first_operation_preflight.yml,22,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_jsongen_prune_reader_readiness.yml,24,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_jsongen_prune_stage_d_readiness.yml,24,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_jsongen_r2_readonly_check.yml,runner PATH / action host,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_jsongen_signer_bundle_r2_transport.yml,22,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_jsongen_signer_deploy.yml,22,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_jsongen_signer_intents_readonly.yml,22,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_latest_snapshot_cloud_run_deploy.yml,runner PATH / action host,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_latest_snapshot_r2_api_worker_deploy.yml,runner PATH / action host,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_observs_history_r2_api_worker_deploy.yml,22,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_observs_partition_maintenance.yml,24,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml,22,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_ops_dashboard_pages_deploy.yml,24,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_postcode_lookup_r2_api_worker_deploy.yml,runner PATH / action host,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_prune_daily.yml,24,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_r2_core_snapshot.yml,24,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_r2_history_dropbox_backup.yml,24,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_r2_history_inventory_generation_migration.yml,24,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_r2_history_restore_from_dropbox.yml,24,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_station_history_deploy.yml,22,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_supabase_db_dump_backup.yml,24,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_ukair_bc_observation_reconciliation.yml,24,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_v3_reader_version_urls.yml,22,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_who_2021_daily.yml,24,24.22.1,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ingest,workers/uk_aq_sensorcommunity_cloud_run/Dockerfile,node:24-slim,node:24.22.1-slim,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ingest,.github/workflows/uk_aq_scomm_cloud_run_deploy.yml,runner PATH / action host,runner PATH / action host,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ingest,docs/security/2026-10-24-node-security.md,new documentation,documentation,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,docs/security/2026-10-24-node-security.md,new documentation,documentation,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,docs/security/2026-10-24-node-promotion-readiness.md,new documentation,documentation,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,docs/security/2026-10-24-node-remediation-report.md,new documentation,documentation,codex/node-october-2026-security
-TEST-uk-aq/uk-aq-ops,docs/security/2026-10-24-node-modified-files.csv,new documentation,file manifest,codex/node-october-2026-security
+repository,file,change_type,before,after,scope_status,pr,branch,baseline_main,original_security_commit
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_chart_metrics.yml,modified,24,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_cloudflare_scheduler_ops_config_sync.yml,modified,implicit runner PATH,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_dropbox_prune_raw.yml,modified,24,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_jsongen.yml,modified,24,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_jsongen_prune_consumer_readonly.yml,modified,24,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_jsongen_prune_first_operation_preflight.yml,modified,22,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_jsongen_prune_reader_readiness.yml,modified,24,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_jsongen_prune_stage_d_readiness.yml,modified,24,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_jsongen_r2_readonly_check.yml,modified,implicit runner PATH,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_jsongen_signer_bundle_r2_transport.yml,modified,22,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_jsongen_signer_deploy.yml,modified,22,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_jsongen_signer_intents_readonly.yml,modified,22,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_observs_partition_maintenance.yml,modified,24,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_prune_daily.yml,modified,24,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_r2_core_snapshot.yml,modified,24,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_r2_history_dropbox_backup.yml,modified,24,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_r2_history_inventory_generation_migration.yml,modified,24,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_r2_history_restore_from_dropbox.yml,modified,24,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_supabase_db_dump_backup.yml,modified,24,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_ukair_bc_observation_reconciliation.yml,modified,24,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_v3_reader_version_urls.yml,modified,22,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,.github/workflows/uk_aq_who_2021_daily.yml,modified,24,24.22.1,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,docs/security/2026-10-24-node-modified-files.csv,added,not present on baseline main,stage 1 scope / acceptance / deferred provenance,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,docs/security/2026-10-24-node-promotion-readiness.md,added,not present on baseline main,stage 1 scope / acceptance / deferred provenance,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,docs/security/2026-10-24-node-remediation-report.md,added,not present on baseline main,stage 1 scope / acceptance / deferred provenance,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd
+TEST-uk-aq/uk-aq-ops,docs/security/2026-10-24-node-security.md,added,not present on baseline main,stage 1 scope / acceptance / deferred provenance,included_stage_1,126,codex/node-october-2026-security,483d333eb0a334dc40a9a8be35ff3014ccffa27c,5da944d1b0660c8cbe818afcecaebb5b2e350cbd

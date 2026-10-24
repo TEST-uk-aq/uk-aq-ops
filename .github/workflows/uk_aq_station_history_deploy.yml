@@ -28,7 +28,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "24.22.1"
+          node-version: "22"
       - name: Validate station-history deployment configuration
         env:
           UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME: ${{ vars.UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME || '' }}
