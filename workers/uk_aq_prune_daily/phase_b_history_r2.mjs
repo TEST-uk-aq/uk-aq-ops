@@ -2,6 +2,9 @@ import {
   runOperationalPruneDailyObservationHistoryV3ConnectorPublication,
   runOperationalPruneDailyObservationHistoryV3RunFinalization,
 } from "../shared/uk_aq_observation_history_operational_writer_v3.mjs";
+import {
+  createPruneDailyObservationHistoryV3RunLocalEvidenceCache,
+} from "../shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
 import { admitPruneFrozenConnectorSnapshot, PruneCommittedHistoryGuardError } from "./committed_history_guard.mjs";
 import { FIRST_DELETE_READY, FIRST_DELETE_CONSUMED, FIRST_DELETE_UNPROVEN } from "./deletion_attempt_state.mjs";
 import { getObservationHistoryGeneration, resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes, assertObservationHistoryGenerationKey } from "../shared/uk_aq_observation_history_generation.mjs";
@@ -3832,6 +3835,7 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
     assertPublicationRequestBudget("v3_publication_json_artifact", 3, {
       key: object?.key || null,
     });
+    runtime.v3_run_local_evidence_cache?.invalidateKey(object?.key);
     const result = await r2PutObjectIfChanged({ ...object, r2: runtime.r2 });
     if (result?.ok !== false) metadataCapture?.recordPublishedObject(object);
     return result;
@@ -4053,8 +4057,9 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
       ...fields,
     }, (requestCount * R2_REQUEST_WORST_CASE_DURATION_MS) + R2_PUBLICATION_SAFETY_MARGIN_MS);
   };
-  const finalizationGetObject = async ({ r2, key }) => {
+  const finalizationGetObject = async ({ r2, key, onR2GetAdmitted = null }) => {
     assertFinalizationRequestBudget("v3_run_finalization_r2_read", 1, { key });
+    onR2GetAdmitted?.();
     // Keep only the exact bytes offered to the original writer, not unrelated
     // historical metadata bodies encountered during parent discovery.
     return await r2GetObject({ r2: r2 || runtime.r2, key });
@@ -4064,6 +4069,7 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
     assertFinalizationRequestBudget("v3_run_finalization_json_artifact", 3, {
       key: object?.key || null,
     });
+    runtime.v3_run_local_evidence_cache?.invalidateKey(object?.key);
     const result = await r2PutObjectIfChanged({ ...object, r2: runtime.r2 });
     if (result?.ok !== false) metadataCapture?.recordPublishedObject(object);
     return result;
@@ -4074,6 +4080,7 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
     assertFinalizationRequestBudget("v3_run_finalization_hierarchy_artifact", 2, {
       key: object?.key || null,
     });
+    runtime.v3_run_local_evidence_cache?.invalidateKey(object?.key);
     const result = await r2PutObject({ ...object, r2: object?.r2 || runtime.r2 });
     if (result?.ok !== false) metadataCapture?.recordPublishedObject(object);
     return result;
@@ -4129,6 +4136,8 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
     listAllCommonPrefixes: finalizationListAllCommonPrefixes,
     diagnosticLog,
     beforePublicationStage,
+    runLocalReferenceEvidenceCache: runtime.v3_run_local_evidence_cache,
+    globalOperationLockContext: runtime.global_operation_lock_context,
   });
   return validatePhaseBV3RunFinalizationResult({
     result,
@@ -7171,6 +7180,31 @@ export function resolvePrunePhaseBRunId(env = process.env) {
     ? context.run_id : randomUUID();
 }
 
+function createPhaseBRunLocalV3EvidenceContext({
+  historyWriteVersion,
+  runId,
+  env = process.env,
+}) {
+  if (historyWriteVersion !== "v3") {
+    return { lock_context: null, evidence_cache: null };
+  }
+  const lockContext = observationsGlobalOperationLockContext({
+    env,
+    expectedOwner: "prune_daily",
+    expectedRunId: runId,
+  });
+  return {
+    lock_context: lockContext.valid ? lockContext : null,
+    evidence_cache: lockContext.valid
+      ? createPruneDailyObservationHistoryV3RunLocalEvidenceCache({ lockContext })
+      : null,
+  };
+}
+
+export function createPhaseBRunLocalV3EvidenceContextForTest(args) {
+  return createPhaseBRunLocalV3EvidenceContext(args);
+}
+
 export async function runPhaseBBackup({
   dryRun,
   phaseB,
@@ -7192,6 +7226,8 @@ export async function runPhaseBBackup({
       maxSecondsPerRun: phaseB.max_seconds_per_run,
       stopBeforeTimeoutSeconds: phaseB.stop_before_timeout_seconds,
     }),
+    global_operation_lock_context: null,
+    v3_run_local_evidence_cache: null,
   };
 
   if (!runtime.enabled) {
@@ -7400,6 +7436,13 @@ export async function runPhaseBBackup({
       });
       return;
     }
+
+    const evidenceContext = createPhaseBRunLocalV3EvidenceContext({
+      historyWriteVersion: runtime.history_write_version,
+      runId,
+    });
+    runtime.global_operation_lock_context = evidenceContext.lock_context;
+    runtime.v3_run_local_evidence_cache = evidenceContext.evidence_cache;
 
     const finalizeAccumulatedBatch = async ({ trigger }) => {
       const batch = [...publishedCandidates];
@@ -7689,6 +7732,7 @@ export async function runPhaseBBackup({
       createClient: createPgClient,
     });
   } catch (error) {
+    runtime.v3_run_local_evidence_cache?.clear?.();
     if (
       (error instanceof PhaseBHistoryBudgetExhaustedError)
       || (isPgStatementTimeoutError(error) && !hasBudgetFor(runtime, 2_000))
@@ -7706,6 +7750,7 @@ export async function runPhaseBBackup({
       throw error;
     }
   }
+  runtime.v3_run_local_evidence_cache?.clear?.();
 
   if (dryRun) {
     logStructured("INFO", "phase_b_history_run_summary", summary);

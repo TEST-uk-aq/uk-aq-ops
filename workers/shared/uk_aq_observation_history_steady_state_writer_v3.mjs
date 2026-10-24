@@ -34,6 +34,7 @@ import {
   buildHistoryV2PollutantManifestKey,
 } from "./uk_aq_r2_history_canonical.mjs";
 import {
+  observationsGlobalOperationLockIdentity,
   requireObservationsGlobalOperationLockContext,
   runCanonicalDayFinalizer,
   runCanonicalGlobalIndexFinalizer,
@@ -56,6 +57,7 @@ export const DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_LATEST_KEY =
 export const DEFAULT_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY = 8;
 export const MAX_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY =
   MAX_OBSERVATION_HISTORY_INDEX_V3_PUBLICATION_CONCURRENCY;
+export const MAX_PRUNE_V3_RUN_LOCAL_REFERENCE_EVIDENCE_ENTRIES = 16_384;
 
 export const OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES = Object.freeze({
   pruneDaily: "prune_daily",
@@ -327,8 +329,165 @@ function assertEvidence(actual, expected, label) {
   });
 }
 
-async function verifiedExternalReference(reference, getObject) {
-  const object = await getObject({ key: reference.key });
+function isPhaseBHistoryBudgetError(error) {
+  return error?.name === "PhaseBHistoryBudgetExhaustedError" ||
+    error?.code === "PHASE_B_HISTORY_BUDGET_EXHAUSTED";
+}
+
+function isPruneGlobalLockContext(context) {
+  if (
+    context?.valid !== true || context.owner !== "prune_daily" ||
+    !String(context.run_id || "").trim() || !String(context.nonce || "").trim()
+  ) {
+    return false;
+  }
+  const identity = observationsGlobalOperationLockIdentity();
+  return context.logical_identity === identity.logical_identity &&
+    Number(context.class_id) === identity.class_id &&
+    Number(context.object_id) === identity.object_id;
+}
+
+/**
+ * Compact evidence for exact scoped roots, bound to one supervised Prune run.
+ * The outer lock supervisor terminates the worker if the retained lock session
+ * is lost, so this process-local object cannot survive a lock handoff/restart.
+ */
+export function createPruneDailyObservationHistoryV3RunLocalEvidenceCache({
+  lockContext,
+} = {}) {
+  if (!isPruneGlobalLockContext(lockContext)) return null;
+
+  const entries = new Map();
+  let eligibleKeys = new Set();
+  let active = true;
+  let pendingInvalidations = 0;
+  const lockIdentity = Object.freeze({
+    owner: lockContext.owner,
+    run_id: lockContext.run_id,
+    nonce: lockContext.nonce,
+    logical_identity: lockContext.logical_identity,
+    class_id: Number(lockContext.class_id),
+    object_id: Number(lockContext.object_id),
+  });
+
+  const cache = {
+    matches(context) {
+      return active && isPruneGlobalLockContext(context) &&
+        context.owner === lockIdentity.owner &&
+        context.run_id === lockIdentity.run_id &&
+        context.nonce === lockIdentity.nonce &&
+        context.logical_identity === lockIdentity.logical_identity &&
+        Number(context.class_id) === lockIdentity.class_id &&
+        Number(context.object_id) === lockIdentity.object_id;
+    },
+    getVerified(reference) {
+      if (!active) return null;
+      const key = typeof reference?.key === "string" ? reference.key : "";
+      const existing = entries.get(key);
+      if (!existing) return null;
+      if (
+        !eligibleKeys.has(key) ||
+        existing.key !== key ||
+        existing.byte_size !== reference?.byte_size ||
+        existing.sha256 !== reference?.sha256
+      ) {
+        entries.delete(key);
+        eligibleKeys.delete(key);
+        pendingInvalidations += 1;
+        return null;
+      }
+      return existing;
+    },
+    remember(reference, evidence) {
+      if (!active) return false;
+      const exact = assertEvidence(evidence, reference, "Prune run-local v3 dependency");
+      const prior = entries.get(exact.key);
+      if (prior && (
+        prior.byte_size !== exact.byte_size || prior.sha256 !== exact.sha256
+      )) {
+        entries.delete(exact.key);
+        eligibleKeys.delete(exact.key);
+        pendingInvalidations += 1;
+      }
+      if (!entries.has(exact.key) &&
+          entries.size >= MAX_PRUNE_V3_RUN_LOCAL_REFERENCE_EVIDENCE_ENTRIES) {
+        return false;
+      }
+      entries.set(exact.key, exact);
+      return true;
+    },
+    invalidateKey(keyValue) {
+      if (!active) return false;
+      const key = typeof keyValue === "string" ? keyValue : "";
+      if (!key || !entries.has(key)) return false;
+      entries.delete(key);
+      eligibleKeys.delete(key);
+      pendingInvalidations += 1;
+      return true;
+    },
+    recordFinalizedDependencies(references) {
+      if (!active || !Array.isArray(references)) return;
+      const currentByKey = new Map(references.map((reference) => [reference.key, reference]));
+      const nextEligibleKeys = new Set();
+      for (const [key, evidence] of entries) {
+        const current = currentByKey.get(key);
+        if (
+          !current || current.byte_size !== evidence.byte_size ||
+          current.sha256 !== evidence.sha256
+        ) {
+          entries.delete(key);
+          if (eligibleKeys.has(key)) pendingInvalidations += 1;
+          continue;
+        }
+        nextEligibleKeys.add(key);
+      }
+      eligibleKeys = nextEligibleKeys;
+    },
+    takeInvalidationCount() {
+      const count = pendingInvalidations;
+      pendingInvalidations = 0;
+      return count;
+    },
+    entryCount() {
+      return active ? entries.size : 0;
+    },
+    clear() {
+      active = false;
+      entries.clear();
+      eligibleKeys.clear();
+      pendingInvalidations = 0;
+    },
+  };
+  return Object.freeze(cache);
+}
+
+async function verifiedExternalReference(reference, getObject, {
+  onGetStarted = null,
+  onGetFinished = null,
+} = {}) {
+  let requestCounted = false;
+  const markGetStarted = () => {
+    if (requestCounted) return;
+    requestCounted = true;
+    onGetStarted?.();
+  };
+  let object;
+  try {
+    object = await getObject({
+      key: reference.key,
+      onR2GetAdmitted: markGetStarted,
+    });
+    // Test/custom adapters may not consume the admission callback. A returned
+    // object still proves that an origin GET was issued.
+    markGetStarted();
+  } catch (error) {
+    // Phase B invokes this callback only after its request-level budget check.
+    // A budget rejection is therefore not counted as an R2 GET.
+    if (!requestCounted && !isPhaseBHistoryBudgetError(error)) markGetStarted();
+    throw error;
+  } finally {
+    if (requestCounted) onGetFinished?.();
+  }
   if (!object || object.exists === false || object.body === null || object.body === undefined) {
     throw new Error(`V3 external publication reference is missing: ${reference.key}`);
   }
@@ -352,6 +511,91 @@ async function verifiedExternalReference(reference, getObject) {
     sha256: reference.sha256,
     verified: true,
     durable: true,
+  });
+}
+
+async function verifyExternalReferencesBounded({
+  references,
+  getObject,
+  evidenceCache = null,
+  reuseEvidence = true,
+  freshKeys = new Set(),
+}) {
+  const concurrency = Math.min(
+    DEFAULT_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY,
+    8,
+  );
+  const metrics = {
+    dependency_count: references.length,
+    actual_r2_get_count: 0,
+    accepted_evidence_reuse_count: 0,
+    maximum_active_verification_requests: 0,
+    _active_verification_requests: 0,
+  };
+  const evidenceByKey = new Map();
+  const failures = [];
+
+  for (let offset = 0; offset < references.length; offset += concurrency) {
+    const batch = references.slice(offset, offset + concurrency);
+    const batchResults = await Promise.all(batch.map(async (reference, batchIndex) => {
+      const position = offset + batchIndex;
+      try {
+        if (freshKeys.has(reference.key)) {
+          evidenceCache?.invalidateKey(reference.key);
+        }
+        if (reuseEvidence && evidenceCache && !freshKeys.has(reference.key)) {
+          const cached = evidenceCache.getVerified(reference);
+          if (cached) {
+            metrics.accepted_evidence_reuse_count += 1;
+            return { position, reference, evidence: cached };
+          }
+        }
+        let active = false;
+        const evidence = await verifiedExternalReference(reference, getObject, {
+          onGetStarted: () => {
+            active = true;
+            metrics.actual_r2_get_count += 1;
+            const currentActive = ++metrics._active_verification_requests;
+            metrics.maximum_active_verification_requests = Math.max(
+              metrics.maximum_active_verification_requests,
+              currentActive,
+            );
+          },
+          onGetFinished: () => {
+            if (!active) return;
+            metrics._active_verification_requests -= 1;
+            active = false;
+          },
+        });
+        evidenceCache?.remember(reference, evidence);
+        return { position, reference, evidence };
+      } catch (error) {
+        return { position, reference, error };
+      }
+    }));
+
+    batchResults.sort((left, right) => left.position - right.position);
+    for (const result of batchResults) {
+      if (result.error) {
+        failures.push({
+          position: result.position,
+          reference: result.reference,
+          error: result.error,
+        });
+      } else {
+        evidenceByKey.set(result.reference.key, result.evidence);
+      }
+    }
+    if (batchResults.some((result) => result.error)) {
+      break;
+    }
+  }
+  delete metrics._active_verification_requests;
+  return Object.freeze({
+    evidence_by_key: evidenceByKey,
+    metrics: Object.freeze(metrics),
+    failures: Object.freeze(failures),
+    failure: failures[0]?.error || null,
   });
 }
 
@@ -1538,6 +1782,8 @@ export async function runObservationHistoryV3RunFinalization({
   lockTimeoutMs,
   recoverLatestScopedReference = null,
   selectedScopeRemovalAuthority = null,
+  runLocalReferenceEvidenceCache = null,
+  globalOperationLockContext = null,
 }) {
   assertObservationHistoryGenerationPrefixes(getObservationHistoryGeneration("v3"), { observationsPrefix, indexRoot, latestKey });
   if (!client?.query) throw new Error("V3 run finalization requires PostgreSQL lock client");
@@ -1561,6 +1807,11 @@ export async function runObservationHistoryV3RunFinalization({
     connectorPublications,
   });
   const normalizedSource = publicationEvidence.source;
+  const runEvidenceCache = normalizedSource ===
+      OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily &&
+      runLocalReferenceEvidenceCache?.matches?.(globalOperationLockContext) === true
+    ? runLocalReferenceEvidenceCache
+    : null;
   if (
     normalizedSource ===
       OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.selectedScopeReconciliation &&
@@ -1590,6 +1841,33 @@ export async function runObservationHistoryV3RunFinalization({
   };
   const runStartedAtMs = Date.now();
   const dayResults = [];
+  const finalizationMetrics = {
+    latest_global_dependency_count: 0,
+    latest_global_dependency_r2_get_count: 0,
+    accepted_same_run_evidence_reuse_count: 0,
+    evidence_invalidation_count: runEvidenceCache?.takeInvalidationCount?.() || 0,
+    maximum_active_verification_requests: 0,
+  };
+  const absorbVerificationMetrics = (metrics = {}) => {
+    finalizationMetrics.latest_global_dependency_count = metrics.dependency_count || 0;
+    finalizationMetrics.latest_global_dependency_r2_get_count += metrics.actual_r2_get_count || 0;
+    finalizationMetrics.accepted_same_run_evidence_reuse_count =
+      finalizationMetrics.accepted_same_run_evidence_reuse_count +
+      (metrics.accepted_evidence_reuse_count || 0);
+    finalizationMetrics.maximum_active_verification_requests =
+      Math.max(
+        finalizationMetrics.maximum_active_verification_requests,
+        metrics.maximum_active_verification_requests || 0,
+      );
+  };
+  const collectEvidenceInvalidations = () => {
+    finalizationMetrics.evidence_invalidation_count +=
+      runEvidenceCache?.takeInvalidationCount?.() || 0;
+    return finalizationMetrics.evidence_invalidation_count;
+  };
+  const failureOutcome = (error) => isPhaseBHistoryBudgetError(error)
+    ? "budget_stop"
+    : "failed_closed";
   try {
     assertV3PublicationStageBudget(
       beforePublicationStage,
@@ -1790,95 +2068,118 @@ export async function runObservationHistoryV3RunFinalization({
               partition.scoped_root.evidence,
             ]),
           );
+          const latestReferencesByKey = new Map();
+          for (const reference of updatedLatest.dependencies) {
+            const prior = latestReferencesByKey.get(reference.key);
+            if (prior && (
+              prior.byte_size !== reference.byte_size ||
+              prior.sha256 !== reference.sha256
+            )) {
+              throw new Error(
+                `Exact-v3 latest dependency identity is ambiguous: ${reference.key}`,
+              );
+            }
+            if (!prior) latestReferencesByKey.set(reference.key, reference);
+          }
+          const latestReferences = [...latestReferencesByKey.values()];
+          finalizationMetrics.latest_global_dependency_count = latestReferences.length;
           const latestExternalByKey = new Map();
           const recoveredScopedManifests = [];
-          for (const reference of updatedLatest.dependencies) {
+          for (const reference of latestReferences) {
             const exact = changedScopedEvidenceByKey.get(reference.key);
             if (exact) {
               assertEvidence(exact, reference, "V3 latest scoped prerequisite");
             }
-            try {
-              latestExternalByKey.set(
-                reference.key,
-                await verifiedExternalReference(reference, getObject),
-              );
-            } catch (error) {
-              if (
-                exact ||
-                normalizedSource !==
-                  OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily ||
-                error?.code !== "V3_EXTERNAL_REFERENCE_IDENTITY_CHANGED" ||
-                typeof recoverLatestScopedReference !== "function"
-              ) {
-                throw error;
-              }
-              const recovered = await recoverLatestScopedReference({
-                source: normalizedSource,
-                reference,
-                latest_scope: (() => {
-                  const matches = existingLatestRoots.filter((root) =>
-                    root.key === reference.key
-                  );
-                  if (matches.length !== 1) {
-                    throw new Error(
-                      `Prune latest-global recovery scope evidence is ambiguous: ${reference.key}`,
-                    );
-                  }
-                  return matches[0];
-                })(),
-                live_reference: error.actual_reference,
-                live_body: error.actual_body,
-                observations_prefix: canonicalObservationsPrefix,
-                index_root: indexRoot,
-              });
-              const artifact = recovered?.artifact;
-              if (
-                !artifact || artifact.key !== reference.key ||
-                artifact.sha256 === reference.sha256
-              ) {
-                throw new Error(
-                  `Prune latest-global recovery returned invalid replacement: ${reference.key}`,
+          }
+          const initialVerification = await verifyExternalReferencesBounded({
+            references: latestReferences,
+            getObject,
+            evidenceCache: runEvidenceCache,
+            freshKeys: new Set(changedScopedEvidenceByKey.keys()),
+          });
+          absorbVerificationMetrics(initialVerification.metrics);
+          for (const [key, evidence] of initialVerification.evidence_by_key) {
+            latestExternalByKey.set(key, evidence);
+          }
+          for (const { reference, error } of initialVerification.failures) {
+            const exact = changedScopedEvidenceByKey.get(reference.key);
+            if (
+              exact ||
+              normalizedSource !==
+                OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily ||
+              error?.code !== "V3_EXTERNAL_REFERENCE_IDENTITY_CHANGED" ||
+              typeof recoverLatestScopedReference !== "function"
+            ) {
+              throw error;
+            }
+            if (!error.actual_reference || !error.actual_body) throw error;
+            const recovered = await recoverLatestScopedReference({
+              source: normalizedSource,
+              reference,
+              latest_scope: (() => {
+                const matches = existingLatestRoots.filter((root) =>
+                  root.key === reference.key
                 );
-              }
-              const evidence = assertEvidence(
-                recovered?.evidence,
-                artifact,
-                "Prune latest-global recovered scoped prerequisite",
-              );
-              recoveredScopedManifests.push(artifact);
-              latestExternalByKey.set(reference.key, evidence);
-              emitV3PublicationDiagnostic(
-                diagnosticLog,
-                "latest_global_exact_v3_scoped_reference_recovered",
-                {
-                  day_utc: artifact.payload.day_utc,
-                  connector_id: artifact.payload.connector_id,
-                  pollutant_code: artifact.payload.pollutant_code,
-                  key: artifact.key,
-                  stale_latest_global_sha256: reference.sha256,
-                  canonically_proven_current_sha256: artifact.sha256,
-                  recovery_mode: "canonical_authority_same_key_recovery",
-                  ...(Number.isSafeInteger(recovered.verification_object_count)
-                    ? {
-                        verification_object_count:
-                          recovered.verification_object_count,
-                      }
-                    : {}),
-                  ...(Number.isSafeInteger(recovered.verification_concurrency)
-                    ? {
-                        verification_concurrency:
-                          recovered.verification_concurrency,
-                      }
-                    : {}),
-                  ...(Number.isSafeInteger(recovered.verification_duration_ms)
-                    ? {
-                        verification_duration_ms:
-                          recovered.verification_duration_ms,
-                      }
-                    : {}),
-                },
+                if (matches.length !== 1) {
+                  throw new Error(
+                    `Prune latest-global recovery scope evidence is ambiguous: ${reference.key}`,
+                  );
+                }
+                return matches[0];
+              })(),
+              live_reference: error.actual_reference,
+              live_body: error.actual_body,
+              observations_prefix: canonicalObservationsPrefix,
+              index_root: indexRoot,
+            });
+            const artifact = recovered?.artifact;
+            if (
+              !artifact || artifact.key !== reference.key ||
+              artifact.sha256 === reference.sha256
+            ) {
+              throw new Error(
+                `Prune latest-global recovery returned invalid replacement: ${reference.key}`,
               );
             }
+            const evidence = assertEvidence(
+              recovered?.evidence,
+              artifact,
+              "Prune latest-global recovered scoped prerequisite",
+            );
+            runEvidenceCache?.invalidateKey(reference.key);
+            recoveredScopedManifests.push(artifact);
+            latestExternalByKey.set(reference.key, evidence);
+            emitV3PublicationDiagnostic(
+              diagnosticLog,
+              "latest_global_exact_v3_scoped_reference_recovered",
+              {
+                day_utc: artifact.payload.day_utc,
+                connector_id: artifact.payload.connector_id,
+                pollutant_code: artifact.payload.pollutant_code,
+                key: artifact.key,
+                stale_latest_global_sha256: reference.sha256,
+                canonically_proven_current_sha256: artifact.sha256,
+                recovery_mode: "canonical_authority_same_key_recovery",
+                ...(Number.isSafeInteger(recovered.verification_object_count)
+                  ? {
+                      verification_object_count:
+                        recovered.verification_object_count,
+                    }
+                  : {}),
+                ...(Number.isSafeInteger(recovered.verification_concurrency)
+                  ? {
+                      verification_concurrency:
+                        recovered.verification_concurrency,
+                    }
+                  : {}),
+                ...(Number.isSafeInteger(recovered.verification_duration_ms)
+                  ? {
+                      verification_duration_ms:
+                        recovered.verification_duration_ms,
+                    }
+                  : {}),
+              },
+            );
           }
           if (recoveredScopedManifests.length > 0) {
             const replacementsByKey = new Map(
@@ -1895,11 +2196,21 @@ export async function runObservationHistoryV3RunFinalization({
               latestKey,
             });
             latestExternalByKey.clear();
-            for (const reference of updatedLatest.dependencies) {
-              latestExternalByKey.set(
-                reference.key,
-                await verifiedExternalReference(reference, getObject),
-              );
+            const strictReverification = await verifyExternalReferencesBounded({
+              references: [...new Map(
+                updatedLatest.dependencies.map((reference) => [reference.key, reference]),
+              ).values()],
+              getObject,
+              evidenceCache: null,
+              reuseEvidence: false,
+              freshKeys: new Set(updatedLatest.dependencies.map((reference) => reference.key)),
+            });
+            absorbVerificationMetrics(strictReverification.metrics);
+            if (strictReverification.failure) {
+              throw strictReverification.failure;
+            }
+            for (const [key, evidence] of strictReverification.evidence_by_key) {
+              latestExternalByKey.set(key, evidence);
             }
           }
           const finalLatestScopeIdentities = new Set(
@@ -1955,20 +2266,30 @@ export async function runObservationHistoryV3RunFinalization({
               })),
             ),
           );
+          const runFinalizationOk = connectorResults.every((entry) =>
+            entry.v3_exact_publication?.ok === true
+          ) && latestPublication.ok === true;
+          if (runFinalizationOk) {
+            runEvidenceCache?.recordFinalizedDependencies?.(
+              updatedLatest.dependencies,
+            );
+          }
           emitV3PublicationDiagnostic(
             diagnosticLog,
             "latest_global_exact_v3_finalization_complete",
             {
               ...latestFields,
+              ...finalizationMetrics,
               prerequisite_reference_count: updatedLatest.dependencies.length,
               removed_scope_count: removedScopes.length,
               duration_ms: Math.max(0, Date.now() - latestStartedAtMs),
+              global_finalization_elapsed_ms: Math.max(0, Date.now() - runStartedAtMs),
+              evidence_invalidation_count: collectEvidenceInvalidations(),
+              outcome: runFinalizationOk ? "succeeded" : "failed_closed",
             },
           );
           return Object.freeze({
-            ok: connectorResults.every((entry) =>
-              entry.v3_exact_publication?.ok === true
-            ) && latestPublication.ok === true,
+            ok: runFinalizationOk,
             status: latestPublication.status,
             source: normalizedSource,
             prune_eligibility_owner:
@@ -1995,12 +2316,16 @@ export async function runObservationHistoryV3RunFinalization({
             }),
           });
         } catch (error) {
+          finalizationMetrics.evidence_invalidation_count = collectEvidenceInvalidations();
           emitV3PublicationDiagnostic(
             diagnosticLog,
             "latest_global_exact_v3_finalization_failed",
             {
               ...latestFields,
+              ...finalizationMetrics,
               duration_ms: Math.max(0, Date.now() - latestStartedAtMs),
+              global_finalization_elapsed_ms: Math.max(0, Date.now() - runStartedAtMs),
+              failure_outcome: failureOutcome(error),
               error: error instanceof Error ? error.message : String(error),
             },
           );
@@ -2008,17 +2333,26 @@ export async function runObservationHistoryV3RunFinalization({
         }
       },
     });
+    finalizationMetrics.evidence_invalidation_count = collectEvidenceInvalidations();
     emitV3PublicationDiagnostic(diagnosticLog, "run_finalization_complete", {
       ...runFields,
       duration_ms: Math.max(0, Date.now() - runStartedAtMs),
+      global_finalization_elapsed_ms: Math.max(0, Date.now() - runStartedAtMs),
+      ...finalizationMetrics,
+      outcome: finalResult?.ok === true ? "succeeded" : "failed_closed",
     });
     return finalResult;
   } catch (error) {
+    finalizationMetrics.evidence_invalidation_count = collectEvidenceInvalidations();
     emitV3PublicationDiagnostic(diagnosticLog, "run_finalization_failed", {
       ...runFields,
       duration_ms: Math.max(0, Date.now() - runStartedAtMs),
+      global_finalization_elapsed_ms: Math.max(0, Date.now() - runStartedAtMs),
+      ...finalizationMetrics,
+      failure_outcome: failureOutcome(error),
       error: error instanceof Error ? error.message : String(error),
     });
+    runEvidenceCache?.clear?.();
     throw error;
   }
 }

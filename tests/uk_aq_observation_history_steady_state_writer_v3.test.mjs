@@ -7,6 +7,7 @@ import {
 } from "../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import {
   buildObservationHistoryV3SteadyStatePartition,
+  createPruneDailyObservationHistoryV3RunLocalEvidenceCache,
   runObservationHistoryV3RunFinalization,
   runIntegrityObservationHistoryV3Writer,
   runPruneDailyObservationHistoryV3ConnectorPublication,
@@ -18,6 +19,7 @@ import {
 } from "../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
 import {
   OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV,
+  observationsGlobalOperationLockContext,
   observationsGlobalOperationLockIdentity,
 } from "../workers/shared/uk_aq_r2_history_writer.mjs";
 import {
@@ -43,6 +45,14 @@ function selectedScopeLockEnv({ owner = "selected-scope-test", runId = "run-1" }
     [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.waitMs]: "0",
     [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.outcome]: "held",
   };
+}
+
+function pruneRunLockContext(runId = "prune-evidence-run") {
+  return observationsGlobalOperationLockContext({
+    env: selectedScopeLockEnv({ owner: "prune_daily", runId }),
+    expectedOwner: "prune_daily",
+    expectedRunId: runId,
+  });
 }
 
 function sha256(value) {
@@ -343,10 +353,12 @@ function finalizationEvidence({
   pollutantCode,
   timeseriesId,
   objects,
+  valueDelta = 0,
 }) {
   const partition = buildObservationHistoryV3SteadyStatePartition({
     source: "prune_daily",
-    rows: rows({ dayUtc, connectorId, pollutantCode, timeseriesId }),
+    rows: rows({ dayUtc, connectorId, pollutantCode, timeseriesId })
+      .map((row) => ({ ...row, value: row.value + valueDelta })),
     writerLimits: LIMITS,
     targetWriterGitSha: TARGET_GIT_SHA,
     backedUpAtUtc: BACKED_UP_AT_UTC,
@@ -687,6 +699,261 @@ test("run finalization admits and diagnoses day, aggregate and latest stages", a
       .map(({ fields }) => fields.day_utc),
     ["2026-08-18", "2026-08-20"],
   );
+});
+
+test("Prune latest-global dependencies verify with at most eight GETs and reuse exact same-run evidence", async () => {
+  const fixture = buildFixture();
+  const lockContext = pruneRunLockContext();
+  const evidenceCache = createPruneDailyObservationHistoryV3RunLocalEvidenceCache({
+    lockContext,
+  });
+  assert.ok(evidenceCache);
+
+  const existingHierarchies = Array.from({ length: 20 }, (_, index) => {
+    const partition = buildObservationHistoryV3SteadyStatePartition({
+      source: "integrity",
+      rows: rows({
+        dayUtc: `2025-01-${String(index + 1).padStart(2, "0")}`,
+        connectorId: 90,
+        pollutantCode: "o3",
+        timeseriesId: 9_000 + index,
+      }),
+      writerLimits: LIMITS,
+      targetWriterGitSha: TARGET_GIT_SHA,
+      backedUpAtUtc: BACKED_UP_AT_UTC,
+    });
+    fixture.objects.set(
+      partition.v3_hierarchy.scoped_manifest.key,
+      Buffer.from(partition.v3_hierarchy.scoped_manifest.body),
+    );
+    return partition.v3_hierarchy;
+  });
+  const initialLatest = buildObservationHistoryIndexV3Latest({
+    scopedHierarchies: existingHierarchies,
+  });
+  assert.equal(initialLatest.key, fixture.latestKey);
+  fixture.objects.set(initialLatest.key, Buffer.from(initialLatest.body));
+
+  const baseGetObject = fixture.options.getObject;
+  let activeRequests = 0;
+  let highestActiveRequests = 0;
+  const measuredGetObject = async ({ key, onR2GetAdmitted = null }) => {
+    if (typeof onR2GetAdmitted !== "function") {
+      return await baseGetObject({ key });
+    }
+    onR2GetAdmitted();
+    activeRequests += 1;
+    highestActiveRequests = Math.max(highestActiveRequests, activeRequests);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      return await baseGetObject({ key });
+    } finally {
+      activeRequests -= 1;
+    }
+  };
+  const runDiagnostics = [];
+  const finalizeOneDay = async ({ dayUtc, connectorId, pollutantCode, timeseriesId, valueDelta }) => {
+    const publication = finalizationEvidence({
+      dayUtc,
+      connectorId,
+      pollutantCode,
+      timeseriesId,
+      objects: fixture.objects,
+      valueDelta,
+    });
+    return await runPruneDailyObservationHistoryV3RunFinalization({
+      ...fixture.options,
+      connectorPublications: [publication],
+      getObject: measuredGetObject,
+      runLocalReferenceEvidenceCache: evidenceCache,
+      globalOperationLockContext: lockContext,
+      diagnosticLog: (event, fields) => runDiagnostics.push({ event, fields }),
+    });
+  };
+
+  const first = await finalizeOneDay({
+    dayUtc: "2026-08-18",
+    connectorId: 1,
+    pollutantCode: "pm25",
+    timeseriesId: 101,
+  });
+  assert.equal(first.ok, true);
+  const firstMetrics = runDiagnostics.find(({ event }) =>
+    event === "run_finalization_complete"
+  ).fields;
+  assert.equal(firstMetrics.latest_global_dependency_count, 21);
+  assert.equal(firstMetrics.latest_global_dependency_r2_get_count, 21);
+  assert.equal(firstMetrics.accepted_same_run_evidence_reuse_count, 0);
+  assert.equal(firstMetrics.maximum_active_verification_requests, 8);
+  assert.equal(highestActiveRequests, 8);
+  assert.equal(evidenceCache.entryCount(), 21);
+
+  highestActiveRequests = 0;
+  runDiagnostics.length = 0;
+  const changedSameKey = await finalizeOneDay({
+    dayUtc: "2026-08-18",
+    connectorId: 1,
+    pollutantCode: "pm25",
+    timeseriesId: 101,
+    valueDelta: 10,
+  });
+  assert.equal(changedSameKey.ok, true);
+  const changedMetrics = runDiagnostics.find(({ event }) =>
+    event === "run_finalization_complete"
+  ).fields;
+  assert.equal(changedMetrics.latest_global_dependency_count, 21);
+  assert.equal(changedMetrics.latest_global_dependency_r2_get_count, 1);
+  assert.equal(changedMetrics.accepted_same_run_evidence_reuse_count, 20);
+  assert.equal(changedMetrics.evidence_invalidation_count, 1);
+  assert.equal(changedMetrics.maximum_active_verification_requests, 1);
+  assert.equal(highestActiveRequests, 1);
+  assert.equal(evidenceCache.entryCount(), 21);
+
+  highestActiveRequests = 0;
+  runDiagnostics.length = 0;
+  const third = await finalizeOneDay({
+    dayUtc: "2026-08-19",
+    connectorId: 2,
+    pollutantCode: "no2",
+    timeseriesId: 202,
+  });
+  assert.equal(third.ok, true);
+  const thirdMetrics = runDiagnostics.find(({ event }) =>
+    event === "run_finalization_complete"
+  ).fields;
+  assert.equal(thirdMetrics.latest_global_dependency_count, 22);
+  assert.equal(thirdMetrics.latest_global_dependency_r2_get_count, 1);
+  assert.equal(thirdMetrics.accepted_same_run_evidence_reuse_count, 21);
+  assert.equal(thirdMetrics.maximum_active_verification_requests, 1);
+  assert.equal(highestActiveRequests, 1);
+  assert.equal(evidenceCache.entryCount(), 22);
+});
+
+test("Prune run-local evidence requires exact identity and invalidates on key mutation", () => {
+  const lockContext = pruneRunLockContext();
+  const cache = createPruneDailyObservationHistoryV3RunLocalEvidenceCache({
+    lockContext,
+  });
+  const body = Buffer.from("scoped-root", "utf8");
+  const reference = {
+    key: "history/_index_v3/observations_timeseries/day_utc=2025-01-01/connector_id=1/pollutant_code=no2/manifest.json",
+    byte_size: body.byteLength,
+    sha256: sha256(body),
+  };
+  const verified = {
+    ...reference,
+    verified: true,
+    durable: true,
+  };
+  assert.equal(cache.remember(reference, verified), true);
+  cache.recordFinalizedDependencies([reference]);
+  assert.deepEqual(cache.getVerified(reference), verified);
+  assert.equal(cache.getVerified({ ...reference, byte_size: reference.byte_size + 1 }), null);
+  assert.equal(cache.takeInvalidationCount(), 1);
+
+  assert.equal(cache.remember(reference, verified), true);
+  cache.recordFinalizedDependencies([reference]);
+  assert.equal(cache.invalidateKey(reference.key), true);
+  assert.equal(cache.getVerified(reference), null);
+  assert.equal(cache.takeInvalidationCount(), 1);
+
+  const removedReference = {
+    ...reference,
+    key: `${reference.key}.removed`,
+  };
+  const removedVerified = {
+    ...verified,
+    key: removedReference.key,
+  };
+  assert.equal(cache.remember(reference, verified), true);
+  assert.equal(cache.remember(removedReference, removedVerified), true);
+  cache.recordFinalizedDependencies([reference, removedReference]);
+  cache.recordFinalizedDependencies([reference]);
+  assert.equal(cache.entryCount(), 1);
+  assert.equal(cache.getVerified(removedReference), null);
+  assert.equal(cache.takeInvalidationCount(), 1);
+
+  const otherRun = pruneRunLockContext("another-prune-run");
+  assert.equal(cache.matches(otherRun), false);
+  cache.clear();
+  assert.equal(cache.entryCount(), 0);
+  assert.equal(cache.getVerified(reference), null);
+});
+
+test("latest-global dependency verification stops at a request budget failure and reports it", async () => {
+  const fixture = buildFixture();
+  const existingHierarchies = Array.from({ length: 10 }, (_, index) => {
+    const partition = buildObservationHistoryV3SteadyStatePartition({
+      source: "integrity",
+      rows: rows({
+        dayUtc: `2025-02-${String(index + 1).padStart(2, "0")}`,
+        connectorId: 91,
+        pollutantCode: "o3",
+        timeseriesId: 9_100 + index,
+      }),
+      writerLimits: LIMITS,
+      targetWriterGitSha: TARGET_GIT_SHA,
+      backedUpAtUtc: BACKED_UP_AT_UTC,
+    });
+    fixture.objects.set(
+      partition.v3_hierarchy.scoped_manifest.key,
+      Buffer.from(partition.v3_hierarchy.scoped_manifest.body),
+    );
+    return partition.v3_hierarchy;
+  });
+  const initialLatest = buildObservationHistoryIndexV3Latest({
+    scopedHierarchies: existingHierarchies,
+  });
+  fixture.objects.set(initialLatest.key, Buffer.from(initialLatest.body));
+
+  const budgetError = Object.assign(new Error("dependency GET budget exhausted"), {
+    name: "PhaseBHistoryBudgetExhaustedError",
+    code: "PHASE_B_HISTORY_BUDGET_EXHAUSTED",
+    operation: "v3_run_finalization_r2_read",
+  });
+  const baseGetObject = fixture.options.getObject;
+  let admittedDependencies = 0;
+  let actualDependencyGets = 0;
+  const budgetedGetObject = async ({ key, onR2GetAdmitted = null }) => {
+    if (typeof onR2GetAdmitted === "function") {
+      admittedDependencies += 1;
+      if (admittedDependencies === 1) throw budgetError;
+      onR2GetAdmitted();
+      actualDependencyGets += 1;
+    }
+    return await baseGetObject({ key });
+  };
+  const diagnostics = [];
+  const publication = finalizationEvidence({
+    dayUtc: "2026-08-18",
+    connectorId: 1,
+    pollutantCode: "pm25",
+    timeseriesId: 101,
+    objects: fixture.objects,
+  });
+
+  await assert.rejects(
+    runPruneDailyObservationHistoryV3RunFinalization({
+      ...fixture.options,
+      connectorPublications: [publication],
+      getObject: budgetedGetObject,
+      diagnosticLog: (event, fields) => diagnostics.push({ event, fields }),
+    }),
+    (error) => error === budgetError,
+  );
+  assert.equal(admittedDependencies, 8);
+  assert.equal(actualDependencyGets, 7);
+  assert.equal(
+    fixture.publicationCalls.filter((call) => call.stage === "latest_global").length,
+    0,
+  );
+  const failure = diagnostics.find(({ event }) =>
+    event === "latest_global_exact_v3_finalization_failed"
+  );
+  assert.equal(failure.fields.failure_outcome, "budget_stop");
+  assert.equal(failure.fields.latest_global_dependency_count, 11);
+  assert.equal(failure.fields.latest_global_dependency_r2_get_count, 7);
+  assert.equal(failure.fields.maximum_active_verification_requests, 7);
 });
 
 test("run finalization preserves a budget-admission error at a safe stage boundary", async () => {

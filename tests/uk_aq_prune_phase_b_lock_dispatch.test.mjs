@@ -2,8 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  createPhaseBRunLocalV3EvidenceContextForTest,
   runPhaseBCandidateObservationWriteForTest,
 } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
+import {
+  OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV,
+  observationsGlobalOperationLockIdentity,
+} from "../workers/shared/uk_aq_r2_history_writer.mjs";
 
 const CONNECTOR_DAY_OPTIONS = Object.freeze({
   client: Object.freeze({}),
@@ -12,6 +17,56 @@ const CONNECTOR_DAY_OPTIONS = Object.freeze({
   diagnosticEnvironment: "TEST",
   diagnostics: Object.freeze([]),
   timeoutMs: 15_000,
+});
+
+test("Phase B creates v3 evidence reuse only for its valid matching Prune lock run", () => {
+  const runId = "phase-b-evidence-run";
+  const identity = observationsGlobalOperationLockIdentity();
+  const env = {
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.held]: "true",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.owner]: "prune_daily",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.runId]: runId,
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.logicalIdentity]: identity.logical_identity,
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.classId]: String(identity.class_id),
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.objectId]: String(identity.object_id),
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.nonce]: "phase-b-evidence-lock-nonce",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.acquired]: "true",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.waitMs]: "0",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.outcome]: "held",
+  };
+
+  const valid = createPhaseBRunLocalV3EvidenceContextForTest({
+    historyWriteVersion: "v3",
+    runId,
+    env,
+  });
+  assert.equal(valid.lock_context.run_id, runId);
+  assert.ok(valid.evidence_cache);
+  assert.equal(valid.evidence_cache.matches(valid.lock_context), true);
+  valid.evidence_cache.clear();
+
+  const mismatchedRun = createPhaseBRunLocalV3EvidenceContextForTest({
+    historyWriteVersion: "v3",
+    runId: "different-run",
+    env,
+  });
+  assert.equal(mismatchedRun.lock_context, null);
+  assert.equal(mismatchedRun.evidence_cache, null);
+
+  const unlocked = createPhaseBRunLocalV3EvidenceContextForTest({
+    historyWriteVersion: "v3",
+    runId,
+    env: {},
+  });
+  assert.equal(unlocked.lock_context, null);
+  assert.equal(unlocked.evidence_cache, null);
+
+  const v2 = createPhaseBRunLocalV3EvidenceContextForTest({
+    historyWriteVersion: "v2",
+    runId,
+    env,
+  });
+  assert.equal(v2.evidence_cache, null);
 });
 
 test("Phase B v2 preserves the outer connector-day writer lock", async () => {
