@@ -276,7 +276,7 @@ maintenance, transition manually:
 3. Install the generic package with `UKAQ_ENV_NAME=TEST`:
 
    ```bash
-      scripts/mbpro_scheduler_watchdog/install_launchagent.sh \
+   scripts/mbpro_scheduler_watchdog/install_launchagent.sh \
      --config "$TEST_WATCHDOG_CONFIG" \
      --python-bin "/opt/local/bin/python3.14"
    ```
