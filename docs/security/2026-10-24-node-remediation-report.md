@@ -1,5 +1,21 @@
 # Node.js October 2026 TEST remediation: stage 1 report
 
+## Post-merge security rollout status (25 October 2026)
+
+This dated addendum updates the **deployment/acceptance status** of the historical stage-1 report below. It does not rewrite the original PR #126 diff or its 12-file deferred manifest.
+
+| TEST batch | GitHub evidence | Verified scope and outstanding work |
+|---|---|---|
+| Ingest PR [#17](https://github.com/TEST-uk-aq/uk-aq-ingest/pull/17) | Merged at [`511ed605697c822fc0d6928838a491802c9a7308`](https://github.com/TEST-uk-aq/uk-aq-ingest/commit/511ed605697c822fc0d6928838a491802c9a7308); [Sensor.Community Cloud Run run 40114963676](https://github.com/TEST-uk-aq/uk-aq-ingest/actions/runs/40114963676) successful | Container build log reports Linux x64 **Node 24.22.1**, new Cloud Run revision `uk-aq-scomm-ingest-00014-gxf` received 100% traffic at deployment; independent subsequent normal ingestion acceptance remains unverified. |
+| Ops PR [#126](https://github.com/TEST-uk-aq/uk-aq-ops/pull/126) | Merged at [`c5fcd85b39bbc516bd748c2c4187549923a458e4`](https://github.com/TEST-uk-aq/uk-aq-ops/commit/c5fcd85b39bbc516bd748c2c4187549923a458e4); [scheduler config run 40138570719](https://github.com/TEST-uk-aq/uk-aq-ops/actions/runs/40138570719) successful | 23 TEST workflow runtime selections pinned to **24.22.1**. The merge-triggered scheduler job was validation-only; routine scheduled/manual operational workflows are not thereby fully accepted. |
+| Ops PR [#129](https://github.com/TEST-uk-aq/uk-aq-ops/pull/129), Latest Snapshot R2 API | Merged at [`d88b54f0c4678269b5404996b598a4e928444ceb`](https://github.com/TEST-uk-aq/uk-aq-ops/commit/d88b54f0c4678269b5404996b598a4e928444ceb); [deployment run 40141259040](https://github.com/TEST-uk-aq/uk-aq-ops/actions/runs/40141259040) successful | Deployer installed and used **Node 24.22.1**; Cloudflare TEST Worker version **21** (`8ca1821c-ab63-4508-8a83-13254cbc7419`) deployed at 100% traffic. R2 binding remained `uk-aq-history-cic-test`, required secret binding present. Retained pre-change version **18** (`0e2de28e-ab48-48ce-999b-ea04719a764a`) is a recovery reference. An operator-authenticated post-deployment finite Latest Snapshot request returned HTTP **200**, PM2.5 `3h`, `network_group=all`, `count=190` and `data.length=190`; visible Hex Map readings rendered. This is **bounded real TEST operational acceptance** of the deployed API, not blanket acceptance of all windows, headers or builders. |
+
+**Remaining Ops deployment-specific batch:** **11** workflows remain from the original 12-file deferred set after the completed Latest Snapshot R2 API workflow. The next recommended isolated TEST candidate is `.github/workflows/uk_aq_postcode_lookup_r2_api_worker_deploy.yml`, subject to current TEST account/Worker/bucket/secret metadata, rollback-version and ordinary request preflight. Do not redeploy it merely to demonstrate a tooling version.
+
+The source pin changes neither Cloudflare's managed Worker runtime nor Deno in the Latest Snapshot builder. The outstanding dashboard duplicate-deployment path, GCP secret lifecycle effects, scheduler migration admission, cache activation preservation, legacy AQI generation constraints, later Deno/npm/SheetJS security work and complete-file LIVE promotion restrictions remain **open**.
+
+The user confirmed TEST currently runs only the two Breathe London networks, not OpenAQ or Sensor.Community source feeds. Network distribution on the Hex Map must not be misdiagnosed as an API regression from this Node rollout. No LIVE change or deployment is authorised by this documentation update.
+
 ## Reconciliation with latest TEST main
 
 Refreshed main is `2d18e847235cfa58f114597a9ac25839cde73156`; previous PR head is `7ead204f3eb8443700067bcd4185bc9702602711`; their merge base is `483d333eb0a334dc40a9a8be35ff3014ccffa27c`. Main independently added signer repository admission and the manual preflight in PR #127 (`0488eb7a92babcc0769bb7f6f4d51589b4479b04`, merged at the refreshed main). The branches are reconciled by one normal merge commit with the previous PR head as first parent and current main as second parent; no history rewrite. The only overlapping file is Prune Daily, where main's repository-variable addition and the security runtime pin are non-overlapping changes. No material semantic conflict was found.
