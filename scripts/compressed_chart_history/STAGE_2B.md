@@ -2,6 +2,10 @@
 
 These instructions are prepared, **not executed**. Review both implementation PRs first. Deployment, data reads/generation, private R2 publication and workflow dispatch require the subsequent explicit TEST operation authorisation. Never point these steps at LIVE. The prior September pilot commands are superseded by the finite configuration protocol in README.md; prior objects and accepted originals are not migrated or rewritten.
 
+For the six Bristol AURN samples, use [P2_READINESS.md](P2_READINESS.md) and its [disabled operator completion template](experiment.bristol-p2.template.json). The handover specifies the inclusive 1 October terminal endpoint, 2 July hidden-context admission, unresolved status/resource evidence, bounded 552-series/day metadata procedure and controlled ordering. Source admission is not complete; the template is neither schema-valid with its unresolved null fields nor approved for execution.
+
+**Merge has deployment consequences:** Ops PR #136 triggers the normal cache-proxy deployment and, through the new shared origin-validator file, the station-history deployment. The normal proxy deployment keeps the prototype disabled. Obtain authorisation for those automatic deployments before merging; check both results and normal chart health. Website PR #79 similarly triggers Pages on merge. Follow the specific merge/deployment sequence in P2_READINESS.md, including the separate chart-selection integration checkpoint. Do not treat merging either PR as operationally inert.
+
 ## Before execution
 
 Supply real metadata for the finite AURN sample and context as described in README.md. Establish accepted verification interpretation from genuine evidence. Confirm selected canonical generation v3, source/binding availability through the terminal endpoint, dedicated derived IAM permissions, existing secrets, private bucket and Access Service Auth policy, allowed website origin, Free plan and route-attributed CPU telemetry. Preserve current private Worker/proxy deployment configuration and any experimental selector bytes for rollback. Keep original JSONgen control/registrations, Prune/Integrity and schedulers untouched.

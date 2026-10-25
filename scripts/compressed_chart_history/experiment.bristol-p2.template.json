@@ -1,0 +1,255 @@
+{
+  "schema_version": 1,
+  "enabled": false,
+  "experiment_id": "aurn_bristol_p2_20261025",
+  "environment": "TEST",
+  "canonical_generation": "v3",
+  "network": "gov_uk_aurn",
+  "source_mode": "exploratory_canonical_source_as_read",
+  "verification_mode": null,
+  "legacy_status_mode": null,
+  "status_authority_reference": null,
+  "observation_units": "ug/m3",
+  "algorithm_version": "aqilevels_hourly_v2",
+  "source_bucket": null,
+  "source_endpoint": null,
+  "derived_bucket": null,
+  "derived_endpoint": null,
+  "derived_prefix": "experimental/aurn_bristol_p2",
+  "samples": [
+    {
+      "id": "st_pauls_pm25",
+      "station_label": "Bristol St Paul's (UKA00494)",
+      "connector_id": 1,
+      "station_id": 441,
+      "timeseries_id": 324,
+      "pollutant_code": "pm25",
+      "permitted_timeseries_ids": [
+        324
+      ],
+      "start_utc": "2026-07-03T00:00:00.000Z",
+      "end_utc": "2026-10-01T00:00:00.000Z",
+      "views": [
+        {
+          "id": "24h",
+          "label": "24 hours",
+          "start_utc": "2026-09-30T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        },
+        {
+          "id": "7d",
+          "label": "Seven days",
+          "start_utc": "2026-09-24T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        },
+        {
+          "id": "september",
+          "label": "Complete September 2026",
+          "start_utc": "2026-09-01T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        },
+        {
+          "id": "90d",
+          "label": "Complete 90-day interval",
+          "start_utc": "2026-07-03T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        }
+      ]
+    },
+    {
+      "id": "st_pauls_pm10",
+      "station_label": "Bristol St Paul's (UKA00494)",
+      "connector_id": 1,
+      "station_id": 440,
+      "timeseries_id": 107,
+      "pollutant_code": "pm10",
+      "permitted_timeseries_ids": [
+        107
+      ],
+      "start_utc": "2026-07-03T00:00:00.000Z",
+      "end_utc": "2026-10-01T00:00:00.000Z",
+      "views": [
+        {
+          "id": "24h",
+          "label": "24 hours",
+          "start_utc": "2026-09-30T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        },
+        {
+          "id": "7d",
+          "label": "Seven days",
+          "start_utc": "2026-09-24T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        },
+        {
+          "id": "september",
+          "label": "Complete September 2026",
+          "start_utc": "2026-09-01T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        },
+        {
+          "id": "90d",
+          "label": "Complete 90-day interval",
+          "start_utc": "2026-07-03T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        }
+      ]
+    },
+    {
+      "id": "st_pauls_no2",
+      "station_label": "Bristol St Paul's (UKA00494)",
+      "connector_id": 1,
+      "station_id": 434,
+      "timeseries_id": 662,
+      "pollutant_code": "no2",
+      "permitted_timeseries_ids": [
+        662
+      ],
+      "start_utc": "2026-07-03T00:00:00.000Z",
+      "end_utc": "2026-10-01T00:00:00.000Z",
+      "views": [
+        {
+          "id": "24h",
+          "label": "24 hours",
+          "start_utc": "2026-09-30T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        },
+        {
+          "id": "7d",
+          "label": "Seven days",
+          "start_utc": "2026-09-24T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        },
+        {
+          "id": "september",
+          "label": "Complete September 2026",
+          "start_utc": "2026-09-01T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        },
+        {
+          "id": "90d",
+          "label": "Complete 90-day interval",
+          "start_utc": "2026-07-03T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        }
+      ]
+    },
+    {
+      "id": "temple_way_pm25",
+      "station_label": "Bristol Temple Way (UKA00631)",
+      "connector_id": 1,
+      "station_id": 448,
+      "timeseries_id": 218,
+      "pollutant_code": "pm25",
+      "permitted_timeseries_ids": [
+        218
+      ],
+      "start_utc": "2026-07-03T00:00:00.000Z",
+      "end_utc": "2026-10-01T00:00:00.000Z",
+      "views": [
+        {
+          "id": "24h",
+          "label": "24 hours",
+          "start_utc": "2026-09-30T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        },
+        {
+          "id": "7d",
+          "label": "Seven days",
+          "start_utc": "2026-09-24T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        },
+        {
+          "id": "september",
+          "label": "Complete September 2026",
+          "start_utc": "2026-09-01T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        },
+        {
+          "id": "90d",
+          "label": "Complete 90-day interval",
+          "start_utc": "2026-07-03T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        }
+      ]
+    },
+    {
+      "id": "temple_way_pm10",
+      "station_label": "Bristol Temple Way (UKA00631)",
+      "connector_id": 1,
+      "station_id": 7353,
+      "timeseries_id": 14,
+      "pollutant_code": "pm10",
+      "permitted_timeseries_ids": [
+        14
+      ],
+      "start_utc": "2026-07-03T00:00:00.000Z",
+      "end_utc": "2026-10-01T00:00:00.000Z",
+      "views": [
+        {
+          "id": "24h",
+          "label": "24 hours",
+          "start_utc": "2026-09-30T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        },
+        {
+          "id": "7d",
+          "label": "Seven days",
+          "start_utc": "2026-09-24T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        },
+        {
+          "id": "september",
+          "label": "Complete September 2026",
+          "start_utc": "2026-09-01T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        },
+        {
+          "id": "90d",
+          "label": "Complete 90-day interval",
+          "start_utc": "2026-07-03T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        }
+      ]
+    },
+    {
+      "id": "temple_way_no2",
+      "station_label": "Bristol Temple Way (UKA00631)",
+      "connector_id": 1,
+      "station_id": 445,
+      "timeseries_id": 612,
+      "pollutant_code": "no2",
+      "permitted_timeseries_ids": [
+        612
+      ],
+      "start_utc": "2026-07-03T00:00:00.000Z",
+      "end_utc": "2026-10-01T00:00:00.000Z",
+      "views": [
+        {
+          "id": "24h",
+          "label": "24 hours",
+          "start_utc": "2026-09-30T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        },
+        {
+          "id": "7d",
+          "label": "Seven days",
+          "start_utc": "2026-09-24T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        },
+        {
+          "id": "september",
+          "label": "Complete September 2026",
+          "start_utc": "2026-09-01T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        },
+        {
+          "id": "90d",
+          "label": "Complete 90-day interval",
+          "start_utc": "2026-07-03T00:00:00.000Z",
+          "end_utc": "2026-10-01T00:00:00.000Z"
+        }
+      ]
+    }
+  ]
+}
