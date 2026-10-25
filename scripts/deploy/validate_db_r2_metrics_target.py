@@ -49,10 +49,8 @@ def unique_object(pairs):
 
 
 def validate_local(env):
-    environment = required(env, "UK_AQ_DB_R2_METRICS_TARGET_ENV")
+    environment = required(env, "UK_AQ_ENV_NAME")
     require(environment in {"TEST", "LIVE"}, "Target environment must be TEST or LIVE.")
-    require(required(env, "UK_AQ_ENV_NAME") == environment,
-            "Target environment disagrees with the canonical environment.")
     repository = required(env, "GITHUB_REPOSITORY")
     require(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository),
             "Invalid running repository identity.")
@@ -70,7 +68,7 @@ def validate_local(env):
     }, "Approved target must contain exactly the four documented identity fields.")
     require(all(isinstance(value, str) for value in approved.values()),
             "Approved identity fields must be strings.")
-    account = required(env, "UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID")
+    account = required(env, "UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID")
     worker = required(env, "UK_AQ_DB_R2_METRICS_API_WORKER_NAME")
     require(re.fullmatch(r"[a-f0-9]{32}", account), "Invalid Cloudflare account identifier.")
     require(re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", worker), "Invalid Worker name.")
@@ -81,7 +79,7 @@ def validate_local(env):
         "worker_name": worker,
     }, "Selected environment/repository/account/Worker tuple is not approved.")
 
-    token = required(env, "UK_AQ_DB_R2_METRICS_CLOUDFLARE_API_TOKEN")
+    token = required(env, "CLOUDFLARE_API_TOKEN")
     require(not any(character.isspace() for character in token),
             "Invalid Cloudflare credential format.")
     # Check the complete upload payload before the first remote mutation.

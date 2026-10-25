@@ -8,12 +8,11 @@ are unchanged. The Node runtime pin remains in separate draft PR #131.
 
 Before either deployment or secret upload, the workflow:
 
-1. requires exact `TEST` or `LIVE` in `UK_AQ_DB_R2_METRICS_TARGET_ENV`, matching
-   the existing canonical `UK_AQ_ENV_NAME`;
+1. requires exact `TEST` or `LIVE` directly in canonical `UK_AQ_ENV_NAME`;
 2. requires existing `UK_AQ_GITHUB_REPO` to match Actions' `GITHUB_REPOSITORY`;
 3. compares that environment/repository and the explicitly selected account and
    Worker with an independently reviewed approval record;
-4. requires the Metrics-specific Cloudflare token and all eleven upload inputs,
+4. requires the selected `CLOUDFLARE_API_TOKEN` and all eleven upload inputs,
    including a nonblank `UK_AQ_DB_SIZE_API_TOKEN`, before any remote mutation;
 5. uses that credential for one read-only GET of secret-name/type metadata at
    the approved account's exact Worker path. All eleven existing secret-text
@@ -49,8 +48,7 @@ Repository **variables**:
 | --- | --- |
 | `UK_AQ_ENV_NAME` | Existing canonical environment, exactly `TEST` or `LIVE` |
 | `UK_AQ_GITHUB_REPO` | Existing explicit repository, matching the running repository |
-| `UK_AQ_DB_R2_METRICS_TARGET_ENV` | Same canonical environment; no aliases or blank value |
-| `UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID` | Independently verified approved account ID; read from variables, as catalogued |
+| `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID` | Sole selected account variable, already used by Latest Snapshot R2 API; must equal the independently approved account ID |
 | `UK_AQ_DB_R2_METRICS_API_WORKER_NAME` | Exact already-provisioned Worker in that account |
 | `UK_AQ_DB_R2_METRICS_APPROVED_TARGET` | New independent approval record described below |
 | `UK_AQ_R2_HISTORY_VERSION` | Existing authorised `v1`, `v2` or `v3`; do not change to pass admission |
@@ -59,20 +57,26 @@ Repository **variables**:
 
 Repository **secrets**, all nonblank:
 
-- `UK_AQ_DB_R2_METRICS_CLOUDFLARE_API_TOKEN`: the existing approved credential for
-  this account/Worker, with Worker secret-metadata read and the already-required
-  deployment/secret-write permissions. The generic token is no longer consulted.
+- `CLOUDFLARE_API_TOKEN`: the sole selected deployment credential, already used
+  by Blog Feed. It must read secret metadata and perform the existing Worker
+  deployments and secret synchronisation for the exact approved account/Worker.
+  Successful Blog Feed deployment alone does not establish those permissions.
 - `SB_SECRET_KEY`, `OBS_AQIDB_SECRET_KEY`: existing keys for their matching projects.
 - `CFLARE_R2_ACCESS_KEY_ID`, `CFLARE_R2_SECRET_ACCESS_KEY`: existing R2 credential pair.
 - `UK_AQ_DB_SIZE_API_TOKEN`: existing authentication secret, compatible with the
   deployed Worker and its normal dashboard callers.
 
-Do not create a new secret, copy generic credentials into the Metrics-specific
-slot, rotate a value or silently change accounts to satisfy this checklist. If a
-required existing secret is unavailable or its ownership cannot be established,
-leave this PR unmerged and resolve that operational prerequisite separately.
-The old Metrics account-ID secret and generic Cloudflare secrets are ignored by
-this workflow; this PR neither edits nor deletes them, since others may use them.
+These are deliberate single-source selections, not fallback chains. Missing or
+invalid selected inputs fail closed even if retired Metrics-specific settings,
+other account IDs or other tokens exist. Do not rotate or copy credentials or
+silently change accounts to satisfy admission. If `CLOUDFLARE_API_TOKEN` access
+and required write permissions for this exact target cannot be established,
+leave this PR blocked. Metadata access proves read access only; the operator must
+verify the token's existing deployment and secret-write grants before merge.
+No GitHub variable or secret value is created, edited, deleted or synchronised.
+The three retired Metrics-specific selection keys are no longer consumed or
+catalogued here; their historical archive references are preserved. Shared
+catalogue entries used by other workflows remain intact.
 
 `UK_AQ_DB_R2_METRICS_APPROVED_TARGET` is a JSON object with exactly four string
 fields (shown as a schema template, not values to apply):
