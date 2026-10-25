@@ -19,65 +19,31 @@ jobs:
   deploy-worker:
     runs-on: ubuntu-latest
     env:
-      UK_AQ_DB_R2_METRICS_API_WORKER_NAME: ${{ vars.UK_AQ_DB_R2_METRICS_API_WORKER_NAME || 'uk-aq-db-r2-metrics-api' }}
-      UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID || secrets.UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID || '' }}
-      UK_AQ_DB_R2_METRICS_CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN || secrets.UK_AQ_DB_R2_METRICS_CLOUDFLARE_API_TOKEN || '' }}
+      UK_AQ_DB_R2_METRICS_API_WORKER_NAME: ${{ vars.UK_AQ_DB_R2_METRICS_API_WORKER_NAME }}
+      UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID }}
+      UK_AQ_DB_R2_METRICS_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_DB_R2_METRICS_CLOUDFLARE_API_TOKEN }}
       UK_AQ_DB_R2_METRICS_TARGET_ENV: ${{ vars.UK_AQ_DB_R2_METRICS_TARGET_ENV || '' }}
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
+      UK_AQ_GITHUB_REPO: ${{ vars.UK_AQ_GITHUB_REPO }}
+      UK_AQ_DB_R2_METRICS_APPROVED_TARGET: ${{ vars.UK_AQ_DB_R2_METRICS_APPROVED_TARGET }}
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Validate Cloudflare credentials
-        run: |
-          set -euo pipefail
-          if [ -z "${UK_AQ_DB_R2_METRICS_API_WORKER_NAME}" ]; then
-            echo "Missing variable UK_AQ_DB_R2_METRICS_API_WORKER_NAME."
-            exit 1
-          fi
-          if [ -z "${UK_AQ_DB_R2_METRICS_CLOUDFLARE_API_TOKEN}" ]; then
-            echo "Missing secret CLOUDFLARE_API_TOKEN (or fallback UK_AQ_DB_R2_METRICS_CLOUDFLARE_API_TOKEN)."
-            exit 1
-          fi
-          if [ -z "${UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID}" ]; then
-            echo "Missing secret CLOUDFLARE_ACCOUNT_ID (or fallback UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID)."
-            exit 1
-          fi
-          case "${UK_AQ_R2_HISTORY_VERSION}" in
-            v1|v2|v3) ;;
-            "")
-              echo "Missing GitHub variable UK_AQ_R2_HISTORY_VERSION."
-              exit 1
-              ;;
-            *)
-              echo "Invalid UK_AQ_R2_HISTORY_VERSION=${UK_AQ_R2_HISTORY_VERSION}; expected v1, v2, or v3."
-              exit 1
-              ;;
-          esac
-
-          target_env="$(printf '%s' "${UK_AQ_DB_R2_METRICS_TARGET_ENV}" | tr '[:upper:]' '[:lower:]')"
-          worker_name_lc="$(printf '%s' "${UK_AQ_DB_R2_METRICS_API_WORKER_NAME}" | tr '[:upper:]' '[:lower:]')"
-          if [ "${target_env}" = "test" ]; then
-            # TEST is the formal environment. The already-provisioned Worker may
-            # legitimately retain a cic-test marker in its resource name.
-            if [[ "${worker_name_lc}" != *"test"* ]] && [[ "${worker_name_lc}" != *"cic-test"* ]]; then
-              echo "Refusing deploy: target env 'TEST' requires the existing TEST Worker resource name (current: ${UK_AQ_DB_R2_METRICS_API_WORKER_NAME})."
-              exit 1
-            fi
-          fi
-          if [ "${target_env}" = "live" ] || [ "${target_env}" = "prod" ] || [ "${target_env}" = "production" ]; then
-            if [[ "${worker_name_lc}" == *"test"* ]] || [[ "${worker_name_lc}" == *"cic-test"* ]]; then
-              echo "Refusing deploy: target env '${target_env}' cannot deploy a test worker name (${UK_AQ_DB_R2_METRICS_API_WORKER_NAME})."
-              exit 1
-            fi
-          fi
-
-          masked_account_id="${UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID:0:4}...${UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID: -4}"
-          echo "Deploy target summary:"
-          echo "  target_env=${target_env:-unset}"
-          echo "  worker_name=${UK_AQ_DB_R2_METRICS_API_WORKER_NAME}"
-          echo "  account_id=${masked_account_id}"
-          echo "  r2_history_version=${UK_AQ_R2_HISTORY_VERSION}"
+      - name: Admit approved deployment target and required bindings
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
+          OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
+          OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
+          CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT }}
+          CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET }}
+          CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION }}
+          CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
+          CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
+          UK_AQ_DB_SIZE_API_TOKEN: ${{ secrets.UK_AQ_DB_SIZE_API_TOKEN }}
+        run: python3 scripts/deploy/validate_db_r2_metrics_target.py
 
       - name: Deploy Worker (base)
         uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0
@@ -92,20 +58,30 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ env.UK_AQ_DB_R2_METRICS_CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ env.UK_AQ_DB_R2_METRICS_CLOUDFLARE_ACCOUNT_ID }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}
+          OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
+          OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
+          CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT }}
+          CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET }}
+          CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION }}
+          CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
+          CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
+          UK_AQ_DB_SIZE_API_TOKEN: ${{ secrets.UK_AQ_DB_SIZE_API_TOKEN }}
         run: |
           set -euo pipefail
           secrets_json="$(jq -n \
-            --arg SUPABASE_URL "${{ vars.SUPABASE_URL }}" \
-            --arg SB_SECRET_KEY "${{ secrets.SB_SECRET_KEY }}" \
-            --arg OBS_AQIDB_SUPABASE_URL "${{ vars.OBS_AQIDB_SUPABASE_URL }}" \
-            --arg OBS_AQIDB_SECRET_KEY "${{ secrets.OBS_AQIDB_SECRET_KEY }}" \
-            --arg CFLARE_R2_ENDPOINT "${{ vars.CFLARE_R2_ENDPOINT }}" \
-            --arg CFLARE_R2_BUCKET "${{ vars.CFLARE_R2_BUCKET }}" \
-            --arg CFLARE_R2_REGION "${{ vars.CFLARE_R2_REGION }}" \
-            --arg CFLARE_R2_ACCESS_KEY_ID "${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}" \
-            --arg CFLARE_R2_SECRET_ACCESS_KEY "${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}" \
+            --arg SUPABASE_URL "${SUPABASE_URL}" \
+            --arg SB_SECRET_KEY "${SB_SECRET_KEY}" \
+            --arg OBS_AQIDB_SUPABASE_URL "${OBS_AQIDB_SUPABASE_URL}" \
+            --arg OBS_AQIDB_SECRET_KEY "${OBS_AQIDB_SECRET_KEY}" \
+            --arg CFLARE_R2_ENDPOINT "${CFLARE_R2_ENDPOINT}" \
+            --arg CFLARE_R2_BUCKET "${CFLARE_R2_BUCKET}" \
+            --arg CFLARE_R2_REGION "${CFLARE_R2_REGION}" \
+            --arg CFLARE_R2_ACCESS_KEY_ID "${CFLARE_R2_ACCESS_KEY_ID}" \
+            --arg CFLARE_R2_SECRET_ACCESS_KEY "${CFLARE_R2_SECRET_ACCESS_KEY}" \
             --arg UK_AQ_R2_HISTORY_VERSION "${UK_AQ_R2_HISTORY_VERSION}" \
-            --arg UK_AQ_DB_SIZE_API_TOKEN "${{ secrets.UK_AQ_DB_SIZE_API_TOKEN }}" \
+            --arg UK_AQ_DB_SIZE_API_TOKEN "${UK_AQ_DB_SIZE_API_TOKEN}" \
             '{SUPABASE_URL: $SUPABASE_URL, SB_SECRET_KEY: $SB_SECRET_KEY, OBS_AQIDB_SUPABASE_URL: $OBS_AQIDB_SUPABASE_URL, OBS_AQIDB_SECRET_KEY: $OBS_AQIDB_SECRET_KEY, CFLARE_R2_ENDPOINT: $CFLARE_R2_ENDPOINT, CFLARE_R2_BUCKET: $CFLARE_R2_BUCKET, CFLARE_R2_REGION: $CFLARE_R2_REGION, CFLARE_R2_ACCESS_KEY_ID: $CFLARE_R2_ACCESS_KEY_ID, CFLARE_R2_SECRET_ACCESS_KEY: $CFLARE_R2_SECRET_ACCESS_KEY, UK_AQ_R2_HISTORY_VERSION: $UK_AQ_R2_HISTORY_VERSION, UK_AQ_DB_SIZE_API_TOKEN: $UK_AQ_DB_SIZE_API_TOKEN} | with_entries(select(.value != ""))')"
           for attempt in 1 2 3; do
             if printf "%s" "$secrets_json" | npx --yes wrangler@4 secret bulk --name "${UK_AQ_DB_R2_METRICS_API_WORKER_NAME}"; then
