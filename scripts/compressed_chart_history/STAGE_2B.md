@@ -1,195 +1,92 @@
-# Stage 2B: Sleepercar TEST compressed chart-history pilot
+# Separately authorised P2 TEST operation
 
-## Precomputed-AQI extension (repository preparation)
+These instructions are prepared, **not executed**. Review both implementation PRs first. Deployment, data reads/generation, private R2 publication and workflow dispatch require the subsequent explicit TEST operation authorisation. Never point these steps at LIVE. The prior September pilot commands are superseded by the finite configuration protocol in README.md; prior objects and accepted originals are not migrated or rewritten.
 
-The current code can publish paired schema-v2 observation/AQI gzip objects from
-a freshly exported, complete v3 September candidate. AQI completeness is
-independent of observation coverage; missing preceding PM context remains
-partial. The Worker streams the selected AQI gzip object for schema v2 and
-keeps the legacy request-time route for existing schema-v1 publications. The
-experimental viewer labels both modes. No remote export, publication, Worker
-deployment, Pages deployment or proxy activation follows from this code change.
+## Before execution
 
-The original Stage 2B account below records the deployed observation-only
-pilot and its earlier operator setup. For this extension, regenerate the v3
-September candidate with the current exporter; do not reuse the earlier
-observation-only candidate if precomputed AQI is intended. Retain the current
-selector bytes before an authorised `--publish` so rollback can restore them.
+Supply real metadata for the finite AURN sample and context as described in README.md. Establish accepted verification interpretation from genuine evidence. Confirm selected canonical generation v3, source/binding availability through the terminal endpoint, dedicated derived IAM permissions, existing secrets, private bucket and Access Service Auth policy, allowed website origin, Free plan and route-attributed CPU telemetry. Preserve current private Worker/proxy deployment configuration and any experimental selector bytes for rollback. Keep original JSONgen control/registrations, Prune/Integrity and schedulers untouched.
 
-Status: **code prepared, not an operational deployment**. This is a TEST-only
-experiment. Authoritative requirements remain in
-`TEST-uk-aq/uk-aq-system-docs/system_docs/station_charts/compressed_history_json_test_prototype_contract.md`.
-No normal chart route, canonical R2 history, Integrity, backups, scheduler or
-LIVE runtime has been changed by this pilot. Do not deploy as a side effect of
-reviewing code.
+Use Node 22+ and installed Ops dependencies (`npm ci` in the real selected checkout). Required private paths/values below are operator-supplied; no example data IDs or cloud resources are implied. POC_ENV_FILE contains existing source/derived settings and UK_AQ_ENV_NAME; never print its secrets. The separate config JSON is reviewed, enabled and fully populated. Use a new experiment prefix/ID for new configuration.
 
-## Account and security topology
+### Manual export and paired publication
 
-- **Sleepercar TEST Cloudflare account**: `sleepercar.co.uk`,
-  `41a81f781d3bd7234fde0b25df51e879`. The dedicated private R2 bucket
-  `uk-aq-chart-history-json-test` was created 09/10/2026 in WEUR, Standard.
-  It was empty at creation. The TEST-only experimental Worker
-  `uk-aq-compressed-chart-history-test` must be deployed **in this account**
-  with an R2 binding to this bucket.
-- **ukaq.co.uk Cloudflare account**: hosts the existing TEST cache proxy, which
-  must remain there for its ukaq.co.uk routing. Its experimental route calls
-  Sleepercar over **authenticated HTTPS**, not a cross-account service binding.
-  No new experimental Worker or derived bucket belongs in this account.
-- Canonical TEST observation history remains independent in Sleepercar R2.
-  The publisher uses dedicated bucket-scoped credentials and never mutates
-  canonical history.
-- The baseline TEST proxy has `UK_AQ_COMPRESSED_CHART_ENABLED = "false"`.
-  Normal pushes and ordinary deployments keep it disabled and return
-  `503 prototype_binding_unavailable` for the experimental endpoint. Only
-  the explicit workflow input opts in to the external service.
+Only after source-read/generation authorisation, for each genuine selected sample:
 
-**Cross-account protection has two layers:** an operator-created Sleepercar
-Cloudflare Access self-hosted application with **Service Auth** policy, and the
-experimental Worker's existing `X-UK-AQ-Upstream-Auth` secret check. The proxy
-sends `CF-Access-Client-Id`, `CF-Access-Client-Secret` and the upstream
-secret server-side, after enforcing its ordinary allowed-origin and real
-Turnstile-backed session cookie. Browser JavaScript never receives these tokens.
-No local-dev bypass, direct unauthenticated R2 URL, public r2.dev bucket or
-workers.dev/preview route is permitted. The TEST upstream origin must be a
-clean HTTPS **subdomain of sleepercar.co.uk**, not a caller-supplied URL.
-
-## Source and publication authority
-
-Only AURN connector 1, physical timeseries 212, station 248 and PM2.5 are
-admitted. The approved samples are complete v3 September 2026 (664 rows,
-4,223-byte gzip) and equivalent v3/v2 1 September (24 rows each, 903/828-byte
-gzip). Retained v2 for 2–30 September is unavailable. Never publish an
-incomplete v2 month. Raw negative source values and nullable row station IDs
-are preserved. The binding remains station 248 and each non-null row station ID
-must equal 248.
-
-The publisher is `scripts/compressed_chart_history/publish.mjs`. Its default
-operation is a **local-only preflight with zero remote requests**. Examples:
-
-```bash
-node scripts/compressed_chart_history/publish.mjs \
-  --candidate /Users/mikehinford/uk-aq-work/compressed-chart-history/stage2a-v3-complete-month/candidate-manifest.d3e42c3f0417ff52759f9fa2746ce39a0d88dc40795e49c4470736b99ec5dd84.json \
-  --sample-id v3-september-2026
-node scripts/compressed_chart_history/publish.mjs \
-  --candidate /Users/mikehinford/uk-aq-work/compressed-chart-history/stage2a-final-overlap/candidate-manifest.d582983bfc30504014ed7076962f55092f4e2e46eda58391d3bca99ecedf5001.json \
-  --sample-id v3-2026-09-01
-node scripts/compressed_chart_history/publish.mjs \
-  --candidate /Users/mikehinford/uk-aq-work/compressed-chart-history/stage2a-final-overlap/candidate-manifest.d582983bfc30504014ed7076962f55092f4e2e46eda58391d3bca99ecedf5001.json \
-  --sample-id v2-2026-09-01
+```sh
+: "${POC_ENV_FILE:?private existing environment file}"
+: "${POC_CONFIG:?private reviewed experiment JSON}"
+: "${POC_SAMPLE_ID:?configured finite sample ID}"
+: "${POC_OUTPUT_DIR:?new absolute private directory with an existing parent outside the repository workspace}"
+node --env-file="$POC_ENV_FILE" scripts/compressed_chart_history/export.mjs \
+  --config "$POC_CONFIG" --sample-id "$POC_SAMPLE_ID" --output-dir "$POC_OUTPUT_DIR"
 ```
 
-The three sample candidates must exist at those exact local paths; use their
-actual paths if the operator has regenerated the exports. Source digests,
-JSON/gzip round trips, coverage and manifest identities are checked before
-publication. Incomplete combined-month candidates are rejected.
+Exit 0 plus complete candidate/report means a local exploratory export, not source freshness or production acceptance. Exit 2/incomplete report or missing candidate after any failure means do not publish. The report pins runtime, source GET/decode/prepare wall/process CPU, AQI wall time, peak process RSS, bytes/counts, source schema/status/context and exact candidate identity. Node CPU/RSS are not Worker metrics. Inspect raw row fidelity and shared AQI results before selecting output. A seven-day source interval may be the first bounded configuration; the full comparison needs the primary month/90-day extent and genuine context, not merely 15/17 October events.
 
-A future operator-authorised publish uses `node --env-file=.env.compressed-chart-test`
-plus the same arguments, `--derived-bucket uk-aq-chart-history-json-test --publish`.
-The private, **untracked** environment contains:
+Take POC_CANDIDATE from the report's exact candidate path/digest, not an arbitrary glob. Local preflight makes zero remote calls. Only the second command writes the authorised private derived namespace:
 
-```text
-UK_AQ_ENV_NAME=TEST
-UK_AQ_COMPRESSED_CHART_R2_ENDPOINT=https://41a81f781d3bd7234fde0b25df51e879.r2.cloudflarestorage.com
-UK_AQ_COMPRESSED_CHART_R2_ACCESS_KEY_ID=<dedicated bucket-scoped key>
-UK_AQ_COMPRESSED_CHART_R2_SECRET_ACCESS_KEY=<dedicated bucket-scoped secret>
+```sh
+: "${POC_CANDIDATE:?exact private candidate-manifest SHA path}"
+node --env-file="$POC_ENV_FILE" scripts/compressed_chart_history/publish.mjs \
+  --config "$POC_CONFIG" --sample-id "$POC_SAMPLE_ID" --candidate "$POC_CANDIDATE"
+node --env-file="$POC_ENV_FILE" scripts/compressed_chart_history/publish.mjs \
+  --config "$POC_CONFIG" --sample-id "$POC_SAMPLE_ID" --candidate "$POC_CANDIDATE" --publish
 ```
 
-These are placeholders, not actual keys. Never commit them or print secrets.
-The publisher pins the exact Sleepercar account and bucket and rejects reuse of
-canonical `CFLARE_R2_*` credentials where present. Only gzip, immutable source
-evidence and publication manifest are uploaded. R2 read-back verification
-precedes a publish-last selector update at
-`experimental/compressed-chart-history/v1/latest.json`. An ambiguous selector
-PUT requires inspecting remote state before retrying. Keep a saved prior
-complete selector for rollback; single operator only (no R2 compare-and-swap).
+Retain each candidate/report and publication outcome/operation counts privately. Verify selected manifest pins and readback. A failed/conflicting conditional write requires current authoritative selector inspection before retry; never overwrite a failed precondition unconditionally. Do not register these candidates in managed VERIFIED control, reconstruct the 16 October original or dispatch a repair/reconciler.
 
-## Separately authorised provisioning and activation
+### Protected Worker, proxy and website
 
-1. Verify the Sleepercar bucket is private, has no public r2.dev/custom R2
-   domain, and is bound only to the experimental Worker. Confirm access to the
-   Sleepercar account before any Wrangler command.
-2. Choose an unused HTTPS subdomain of `sleepercar.co.uk` for the Worker.
-   Provision a Cloudflare Access self-hosted application protecting that exact
-   hostname, with a Service Auth policy allowing only the dedicated service
-   token. Preserve the token ID/secret securely. Do **not** expose the origin
-   before its Access policy is active.
-3. The baseline Worker `workers/uk_aq_compressed_chart_history/wrangler.toml`
-   deliberately has no HTTP route, workers.dev or preview URL. Create a local,
-   untracked `wrangler.deploy.toml` copy, adding a verified custom-domain
-   route only after step 2. Example syntax (replace the chosen hostname):
+Provisioning/account/access changes are separate operator actions within the later approved scope. Confirm an existing Access Service Auth policy on the exact private upstream hostname before deploying its route. Browser code receives neither Access tokens nor storage credentials.
 
-   ```toml
-   [[routes]]
-   pattern = "uk-aq-chart-history-test.sleepercar.co.uk"
-   custom_domain = true
-   ```
+Render local configuration **disabled** first; this helper itself has no network or data operation:
 
-   Set `CLOUDFLARE_ACCOUNT_ID=41a81f781d3bd7234fde0b25df51e879` and
-   authenticate to Sleepercar. Check Wrangler's dry-run config; later deploy
-   `uk-aq-compressed-chart-history-test` explicitly. Provision its
-   `UK_AQ_EDGE_UPSTREAM_SECRET` from the existing TEST secret source. The
-   Worker retains its independent fail-closed header check.
-4. Set up a dedicated Sleepercar R2 API token scoped to this derived bucket.
-   After separately authorised deployment, run the three manual publications
-   above with `--publish`, using only the private Sleepercar endpoint.
-5. Configure the following **TEST ops GitHub repository** items for the TEST
-   cache proxy's deployment account (the account hosting ukaq.co.uk):
-
-   - Variable `UK_AQ_COMPRESSED_CHART_UPSTREAM_URL`: the selected
-     `https://<sleepercar-test-subdomain>/` origin, no path or query.
-   - Secret `UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_ID`: Sleepercar Access service token ID.
-   - Secret `UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_SECRET`: paired Access service token secret.
-
-   The existing proxy `UK_AQ_EDGE_UPSTREAM_SECRET` must equal the pilot
-   Worker's header-auth secret, but never expose or copy it into website files.
-6. Only **after** the Worker is reachable behind Access and v3 September has
-   been published, manually activate using:
-
-   ```bash
-   gh workflow run uk_aq_cache_proxy_deploy.yml \
-     --repo TEST-uk-aq/uk-aq-ops \
-     -f activate_compressed_chart_history=true
-   ```
-
-   The workflow verifies actual Access-authenticated manifest access and
-   sample identity before enabling `UK_AQ_COMPRESSED_CHART_ENABLED="true"`
-   in its generated proxy config and injecting TEST-only upstream/token secrets.
-   No cross-account service binding is created.
-
-**Rollback:** an ordinary proxy deployment without the activation input
-restores the disabled baseline:
-
-```bash
-gh workflow run uk_aq_cache_proxy_deploy.yml --repo TEST-uk-aq/uk-aq-ops
+```sh
+: "${POC_WORKER_NAME:?approved private Worker name}"
+: "${POC_UPSTREAM_HOSTNAME:?approved Access-protected bare hostname}"
+: "${POC_DISABLED_CONFIG:?new private absolute TOML path}"
+node --env-file="$POC_ENV_FILE" scripts/compressed_chart_history/render-config.mjs \
+  --config "$POC_CONFIG" --worker-name "$POC_WORKER_NAME" \
+  --hostname "$POC_UPSTREAM_HOSTNAME" --output "$POC_DISABLED_CONFIG"
+npx wrangler deploy --config "$POC_DISABLED_CONFIG"
 ```
 
-The Worker, bucket, Access application and immutable objects may remain in the
-Sleepercar TEST account for independent later cleanup. No canonical history
-objects should be deleted. Do not run these workflows as part of code review.
+The account/bucket come from the reviewed derived endpoint/config, not application literals. Configure the existing UK_AQ_EDGE_UPSTREAM_SECRET through the approved secret mechanism (Wrangler interactive secret put is available); do not put it into JSON/TOML/source or terminal logs. Keep workers.dev and preview URLs disabled.
 
-## Real TEST measurements after deployment
+After private deployment/authentication and immutable publication readiness, render a fresh explicitly enabled config and deploy only when authorised:
 
-The isolated `compressed-chart-history-test/` page remains unchanged and
-compares normal v3 history to JSON v3/v2 for the verified one-day overlap, and
-normal v3 to JSON v3 for September (30 days). Capture real cold/warm browser
-request, gzip transfer/parse, normalisation, cache commit, first visible line,
-full history, AQI, SVG render, cache state and Cloudflare Worker CPU/outcomes.
+```sh
+: "${POC_ENABLED_CONFIG:?new private absolute TOML path}"
+node --env-file="$POC_ENV_FILE" scripts/compressed_chart_history/render-config.mjs \
+  --config "$POC_CONFIG" --worker-name "$POC_WORKER_NAME" \
+  --hostname "$POC_UPSTREAM_HOSTNAME" --output "$POC_ENABLED_CONFIG" --enable
+npx wrangler deploy --config "$POC_ENABLED_CONFIG"
+gh workflow run uk_aq_cache_proxy_deploy.yml --repo TEST-uk-aq/uk-aq-ops \
+  --ref main -f activate_compressed_chart_history=true
+```
 
-The first 23 hours of PM context can be incomplete; report incomplete AQI rather
-than substituting the normal path. Negative canonical source values (`-99`)
-remain present for the shared point-eligibility rules. Workers Free CPU usage,
-Access handshake and **cross-account HTTP latency** must be measured separately.
-This TEST path has an extra HTTP hop compared with a possible same-account
-LIVE service binding: do not automatically extrapolate end-to-end latency or
-request counts to LIVE.
+The existing proxy workflow's explicit preflight now checks the protected catalog/environment and at least one selected publication, rather than a fixed September station. Its ordinary deployment still disables the prototype. Configure existing upstream URL, Access ID/secret, upstream secret and allowed origins before this dispatch. Confirm all samples needed for a particular comparison are actually published; catalog admission alone is not data acceptance.
 
-Initial pilot responses deliberately use `Cache-Control: no-store`. Manifest
-refresh, immutable gzip caches, correction freshness (preferred 1–2 hours),
-automatic regeneration and any LIVE adoption are separate future decisions.
+Deploy the companion TEST website through its existing Pages workflow only after separate authorisation. Its existing workflow remains unchanged. Open the existing isolated /compressed-chart-history-test/ path with browser-safe environment=APPROVED_ENVIRONMENT and, where needed, cache_base=APPROVED_TEST_CACHE_ORIGIN/api/aq query parameters. Values must match the authorised TEST deployment; no implicit cross-environment fallback exists. The page remains noindex and unlinked from normal navigation. No default chart source changes.
 
-System-documentation handover (Chat mode owner): after real deployment,
-record the Sleepercar account/bucket, Access-protected HTTPS origin and tokens
-by **configuration names only**, manual publish-last selector, TEST proxy
-activation/rollback, optional JSON provider, PM context, Worker CPU and
-cross-account-versus-LIVE latency qualification in the owning station-chart
-and deployment contracts. Do not copy secret values into documentation.
+## Real evaluation and expected evidence
+
+Alternate normal canonical-v3 and JSON modes under comparable device/network/cache conditions. Record deployed Ops/website SHAs, configuration SHA, exact source/algorithm/publication pins and UTC ranges. Confirm the normal route actually uses v3 and equivalent source observations/context. If canonical revisions changed, classify the comparison non-equivalent and choose/re-export a stable qualified interval before drawing latency conclusions.
+
+Retain actual authenticated normal response bodies (or a private browser network capture) and the corresponding JSON payloads for identical ranges/context. Compare raw observation multisets and per-hour AQI values/statuses against those real responses/shared calculations; timing metadata alone is not parity evidence.
+
+Use primary 24h, seven-day, full-month and 90-day views; switch pollutants/stations while mounted, change ranges quickly, repeat and Refresh. Confirm genuine gaps, zero/negative values, raw multiplicity/status provenance and nullable physical identity remain traceable to source; shared display filtering/merging stays the same as normal charts. Check exact hour-ending endpoint sets, daily/monthly joins and context, independent DAQI/EAQI results/status/missing reasons and latest-source-observation band cap. Include a genuine continuity transition only when admitted real data exists; otherwise record that case untested.
+
+Download viewer diagnostics. They include bounded raw request records, request IDs, public pins, first useful line, shared-controller observation completion, separate normalised part coverage/cache commit hooks, parse/hash/normalise/merge/render timings, object reuse and observed bytes. Source completeness, natural blank hours, browser settlement and correctness are distinct. Cache-based repeats may settle without new full-range response records. Current JSON head is at most 24h; the shared controller requests older chunks, which reuse decoded month objects. A 24h view fetches only intersecting objects; an exact month boundary can genuinely require the terminal fragment. The transport cache is bounded, cancellation is consumer-aware and Refresh discards it after requesting an origin-authoritative catalog. Timing/diagnostic overhead and cross-origin Resource Timing restrictions must be included in interpretation.
+
+Correlate IDs with actual Cloudflare per-Worker/per-route telemetry: manifest/catalog, observation, AQI, proxy/auth and normal control. Collect p50/p95/p99 only with adequate sample counts, maximum, over-10-ms share, exceededCpu and errors. Require reliable uncached headroom below 10 ms on every HTTP Worker. Browser elapsed time, request count headers and offline process CPU do not establish Worker CPU. Record observable memory and otherwise mark it unknown.
+
+Measure compressed observation + AQI + discovery bytes, actual R2 GET/HEAD/PUT counts/storage, generation/read amplification/revision churn and manual publication-to-Refresh delay. Inspect fail-closed local refusal using a genuinely incomplete candidate if available, then a separately authorised genuine revision and Refresh; unchanged genuine bytes with a new identity demonstrate discovery only, not repair propagation. Never mutate canonical source for a benchmark. No automation/freshness SLA is established by manual success.
+
+Before measuring, agree acceptable latency/resource/maintenance envelopes. GO requires same-source observation/AQI correctness, inspectable real charts, Free headroom, repeatable material benefit and a credible common-interface route to every applicable network. Missing evidence is not GO. NO-GO retains current charts and recommends authorised experimental retirement. The decision and any future rollout/cut-over remain separate operator actions; pollutant coverage is a separate policy from network coverage. Sensor.Community remains excluded and its conditional future hourly aggregation is not implemented here.
+
+## Rollback and Chat-mode handover
+
+Stop invoking the exporter/publisher. Disable the prototype flag/config through a separately authorised deployment; an ordinary proxy workflow deployment omitting activation restores its disabled route. Normal charts/canonical history require no rollback because they are unchanged. Preserve the last complete selectors/objects and original evidence; do not delete anything automatically. New-namespace partial uploads are unselected. Restoring a previous experimental selection/code requires explicit operational action and known bytes, not an unconditional blind overwrite. Exact prior code/workflow is archived in each implementation repository; configuration rollback sources remain in Git history.
+
+For ChatGPT Chat mode, update only the routed prototype/precomputed chart contracts after separately requested documentation maintenance. Distinguish prepared code from deployed acceptance; record protocol versions, finite generic configuration, explicit source-as-read authority, status/physical identity preservation, inclusive terminal endpoint/context, paired CAS/readback, authenticated cross-account route, browser cache/cancellation and unchanged normal charts/managed selector. Add the local-only configuration catalogue row from README.md to the external env-vars-master.csv if maintained there. Link both implementation PRs and their structural checks. After P2, add only actual deployments, source pins, correctness/CPU/timing/cost evidence and unresolved limitations. Do not imply all-writer authority, full monthly VERIFIED baseline, Sensor.Community activation, a GO decision or LIVE adoption from this implementation.

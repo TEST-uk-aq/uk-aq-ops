@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "enabled": false,
+  "experiment_id": null,
+  "environment": null,
+  "canonical_generation": "v3",
+  "network": null,
+  "source_mode": "exploratory_canonical_source_as_read",
+  "verification_mode": null,
+  "legacy_status_mode": null,
+  "status_authority_reference": null,
+  "observation_units": "ug/m3",
+  "algorithm_version": "aqilevels_hourly_v2",
+  "source_bucket": null,
+  "source_endpoint": null,
+  "derived_bucket": null,
+  "derived_endpoint": null,
+  "derived_prefix": null,
+  "samples": []
+}

@@ -1,0 +1,215 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Finite isolated chart-history experiment configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "description": "Runtime validation also requires explicit enablement, matched environment/resources, hour alignment, bounded intervals, unique samples and valid contained views. This is exploratory source-as-read authority only.",
+  "required": [
+    "schema_version",
+    "enabled",
+    "experiment_id",
+    "environment",
+    "canonical_generation",
+    "network",
+    "source_mode",
+    "verification_mode",
+    "legacy_status_mode",
+    "status_authority_reference",
+    "observation_units",
+    "algorithm_version",
+    "source_bucket",
+    "source_endpoint",
+    "derived_bucket",
+    "derived_endpoint",
+    "derived_prefix",
+    "samples"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "experiment_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+    },
+    "environment": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]{0,31}$"
+    },
+    "canonical_generation": {
+      "const": "v3"
+    },
+    "network": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "source_mode": {
+      "const": "exploratory_canonical_source_as_read"
+    },
+    "verification_mode": {
+      "enum": [
+        "pre_overlay_accepted",
+        "overlay_accepted"
+      ]
+    },
+    "legacy_status_mode": {
+      "enum": [
+        "sos_compatibility",
+        "persisted_verification_only"
+      ]
+    },
+    "status_authority_reference": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "observation_units": {
+      "const": "ug/m3"
+    },
+    "algorithm_version": {
+      "const": "aqilevels_hourly_v2"
+    },
+    "source_bucket": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 63
+    },
+    "source_endpoint": {
+      "type": "string",
+      "format": "uri"
+    },
+    "derived_bucket": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 63
+    },
+    "derived_endpoint": {
+      "type": "string",
+      "format": "uri"
+    },
+    "derived_prefix": {
+      "type": "string",
+      "pattern": "^experimental/[a-z0-9_/-]+$",
+      "maxLength": 180
+    },
+    "samples": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 6,
+      "items": {
+        "$ref": "#/$defs/sample"
+      }
+    }
+  },
+  "$defs": {
+    "sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "station_label",
+        "connector_id",
+        "station_id",
+        "timeseries_id",
+        "pollutant_code",
+        "permitted_timeseries_ids",
+        "start_utc",
+        "end_utc",
+        "views"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+        },
+        "station_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "connector_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "station_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "timeseries_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "pollutant_code": {
+          "enum": [
+            "pm25",
+            "pm10",
+            "no2"
+          ]
+        },
+        "permitted_timeseries_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "start_utc": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.000Z$"
+        },
+        "end_utc": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.000Z$"
+        },
+        "views": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/view"
+          }
+        }
+      }
+    },
+    "view": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "start_utc": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.000Z$"
+        },
+        "end_utc": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.000Z$"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "start_utc",
+        "end_utc"
+      ]
+    }
+  }
+}

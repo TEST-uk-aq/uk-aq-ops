@@ -1,96 +1,337 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Experimental UK AQ chart-history monthly JSON v1",
+  "title": "Experimental UK AQ chart-history monthly observations v2",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "kind", "identity", "source", "coverage", "row_columns", "observations"],
+  "required": [
+    "schema_version",
+    "kind",
+    "identity",
+    "source",
+    "coverage",
+    "row_columns",
+    "observations",
+    "publication_id",
+    "config_sha256",
+    "source_mode",
+    "environment",
+    "managed_publication_eligible",
+    "continuity",
+    "algorithm"
+  ],
   "properties": {
-    "schema_version": { "const": 1 },
-    "kind": { "const": "uk_aq_compressed_chart_history_month" },
+    "schema_version": {
+      "const": 2
+    },
+    "kind": {
+      "const": "uk_aq_compressed_chart_history_month"
+    },
     "identity": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["connector_id", "timeseries_id", "station_id", "pollutant_code"],
+      "required": [
+        "connector_id",
+        "timeseries_id",
+        "station_id",
+        "pollutant_code"
+      ],
       "properties": {
-        "connector_id": { "const": 1 },
-        "timeseries_id": { "type": "integer", "minimum": 1 },
-        "station_id": { "type": "integer", "minimum": 1 },
-        "pollutant_code": { "enum": ["pm25", "pm10", "no2"] }
+        "connector_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "timeseries_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "station_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "pollutant_code": {
+          "enum": [
+            "pm25",
+            "pm10",
+            "no2"
+          ]
+        }
       }
     },
     "source": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["generation", "bucket", "source_evidence", "physical_schemas", "verification"],
+      "required": [
+        "generation",
+        "bucket",
+        "source_evidence",
+        "physical_schemas",
+        "verification"
+      ],
       "properties": {
-        "generation": { "enum": ["v2", "v3"] },
-        "bucket": { "const": "uk-aq-history-cic-test" },
-        "source_evidence": { "$ref": "#/$defs/evidence" },
-        "physical_schemas": { "type": "array", "items": { "type": "object" } },
-        "verification": { "type": "object" }
+        "generation": {
+          "const": "v3"
+        },
+        "bucket": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 63
+        },
+        "source_evidence": {
+          "$ref": "#/$defs/evidence"
+        },
+        "physical_schemas": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "verification": {
+          "type": "object"
+        }
       }
     },
     "coverage": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["month_utc", "month_start_utc", "month_end_exclusive_utc", "requested_start_utc", "requested_end_exclusive_utc", "state", "complete", "row_count", "unique_timestamp_count", "duplicate_timestamp_row_count", "min_observed_at_utc", "max_observed_at_utc", "days"],
+      "required": [
+        "month_utc",
+        "requested_start_utc",
+        "requested_end_exclusive_utc",
+        "complete",
+        "row_count",
+        "unique_timestamp_count",
+        "min_observed_at_utc",
+        "max_observed_at_utc",
+        "days"
+      ],
       "properties": {
-        "month_utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}$" },
-        "month_start_utc": { "$ref": "#/$defs/utc" },
-        "month_end_exclusive_utc": { "$ref": "#/$defs/utc" },
-        "requested_start_utc": { "$ref": "#/$defs/utc" },
-        "requested_end_exclusive_utc": { "$ref": "#/$defs/utc" },
-        "state": { "enum": ["exported", "authoritative_absence", "incomplete"] },
-        "complete": { "type": "boolean" },
-        "row_count": { "type": "integer", "minimum": 0 },
-        "unique_timestamp_count": { "type": "integer", "minimum": 0 },
-        "duplicate_timestamp_row_count": { "type": "integer", "minimum": 0 },
-        "min_observed_at_utc": { "anyOf": [{ "$ref": "#/$defs/utc" }, { "type": "null" }] },
-        "max_observed_at_utc": { "anyOf": [{ "$ref": "#/$defs/utc" }, { "type": "null" }] },
+        "month_utc": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}$"
+        },
+        "requested_start_utc": {
+          "$ref": "#/$defs/utc"
+        },
+        "requested_end_exclusive_utc": {
+          "$ref": "#/$defs/utc"
+        },
+        "complete": {
+          "type": "boolean"
+        },
+        "row_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unique_timestamp_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "min_observed_at_utc": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/utc"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "max_observed_at_utc": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/utc"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "days": {
           "type": "array",
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["day_utc", "state", "row_count"],
+            "required": [
+              "day_utc",
+              "state",
+              "row_count",
+              "timeseries_id"
+            ],
             "properties": {
-              "day_utc": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
-              "state": { "enum": ["exported", "authoritative_absence", "unexported_missing_index", "unknown_missing_source_scope"] },
-              "row_count": { "type": "integer", "minimum": 0 }
+              "day_utc": {
+                "type": "string",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+              },
+              "state": {
+                "enum": [
+                  "exported",
+                  "authoritative_absence",
+                  "unexported_missing_index",
+                  "unknown_missing_source_scope"
+                ]
+              },
+              "row_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "timeseries_id": {
+                "type": "integer",
+                "minimum": 1
+              }
             }
-          }
+          },
+          "maxItems": 31
         }
       }
     },
-    "row_columns": { "const": ["observed_at_utc", "value", "station_id", "source_status", "verification_status"] },
+    "row_columns": {
+      "const": [
+        "observed_at_utc",
+        "value",
+        "station_id",
+        "source_status",
+        "verification_status",
+        "timeseries_id",
+        "embedded_verification_status",
+        "source_status_provenance"
+      ]
+    },
     "observations": {
       "type": "array",
       "items": {
         "type": "array",
-        "minItems": 5,
-        "maxItems": 5,
+        "minItems": 8,
+        "maxItems": 8,
         "prefixItems": [
-          { "$ref": "#/$defs/utc" },
-          { "type": "number" },
-          { "type": ["integer", "null"], "minimum": 1 },
-          { "type": ["string", "null"] },
-          { "enum": ["P", "R", null] }
+          {
+            "$ref": "#/$defs/utc"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          },
+          {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          {
+            "enum": [
+              "P",
+              "R",
+              null
+            ]
+          },
+          {
+            "type": "integer",
+            "minimum": 1
+          },
+          {
+            "enum": [
+              "P",
+              "R",
+              null
+            ]
+          },
+          {
+            "enum": [
+              "legacy_source_status_retained",
+              "original_source_status_unavailable"
+            ]
+          }
         ],
         "items": false
+      },
+      "maxItems": 100000
+    },
+    "publication_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "config_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "source_mode": {
+      "const": "exploratory_canonical_source_as_read"
+    },
+    "environment": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]{0,31}$"
+    },
+    "managed_publication_eligible": {
+      "const": false
+    },
+    "continuity": {
+      "type": "object"
+    },
+    "algorithm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "parameters",
+        "implementation_sha256",
+        "orchestration_sha256"
+      ],
+      "properties": {
+        "version": {
+          "const": "aqilevels_hourly_v2"
+        },
+        "parameters": {
+          "const": {
+            "pm_window_hours": 24,
+            "pm_min_valid_hours": 18,
+            "endpoint_convention": "hour_ending"
+          }
+        },
+        "implementation_sha256": {
+          "$ref": "#/$defs/digest"
+        },
+        "orchestration_sha256": {
+          "$ref": "#/$defs/digest"
+        }
       }
     }
   },
   "$defs": {
-    "utc": { "type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$" },
+    "utc": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+    },
     "evidence": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "sha256", "byte_size"],
+      "required": [
+        "path",
+        "sha256",
+        "byte_size"
+      ],
       "properties": {
-        "path": { "type": "string", "minLength": 1 },
-        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "byte_size": { "type": "integer", "minimum": 1 }
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "byte_size": {
+          "type": "integer",
+          "minimum": 1
+        }
       }
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     }
   }
 }

@@ -549,7 +549,7 @@ export function addCorsHeaders(headers: Headers, requestOrigin: string | null, a
   headers.set("Access-Control-Max-Age", "86400");
   headers.set(
     "Access-Control-Expose-Headers",
-    "CF-Cache-Status,ETag,X-UK-AQ-Cache,X-UK-AQ-Cache-Profile,X-UK-AQ-Timeseries-Source-Mode,X-UK-AQ-Has-Gap,X-UK-AQ-R2-Coverage-End,X-UK-AQ-Ingest-Tail-Start,X-UK-AQ-R2-Rows,X-UK-AQ-Ingest-Rows,X-UK-AQ-Cache-Key-Version,X-UK-AQ-Station-History-Cache-Key-Version,X-UK-AQ-Station-History-Cache-State,X-UK-AQ-Station-History-Cached-At,X-UK-AQ-Station-History-Fresh-Until,X-UK-AQ-Station-History-Stale-Until,X-UK-AQ-Station-History-Stale-Reason,X-UK-AQ-Prototype-Request-ID,X-UK-AQ-Prototype-Publication,X-UK-AQ-Prototype-Compressed-Bytes,X-UK-AQ-Prototype-R2-Reads,X-UK-AQ-Prototype-Cache,X-UK-AQ-Prototype-AQI-Wall-MS",
+    "CF-Cache-Status,ETag,X-UK-AQ-Cache,X-UK-AQ-Cache-Profile,X-UK-AQ-Timeseries-Source-Mode,X-UK-AQ-Has-Gap,X-UK-AQ-R2-Coverage-End,X-UK-AQ-Ingest-Tail-Start,X-UK-AQ-R2-Rows,X-UK-AQ-Ingest-Rows,X-UK-AQ-Cache-Key-Version,X-UK-AQ-Station-History-Cache-Key-Version,X-UK-AQ-Station-History-Cache-State,X-UK-AQ-Station-History-Cached-At,X-UK-AQ-Station-History-Fresh-Until,X-UK-AQ-Station-History-Stale-Until,X-UK-AQ-Station-History-Stale-Reason,X-UK-AQ-Prototype-Request-ID,X-UK-AQ-Prototype-Publication,X-UK-AQ-Prototype-Compressed-Bytes,X-UK-AQ-Prototype-R2-Reads,X-UK-AQ-Prototype-Cache,X-UK-AQ-Prototype-AQI-Wall-MS,X-UK-AQ-Prototype-Object-SHA256,X-UK-AQ-Prototype-AQI-Source,X-UK-AQ-Prototype-Config,X-UK-AQ-Prototype-Environment",
   );
   appendVary(headers, "Origin");
 }
@@ -2969,10 +2969,10 @@ export default {
       if (!sessionToken) return makeErrorResponse(401, "missing_session_cookie", requestOrigin, allowedOrigins);
       const authCheck = await verifyAccessToken(sessionToken, tokenSecret, requestOrigin);
       if (!authCheck.ok) return makeErrorResponse(401, authCheck.error, requestOrigin, allowedOrigins);
-      // The pilot Worker/R2 live in the separate Sleepercar TEST account.
+      // The private upstream is selected only by trusted deployment configuration.
       // Normal proxy deployments have this flag disabled; never use a service
       // binding, unauthenticated URL, local-dev bypass or browser-supplied host.
-      if (String(env.UK_AQ_ENV_NAME) !== "TEST"
+      if (!/^[A-Z][A-Z0-9_]{0,31}$/.test(String(env.UK_AQ_ENV_NAME || ""))
         || String(env.UK_AQ_COMPRESSED_CHART_ENABLED) !== "true") {
         return makeErrorResponse(503, "prototype_binding_unavailable", requestOrigin, allowedOrigins);
       }
@@ -2987,8 +2987,7 @@ export default {
       try { origin = new URL(upstreamOrigin); } catch {
         return makeErrorResponse(503, "prototype_origin_invalid", requestOrigin, allowedOrigins);
       }
-      if (origin.protocol !== "https:" || !/^[a-z0-9-]+\.sleepercar\.co\.uk$/.test(origin.hostname)
-        || origin.port || origin.pathname !== "/" || origin.search || origin.hash
+      if (origin.protocol !== "https:" || origin.port || origin.pathname !== "/" || origin.search || origin.hash
         || origin.username || origin.password) {
         return makeErrorResponse(503, "prototype_origin_invalid", requestOrigin, allowedOrigins);
       }
@@ -3011,6 +3010,10 @@ export default {
       if (upstream.status >= 300 && upstream.status < 400) {
         await upstream.body?.cancel();
         return makeErrorResponse(502, "prototype_upstream_redirect_refused", requestOrigin, allowedOrigins);
+      }
+      if (upstream.headers.get("X-UK-AQ-Prototype-Environment") !== String(env.UK_AQ_ENV_NAME)) {
+        await upstream.body?.cancel();
+        return makeErrorResponse(502, "prototype_environment_mismatch", requestOrigin, allowedOrigins);
       }
       const headers = new Headers(upstream.headers);
       headers.delete("Set-Cookie");

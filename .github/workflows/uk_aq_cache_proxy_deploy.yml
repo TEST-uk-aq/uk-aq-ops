@@ -128,10 +128,11 @@ jobs:
             exit 1
           fi
 
-      - name: Verify and enable optional Sleepercar compressed-chart HTTPS upstream
+      - name: Verify and enable configured private compressed-chart HTTPS upstream
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.activate_compressed_chart_history }}
         working-directory: workers/uk_aq_cache_proxy
         env:
+          PILOT_ENVIRONMENT: ${{ vars.UK_AQ_ENV_NAME }}
           PILOT_ORIGIN: ${{ vars.UK_AQ_COMPRESSED_CHART_UPSTREAM_URL || '' }}
           PILOT_ACCESS_ID: ${{ secrets.UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_ID || '' }}
           PILOT_ACCESS_SECRET: ${{ secrets.UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_SECRET || '' }}
@@ -147,14 +148,13 @@ jobs:
           const raw = process.env.PILOT_ORIGIN || "";
           let u;
           try { u = new URL(raw); } catch { process.exit(1); }
-          if (u.protocol !== "https:" || !/^[a-z0-9-]+\.sleepercar\.co\.uk$/.test(u.hostname)
-            || u.port || u.pathname !== "/" || u.search || u.hash || u.username || u.password) {
-            console.error("Pilot origin must be a clean HTTPS Sleepercar TEST subdomain.");
+          if (u.protocol !== "https:" || u.port || u.pathname !== "/" || u.search || u.hash || u.username || u.password) {
+            console.error("Pilot origin must be a clean explicitly configured HTTPS origin.");
             process.exit(1);
           }
           NODE
           # This read-only probe is run only after the private Worker, Access
-          # service policy and approved v3 sample are actually deployed.
+          # service policy and configured v3 publication are actually deployed.
           http_code="$(curl --silent --show-error --max-time 20 --connect-timeout 10 \
             --output "${RUNNER_TEMP}/uk_aq_chart_history_prototype_manifest.json" \
             --write-out '%{http_code}' \
@@ -162,17 +162,19 @@ jobs:
             --header "CF-Access-Client-Secret: ${PILOT_ACCESS_SECRET}" \
             --header "X-UK-AQ-Upstream-Auth: ${PILOT_UPSTREAM_SECRET}" \
             --header "Accept: application/json" \
-            "${PILOT_ORIGIN}/v1/manifest?sample=v3-september-2026")"
+            "${PILOT_ORIGIN%/}/v1/manifest")"
           if [ "${http_code}" != "200" ]; then
             echo "Sleepercar Worker not yet reachable/published through Access (HTTP ${http_code})."
             exit 1
           fi
-          jq -e '.schema_version == 1 and .sample_id == "v3-september-2026"
-            and .source_generation == "v3" and .identity.connector_id == 1
-            and .identity.station_id == 248 and .identity.timeseries_id == 212
-            and .identity.pollutant_code == "pm25"' \
+          jq -e --arg environment "${PILOT_ENVIRONMENT}" '
+            .schema_version == 2 and .kind == "uk_aq_compressed_chart_catalog"
+            and .environment == $environment and .source_generation == "v3"
+            and .source_mode == "exploratory_canonical_source_as_read"
+            and (.samples | length > 0 and length <= 6)
+            and any(.samples[]; (.publication_sha256 // "") | test("^[0-9a-f]{64}$"))' \
             "${RUNNER_TEMP}/uk_aq_chart_history_prototype_manifest.json" >/dev/null || {
-            echo "Sleepercar pilot returned unexpected manifest identity."
+            echo "Configured pilot returned unexpected catalog/environment or no publication."
             exit 1
           }
           sed -i 's/^UK_AQ_COMPRESSED_CHART_ENABLED = "false"$/UK_AQ_COMPRESSED_CHART_ENABLED = "true"/' wrangler.deploy.toml

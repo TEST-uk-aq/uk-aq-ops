@@ -1,20 +1,25 @@
 import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { buildAwsSignedRequest } from "../../workers/shared/r2_sigv4.mjs";
+import { validatePilotConfig, COMPRESSED_CHART_LIMITS } from "../../workers/shared/uk_aq_compressed_chart_pilot.mjs";
 
 export const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 export function requireCondition(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-// This pilot deliberately admits only AURN and the named TEST bucket. No LIST,
-// PUT, DELETE, database access, credential output or runtime-selector changes.
-export function createSourceReader(generation, { maxBytes = 512 * 1024 ** 2 } = {}) {
-  requireCondition(["v2", "v3"].includes(generation), "Select v2 or v3 explicitly");
-  requireCondition(process.env.UK_AQ_ENV_NAME === "TEST", "UK_AQ_ENV_NAME must be TEST");
-  requireCondition(process.env.CFLARE_R2_BUCKET === "uk-aq-history-cic-test", "Unexpected TEST bucket");
+// Read-only, finite selection. Environment/resource identity is operator config.
+export function createSourceReader(generation, { config, sample, contextStart, end, maxBytes = COMPRESSED_CHART_LIMITS.source_bytes } = {}) {
+  validatePilotConfig(config, process.env.UK_AQ_ENV_NAME);
+  requireCondition(generation === config.canonical_generation, "Selected generation mismatch");
+  requireCondition(config.samples.some(entry => entry.id === sample?.id), "Configured sample required");
+  requireCondition(process.env.CFLARE_R2_BUCKET === config.source_bucket, "Configured canonical bucket mismatch");
+  requireCondition(Number.isSafeInteger(maxBytes) && maxBytes > 0 && maxBytes <= COMPRESSED_CHART_LIMITS.source_bytes, "Source byte bound");
+  const deadline = performance.now() + COMPRESSED_CHART_LIMITS.duration_ms;
+  const checkBudget = () => requireCondition(performance.now() < deadline, "Source processing time budget exceeded");
   const endpoint = process.env.CFLARE_R2_ENDPOINT;
-  requireCondition(endpoint && new URL(endpoint).protocol === "https:", "HTTPS R2 endpoint required");
+  requireCondition(endpoint && new URL(endpoint).origin === config.source_endpoint
+    && [config.source_endpoint, `${config.source_endpoint}/`].includes(endpoint), "Configured canonical endpoint mismatch");
   const r2 = {
     endpoint, bucket: process.env.CFLARE_R2_BUCKET,
     region: process.env.CFLARE_R2_REGION || "auto",
@@ -31,15 +36,19 @@ export function createSourceReader(generation, { maxBytes = 512 * 1024 ** 2 } = 
   };
   function admit(key) {
     requireCondition(typeof key === "string" && !key.split("/").some((v) => !v || v === "." || v === ".."), "Invalid source key");
-    const observation = new RegExp(`^history/${generation}/observations/(?:_manifests/manifest\\.json|day_utc=\\d{4}-\\d{2}-\\d{2}/(?:manifest\\.json|connector_id=1/(?:manifest\\.json|pollutant_code=[a-z0-9_]+/[^/]+)))$`);
-    const index = new RegExp(`^history/_index_${generation}/(?:timeseries_binding/timeseries_id=\\d+\\.json|observations_timeseries/day_utc=\\d{4}-\\d{2}-\\d{2}/connector_id=1/(?:manifest\\.json|pollutant_code=[a-z0-9_]+/[^/]+))$`);
-    const verification = generation === "v3" && (
-      key === "history/_index_v3/verification/latest.json" ||
-      /^history\/v3\/verification\/connector_id=1\/manifests\/[0-9a-f]{64}\.json$/.test(key)
-    );
-    requireCondition(observation.test(key) || index.test(key) || verification, "Source key outside admitted TEST AURN roots");
+    const connector = sample.connector_id, pollutant = sample.pollutant_code;
+    const observation = new RegExp(`^history/${generation}/observations/(?:_manifests/manifest\\.json|day_utc=\\d{4}-\\d{2}-\\d{2}/(?:manifest\\.json|connector_id=${connector}/(?:manifest\\.json|pollutant_code=${pollutant}/[^/]+)))$`);
+    const index = new RegExp(`^history/_index_${generation}/observations_timeseries/day_utc=\\d{4}-\\d{2}-\\d{2}/connector_id=${connector}/(?:manifest\\.json|pollutant_code=${pollutant}/[^/]+)$`);
+    const binding = /^history\/_index_v3\/timeseries_binding\/timeseries_id=(\d+)\.json$/.exec(key);
+    const verification = key === "history/_index_v3/verification/latest.json"
+      || new RegExp(`^history/v3/verification/connector_id=${connector}/manifests/[0-9a-f]{64}\\.json$`).test(key);
+    requireCondition(observation.test(key) || index.test(key) || verification
+      || (binding && sample.permitted_timeseries_ids.includes(Number(binding[1]))), "Source key outside configured scope");
+    const day = /\/day_utc=(\d{4}-\d{2}-\d{2})\//.exec(key)?.[1];
+    if (day) requireCondition(day >= contextStart.slice(0, 10) && day <= new Date(Date.parse(end) - 1).toISOString().slice(0, 10), "Source day outside bounded interval");
   }
   async function read(key, { fresh = false, expected = null } = {}) {
+    checkBudget();
     admit(key);
     if (!fresh && cache.has(key)) {
       const result = cache.get(key);
@@ -53,7 +62,7 @@ export function createSourceReader(generation, { maxBytes = 512 * 1024 ** 2 } = 
     let response;
     try {
       const request = buildAwsSignedRequest({ method: "GET", ...r2, objectKey: key });
-      response = await fetch(request.url, { method: "GET", headers: request.headers, signal: AbortSignal.timeout(30_000) });
+      response = await fetch(request.url, { method: "GET", headers: request.headers, redirect: "error", signal: AbortSignal.timeout(Math.max(1, Math.min(30_000, Math.floor(deadline - performance.now())))) });
     } catch {
       throw new Error(`Source GET transport failure: ${key}`);
     }
@@ -79,6 +88,7 @@ export function createSourceReader(generation, { maxBytes = 512 * 1024 ** 2 } = 
     let size = 0;
     try {
       for await (const chunk of response.body) {
+        checkBudget();
         size += chunk.length;
         metrics.source_bytes_read += chunk.length;
         metrics[key.endsWith(".parquet") ? "parquet_bytes_read" : "metadata_bytes_read"] += chunk.length;
@@ -121,5 +131,5 @@ export function createSourceReader(generation, { maxBytes = 512 * 1024 ** 2 } = 
       requireCondition((before?.sha256 ?? null) === (after?.sha256 ?? null), `Source authority changed during export: ${key}`);
     }
   }
-  return { read, json, checkStability, inventory, metrics, generation, bucket: r2.bucket };
+  return { read, json, checkStability, inventory, metrics, generation, checkBudget, bucket: r2.bucket };
 }

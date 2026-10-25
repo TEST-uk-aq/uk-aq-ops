@@ -1,279 +1,180 @@
 #!/usr/bin/env node
+// Manual read-only exploratory export. Never called by managed JSONgen.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { performance } from "node:perf_hooks";
-import { extractGeneration } from "./extract.mjs";
+import { extractGeneration, daysBetween } from "./extract.mjs";
 import { sha256, requireCondition as check } from "./source_reader.mjs";
+import { canonicalJson, loadPilotConfig, calculationIdentity, parsePairs } from "./configuration.mjs";
 import { buildCalculatedHistory } from "../../workers/uk_aq_station_history/src/calculated_history.mjs";
-import { AQI_ALGORITHM_VERSION } from "../../lib/aqi/aqi_levels.mjs";
-
-const HOUR = 3_600_000;
-const DAY = 86_400_000;
-
-const HELP = `Bounded offline TEST AURN observation and precomputed AQI export (GET only).
-Usage, from TEST ops with its existing .env:
-  node --env-file=.env scripts/compressed_chart_history/export.mjs \\
-    --connector-id 1 --timeseries-id 212 --pollutant pm25 \\
-    --start-utc 2026-09-01T00:00:00Z --end-utc 2026-10-01T00:00:00Z \\
-    --generations v3,v2 --output-dir /absolute/outside/workspace/new-directory
-
-Required: all options above. End is exclusive; maximum 93 UTC days.
-Optional: --max-source-mib 128 (default; integer 1..512 per generation).
-Only AURN connector 1 is admitted; WAQN/SAQN are excluded.
-Existing UK_AQ_ENV_NAME=TEST and CFLARE_R2_* credentials are used privately.
-Output directory must be new and outside the multi-repository workspace.
-Reads the preceding UTC day as PM context when available; unresolved context is marked incomplete.
-No publication, source changes, runtime routing changes or retries.
-`;
-export function canonicalJson(value) {
-  const canonical = (entry) => Array.isArray(entry) ? entry.map(canonical) : entry && typeof entry === "object" ? Object.fromEntries(Object.keys(entry).sort().filter((key) => entry[key] !== undefined).map((key) => [key, canonical(entry[key])])) : entry;
-  return Buffer.from(`${JSON.stringify(canonical(value))}\n`);
-}
-function parseOptions(args) {
-  const allowed = ["connector-id", "timeseries-id", "pollutant", "start-utc", "end-utc", "generations", "output-dir", "max-source-mib"];
-  const supplied = {};
-  check(args.length % 2 === 0, "Every option requires a value; use --help");
-  for (let i = 0; i < args.length; i += 2) {
-    const key = args[i].replace(/^--/, "");
-    check(args[i] === `--${key}` && allowed.includes(key) && supplied[key] === undefined, "Unknown or repeated option; use --help");
-    supplied[key] = args[i + 1];
-  }
-  check(supplied["connector-id"] === "1", "Only explicitly selected AURN connector 1 is supported");
-  const timeseriesId = Number(supplied["timeseries-id"]);
-  check(/^[1-9][0-9]*$/.test(supplied["timeseries-id"] || "") && Number.isSafeInteger(timeseriesId), "Positive timeseries ID required");
-  check(["pm25", "pm10", "no2"].includes(supplied.pollutant), "Select pm25, pm10 or no2");
-  function utc(value) {
-    check(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value || ""), "Explicit UTC timestamp required");
-    const date = new Date(value);
-    check(!Number.isNaN(date.getTime()) && date.toISOString() === value.replace(/Z$/, value.includes(".") ? "Z" : ".000Z"), "Invalid UTC timestamp");
-    return date.toISOString();
-  }
-  const start = utc(supplied["start-utc"]), end = utc(supplied["end-utc"]);
-  check(start < end && Math.ceil(Date.parse(end) / 86_400_000) - Math.floor(Date.parse(start) / 86_400_000) <= 93, "Select at most 93 UTC days, with exclusive end after start");
-  const generations = (supplied.generations || "").split(",");
-  check(generations.length <= 2 && new Set(generations).size === generations.length && generations.every((v) => ["v2", "v3"].includes(v)), "Select v3 and/or v2 explicitly");
-  const mib = Number(supplied["max-source-mib"] || 128);
-  check(Number.isSafeInteger(mib) && mib >= 1 && mib <= 512, "Source budget must be 1..512 MiB per generation");
-  check(path.isAbsolute(supplied["output-dir"] || ""), "Absolute output directory required");
-  return { timeseriesId, pollutant: supplied.pollutant, start, end, generations, maxBytes: mib * 1024 ** 2, output: path.resolve(supplied["output-dir"]) };
-}
-function aqiInputRows(result) {
-  return [...result.contextRows, ...result.rows].map((row) => ({
-    connector_id: result.binding.connector_id, station_id: row[2], timeseries_id: result.binding.timeseries_id,
-    pollutant_code: result.binding.pollutant_code, observed_at: row[0], value: row[1],
-    source_status: row[3], verification_status: row[4], source: "json",
-  }));
+import { publicContinuity } from "../../workers/uk_aq_station_history/src/continuity.mjs";
+import { pilotIdentity, sampleInterval, pilotMonths, COMPRESSED_CHART_LIMITS } from "../../workers/shared/uk_aq_compressed_chart_pilot.mjs";
+export { canonicalJson } from "./configuration.mjs";
+const HOUR = 3_600_000, DAY = 86_400_000;
+const HELP = "Manual exploratory v3 export (GET only): --config /private/experiment.json --sample-id CONFIGURED-ID --output-dir /private/new-directory. Source/status/resources are explicit configuration; no verified authority, upload, fallback or scheduling.";
+const resolvedDay = day => ["exported", "authoritative_absence"].includes(day.state);
+function physicalRows(result) {
+  return [...result.contextRows, ...result.rows].map(row => ({ connector_id: result.binding.connector_id,
+    station_id: row[2], timeseries_id: row[5], pollutant_code: result.binding.pollutant_code,
+    observed_at: row[0], value: row[1], source_status: row[3], verification_status: row[4], source: "json" }));
 }
 export async function calculateMonthAqi(result, month, options) {
-  const connectorId = result.binding.connector_id;
-  const allRows = aqiInputRows(result);
-  const continuity = { enabled: false, continuityKey: null, siteRef: null, ukAirRef: null,
-    pollutant: options.pollutant, members: [{ connectorId, stationId: result.binding.station_id,
-      timeseriesId: options.timeseriesId, pollutant: options.pollutant,
-      validFromDayUtc: null, validToDayUtc: null }] };
-  const request = { connectorId, stationId: result.binding.station_id,
-    timeseriesId: options.timeseriesId, pollutant: options.pollutant,
-    includeObservations: false, includeAqi: true };
-  const batches = [], rows = [], gapRanges = [], reasons = new Set(), seen = new Set();
-  for (let dayMs = Date.parse(month.requested_start_utc); dayMs < Date.parse(month.requested_end_exclusive_utc); dayMs += DAY) {
-    const endExclusive = Math.min(dayMs + DAY, Date.parse(month.requested_end_exclusive_utc));
-    const outputStartMs = dayMs - HOUR, outputEndMs = endExclusive - HOUR;
-    const inputStart = outputStartMs - (options.pollutant === "no2" ? 0 : 23 * HOUR);
-    const inputEnd = outputEndMs + 1;
-    const scoped = allRows.filter((row) => { const t = Date.parse(row.observed_at); return t >= inputStart && t < inputEnd; });
-    const requiredDays = [...result.contextDays, ...result.days].filter((day) => {
-      const t = Date.parse(`${day.day_utc}T00:00:00.000Z`);
-      return t < inputEnd && t + DAY > inputStart;
-    });
-    const expectedDayCount = Math.ceil(inputEnd / DAY) - Math.floor(inputStart / DAY);
-    const contextComplete = requiredDays.length === expectedDayCount
-      && requiredDays.every((day) => ["exported", "authoritative_absence"].includes(day.state))
-      && inputStart >= Date.parse(options.contextStart);
-    const calculated = await buildCalculatedHistory({ request, continuity, outputStartMs, outputEndMs,
-      observationProvider: async () => ({ rows: scoped, response_complete: result.state === "complete",
-        partial_reasons: [], fetch_count: 0, context_complete: contextComplete }) });
-    for (const row of calculated.aqi.rows) {
-      check(!seen.has(row.timestamp_hour_utc), "Overlapping daily AQI output");
-      seen.add(row.timestamp_hour_utc);
-      rows.push(row);
-    }
-    gapRanges.push(...calculated.aqi.gap_ranges);
-    calculated.aqi.partial_reasons.forEach((reason) => reasons.add(reason));
-    batches.push({ day_utc: new Date(dayMs).toISOString().slice(0, 10),
-      output_start_utc: new Date(dayMs).toISOString(), output_end_exclusive_utc: new Date(endExclusive).toISOString(),
-      required_context_start_utc: new Date(inputStart).toISOString(), context_complete: contextComplete,
+  const allRows = physicalRows(result), rows = [], batches = [], gaps = [], reasons = new Set();
+  const request = { connectorId: options.connectorId, stationId: options.sample.station_id, timeseriesId: options.timeseriesId,
+    pollutant: options.pollutant, includeObservations: false, includeAqi: true };
+  const coverage = [...result.contextDays, ...result.days];
+  for (const day of daysBetween(month.start_utc, month.end_exclusive_utc)) {
+    check(performance.now() < options.deadline, "Offline processing time budget exceeded");
+    const dayStart = Date.parse(`${day}T00:00:00.000Z`);
+    const first = Math.ceil(Math.max(dayStart, Date.parse(month.start_utc)) / HOUR) * HOUR;
+    const last = Math.floor((Math.min(dayStart + DAY, Date.parse(month.end_exclusive_utc)) - 1) / HOUR) * HOUR;
+    check(first <= last, "Empty/unrepresentable hour-ending batch");
+    const calculated = await buildCalculatedHistory({ request, continuity: result.continuity,
+      outputStartMs: first - HOUR, outputEndMs: last,
+      observationProvider: async ({ identity, startMs, endMs }) => {
+        const neededDays = daysBetween(new Date(startMs).toISOString(), new Date(endMs).toISOString());
+        const complete = startMs >= Date.parse(options.contextStart) && endMs <= Date.parse(options.end)
+          && neededDays.every(required => coverage.some(entry => entry.day_utc === required
+            && entry.timeseries_id === identity.timeseriesId && resolvedDay(entry)));
+        return { rows: allRows.filter(row => row.timeseries_id === identity.timeseriesId
+          && Date.parse(row.observed_at) >= startMs && Date.parse(row.observed_at) < endMs),
+        response_complete: complete, partial_reasons: complete ? [] : ["required_canonical_context_unresolved"],
+        context_complete: complete, fetch_count: 0 };
+      } });
+    rows.push(...calculated.aqi.rows);
+    gaps.push(...calculated.aqi.gap_ranges);
+    calculated.aqi.partial_reasons.forEach(reason => reasons.add(reason));
+    batches.push({ day_utc: day, endpoint_start_utc: new Date(first).toISOString(), endpoint_end_utc: new Date(last).toISOString(),
+      context_complete: !calculated.aqi.partial_reasons.includes("required_aqi_context_incomplete")
+        && !calculated.aqi.partial_reasons.includes("required_canonical_context_unresolved"),
       response_complete: calculated.aqi.response_complete, has_gap: calculated.aqi.has_gap,
-      partial_reasons: calculated.aqi.partial_reasons, row_count: calculated.aqi.rows.length });
+      gap_ranges: calculated.aqi.gap_ranges, partial_reasons: calculated.aqi.partial_reasons, row_count: calculated.aqi.rows.length,
+      required_context_start_utc: calculated.aqi.required_context_start_utc });
   }
-  rows.sort((a, b) => a.timestamp_hour_utc.localeCompare(b.timestamp_hour_utc));
-  const complete = batches.every((batch) => batch.response_complete);
-  return { schema_version: 2, kind: "uk_aq_compressed_chart_aqi_month",
-    identity: { connector_id: connectorId, timeseries_id: options.timeseriesId,
-      station_id: result.binding.station_id, pollutant_code: options.pollutant },
-    source: { generation: result.generation, bucket: result.bucket,
-      source_evidence: result.evidence, algorithm_version: AQI_ALGORITHM_VERSION },
-    coverage: { ...month, response_complete: complete, daily_batches: batches,
-      context_days: result.contextDays, row_count: rows.length },
-    aqi: { enabled: true, calculation_source: "calculated_from_observations",
-      publication_source: "precomputed_compressed_json", response_contract: "aqi_hour_interval_v2",
-      algorithm_version: AQI_ALGORITHM_VERSION, rows, response_complete: complete,
-      has_gap: batches.some((batch) => batch.has_gap), gap_ranges: gapRanges,
-      partial_reasons: [...reasons].sort(), required_context_start_utc: batches[0]?.required_context_start_utc,
-      output_start_utc: month.requested_start_utc,
-      output_end_utc: new Date(Date.parse(month.requested_end_exclusive_utc) - HOUR).toISOString(),
-      source_counts: { calculated_from_observations: rows.length } } };
-}
-function monthsBetween(start, end) {
-  const months = [];
-  const date = new Date(start);
-  date.setUTCDate(1); date.setUTCHours(0, 0, 0, 0);
-  while (date.toISOString() < end) {
-    const monthStart = date.toISOString();
-    date.setUTCMonth(date.getUTCMonth() + 1);
-    months.push({ month_utc: monthStart.slice(0, 7), month_start_utc: monthStart, month_end_exclusive_utc: date.toISOString(), requested_start_utc: start > monthStart ? start : monthStart, requested_end_exclusive_utc: end < date.toISOString() ? end : date.toISOString() });
-  }
-  return months;
-}
-async function writeNew(root, relative, body) {
-  const target = path.join(root, relative);
-  await fs.mkdir(path.dirname(target), { recursive: true });
-  await fs.writeFile(target, body, { flag: "wx", mode: 0o600 });
-  return target;
-}
-function compareSources(results) {
-  const v2 = results.find((r) => r.generation === "v2"), v3 = results.find((r) => r.generation === "v3");
-  if (!v2 || !v3 || [v2, v3].some((r) => r.state !== "complete")) return { state: "not_comparable", reason: "Two complete independently extracted source scopes required" };
-  function multiset(rows, columns) {
-    const map = new Map();
-    for (const row of rows) {
-      const key = JSON.stringify(columns.map((i) => row[i]));
-      map.set(key, (map.get(key) || 0) + 1);
-    }
-    return map;
-  }
-  function differences(columns) {
-    const left = multiset(v2.rows, columns), right = multiset(v3.rows, columns);
-    let onlyV2 = 0, onlyV3 = 0;
-    const examples = [];
-    for (const key of [...new Set([...left.keys(), ...right.keys()])].sort()) {
-      const delta = (left.get(key) || 0) - (right.get(key) || 0);
-      if (delta > 0) onlyV2 += delta;
-      if (delta < 0) onlyV3 -= delta;
-      if (delta && examples.length < 8) examples.push({ row: JSON.parse(key), v2_multiplicity: left.get(key) || 0, v3_multiplicity: right.get(key) || 0 });
-    }
-    return { equal: onlyV2 === 0 && onlyV3 === 0, only_v2_rows: onlyV2, only_v3_rows: onlyV3, examples };
-  }
-  return { state: "compared", measurements: differences([0, 1, 2]), embedded_status: differences([0, 1, 2, 3]), effective_status: differences([0, 1, 2, 4]), full_rows: differences([0, 1, 2, 3, 4]) };
+  check(new Set(rows.map(row => row.timestamp_hour_utc)).size === rows.length, "Overlapping daily AQI endpoints");
+  return { rows, batches, context_complete: batches.every(batch => batch.context_complete),
+    response_complete: batches.every(batch => batch.response_complete), has_gap: batches.some(batch => batch.has_gap),
+    gap_ranges: gaps, partial_reasons: [...reasons].sort() };
 }
 async function prepareFiles(result, options) {
-  const started = performance.now(), cpuStarted = process.cpuUsage();
-  const objects = [];
+  const objects = [], started = performance.now(), cpuStarted = process.cpuUsage();
   if (result.state === "failed") return objects;
-  const evidence = { schema_version: 1, kind: "uk_aq_chart_history_source_evidence", source_generation: result.generation, bucket: result.bucket, binding: result.binding, verification: result.verification, source_objects: result.source_objects, context_days: result.contextDays };
-  const evidenceBody = canonicalJson(evidence);
-  const evidenceSha = sha256(evidenceBody);
-  const evidencePath = `${result.generation}/source-evidence.${evidenceSha}.json`;
-  await writeNew(options.output, evidencePath, evidenceBody);
-  result.evidence = { path: evidencePath, sha256: evidenceSha, byte_size: evidenceBody.length };
-  for (const month of monthsBetween(options.start, options.end)) {
-    const rows = result.rows.filter(([timestamp]) => timestamp >= month.requested_start_utc && timestamp < month.requested_end_exclusive_utc);
-    const days = result.days.filter((day) => day.day_utc.startsWith(month.month_utc));
-    const complete = days.every((day) => ["exported", "authoritative_absence"].includes(day.state));
-    const uniqueTimes = new Set(rows.map(([timestamp]) => timestamp));
-    const payload = {
-      schema_version: 1, kind: "uk_aq_compressed_chart_history_month",
-      identity: { connector_id: 1, timeseries_id: options.timeseriesId, station_id: result.binding.station_id, pollutant_code: options.pollutant },
-      source: { generation: result.generation, bucket: result.bucket, source_evidence: result.evidence, physical_schemas: result.metrics.physical_schemas, verification: result.verification },
-      coverage: { ...month, state: complete ? rows.length ? "exported" : "authoritative_absence" : "incomplete", complete, row_count: rows.length, unique_timestamp_count: uniqueTimes.size, duplicate_timestamp_row_count: rows.length - uniqueTimes.size, min_observed_at_utc: rows[0]?.[0] || null, max_observed_at_utc: rows.at(-1)?.[0] || null, days },
-      row_columns: ["observed_at_utc", "value", "station_id", "source_status", "verification_status"],
-      observations: rows,
-    };
-    const json = canonicalJson(payload), compressed = gzipSync(json, { level: 9 });
-    check(gunzipSync(compressed).equals(json), "Local gzip round-trip failed");
-    const rawSha = sha256(json), compressedSha = sha256(compressed);
-    const prefix = `${result.generation}/connector_id=1/timeseries_id=${options.timeseriesId}/month_utc=${month.month_utc}`;
-    const jsonPath = `${prefix}/${rawSha}.json`, gzipPath = `${prefix}/${rawSha}.json.gz`;
-    await writeNew(options.output, jsonPath, json);
-    await writeNew(options.output, gzipPath, compressed);
-    // Read written bytes back before proposing any manifest references.
-    check(sha256(await fs.readFile(path.join(options.output, gzipPath))) === compressedSha && sha256(await fs.readFile(path.join(options.output, jsonPath))) === rawSha, "Local file verification failed");
-    objects.push({ ...month, state: payload.coverage.state, row_count: rows.length, json_path: jsonPath, path: gzipPath, json_byte_size: json.length, byte_size: compressed.length, json_sha256: rawSha, sha256: compressedSha, content_type: "application/json", content_encoding: "gzip", source_evidence: result.evidence, publication_eligible: complete });
-    if (complete) {
-      const aqi = await calculateMonthAqi(result, month, options);
-      const aqiJson = canonicalJson(aqi), aqiGzip = gzipSync(aqiJson, { level: 9 });
-      check(gunzipSync(aqiGzip).equals(aqiJson), "AQI gzip round-trip failed");
-      const aqiSha = sha256(aqiJson), aqiGzipSha = sha256(aqiGzip);
-      const aqiJsonPath = `${prefix}/aqi.${aqiSha}.json`, aqiGzipPath = `${prefix}/aqi.${aqiSha}.json.gz`;
-      await writeNew(options.output, aqiJsonPath, aqiJson);
-      await writeNew(options.output, aqiGzipPath, aqiGzip);
-      check(sha256(await fs.readFile(path.join(options.output, aqiGzipPath))) === aqiGzipSha,
-        "Local AQI file verification failed");
-      objects.at(-1).aqi = { path: aqiGzipPath, json_path: aqiJsonPath,
-        byte_size: aqiGzip.length, json_byte_size: aqiJson.length,
-        sha256: aqiGzipSha, json_sha256: aqiSha, row_count: aqi.aqi.rows.length,
-        response_complete: aqi.aqi.response_complete, algorithm_version: AQI_ALGORITHM_VERSION,
-        source_evidence: result.evidence };
+  const common = { publication_id: options.publicationId, config_sha256: options.configSha,
+    source_mode: options.config.source_mode, environment: options.config.environment, managed_publication_eligible: false,
+    algorithm: options.algorithm };
+  const evidence = { schema_version: 2, kind: "uk_aq_chart_history_source_evidence", ...common,
+    source_generation: result.generation, bucket: result.bucket, sample_id: options.sample.id,
+    requested_interval: sampleInterval(options.sample), binding: result.binding, physical_bindings: result.physical_bindings,
+    continuity: publicContinuity(result.continuity), verification: result.verification,
+    physical_schemas: result.metrics.physical_schemas, source_objects: result.source_objects,
+    days: result.days, context_days: result.contextDays, required_context_start_utc: options.contextStart,
+    snapshot_claim: "source_as_read_with_metadata_rechecks_not_coherent_writer_checkpoint" };
+  const evidenceBytes = canonicalJson(evidence), evidencePath = `source-evidence.${sha256(evidenceBytes)}.json`;
+  check(evidenceBytes.length <= COMPRESSED_CHART_LIMITS.evidence_bytes, "Evidence size bound");
+  await options.write(evidencePath, evidenceBytes);
+  result.evidence = { path: evidencePath, sha256: sha256(evidenceBytes), byte_size: evidenceBytes.length };
+  const source = { generation: result.generation, bucket: result.bucket, source_evidence: result.evidence,
+    physical_schemas: result.metrics.physical_schemas, verification: result.verification };
+  for (const month of pilotMonths(options.sample)) {
+    check(performance.now() < options.deadline, "Offline processing time budget exceeded");
+    const rows = result.rows.filter(row => row[0] >= month.start_utc && row[0] < month.end_exclusive_utc);
+    const days = result.days.filter(day => day.day_utc.startsWith(month.month_utc));
+    const complete = days.length > 0 && days.every(resolvedDay);
+    const calculationStarted = performance.now();
+    const calculated = await calculateMonthAqi(result, month, options);
+    options.aqiWallMs += performance.now() - calculationStarted;
+    const coverage = { month_utc: month.month_utc, requested_start_utc: month.start_utc,
+      requested_end_exclusive_utc: month.end_exclusive_utc, complete, days, row_count: rows.length,
+      unique_timestamp_count: new Set(rows.map(row => row[0])).size,
+      min_observed_at_utc: rows[0]?.[0] || null, max_observed_at_utc: rows.at(-1)?.[0] || null };
+    const observations = { schema_version: 2, kind: "uk_aq_compressed_chart_history_month", ...common,
+      identity: pilotIdentity(options.sample), source, continuity: publicContinuity(result.continuity), coverage,
+      row_columns: ["observed_at_utc", "value", "station_id", "source_status", "verification_status", "timeseries_id", "embedded_verification_status", "source_status_provenance"], observations: rows };
+    const aqi = { schema_version: 2, kind: "uk_aq_compressed_chart_aqi_month", ...common,
+      identity: pilotIdentity(options.sample), source, continuity: publicContinuity(result.continuity),
+      coverage: { ...coverage, row_count: calculated.rows.length, daily_batches: calculated.batches,
+        context_complete: calculated.context_complete, response_complete: calculated.response_complete },
+      aqi: { enabled: true, calculation_source: "calculated_from_observations", publication_source: "precomputed_compressed_json",
+        response_contract: "aqi_hour_interval_v2", algorithm_version: options.algorithm.version,
+        rows: calculated.rows, response_complete: calculated.response_complete, has_gap: calculated.has_gap,
+        gap_ranges: calculated.gap_ranges, partial_reasons: calculated.partial_reasons,
+        required_context_start_utc: calculated.batches[0]?.required_context_start_utc,
+        output_start_utc: new Date(Date.parse(calculated.rows[0].timestamp_hour_utc) - HOUR).toISOString(),
+        output_end_utc: calculated.rows.at(-1).timestamp_hour_utc,
+        source_counts: { calculated_from_observations: calculated.rows.length } } };
+    const pair = { ...month, source_complete: complete, context_complete: calculated.context_complete,
+      publication_id: options.publicationId, source_evidence_sha256: result.evidence.sha256 };
+    for (const [part, payload] of Object.entries({ observations, aqi })) {
+      const raw = canonicalJson(payload), gzip = gzipSync(raw, { level: 9 });
+      check(raw.length <= COMPRESSED_CHART_LIMITS.json_bytes && gzip.length <= COMPRESSED_CHART_LIMITS.gzip_bytes
+        && gunzipSync(gzip, { maxOutputLength: COMPRESSED_CHART_LIMITS.json_bytes }).equals(raw), "Payload size/gzip integrity bound");
+      const prefix = `month_utc=${month.month_utc}/${part}.${sha256(gzip)}`;
+      await options.write(`${prefix}.json`, raw);
+      await options.write(`${prefix}.json.gz`, gzip);
+      check(sha256(await fs.readFile(path.join(options.output, `${prefix}.json.gz`))) === sha256(gzip), "Local gzip readback mismatch");
+      pair[part] = { path: `${prefix}.json.gz`, json_path: `${prefix}.json`, sha256: sha256(gzip), json_sha256: sha256(raw),
+        byte_size: gzip.length, json_byte_size: raw.length, row_count: part === "observations" ? rows.length : calculated.rows.length,
+        ...(part === "aqi" ? { response_complete: calculated.response_complete } : {}) };
     }
+    objects.push(pair);
   }
   const cpu = process.cpuUsage(cpuStarted);
-  Object.assign(result.metrics, { output_object_count: objects.length, json_bytes: objects.reduce((sum, o) => sum + o.json_byte_size, 0), gzip_bytes: objects.reduce((sum, o) => sum + o.byte_size, 0), source_evidence_bytes: evidenceBody.length, encoding_and_local_write_wall_ms: performance.now() - started, encoding_and_local_write_cpu_ms: (cpu.user + cpu.system) / 1000 });
+  Object.assign(result.metrics, { prepare_wall_ms: performance.now() - started, prepare_cpu_ms: (cpu.user + cpu.system) / 1000,
+    aqi_wall_ms: options.aqiWallMs, output_pairs: objects.length, output_bytes: options.outputBytes });
   return objects;
 }
-function markdownReport(report) {
-  const lines = ["# Stage 2A local TEST comparison", "", `Captured: ${report.captured_at_utc}. Physical AURN connector 1, timeseries ${report.selection.timeseriesId}, pollutant ${report.selection.pollutant}.`, `UTC interval: [${report.selection.start}, ${report.selection.end}).`, "", "| Generation | State | Rows | Source objects / Parquet | GETs | Source body bytes | Parquet bytes | JSON bytes | gzip bytes | Extract wall ms | Extract CPU ms | Encode/write ms |", "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|", ...report.sources.map((r) => { const m = r.metrics; return `| ${r.generation} | ${r.state} | ${m.row_count} | ${m.source_object_count} / ${m.source_parquet_object_count} | ${m.get_requests} | ${m.source_bytes_read} | ${m.parquet_bytes_read} | ${m.json_bytes ?? 0} | ${m.gzip_bytes ?? 0} | ${m.extraction_wall_ms.toFixed(1)} | ${m.extraction_cpu_ms.toFixed(1)} | ${(m.encoding_and_local_write_wall_ms ?? 0).toFixed(1)} |`; }), "", `Comparison: ${JSON.stringify(report.comparison)}.`, "", "Downloaded Parquet files include other AURN timeseries. Their full size is read volume, not the storage attributable to this one series. V3 additionally reports the indexed timestamp/value chunk bytes; these exclude identity/status columns, footer and shared metadata. V2 has no exact chunk attribution here. No proportional storage estimate is made.", "", "Source metadata was re-read and unchanged at the end of each successful extraction. This detects changes; it does not establish a writer freeze or a simultaneous v2/v3 snapshot. Comparisons concern these pinned scopes only. Missing authority is unknown/unexported, not canonical absence. Row multiplicity and status differences are retained.", "", "Sizes exclude source-evidence and manifest overhead; those sizes are separately recorded. Only gzip objects are proposed for later delivery; local raw JSON is diagnostic output. R2 writes: 0. GET counts include metadata revalidation and 404s; source bytes count consumed success body bytes, excluding HTTP/TLS overhead. No retries, LIST or HEAD calls. Network wall time is local R2 export time, not HTTP chart delivery speed or Worker CPU.", "", "Stage 2B: use only a complete approved sample; privately publish digest-named gzip objects and evidence after verification, then select them with a publish-last manifest. Keep the normal chart route unchanged and inject history through the existing controller/renderer/AQI boundary. Measure real TEST cold/warm delivery and chart milestones plus Cloudflare CPU/outcomes after explicit deployment approval. This offline run supplies no browser/Worker performance result.", ""];
-  for (const source of report.sources) if (source.error) lines.push(`${source.generation} failure: ${source.error}`, "");
-  return lines.join("\n");
-}
 async function main() {
-  if (process.argv.slice(2).includes("--help")) { console.log(HELP); return; }
-  const started = performance.now(), cpuStarted = process.cpuUsage();
-  const options = parseOptions(process.argv.slice(2));
-  options.contextStart = new Date(Date.parse(options.start) - 24 * HOUR).toISOString();
+  const args = process.argv.slice(2);
+  if (args.length === 1 && args[0] === "--help") { console.log(HELP); return; }
+  const values = parsePairs(args, ["config", "sample-id", "output-dir"]);
+  check(values.config && values["sample-id"] && path.isAbsolute(values["output-dir"] || ""), HELP);
+  const selected = await loadPilotConfig(values.config, values["sample-id"]);
+  const { config, sample } = selected;
+  const interval = sampleInterval(sample), started = performance.now(), cpuStarted = process.cpuUsage();
+  const output = path.resolve(values["output-dir"]), parent = await fs.realpath(path.dirname(output));
   const workspace = await fs.realpath(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../.."));
-  let existingParent = path.dirname(options.output);
-  const missingParts = [];
-  for (;;) {
-    try {
-      const resolved = await fs.realpath(existingParent);
-      existingParent = path.join(resolved, ...missingParts.reverse());
-      break;
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-      const parent = path.dirname(existingParent);
-      if (parent === existingParent) throw error;
-      missingParts.push(path.basename(existingParent));
-      existingParent = parent;
-    }
-  }
-  const outputParent = existingParent;
-  check(outputParent !== workspace && !outputParent.startsWith(`${workspace}${path.sep}`), "Output must be outside repository workspace");
-  await fs.mkdir(outputParent, { recursive: true });
-  options.output = path.join(outputParent, path.basename(options.output));
-  await fs.mkdir(options.output, { mode: 0o700 }); // refuses reuse/overwrite
-  const results = [], objects = [];
-  for (const version of options.generations) {
-    console.log(`Reading bounded TEST ${version}: physical timeseries ${options.timeseriesId}`);
-    const result = await extractGeneration(version, options);
-    objects.push(...await prepareFiles(result, options));
-    results.push(result);
-    console.log(`${version}: ${result.state}, ${result.metrics.row_count} rows, ${result.metrics.source_bytes_read} source bytes`);
-  }
-  const comparison = compareSources(results);
-  const manifest = { schema_version: 2, kind: "uk_aq_chart_history_candidate_manifest", publication_state: "local_only_not_published", export_schema_version: 2, environment: "TEST", requested_interval: { start_utc: options.start, end_exclusive_utc: options.end }, identity: { connector_id: 1, timeseries_id: options.timeseriesId, pollutant_code: options.pollutant }, complete: results.every((r) => r.state === "complete"), sources: results.map((r) => ({ generation: r.generation, state: r.state, binding: r.binding || null, source_evidence: r.evidence || null, days: r.days, context_days: r.contextDays, error: r.error || null })), objects, publication_rule: "Verify paired observation/AQI gzip and evidence objects before publishing a new complete manifest; retain prior complete selection on failure." };
-  const manifestBody = canonicalJson(manifest);
-  const manifestPath = `candidate-manifest.${sha256(manifestBody)}.json`;
-  // Manifest last, only after referenced local outputs pass checks. State never
-  // claims remote publication or completeness for a failed/unexported period.
-  await writeNew(options.output, manifestPath, manifestBody);
+  check(parent !== workspace && !parent.startsWith(`${workspace}${path.sep}`), "Private output must be outside repository workspace");
+  check(path.join(parent, path.basename(output)) === output, "Output path must have a real parent");
+  const options = { ...selected, connectorId: sample.connector_id, timeseriesId: sample.timeseries_id, pollutant: sample.pollutant_code,
+    start: interval.start_utc, end: interval.end_exclusive_utc,
+    contextStart: new Date(Date.parse(interval.start_utc) - (sample.pollutant_code === "no2" ? HOUR : 24 * HOUR)).toISOString(),
+    maxBytes: COMPRESSED_CHART_LIMITS.source_bytes, output, outputBytes: 0, aqiWallMs: 0,
+    publicationId: randomUUID(), algorithm: await calculationIdentity(), deadline: started + COMPRESSED_CHART_LIMITS.duration_ms };
+  await fs.mkdir(output, { mode: 0o700 });
+  options.write = async (relative, bytes) => {
+    options.outputBytes += bytes.length;
+    check(options.outputBytes <= 192 * 1024 ** 2, "Private output byte budget exceeded");
+    const target = path.join(output, relative);
+    await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+    await fs.writeFile(target, bytes, { flag: "wx", mode: 0o600 });
+  };
+  const result = await extractGeneration(config.canonical_generation, options);
+  const objects = await prepareFiles(result, options);
+  const complete = result.state === "complete" && objects.length === pilotMonths(sample).length
+    && objects.every(pair => pair.source_complete && pair.context_complete && pair.aqi.response_complete);
+  const candidate = { schema_version: 3, kind: "uk_aq_chart_history_candidate_manifest", publication_state: "local_only_not_published",
+    environment: config.environment, config_sha256: selected.configSha, sample_id: sample.id, source_mode: config.source_mode,
+    source_generation: config.canonical_generation, managed_publication_eligible: false, publication_id: options.publicationId,
+    identity: pilotIdentity(sample), requested_interval: interval, algorithm: options.algorithm, complete,
+    source_evidence: result.evidence || null, pairs: objects };
+  const bytes = canonicalJson(candidate), candidatePath = `candidate-manifest.${sha256(bytes)}.json`;
+  await options.write(candidatePath, bytes); // local manifest last; incomplete output never claims eligibility
   const cpu = process.cpuUsage(cpuStarted);
-  const report = { schema_version: 2, captured_at_utc: new Date().toISOString(), selection: { timeseriesId: options.timeseriesId, pollutant: options.pollutant, start: options.start, end: options.end }, runtime: { node: process.version, zlib: process.versions.zlib, gzip_level: 9 }, r2_write_operations: 0, manifest: { path: manifestPath, sha256: sha256(manifestBody), byte_size: manifestBody.length }, export_wall_ms: performance.now() - started, export_cpu_ms: (cpu.user + cpu.system) / 1000, sources: results.map(({ rows: _rows, contextRows: _contextRows, ...r }) => r), comparison };
-  await writeNew(options.output, "comparison.json", canonicalJson(report));
-  await writeNew(options.output, "comparison.md", markdownReport(report));
-  console.log(`Local comparison: ${path.join(options.output, "comparison.md")}`);
-  if (results.some((r) => r.state !== "complete")) process.exitCode = 2;
+  const report = { schema_version: 3, state: complete ? "local_candidates_complete" : "incomplete", source_mode: config.source_mode,
+    managed_publication_eligible: false, sample_id: sample.id, config_sha256: selected.configSha, publication_id: options.publicationId,
+    algorithm: options.algorithm, requested_interval: interval, context_start_utc: options.contextStart,
+    runtime: { node: process.version, zlib: process.versions.zlib, gzip_level: 9 }, r2_write_operations: 0,
+    wall_ms: performance.now() - started, process_cpu_ms: (cpu.user + cpu.system) / 1000, max_rss_kib: process.resourceUsage().maxRSS,
+    output_bytes_before_report: options.outputBytes, metrics: result.metrics, error: result.error || null,
+    candidate: { path: candidatePath, byte_size: bytes.length, sha256: sha256(bytes) },
+    payloads: objects.map(pair => ({ month_utc: pair.month_utc, observations: pair.observations, aqi: pair.aqi })) };
+  await options.write("comparison.json", canonicalJson(report));
+  console.log(`Exploratory ${sample.id}: ${report.state}; candidate ${candidatePath}; private comparison.json; no remote writes`);
+  if (!complete) process.exitCode = 2;
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().catch((error) => { console.error(`Export stopped: ${error.message}`); process.exitCode = 1; });
+  main().catch(error => { console.error(`Export stopped: ${error.message}`); process.exitCode = 1; });
 }
