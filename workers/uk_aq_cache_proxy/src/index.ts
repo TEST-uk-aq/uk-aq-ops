@@ -1,4 +1,5 @@
 import { authenticatedHistoryTags, historyCacheEnabled, historyCacheKeyUrl, HISTORY_CACHE_CONTRACT } from "../../shared/uk_aq_history_cache.mjs";
+import { approvedCompressedChartOrigin } from "../../shared/uk_aq_compressed_chart_origin.mjs";
 import { resolveObservationHistoryGeneration } from "../../shared/uk_aq_observation_history_generation.mjs";
 import {
   buildTimeseriesV2SupabaseFillPlan,
@@ -21,6 +22,7 @@ export interface Env {
   STATION_HISTORY?: { fetch(input: Request | string, init?: RequestInit): Promise<Response> };
   UK_AQ_COMPRESSED_CHART_ENABLED?: unknown;
   UK_AQ_COMPRESSED_CHART_UPSTREAM_URL?: unknown;
+  UK_AQ_COMPRESSED_CHART_APPROVED_ORIGIN?: unknown;
   UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_ID?: unknown;
   UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_SECRET?: unknown;
   SUPABASE_URL: unknown;
@@ -2976,20 +2978,17 @@ export default {
         || String(env.UK_AQ_COMPRESSED_CHART_ENABLED) !== "true") {
         return makeErrorResponse(503, "prototype_binding_unavailable", requestOrigin, allowedOrigins);
       }
+      const upstreamOrigin = String(await readSecret(env.UK_AQ_COMPRESSED_CHART_UPSTREAM_URL) || "");
+      const approvedOrigin = String(await readSecret(env.UK_AQ_COMPRESSED_CHART_APPROVED_ORIGIN) || "");
+      const origin = approvedCompressedChartOrigin(upstreamOrigin, approvedOrigin);
+      if (!origin) return makeErrorResponse(503, "prototype_origin_not_approved", requestOrigin, allowedOrigins);
+      // Construct credentials only after matching independently approved config.
+      // The returned base is the approved origin, never browser/request input.
       const secret = await readSecret(env.UK_AQ_EDGE_UPSTREAM_SECRET);
-      const upstreamOrigin = String(await readSecret(env.UK_AQ_COMPRESSED_CHART_UPSTREAM_URL) || "").trim();
       const accessId = await readSecret(env.UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_ID);
       const accessSecret = await readSecret(env.UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_SECRET);
-      if (!secret || !accessId || !accessSecret || !upstreamOrigin) {
+      if (!secret || !accessId || !accessSecret) {
         return makeErrorResponse(503, "prototype_auth_unavailable", requestOrigin, allowedOrigins);
-      }
-      let origin: URL;
-      try { origin = new URL(upstreamOrigin); } catch {
-        return makeErrorResponse(503, "prototype_origin_invalid", requestOrigin, allowedOrigins);
-      }
-      if (origin.protocol !== "https:" || origin.port || origin.pathname !== "/" || origin.search || origin.hash
-        || origin.username || origin.password) {
-        return makeErrorResponse(503, "prototype_origin_invalid", requestOrigin, allowedOrigins);
       }
       const upstreamUrl = new URL(`/v1/${prototypeMatch[1]}${url.search}`, origin);
       const prototypeHeaders = new Headers({

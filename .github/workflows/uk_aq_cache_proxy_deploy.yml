@@ -134,35 +134,38 @@ jobs:
         env:
           PILOT_ENVIRONMENT: ${{ vars.UK_AQ_ENV_NAME }}
           PILOT_ORIGIN: ${{ vars.UK_AQ_COMPRESSED_CHART_UPSTREAM_URL || '' }}
+          PILOT_APPROVED_ORIGIN: ${{ secrets.UK_AQ_COMPRESSED_CHART_APPROVED_ORIGIN || '' }}
           PILOT_ACCESS_ID: ${{ secrets.UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_ID || '' }}
           PILOT_ACCESS_SECRET: ${{ secrets.UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_SECRET || '' }}
           PILOT_UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
         run: |
           set -euo pipefail
-          if [ -z "${PILOT_ORIGIN}" ] || [ -z "${PILOT_ACCESS_ID}" ] ||
+          if [ -z "${PILOT_ORIGIN}" ] || [ -z "${PILOT_APPROVED_ORIGIN}" ] || [ -z "${PILOT_ACCESS_ID}" ] ||
              [ -z "${PILOT_ACCESS_SECRET}" ] || [ -z "${PILOT_UPSTREAM_SECRET}" ]; then
-            echo "Sleepercar origin, Access service token and TEST upstream secret must be configured."
+            echo "Upstream URL, independently approved origin, Access service token and upstream secret must be configured."
             exit 1
           fi
-          node --input-type=module <<'NODE'
-          const raw = process.env.PILOT_ORIGIN || "";
-          let u;
-          try { u = new URL(raw); } catch { process.exit(1); }
-          if (u.protocol !== "https:" || u.port || u.pathname !== "/" || u.search || u.hash || u.username || u.password) {
-            console.error("Pilot origin must be a clean explicitly configured HTTPS origin.");
+          PILOT_REQUEST_ORIGIN="$(node --input-type=module <<'NODE'
+          import { approvedCompressedChartOrigin } from "../shared/uk_aq_compressed_chart_origin.mjs";
+          const origin = approvedCompressedChartOrigin(process.env.PILOT_ORIGIN, process.env.PILOT_APPROVED_ORIGIN);
+          if (!origin) {
+            console.error("Private upstream does not match the independently approved exact HTTPS origin.");
             process.exit(1);
           }
+          process.stdout.write(origin);
           NODE
+          )"
           # This read-only probe is run only after the private Worker, Access
           # service policy and configured v3 publication are actually deployed.
-          http_code="$(curl --silent --show-error --max-time 20 --connect-timeout 10 \
+          http_code="$(curl --disable --silent --show-error --proto '=https' --max-redirs 0 \
+            --max-time 20 --connect-timeout 10 \
             --output "${RUNNER_TEMP}/uk_aq_chart_history_prototype_manifest.json" \
             --write-out '%{http_code}' \
             --header "CF-Access-Client-Id: ${PILOT_ACCESS_ID}" \
             --header "CF-Access-Client-Secret: ${PILOT_ACCESS_SECRET}" \
             --header "X-UK-AQ-Upstream-Auth: ${PILOT_UPSTREAM_SECRET}" \
             --header "Accept: application/json" \
-            "${PILOT_ORIGIN%/}/v1/manifest")"
+            "${PILOT_REQUEST_ORIGIN}/v1/manifest")"
           if [ "${http_code}" != "200" ]; then
             echo "Sleepercar Worker not yet reachable/published through Access (HTTP ${http_code})."
             exit 1
@@ -212,6 +215,7 @@ jobs:
         env:
           RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN: ${{ secrets.UK_AQ_RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN || '' }}
           PILOT_ORIGIN: ${{ vars.UK_AQ_COMPRESSED_CHART_UPSTREAM_URL || '' }}
+          PILOT_APPROVED_ORIGIN: ${{ secrets.UK_AQ_COMPRESSED_CHART_APPROVED_ORIGIN || '' }}
           PILOT_ACCESS_ID: ${{ secrets.UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_ID || '' }}
           PILOT_ACCESS_SECRET: ${{ secrets.UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_SECRET || '' }}
         run: |
@@ -284,9 +288,11 @@ jobs:
              [ "${{ inputs.activate_compressed_chart_history }}" = "true" ]; then
             secrets_json="$(jq \
               --arg origin "${PILOT_ORIGIN}" \
+              --arg approved_origin "${PILOT_APPROVED_ORIGIN}" \
               --arg id "${PILOT_ACCESS_ID}" \
               --arg secret "${PILOT_ACCESS_SECRET}" \
               '. + {UK_AQ_COMPRESSED_CHART_UPSTREAM_URL: $origin,
+                    UK_AQ_COMPRESSED_CHART_APPROVED_ORIGIN: $approved_origin,
                     UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_ID: $id,
                     UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_SECRET: $secret}' <<<"$secrets_json")"
           fi
