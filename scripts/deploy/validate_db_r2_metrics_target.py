@@ -43,7 +43,7 @@ def required(env, key):
 def unique_object(pairs):
     result = {}
     for key, value in pairs:
-        require(key not in result, "Duplicate JSON field in approval or metadata.")
+        require(key not in result, "Duplicate JSON field in Cloudflare metadata.")
         result[key] = value
     return result
 
@@ -57,27 +57,10 @@ def validate_local(env):
     require(required(env, "UK_AQ_GITHUB_REPO") == repository,
             "Configured repository disagrees with the running repository.")
 
-    raw = required(env, "UK_AQ_DB_R2_METRICS_APPROVED_TARGET")
-    require(len(raw.encode("utf-8")) <= 4096, "Approved target record is too large.")
-    try:
-        approved = json.loads(raw, object_pairs_hook=unique_object)
-    except (ValueError, RecursionError):
-        raise AdmissionError("Approved target must be valid JSON.") from None
-    require(isinstance(approved, dict) and set(approved) == {
-        "environment", "repository", "account_id", "worker_name",
-    }, "Approved target must contain exactly the four documented identity fields.")
-    require(all(isinstance(value, str) for value in approved.values()),
-            "Approved identity fields must be strings.")
     account = required(env, "UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID")
     worker = required(env, "UK_AQ_DB_R2_METRICS_API_WORKER_NAME")
     require(re.fullmatch(r"[a-f0-9]{32}", account), "Invalid Cloudflare account identifier.")
     require(re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", worker), "Invalid Worker name.")
-    require(approved == {
-        "environment": environment,
-        "repository": repository,
-        "account_id": account,
-        "worker_name": worker,
-    }, "Selected environment/repository/account/Worker tuple is not approved.")
 
     token = required(env, "CLOUDFLARE_API_TOKEN")
     require(not any(character.isspace() for character in token),
@@ -99,7 +82,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def validate_existing_bindings(account, worker, token):
     # This endpoint returns only secret names/types, never secret values.
-    # Its account and script path must be the exact independently approved pair.
+    # Query the exact configured account/script pair; ownership is operator-verified.
     url = ("https://api.cloudflare.com/client/v4/accounts/" + account
            + "/workers/scripts/" + worker + "/secrets")
     request = urllib.request.Request(url, headers={
@@ -138,7 +121,7 @@ def main():
     except AdmissionError as error:
         print("Metrics deployment refused: " + str(error), file=sys.stderr)
         return 1
-    print("Approved existing Metrics target admitted:")
+    print("Existing Metrics target admitted:")
     print("  target_env=" + environment)
     print("  repository=" + repository)
     print("  worker_name=" + worker)

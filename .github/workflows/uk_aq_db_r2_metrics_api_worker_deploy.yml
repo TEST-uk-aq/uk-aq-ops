@@ -24,13 +24,12 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
       UK_AQ_GITHUB_REPO: ${{ vars.UK_AQ_GITHUB_REPO }}
-      UK_AQ_DB_R2_METRICS_APPROVED_TARGET: ${{ vars.UK_AQ_DB_R2_METRICS_APPROVED_TARGET }}
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Admit approved deployment target and required bindings
+      - name: Validate deployment target and required bindings
         env:
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY }}

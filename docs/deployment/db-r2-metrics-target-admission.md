@@ -10,30 +10,33 @@ Before either deployment or secret upload, the workflow:
 
 1. requires exact `TEST` or `LIVE` directly in canonical `UK_AQ_ENV_NAME`;
 2. requires existing `UK_AQ_GITHUB_REPO` to match Actions' `GITHUB_REPOSITORY`;
-3. compares that environment/repository and the explicitly selected account and
-   Worker with an independently reviewed approval record;
+3. requires an explicitly configured, correctly formatted Cloudflare account ID
+   and Worker name;
 4. requires the selected `CLOUDFLARE_API_TOKEN` and all eleven upload inputs,
    including a nonblank `UK_AQ_DB_SIZE_API_TOKEN`, before any remote mutation;
 5. uses that credential for one read-only GET of secret-name/type metadata at
-   the approved account's exact Worker path. All eleven existing secret-text
+   the selected account's exact Worker path. All eleven existing secret-text
    bindings must be present. Missing Worker/access/bindings, redirects, invalid
    responses and network failures stop the job before deployment.
 
 There is no account, token, Worker-name or environment fallback. Resource names
 have no environment suffix requirement. The read uses Cloudflare's provider API,
 not an operator-supplied API origin; it never retrieves secret values. An active
-token alone is insufficient: the approved tuple must match first, and the token
-must read the existing Worker at that exact account/script endpoint. No Worker
+token alone is insufficient: input checks must pass first, and the token must
+read the existing Worker at that exact configured account/script endpoint. No Worker
 creation or rename is an admission remedy.
 
-The approval is operator-managed configuration, not a discovery result generated
-from the selected target. Whoever can change both the approval and selection can
-change this trust boundary. Review them against independent Cloudflare inventory
-and the approved repository/environment topology. Metadata proves existence and
-binding names at check time, not secret validity, caller compatibility, exclusive
-TEST use or future availability. It does not lock Cloudflare against concurrent
-operator changes. Avoid concurrent deployments/configuration changes during the
-authorised rollout.
+The existing GitHub account variable and API token are the target-selection trust
+boundary. The workflow cannot independently establish whether the configured
+account is the intended TEST or LIVE account. The operator must verify those
+values against actual Cloudflare account ownership before merging.
+
+The metadata check establishes that the selected Worker exists and its required
+bindings are present. It does not prove environment ownership, secret-value
+compatibility, deployment-write permissions or the absence of LIVE consumers.
+There is no secondary approval record, allow-list or duplicated environment
+configuration. Metadata is a point-in-time check, not a lock against concurrent
+cloud changes. Avoid concurrent target/configuration changes during rollout.
 
 ## Required configuration before merge
 
@@ -48,9 +51,8 @@ Repository **variables**:
 | --- | --- |
 | `UK_AQ_ENV_NAME` | Existing canonical environment, exactly `TEST` or `LIVE` |
 | `UK_AQ_GITHUB_REPO` | Existing explicit repository, matching the running repository |
-| `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID` | Sole selected account variable, already used by Latest Snapshot R2 API; must equal the independently approved account ID |
+| `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID` | Sole selected account variable, already used by Latest Snapshot R2 API; operator must verify actual account ownership |
 | `UK_AQ_DB_R2_METRICS_API_WORKER_NAME` | Exact already-provisioned Worker in that account |
-| `UK_AQ_DB_R2_METRICS_APPROVED_TARGET` | New independent approval record described below |
 | `UK_AQ_R2_HISTORY_VERSION` | Existing authorised `v1`, `v2` or `v3`; do not change to pass admission |
 | `SUPABASE_URL`, `OBS_AQIDB_SUPABASE_URL` | Existing intended project endpoints |
 | `CFLARE_R2_ENDPOINT`, `CFLARE_R2_BUCKET`, `CFLARE_R2_REGION` | Existing intended R2 resource configuration; all nonblank |
@@ -59,7 +61,7 @@ Repository **secrets**, all nonblank:
 
 - `CLOUDFLARE_API_TOKEN`: the sole selected deployment credential, already used
   by Blog Feed. It must read secret metadata and perform the existing Worker
-  deployments and secret synchronisation for the exact approved account/Worker.
+  deployments and secret synchronisation for the exact selected account/Worker.
   Successful Blog Feed deployment alone does not establish those permissions.
 - `SB_SECRET_KEY`, `OBS_AQIDB_SECRET_KEY`: existing keys for their matching projects.
 - `CFLARE_R2_ACCESS_KEY_ID`, `CFLARE_R2_SECRET_ACCESS_KEY`: existing R2 credential pair.
@@ -78,25 +80,12 @@ The three retired Metrics-specific selection keys are no longer consumed or
 catalogued here; their historical archive references are preserved. Shared
 catalogue entries used by other workflows remain intact.
 
-`UK_AQ_DB_R2_METRICS_APPROVED_TARGET` is a JSON object with exactly four string
-fields (shown as a schema template, not values to apply):
-
-```json
-{"environment":"<canonical environment>","repository":"<approved owner/repo>","account_id":"<verified 32-character account ID>","worker_name":"<existing approved Worker>"}
-```
-
-Duplicate fields, extra fields, malformed JSON, missing/whitespace values and any
-tuple mismatch are rejected. This one new key is necessary because the existing
-selection keys and terminal-only migration preflight do not store an independent
-deployment approval. Existing `UK_AQ_ENV_NAME` and `UK_AQ_GITHUB_REPO` are reused.
-No TEST/LIVE resource ID, hostname or name is embedded in executable code.
-
-Register the new record as a variable in the existing private, ignored
-`env-vars-master.csv` and the environment's sourced configuration, aligned with
-the committed `config/uk_aq_github_env_targets.csv`. The existing sync script
-routes by that CSV, skips empty variables and does not remove obsolete remote
-secrets. Inspect the applied repository settings separately; the catalogue alone
-is not proof of applied values. No sync was run for this PR.
+Keep the existing private, ignored `env-vars-master.csv`, sourced configuration
+and committed target catalogue aligned with these single-source settings. No new
+approval variable or replacement allow-list is required. The existing sync
+script skips empty variables and does not remove obsolete remote settings.
+Inspect applied repository settings separately; the catalogue is not proof of
+applied values. No sync or GitHub settings change was performed for this PR.
 
 ## Secret preservation and authentication
 
@@ -134,10 +123,13 @@ masked account `41a8...e879`, the unsuffixed Worker, history `v3`, eleven succes
 secret writes and the same final version ID. It explains the old guard bypass.
 The current source workflow matches that successful workflow before this change.
 
-For this TEST repository, the reviewed record must bind environment `TEST` and
-repository `TEST-uk-aq/uk-aq-ops` to that existing Worker and its independently
-verified full account ID. The masked historical ID cannot substitute for the
-full ID, and the JSON schema template is not an approval to apply guessed values.
+Before merging in this TEST repository, the operator must verify canonical
+`UK_AQ_ENV_NAME=TEST`, repository `TEST-uk-aq/uk-aq-ops`, and the selected full
+account ID and existing Worker against actual Cloudflare ownership. Do not infer
+ownership from these strings, the Worker suffix or the earlier successful
+Latest Snapshot/Blog deployments. The masked historical ID cannot substitute for
+the full account ID. If a resource serves both TEST and LIVE, flag the risk and
+stop for separate explicit shared-impact authorisation.
 
 No Cloudflare connection/credential is available in this task. GitHub's connector
 does not expose repository-variable or secret APIs here. Current full account
@@ -156,7 +148,7 @@ dependency/runtime pin is added to this safety correction.
 1. Review this draft and independently verify TEST inventory, Worker bindings,
    version/traffic, account ID and all upstream/caller credential provenance.
 2. An authorised operator reconciles the private master and applied variables,
-   verifies the required existing secrets and approved tuple, captures the normal
+   verifies the existing secrets and actual account/Worker ownership, captures the normal
    authenticated dashboard baseline and confirms an eligible recovery version.
    Do this before merge. If anything is unknown, leave both draft PRs unmerged.
 3. Obtain explicit authorisation for the corrective merge and its automatic TEST
@@ -187,6 +179,6 @@ caller settings or connected database/R2 state. The staged deployment is not
 atomic and can leave an intermediate version serving after failure. Do not
 blindly rerun it or revert to the unsafe guard as a recovery procedure.
 
-System Docs handover for Chat mode: document the approved account/Worker admission
-record and pre-mutation protected-binding requirements, and record actual TEST
+System Docs handover for Chat mode: document configuration-driven admission,
+operator ownership verification and pre-mutation binding checks; record TEST
 acceptance only after it occurs. Authoritative `system_docs/` remains read-only.
