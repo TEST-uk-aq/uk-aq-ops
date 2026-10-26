@@ -515,8 +515,8 @@ export UK_AQ_INTEGRITY_CORE_SNAPSHOT_STAGE="${INCOMING_CORE_SNAPSHOT_STAGE:-inte
 export UK_AQ_INTEGRITY_EFFECTIVE_MODE="${INCOMING_INTEGRITY_EFFECTIVE_MODE}"
 export UK_AQ_INTEGRITY_INVOCATION="${INCOMING_INTEGRITY_INVOCATION:-true}"
 
-if [[ "$(trim "${UKAQ_ENV_NAME:-}")" != "${ENV_NAME}" ]]; then
-  echo "ERROR: UKAQ_ENV_NAME in the selected repository root .env does not match --env=${ENV_NAME}." >&2
+if [[ "$(trim "${UK_AQ_ENV_NAME:-}")" != "${ENV_NAME}" ]]; then
+  echo "ERROR: UK_AQ_ENV_NAME in the selected repository root .env does not match --env=${ENV_NAME}." >&2
   exit 4
 fi
 

@@ -214,7 +214,7 @@ On the Pro itself:
    a state that permits operation. `caffeinate` does not guarantee survival of
    lid closure, power loss or reboot. The Air is not needed once launched.
 2. Use the existing environment/profile loader locally on the Pro. Required
-   loaded values are `UKAQ_ENV_NAME` and/or existing environment aliases,
+   loaded values are `UK_AQ_ENV_NAME` and/or existing environment aliases,
    `UK_AQ_R2_HISTORY_VERSION` (v2 for pre-cutover, v3 for read-cutover),
    `UK_AQ_R2_HISTORY_INTEGRITY_VERSION=v2`, `CFLARE_R2_ENDPOINT`,
    `CFLARE_R2_BUCKET`, `CFLARE_R2_ACCESS_KEY_ID`, `CFLARE_R2_SECRET_ACCESS_KEY`,

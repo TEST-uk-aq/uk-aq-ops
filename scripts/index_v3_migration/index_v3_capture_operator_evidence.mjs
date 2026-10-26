@@ -664,10 +664,10 @@ function parseArgs(argv) {
 }
 
 function assertEnvironment(localEnvironment, githubEnvironment) {
-  const local = requiredString(localEnvironment, "UKAQ_ENV_NAME").toUpperCase();
-  const remote = requiredString(githubEnvironment, "GitHub variable UKAQ_ENV_NAME").toUpperCase();
+  const local = requiredString(localEnvironment, "UK_AQ_ENV_NAME").toUpperCase();
+  const remote = requiredString(githubEnvironment, "GitHub variable UK_AQ_ENV_NAME").toUpperCase();
   if (!new Set(["TEST", "LIVE"]).has(local) || local !== remote) {
-    throw new Error("Local and GitHub UKAQ_ENV_NAME must match and be TEST or LIVE");
+    throw new Error("Local and GitHub UK_AQ_ENV_NAME must match and be TEST or LIVE");
   }
   return local;
 }
@@ -744,7 +744,7 @@ export async function main(argv = process.argv.slice(2), environment = process.e
   if (!github.repository || !github.defaultBranch || state.branch !== github.defaultBranch) {
     throw new Error("Capture must run on the GitHub default branch");
   }
-  const captureEnvironment = assertEnvironment(environment.UKAQ_ENV_NAME, githubVariable("UKAQ_ENV_NAME", github.repository, repositoryRoot));
+  const captureEnvironment = assertEnvironment(environment.UK_AQ_ENV_NAME, githubVariable("UK_AQ_ENV_NAME", github.repository, repositoryRoot));
   let payload;
   let kind;
   if (args.mode === "writer-freeze") {

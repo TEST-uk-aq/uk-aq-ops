@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME || 'TEST' }}
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
       CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || '' }}
@@ -90,7 +90,7 @@ jobs:
       - name: Validate TEST configuration
         run: |
           set -euo pipefail
-          if [ "${UKAQ_ENV_NAME^^}" != "TEST" ]; then
+          if [ "${UK_AQ_ENV_NAME^^}" != "TEST" ]; then
             echo "Refusing Black Carbon reconciliation outside TEST" >&2
             exit 1
           fi

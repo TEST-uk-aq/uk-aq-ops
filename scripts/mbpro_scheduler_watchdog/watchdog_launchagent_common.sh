@@ -31,7 +31,7 @@ watchdog_load_identity() {
         if (!separator) next
         key = substr(line, 1, separator - 1)
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
-        if (key != "UKAQ_ENV_NAME") next
+        if (key != "UK_AQ_ENV_NAME") next
         value = substr(line, separator + 1)
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
         count += 1
@@ -43,7 +43,7 @@ watchdog_load_identity() {
       }
     ' "$config_file"
   )" || {
-    echo "Configuration must contain exactly one non-empty UKAQ_ENV_NAME." >&2
+    echo "Configuration must contain exactly one non-empty UK_AQ_ENV_NAME." >&2
     return 1
   }
 
@@ -52,7 +52,7 @@ watchdog_load_identity() {
     TEST) WATCHDOG_ENVIRONMENT_SUFFIX="test" ;;
     LIVE) WATCHDOG_ENVIRONMENT_SUFFIX="live" ;;
     *)
-      echo "UKAQ_ENV_NAME must be TEST or LIVE." >&2
+      echo "UK_AQ_ENV_NAME must be TEST or LIVE." >&2
       return 1
       ;;
   esac

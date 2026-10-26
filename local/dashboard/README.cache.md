@@ -18,7 +18,7 @@ The local dashboard and refresher use separate ignored files:
 with:
 
 ```dotenv
-UKAQ_ENV_NAME=test
+UK_AQ_ENV_NAME=test
 UK_AQ_DASHBOARD_MYSQL_ENABLED=true
 UK_AQ_DASHBOARD_MYSQL_DATABASE=uk_aq_dashboard_test
 UK_AQ_DASHBOARD_MYSQL_SOCKET=/tmp/mysql.sock

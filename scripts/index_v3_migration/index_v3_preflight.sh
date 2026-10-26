@@ -330,7 +330,7 @@ require_env() {
 }
 
 for name in \
-  UKAQ_ENV_NAME \
+  UK_AQ_ENV_NAME \
   UK_AQ_R2_HISTORY_VERSION \
   UK_AQ_R2_HISTORY_INDEX_VERSION \
   UK_AQ_R2_HISTORY_INTEGRITY_VERSION \
@@ -348,8 +348,8 @@ if [ "$STAGE" = "rollback" ]; then
   require_env UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN
 fi
 
-ENVIRONMENT="$(printf '%s' "$UKAQ_ENV_NAME" | tr '[:lower:]' '[:upper:]')"
-case "$ENVIRONMENT" in TEST|LIVE) ;; *) fail "UKAQ_ENV_NAME must identify TEST or LIVE" ;; esac
+ENVIRONMENT="$(printf '%s' "$UK_AQ_ENV_NAME" | tr '[:lower:]' '[:upper:]')"
+case "$ENVIRONMENT" in TEST|LIVE) ;; *) fail "UK_AQ_ENV_NAME must identify TEST or LIVE" ;; esac
 
 STATION_CANDIDATE_WORKER_NAME="$(candidate_worker_name "$UK_AQ_STATION_HISTORY_WORKER_NAME")" \
   || fail "UK_AQ_STATION_HISTORY_WORKER_NAME cannot form a valid candidate Worker name"
@@ -405,11 +405,11 @@ get_repo_var() {
   gh variable get "$1" --repo "$REPO_SLUG" 2>/dev/null
 }
 
-ACTUAL_ENVIRONMENT="$(get_repo_var UKAQ_ENV_NAME)" \
-  || fail "GitHub variable UKAQ_ENV_NAME could not be read"
+ACTUAL_ENVIRONMENT="$(get_repo_var UK_AQ_ENV_NAME)" \
+  || fail "GitHub variable UK_AQ_ENV_NAME could not be read"
 ACTUAL_ENVIRONMENT="$(printf '%s' "$ACTUAL_ENVIRONMENT" | tr '[:lower:]' '[:upper:]')"
 [ "$ACTUAL_ENVIRONMENT" = "$ENVIRONMENT" ] \
-  || fail "GitHub UKAQ_ENV_NAME=$ACTUAL_ENVIRONMENT does not match loaded $ENVIRONMENT"
+  || fail "GitHub UK_AQ_ENV_NAME=$ACTUAL_ENVIRONMENT does not match loaded $ENVIRONMENT"
 
 compare_repo_var() {
   local name="$1" expected="$2" actual

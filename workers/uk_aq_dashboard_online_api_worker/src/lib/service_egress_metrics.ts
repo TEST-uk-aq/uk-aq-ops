@@ -129,7 +129,7 @@ export function recordDashboardSupabaseResponse(
     ].join("\u001f");
     const current = aggregate.get(key) || {
       bucket_minute: bucketMinute,
-      env_name: String(env.UKAQ_ENV_NAME || "TEST").trim() || "TEST",
+      env_name: String(env.UK_AQ_ENV_NAME || "TEST").trim() || "TEST",
       project_ref: identity.project_ref,
       service_name: SERVICE_NAME,
       source_type: "supabase_postgrest",

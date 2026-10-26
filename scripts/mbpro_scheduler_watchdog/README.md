@@ -4,7 +4,7 @@ This package provides an environment-neutral trigger-source fallback for the UK
 AQ D1-backed Cloudflare scheduler Workers. One installation protects TEST. A
 separate installation can later protect LIVE using the exact same package.
 
-`UKAQ_ENV_NAME` in the supplied watchdog env file selects the installation
+`UK_AQ_ENV_NAME` in the supplied watchdog env file selects the installation
 identity. Supported values are `TEST` and `LIVE`, case-insensitively. TEST and
 LIVE use separate LaunchAgent labels, installed code/configuration directories,
 JSONL logs, stdout and stderr, so both can run on the same Mac.
@@ -52,7 +52,7 @@ Keep the watchdog env file outside the repository with mode `600`. It should
 contain only:
 
 ```dotenv
-UKAQ_ENV_NAME=TEST
+UK_AQ_ENV_NAME=TEST
 
 UK_AQ_SCHEDULER_TRIGGER_SECRET=replace-with-dedicated-trigger-secret
 UK_AQ_INGEST_SCHEDULER_URL=https://replace-with-ingest-scheduler-worker
@@ -92,7 +92,7 @@ GitHub PATs, downstream dispatch secrets and unrelated service secrets do not
 belong in the watchdog configuration.
 
 The shell scripts do not source or evaluate this file. They parse only the
-single `UKAQ_ENV_NAME` assignment needed to derive installation identity. The
+single `UK_AQ_ENV_NAME` assignment needed to derive installation identity. The
 Python watchdog validates the complete file before installation without making
 a network request.
 
@@ -183,7 +183,7 @@ cp scripts/mbpro_scheduler_watchdog/watchdog.env.example "$TEST_WATCHDOG_CONFIG"
 chmod 600 "$TEST_WATCHDOG_CONFIG"
 ```
 
-Edit that file as data, retain `UKAQ_ENV_NAME=TEST`, set the TEST Worker URLs,
+Edit that file as data, retain `UK_AQ_ENV_NAME=TEST`, set the TEST Worker URLs,
 dedicated scheduler trigger secret, established Dropbox OAuth values and TEST
 `UK_AQ_DROPBOX_ROOT`, plus any non-default watchdog limits. Then install and
 inspect:
@@ -206,7 +206,7 @@ job. For TEST this safely replaces the existing
 environment-specific paths. To apply a later configuration change, edit the
 protected source `.env` and rerun the same installer command. It validates and
 copies that file, then restarts only the LaunchAgent selected by its
-`UKAQ_ENV_NAME`.
+`UK_AQ_ENV_NAME`.
 
 ## Install LIVE later without affecting TEST
 
@@ -218,7 +218,7 @@ cp scripts/mbpro_scheduler_watchdog/watchdog.env.example "$LIVE_WATCHDOG_CONFIG"
 chmod 600 "$LIVE_WATCHDOG_CONFIG"
 ```
 
-Set `UKAQ_ENV_NAME=LIVE`, the LIVE-specific scheduler secret, URLs and
+Set `UK_AQ_ENV_NAME=LIVE`, the LIVE-specific scheduler secret, URLs and
 `UK_AQ_DROPBOX_ROOT`, plus the appropriate established Dropbox OAuth values.
 Then:
 
@@ -273,7 +273,7 @@ maintenance, transition manually:
      "gui/$(id -u)/uk.co.ukaq.test-scheduler-watchdog" 2>/dev/null || true
    ```
 
-3. Install the generic package with `UKAQ_ENV_NAME=TEST`:
+3. Install the generic package with `UK_AQ_ENV_NAME=TEST`:
 
    ```bash
    scripts/mbpro_scheduler_watchdog/install_launchagent.sh \

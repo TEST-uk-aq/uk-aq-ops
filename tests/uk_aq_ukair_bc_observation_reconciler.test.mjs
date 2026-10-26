@@ -1323,7 +1323,7 @@ test("apply wiring enters the existing global-lock coordinator and protected chi
     planPath: "/tmp/ukair-bc-plan.json",
     planSha256: "a".repeat(64),
     runId: "ukair-bc-test-run",
-    env: { UKAQ_ENV_NAME: "TEST" },
+    env: { UK_AQ_ENV_NAME: "TEST" },
     spawnImpl: async (command, args, options) => {
       invocation = { command, args, options };
       return 0;
@@ -1341,7 +1341,7 @@ test("apply wiring enters the existing global-lock coordinator and protected chi
     "--",
   ]);
   assert.match(invocation.args[7], /uk_aq_ukair_bc_observation_reconciler_locked\.mjs$/);
-  assert.equal(invocation.options.env.UKAQ_ENV_NAME, "TEST");
+  assert.equal(invocation.options.env.UK_AQ_ENV_NAME, "TEST");
 });
 
 test("daily CLI derives a configurable recent horizon without selecting the full backfill", () => {
@@ -1407,7 +1407,7 @@ test("backfill dry-run processes bounded years sequentially with identical narro
       "--run-id", "backfill-dry-test",
       "--evidence-root", evidenceRoot,
     ],
-    env: { UKAQ_ENV_NAME: "TEST" },
+    env: { UK_AQ_ENV_NAME: "TEST" },
     now: new Date("2022-07-01T12:00:00.000Z"),
     clock: () => new Date("2022-07-01T12:01:00.000Z"),
     runBackfillYear: async (input) => {
@@ -1460,7 +1460,7 @@ test("backfill apply starts one independently protected range child per year", a
       "--run-id", "backfill-apply-test",
       "--evidence-root", evidenceRoot,
     ],
-    env: { UKAQ_ENV_NAME: "TEST" },
+    env: { UK_AQ_ENV_NAME: "TEST" },
     now: new Date("2022-01-01T12:00:00.000Z"),
     runBackfillYear: async (input) => {
       calls.push(input);
@@ -1495,7 +1495,7 @@ test("backfill failure stops later years and records completed, failed and unatt
       "--run-id", "backfill-failure-test",
       "--evidence-root", evidenceRoot,
     ],
-    env: { UKAQ_ENV_NAME: "TEST" },
+    env: { UK_AQ_ENV_NAME: "TEST" },
     now: new Date("2023-01-01T12:00:00.000Z"),
     runBackfillYear: async (input) => {
       attempted.push(input.year);
@@ -1547,7 +1547,7 @@ test("a new backfill run still attempts an already canonical year and preserves 
         "--run-id", runId,
         "--evidence-root", evidenceRoot,
       ],
-      env: { UKAQ_ENV_NAME: "TEST" },
+      env: { UK_AQ_ENV_NAME: "TEST" },
       now: new Date("2021-01-01T12:00:00.000Z"),
       runBackfillYear: async (input) => {
         attempted.push({ runId, year: input.year });

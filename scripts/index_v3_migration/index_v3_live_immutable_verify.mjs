@@ -69,7 +69,7 @@ function parse(argv) {
 
 export function assertLoadedLiveEnvironment(phase) {
   const env = process.env;
-  const names = [env.UKAQ_ENV_NAME, env.UK_AQ_ENV_NAME, env.ENVIRONMENT]
+  const names = [env.UK_AQ_ENV_NAME, env.ENVIRONMENT]
     .filter((name) => String(name || "").trim());
   if (!names.length || names.some((name) => String(name).trim().toUpperCase() !== "LIVE") ||
       env.UK_AQ_R2_HISTORY_VERSION !== (phase === "pre-cutover" ? "v2" : "v3") ||
@@ -105,7 +105,7 @@ export function assertLiveRepository(expectedSha, selectedGeneration) {
   if (command("gh", ["api", `repos/${REPOSITORY}/commits/main`, "--jq", ".sha"], root) !== expectedSha) {
     throw new Error("Current LIVE GitHub main differs from reviewed verifier implementation");
   }
-  if (command("gh", ["variable", "get", "UKAQ_ENV_NAME", "--repo", REPOSITORY], root).toUpperCase() !== "LIVE" ||
+  if (command("gh", ["variable", "get", "UK_AQ_ENV_NAME", "--repo", REPOSITORY], root).toUpperCase() !== "LIVE" ||
       command("gh", ["variable", "get", "UK_AQ_R2_HISTORY_VERSION", "--repo", REPOSITORY], root) !== selectedGeneration) {
     throw new Error("Independently read LIVE GitHub environment or generation differs from loaded verifier configuration");
   }

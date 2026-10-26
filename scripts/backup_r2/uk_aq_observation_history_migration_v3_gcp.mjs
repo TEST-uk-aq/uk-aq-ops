@@ -55,7 +55,7 @@ function assertTestEnvironment(argv, env = process.env) {
   const selectedBucket = oneValue(argv, '--expected-bucket');
   if (oneValue(argv, '--environment') !== 'TEST' || !TEST_BUCKET_PATTERN.test(selectedBucket) ||
       env.CFLARE_R2_BUCKET !== selectedBucket ||
-      [env.UKAQ_ENV_NAME, env.UK_AQ_ENV_NAME, env.ENVIRONMENT].filter(Boolean).some((value) => value.toUpperCase() !== 'TEST') ||
+      [env.UK_AQ_ENV_NAME, env.ENVIRONMENT].filter(Boolean).some((value) => value.toUpperCase() !== 'TEST') ||
       env.UK_AQ_R2_HISTORY_VERSION !== 'v2') {
     throw new Error('TEST GCP migration requires the pinned TEST environment and R2 bucket');
   }

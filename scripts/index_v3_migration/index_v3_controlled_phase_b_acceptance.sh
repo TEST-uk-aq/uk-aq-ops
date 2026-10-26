@@ -157,7 +157,7 @@ CURRENT_BRANCH="$(git branch --show-current)"
   || fail "current branch $CURRENT_BRANCH is not GitHub default branch $DEFAULT_BRANCH"
 
 for name in \
-  UKAQ_ENV_NAME \
+  UK_AQ_ENV_NAME \
   UK_AQ_R2_HISTORY_VERSION \
   UK_AQ_R2_HISTORY_INTEGRITY_VERSION \
   SUPABASE_DB_URL \
@@ -171,16 +171,16 @@ do
   require_env "$name"
 done
 
-LOADED_ENV="$(printf '%s' "$UKAQ_ENV_NAME" | tr '[:lower:]' '[:upper:]')"
+LOADED_ENV="$(printf '%s' "$UK_AQ_ENV_NAME" | tr '[:lower:]' '[:upper:]')"
 [ "$LOADED_ENV" = "$ENVIRONMENT" ] \
-  || fail "loaded UKAQ_ENV_NAME=$LOADED_ENV differs from requested $ENVIRONMENT"
+  || fail "loaded UK_AQ_ENV_NAME=$LOADED_ENV differs from requested $ENVIRONMENT"
 [ "$UK_AQ_R2_HISTORY_VERSION" = "v3" ] || fail "loaded observation generation must be v3"
 [ "$UK_AQ_R2_HISTORY_INTEGRITY_VERSION" = "v2" ] || fail "loaded Integrity semantic version must be v2"
 [ "$CFLARE_R2_BUCKET" = "$EXPECTED_BUCKET" ] \
   || fail "loaded R2 bucket differs from --expected-bucket"
 
-GH_ENV="$(gh variable get UKAQ_ENV_NAME --repo "$REPO_SLUG" 2>/dev/null | tr '[:lower:]' '[:upper:]')" \
-  || fail "GitHub UKAQ_ENV_NAME could not be read"
+GH_ENV="$(gh variable get UK_AQ_ENV_NAME --repo "$REPO_SLUG" 2>/dev/null | tr '[:lower:]' '[:upper:]')" \
+  || fail "GitHub UK_AQ_ENV_NAME could not be read"
 [ "$GH_ENV" = "$ENVIRONMENT" ] || fail "GitHub environment differs from requested $ENVIRONMENT"
 GH_HISTORY="$(gh variable get UK_AQ_R2_HISTORY_VERSION --repo "$REPO_SLUG" 2>/dev/null)" \
   || fail "GitHub UK_AQ_R2_HISTORY_VERSION could not be read"

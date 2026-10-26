@@ -1653,7 +1653,7 @@ async function fetchServiceEgressMetrics(env: WorkerEnv): Promise<{ rows: unknow
       {
         select: "bucket_minute,env_name,project_ref,service_name,source_type,source_name,route_name,query_name,window_label,status,request_count,response_rows,response_bytes_est,upstream_bytes_est,duration_ms,error_count,notes",
         bucket_minute: `gte.${toPostgrestTimestamp(since)}`,
-        env_name: `eq.${String(env.UKAQ_ENV_NAME || "TEST").trim() || "TEST"}`,
+        env_name: `eq.${String(env.UK_AQ_ENV_NAME || "TEST").trim() || "TEST"}`,
         order: "bucket_minute.asc",
       },
       1000,

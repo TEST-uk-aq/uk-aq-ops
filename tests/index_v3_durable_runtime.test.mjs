@@ -170,7 +170,7 @@ test('intervening upload and later upload before deployment remain fail-closed',
 
 test('successful capture uses version-specific GETs, pins packages and refuses later overwrite',async t=>{
   const f=fixture(t),bin=path.join(f.dir,'bin');fs.mkdirSync(bin);
-  const variables={UKAQ_ENV_NAME:'TEST',UK_AQ_R2_HISTORY_VERSION:'v2',UK_AQ_R2_HISTORY_INDEX_VERSION:'v2',UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME:'worker-0',UK_AQ_STATION_HISTORY_WORKER_NAME:'worker-1',UK_AQ_CACHE_WORKER_NAME:'worker-2'};
+  const variables={UK_AQ_ENV_NAME:'TEST',UK_AQ_R2_HISTORY_VERSION:'v2',UK_AQ_R2_HISTORY_INDEX_VERSION:'v2',UK_AQ_OBSERVS_HISTORY_R2_API_WORKER_NAME:'worker-0',UK_AQ_STATION_HISTORY_WORKER_NAME:'worker-1',UK_AQ_CACHE_WORKER_NAME:'worker-2'};
   const script=`#!${process.execPath}\nimport fs from 'node:fs';\nconst args=process.argv.slice(2);\nconst vars=${JSON.stringify(variables)}, components=${JSON.stringify(f.components)};\nlet result;\nif(args[0]==='repo') result='TEST-uk-aq/uk-aq-ops';\nelse if(args[0]==='variable' && args[1]==='get') result=vars[args[2]];\nelse if(args[0]==='api' && args[1]==='graphql') result={data:{repository:{nameWithOwner:'TEST-uk-aq/uk-aq-ops',defaultBranchRef:{name:'main',target:{oid:${JSON.stringify(head)}}}}}};\nelse if(args[0]==='api'){const c=components.find(c=>args[1].endsWith('/'+c.provenance.workflow_run_id));if(!c)process.exit(2);result={status:'completed',conclusion:'success',path:c.provenance.workflow_path,head_branch:'main',head_sha:c.git_commit_sha,repository:{full_name:'TEST-uk-aq/uk-aq-ops'}};}\nelse if(args[0]==='run' && args[1]==='view'){const c=components.find(c=>c.provenance.workflow_run_id===args[2]);result='Current Version ID: '+c.deployment.version_id;}\nelse process.exit(2);\nif(result===undefined)process.exit(2);process.stdout.write(typeof result==='string'?result:JSON.stringify(result));\n`;
   fs.writeFileSync(path.join(bin,'gh'),script,{mode:0o700});
   // Ignore this task's deliberate dirty tree only in the fixture; all other Git
@@ -186,12 +186,12 @@ test('successful capture uses version-specific GETs, pins packages and refuses l
     return new Response(JSON.stringify({success:true,result}));
   });
   const out=path.join(f.dir,'captured.json'),args=['capture-v2-runtime-rollback-authority','--environment','TEST','--work-dir',f.dir,'--out',out,'--operator','fixture','--confirm-frozen','--secret-binding-policy','preserve_current_required_bindings','--observations-run-id','101','--station-run-id','102','--cache-run-id','103'];
-  await capture(args,{UKAQ_ENV_NAME:'TEST',UK_AQ_R2_HISTORY_INTEGRITY_VERSION:'v2',CLOUDFLARE_ACCOUNT_ID:'a'.repeat(32),CLOUDFLARE_API_TOKEN:'fixture-token'});
+  await capture(args,{UK_AQ_ENV_NAME:'TEST',UK_AQ_R2_HISTORY_INTEGRITY_VERSION:'v2',CLOUDFLARE_ACCOUNT_ID:'a'.repeat(32),CLOUDFLARE_API_TOKEN:'fixture-token'});
   const record=JSON.parse(fs.readFileSync(out));assert.equal(validateDurableRuntimeEvidence(record,root,out).ok,true);
   assert.equal(gets.filter(p=>p.includes('/content/')).length,6);
   assert.ok(record.payload.components.every(c=>!path.isAbsolute(c.recovery_package.path) && path.basename(c.recovery_package.path)===c.recovery_package.path && fs.existsSync(path.join(f.dir,c.recovery_package.path))));
   const before=gets.length;await assert.rejects(capture(args),/already exists/);assert.equal(gets.length,before);
-  const diagnostic=await runObservationHistoryMigrationV3({argv:['--mode','runtime-recoverability','--transition','v2-to-v3','--environment','TEST','--v2-runtime-rollback-record',out,'--report-out',path.join(f.dir,'diagnostic.json')],env:{...process.env,UKAQ_ENV_NAME:'TEST',CLOUDFLARE_ACCOUNT_ID:'a'.repeat(32),CLOUDFLARE_API_TOKEN:'fixture-token'}});
+  const diagnostic=await runObservationHistoryMigrationV3({argv:['--mode','runtime-recoverability','--transition','v2-to-v3','--environment','TEST','--v2-runtime-rollback-record',out,'--report-out',path.join(f.dir,'diagnostic.json')],env:{...process.env,UK_AQ_ENV_NAME:'TEST',CLOUDFLARE_ACCOUNT_ID:'a'.repeat(32),CLOUDFLARE_API_TOKEN:'fixture-token'}});
   assert.equal(diagnostic.result.ok,true);assert.equal(diagnostic.result.mutation_calls,0);
 
 });

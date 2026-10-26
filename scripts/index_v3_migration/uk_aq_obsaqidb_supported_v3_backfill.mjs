@@ -75,7 +75,7 @@ function usage() {
     "  OBS_AQI_DB_URL",
     "",
     "Additional --apply requirements:",
-    "  UK_AQ_ENV_NAME=TEST (or UKAQ_ENV_NAME=TEST)",
+    "  UK_AQ_ENV_NAME=TEST",
     "  UK_AQ_R2_HISTORY_VERSION=v2",
     "  UK_AQ_R2_HISTORY_INDEX_VERSION=v3",
     "  SUPABASE_DB_URL (or DATABASE_URL) for the advisory-lock client",
@@ -214,11 +214,11 @@ function sourceDatabase(env) {
 }
 
 function assertConfiguredTestEnvironment(env) {
-  const configured = String(env.UK_AQ_ENV_NAME || env.UKAQ_ENV_NAME || "")
+  const configured = String(env.UK_AQ_ENV_NAME || "")
     .trim()
     .toUpperCase();
   if (configured !== "TEST") {
-    throw new Error("TEST ObsAQIDB access requires UK_AQ_ENV_NAME=TEST (or UKAQ_ENV_NAME=TEST)");
+    throw new Error("TEST ObsAQIDB access requires UK_AQ_ENV_NAME=TEST");
   }
 }
 

@@ -22938,7 +22938,6 @@ def _generic_v2_configured_identity(
         ) from exc
     environment = str(
         normal_config.get("UK_AQ_ENV_NAME")
-        or normal_config.get("UKAQ_ENV_NAME")
         or normal_config.get("ENVIRONMENT")
         or ""
     ).strip()
@@ -22956,7 +22955,6 @@ def _generic_v2_configured_identity(
     ).strip()
     selected_environment = str(
         effective.get("UK_AQ_ENV_NAME")
-        or effective.get("UKAQ_ENV_NAME")
         or effective.get("ENVIRONMENT")
         or ""
     ).strip()

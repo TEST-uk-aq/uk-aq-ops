@@ -36,7 +36,7 @@ Usage:
     [--node-bin PATH]
 
 Required loaded environment:
-  UKAQ_ENV_NAME=TEST
+  UK_AQ_ENV_NAME=TEST
   UK_AQ_R2_HISTORY_VERSION=v3
   UK_AQ_R2_HISTORY_INTEGRITY_VERSION=v2
   SUPABASE_DB_URL
@@ -216,13 +216,13 @@ CURRENT_BRANCH="$(git branch --show-current)"
 REMOTE_SHA="$(gh api "repos/$REPO_SLUG/commits/$DEFAULT_BRANCH" --jq .sha)" || fail "current default-branch SHA could not be read"
 [ "$CURRENT_SHA" = "$REMOTE_SHA" ] || fail "local HEAD differs from current GitHub default-branch HEAD"
 
-for name in UKAQ_ENV_NAME UK_AQ_R2_HISTORY_VERSION UK_AQ_R2_HISTORY_INTEGRITY_VERSION SUPABASE_DB_URL CFLARE_R2_ENDPOINT CFLARE_R2_BUCKET CFLARE_R2_ACCESS_KEY_ID CFLARE_R2_SECRET_ACCESS_KEY UK_AQ_CACHE_BYPASS_SECRET; do require_env "$name"; done
-[ "$(printf '%s' "$UKAQ_ENV_NAME" | tr '[:lower:]' '[:upper:]')" = "$ENVIRONMENT" ] || fail "loaded environment differs from explicit environment"
+for name in UK_AQ_ENV_NAME UK_AQ_R2_HISTORY_VERSION UK_AQ_R2_HISTORY_INTEGRITY_VERSION SUPABASE_DB_URL CFLARE_R2_ENDPOINT CFLARE_R2_BUCKET CFLARE_R2_ACCESS_KEY_ID CFLARE_R2_SECRET_ACCESS_KEY UK_AQ_CACHE_BYPASS_SECRET; do require_env "$name"; done
+[ "$(printf '%s' "$UK_AQ_ENV_NAME" | tr '[:lower:]' '[:upper:]')" = "$ENVIRONMENT" ] || fail "loaded environment differs from explicit environment"
 [ "$UK_AQ_R2_HISTORY_VERSION" = "v3" ] || fail "loaded observation generation is not v3"
 [ "$UK_AQ_R2_HISTORY_INTEGRITY_VERSION" = "v2" ] || fail "loaded Integrity semantic version is not v2"
 [ "$CFLARE_R2_BUCKET" = "$EXPECTED_BUCKET" ] || fail "loaded R2 bucket differs from explicit expected bucket"
 
-GH_ENV="$(gh variable get UKAQ_ENV_NAME --repo "$REPO_SLUG" 2>/dev/null | tr '[:lower:]' '[:upper:]')" || fail "GitHub environment could not be read"
+GH_ENV="$(gh variable get UK_AQ_ENV_NAME --repo "$REPO_SLUG" 2>/dev/null | tr '[:lower:]' '[:upper:]')" || fail "GitHub environment could not be read"
 GH_HISTORY="$(gh variable get UK_AQ_R2_HISTORY_VERSION --repo "$REPO_SLUG" 2>/dev/null)" || fail "GitHub history authority could not be read"
 [ "$GH_ENV" = "$ENVIRONMENT" ] && [ "$GH_HISTORY" = "v3" ] || fail "persistent GitHub environment/history authority is contradictory"
 # Deliberately do not read or create UK_AQ_R2_HISTORY_INTEGRITY_VERSION in GitHub.

@@ -20,7 +20,7 @@ node scripts/dashboard/generate_dashboard_config.mjs
 
 Relevant variables:
 
-- `UKAQ_ENV_NAME`
+- `UK_AQ_ENV_NAME`
 - `UKAQ_API_BASE_URL`
 - `UKAQ_DASHBOARD_TITLE`
 - `UKAQ_DASHBOARD_SUBTITLE`
