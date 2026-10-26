@@ -85,7 +85,7 @@ export function boundedVerifyLockMigrationRunId(args, report = null) {
 
 function assertTestRepositoryAndEnvironment(args, generation) {
   const env = process.env, repository = 'TEST-uk-aq/uk-aq-ops';
-  const names = [env.UKAQ_ENV_NAME, env.UK_AQ_ENV_NAME, env.ENVIRONMENT].filter((value) => String(value || '').trim());
+  const names = [env.UK_AQ_ENV_NAME, env.ENVIRONMENT].filter((value) => String(value || '').trim());
   demand(names.length && names.every((value) => value.trim().toUpperCase() === 'TEST') &&
     env.UK_AQ_R2_HISTORY_VERSION === generation && env.UK_AQ_R2_HISTORY_INTEGRITY_VERSION === 'v2' &&
     env.CFLARE_R2_BUCKET === args['expected-bucket'] && env.CFLARE_R2_BUCKET !== 'uk-aq-history-live',
@@ -101,7 +101,7 @@ function assertTestRepositoryAndEnvironment(args, generation) {
     !git(['status', '--porcelain=v1', '--untracked-files=normal']), 'TEST verifier requires clean reviewed TEST main');
   const gh = (command) => execFileSync('gh', command, { cwd: root, encoding: 'utf8', timeout: 20000 }).trim();
   demand(gh(['api', `repos/${repository}/commits/main`, '--jq', '.sha']) === args['expected-repository-git-sha'] &&
-    gh(['variable', 'get', 'UKAQ_ENV_NAME', '--repo', repository]).toUpperCase() === 'TEST' &&
+    gh(['variable', 'get', 'UK_AQ_ENV_NAME', '--repo', repository]).toUpperCase() === 'TEST' &&
     gh(['variable', 'get', 'UK_AQ_R2_HISTORY_VERSION', '--repo', repository]) === generation,
   'Independently read TEST repository authority differs');
 }

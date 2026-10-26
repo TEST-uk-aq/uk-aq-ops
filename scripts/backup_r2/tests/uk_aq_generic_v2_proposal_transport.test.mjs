@@ -88,7 +88,7 @@ function genericAuthorityFixture() {
 
 function normalConfigurationBody(environment, servingGeneration, bucket) {
   return Buffer.from([
-    `UKAQ_ENV_NAME=${environment}`,
+    `UK_AQ_ENV_NAME=${environment}`,
     `UK_AQ_R2_HISTORY_VERSION=${servingGeneration}`,
     `UK_AQ_R2_HISTORY_INDEX_VERSION=${servingGeneration}`,
     `CFLARE_R2_BUCKET=${bucket}`,

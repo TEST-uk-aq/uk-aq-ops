@@ -765,7 +765,7 @@ export function requireGenericV3CoordinatorFreeze(runState, env = process.env) {
     );
   }
   const configuredEnvironment = String(
-    env.UK_AQ_ENV_NAME || env.UKAQ_ENV_NAME || env.ENVIRONMENT || "",
+    env.UK_AQ_ENV_NAME || env.ENVIRONMENT || "",
   ).trim();
   if (!["TEST", "LIVE"].includes(configuredEnvironment)
       || configuredEnvironment !== runState.environment) {

@@ -1063,7 +1063,7 @@ export async function runBlackCarbonObservationReconciler({
 } = {}) {
   const args = parseReconcilerArgs(argv, { now });
   if (args.help) return Object.freeze({ help: true, text: usage() });
-  const configuredEnvironment = String(env.UKAQ_ENV_NAME || env.UK_AQ_ENV_NAME || "TEST")
+  const configuredEnvironment = String(env.UK_AQ_ENV_NAME || "TEST")
     .trim().toUpperCase();
   if (configuredEnvironment !== "TEST") throw new Error("Configured environment must be TEST");
   if (args.mode === "backfill") {

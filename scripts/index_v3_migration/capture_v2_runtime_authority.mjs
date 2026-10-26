@@ -42,14 +42,14 @@ function options(argv) {
   return args;
 }
 async function context(environment,env) {
-  if(!['TEST','LIVE'].includes(environment) || environment!==env.UKAQ_ENV_NAME?.toUpperCase()) throw new Error('Explicit --environment must match loaded UKAQ_ENV_NAME');
+  if(!['TEST','LIVE'].includes(environment) || environment!==env.UK_AQ_ENV_NAME?.toUpperCase()) throw new Error('Explicit --environment must match loaded UK_AQ_ENV_NAME');
   assertCleanWorkingTree(root);
   // Load at command execution, not module evaluation: the rollback authenticator
   // itself loads the migration CLI while authenticating historical recovery.
   const {validateRollbackReviewedHead}=await import('./rollback_executor_authority.mjs');
   const identity=validateRollbackReviewedHead({repositoryRoot:root});
   const variable=name=>run('gh',['variable','get',name,'--repo',identity.repository]);
-  if(variable('UKAQ_ENV_NAME').toUpperCase()!==environment) throw new Error('GitHub environment mismatch');
+  if(variable('UK_AQ_ENV_NAME').toUpperCase()!==environment) throw new Error('GitHub environment mismatch');
   if(env.UK_AQ_R2_HISTORY_INTEGRITY_VERSION!=='v2') throw new Error('Loaded UK_AQ_R2_HISTORY_INTEGRITY_VERSION must be v2');
   for(const name of ['UK_AQ_R2_HISTORY_VERSION','UK_AQ_R2_HISTORY_INDEX_VERSION']) if(variable(name)!=='v2') throw new Error(`GitHub ${name} must be v2`);
   return {identity,variable,credentials:cloudflareCaptureCredentials(env)};

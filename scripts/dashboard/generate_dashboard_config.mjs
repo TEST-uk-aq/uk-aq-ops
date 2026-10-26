@@ -28,7 +28,7 @@ const defaultRefreshSeconds = Number.parseInt(
 );
 
 const config = {
-  envName: stripWrappingQuotes(process.env.UKAQ_ENV_NAME || "local"),
+  envName: stripWrappingQuotes(process.env.UK_AQ_ENV_NAME || "local"),
   apiBaseUrl: stripWrappingQuotes(process.env.UKAQ_API_BASE_URL || "/api"),
   dashboardTitle: stripWrappingQuotes(process.env.UKAQ_DASHBOARD_TITLE || "UK AQ Dashboard"),
   dashboardSubtitle: String(

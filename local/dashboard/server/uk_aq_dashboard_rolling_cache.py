@@ -472,7 +472,7 @@ def sync_service_egress(core) -> Dict[str, Any]:
     params = {
         "select": EGRESS_SELECT,
         "bucket_minute": f"gte.{core._to_postgrest_ts(since)}",
-        "env_name": f"eq.{str(core.os.getenv('UKAQ_ENV_NAME') or 'TEST').strip() or 'TEST'}",
+        "env_name": f"eq.{str(core.os.getenv('UK_AQ_ENV_NAME') or 'TEST').strip() or 'TEST'}",
         "order": "bucket_minute.asc",
     }
     rows = core._fetch_all(base, headers, core.SERVICE_EGRESS_MINUTE_VIEW, params, limit=1000)

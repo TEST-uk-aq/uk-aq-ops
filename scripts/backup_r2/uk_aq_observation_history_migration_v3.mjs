@@ -2486,7 +2486,7 @@ async function runSideBySideMigrationOperator({
   if (!hasRequiredR2Config(config.r2)) throw new Error("Complete configured R2 credentials and bucket are required");
   const evidence = {
     ...environmentEvidence(args, env, config),
-    configuredEnvironment: env.UKAQ_ENV_NAME || env.UK_AQ_ENV_NAME || env.ENVIRONMENT || "",
+    configuredEnvironment: env.UK_AQ_ENV_NAME || env.ENVIRONMENT || "",
     indexVersion: env.UK_AQ_R2_HISTORY_VERSION,
   };
   validateObservationHistoryV3MigrationEnvironment({ ...evidence, apply: true });
@@ -2911,7 +2911,7 @@ export async function runObservationHistoryMigrationV3({
     const validated = validateIndexV3OperatorEvidence({ evidence: rollbackEvidence, repositoryRoot, runtimeEvidencePath: path.resolve(args.v2RuntimeRollbackRecord) });
     if (validated.kind !== "uk_aq_index_v3_v2_runtime_rollback_record" ||
         validated.environment.toUpperCase() !== String(args.environment || "").toUpperCase() ||
-        validated.environment.toUpperCase() !== String(env.UKAQ_ENV_NAME || "").toUpperCase()) {
+        validated.environment.toUpperCase() !== String(env.UK_AQ_ENV_NAME || "").toUpperCase()) {
       throw new Error("Runtime recovery diagnostic environment or evidence kind mismatch");
     }
     const identity = await runOperatorCommand("gh", ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"], {

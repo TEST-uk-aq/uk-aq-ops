@@ -186,8 +186,8 @@ apply_env_file_safe() {
 
 apply_env_file_safe "${ROOT_ENV_FILE}"
 
-if [[ "$(printf '%s' "${UKAQ_ENV_NAME:-}" | sed 's/[[:space:]]*$//')" != "${ENV_NAME}" ]]; then
-  error "UKAQ_ENV_NAME in the selected repository root .env does not match --env=${ENV_NAME}"
+if [[ "$(printf '%s' "${UK_AQ_ENV_NAME:-}" | sed 's/[[:space:]]*$//')" != "${ENV_NAME}" ]]; then
+  error "UK_AQ_ENV_NAME in the selected repository root .env does not match --env=${ENV_NAME}"
 fi
 
 UK_AQ_ENV_NAME="${ENV_NAME}"

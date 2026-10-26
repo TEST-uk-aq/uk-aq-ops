@@ -185,7 +185,7 @@ export function childEnvironment(c, p) {
   return { ...env, ...backupEnv, PATH: `${path.dirname(process.execPath)}:${path.dirname(c.rclone_bin)}:/usr/bin:/bin:/usr/sbin:/sbin`,
     NODE_EXTRA_CA_CERTS: postgresCAFile(c, p),
     RCLONE_CONFIG: c.rclone_config, UK_AQ_R2_HISTORY_BACKUP_RCLONE_BIN: c.rclone_bin,
-    UKAQ_ENV_NAME: p.environment };
+    UK_AQ_ENV_NAME: p.environment };
 }
 export function remoteConfiguration(c, env) {
   let remotes;

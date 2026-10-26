@@ -13,7 +13,7 @@ const SOURCE_HASH = "b".repeat(64);
 
 function baseEnv() {
   return {
-    UKAQ_ENV_NAME: "TEST",
+    UK_AQ_ENV_NAME: "TEST",
     UK_AQ_R2_HISTORY_INTEGRITY_VERSION: "v2",
     GITHUB_SHA: GIT_SHA,
     INGESTDB_RETENTION_DAYS: "5",

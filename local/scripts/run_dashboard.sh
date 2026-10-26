@@ -127,7 +127,7 @@ if refresh_seconds <= 0:
     refresh_seconds = 300
 
 config = {
-    "envName": strip_wrapping_quotes(str(os.getenv("UKAQ_ENV_NAME", "local"))),
+    "envName": strip_wrapping_quotes(str(os.getenv("UK_AQ_ENV_NAME", "local"))),
     "apiBaseUrl": strip_wrapping_quotes(str(os.getenv("UKAQ_API_BASE_URL", "/api"))),
     "dashboardTitle": strip_wrapping_quotes(str(os.getenv("UKAQ_DASHBOARD_TITLE", "UK AQ Dashboard"))),
     "dashboardSubtitle": strip_wrapping_quotes(

@@ -459,9 +459,9 @@ export function buildControlledPhaseBConfig(phaseB) {
 }
 
 function validateRuntimeAuthority({ options, phaseB, env }) {
-  const loadedEnvironment = String(env.UKAQ_ENV_NAME || "").trim().toUpperCase();
+  const loadedEnvironment = String(env.UK_AQ_ENV_NAME || "").trim().toUpperCase();
   if (loadedEnvironment !== options.environment) {
-    fail(`Loaded UKAQ_ENV_NAME=${loadedEnvironment || "<empty>"} differs from requested ${options.environment}`);
+    fail(`Loaded UK_AQ_ENV_NAME=${loadedEnvironment || "<empty>"} differs from requested ${options.environment}`);
   }
   if (String(env.UK_AQ_R2_HISTORY_INTEGRITY_VERSION || "").trim() !== "v2") {
     fail("Loaded UK_AQ_R2_HISTORY_INTEGRITY_VERSION must be exactly v2");

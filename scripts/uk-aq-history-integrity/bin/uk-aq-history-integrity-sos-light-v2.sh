@@ -198,8 +198,8 @@ export UK_AQ_HISTORY_INTEGRITY_LAUNCHD_JOB_LABEL="${LAUNCHD_METADATA[0]}"
 export UK_AQ_HISTORY_INTEGRITY_LAUNCHD_DOMAIN="${LAUNCHD_METADATA[1]}"
 export UK_AQ_HISTORY_INTEGRITY_LAUNCHD_LOG_PATH="${LAUNCHD_METADATA[2]}"
 
-if [[ "$(printf '%s' "${UKAQ_ENV_NAME:-}" | sed 's/[[:space:]]*$//')" != "${ENV_NAME}" ]]; then
-  error "UKAQ_ENV_NAME in the selected repository root .env does not match --env=${ENV_NAME}"
+if [[ "$(printf '%s' "${UK_AQ_ENV_NAME:-}" | sed 's/[[:space:]]*$//')" != "${ENV_NAME}" ]]; then
+  error "UK_AQ_ENV_NAME in the selected repository root .env does not match --env=${ENV_NAME}"
 fi
 
 UK_AQ_ENV_NAME="${ENV_NAME}"

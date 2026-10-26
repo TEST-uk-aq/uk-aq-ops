@@ -20,7 +20,7 @@ Usage:
     --cache-url URL
 
 Required environment already used by the migration tooling:
-  UKAQ_ENV_NAME
+  UK_AQ_ENV_NAME
   UK_AQ_R2_HISTORY_VERSION
   CFLARE_R2_ENDPOINT
   CFLARE_R2_BUCKET
@@ -123,7 +123,7 @@ jq empty "$PLAN_REPORT" >/dev/null 2>&1 || fail "migration plan report is invali
 [ -f "$CHECKPOINT" ] || fail "migration checkpoint is missing: $CHECKPOINT"
 
 for name in \
-  UKAQ_ENV_NAME \
+  UK_AQ_ENV_NAME \
   UK_AQ_R2_HISTORY_VERSION \
   CFLARE_R2_ENDPOINT \
   CFLARE_R2_BUCKET \
@@ -134,7 +134,7 @@ do
   require_env "$name"
 done
 
-ENVIRONMENT="$(printf '%s' "$UKAQ_ENV_NAME" | tr '[:lower:]' '[:upper:]')"
+ENVIRONMENT="$(printf '%s' "$UK_AQ_ENV_NAME" | tr '[:lower:]' '[:upper:]')"
 [ "$ENVIRONMENT" = "TEST" ] || fail "normal side-by-side cut-over is TEST-only"
 [ "$CFLARE_R2_BUCKET" = "$EXPECTED_BUCKET" ] || fail "loaded bucket differs from explicit expected bucket"
 
@@ -166,8 +166,8 @@ printf '%s\n\n' 'READ-ONLY: NO CONFIGURATION OR DATA MUTATION IS PERFORMED'
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/uk-aq-index-v3-post-cutover.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-GH_ENV="$(gh variable get UKAQ_ENV_NAME --repo "$REPO_SLUG" 2>/dev/null | tr '[:lower:]' '[:upper:]')" \
-  || fail "GitHub UKAQ_ENV_NAME could not be read"
+GH_ENV="$(gh variable get UK_AQ_ENV_NAME --repo "$REPO_SLUG" 2>/dev/null | tr '[:lower:]' '[:upper:]')" \
+  || fail "GitHub UK_AQ_ENV_NAME could not be read"
 [ "$GH_ENV" = "$ENVIRONMENT" ] || fail "GitHub environment does not match loaded $ENVIRONMENT"
 
 HISTORY_AUTHORITY="$(gh variable get UK_AQ_R2_HISTORY_VERSION --repo "$REPO_SLUG" 2>/dev/null)" || fail "persistent history generation could not be read"

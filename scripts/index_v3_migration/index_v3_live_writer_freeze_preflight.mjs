@@ -79,7 +79,7 @@ function assertRepository(root, sha) {
   if (run("gh", ["api", `repos/${REPO}/commits/main`, "--jq", ".sha"], root) !== sha) {
     throw new Error("LIVE remote main differs from reviewed preflight implementation");
   }
-  if (run("gh", ["variable", "get", "UKAQ_ENV_NAME", "--repo", REPO], root).toUpperCase() !== "LIVE" ||
+  if (run("gh", ["variable", "get", "UK_AQ_ENV_NAME", "--repo", REPO], root).toUpperCase() !== "LIVE" ||
       run("gh", ["variable", "get", "UK_AQ_R2_HISTORY_VERSION", "--repo", REPO], root) !== "v2") {
     throw new Error("LIVE GitHub environment or selected-generation authority disagrees with frozen v2");
   }
@@ -87,7 +87,7 @@ function assertRepository(root, sha) {
 
 function assertEnvironment() {
   const env = process.env;
-  const names = [env.UKAQ_ENV_NAME, env.UK_AQ_ENV_NAME, env.ENVIRONMENT]
+  const names = [env.UK_AQ_ENV_NAME, env.ENVIRONMENT]
     .filter(x => String(x || "").trim());
   if (!names.length || names.some(x => String(x).toUpperCase() !== "LIVE") ||
       env.UK_AQ_R2_HISTORY_VERSION !== "v2" ||

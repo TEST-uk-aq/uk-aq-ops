@@ -32,7 +32,7 @@ LOG_BACKUP_COUNT = 7
 DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token"
 DROPBOX_UPLOAD_URL = "https://content.dropboxapi.com/2/files/upload"
 REQUIRED_SETTINGS = (
-    "UKAQ_ENV_NAME",
+    "UK_AQ_ENV_NAME",
     "UK_AQ_SCHEDULER_TRIGGER_SECRET",
     "UK_AQ_INGEST_SCHEDULER_URL",
     "UK_AQ_OPS_SCHEDULER_URL",
@@ -73,9 +73,9 @@ def load_env_file(path: Path) -> dict[str, str]:
 
 
 def canonical_environment(settings: dict[str, str]) -> str:
-    environment = settings["UKAQ_ENV_NAME"].strip().upper()
+    environment = settings["UK_AQ_ENV_NAME"].strip().upper()
     if environment not in {"TEST", "LIVE"}:
-        raise ValueError("UKAQ_ENV_NAME must be TEST or LIVE")
+        raise ValueError("UK_AQ_ENV_NAME must be TEST or LIVE")
     return environment
 
 

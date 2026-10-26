@@ -23,7 +23,7 @@ function fixture(environment = "TEST") {
   fs.chmodSync(pythonPath, 0o755);
   fs.mkdirSync(r2Root, { recursive: true });
   fs.writeFileSync(path.join(repositoryRoot, ".env"), [
-    `export UKAQ_ENV_NAME=${environment}`,
+    `export UK_AQ_ENV_NAME=${environment}`,
     `UK_AQ_DROPBOX_APP_ROOT="${dropboxAppRoot}"`,
     `UK_AQ_DROPBOX_ROOT='${environment}'`,
     "UK_AQ_R2_HISTORY_DROPBOX_DIR=R2_history_backup # accepted trailing comment",
@@ -36,13 +36,13 @@ function fixture(environment = "TEST") {
 test("safe env parsing follows the fixed-v3 runner assignment semantics without evaluation", () => {
   assert.deepEqual(parseIntegrityEnvAssignments([
     "# comment",
-    "export UKAQ_ENV_NAME=TEST",
+    "export UK_AQ_ENV_NAME=TEST",
     "QUOTED='value # retained' # removed",
     "PLAIN=value # removed",
     "SHELL=$(touch must-not-run)",
     "INVALID-NAME=ignored",
   ].join("\n")), {
-    UKAQ_ENV_NAME: "TEST",
+    UK_AQ_ENV_NAME: "TEST",
     QUOTED: "value # retained",
     PLAIN: "value",
     SHELL: "$(touch must-not-run)",
@@ -96,7 +96,7 @@ test("bootstrap rejects environment mismatch and keeps --state-dir as an explici
     environment: "TEST",
     repositoryRoot: mismatch.repositoryRoot,
     env: { UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT: mismatch.localRoot },
-  }), /UKAQ_ENV_NAME.*does not match --env=TEST/);
+  }), /UK_AQ_ENV_NAME.*does not match --env=TEST/);
 
   const stateOverride = path.join(current.root, "debug-state");
   const env = { UK_AQ_HISTORY_INTEGRITY_LOCAL_ROOT: current.localRoot };

@@ -5448,7 +5448,7 @@ class GenericV2OperationalContextTests(unittest.TestCase):
         env_path = self.root / f"{environment}-{generation}.env"
         env_path.write_text(
             "\n".join((
-                f"UKAQ_ENV_NAME={environment}",
+                f"UK_AQ_ENV_NAME={environment}",
                 f"UK_AQ_R2_HISTORY_VERSION={generation}",
                 f"UK_AQ_R2_HISTORY_INDEX_VERSION={generation}",
                 f"CFLARE_R2_BUCKET={bucket}",

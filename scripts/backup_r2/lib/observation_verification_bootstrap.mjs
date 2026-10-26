@@ -136,10 +136,10 @@ export function bootstrapObservationVerificationIntegrityV3({
 
   const rootEnvFile = requireReadableFile("repository root .env", path.join(repoRoot, ".env"));
   Object.assign(env, parseIntegrityEnvAssignments(fs.readFileSync(rootEnvFile, "utf8")));
-  const configuredEnvironment = String(env.UKAQ_ENV_NAME || "").trimEnd();
+  const configuredEnvironment = String(env.UK_AQ_ENV_NAME || "").trimEnd();
   if (configuredEnvironment !== selectedEnvironment) {
     throw new Error(
-      `UKAQ_ENV_NAME in the selected repository root .env does not match --env=${selectedEnvironment}`,
+      `UK_AQ_ENV_NAME in the selected repository root .env does not match --env=${selectedEnvironment}`,
     );
   }
 

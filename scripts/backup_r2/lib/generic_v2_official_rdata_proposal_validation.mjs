@@ -246,7 +246,7 @@ function authoritativeNormalConfiguration(env) {
     values[match[1]] = value;
   }
   const environment = String(
-    values.UK_AQ_ENV_NAME || values.UKAQ_ENV_NAME || values.ENVIRONMENT || "",
+    values.UK_AQ_ENV_NAME || values.ENVIRONMENT || "",
   ).trim();
   const servingGeneration = String(values.UK_AQ_R2_HISTORY_VERSION || "").trim();
   const indexGeneration = String(
@@ -990,7 +990,7 @@ export function requireRetainedV2MaintenanceContext(runState, env = process.env)
   const normalConfig = authoritativeNormalConfiguration(env);
   const implementationRevision = authenticatedImplementationRevision(env);
   const configuredEnvironment = String(
-    env.UK_AQ_ENV_NAME || env.UKAQ_ENV_NAME || env.ENVIRONMENT || "",
+    env.UK_AQ_ENV_NAME || env.ENVIRONMENT || "",
   ).trim();
   const configuredGeneration = String(env.UK_AQ_R2_HISTORY_VERSION || "").trim();
   const configuredIndexGeneration = String(
@@ -1100,7 +1100,7 @@ export function requireServingV2LiveContext(runState, env = process.env) {
   const normalConfig = authoritativeNormalConfiguration(env);
   const implementationRevision = authenticatedImplementationRevision(env);
   const configuredEnvironment = String(
-    env.UK_AQ_ENV_NAME || env.UKAQ_ENV_NAME || env.ENVIRONMENT || "",
+    env.UK_AQ_ENV_NAME || env.ENVIRONMENT || "",
   ).trim();
   const configuredGeneration = String(env.UK_AQ_R2_HISTORY_VERSION || "").trim();
   const configuredIndexGeneration = String(
@@ -1246,7 +1246,7 @@ export function requireGenericV2CoordinatorFreeze(runState, env = process.env) {
     );
   }
   const configuredEnvironment = String(
-    env.UK_AQ_ENV_NAME || env.UKAQ_ENV_NAME || env.ENVIRONMENT || "",
+    env.UK_AQ_ENV_NAME || env.ENVIRONMENT || "",
   ).trim();
   if (!["TEST", "LIVE"].includes(configuredEnvironment)
       || configuredEnvironment !== runState.environment) {

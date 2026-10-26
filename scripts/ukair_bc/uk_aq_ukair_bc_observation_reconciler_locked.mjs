@@ -926,7 +926,7 @@ export async function runProtectedBlackCarbonReconciliation({
   const { plan, planSha256 } = await loadProtectedPlan(args);
   try {
     const verifiedSources = await verifyPinnedSourceEvidence(plan);
-    const configuredEnvironment = String(env.UKAQ_ENV_NAME || env.UK_AQ_ENV_NAME || "")
+    const configuredEnvironment = String(env.UK_AQ_ENV_NAME || "")
       .trim().toUpperCase();
     if (configuredEnvironment !== "TEST") {
       throw new Error("Protected Black Carbon reconciliation permits only TEST");

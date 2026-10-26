@@ -467,7 +467,7 @@ def _record_dashboard_supabase_response(
         if row is None:
             row = {
                 "bucket_minute": bucket_minute,
-                "env_name": str(os.getenv("UKAQ_ENV_NAME") or "TEST").strip() or "TEST",
+                "env_name": str(os.getenv("UK_AQ_ENV_NAME") or "TEST").strip() or "TEST",
                 "project_ref": identity["project_ref"],
                 "service_name": "dashboard.dev",
                 "source_type": "supabase_postgrest",
@@ -1774,7 +1774,7 @@ def _fetch_service_egress_metrics() -> Tuple[List[Dict[str, Any]], Optional[str]
                     "response_bytes_est,upstream_bytes_est,duration_ms,error_count,notes"
                 ),
                 "bucket_minute": f"gte.{_to_postgrest_ts(now - timedelta(hours=24))}",
-                "env_name": f"eq.{str(os.getenv('UKAQ_ENV_NAME') or 'TEST').strip() or 'TEST'}",
+                "env_name": f"eq.{str(os.getenv('UK_AQ_ENV_NAME') or 'TEST').strip() or 'TEST'}",
                 "order": "bucket_minute.asc",
             },
             page_size=METRICS_VIEW_PAGE_SIZE,

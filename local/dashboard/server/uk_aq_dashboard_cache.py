@@ -44,7 +44,7 @@ def enabled():
 
 
 def configuration(role):
-    environment = os.getenv("UKAQ_ENV_NAME", "").lower()
+    environment = os.getenv("UK_AQ_ENV_NAME", "").lower()
     database = os.getenv("UK_AQ_DASHBOARD_MYSQL_DATABASE", "")
     expected = f"uk_aq_dashboard_{environment}"
     checkout = Path(__file__).resolve().parents[3].name
@@ -75,7 +75,7 @@ def connect(role):
 
 
 def request_dir():
-    environment = os.getenv("UKAQ_ENV_NAME", "").lower()
+    environment = os.getenv("UK_AQ_ENV_NAME", "").lower()
     if environment not in {"test", "live"}:
         raise CacheConfigurationError("Cache refresh marker requires explicit environment")
     return Path.home() / "Library/Caches/uk-aq" / f"dashboard-{environment}"

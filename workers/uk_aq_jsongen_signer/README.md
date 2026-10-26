@@ -186,8 +186,7 @@ object bodies or canonical writer credentials. Native rate limiting remains
 
 Prune's workflow passes the existing optional handover settings, including
 `UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED`. It also supplies the
-exact `UK_AQ_ENV_NAME=TEST` required by `resolvePruneSignerConfig`; the existing
-`UKAQ_ENV_NAME` remains in place. No Prune extraction, canonical R2 publication,
+exact `UK_AQ_ENV_NAME=TEST` required by `resolvePruneSignerConfig`. No Prune extraction, canonical R2 publication,
 object/manifest verification, v3 finalisation, PostgreSQL gate or deletion code
 is changed. No new confirmation/receipt endpoint or monthly publisher is added.
 

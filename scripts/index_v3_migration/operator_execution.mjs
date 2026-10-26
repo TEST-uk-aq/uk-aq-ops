@@ -231,7 +231,7 @@ export async function superviseOperatorInvocation(entry, args, env = process.env
   };
   const metadata = {
     kind: 'uk_aq_operator_run', diagnostic_only: true,
-    environment: env.UKAQ_ENV_NAME || null, operation,
+    environment: env.UK_AQ_ENV_NAME || null, operation,
     transition: argValue(args, '--transition'), migration_run_id: argValue(args, '--migration-run-id'),
     repository: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..'),
     started_at_utc: started.toISOString(), pid: process.pid, run_directory: directory,

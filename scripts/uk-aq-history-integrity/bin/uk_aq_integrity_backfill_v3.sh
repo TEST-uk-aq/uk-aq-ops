@@ -483,8 +483,8 @@ export UK_AQ_INTEGRITY_TARGET_WRITER_GIT_SHA="${INCOMING_TARGET_WRITER_GIT_SHA}"
 export UK_AQ_INTEGRITY_WORKER_PURPOSE="${INCOMING_INTEGRITY_WORKER_PURPOSE}"
 export UK_AQ_INTEGRITY_CANONICAL_WRITES_ALLOWED="${INCOMING_CANONICAL_WRITES_ALLOWED}"
 
-if [[ "$(trim "${UKAQ_ENV_NAME:-}")" != "${ENV_NAME}" ]]; then
-  echo "ERROR: UKAQ_ENV_NAME in the selected repository root .env does not match --env=${ENV_NAME}." >&2
+if [[ "$(trim "${UK_AQ_ENV_NAME:-}")" != "${ENV_NAME}" ]]; then
+  echo "ERROR: UK_AQ_ENV_NAME in the selected repository root .env does not match --env=${ENV_NAME}." >&2
   exit 4
 fi
 

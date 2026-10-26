@@ -29,7 +29,7 @@ jobs:
       CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
       CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME || '' }}
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME || '' }}
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
       INPUT_APPLY: ${{ inputs.apply }}
 
@@ -59,7 +59,7 @@ jobs:
             CFLARE_R2_BUCKET
             CFLARE_R2_ACCESS_KEY_ID
             CFLARE_R2_SECRET_ACCESS_KEY
-            UKAQ_ENV_NAME
+            UK_AQ_ENV_NAME
             UK_AQ_R2_HISTORY_VERSION
           )
 
@@ -74,8 +74,8 @@ jobs:
             exit 1
           fi
 
-          if [ "${UKAQ_ENV_NAME}" != "live" ]; then
-            echo "Refusing migration because UKAQ_ENV_NAME is not live: ${UKAQ_ENV_NAME}" >&2
+          if [ "${UK_AQ_ENV_NAME}" != "live" ]; then
+            echo "Refusing migration because UK_AQ_ENV_NAME is not live: ${UK_AQ_ENV_NAME}" >&2
             exit 1
           fi
 

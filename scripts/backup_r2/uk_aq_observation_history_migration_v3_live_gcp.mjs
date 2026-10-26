@@ -155,7 +155,7 @@ export function parseLiveArguments(argv) {
 }
 
 function assertLiveEnvironment(env = process.env) {
-  const names = [env.UKAQ_ENV_NAME, env.UK_AQ_ENV_NAME, env.ENVIRONMENT]
+  const names = [env.UK_AQ_ENV_NAME, env.ENVIRONMENT]
     .filter((value) => String(value || "").trim());
   if (!names.length || names.some((value) => String(value).trim().toUpperCase() !== "LIVE") ||
       env.UK_AQ_R2_HISTORY_VERSION !== "v2" ||
