@@ -1,11 +1,7 @@
 name: Deploy UK AQ Ops Dashboard API Worker
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - workers/uk_aq_dashboard_online_api_worker/src/routes/media.ts
-      - .github/workflows/uk_aq_ops_dashboard_api_worker_deploy.yml
+  # Automatic deployments are selected by the observations-history/dashboard orchestrator.
   workflow_call:
   workflow_dispatch:
 
@@ -29,7 +25,7 @@ jobs:
       SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY || '' }}
       OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL || '' }}
       OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY || '' }}
-      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME || '' }}
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
       UK_AQ_SERVICE_EGRESS_METRICS_ENABLED: ${{ vars.UK_AQ_SERVICE_EGRESS_METRICS_ENABLED || 'false' }}
       UK_AQ_CORE_SCHEMA: ${{ vars.UK_AQ_CORE_SCHEMA || 'uk_aq_core' }}
       UK_AQ_PUBLIC_SCHEMA: ${{ vars.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public' }}
@@ -104,10 +100,17 @@ jobs:
             echo "Missing GitHub variable UK_AQ_OPS_DASHBOARD_API_WORKER_NAME."
             exit 1
           fi
-          if [ -z "${UK_AQ_ENV_NAME}" ]; then
-            echo "Missing GitHub variable UK_AQ_ENV_NAME."
+          if [ -z "${UK_AQ_ENV_NAME:-}" ]; then
+            echo "Missing required GitHub Actions repository variable: UK_AQ_ENV_NAME"
             exit 1
           fi
+          case "${UK_AQ_ENV_NAME}" in
+            TEST|LIVE) ;;
+            *)
+              echo "UK_AQ_ENV_NAME must be exactly TEST or LIVE."
+              exit 1
+              ;;
+          esac
           if [ -z "${UK_AQ_DROPBOX_ROOT}" ]; then
             echo "Missing GitHub variable UK_AQ_DROPBOX_ROOT."
             exit 1
@@ -171,14 +174,7 @@ jobs:
           EOF
           fi
 
-      - name: Deploy Worker base version
-        working-directory: workers/uk_aq_dashboard_online_api_worker
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ env.UK_AQ_CF_ACCOUNT_ID_UKAQ }}
-        run: ./node_modules/.bin/wrangler deploy --config wrangler.deploy.toml --name "${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}"
-
-      - name: Set Worker secrets
+      - name: Deploy Worker with secrets
         working-directory: workers/uk_aq_dashboard_online_api_worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
@@ -186,6 +182,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
+          secrets_file="$(mktemp "${RUNNER_TEMP}/uk-aq-dashboard-secrets.XXXXXX.json")"
+          trap 'rm -f "${secrets_file}"' EXIT
+          ./node_modules/.bin/wrangler --version
           secrets_json="$(jq -n \
             --arg DASHBOARD_UPSTREAM_BASE_URL "${DASHBOARD_UPSTREAM_BASE_URL}" \
             --arg DASHBOARD_UPSTREAM_BEARER_TOKEN "${DASHBOARD_UPSTREAM_BEARER_TOKEN}" \
@@ -264,20 +264,16 @@ jobs:
               CLEANAIRSURB_ST_ID: $CLEANAIRSURB_ST_ID
             } | with_entries(select(.value != ""))')"
 
+          printf '%s' "${secrets_json}" > "${secrets_file}"
+
           for attempt in 1 2 3; do
-            if printf '%s' "${secrets_json}" | ./node_modules/.bin/wrangler secret bulk --name "${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}"; then
+            if ./node_modules/.bin/wrangler deploy --config wrangler.deploy.toml \
+              --name "${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}" --secrets-file "${secrets_file}"; then
               exit 0
             fi
             if [ "${attempt}" -eq 3 ]; then
-              echo "Failed to apply Worker secrets after 3 attempts."
+              echo "Failed to deploy Worker with secrets after 3 attempts."
               exit 1
             fi
             sleep $((attempt * 5))
           done
-
-      - name: Deploy Worker with updated secrets
-        working-directory: workers/uk_aq_dashboard_online_api_worker
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ env.UK_AQ_CF_API_TOKEN_UKAQ }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ env.UK_AQ_CF_ACCOUNT_ID_UKAQ }}
-        run: ./node_modules/.bin/wrangler deploy --config wrangler.deploy.toml --name "${UK_AQ_OPS_DASHBOARD_API_WORKER_NAME}"

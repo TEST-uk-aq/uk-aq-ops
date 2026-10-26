@@ -21,7 +21,7 @@ jobs:
       UK_AQ_CF_ACCOUNT_ID_UKAQ: ${{ vars.UK_AQ_CF_ACCOUNT_ID_UKAQ || vars.UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID || '' }}
       UK_AQ_CF_API_TOKEN_UKAQ: ${{ secrets.UK_AQ_CF_API_TOKEN_UKAQ || secrets.UK_AQ_DOMAIN_CLOUDFLARE_API_TOKEN || '' }}
       UK_AQ_OPS_DASHBOARD_PAGES_PROJECT: ${{ vars.UK_AQ_OPS_DASHBOARD_PAGES_PROJECT || 'uk-aq-ops-dashboard-test' }}
-      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME || 'test' }}
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
       UKAQ_API_BASE_URL: ${{ vars.UKAQ_API_BASE_URL || '/api' }}
       UKAQ_DASHBOARD_TITLE: ${{ vars.UKAQ_DASHBOARD_TITLE || 'UK AQ Dashboard (Test)' }}
       UKAQ_DASHBOARD_SUBTITLE: ${{ vars.UKAQ_DASHBOARD_SUBTITLE || 'Test dashboard on ukaq.co.uk' }}
@@ -47,6 +47,17 @@ jobs:
             echo "Missing variable UK_AQ_CF_ACCOUNT_ID_UKAQ (or fallback UK_AQ_DOMAIN_CLOUDFLARE_ACCOUNT_ID)."
             exit 1
           fi
+          if [ -z "${UK_AQ_ENV_NAME:-}" ]; then
+            echo "Missing required GitHub Actions repository variable: UK_AQ_ENV_NAME"
+            exit 1
+          fi
+          case "${UK_AQ_ENV_NAME}" in
+            TEST|LIVE) ;;
+            *)
+              echo "UK_AQ_ENV_NAME must be exactly TEST or LIVE."
+              exit 1
+              ;;
+          esac
           if [ -z "${UK_AQ_OPS_DASHBOARD_PAGES_PROJECT}" ]; then
             echo "Missing variable UK_AQ_OPS_DASHBOARD_PAGES_PROJECT."
             exit 1
