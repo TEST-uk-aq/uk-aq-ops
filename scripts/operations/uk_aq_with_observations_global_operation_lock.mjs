@@ -231,7 +231,7 @@ export async function runCommandWithObservationsGlobalOperationLock({
           timeoutMs: acquisitionTimeoutMs,
           heartbeatMs,
           diagnostics,
-          diagnosticEnvironment: env.UKAQ_ENV_NAME || env.UK_AQ_ENV || env.ENVIRONMENT,
+          diagnosticEnvironment: env.UK_AQ_ENV_NAME,
         }, async (identity, lock) => {
           acquired = true;
           const acquiredDiagnostic = [...diagnostics].reverse().find(
