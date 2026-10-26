@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME || 'TEST' }}
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
       CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || '' }}
