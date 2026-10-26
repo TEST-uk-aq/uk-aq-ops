@@ -126,7 +126,7 @@ function registerServiceMetric({
     ].join("\u001f");
     const current = serviceMetrics.get(key) || {
       bucket_minute: bucketMinute,
-      env_name: String(process.env.UKAQ_ENV_NAME || "TEST").trim() || "TEST",
+      env_name: String(process.env.UK_AQ_ENV_NAME || "").trim().toLowerCase(),
       project_ref: identity.project_ref,
       service_name: SERVICE_NAME,
       source_type: SOURCE_TYPE,
@@ -490,7 +490,14 @@ export async function flushPhaseBServiceEgressMetrics({ env = process.env, fetch
     return { enabled: true, rows: 0, error: "metrics_destination_not_configured" };
   }
 
-  const envName = String(env.UKAQ_ENV_NAME || "TEST").trim() || "TEST";
+  const canonicalEnvName = String(env.UK_AQ_ENV_NAME || "").trim();
+  if (!["TEST", "LIVE"].includes(canonicalEnvName)) {
+    emitInfo("phase_b_history_service_egress_metrics_warning", {
+      reason: "metrics_environment_invalid",
+    });
+    return { enabled: true, rows: 0, error: "metrics_environment_invalid" };
+  }
+  const envName = canonicalEnvName.toLowerCase();
   const rows = Array.from(serviceMetrics.values(), (row) => ({ ...row, env_name: envName }));
   serviceMetrics.clear();
   try {
