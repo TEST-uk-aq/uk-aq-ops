@@ -23,9 +23,9 @@ jobs:
     # once Prune Daily has returned to normal daily steady state.
     timeout-minutes: 190
     env:
-      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME || 'TEST' }}
+      UKAQ_ENV_NAME: ${{ vars.UKAQ_ENV_NAME }}
       # Optional JSONgen handover only; canonical Prune behaviour is unchanged.
-      UK_AQ_ENV_NAME: TEST
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
       UK_AQ_GITHUB_REPO: ${{ vars.UK_AQ_GITHUB_REPO }}
       UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED: ${{ vars.UK_AQ_JSONGEN_PRUNE_PENDING_SOURCE_ENABLED || 'false' }}
       UK_AQ_JSONGEN_PRUNE_SIGNER_URL: ${{ vars.UK_AQ_JSONGEN_PRUNE_SIGNER_URL || '' }}
@@ -101,6 +101,8 @@ jobs:
         run: |
           set -euo pipefail
           required_values=(
+            UK_AQ_ENV_NAME
+            UKAQ_ENV_NAME
             SUPABASE_URL
             OBS_AQIDB_SUPABASE_URL
             SB_SECRET_KEY
@@ -126,6 +128,24 @@ jobs:
               missing=1
             fi
           done
+          # Canonical runtime identity is uppercase; the task-health label may be lowercase.
+          case "${UK_AQ_ENV_NAME:-}" in
+            TEST|LIVE) ;;
+            "") ;; # Missing value is already reported by required_values.
+            *)
+              echo "Invalid UK_AQ_ENV_NAME: expected TEST or LIVE (uppercase)" >&2
+              missing=1
+              ;;
+          esac
+          if [ -n "${UKAQ_ENV_NAME:-}" ] && [ -n "${UK_AQ_ENV_NAME:-}" ]; then
+            if [ "${UKAQ_ENV_NAME^^}" != "${UK_AQ_ENV_NAME}" ]; then
+              echo "UKAQ_ENV_NAME does not match UK_AQ_ENV_NAME" >&2
+              missing=1
+            fi
+          fi
+          if [ "${missing}" -ne 0 ]; then
+            exit 1
+          fi
           node --input-type=module -e '
             import { resolvePruneHistoryGeneration } from "./workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
             resolvePruneHistoryGeneration(process.env);
