@@ -22,7 +22,8 @@ Required:
   --checkpoint-path ${CHECKPOINT_KEY}
   --checkpoint-sha256 <SHA-256 of exact selected completed root.json bytes>
   --observations-root-sha256 <checkpoint processed observations root>
-  --start-utc <UTC midnight> --end-utc <exclusive UTC midnight>
+  --month-utc <closed calendar month YYYY-MM> (complete-month mode)
+  or --start-utc <UTC midnight> --end-utc <exclusive UTC midnight> (legacy range)
   --connector-ids <comma-separated explicit physical connector IDs>
   --pollutants <pm25,pm10,no2 subset>
   --verification-modes <id=overlay_accepted|pre_overlay_accepted,...>
@@ -47,7 +48,7 @@ function csv(value, validate, label) {
 }
 export function parseOptions(argv) {
   const names = ['source', 'checkpoint-path', 'checkpoint-sha256', 'observations-root-sha256',
-    'start-utc', 'end-utc', 'connector-ids', 'timeseries-ids', 'pollutants', 'verification-modes', 'output-dir',
+    'month-utc', 'start-utc', 'end-utc', 'connector-ids', 'timeseries-ids', 'pollutants', 'verification-modes', 'output-dir',
     'max-days', 'max-series', 'max-selected-rows', 'max-file-rows', 'max-decoded-rows', 'max-source-mib',
     'max-object-mib', 'max-metadata-mib', 'max-output-mib', 'max-objects', 'max-read-commands', 'max-wall-seconds'];
   const supplied = {};
@@ -90,13 +91,30 @@ export function parseOptions(argv) {
     check(Number.isFinite(date.getTime()) && date.toISOString() === raw.replace(/(?:\.000)?Z$/, '.000Z'), 'invalid UTC date');
     return date.toISOString();
   }
-  const start = utc(supplied['start-utc']), end = utc(supplied['end-utc']);
+  let start, end, selectedMonth = null;
+  if (supplied['month-utc'] !== undefined) {
+    check(supplied['start-utc'] === undefined && supplied['end-utc'] === undefined,
+      '--month-utc cannot be combined with --start-utc/--end-utc');
+    check(/^\d{4}-(0[1-9]|1[0-2])$/.test(supplied['month-utc']), '--month-utc must be YYYY-MM');
+    selectedMonth = supplied['month-utc'];
+    start = `${selectedMonth}-01T00:00:00.000Z`;
+    const nextMonth = new Date(start);
+    nextMonth.setUTCMonth(nextMonth.getUTCMonth() + 1);
+    end = nextMonth.toISOString();
+    check(connectors.length === 1 && timeseries?.length === 1 && pollutants.length === 1
+      && pollutants[0] === 'pm25',
+    'complete-month mode requires one explicit physical timeseries and the pm25 pollutant');
+  } else {
+    check(supplied['start-utc'] !== undefined && supplied['end-utc'] !== undefined,
+      'provide --month-utc or both --start-utc and --end-utc');
+    start = utc(supplied['start-utc']); end = utc(supplied['end-utc']);
+  }
   check(start < end && (Date.parse(end) - Date.parse(start)) / DAY <= limits.days, 'invalid or over-budget requested interval');
   check(path.isAbsolute(supplied['output-dir'] || ''), 'absolute new output directory required');
   check(!timeseries || timeseries.length <= limits.series, 'selected series exceed invocation limit');
   return { source: 'dropbox-backup', checkpointPath: CHECKPOINT_KEY, checkpointSha256: supplied['checkpoint-sha256'],
     observationsRoot: supplied['observations-root-sha256'], start, end, connectors, timeseries, pollutants,
-    verificationModes, limits, output: path.resolve(supplied['output-dir']) };
+    verificationModes, limits, output: path.resolve(supplied['output-dir']), selectedMonth };
 }
 
 export function monthsBetween(start, end) {
@@ -143,6 +161,7 @@ export async function runBootstrap(options) {
   const stats = { rows_decoded: 0, row_groups_decoded: 0, selected_timestamp_value_column_bytes: 0,
     decode_wall_ms: 0, decode_cpu_ms: 0, physical_schemas: new Map() };
   const report = { schema_version: 1, kind: 'uk_aq_jsongen_dropbox_bootstrap_report', environment: 'TEST',
+    started_at_utc: new Date().toISOString(),
     state: 'running', invocation_id: newPubID(), source: DROPBOX_SOURCE,
     requested_period: { start_utc: options.start, end_exclusive_utc: options.end }, completed_periods: [],
     selection: { connector_ids: options.connectors, timeseries_ids: options.timeseries, pollutants: options.pollutants },
@@ -152,6 +171,30 @@ export async function runBootstrap(options) {
     successful_scopes: [], incomplete_scopes: [], errors: [], candidates: [],
     eligible_for_further_manual_review: false, managed_publication_eligible: false,
     current_canonical_authority: 'not_established_offline_backup_reconstruction',
+    currentness: {
+      status: 'not_established',
+      start: { checked_at_utc: null, checkpoint_sha256: null, backup_writer_ordering: 'not_established',
+        live_root_match: 'not_established', lock_coordination: 'not_established' },
+      final: { checked_at_utc: null, checkpoint_stable: 'not_established', backup_writer_ordering: 'not_established',
+        live_root_match: 'not_established', lock_coordination: 'not_established' },
+      blocker: 'Integrity backup/writer ordering has no reusable standalone bootstrap interface; its locked live-root helper requires local checkpoint materialisation',
+      source_as_of: 'unknown', managed_publication_eligible: false,
+    },
+    verification_binding_authority: { selected_backup_domains: 'authenticated_by_existing_bootstrap_validators',
+      packed_physical_bindings: 'authenticated_from_selected_backup', core_binding_currentness: 'unresolved',
+      transition_mode: 'explicit_operator_input_not_independently_established' },
+    admission_blockers: [
+      { gate: 'backup_writer_ordering', state: 'not_established',
+        reason: 'no reusable standalone Integrity ordering interface' },
+      { gate: 'live_observations_root_match', state: 'not_established',
+        reason: 'no lock-coordinated bootstrap adapter for the remote Dropbox checkpoint' },
+      { gate: 'independent_binding_verification_authority', state: 'unresolved',
+        reason: 'selected backup evidence does not establish matching current Core authority or accepted transition mode' },
+    ],
+    relevant_backup_writer_evidence: { status: 'not_established', latest_relevant_backup: null,
+      latest_completed_writer: null, evidence_source: 'Integrity private run-path gate has no standalone bootstrap interface' },
+    source_stability: { final_checkpoint_reread_at_utc: null, exact_checkpoint_sha256_stable: 'not_established' },
+    selected_month_utc: options.selectedMonth,
     remote_write_operations: 0, canonical_r2_reads: 0, derived_r2_reads: 0,
     observation_count: 0, aqi_calculation_wall_ms: 0, aqi_calculation_cpu_ms: 0,
     json_gzip_write_wall_ms: 0, json_gzip_write_cpu_ms: 0, output_bytes: 0,
@@ -192,6 +235,7 @@ export async function runBootstrap(options) {
   try {
     const source = await openBackupSource(reader, options);
     report.source_checkpoint = source.checkpoint;
+    report.currentness.start.checkpoint_sha256 = source.checkpoint.sha256;
     // Preserve exact metadata bytes once, independent of volatile measurements.
     const retainedMetadata = new Set();
     async function retainMetadata() {
@@ -227,7 +271,8 @@ export async function runBootstrap(options) {
         for (const day of daysBetween(contextStart, month.requested_end_exclusive_utc)) {
           reader.deadline();
           const manifest = await source.pollutant(day, connectorId, pollutant);
-          if (!manifest) { days.push({ day_utc: day, state: 'authoritative_absence', row_count: 0 }); continue; }
+          if (!manifest) { days.push({ day_utc: day, state: 'authoritative_absence',
+            source_state: 'authoritative_absence', row_count: 0 }); continue; }
           for (const physical of observationHistoryPhysicalSchemasFromManifest(manifest)) source.assertStatusMode(physical, connectorId, authority);
           const before = selectedRows, perSeries = new Map();
           for (const file of manifest.files) {
@@ -258,12 +303,15 @@ export async function runBootstrap(options) {
           }
           if (manifest.timeseries_row_counts) check([...perSeries.keys()].every(id => Object.hasOwn(manifest.timeseries_row_counts, String(id))),
             'canonical timeseries counts omit decoded physical identity');
-          days.push({ day_utc: day, state: 'exported', row_count: selectedRows - before });
+          days.push({ day_utc: day, state: 'exported', source_state: 'authenticated_membership',
+            row_count: selectedRows - before });
         }
         await retainMetadata();
         const sourceEvidence = await contentJson('evidence/source-evidence', {
           schema_version: 1, kind: 'uk_aq_jsongen_dropbox_bootstrap_source_evidence', environment: 'TEST',
           source: DROPBOX_SOURCE, source_checkpoint: source.checkpoint, scope: active, month,
+          currentness: report.currentness,
+          verification_binding_authority: report.verification_binding_authority,
           current_authority: source.current_authority, index_v3_trees: 'excluded_from_backup_not_read_or_rebuilt',
           verification_mode: options.verificationModes[connectorId], verification_mode_provenance: source.verification_mode_provenance,
           verification: { overlay_authoritative: authority.overlay_authoritative,
@@ -297,9 +345,12 @@ export async function runBootstrap(options) {
             physical_schemas: [...groupValue.schemas.values()], source_status_provenance: provenance.length ? provenance : ['no_source_rows'],
             canonical_row_multiplicity_preserved: true,
             completeness: { requested_source_complete: true, full_calendar_month: !month.partial_month,
+              currentness_complete: false,
               row_count: visible.length, unique_timestamp_count: unique, duplicate_timestamp_row_count: visible.length - unique,
-              days: days.filter(d => d.day_utc >= month.requested_start_utc.slice(0,10)).map(d => ({
-                day_utc: d.day_utc, state: visible.some(r => r.observed_at_utc.startsWith(d.day_utc)) ? 'exported' : 'authoritative_absence',
+              days: days.filter(d => d.day_utc >= month.requested_start_utc.slice(0,10)
+                && d.day_utc < month.requested_end_exclusive_utc.slice(0,10)).map(d => ({
+                day_utc: d.day_utc, source_state: d.source_state,
+                measurement_state: d.row_count > 0 ? 'measurements_present' : 'natural_measurement_gap',
                 row_count: visible.filter(r => r.observed_at_utc.startsWith(d.day_utc)).length })) },
             row_columns: ['observed_at_utc', 'value', 'station_id', 'source_status', 'verification_status',
               'embedded_verification_status', 'source_status_provenance'],
@@ -328,7 +379,10 @@ export async function runBootstrap(options) {
             completeness: { response_complete: calculated.aqi.response_complete,
               daqi: indexCompleteness(calculated.aqi, 'daqi', (Date.parse(month.requested_end_exclusive_utc) - Date.parse(month.requested_start_utc)) / HOUR),
               eaqi: indexCompleteness(calculated.aqi, 'eaqi', (Date.parse(month.requested_end_exclusive_utc) - Date.parse(month.requested_start_utc)) / HOUR),
-              context_source_complete: true, partial_reasons: calculated.aqi.partial_reasons,
+              context_source_complete: days.filter(d => d.day_utc < month.requested_start_utc.slice(0,10))
+                .every(d => d.source_state),
+              context_day_accounting: days.filter(d => d.day_utc < month.requested_start_utc.slice(0,10)),
+              currentness_complete: false, partial_reasons: calculated.aqi.partial_reasons,
               calculation_error: calculated.rejection_reason || null }, aqi: calculated.aqi };
           const prefix = `candidates/${publicationPrefix(identity, month.month_utc, pubID)}`;
           const observationRef = await gzipProduct(prefix, 'observations', observations);
@@ -338,38 +392,52 @@ export async function runBootstrap(options) {
             observation_completeness: observations.completeness, aqi_completeness: aqi.completeness,
             proposed_publication_keys: { observations: `${publicationPrefix(identity, month.month_utc, pubID)}/observations.${observationRef.sha256}.json.gz`,
               aqi: `${publicationPrefix(identity, month.month_utc, pubID)}/aqi.${aqiRef.sha256}.json.gz` },
-            managed_publication_eligible: false, manual_review_eligible: calculated.aqi.response_complete,
+            managed_publication_eligible: false, local_candidate_complete: false,
+            manual_review_eligible: false,
             completion_rule: 'requires final invocation COMPLETE.json, matching report and candidate manifest',
-            unresolved_authority: ['current_canonical_authority_not_established', 'no_verified_writer_receipts',
+            unresolved_authority: ['current_canonical_authority_not_established', 'backup_writer_ordering_not_established',
+              'no_verified_writer_receipts', 'independent_current_verification_transition_authority_unresolved',
               'matching_core_publication_not_independently_authenticated',
               'no_authenticated_managed_monthly_baseline', 'no_managed_preceding_month_publication'] };
           const descriptor = await contentJson(`${prefix}/candidate`, candidate);
           const summary = { identity, month_utc: month.month_utc, included_start_utc: month.requested_start_utc,
             included_end_exclusive_utc: month.requested_end_exclusive_utc, partial_month: month.partial_month,
             observation_count: visible.length, aqi_row_count: calculated.aqi.rows.length,
-            aqi_response_complete: calculated.aqi.response_complete, candidate: descriptor,
+            aqi_response_complete: calculated.aqi.response_complete, local_candidate_complete: false,
+            candidate: descriptor,
             aqi_completeness: aqi.completeness,
             observations: observationRef, aqi: aqiRef, pub_id: pubID };
           report.candidates.push(summary); report.observation_count += visible.length;
-          (calculated.aqi.response_complete ? report.successful_scopes : report.incomplete_scopes).push(summary);
+          report.incomplete_scopes.push(summary);
         }
         report.completed_periods.push({ ...active, start_utc: month.requested_start_utc,
           end_exclusive_utc: month.requested_end_exclusive_utc, source_complete: true,
+          full_calendar_month: !month.partial_month,
+          selected_day_accounting: days.filter(d => d.day_utc >= month.requested_start_utc.slice(0,10)
+            && d.day_utc < month.requested_end_exclusive_utc.slice(0,10)),
+          pm_context_day_accounting: days.filter(d => d.day_utc < month.requested_start_utc.slice(0,10)),
           physical_series_count: groups.size, candidate_count: groups.size });
       }
     }
     check(report.candidates.length > 0, 'no physical candidates resolved; explicitly select timeseries for authenticated empty output');
     await reader.checkStability();
+    report.source_stability.final_checkpoint_reread_at_utc = new Date().toISOString();
+    report.source_stability.exact_checkpoint_sha256_stable = 'yes';
+    report.currentness.final.checkpoint_stable = source.checkpoint.sha256 === options.checkpointSha256
+      ? 'stable_at_final_checkpoint_reread' : 'mismatch';
     await retainMetadata();
+    report.incomplete_scopes.push({ requested_period: report.requested_period,
+      reason: 'currentness_not_established', blocker: report.currentness.blocker });
     const manifest = await contentJson('candidate-manifest', { schema_version: 1,
       kind: 'uk_aq_jsongen_dropbox_bootstrap_candidate_manifest', environment: 'TEST',
       source_checkpoint: source.checkpoint, requested_period: report.requested_period,
-      source_complete: true, aqi_complete: report.incomplete_scopes.length === 0,
+      source_complete: true, aqi_complete: report.candidates.every(c => c.aqi_response_complete),
+      currentness: report.currentness,
       publication_state: 'local_private_candidate_not_managed_publication',
       managed_publication_eligible: false, candidates: report.candidates });
     report.manifest = manifest;
-    report.state = report.incomplete_scopes.length ? 'incomplete' : 'local_candidates_complete';
-    report.eligible_for_further_manual_review = report.incomplete_scopes.length === 0;
+    report.state = 'incomplete';
+    report.eligible_for_further_manual_review = false;
   } catch (error) {
     report.state = 'failed';
     report.errors.push({ scope: active, message: error.message });

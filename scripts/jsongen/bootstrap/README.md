@@ -6,7 +6,7 @@ Imports are inert. The first real TEST operation requires separate authorisation
 after code review. Development did not run a backfill or fetch Dropbox history.
 
 Authoritative TEST system-docs were read at `main`
-`bbc09c2da361136bf1dcbdea077f07014f84b668`, following the JSONgen, compressed-history,
+`fdc9d41560958819d47f1cbd11bce95bf7bb0084`, following the JSONgen, compressed-history,
 precomputed-AQI, canonical observation hierarchy/schema/generation, verification,
 station-history AQI and Dropbox checkpoint/pack routes. No authoritative docs or
 plans were edited. This README describes implementation, not a replacement contract.
@@ -154,6 +154,20 @@ missing or unreadable dependencies fail the run. Parquet is content-hash pinned
 when consumed. This detects selected-backup changes; it is not a distributed lock
 or current-R2 claim. Overwritten old backup bytes require recovery, not weaker pins.
 
+The `--month-utc YYYY-MM` mode requests one complete UTC calendar month and
+requires one explicit physical timeseries and PM2.5. Connector, physical series
+and month remain operator inputs. Existing start/end range mode remains available.
+
+**Currentness is `not_established`.** The shared Integrity currentness helper
+requires a locally materialised checkpoint, while this bootstrap reads through
+the bounded rclone reader. The backup-versus-writer ordering decision is private
+to Integrity's run path and has no reusable standalone read-only interface here.
+The global lock coordinator and live-root metadata reader exist, but root equality
+without ordered backup evidence would weaken the gate. Reports record start/final
+currentness and writer ordering as `not_established`; private pairs remain
+incomplete, `COMPLETE.json` is omitted, and the run exits 2. Final checkpoint
+stability is reported separately and does not prove canonical currentness.
+
 ## Proposed seven-day command — do not execute during code review
 
 Run from TEST ops only after separate authorisation. Set these local shell inputs
@@ -195,10 +209,38 @@ negatives, nullable station IDs and multiplicity. Existing canonical JSON uses
 round-trip numbers (canonical negative zero serialises as zero). Measurements
 are never rounded, averaged, interpolated or deduplicated.
 
+### Complete-month command shape — currentness gate not established
+
+The supported first-scope shape uses one operator-supplied connector, one physical
+timeseries, `pm25`, and one UTC month. Set the identity, month, checkpoint byte
+digest, observation-root digest, accepted verification mode and private output
+from independently reviewed operational evidence before any separately authorised
+run. This code currently cannot establish backup/writer ordering or compare the
+live root under the shared lock, so a run would produce only incomplete private
+pairs and exit 2. This command shape is documentation only; do not execute it as
+a real bootstrap until that blocker is resolved.
+
+```sh
+UK_AQ_ENV_NAME=TEST node --max-old-space-size=4096 \
+  scripts/jsongen/bootstrap/generate.mjs \
+  --source dropbox-backup \
+  --checkpoint-path _ops/checkpoints/r2_history_backup_state_v2/observation_generation=v3/root.json \
+  --checkpoint-sha256 "${operator_checkpoint_sha256:?set reviewed exact checkpoint digest}" \
+  --observations-root-sha256 "${operator_observations_root_sha256:?set reviewed processed root digest}" \
+  --month-utc "${operator_month_utc:?set closed UTC month YYYY-MM}" \
+  --connector-ids "${operator_connector_id:?set reviewed connector ID}" \
+  --timeseries-ids "${operator_timeseries_id:?set reviewed physical timeseries ID}" \
+  --pollutants pm25 \
+  --verification-modes "${operator_verification_mode:?set independently justified mode}" \
+  --output-dir "${operator_private_output:?set new private absolute directory}"
+```
+
 ## Bounded processing and AQI
 
-Whole UTC days are accepted. Ranges split at month boundaries and process one
-connector/pollutant/month in memory. Each Parquet is decoded once for all selected
+Whole UTC days are accepted. Full-month mode derives boundaries from the explicit
+`YYYY-MM`, accounts for every selected UTC day separately from natural missing
+measurements, and records preceding PM context days. Ranges split at month
+boundaries and process one connector/pollutant/month in memory. Each Parquet is decoded once for all selected
 physical series. SHA-pinned local disk cache avoids repeat Dropbox downloads for
 adjacent-month context/multiple series. Total source-byte budget bounds cache disk;
 controlled completion/failure removes it. One binding range is cached in memory.
@@ -281,14 +323,20 @@ Bootstrap `schema_version:1` formats are deliberately distinct from managed sche
 successful/incomplete scopes, observation/AQI counts, exact source object hashes/
 sizes, bytes/commands, read/decode CPU/wall, AQI time, JSON/gzip time/sizes, errors,
 bounds and manual-review eligibility. Managed publication eligibility is always
-false. Missing source coverage cannot produce a successful report. Diagnostic
+false. Reports distinguish authenticated membership/absence from natural
+measurement gaps and include PM-context accounting. Currentness and independent
+backup/writer ordering remain `not_established`, so no invocation can currently
+produce a successful local-baseline completion marker. Missing source coverage cannot produce a successful report. Diagnostic
 report/reference lists and completion marker are outside the generated-product
 byte cap; reference counts are bounded by object/series/range limits.
 
 ## Failure, restart and rollback
 
-Exit 0 plus `COMPLETE.json` means complete local generation suitable for manual
-review, **not operational acceptance**. Exit 2 means failed/incomplete generation;
+`COMPLETE.json` is reserved for a generation that passes source, month, context,
+start/final currentness and authority checks. Those currentness interfaces are
+not reusable by this bootstrap yet, so it writes private pair candidates and a
+report but exits 2, marks the run incomplete and omits `COMPLETE.json`. Exit 2
+means failed/incomplete generation;
 exit 1 covers admission/unhandled local errors. Missing `COMPLETE.json` always
 means incomplete, including kill/power loss. Validate its report digest and final
 manifest chain; a pair descriptor alone is insufficient. Reports are written on
@@ -303,8 +351,9 @@ private output. There are no deployed changes to undo.
 
 ## Later months and separate first-run authorisation
 
-July/August/September are full-month requests when start/end are adjacent first-day
-UTC midnights. October may stay partial. Dates are not hard-coded. The same pin
+Use `--month-utc YYYY-MM` to explicitly request a full calendar month. Existing
+start/end range mode remains for partial historical reconstruction. Dates are not
+hard-coded. The same pin
 can supply June context for July only when its chain authenticates those scopes.
 Never fill missing dependencies from R2. One invocation reuses cached files at
 month boundaries; separate batches have independent staging/UUIDs, and later
