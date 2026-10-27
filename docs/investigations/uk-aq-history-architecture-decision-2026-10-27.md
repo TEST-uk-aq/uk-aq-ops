@@ -2,6 +2,8 @@
 
 27 October 2026. Documentation-only extension of [PR #139](https://github.com/TEST-uk-aq/uk-aq-ops/pull/139) and its [storage investigation](r2-v3-index-storage-efficiency-2026-10-27.md). This is a recommendation, not implementation, migration, deployment or deletion authority.
 
+**Later focused decision under revised user requirements:** [Retain efficient Parquet retrieval with one exact-only index](v3-exact-only-index-decision-2026-10-27.md). The user now requires a permanent website physical retrieval capability and excludes a new witness/catalogue. That focused decision supersedes this document's conditional physical-index retirement/catalogue recommendation for the new scope; measurements and historical reasoning below remain unchanged. JSONgen control/publication design is outside the follow-up scope.
+
 ## 1. Decision
 
 **Keep canonical v3. Complete the bounded AURN JSONgen experiment and the managed publisher's integrity boundaries. Do not begin an index rewrite or return to v2.** V3 delivered a useful bounded physical-access design; it did not establish universal storage, request-count, writer-cost or latency superiority. Accepted JSONgen serving would remove much of the historical chart workload that justified that design. It would not make the retained v2 generation current, remove canonical recovery requirements, or release any index objects under current contracts.

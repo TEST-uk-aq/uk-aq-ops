@@ -2,6 +2,8 @@
 
 Date: 27 October 2026; expanded to investigate JSONgen replacing historical chart loading. Status: architectural investigation and recommendations; **no implementation or operational authority**.
 
+**Revised user requirements, 27 October:** [Exact-only index decision retaining website Parquet retrieval](v3-exact-only-index-decision-2026-10-27.md). This later focused analysis retains canonical v3 and a permanent efficient physical reader, excludes new witness/catalogue infrastructure, and recommends direct canonical reconciliation before eventual `_aligned` retirement. Earlier evidence and conditional recommendations below remain as recorded.
+
 **Final architecture follow-up, 27 October:** [v2/v3, JSONgen and complete-system decision](uk-aq-history-architecture-decision-2026-10-27.md). The companion explicitly compares returning to canonical v2, retaining v3 with smaller metadata, alternative serving/storage designs and retaining on-demand serving without JSONgen. It supplies the final architectural recommendation and decision gates; the measurements, provenance and earlier conditional index scenarios below remain unchanged.
 
 ## 1. Executive summary
