@@ -134,43 +134,58 @@ export async function readCurrentObservationScopes(scopes, {
   const results = [];
   for (const scope of scopes) {
     assertHeld();
-    check(/^\d{4}-(0[1-9]|1[0-2])$/.test(scope.month_utc || ''), 'invalid scoped month');
-    const currentMonth = await month(scope.month_utc);
-    const canonicalDays = new Map((currentMonth.manifest?.children || [])
-      .map(child => [child.day_utc, child.manifest_hash]));
-    const rootEvidence = {
-      root: rootResult.reference,
-      year: currentMonth.year.reference,
-      year_manifest: currentMonth.year.reference?.key || null,
-      month: currentMonth.reference,
-      observations_root_content_hash: root.content_hash,
-    };
-    const currentness = scope.mode === 'complete_month'
-      ? { mode: 'complete_month', source_content_hash: scope.source_month_hash || null,
-          canonical_content_hash: currentMonth.manifest?.content_hash || null,
-          matches: (scope.source_month_hash || null) === (currentMonth.manifest?.content_hash || null) }
-      : { mode: 'partial_completed_days', days: compareDayMembership(
-          new Map(scope.source_days.map(day => [day.day_utc, day.manifest_hash])),
-          canonicalDays, scope.selected_days) };
-    if (currentness.mode === 'partial_completed_days') {
-      check(scope.source_days.length === scope.selected_days.length,
-        `Dropbox selected-day proof is incomplete for ${scope.month_utc}`);
-      currentness.matches = currentness.days.every(day => day.matches);
+    try {
+      check(/^\d{4}-(0[1-9]|1[0-2])$/.test(scope.month_utc || ''), 'invalid scoped month');
+      const currentMonth = await month(scope.month_utc);
+      const canonicalDays = new Map((currentMonth.manifest?.children || [])
+        .map(child => [child.day_utc, child.manifest_hash]));
+      const rootEvidence = {
+        root: rootResult.reference,
+        year: currentMonth.year.reference,
+        year_manifest: currentMonth.year.reference?.key || null,
+        month: currentMonth.reference,
+        observations_root_content_hash: root.content_hash,
+      };
+      const currentness = scope.mode === 'complete_month'
+        ? { mode: 'complete_month', source_content_hash: scope.source_month_hash || null,
+            canonical_content_hash: currentMonth.manifest?.content_hash || null,
+            matches: (scope.source_month_hash || null) === (currentMonth.manifest?.content_hash || null) }
+        : { mode: 'partial_completed_days', days: compareDayMembership(
+            new Map(scope.source_days.map(day => [day.day_utc, day.manifest_hash])),
+            canonicalDays, scope.selected_days) };
+      if (currentness.mode === 'partial_completed_days') {
+        check(scope.source_days.length === scope.selected_days.length,
+          `Dropbox selected-day proof is incomplete for ${scope.month_utc}`);
+        currentness.matches = currentness.days.every(day => day.matches);
+      }
+      const contextResults = [];
+      check((scope.source_context_days || []).length === (scope.context_days || []).length,
+        `Dropbox PM context day proof is incomplete for ${scope.month_utc}`);
+      for (const contextDay of scope.context_days || []) {
+        try {
+          const contextMonth = await month(contextDay.slice(0, 7));
+          const contextHash = contextMonth.manifest?.children.find(child => child.day_utc === contextDay)?.manifest_hash || null;
+          const sourceHash = scope.source_context_days?.find(day => day.day_utc === contextDay)?.manifest_hash || null;
+          contextResults.push({ day_utc: contextDay, source_manifest_hash: sourceHash,
+            canonical_manifest_hash: contextHash, matches: sourceHash === contextHash,
+            proof_state: 'established', root: rootResult.reference,
+            year: contextMonth.year.reference, month: contextMonth.reference });
+        } catch (error) {
+          assertHeld();
+          contextResults.push({ day_utc: contextDay, matches: false,
+            proof_state: 'not_established', error: error.message });
+        }
+      }
+      results.push({ month_utc: scope.month_utc, currentness,
+        context_days: contextResults, matches: currentness.matches && contextResults.every(day => day.matches),
+        canonical_scope: rootEvidence, proof_state: 'established' });
+    } catch (error) {
+      // A lost lock is invocation-wide: never downgrade it to one failed month.
+      assertHeld();
+      results.push({ month_utc: scope.month_utc,
+        currentness: { mode: scope.mode, matches: false, state: 'not_established' },
+        context_days: [], matches: false, proof_state: 'not_established', error: error.message });
     }
-    const contextResults = [];
-    check((scope.source_context_days || []).length === (scope.context_days || []).length,
-      `Dropbox PM context day proof is incomplete for ${scope.month_utc}`);
-    for (const contextDay of scope.context_days || []) {
-      const contextMonth = await month(contextDay.slice(0, 7));
-      const contextHash = contextMonth.manifest?.children.find(child => child.day_utc === contextDay)?.manifest_hash || null;
-      const sourceHash = scope.source_context_days?.find(day => day.day_utc === contextDay)?.manifest_hash || null;
-      contextResults.push({ day_utc: contextDay, source_manifest_hash: sourceHash,
-        canonical_manifest_hash: contextHash, matches: sourceHash === contextHash,
-        root: rootResult.reference, year: contextMonth.year.reference, month: contextMonth.reference });
-    }
-    results.push({ month_utc: scope.month_utc, currentness,
-      context_days: contextResults, matches: currentness.matches && contextResults.every(day => day.matches),
-      canonical_scope: rootEvidence });
   }
   return { root: rootResult.reference, root_content_hash: root.content_hash,
     reads, scopes: results, checked_at_utc: new Date().toISOString() };

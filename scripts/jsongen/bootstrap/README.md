@@ -162,13 +162,24 @@ Legacy range mode remains available and is compared as selected-day membership.
 Currentness is proved per selected scope. Full calendar months compare the
 authenticated Dropbox processed-month hash with the current canonical R2 month
 hash. Partial months compare each selected day manifest hash or authenticated
-absence. PM2.5/PM10 scopes also compare the preceding full context day. Initial
-and final comparisons read only the required R2 root/year/month hierarchy under
-the shared global observation lock. A changed unrelated R2 root does not fail a
-scope whose selected month/day and PM context still match; the root change is
-recorded. No observation Parquet is fetched from R2. Selected Dropbox metadata
-and the exact checkpoint pin are rechecked before local candidate descriptors
-are finalised.
+absence. PM2.5/PM10 pairs also compare the preceding full context day; NO2 does
+not depend on PM context. Initial admission authenticates the selected Dropbox
+checkpoint and source ancestry under the shared lock. The final lock callback
+contains only bounded canonical R2 root/year/month reads and scope comparisons.
+Dropbox selected-leaf checks and local rehashing of the original cached source
+bytes happen outside that final lock.
+
+The original checkpoint and root/year ancestry remain pinned as provenance, but
+their mutable global keys need not stay byte-identical. The tool records the
+current checkpoint digest for diagnosis and never adopts it. Full-month scopes
+revalidate their selected month manifest and completion shard; partial scopes
+revalidate only selected day pollutant leaves, so later unselected days may
+advance. Required selected binding and connector-verification objects are also
+checked. Final canonical R2 comparison occurs under the shared lock, which
+serializes against a backup or canonical writer holding that same lock. If the
+selected source chain or a required dependency cannot be proved, only affected
+scopes fail closed; a changed global checkpoint alone does not invalidate an
+unchanged month.
 
 Matching scoped currentness can make a **local private pair** ready when source,
 AQI response and required context are complete. It does not establish matching
@@ -176,7 +187,10 @@ Core publication, independent verification-transition authority, writer
 publication freshness or a managed baseline. Those remain explicit blockers to
 managed publication, which is always disabled. A successful `COMPLETE.json`
 means only that the local candidate set passed this bounded readiness gate and
-is available for further manual review.
+is available for further manual review. It is omitted if any requested scope
+fails, even when unaffected month pairs remain complete in the report. Regenerate
+changed or unproved scopes only in a separate invocation with fresh pins; never
+rebase an existing candidate onto a newer checkpoint.
 
 ## Proposed seven-day command — do not execute during code review
 
@@ -342,9 +356,12 @@ byte cap; reference counts are bounded by object/series/range limits.
 ## Failure, restart and rollback
 
 `COMPLETE.json` is written only when every requested local candidate passes
-source, selected month/day, PM context, AQI response and initial/final currentness
-checks. The marker does not grant managed-publication eligibility. An incomplete
-scope keeps its staged products private, writes a report and exits 2. Exit 2
+original source-proof, selected month/day, applicable PM context, AQI response
+and initial/final currentness checks. It proves local private readiness and
+report/candidate-chain integrity only; it does not grant managed-publication
+eligibility. A failed month or PM dependency leaves its products as diagnostics
+and does not discard independently complete month pairs. The invocation still
+omits `COMPLETE.json` and exits 2. Exit 2
 means failed/incomplete generation;
 exit 1 covers admission/unhandled local errors. Missing `COMPLETE.json` always
 means incomplete, including kill/power loss. Validate its report digest and final

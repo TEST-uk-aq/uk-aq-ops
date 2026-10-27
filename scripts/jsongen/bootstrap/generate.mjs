@@ -16,6 +16,7 @@ import { openBackupSource } from './source.mjs';
 import { readCurrentObservationScopes, withBootstrapObservationLock } from './currentness.mjs';
 
 const DAY = 86_400_000, HOUR = 3_600_000, MIB = 1024 ** 2;
+const scopeKey = scope => `${scope.connector_id}/${scope.pollutant_code}/${scope.month_utc}`;
 export const HELP = `Manual, local-only TEST Dropbox historical JSONgen bootstrap.
 No execution occurs on import. No R2/database/Dropbox writes or publication.
 Required:
@@ -195,36 +196,64 @@ export async function buildCurrentnessScopes(source, periods, pollutants) {
   return { source_months: Object.fromEntries(sourceMonths), scopes };
 }
 
-export function classifyPeriodCurrentness(sourceScope, canonicalScope) {
-  const monthMatches = sourceScope.mode === 'complete_month'
+export function classifyPeriodCurrentness(sourceScope, canonicalScope, requirePmContext = true) {
+  const established = canonicalScope.proof_state === 'established';
+  const monthMatches = established && (sourceScope.mode === 'complete_month'
     ? (sourceScope.source_month_hash || null) === (canonicalScope.currentness.canonical_content_hash || null)
-    : canonicalScope.currentness.matches;
+    : canonicalScope.currentness.matches);
   const contextMatches = (canonicalScope.context_days || []).every(day => day.matches);
-  return { matches: monthMatches && contextMatches, month_matches: monthMatches,
-    context_matches: contextMatches };
+  return { matches: monthMatches && (!requirePmContext || contextMatches),
+    month_matches: monthMatches, context_matches: contextMatches,
+    context_required: requirePmContext };
 }
 
-export function scopedSourceStabilityKeys(source, scopeProof, reader) {
-  const keys = new Set([CHECKPOINT_KEY]);
-  for (const month of Object.values(scopeProof.source_months)) {
-    for (const reference of [month.observations_root_manifest, month.year_manifest,
-      month.month_manifest, month.month_state_shard]) {
-      if (reference?.key) keys.add(reference.key);
+export function scopedSourceStabilityKeys(source, scopeProof, reader, scope, timeseriesIds = [], requirePmContext = true) {
+  const networkKeys = new Set();
+  const cachedProofKeys = new Set([CHECKPOINT_KEY]);
+  if (source.bindingPackRootEvidence?.key) cachedProofKeys.add(source.bindingPackRootEvidence.key);
+  if (source.verificationLatestEvidence?.key) cachedProofKeys.add(source.verificationLatestEvidence.key);
+  const monthEvidence = scopeProof.source_month_evidence;
+  for (const evidence of [monthEvidence, ...(scopeProof.context_month_evidence || [])]) {
+    if (!evidence) continue;
+    for (const reference of [evidence.observations_root_manifest, evidence.year_manifest,
+      evidence.month_manifest, evidence.month_state_shard]) {
+      if (reference?.key) cachedProofKeys.add(reference.key);
     }
-    for (const day of month.selected_days || []) {
-      if (!day.manifest_key) continue;
-      const dayPrefix = `${day.manifest_key.split('/connector_id=')[0]}/`;
-      for (const key of reader.metadata.keys()) if (key.startsWith(dayPrefix)) keys.add(key);
+  }
+  // A whole-month identity includes its complete child set, so pin and reread
+  // that selected month and its completion shard. Partial scopes deliberately
+  // validate only selected day leaves; later days may advance the month parent.
+  if (scopeProof.mode === 'complete_month') {
+    for (const reference of [monthEvidence.month_manifest, monthEvidence.month_state_shard]) {
+      if (reference?.key) networkKeys.add(reference.key);
     }
   }
-  for (const evidence of source.memberEvidence.values()) {
-    if (evidence.pack_key) keys.add(evidence.pack_key);
-    if (evidence.pack_state_shard_key) keys.add(evidence.pack_state_shard_key);
+  const selectedDays = [...scopeProof.selected_days,
+    ...(requirePmContext ? (scopeProof.context_days || []) : [])];
+  for (const dayUtc of selectedDays) {
+    const evidence = scopeProof.source_months[dayUtc.slice(0, 7)]
+      || scopeProof.context_month_evidence?.find(item => item.month_utc === dayUtc.slice(0, 7));
+    const day = evidence?.selected_days?.find(item => item.day_utc === dayUtc);
+    if (!day?.manifest_key) continue; // authenticated absence was pinned in the original parent chain
+    const dayBase = day.manifest_key.slice(0, -14);
+    const connectorManifest = `${dayBase}/connector_id=${scope.connector_id}/manifest.json`;
+    const pollutantManifest = `${dayBase}/connector_id=${scope.connector_id}`
+      + `/pollutant_code=${scope.pollutant_code}/manifest.json`;
+    for (const key of [day.manifest_key, connectorManifest, pollutantManifest]) {
+      if (reader.metadata.has(key)) cachedProofKeys.add(key);
+    }
+    if (reader.metadata.has(pollutantManifest)) networkKeys.add(pollutantManifest);
   }
-  for (const key of reader.metadata.keys()) {
-    if (key.includes('/verification/') || key.includes('/timeseries_binding_packs/')) keys.add(key);
+  for (const timeseriesId of timeseriesIds) {
+    const binding = source.memberEvidence.get(timeseriesId);
+    if (binding?.pack_key) networkKeys.add(binding.pack_key);
+    if (binding?.pack_state_shard_key) networkKeys.add(binding.pack_state_shard_key);
   }
-  return [...keys].filter(key => reader.metadata.has(key) || key === CHECKPOINT_KEY).sort();
+  const authority = source.authorities.get(scope.connector_id);
+  const verificationKey = authority?.manifest_identity?.key || authority?.manifest_identity?.relative_path;
+  if (verificationKey && reader.metadata.has(verificationKey)) networkKeys.add(verificationKey);
+  for (const key of networkKeys) cachedProofKeys.add(key);
+  return { network_keys: [...networkKeys].sort(), cached_proof_keys: [...cachedProofKeys].sort() };
 }
 const sortedRows = rows => rows.sort((a,b) => a.observed_at_utc.localeCompare(b.observed_at_utc)
   || a.value - b.value || canonicalJson(a).localeCompare(canonicalJson(b)));
@@ -279,7 +308,10 @@ export async function runBootstrap(options) {
       reason: 'matching Core publication, independent verification-transition authority, writer freshness and managed baseline are not established by this local bootstrap' }],
     operation_lock: { initial: [], final: [] },
     scoped_currentness_r2_reads: { count: 0, bytes: 0, wall_ms: 0 },
-    source_stability: { final_checkpoint_reread_at_utc: null, exact_checkpoint_sha256_stable: 'not_established' },
+    source_stability: { original_checkpoint_sha256: options.checkpointSha256,
+      original_checkpoint_cached_proof: 'not_established', current_checkpoint: 'not_read',
+      selected_scopes: [],
+      lock_boundary_rule: 'original source proof remains pinned; final shared-lock comparison observes canonical R2 after any earlier backup-lock holder completes; newer Dropbox checkpoints are diagnostic only and never adopted' },
     selected_month_utc: options.selectedMonth, partial_month_utc: options.partialMonth,
     period_mode: options.periodMode,
     remote_write_operations: 0, canonical_r2_reads: 0, derived_r2_reads: 0,
@@ -291,6 +323,7 @@ export async function runBootstrap(options) {
   let sourceScopeProof = null;
   const periodCurrentness = new Map();
   const stagedCandidates = [];
+  const failedScopes = new Map();
   const periods = monthsBetween(options.start, options.end);
   const progress = setInterval(() => process.stderr.write(JSON.stringify({ state: report.state,
     scope: active, source_files: reader.inventory.size, source_bytes: reader.metrics.source_bytes_read,
@@ -326,18 +359,18 @@ export async function runBootstrap(options) {
   }
   try {
     const initialStarted = performance.now();
-    const opened = await openBackupSource(reader, options);
-    const sourceProof = await buildCurrentnessScopes(opened, periods, options.pollutants);
-    const initialCanonical = await withBootstrapObservationLock(async lock => {
-      return await readCurrentObservationScopes(sourceProof.scopes, {
+    const initial = await withBootstrapObservationLock(async lock => {
+      const opened = await openBackupSource(reader, options);
+      const sourceProof = await buildCurrentnessScopes(opened, periods, options.pollutants);
+      const canonical = await readCurrentObservationScopes(sourceProof.scopes, {
         env: process.env, signal: lock.signal, assertHeld: lock.assertHeld,
       });
+      return { source: opened, sourceProof, canonical,
+        scopes: sourceProof.scopes.map((scope, index) => ({ ...scope,
+          canonical: canonical.scopes[index],
+          result: classifyPeriodCurrentness(scope, canonical.scopes[index]),
+        })) };
     }, { env: process.env, runId: report.invocation_id, diagnostics: report.operation_lock.initial });
-    const initial = { source: opened, sourceProof, canonical: initialCanonical,
-      scopes: sourceProof.scopes.map((scope, index) => ({
-        ...scope, canonical: initialCanonical.scopes[index],
-        result: classifyPeriodCurrentness(scope, initialCanonical.scopes[index]),
-      })) };
     source = initial.source;
     sourceScopeProof = initial.sourceProof;
     report.source_checkpoint = source.checkpoint;
@@ -379,13 +412,16 @@ export async function runBootstrap(options) {
     for (const month of periods) {
       for (const connectorId of options.connectors) for (const pollutant of options.pollutants) {
         active = { connector_id: connectorId, pollutant_code: pollutant, month_utc: month.month_utc };
+        try {
         const monthCurrentness = periodCurrentness.get(month.month_utc);
-        if (!monthCurrentness?.result.matches) {
+        const needsPmContext = pollutant === 'pm25' || pollutant === 'pm10';
+        if (!monthCurrentness?.result.month_matches
+          || (needsPmContext && !monthCurrentness.result.context_matches)) {
           report.incomplete_scopes.push({ ...active, timeseries_ids: options.timeseries,
-            reason: 'initial_scoped_currentness_mismatch', currentness: monthCurrentness?.canonical || null });
+            reason: !monthCurrentness?.result.month_matches ? 'initial_month_currentness_mismatch'
+              : 'initial_pm_context_currentness_mismatch', currentness: monthCurrentness?.canonical || null });
           continue;
         }
-        const needsPmContext = pollutant === 'pm25' || pollutant === 'pm10';
         const contextStart = needsPmContext
           ? new Date(Date.parse(month.requested_start_utc) - DAY).toISOString()
           : month.requested_start_utc;
@@ -524,10 +560,12 @@ export async function runBootstrap(options) {
           const prefix = `candidates/${publicationPrefix(identity, month.month_utc, pubID)}`;
           const observationRef = await gzipProduct(prefix, 'observations', observations);
           const aqiRef = await gzipProduct(prefix, 'aqi', aqi);
+          const sourceScope = sourceScopeProof.scopes.find(scope => scope.month_utc === month.month_utc);
           const candidate = { ...common, kind: 'uk_aq_jsongen_bootstrap_monthly_pair_candidate',
             observations: observationRef, aqi: aqiRef, observation_count: visible.length,
             observation_completeness: observations.completeness, aqi_completeness: aqi.completeness,
-            currentness: { initial: monthCurrentness.canonical, final: null },
+            currentness: { initial: { ...monthCurrentness.canonical,
+              result: classifyPeriodCurrentness(sourceScope, monthCurrentness.canonical, needsPmContext) }, final: null },
             proposed_publication_keys: { observations: `${publicationPrefix(identity, month.month_utc, pubID)}/observations.${observationRef.sha256}.json.gz`,
               aqi: `${publicationPrefix(identity, month.month_utc, pubID)}/aqi.${aqiRef.sha256}.json.gz` },
             managed_publication_eligible: false, local_candidate_complete: false,
@@ -546,6 +584,8 @@ export async function runBootstrap(options) {
             aqi_completeness: aqi.completeness,
             observations: observationRef, aqi: aqiRef, pub_id: pubID };
           stagedCandidates.push({ prefix, candidate, summary, month_utc: month.month_utc,
+            connector_id: connectorId, pollutant_code: pollutant, timeseries_id: timeseriesId,
+            source_object_keys: files.map(file => file.key),
             aqi_complete: calculated.aqi.response_complete,
             context_complete: aqi.completeness.context_source_complete });
           report.observation_count += visible.length;
@@ -557,27 +597,81 @@ export async function runBootstrap(options) {
             && d.day_utc < month.requested_end_exclusive_utc.slice(0,10)),
           pm_context_day_accounting: days.filter(d => d.day_utc < month.requested_start_utc.slice(0,10)),
           physical_series_count: groups.size, candidate_count: groups.size });
+        } catch (error) {
+          const key = scopeKey(active);
+          failedScopes.set(key, error.message);
+          report.errors.push({ scope: active, message: error.message });
+          report.incomplete_scopes.push({ ...active, reason: 'source_scope_generation_failed', message: error.message });
+        }
       }
     }
     check(stagedCandidates.length > 0 || report.incomplete_scopes.length > 0,
       'no physical candidates resolved; explicitly select timeseries for authenticated empty output');
-    // Recheck every consumed Dropbox metadata object, then repeat the bounded
-    // selected-source and canonical-scope proof while holding the shared lock.
-    await reader.checkStability();
+    // Revalidate the original pinned source proof outside the global lock.
+    // Mutable global checkpoint/root/year objects are retained as original
+    // evidence, but are not required to remain byte-identical for unrelated
+    // months. Complete months recheck their month identity; partial scopes
+    // recheck only selected day leaves. Parquet cache bytes are locally rehashed.
+    const networkConsumers = new Map(), cachedConsumers = new Map();
+    const addConsumer = (map, key, candidate) => {
+      if (!map.has(key)) map.set(key, new Set());
+      map.get(key).add(candidate);
+    };
+    for (const staged of stagedCandidates) {
+      const scopeProof = sourceScopeProof.scopes.find(scope => scope.month_utc === staged.month_utc);
+      check(scopeProof, `original selected source proof missing for ${staged.month_utc}`);
+      const proofKeys = scopedSourceStabilityKeys(source, scopeProof, reader, staged,
+        [staged.timeseries_id], staged.pollutant_code === 'pm25' || staged.pollutant_code === 'pm10');
+      const networkKeys = new Set(proofKeys.network_keys);
+      const cachedKeys = new Set([...proofKeys.cached_proof_keys, ...proofKeys.network_keys,
+        ...staged.source_object_keys]);
+      for (const key of networkKeys) addConsumer(networkConsumers, key, staged);
+      for (const key of cachedKeys) addConsumer(cachedConsumers, key, staged);
+    }
+    const sourceFailures = new Map();
+    const failSourceConsumers = (key, error, consumers) => {
+      for (const staged of consumers || stagedCandidates) {
+        if (!sourceFailures.has(staged)) sourceFailures.set(staged, []);
+        sourceFailures.get(staged).push({ key, reason: error.message });
+      }
+    };
+    try { await reader.verifyCachedObjects([CHECKPOINT_KEY]); }
+    catch (error) { throw new Error(`original selected checkpoint proof failed: ${error.message}`, { cause: error }); }
+    for (const [key, consumers] of cachedConsumers) {
+      if (key === CHECKPOINT_KEY) continue;
+      try { await reader.verifyCachedObjects([key]); }
+      catch (error) { failSourceConsumers(key, error, consumers); }
+    }
+    for (const [key, consumers] of networkConsumers) {
+      try { await reader.checkSelectedStability([key]); }
+      catch (error) { failSourceConsumers(key, error, consumers); }
+    }
+    report.source_stability.original_checkpoint_cached_proof = 'verified';
+    const checkpointKeyStillPinned = reader.inventory.get(CHECKPOINT_KEY)?.sha256 === options.checkpointSha256;
+    if (!checkpointKeyStillPinned) throw new Error('original selected checkpoint bytes are not present at their pinned identity');
+    try {
+      const currentCheckpoint = await reader.readCurrentDigest(CHECKPOINT_KEY);
+      report.source_stability.current_checkpoint = currentCheckpoint.sha256 === options.checkpointSha256
+        ? { state: 'unchanged', ...currentCheckpoint }
+        : { state: 'changed_not_adopted_scope_results_decide', ...currentCheckpoint };
+    } catch (error) {
+      report.source_stability.current_checkpoint = { state: 'not_established', reason: error.message };
+    }
     report.source_stability.final_checkpoint_reread_at_utc = new Date().toISOString();
-    report.source_stability.exact_checkpoint_sha256_stable = 'yes';
-    const scopedKeys = scopedSourceStabilityKeys(source, sourceScopeProof, reader);
+    report.source_stability.selected_scopes = stagedCandidates.map(staged => ({
+      scope: scopeKey(staged), timeseries_id: staged.timeseries_id,
+      state: sourceFailures.has(staged) ? 'not_established' : 'original_selected_proof_revalidated',
+      failures: sourceFailures.get(staged) || [],
+    }));
     const finalStarted = performance.now();
+    // The final lock callback contains only bounded canonical R2 reads and
+    // selected month/day comparisons. No Dropbox network or source-byte work.
     const final = await withBootstrapObservationLock(async lock => {
-      const sourceStable = await reader.checkStability(scopedKeys);
       const canonical = await readCurrentObservationScopes(sourceScopeProof.scopes, {
         env: process.env, signal: lock.signal, assertHeld: lock.assertHeld,
       });
-      return { sourceStable, canonical };
+      return { canonical };
     }, { env: process.env, runId: report.invocation_id, diagnostics: report.operation_lock.final });
-    check(final.sourceStable.checkpoint_sha256 === options.checkpointSha256,
-      'selected Dropbox checkpoint changed before final scoped comparison');
-    report.source_stability.exact_checkpoint_sha256_stable = 'yes';
     report.scoped_currentness_r2_reads.count += final.canonical.reads.length;
     report.scoped_currentness_r2_reads.bytes += final.canonical.reads.reduce((sum, read) => sum + read.byte_size, 0);
     report.scoped_currentness_r2_reads.wall_ms += performance.now() - finalStarted;
@@ -585,7 +679,7 @@ export async function runBootstrap(options) {
     const finalByMonth = new Map(sourceScopeProof.scopes.map((scope, index) => [scope.month_utc,
       { ...final.canonical.scopes[index], result: classifyPeriodCurrentness(scope, final.canonical.scopes[index]) }]));
     report.currentness.final = { checked_at_utc: final.canonical.checked_at_utc,
-      checkpoint_sha256: final.sourceStable.checkpoint_sha256,
+      checkpoint_sha256: source.checkpoint.sha256,
       canonical_root: final.canonical.root,
       canonical_root_content_hash: final.canonical.root_content_hash,
       r2_manifest_reads: final.canonical.reads,
@@ -606,23 +700,53 @@ export async function runBootstrap(options) {
       final_matches: scope.result.matches }));
     await retainMetadata();
     for (const staged of stagedCandidates) {
-      const finalScope = finalByMonth.get(staged.month_utc);
-      const initiallyCurrent = periodCurrentness.get(staged.month_utc)?.result.matches === true;
+      const canonicalScope = finalByMonth.get(staged.month_utc);
+      const sourceScope = sourceScopeProof.scopes.find(scope => scope.month_utc === staged.month_utc);
+      const needsPmContext = staged.pollutant_code === 'pm25' || staged.pollutant_code === 'pm10';
+      const finalResult = canonicalScope && sourceScope
+        ? classifyPeriodCurrentness(sourceScope, canonicalScope, needsPmContext) : { matches: false };
+      const finalScope = canonicalScope ? { ...canonicalScope, result: finalResult } : null;
+      const startResult = periodCurrentness.get(staged.month_utc)?.result;
+      const initiallyCurrent = startResult?.month_matches === true
+        && (!needsPmContext || startResult.context_matches === true);
+      const sourceFailure = sourceFailures.get(staged) || [];
+      const generationFailure = failedScopes.get(scopeKey(staged)) || null;
       const localComplete = initiallyCurrent && finalScope?.result.matches === true
+        && finalResult.matches === true && canonicalScope?.proof_state === 'established'
+        && sourceFailure.length === 0 && !generationFailure
         && staged.aqi_complete && staged.context_complete;
       staged.candidate.currentness.final = finalScope || null;
+      staged.candidate.source_stability = { state: sourceFailure.length ? 'not_established'
+        : generationFailure ? 'scope_generation_failed' : 'original_selected_proof_revalidated',
+        failures: sourceFailure, generation_failure: generationFailure };
       staged.candidate.local_candidate_complete = localComplete;
       staged.candidate.manual_review_eligible = localComplete;
       staged.candidate.completion_rule = 'requires final invocation COMPLETE.json, matching report and candidate manifest';
       staged.summary.local_candidate_complete = localComplete;
-      staged.summary.candidate = await contentJson(`${staged.prefix}/candidate`, staged.candidate);
+      try {
+        staged.summary.candidate = await contentJson(`${staged.prefix}/candidate`, staged.candidate);
+      } catch (error) {
+        staged.candidate.local_candidate_complete = false;
+        staged.candidate.manual_review_eligible = false;
+        staged.summary.local_candidate_complete = false;
+        report.candidates.push({ ...staged.summary, candidate: null,
+          staged_products: { observations: staged.candidate.observations, aqi: staged.candidate.aqi } });
+        report.errors.push({ scope: staged.candidate.identity, message: error.message });
+        report.incomplete_scopes.push({ month_utc: staged.month_utc,
+          identity: staged.summary.identity, reason: 'candidate_descriptor_write_failed', message: error.message });
+        continue;
+      }
       report.candidates.push({ ...staged.summary });
       if (localComplete) report.successful_scopes.push({ month_utc: staged.month_utc,
         identity: staged.summary.identity, currentness: finalScope });
       else report.incomplete_scopes.push({ month_utc: staged.month_utc,
-        identity: staged.summary.identity, reason: 'final_local_candidate_gate_failed',
+        identity: staged.summary.identity,
+        reason: generationFailure ? 'source_scope_generation_failed'
+          : sourceFailure.length ? 'selected_source_revalidation_not_established'
+            : finalScope?.proof_state !== 'established' ? 'final_currentness_not_established'
+              : 'final_local_candidate_gate_failed',
         currentness: finalScope, aqi_complete: staged.aqi_complete,
-        context_complete: staged.context_complete });
+        context_complete: staged.context_complete, source_failures: sourceFailure });
     }
     const manifest = await contentJson('candidate-manifest', { schema_version: 1,
       kind: 'uk_aq_jsongen_dropbox_bootstrap_candidate_manifest', environment: 'TEST',
@@ -641,7 +765,9 @@ export async function runBootstrap(options) {
     report.state = 'failed';
     report.errors.push({ scope: active, message: error.message });
     report.incomplete_scopes.push({ scope: active, requested_period: report.requested_period, reason: error.message });
+    const reportedCandidateIds = new Set(report.candidates.map(candidate => candidate.pub_id));
     for (const staged of stagedCandidates) {
+      if (reportedCandidateIds.has(staged.summary.pub_id)) continue;
       staged.candidate.local_candidate_complete = false;
       staged.candidate.manual_review_eligible = false;
       staged.summary.local_candidate_complete = false;

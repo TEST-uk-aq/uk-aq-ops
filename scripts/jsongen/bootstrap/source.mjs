@@ -21,6 +21,14 @@ import { validateTimeseriesBinding } from '../../../workers/uk_aq_station_histor
 
 const identity = ref => ({ sha256: ref.sha256, byte_size: ref.byte_size });
 function unique(values, label) { check(new Set(values).size === values.length, `duplicate ${label}`); }
+export function selectedBindingPackRangeState(packState, range) {
+  const state = packState.ranges.find(entry => entry.range_start === range.range_start
+    && entry.range_end === range.range_end);
+  check(state, `binding pack range state missing: ${range.range_start}-${range.range_end}`);
+  check(state.state_shard_key === timeseriesBindingPackRangeStateShardKey(
+    g.backup_state_prefix, range.range_start, range.range_end), 'binding pack state shard path mismatch');
+  return state;
+}
 function childEntry(parent, childId, parentKey, kind) {
   const alias = kind === 'connector' ? 'connector_manifests' : 'pollutant_manifests';
   check(Array.isArray(parent[alias]) && same(parent[alias], parent.child_manifests), 'contradictory canonical child aliases');
@@ -187,10 +195,8 @@ export async function openBackupSource(reader, options) {
     }
     const ref = packRoot.ranges.find(r => timeseriesId >= r.range_start && timeseriesId <= r.range_end);
     check(ref, `physical binding absent from backed-up pack root: ${timeseriesId}`);
-    if (cachedRange?.range_start !== ref.range_start) {
-      const s = packState.ranges.find(r => r.range_start === ref.range_start);
-      check(s.state_shard_key === timeseriesBindingPackRangeStateShardKey(g.backup_state_prefix, ref.range_start, ref.range_end),
-        'binding pack state shard path mismatch');
+    const s = selectedBindingPackRangeState(packState, ref);
+    if (cachedRange?.range_start !== ref.range_start || cachedRange?.range_end !== ref.range_end) {
       const shard = validateTimeseriesBindingPackRangeState(await reader.json(s.state_shard_key,
         { expected: { sha256: s.state_shard_hash } }), ref.range_start, ref.range_end);
       check(shard.verified && shard.processed_source_range_hash === ref.source_range_hash
@@ -284,6 +290,10 @@ export async function openBackupSource(reader, options) {
     return selected;
   }
   return { pollutant, binding, authority, assertStatusMode, observationMonthSnapshot, bindings, memberEvidence, authorities,
+    bindingPackRootEvidence: reader.inventory.get(packState.pack_root_relative_path),
+    verificationLatestEvidence: verificationInventory
+      ? reader.inventory.get(verificationInventory.latest.relative_path) || reader.inventory.get(VERIFICATION_LATEST_PATH)
+      : null,
     checkpoint: { key: CHECKPOINT_KEY, sha256: checkpoint.sha256, byte_size: checkpoint.byte_size,
       processed_observations_root_hash: options.observationsRoot,
       processed_verification_root_hash: verification?.processed_source_root_hash || null,

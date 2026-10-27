@@ -115,18 +115,30 @@ export function createDropboxReader({ cacheDir, limits, checkpointKey = CHECKPOI
     return object;
   }
   async function json(key, options) { return parseJson((await read(key, options)).body, key); }
-  async function checkStability(keys = null) {
-    // All consumed Parquet is SHA-pinned. Recheck replaceable authority and
-    // checkpoint bytes, including checkpoint last. Not a distributed lock.
-    const selected = keys ? [...new Set(keys)] : [...metadata.keys()];
-    for (const key of selected.filter(k => k !== checkpointKey).sort()) {
-      check(metadata.has(key), `stability key was not originally authenticated: ${key}`);
+  async function checkSelectedStability(keys) {
+    const selected = [...new Set(keys)].sort();
+    for (const key of selected) {
+      check(metadata.has(key), `selected stability key was not originally authenticated: ${key}`);
       await read(key, { fresh: true });
     }
-    await read(checkpointKey, { fresh: true });
-    return { checkpoint_sha256: inventory.get(checkpointKey)?.sha256 || null,
-      checkpoint_byte_size: inventory.get(checkpointKey)?.byte_size || null,
-      checked_keys: selected.length + 1 };
+    return { checked_keys: selected.length };
   }
-  return { read, json, checkStability, deadline, inventory, metadata, metrics, sourceRoot };
+  async function verifyCachedObjects(keys) {
+    const selected = [...new Set(keys)].sort();
+    for (const key of selected) {
+      const pinned = inventory.get(key);
+      check(pinned, `selected source object was not originally authenticated: ${key}`);
+      const body = await fs.readFile(path.join(cacheDir, pinned.sha256));
+      check(body.length === pinned.byte_size && sha256Hex(body) === pinned.sha256,
+        `cached selected source bytes failed their original identity: ${key}`);
+    }
+    return { verified_keys: selected.length };
+  }
+  async function readCurrentDigest(key) {
+    admit(key);
+    const body = await fetchBytes(key, limits.metadataBytes);
+    return { key, sha256: sha256Hex(body), byte_size: body.length };
+  }
+  return { read, json, checkSelectedStability, verifyCachedObjects,
+    readCurrentDigest, deadline, inventory, metadata, metrics, sourceRoot };
 }
