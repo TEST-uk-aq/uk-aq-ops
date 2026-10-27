@@ -2,6 +2,8 @@
 
 Date: 27 October 2026; expanded to investigate JSONgen replacing historical chart loading. Status: architectural investigation and recommendations; **no implementation or operational authority**.
 
+**Final architecture follow-up, 27 October:** [v2/v3, JSONgen and complete-system decision](uk-aq-history-architecture-decision-2026-10-27.md). The companion explicitly compares returning to canonical v2, retaining v3 with smaller metadata, alternative serving/storage designs and retaining on-demand serving without JSONgen. It supplies the final architectural recommendation and decision gates; the measurements, provenance and earlier conditional index scenarios below remain unchanged.
+
 ## 1. Executive summary
 
 The selected v3 physical observation layout has useful performance properties that should be retained: exact timeseries lookup, authenticated membership, offline-derived Parquet column ranges, one timeseries per independently decodable row group, a 1,024-row segment cap and bounded private pagination. Its current **index representation is substantially more redundant than those requirements demand**.
