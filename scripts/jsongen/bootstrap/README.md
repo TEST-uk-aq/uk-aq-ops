@@ -82,17 +82,14 @@ refresh implementation is added. Normal rclone refresh may update its existing
 **local** config. `UK_AQ_R2_HISTORY_BACKUP_RCLONE_BIN` retains its existing meaning.
 No new persistent environment variables/catalogue entries are introduced.
 
-The only transport operation is exact `rclone cat` below the fixed source:
-
-```text
-uk_aq_dropbox:TEST/R2_history_backup
-```
-
-This is the workflow's `TEST/R2_history_backup` under the authorised application
-root (`/Apps/github-uk-air-quality-networks/TEST/R2_history_backup/` in Dropbox UI).
-There is no local Mac path or arbitrary remote, LIST, upload, deletion, restore,
-database operation or R2 read/write. Existing auth/config was inspected in code;
-real credentials and permissions were not exercised during development.
+The Dropbox transport is exact `rclone cat` below the root resolved by the
+existing backup configuration (`UK_AQ_DROPBOX_ROOT` and
+`UK_AQ_R2_HISTORY_DROPBOX_DIR`) on the `uk_aq_dropbox` remote. There is no local
+Mac path or arbitrary remote, LIST, upload, deletion, restore, or database
+operation. It also performs bounded read-only R2 hierarchy GETs and acquires the existing TEST
+observations global operation lock for initial and final currentness checks.
+Existing auth/config was inspected in code; credentials and permissions were
+not exercised during development.
 
 Supply two distinct pins:
 
@@ -156,17 +153,30 @@ or current-R2 claim. Overwritten old backup bytes require recovery, not weaker p
 
 The `--month-utc YYYY-MM` mode requests one complete UTC calendar month and
 requires one explicit physical timeseries and PM2.5. Connector, physical series
-and month remain operator inputs. Existing start/end range mode remains available.
+and month remain operator inputs. The partial-month mode combines complete
+calendar months with a final selected month cut off at an explicit UTC midnight:
+`--start-utc YYYY-MM-01T00:00:00Z --partial-month-utc YYYY-MM
+--completed-before-utc YYYY-MM-DDT00:00:00Z`. The cutoff day is exclusive.
+Legacy range mode remains available and is compared as selected-day membership.
 
-**Currentness is `not_established`.** The shared Integrity currentness helper
-requires a locally materialised checkpoint, while this bootstrap reads through
-the bounded rclone reader. The backup-versus-writer ordering decision is private
-to Integrity's run path and has no reusable standalone read-only interface here.
-The global lock coordinator and live-root metadata reader exist, but root equality
-without ordered backup evidence would weaken the gate. Reports record start/final
-currentness and writer ordering as `not_established`; private pairs remain
-incomplete, `COMPLETE.json` is omitted, and the run exits 2. Final checkpoint
-stability is reported separately and does not prove canonical currentness.
+Currentness is proved per selected scope. Full calendar months compare the
+authenticated Dropbox processed-month hash with the current canonical R2 month
+hash. Partial months compare each selected day manifest hash or authenticated
+absence. PM2.5/PM10 scopes also compare the preceding full context day. Initial
+and final comparisons read only the required R2 root/year/month hierarchy under
+the shared global observation lock. A changed unrelated R2 root does not fail a
+scope whose selected month/day and PM context still match; the root change is
+recorded. No observation Parquet is fetched from R2. Selected Dropbox metadata
+and the exact checkpoint pin are rechecked before local candidate descriptors
+are finalised.
+
+Matching scoped currentness can make a **local private pair** ready when source,
+AQI response and required context are complete. It does not establish matching
+Core publication, independent verification-transition authority, writer
+publication freshness or a managed baseline. Those remain explicit blockers to
+managed publication, which is always disabled. A successful `COMPLETE.json`
+means only that the local candidate set passed this bounded readiness gate and
+is available for further manual review.
 
 ## Proposed seven-day command — do not execute during code review
 
@@ -197,8 +207,8 @@ UK_AQ_ENV_NAME=TEST node --max-old-space-size=4096 \
   --output-dir "${bootstrap_output_dir:?set a new absolute private directory}"
 ```
 
-The existing `RCLONE_CONFIG`/remote must be available in the shell. No R2 or DB
-credentials are needed. To narrow the first operation, add `--timeseries-ids 212`
+The existing `RCLONE_CONFIG`/remote, TEST database URL and R2 read credentials
+must be available in the shell. To narrow the first operation, add `--timeseries-ids 212`
 and select only its authorised pollutant (`--pollutants pm25`). That is a separate,
 smaller scope, not acceptance of every connector-1 series.
 
@@ -209,16 +219,15 @@ negatives, nullable station IDs and multiplicity. Existing canonical JSON uses
 round-trip numbers (canonical negative zero serialises as zero). Measurements
 are never rounded, averaged, interpolated or deduplicated.
 
-### Complete-month command shape — currentness gate not established
+### Complete-month command shape
 
 The supported first-scope shape uses one operator-supplied connector, one physical
 timeseries, `pm25`, and one UTC month. Set the identity, month, checkpoint byte
 digest, observation-root digest, accepted verification mode and private output
 from independently reviewed operational evidence before any separately authorised
-run. This code currently cannot establish backup/writer ordering or compare the
-live root under the shared lock, so a run would produce only incomplete private
-pairs and exit 2. This command shape is documentation only; do not execute it as
-a real bootstrap until that blocker is resolved.
+run. The invocation also requires the existing TEST database URL, R2 credentials,
+Dropbox remote and configured source root for its shared lock and read-only
+currentness checks.
 
 ```sh
 UK_AQ_ENV_NAME=TEST node --max-old-space-size=4096 \
@@ -324,18 +333,18 @@ successful/incomplete scopes, observation/AQI counts, exact source object hashes
 sizes, bytes/commands, read/decode CPU/wall, AQI time, JSON/gzip time/sizes, errors,
 bounds and manual-review eligibility. Managed publication eligibility is always
 false. Reports distinguish authenticated membership/absence from natural
-measurement gaps and include PM-context accounting. Currentness and independent
-backup/writer ordering remain `not_established`, so no invocation can currently
-produce a successful local-baseline completion marker. Missing source coverage cannot produce a successful report. Diagnostic
+measurement gaps and include PM-context accounting. Per-scope initial/final
+hashes and canonical hierarchy references explain currentness. Missing source
+coverage cannot produce a successful report. Diagnostic
 report/reference lists and completion marker are outside the generated-product
 byte cap; reference counts are bounded by object/series/range limits.
 
 ## Failure, restart and rollback
 
-`COMPLETE.json` is reserved for a generation that passes source, month, context,
-start/final currentness and authority checks. Those currentness interfaces are
-not reusable by this bootstrap yet, so it writes private pair candidates and a
-report but exits 2, marks the run incomplete and omits `COMPLETE.json`. Exit 2
+`COMPLETE.json` is written only when every requested local candidate passes
+source, selected month/day, PM context, AQI response and initial/final currentness
+checks. The marker does not grant managed-publication eligibility. An incomplete
+scope keeps its staged products private, writes a report and exits 2. Exit 2
 means failed/incomplete generation;
 exit 1 covers admission/unhandled local errors. Missing `COMPLETE.json` always
 means incomplete, including kill/power loss. Validate its report digest and final
@@ -351,8 +360,9 @@ private output. There are no deployed changes to undo.
 
 ## Later months and separate first-run authorisation
 
-Use `--month-utc YYYY-MM` to explicitly request a full calendar month. Existing
-start/end range mode remains for partial historical reconstruction. Dates are not
+Use `--month-utc YYYY-MM` to explicitly request a full calendar month, or the
+partial-month cutoff form described above. Existing start/end range mode remains
+for partial historical reconstruction. Dates are not
 hard-coded. The same pin
 can supply June context for July only when its chain authenticates those scopes.
 Never fill missing dependencies from R2. One invocation reuses cached files at
@@ -374,8 +384,9 @@ publication, managed baseline acceptance and chart serving remain separate decis
 Separately record this manual local-only Dropbox bootstrap in the routed JSONgen
 bootstrap/manual-rebuild documentation. Cover version-1 candidates/evidence, real
 generation-v3 pack path, canonical whole-file authentication, month units/bounds,
-partial coverage, independent completeness, operator transition prerequisite and
-unknown current authority. Link implementation files and the code PR. No schema
+partial coverage, independent completeness, operator transition prerequisite,
+scoped currentness proof and unresolved managed authority. Link implementation
+files and the code PR. No schema
 migration, persistent environment catalogue update, scheduler or deployment is
 needed. Preserve missing writer/gate/receipt/managed-context authority and the
 disabled managed selector. Add real TEST acceptance only after the separate

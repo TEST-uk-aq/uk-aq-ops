@@ -10,7 +10,8 @@ import { validateTimeseriesBindingBackupPackRootV1, validateTimeseriesBindingBac
   serializeTimeseriesBindingBackupPackV1 } from '../../backup_r2/lib/timeseries_binding_backup_pack_v1.mjs';
 import { buildTimeseriesBindingSourceRangeManifest, buildTimeseriesBindingSourceRootManifest,
   timeseriesBindingSourceRangeManifestKey } from '../../backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs';
-import { validateR2HistoryV2ObservationsAggregateManifest } from '../../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs';
+import { OBSERVATIONS_AGGREGATE_MANIFEST_KINDS,
+  validateR2HistoryV2ObservationsAggregateManifest } from '../../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs';
 import { validateCanonicalHistoryV2Manifest } from '../../../workers/shared/uk_aq_r2_history_manifest_validation.mjs';
 import { assertV2ObservationsChildManifest } from '../../backup_r2/lib/uk_aq_v2_observations_manifest_validation.mjs';
 import { classifyManifestFileIdentity } from '../../../workers/shared/uk_aq_r2_file_identity.mjs';
@@ -66,6 +67,7 @@ export async function openBackupSource(reader, options) {
     && s.pack_relative_path === r.pack_relative_path && s.pack_sha256 === r.pack_sha256
     && s.pack_size === r.pack_size && s.member_count === r.member_count), 'pack root/checkpoint disagreement');
   const bindings = new Map(), memberEvidence = new Map(), authorities = new Map(), months = new Map();
+  const monthDetails = new Map(), yearManifests = new Map();
   // One bounded range cache. All source bodies are also on disk, so moving
   // between ranges never causes another Dropbox download of an existing pack.
   let cachedRange = null;
@@ -94,11 +96,30 @@ export async function openBackupSource(reader, options) {
     const ym = day.slice(0, 7);
     if (months.has(ym)) return months.get(ym);
     const yearRef = root.children.find(c => c.year === Number(day.slice(0, 4)));
-    if (!yearRef) { months.set(ym, null); return null; }
-    const year = await aggregate(yearRef.manifest_key, yearRef.content_hash);
+    if (!yearRef) {
+      months.set(ym, null);
+      monthDetails.set(ym, { manifest: null, year_reference: null, year_manifest: null,
+        month_reference: null, state_entry: stateMonthEntry(state, day.slice(0, 4), day.slice(5, 7)), state_shard: null });
+      return null;
+    }
+    let year = yearManifests.get(yearRef.manifest_key);
+    if (!year) {
+      year = await aggregate(yearRef.manifest_key, yearRef.content_hash);
+      check(year.kind === OBSERVATIONS_AGGREGATE_MANIFEST_KINDS.year
+        && year.year === Number(day.slice(0, 4)), `canonical year identity mismatch: ${yearRef.manifest_key}`);
+      yearManifests.set(yearRef.manifest_key, year);
+    }
     const monthRef = year.children.find(c => c.month === day.slice(5, 7));
-    if (!monthRef) { months.set(ym, null); return null; }
+    if (!monthRef) {
+      months.set(ym, null);
+      monthDetails.set(ym, { manifest: null, year_reference: yearRef, year_manifest: year,
+        month_reference: null, state_entry: stateMonthEntry(state, day.slice(0, 4), day.slice(5, 7)), state_shard: null });
+      return null;
+    }
     const manifest = await aggregate(monthRef.manifest_key, monthRef.content_hash);
+    check(manifest.kind === OBSERVATIONS_AGGREGATE_MANIFEST_KINDS.month
+      && manifest.year === Number(day.slice(0, 4)) && manifest.month === day.slice(5, 7),
+    `canonical month identity mismatch: ${monthRef.manifest_key}`);
     const summary = stateMonthEntry(state, day.slice(0, 4), day.slice(5, 7));
     check(summary?.processed_source_month_hash === manifest.content_hash && summary.state_shard_hash,
       `selected checkpoint month incomplete: ${ym}`);
@@ -110,7 +131,10 @@ export async function openBackupSource(reader, options) {
     check(shard.processed_source_month_hash === manifest.content_hash && manifest.children.length === shard.days.length
       && manifest.children.every(c => shard.days.some(d => d.day_utc === c.day_utc && d.manifest_hash === c.manifest_hash && d.copied_at)),
     `checkpoint month child completion mismatch: ${ym}`);
-    months.set(ym, manifest); return manifest;
+    months.set(ym, manifest);
+    monthDetails.set(ym, { manifest, year_reference: yearRef, year_manifest: year,
+      month_reference: monthRef, state_entry: summary, state_shard: shard, state_shard_key: key });
+    return manifest;
   }
   async function canonical(ref, { kind, day, connectorId = null }, parent = null) {
     const raw = await reader.json(ref.manifest_key);
@@ -191,7 +215,8 @@ export async function openBackupSource(reader, options) {
     check(bindings.size < options.limits.series, 'invocation physical-series limit exceeded; select a smaller batch');
     bindings.set(timeseriesId, b);
     memberEvidence.set(timeseriesId, { key: member.relative_path, sha256: member.sha256, byte_size: member.size,
-      pack_key: ref.pack_relative_path, source_range_hash: ref.source_range_hash });
+      pack_key: ref.pack_relative_path, pack_state_shard_key: s.state_shard_key,
+      source_range_hash: ref.source_range_hash });
     return b;
   }
   async function authority(connectorId) {
@@ -213,6 +238,43 @@ export async function openBackupSource(reader, options) {
       'operator verification mode contradicts selected backup');
     authorities.set(connectorId, a); return a;
   }
+  async function observationMonthSnapshot(monthUtc, dayUts = []) {
+    check(/^\d{4}-(0[1-9]|1[0-2])$/.test(monthUtc || ''), 'invalid selected observation month');
+    const manifest = await month(`${monthUtc}-01`);
+    const detail = monthDetails.get(monthUtc);
+    check(detail, `selected Dropbox month ancestry was not captured: ${monthUtc}`);
+    check(manifest || !detail.state_entry,
+      `Dropbox checkpoint retains month state absent from its authenticated observations root: ${monthUtc}`);
+    const refs = new Map((manifest?.children || []).map(child => [child.day_utc, child.manifest_hash]));
+    const stateDays = new Map((detail.state_shard?.days || []).map(day => [day.day_utc, day]));
+    const selectedDays = [...new Set(dayUts)].sort();
+    for (const dayUtc of selectedDays) {
+      check(dayUtc.startsWith(`${monthUtc}-`) && /^\d{4}-\d{2}-\d{2}$/.test(dayUtc),
+        `selected day does not belong to Dropbox month ${monthUtc}`);
+      const manifestHash = refs.get(dayUtc) || null;
+      const stateDay = stateDays.get(dayUtc);
+      check(Boolean(manifestHash) === Boolean(stateDay),
+        `Dropbox month/day completion evidence contradicts membership: ${dayUtc}`);
+      if (stateDay) check(stateDay.manifest_hash === manifestHash && stateDay.copied_at,
+        `Dropbox day completion evidence mismatch: ${dayUtc}`);
+    }
+    const objectRef = key => key ? reader.inventory.get(key) || null : null;
+    return {
+      month_utc: monthUtc,
+      processed_source_month_hash: detail.state_entry?.processed_source_month_hash || null,
+      source_month_content_hash: manifest?.content_hash || null,
+      month_manifest: objectRef(detail.month_reference?.manifest_key),
+      year_manifest: objectRef(detail.year_reference?.manifest_key),
+      observations_root_manifest: objectRef(g.observations_root_key),
+      month_state_shard: objectRef(detail.state_shard_key),
+      year_manifest_content_hash: detail.year_manifest?.content_hash || null,
+      selected_days: selectedDays.map(dayUtc => ({ day_utc: dayUtc,
+        state: refs.has(dayUtc) ? 'authenticated_membership' : 'authenticated_absence',
+        manifest_hash: refs.get(dayUtc) || null,
+        manifest_key: manifest?.children.find(child => child.day_utc === dayUtc)?.manifest_key || null,
+        copied_at: stateDays.get(dayUtc)?.copied_at || null })),
+    };
+  }
   function assertStatusMode(physical, connectorId, a) {
     // Keep the managed inspector's transition validator intact and reuse it.
     const selected = selectVerificationStatusAuthority({ physicalIdentity: physical,
@@ -221,7 +283,7 @@ export async function openBackupSource(reader, options) {
       'backed-up physical schema/verification authority unresolved');
     return selected;
   }
-  return { pollutant, binding, authority, assertStatusMode, bindings, memberEvidence, authorities,
+  return { pollutant, binding, authority, assertStatusMode, observationMonthSnapshot, bindings, memberEvidence, authorities,
     checkpoint: { key: CHECKPOINT_KEY, sha256: checkpoint.sha256, byte_size: checkpoint.byte_size,
       processed_observations_root_hash: options.observationsRoot,
       processed_verification_root_hash: verification?.processed_source_root_hash || null,

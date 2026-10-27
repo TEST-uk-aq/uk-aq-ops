@@ -5,21 +5,28 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 import { joinTargetPath, sha256Hex } from '../../backup_r2/lib/rclone.mjs';
+import { configuredHistoryDropboxRoot } from '../../backup_r2/lib/history_backup_targets.mjs';
 import { requireValid as check } from '../schema.mjs';
 import { getObservationHistoryGeneration } from '../../../workers/shared/uk_aq_observation_history_generation.mjs';
 
-export const DROPBOX_SOURCE = 'uk_aq_dropbox:TEST/R2_history_backup';
 export const GENERATION = getObservationHistoryGeneration('v3');
 export const CHECKPOINT_KEY = `${GENERATION.backup_state_prefix}/root.json`;
 const decoder = new TextDecoder('utf-8', { fatal: true });
+
+export function resolveDropboxSource(env = process.env) {
+  check(env.UK_AQ_ENV_NAME === 'TEST', 'UK_AQ_ENV_NAME must be TEST');
+  return configuredHistoryDropboxRoot(env);
+}
 
 export function parseJson(body, key) {
   try { return JSON.parse(decoder.decode(body)); }
   catch { throw new Error(`Invalid UTF-8 JSON: ${key}`); }
 }
-export function createDropboxReader({ cacheDir, limits, checkpointKey = CHECKPOINT_KEY }) {
-  check(process.env.UK_AQ_ENV_NAME === 'TEST', 'UK_AQ_ENV_NAME must be TEST');
+export function createDropboxReader({ cacheDir, limits, checkpointKey = CHECKPOINT_KEY,
+  env = process.env, sourceRoot = resolveDropboxSource(env) }) {
+  check(env.UK_AQ_ENV_NAME === 'TEST', 'UK_AQ_ENV_NAME must be TEST');
   check(checkpointKey === CHECKPOINT_KEY, 'select the generation-v3 checkpoint root path');
+  check(sourceRoot === configuredHistoryDropboxRoot(env), 'Dropbox source root must match shared operator configuration');
   const inventory = new Map(), metadata = new Map();
   const metrics = { read_commands: 0, dropbox_api_requests: null, source_bytes_read: 0,
     parquet_bytes_read: 0, metadata_bytes_read: 0, read_wall_ms: 0, read_cpu_ms: 0,
@@ -57,7 +64,7 @@ export function createDropboxReader({ cacheDir, limits, checkpointKey = CHECKPOI
         const chunks = []; let size = 0, failure = null;
         // Existing remote and RCLONE_CONFIG are inherited unchanged. rclone may
         // refresh its local OAuth token normally; no Dropbox content is written.
-        const child = spawn(rcloneBin, ['cat', joinTargetPath(DROPBOX_SOURCE, key),
+        const child = spawn(rcloneBin, ['cat', joinTargetPath(sourceRoot, key),
           '--count', String(cap + 1), '--retries', '1', '--low-level-retries', '1',
           '--contimeout', '15s', '--timeout', '30s', '--stats', '0', '--log-level', 'ERROR'],
         { env: process.env, stdio: ['ignore', 'pipe', 'ignore'] });
@@ -108,11 +115,18 @@ export function createDropboxReader({ cacheDir, limits, checkpointKey = CHECKPOI
     return object;
   }
   async function json(key, options) { return parseJson((await read(key, options)).body, key); }
-  async function checkStability() {
+  async function checkStability(keys = null) {
     // All consumed Parquet is SHA-pinned. Recheck replaceable authority and
     // checkpoint bytes, including checkpoint last. Not a distributed lock.
-    for (const key of [...metadata.keys()].filter(k => k !== checkpointKey).sort()) await read(key, { fresh: true });
+    const selected = keys ? [...new Set(keys)] : [...metadata.keys()];
+    for (const key of selected.filter(k => k !== checkpointKey).sort()) {
+      check(metadata.has(key), `stability key was not originally authenticated: ${key}`);
+      await read(key, { fresh: true });
+    }
     await read(checkpointKey, { fresh: true });
+    return { checkpoint_sha256: inventory.get(checkpointKey)?.sha256 || null,
+      checkpoint_byte_size: inventory.get(checkpointKey)?.byte_size || null,
+      checked_keys: selected.length + 1 };
   }
-  return { read, json, checkStability, deadline, inventory, metadata, metrics };
+  return { read, json, checkStability, deadline, inventory, metadata, metrics, sourceRoot };
 }
