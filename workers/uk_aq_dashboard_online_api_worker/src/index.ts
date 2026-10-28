@@ -13,6 +13,7 @@ import type { WorkerEnv } from "./lib/upstream";
 import { handleStationSnapshotV2Rows, handleStationSnapshotV2Search } from "./lib/station_snapshot_v2";
 import { flushDashboardServiceEgressMetrics } from "./lib/service_egress_metrics";
 import { handleMediaRoute, isMediaRoute } from "./routes/media";
+import { handleAccountsRoute, isAccountsPath } from "./routes/accounts";
 
 type WorkerExecutionContext = {
   waitUntil(promise: Promise<unknown>): void;
@@ -30,6 +31,11 @@ export default {
   async fetch(request: Request, env: WorkerEnv, ctx: WorkerExecutionContext): Promise<Response> {
     try {
       const pathname = getPathname(request);
+
+      // Private routes authenticate before OPTIONS, compatibility caches or upstream proxying.
+      if (isAccountsPath(pathname)) {
+        return await handleAccountsRoute(request, env);
+      }
 
       if (request.method === "OPTIONS" && isApiRoute(pathname)) {
         return optionsResponse();

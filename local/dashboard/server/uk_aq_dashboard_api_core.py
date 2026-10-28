@@ -4495,6 +4495,18 @@ def _build_storage_coverage_payload(
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "uk-aq-dashboard/1.0"
 
+    def parse_request(self) -> bool:
+        if not super().parse_request():
+            return False
+        from uk_aq_dashboard_accounts import is_accounts_path, serve_accounts_request
+
+        if is_accounts_path(urlparse(self.path).path):
+            # Intercept every HTTP method before optional upstream bearer auth,
+            # Media facade dispatch, MySQL products or existing cache handlers.
+            serve_accounts_request(self, _postgrest_headers)
+            return False
+        return True
+
     @staticmethod
     def _is_client_disconnect_error(exc: Exception) -> bool:
         if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
@@ -4523,6 +4535,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "/ingest/": "/ingest",
                 "/ops/": "/ops",
                 "/media/": "/media",
+                "/accounts/": "/accounts",
             }
             if parsed.path in dashboard_redirects:
                 location = dashboard_redirects[parsed.path]
@@ -4533,7 +4546,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 return
-            if parsed.path in ("/", "/index.html", "/ingest", "/ops", "/media"):
+            if parsed.path in ("/", "/index.html", "/ingest", "/ops", "/media", "/accounts"):
                 self._serve_html()
                 return
             if parsed.path == "/favicon.ico":

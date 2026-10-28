@@ -3,6 +3,10 @@ main = "src/index.ts"
 compatibility_date = "2026-04-08"
 compatibility_flags = ["nodejs_compat"]
 
+[observability]
+# Email searches are sensitive even when invocation logging is enabled externally.
+redact_query_string = true
+
 [vars]
 UKAQ_PROXY_ROUTE_PREFIX = "/api"
 # DASHBOARD_UPSTREAM_BASE_URL = "https://example.internal"

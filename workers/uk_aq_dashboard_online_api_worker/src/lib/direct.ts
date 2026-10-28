@@ -361,10 +361,32 @@ async function fetchJsonObject(
   init?: RequestInit,
   errLabel?: string,
   metricEnv?: WorkerEnv,
+  maxResponseBytes = 0,
 ): Promise<JsonObject> {
   const startedAt = Date.now();
   const response = await fetch(url, init);
-  const text = await response.text();
+  let text: string;
+  if (maxResponseBytes && response.body) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let bytes = 0;
+    text = '';
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > maxResponseBytes) {
+          await reader.cancel();
+          throw new Error('Read response exceeds allowed size');
+        }
+        text += decoder.decode(value, { stream: true });
+      }
+      text += decoder.decode();
+    } finally { reader.releaseLock(); }
+  } else {
+    text = await response.text();
+  }
   if (metricEnv) {
     recordDashboardSupabaseResponse(metricEnv, url, response, text, Date.now() - startedAt);
   }
@@ -385,6 +407,23 @@ async function fetchJsonObject(
     throw new Error(`${errLabel || "Request failed"} returned non-object JSON payload.`);
   }
   return parsed as JsonObject;
+}
+
+// Reuse the IngestDB PostgREST connection, never the ObsAQIDB Daily Tasks adapter.
+// The RPC owns validation/projection/grants; its body is not a URL or telemetry label.
+export async function readAccountsSubscriptions(env: WorkerEnv, query: Record<string, unknown>): Promise<JsonObject> {
+  const base = new URL(String(env.SUPABASE_URL || '').trim());
+  if (base.protocol !== 'https:' || base.username || base.password || base.port || base.pathname !== '/' ||
+      base.search || base.hash || !/^[a-z_][a-z0-9_]*$/.test(defaultPublicSchema(env))) {
+    throw new Error('Invalid IngestDB configuration');
+  }
+  const headers = postgrestHeaders(requireServiceKey(env), defaultPublicSchema(env), true);
+  headers.set('Content-Type', 'application/json');
+  headers.set('Accept', 'application/json');
+  return fetchJsonObject(`${ingestRestBase(env)}/rpc/uk_aq_news_subscriptions_admin_read`, {
+    method: 'POST', headers, body: JSON.stringify({ p_query: query }), cache: 'no-store',
+    redirect: 'error', signal: AbortSignal.timeout(15000),
+  }, 'Accounts read unavailable', undefined, 512 * 1024);
 }
 
 async function fetchJsonArray(
