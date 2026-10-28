@@ -1,8 +1,5 @@
 # Server-only Accounts read configuration. Never put these values in config.js.
-# Use this listener's Access application audience (the local Tunnel application).
-DASHBOARD_ACCESS_TEAM_DOMAIN=https://your-team.cloudflareaccess.com
-DASHBOARD_ACCESS_AUD=your_application_audience
-DASHBOARD_ACCOUNTS_ADMIN_EMAILS=operator@example.invalid
+# The installed ~/.cloudflared/config.yml selects this listener's Access hostname.
+# Cloudflare validates each assertion at that protected hostname.
 # Reuse the existing per-environment IngestDB SUPABASE_URL and SB_SECRET_KEY.
-# Reuse existing UK_AQ_MEDIA_ADMIN_URL; dedicated token must differ from admin token.
-UK_AQ_MEDIA_NEWS_READ_TOKEN=replace_with_dedicated_read_secret
+# Reuse existing UK_AQ_MEDIA_ADMIN_URL and UK_AQ_MEDIA_ADMIN_TOKEN.

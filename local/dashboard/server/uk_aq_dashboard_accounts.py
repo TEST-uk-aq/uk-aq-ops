@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import secrets
 from http import HTTPStatus
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlparse
@@ -264,9 +263,8 @@ def _read_email_delivery(parsed: Any) -> dict[str, Any]:
     if "subscription_id" in raw_query:
         query["subscription_id"] = _uuid(raw_query["subscription_id"])
     base = _media_base_url()
-    token = str(os.getenv("UK_AQ_MEDIA_NEWS_READ_TOKEN") or "").strip()
-    full_admin_token = str(os.getenv("UK_AQ_MEDIA_ADMIN_TOKEN") or "").strip()
-    if not base or not token or len(token) > 4096 or secrets.compare_digest(token, full_admin_token):
+    token = str(os.getenv("UK_AQ_MEDIA_ADMIN_TOKEN") or "").strip()
+    if not base or not token or len(token) > 4096:
         raise AccountsRequestError(HTTPStatus.SERVICE_UNAVAILABLE, "Email Delivery read access is not configured", "EMAIL_DELIVERY_UNAVAILABLE")
     payload = _upstream_json(
         "GET", base + "/admin/news-email/delivery?" + urlencode(query),

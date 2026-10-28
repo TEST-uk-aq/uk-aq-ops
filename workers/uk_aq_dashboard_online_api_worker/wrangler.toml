@@ -2,6 +2,8 @@ name = "uk-aq-ops-dashboard-api"
 main = "src/index.ts"
 compatibility_date = "2026-04-08"
 compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+preview_urls = false
 
 [observability]
 # Email searches are sensitive even when invocation logging is enabled externally.

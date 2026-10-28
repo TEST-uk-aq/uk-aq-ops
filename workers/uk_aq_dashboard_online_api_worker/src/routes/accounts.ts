@@ -1,4 +1,5 @@
 import { AccountsError, authorizeAccountsRequest } from '../lib/accounts_auth';
+import type { AccountsAccessContext } from '../lib/accounts_auth';
 import { readAccountsSubscriptions } from '../lib/direct';
 import type { WorkerEnv } from '../lib/upstream';
 
@@ -179,12 +180,11 @@ async function delivery(url: URL, env: WorkerEnv): Promise<Response> {
   const subscription = query.get('subscription_id');
   if (subscription !== null && !UUID.test(subscription)) badQuery();
   let target: URL;
-  const token = String(env.UK_AQ_MEDIA_NEWS_READ_TOKEN || '').trim();
+  const token = String(env.UK_AQ_MEDIA_ADMIN_TOKEN || '').trim();
   try {
     const base = new URL(String(env.UK_AQ_MEDIA_ADMIN_URL || '').trim());
     if (base.protocol !== 'https:' || base.username || base.password || base.port || base.pathname !== '/' ||
-        base.search || base.hash || !token || token.length > 4096 ||
-        token === String(env.UK_AQ_MEDIA_ADMIN_TOKEN || '').trim()) throw new Error();
+        base.search || base.hash || !token || token.length > 4096) throw new Error();
     target = new URL('/admin/news-email/delivery', base);
   } catch {
     throw new AccountsError('EMAIL_DELIVERY_UNAVAILABLE', 'Email Delivery read access is not configured', 503);
@@ -228,9 +228,9 @@ async function delivery(url: URL, env: WorkerEnv): Promise<Response> {
     summary, deliveries, outbox, pagination: pagination(result.pagination, paging) });
 }
 
-export async function handleAccountsRoute(request: Request, env: WorkerEnv): Promise<Response> {
+export async function handleAccountsRoute(request: Request, env: WorkerEnv, ctx: AccountsAccessContext): Promise<Response> {
   try {
-    await authorizeAccountsRequest(request, env);
+    await authorizeAccountsRequest(ctx);
     if (request.method !== 'GET') throw new AccountsError('METHOD_NOT_ALLOWED', 'Accounts API supports GET only', 405);
     const url = new URL(request.url);
     validateRequestQuery(url);

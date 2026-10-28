@@ -14,8 +14,9 @@ import { handleStationSnapshotV2Rows, handleStationSnapshotV2Search } from "./li
 import { flushDashboardServiceEgressMetrics } from "./lib/service_egress_metrics";
 import { handleMediaRoute, isMediaRoute } from "./routes/media";
 import { handleAccountsRoute, isAccountsPath } from "./routes/accounts";
+import type { AccountsAccessContext } from "./lib/accounts_auth";
 
-type WorkerExecutionContext = {
+type WorkerExecutionContext = AccountsAccessContext & {
   waitUntil(promise: Promise<unknown>): void;
 };
 
@@ -34,7 +35,7 @@ export default {
 
       // Private routes authenticate before OPTIONS, compatibility caches or upstream proxying.
       if (isAccountsPath(pathname)) {
-        return await handleAccountsRoute(request, env);
+        return await handleAccountsRoute(request, env, ctx);
       }
 
       if (request.method === "OPTIONS" && isApiRoute(pathname)) {

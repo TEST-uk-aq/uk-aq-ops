@@ -13,8 +13,5 @@
   },
   "overrides": {
     "sharp": "0.35.4"
-  },
-  "dependencies": {
-    "jose": "6.2.13"
   }
 }

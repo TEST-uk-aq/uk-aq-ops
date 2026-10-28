@@ -19,52 +19,53 @@ existing automatic deployment workflows on relevant `main` changes.
 | Schema `docs/accounts_subscriptions_admin_read.md` | Exact RPC DTO, grants, query limits and apply/rollback instructions |
 | Media `apps/media-admin/src/news-email-delivery.ts`, `src/index.ts` | Dedicated authenticated GET delivery capability, separate from editorial and email-operator mutations |
 | Media `migrations/0054_news_email_dashboard_reads.sql` | Date/subscription indexes over existing D1 delivery/outbox tables; not applied |
-| Media admin Wrangler/types/example, deployment workflow, environment targets, README | Read-secret injection and query-string log redaction |
+| Media admin Wrangler/types/example, deployment workflow, environment targets, README | Existing admin-token reuse and query-string log redaction |
 | Ops `dashboard/index.html`, `_redirects`, `assets/accounts.js`, `assets/accounts.css` | Fourth route/navigation, pill mini-pages, read-only list/detail and delivery views |
-| Ops Worker `src/routes/accounts.ts`, `src/lib/accounts_auth.ts` | Protected Accounts route dispatch, verified Access identity, strict inputs and response projection |
+| Ops Worker `src/routes/accounts.ts`, `src/lib/accounts_auth.ts` | Protected Accounts route dispatch, platform-verified personal Access identity, strict inputs and response projection |
 | Ops Worker `src/index.ts`, `src/lib/direct.ts`, `src/lib/upstream.ts` | Early private-route dispatch and reuse of existing IngestDB PostgREST helpers |
-| Ops local `uk_aq_dashboard_accounts.py`, `uk_aq_dashboard_accounts_auth.py`, `uk_aq_dashboard_api_core.py`, `requirements.txt` | Same API on Python, before optional bearer/cache dispatch, with signed Access verification |
-| Ops Worker package/lock, Wrangler, deployment workflow, environment targets, `local/dashboard/accounts-env.example` | Pinned JOSE verification dependency, backend configuration and log redaction |
+| Ops local `uk_aq_dashboard_accounts.py`, `uk_aq_dashboard_accounts_auth.py`, `uk_aq_dashboard_api_core.py`, `requirements.txt` | Same API on Python, before optional bearer/cache dispatch, with Cloudflare identity verification through installed Tunnel ingress |
+| Ops Worker package/lock, Wrangler, deployment workflow, environment targets, `local/dashboard/accounts-env.example` | Existing configuration reuse and query-string log redaction |
 | All three dated `archive/2026-10-28/` snapshots | Exact pre-change active implementation; reference only, never execute or promote to LIVE |
 
 ## Authentication and configuration
 
 Every Accounts request, including direct Worker/Python listener requests and
-non-GET methods, verifies `Cf-Access-Jwt-Assertion` against public keys fetched
-only from the configured Access team's `/cdn-cgi/access/certs`. RS256 signature,
-issuer, audience, expiry, optional not-before, issued-at, application-token type,
-subject and an explicit email allow-list are checked. Plain identity headers,
-the existing optional upstream bearer, service tokens and browser visibility do
-not authorise these reads. Only public signing keys are temporarily cached.
-Missing configuration fails closed with 503, missing/invalid identity with 401,
-and a valid identity outside the allow-list with 403.
+non-GET methods, requires a personal identity authenticated by the existing
+Cloudflare Access application policy. The hosted Worker reads the platform's
+`ctx.access.getIdentity()`; Access did not run when `ctx.access` is absent.
+The dashboard Worker disables `workers.dev` and preview/version URLs; its
+configured `/api/*` route is the only intended public invocation path.
+The local Python handler obtains the unique protected hostname for its listener
+port from the installed `~/.cloudflared/config.yml` ingress, then sends the
+request's app assertion as a cookie to that hostname's Cloudflare
+`/cdn-cgi/access/get-identity` endpoint. It accepts only a bounded JSON
+personal identity with user UUID and email, rejecting service-token identity.
+It never selects a validation target from Host or unverified JWT claims.
+Plain identity headers, the optional upstream bearer, service tokens and
+browser visibility do not authorise reads. Missing local Tunnel configuration
+fails closed with 503; missing/invalid identity with 401.
 
-| Server setting | Existing/new and source |
+| Server setting | Existing source |
 | --- | --- |
 | `SUPABASE_URL`, `SB_SECRET_KEY` | Existing IngestDB connection; reuse on Worker and Mac, never the `OBS_AQIDB_*` connection |
 | `UK_AQ_PUBLIC_SCHEMA` | Existing schema selector, default `uk_aq_public` |
-| `DASHBOARD_ACCESS_TEAM_DOMAIN` | New variable: full `https://<team>.cloudflareaccess.com` origin |
-| `DASHBOARD_ACCESS_AUD` | New variable: one Access application audience for this backend |
-| `DASHBOARD_ACCOUNTS_ADMIN_EMAILS` | New **secret**: comma-separated administrative email allow-list |
 | `UK_AQ_MEDIA_ADMIN_URL` | Existing Media Admin origin, reused for the new read path |
-| `UK_AQ_MEDIA_NEWS_READ_TOKEN` | New shared server secret in Media Admin, dashboard Worker and Mac; must differ from `UK_AQ_MEDIA_ADMIN_TOKEN` |
+| `UK_AQ_MEDIA_ADMIN_TOKEN` | Existing server secret reused for exact GET-only Media delivery reads |
 
-These additions are necessary because the existing bearer is optional and the
-Media editorial credential authorises writes. The new Media token can authorise
-only `GET /admin/news-email/delivery`; it cannot reach any other admin route or
-trigger the existing POST queue-wakeup hook. There is no full-admin fallback.
+The existing Media admin credential authorises other Media admin routes, but
+the new delivery route itself accepts only GET and returns before the POST
+queue-wakeup hook. Browser requests never receive the credential.
 
-Use the hosted Access application's audience in the Ops Actions settings. Use
-the local Tunnel Access application's audience in that Mac checkout's `.env`;
-they can differ. Local browser operation uses the existing Access-protected
-Tunnel. Direct unauthenticated localhost Accounts reads intentionally fail.
+Local browser operation uses the existing Access-protected Tunnel. The Mac
+must have its installed cloudflared ingress file at the documented path, with
+exactly one hostname routing to this listener's loopback port. Direct
+unauthenticated localhost Accounts reads intentionally fail.
 There is no local password prompt, bearer bypass or new public login feature.
 
-Set each repository's existing environment-sync catalogue/secret stores through
-the normal operator mechanism. The private ignored `env-vars-master.csv` is
-absent from this Cloud workspace: the operator must add these names/types there
-before the next sync. Application code contains no environment-specific origin,
-audience, project ID, credential or cross-environment fallback.
+Reuse the existing environment-sync catalogue/secret stores. The private
+ignored `env-vars-master.csv` is absent from this Cloud workspace; no new
+Accounts-specific key needs adding. Application code contains no
+environment-specific origin, audience, project ID, credential or fallback.
 
 ## UI and API behavior
 
@@ -122,9 +123,10 @@ backends also enforce upstream timeouts, response sizes and result bounds.
 
 ## Exact operator sequence after separate TEST authorisation
 
-1. Review all three PRs and provision the server settings above in TEST only.
-   Ensure Access issues an `app` assertion carrying the intended admin email
-   for the hosted hostname and the local Tunnel; do not relax verification.
+1. Review all three PRs and confirm the existing TEST server settings above.
+   Ensure the existing Access policies admit only intended personal operators
+   on the hosted API route and the local Tunnel. Confirm the installed local
+   Tunnel ingress selects this listener's loopback port.
 2. Review/merge the Schema PR, then apply **only** its new transition to TEST
    IngestDB from the Schema checkout (normal index creation can briefly block
    subscriber writes; select a suitable window):
@@ -138,8 +140,8 @@ backends also enforce upstream timeouts, response sizes and result bounds.
    table grants. A fresh database uses canonical apply order instead.
 3. Review/merge the Media PR only when its existing automatic TEST deployment
    is authorised. The `uk_aq_media_deploy.yml` workflow renders/verifies TEST
-   bindings, applies pending D1 migrations (including `0054`), injects both
-   admin secrets and deploys the existing Media Workers. Review pending D1
+   bindings, applies pending D1 migrations (including `0054`), injects the
+   existing admin secret and deploys the existing Media Workers. Review pending D1
    migrations before allowing that workflow; do not assume only `0054` is pending.
    If no automatic run was started, invoke the existing workflow once:
 
@@ -175,8 +177,8 @@ backends also enforce upstream timeouts, response sizes and result bounds.
 Use controlled existing TEST subscriptions; this acceptance sends no email and
 changes no subscriber state.
 
-- Authorised hosted and Tunnel sessions can read. No/forged/expired/wrong-team/
-  wrong-audience assertions fail; a verified non-allowlisted user fails. Test
+- Authorised hosted and Tunnel sessions can read. No/forged/expired/wrong-app
+  assertions and service-token-only identities fail. Test
   both the protected hostname and direct Worker URL/direct Python listener.
   A raw email identity header or optional upstream bearer must not bypass auth.
 - Verify direct `/accounts`, reload, trailing-slash canonicalisation,
@@ -191,8 +193,8 @@ changes no subscriber state.
   including confirmation/Immediate/Daily, failed/unknown/held where present.
   Accepted rows must never claim inbox placement. Missing delivery access must
   show unavailable, not an empty-success history or a public fallback.
-- Confirm the dedicated Media read token fails on unrelated GET/admin mutation
-  routes and all non-GET delivery methods. Check no queue wake-up or email work
+- Confirm the existing Media admin token permits the exact delivery GET route
+  but all non-GET delivery methods fail. Check no queue wake-up or email work
   is caused by read requests. Existing public lifecycle flows remain unchanged.
 - Inspect responses, network panel, browser storage and appropriately redacted
   logs: no private extra fields, cached responses, search/email diagnostics or
@@ -209,8 +211,8 @@ or reapply archive files. The Schema note provides the exact additive rollback
 (`DROP FUNCTION` and its new index) after consumers are disabled.
 
 ChatGPT in Chat mode should update authoritative docs after review/application
-and real acceptance: settle these DTOs/configuration names, signed Access plus
-allow-list authorization, dedicated Media read capability/index migration,
+and real acceptance: settle these DTOs/configuration names, existing Access
+policy authorization, bounded Media read capability/index migration,
 global count scope, date-window semantics, route set and actual deployment
 evidence. No additional product scope/contract change is needed for this
 implementation. Public accounts, Settings, all subscriber actions, exports and

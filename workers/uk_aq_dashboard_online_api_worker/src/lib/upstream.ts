@@ -41,10 +41,6 @@ export type WorkerEnv = {
   CLEANAIRSURB_ST_ID?: string;
   UK_AQ_MEDIA_ADMIN_URL?: string;
   UK_AQ_MEDIA_ADMIN_TOKEN?: string;
-  UK_AQ_MEDIA_NEWS_READ_TOKEN?: string;
-  DASHBOARD_ACCESS_TEAM_DOMAIN?: string;
-  DASHBOARD_ACCESS_AUD?: string;
-  DASHBOARD_ACCOUNTS_ADMIN_EMAILS?: string;
 };
 
 export type ProxyCacheOptions = {

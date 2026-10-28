@@ -21,10 +21,6 @@ jobs:
       DASHBOARD_UPSTREAM_BEARER_TOKEN: ${{ secrets.DASHBOARD_UPSTREAM_BEARER_TOKEN || '' }}
       UK_AQ_MEDIA_ADMIN_URL: ${{ vars.UK_AQ_MEDIA_ADMIN_URL || '' }}
       UK_AQ_MEDIA_ADMIN_TOKEN: ${{ secrets.UK_AQ_MEDIA_ADMIN_TOKEN || '' }}
-      UK_AQ_MEDIA_NEWS_READ_TOKEN: ${{ secrets.UK_AQ_MEDIA_NEWS_READ_TOKEN || '' }}
-      DASHBOARD_ACCESS_TEAM_DOMAIN: ${{ vars.DASHBOARD_ACCESS_TEAM_DOMAIN || '' }}
-      DASHBOARD_ACCESS_AUD: ${{ vars.DASHBOARD_ACCESS_AUD || '' }}
-      DASHBOARD_ACCOUNTS_ADMIN_EMAILS: ${{ secrets.DASHBOARD_ACCOUNTS_ADMIN_EMAILS || '' }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL || '' }}
       SB_SECRET_KEY: ${{ secrets.SB_SECRET_KEY || '' }}
       OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL || '' }}
@@ -137,16 +133,8 @@ jobs:
             exit 1
           fi
 
-          if [ -z "${DASHBOARD_ACCESS_TEAM_DOMAIN}" ] || [ -z "${DASHBOARD_ACCESS_AUD}" ] || [ -z "${DASHBOARD_ACCOUNTS_ADMIN_EMAILS}" ]; then
-            echo "Accounts routes require DASHBOARD_ACCESS_TEAM_DOMAIN, DASHBOARD_ACCESS_AUD and DASHBOARD_ACCOUNTS_ADMIN_EMAILS."
-            exit 1
-          fi
           if [ -z "${SUPABASE_URL}" ] || [ -z "${SB_SECRET_KEY}" ]; then
             echo "Accounts routes require the IngestDB SUPABASE_URL and SB_SECRET_KEY, including in upstream mode."
-            exit 1
-          fi
-          if [ -n "${UK_AQ_MEDIA_NEWS_READ_TOKEN}" ] && [ "${UK_AQ_MEDIA_NEWS_READ_TOKEN}" = "${UK_AQ_MEDIA_ADMIN_TOKEN}" ]; then
-            echo "The Media News read token must differ from the Media admin token."
             exit 1
           fi
 
@@ -208,10 +196,6 @@ jobs:
             --arg DASHBOARD_UPSTREAM_BEARER_TOKEN "${DASHBOARD_UPSTREAM_BEARER_TOKEN}" \
             --arg UK_AQ_MEDIA_ADMIN_URL "${UK_AQ_MEDIA_ADMIN_URL}" \
             --arg UK_AQ_MEDIA_ADMIN_TOKEN "${UK_AQ_MEDIA_ADMIN_TOKEN}" \
-            --arg DASHBOARD_ACCOUNTS_ADMIN_EMAILS "${DASHBOARD_ACCOUNTS_ADMIN_EMAILS}" \
-            --arg DASHBOARD_ACCESS_AUD "${DASHBOARD_ACCESS_AUD}" \
-            --arg DASHBOARD_ACCESS_TEAM_DOMAIN "${DASHBOARD_ACCESS_TEAM_DOMAIN}" \
-            --arg UK_AQ_MEDIA_NEWS_READ_TOKEN "${UK_AQ_MEDIA_NEWS_READ_TOKEN}" \
             --arg SUPABASE_URL "${SUPABASE_URL}" \
             --arg SB_SECRET_KEY "${SB_SECRET_KEY}" \
             --arg OBS_AQIDB_SUPABASE_URL "${OBS_AQIDB_SUPABASE_URL}" \
@@ -250,10 +234,6 @@ jobs:
               DASHBOARD_UPSTREAM_BEARER_TOKEN: $DASHBOARD_UPSTREAM_BEARER_TOKEN,
               UK_AQ_MEDIA_ADMIN_URL: $UK_AQ_MEDIA_ADMIN_URL,
               UK_AQ_MEDIA_ADMIN_TOKEN: $UK_AQ_MEDIA_ADMIN_TOKEN,
-              DASHBOARD_ACCOUNTS_ADMIN_EMAILS: $DASHBOARD_ACCOUNTS_ADMIN_EMAILS,
-              DASHBOARD_ACCESS_AUD: $DASHBOARD_ACCESS_AUD,
-              DASHBOARD_ACCESS_TEAM_DOMAIN: $DASHBOARD_ACCESS_TEAM_DOMAIN,
-              UK_AQ_MEDIA_NEWS_READ_TOKEN: $UK_AQ_MEDIA_NEWS_READ_TOKEN,
               SUPABASE_URL: $SUPABASE_URL,
               SB_SECRET_KEY: $SB_SECRET_KEY,
               OBS_AQIDB_SUPABASE_URL: $OBS_AQIDB_SUPABASE_URL,
