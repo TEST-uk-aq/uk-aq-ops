@@ -1,3 +1,4 @@
 requests>=2.31.0,<3
 PyMySQL[rsa]>=1.1.1,<2
 PyYAML==6.0.2
+PyJWT[crypto]>=2.15.1,<3
