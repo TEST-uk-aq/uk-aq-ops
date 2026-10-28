@@ -14,6 +14,7 @@ import {
 const MAX_MANIFEST_BYTES = 4 * 1024 * 1024;
 const LOCK_TIMEOUT_MS = 60_000;
 const LOCK_HEARTBEAT_MS = 5_000;
+const SHA256_RE = /^[a-f0-9]{64}$/;
 
 export async function withBootstrapObservationLock(callback, {
   env = process.env,
@@ -54,6 +55,59 @@ export function compareDayMembership(sourceDays, canonicalDays, selectedDays) {
   });
 }
 
+function authenticatedSourceDay(day, dayUtc) {
+  if (!day || day.day_utc !== dayUtc) return false;
+  if (day.state === 'authenticated_membership') {
+    return SHA256_RE.test(day.manifest_hash || '') && typeof day.manifest_key === 'string'
+      && day.manifest_key.length > 0 && Boolean(day.copied_at);
+  }
+  return day.state === 'authenticated_absence' && day.manifest_hash === null
+    && day.manifest_key === null && day.copied_at === null;
+}
+
+export function compareCompleteMonthAuthority(scope, currentMonth) {
+  const sourceEvidence = scope.source_month_evidence;
+  const sourceHash = scope.source_month_hash;
+  const sourceAuthorityEstablished = SHA256_RE.test(sourceHash || '')
+    && sourceEvidence?.processed_source_month_hash === sourceHash
+    && sourceEvidence?.source_month_content_hash === sourceHash
+    && SHA256_RE.test(sourceEvidence?.month_manifest?.sha256 || '')
+    && Boolean(sourceEvidence?.month_manifest?.key)
+    && SHA256_RE.test(sourceEvidence?.month_state_shard?.sha256 || '')
+    && Boolean(sourceEvidence?.month_state_shard?.key);
+  const canonicalHash = currentMonth.manifest?.content_hash || null;
+  const canonicalAuthorityEstablished = Boolean(currentMonth.year?.manifest)
+    && Boolean(currentMonth.year?.reference?.key)
+    && Boolean(currentMonth.manifest)
+    && Boolean(currentMonth.reference?.key)
+    && SHA256_RE.test(canonicalHash || '')
+    && currentMonth.reference.content_hash === canonicalHash;
+  return { mode: 'complete_month', source_content_hash: sourceHash || null,
+    canonical_content_hash: canonicalHash,
+    source_authority_established: sourceAuthorityEstablished,
+    canonical_authority_established: canonicalAuthorityEstablished,
+    matches: sourceAuthorityEstablished && canonicalAuthorityEstablished && sourceHash === canonicalHash,
+    state: sourceAuthorityEstablished && canonicalAuthorityEstablished ? 'established' : 'not_established' };
+}
+
+export function compareAuthenticatedPartialDays(scope, currentMonth) {
+  const sourceDays = scope.source_days || [];
+  const sourceAuthorityEstablished = sourceDays.length === scope.selected_days.length
+    && scope.selected_days.every(dayUtc => authenticatedSourceDay(
+      sourceDays.find(day => day?.day_utc === dayUtc), dayUtc));
+  const canonicalAuthorityEstablished = currentMonth.manifest
+    ? Boolean(currentMonth.reference?.key)
+    : currentMonth.absence_authorized === true;
+  const days = compareDayMembership(new Map(sourceDays.map(day => [day.day_utc, day.manifest_hash])),
+    new Map((currentMonth.manifest?.children || []).map(child => [child.day_utc, child.manifest_hash])),
+    scope.selected_days);
+  return { mode: 'partial_completed_days', days,
+    source_authority_established: sourceAuthorityEstablished,
+    canonical_authority_established: canonicalAuthorityEstablished,
+    matches: sourceAuthorityEstablished && canonicalAuthorityEstablished && days.every(day => day.matches),
+    state: sourceAuthorityEstablished && canonicalAuthorityEstablished ? 'established' : 'not_established' };
+}
+
 export async function readCurrentObservationScopes(scopes, {
   env = process.env,
   signal,
@@ -92,7 +146,7 @@ export async function readCurrentObservationScopes(scopes, {
     if (rootYearCache.has(yearNumber)) return rootYearCache.get(yearNumber);
     const ref = root.children.find(child => child.year === yearNumber) || null;
     if (!ref) {
-      const absent = { reference: null, manifest: null };
+      const absent = { reference: null, manifest: null, absence_authorized: true };
       rootYearCache.set(yearNumber, absent);
       return absent;
     }
@@ -111,13 +165,14 @@ export async function readCurrentObservationScopes(scopes, {
     const yearNumber = Number(yearText);
     const yearResult = await year(yearNumber);
     if (!yearResult.manifest) {
-      const absent = { reference: null, manifest: null, year: yearResult };
+      const absent = { reference: null, manifest: null, year: yearResult,
+        absence_authorized: yearResult.absence_authorized === true };
       yearMonthCache.set(monthUtc, absent);
       return absent;
     }
     const ref = yearResult.manifest.children.find(child => child.month === monthText) || null;
     if (!ref) {
-      const absent = { reference: null, manifest: null, year: yearResult };
+      const absent = { reference: null, manifest: null, year: yearResult, absence_authorized: true };
       yearMonthCache.set(monthUtc, absent);
       return absent;
     }
@@ -137,8 +192,6 @@ export async function readCurrentObservationScopes(scopes, {
     try {
       check(/^\d{4}-(0[1-9]|1[0-2])$/.test(scope.month_utc || ''), 'invalid scoped month');
       const currentMonth = await month(scope.month_utc);
-      const canonicalDays = new Map((currentMonth.manifest?.children || [])
-        .map(child => [child.day_utc, child.manifest_hash]));
       const rootEvidence = {
         root: rootResult.reference,
         year: currentMonth.year.reference,
@@ -147,28 +200,25 @@ export async function readCurrentObservationScopes(scopes, {
         observations_root_content_hash: root.content_hash,
       };
       const currentness = scope.mode === 'complete_month'
-        ? { mode: 'complete_month', source_content_hash: scope.source_month_hash || null,
-            canonical_content_hash: currentMonth.manifest?.content_hash || null,
-            matches: (scope.source_month_hash || null) === (currentMonth.manifest?.content_hash || null) }
-        : { mode: 'partial_completed_days', days: compareDayMembership(
-            new Map(scope.source_days.map(day => [day.day_utc, day.manifest_hash])),
-            canonicalDays, scope.selected_days) };
-      if (currentness.mode === 'partial_completed_days') {
-        check(scope.source_days.length === scope.selected_days.length,
-          `Dropbox selected-day proof is incomplete for ${scope.month_utc}`);
-        currentness.matches = currentness.days.every(day => day.matches);
-      }
+        ? compareCompleteMonthAuthority(scope, currentMonth)
+        : compareAuthenticatedPartialDays(scope, currentMonth);
       const contextResults = [];
-      check((scope.source_context_days || []).length === (scope.context_days || []).length,
-        `Dropbox PM context day proof is incomplete for ${scope.month_utc}`);
       for (const contextDay of scope.context_days || []) {
         try {
           const contextMonth = await month(contextDay.slice(0, 7));
           const contextHash = contextMonth.manifest?.children.find(child => child.day_utc === contextDay)?.manifest_hash || null;
-          const sourceHash = scope.source_context_days?.find(day => day.day_utc === contextDay)?.manifest_hash || null;
+          const sourceDay = scope.source_context_days?.find(day => day?.day_utc === contextDay);
+          const sourceHash = sourceDay?.manifest_hash || null;
+          const sourceAuthorityEstablished = authenticatedSourceDay(sourceDay, contextDay);
+          const canonicalAuthorityEstablished = contextMonth.manifest
+            ? Boolean(contextMonth.reference?.key) : contextMonth.absence_authorized === true;
           contextResults.push({ day_utc: contextDay, source_manifest_hash: sourceHash,
-            canonical_manifest_hash: contextHash, matches: sourceHash === contextHash,
-            proof_state: 'established', root: rootResult.reference,
+            canonical_manifest_hash: contextHash,
+            source_authority_established: sourceAuthorityEstablished,
+            canonical_authority_established: canonicalAuthorityEstablished,
+            matches: sourceAuthorityEstablished && canonicalAuthorityEstablished && sourceHash === contextHash,
+            proof_state: sourceAuthorityEstablished && canonicalAuthorityEstablished ? 'established' : 'not_established',
+            root: rootResult.reference,
             year: contextMonth.year.reference, month: contextMonth.reference });
         } catch (error) {
           assertHeld();
@@ -178,7 +228,7 @@ export async function readCurrentObservationScopes(scopes, {
       }
       results.push({ month_utc: scope.month_utc, currentness,
         context_days: contextResults, matches: currentness.matches && contextResults.every(day => day.matches),
-        canonical_scope: rootEvidence, proof_state: 'established' });
+        canonical_scope: rootEvidence, proof_state: currentness.state });
     } catch (error) {
       // A lost lock is invocation-wide: never downgrade it to one failed month.
       assertHeld();

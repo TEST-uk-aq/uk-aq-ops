@@ -161,13 +161,19 @@ Legacy range mode remains available and is compared as selected-day membership.
 
 Currentness is proved per selected scope. Full calendar months compare the
 authenticated Dropbox processed-month hash with the current canonical R2 month
-hash. Partial months compare each selected day manifest hash or authenticated
-absence. PM2.5/PM10 pairs also compare the preceding full context day; NO2 does
-not depend on PM context. Initial admission authenticates the selected Dropbox
-checkpoint and source ancestry under the shared lock. The final lock callback
-contains only bounded canonical R2 root/year/month reads and scope comparisons.
-Dropbox selected-leaf checks and local rehashing of the original cached source
-bytes happen outside that final lock.
+hash, and both month identities must be established; matching missing months do
+not count as current. Partial months compare each selected day manifest hash or
+authenticated absence, with absence accepted only when both the selected Dropbox
+completion evidence and canonical parent hierarchy authenticate it. PM2.5/PM10
+pairs also compare the preceding full context day; NO2 does not depend on PM
+context. Dropbox checkpoint, source ancestry and selected source proofs are
+prepared from the exact supplied pin before acquiring the initial shared lock.
+The initial and final lock callbacks contain only bounded canonical R2
+root/year/month reads and scope comparisons. Dropbox selected-leaf checks and
+local rehashing of the original cached source bytes happen outside those locks.
+If the canonical state changes while source preparation is underway, the pinned
+source proof is compared under the lock and the scope fails closed; no newer
+Dropbox checkpoint is adopted.
 
 The original checkpoint and root/year ancestry remain pinned as provenance, but
 their mutable global keys need not stay byte-identical. The tool records the

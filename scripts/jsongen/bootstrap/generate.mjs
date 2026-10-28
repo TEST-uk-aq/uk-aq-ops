@@ -207,7 +207,9 @@ export function classifyPeriodCurrentness(sourceScope, canonicalScope, requirePm
     context_required: requirePmContext };
 }
 
-export function scopedSourceStabilityKeys(source, scopeProof, reader, scope, timeseriesIds = [], requirePmContext = true) {
+export function scopedSourceStabilityKeys(source, sourceProof, reader, scope, timeseriesIds = [], requirePmContext = true) {
+  const scopeProof = sourceProof.scopes.find(item => item.month_utc === scope.month_utc);
+  check(scopeProof, `scoped metadata proof missing for ${scope.month_utc}`);
   const networkKeys = new Set();
   const cachedProofKeys = new Set([CHECKPOINT_KEY]);
   if (source.bindingPackRootEvidence?.key) cachedProofKeys.add(source.bindingPackRootEvidence.key);
@@ -231,8 +233,7 @@ export function scopedSourceStabilityKeys(source, scopeProof, reader, scope, tim
   const selectedDays = [...scopeProof.selected_days,
     ...(requirePmContext ? (scopeProof.context_days || []) : [])];
   for (const dayUtc of selectedDays) {
-    const evidence = scopeProof.source_months[dayUtc.slice(0, 7)]
-      || scopeProof.context_month_evidence?.find(item => item.month_utc === dayUtc.slice(0, 7));
+    const evidence = sourceProof.source_months[dayUtc.slice(0, 7)];
     const day = evidence?.selected_days?.find(item => item.day_utc === dayUtc);
     if (!day?.manifest_key) continue; // authenticated absence was pinned in the original parent chain
     const dayBase = day.manifest_key.slice(0, -14);
@@ -359,41 +360,43 @@ export async function runBootstrap(options) {
   }
   try {
     const initialStarted = performance.now();
+    // Authenticate the immutable selected Dropbox generation and prepare all
+    // selected month/day/PM proofs before acquiring the canonical writer lock.
+    const opened = await openBackupSource(reader, options);
+    const sourceProof = await buildCurrentnessScopes(opened, periods, options.pollutants);
     const initial = await withBootstrapObservationLock(async lock => {
-      const opened = await openBackupSource(reader, options);
-      const sourceProof = await buildCurrentnessScopes(opened, periods, options.pollutants);
       const canonical = await readCurrentObservationScopes(sourceProof.scopes, {
         env: process.env, signal: lock.signal, assertHeld: lock.assertHeld,
       });
-      return { source: opened, sourceProof, canonical,
-        scopes: sourceProof.scopes.map((scope, index) => ({ ...scope,
-          canonical: canonical.scopes[index],
-          result: classifyPeriodCurrentness(scope, canonical.scopes[index]),
-        })) };
+      return canonical;
     }, { env: process.env, runId: report.invocation_id, diagnostics: report.operation_lock.initial });
-    source = initial.source;
-    sourceScopeProof = initial.sourceProof;
+    source = opened;
+    sourceScopeProof = sourceProof;
     report.source_checkpoint = source.checkpoint;
-    report.currentness.start = { checked_at_utc: initial.canonical.checked_at_utc,
+    const initialScopes = sourceProof.scopes.map((scope, index) => ({ ...scope,
+      canonical: initial.scopes[index],
+      result: classifyPeriodCurrentness(scope, initial.scopes[index]),
+    }));
+    report.currentness.start = { checked_at_utc: initial.checked_at_utc,
       checkpoint_sha256: source.checkpoint.sha256,
       checkpoint_observations_root_hash: source.checkpoint.processed_observations_root_hash,
-      canonical_root: initial.canonical.root,
-      canonical_root_content_hash: initial.canonical.root_content_hash,
-      r2_manifest_reads: initial.canonical.reads,
-      scopes: initial.scopes.map(scope => ({ month_utc: scope.month_utc, mode: scope.mode,
+      canonical_root: initial.root,
+      canonical_root_content_hash: initial.root_content_hash,
+      r2_manifest_reads: initial.reads,
+      scopes: initialScopes.map(scope => ({ month_utc: scope.month_utc, mode: scope.mode,
         result: scope.result, currentness: scope.canonical.currentness,
         context_days: scope.canonical.context_days, canonical_scope: scope.canonical.canonical_scope })),
     };
-    report.currentness.source_as_of = initial.canonical.checked_at_utc;
-    report.currentness.status = initial.scopes.every(scope => scope.result.matches)
+    report.currentness.source_as_of = initial.checked_at_utc;
+    report.currentness.status = initialScopes.every(scope => scope.result.matches)
       ? 'initial_scopes_match' : 'initial_scoped_mismatch';
-    report.currentness.scope_results = initial.scopes.map(scope => ({ month_utc: scope.month_utc,
+    report.currentness.scope_results = initialScopes.map(scope => ({ month_utc: scope.month_utc,
       mode: scope.mode, start_matches: scope.result.matches }));
-    report.scoped_currentness_r2_reads.count += initial.canonical.reads.length;
-    report.scoped_currentness_r2_reads.bytes += initial.canonical.reads.reduce((sum, read) => sum + read.byte_size, 0);
+    report.scoped_currentness_r2_reads.count += initial.reads.length;
+    report.scoped_currentness_r2_reads.bytes += initial.reads.reduce((sum, read) => sum + read.byte_size, 0);
     report.scoped_currentness_r2_reads.wall_ms += performance.now() - initialStarted;
-    report.canonical_r2_reads += initial.canonical.reads.length;
-    for (const scope of initial.scopes) periodCurrentness.set(scope.month_utc, scope);
+    report.canonical_r2_reads += initial.reads.length;
+    for (const scope of initialScopes) periodCurrentness.set(scope.month_utc, scope);
     if (source.checkpoint.sha256 !== options.checkpointSha256) throw new Error('selected Dropbox checkpoint byte pin mismatch');
     // Preserve exact metadata bytes once, independent of volatile measurements.
     const retainedMetadata = new Set();
@@ -618,9 +621,7 @@ export async function runBootstrap(options) {
       map.get(key).add(candidate);
     };
     for (const staged of stagedCandidates) {
-      const scopeProof = sourceScopeProof.scopes.find(scope => scope.month_utc === staged.month_utc);
-      check(scopeProof, `original selected source proof missing for ${staged.month_utc}`);
-      const proofKeys = scopedSourceStabilityKeys(source, scopeProof, reader, staged,
+      const proofKeys = scopedSourceStabilityKeys(source, sourceScopeProof, reader, staged,
         [staged.timeseries_id], staged.pollutant_code === 'pm25' || staged.pollutant_code === 'pm10');
       const networkKeys = new Set(proofKeys.network_keys);
       const cachedKeys = new Set([...proofKeys.cached_proof_keys, ...proofKeys.network_keys,
