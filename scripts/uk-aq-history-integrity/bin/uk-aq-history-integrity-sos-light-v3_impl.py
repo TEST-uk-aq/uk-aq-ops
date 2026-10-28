@@ -9713,28 +9713,16 @@ def resolve_history_path_config(
     history_version: str,
     env: Mapping[str, str] | None = None,
 ) -> HistoryPathConfig:
-    values = os.environ if env is None else env
     if history_version == CURRENT_INTEGRITY_HISTORY_VERSION:
-        index_prefix = _normalize_history_prefix(
-            values.get("UK_AQ_R2_HISTORY_INDEX_V2_PREFIX"),
-            R2_HISTORY_V2_INDEX_PREFIX,
-        )
-        observations_index_prefix = _normalize_history_prefix(
-            values.get("UK_AQ_R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX"),
-            f"{index_prefix}/observations_timeseries",
-        )
-        timeseries_binding_index_prefix = _normalize_history_prefix(
-            values.get("UK_AQ_R2_HISTORY_V2_TIMESERIES_BINDING_INDEX_PREFIX"),
-            f"{index_prefix}/timeseries_binding",
-        )
+        # Fixed-v3 routing must not inherit retired v2 path overrides from
+        # repository configuration. These constants denote canonical v3 roots,
+        # despite their retained legacy internal variable names.
+        index_prefix = R2_HISTORY_V2_INDEX_PREFIX
         return HistoryPathConfig(
-            history_version="v2",
-            observations_data_prefix=_normalize_history_prefix(
-                values.get("UK_AQ_R2_HISTORY_V2_OBSERVATIONS_PREFIX"),
-                R2_HISTORY_V2_OBSERVATIONS_PREFIX,
-            ),
-            observations_timeseries_index_prefix=observations_index_prefix,
-            timeseries_binding_index_prefix=timeseries_binding_index_prefix,
+            history_version=CURRENT_INTEGRITY_HISTORY_VERSION,
+            observations_data_prefix=R2_HISTORY_V2_OBSERVATIONS_PREFIX,
+            observations_timeseries_index_prefix=R2_HISTORY_V2_OBSERVATIONS_TIMESERIES_INDEX_PREFIX,
+            timeseries_binding_index_prefix=f"{index_prefix}/timeseries_binding",
             observations_latest_index_key=_append_json_name(
                 index_prefix,
                 "observations_timeseries_latest.json",
