@@ -8,10 +8,11 @@ get-identity endpoint. No direct-listener identity header is trusted.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import requests
@@ -39,10 +40,28 @@ class AccountsAccessError(Exception):
         }[status]
 
 
+# Fixed codes only; no configuration contents, assertions or exception text.
+_AccessDiagnostic = Literal[
+    "ACCESS_DEPENDENCY_MISSING", "ACCESS_TUNNEL_CONFIG_MISSING", "ACCESS_TUNNEL_CONFIG_INVALID",
+    "ACCESS_TUNNEL_INGRESS_NOT_UNIQUE", "ACCESS_ASSERTION_INVALID", "ACCESS_IDENTITY_FETCH",
+    "ACCESS_IDENTITY_HTTP_REJECTED", "ACCESS_IDENTITY_RESPONSE_INVALID",
+]
+
+
+def _access_error(diagnostic: _AccessDiagnostic, status: int = HTTPStatus.SERVICE_UNAVAILABLE,
+                  upstream_status: int | None = None) -> AccountsAccessError:
+    event = {"event": "accounts_access_failed", "code": diagnostic}
+    if type(upstream_status) is int and 100 <= upstream_status <= 599:
+        event["upstream_status"] = upstream_status
+    logging.getLogger(__name__).warning(json.dumps(event, separators=(",", ":")))
+    message = "Accounts access is not configured" if status == HTTPStatus.SERVICE_UNAVAILABLE else "Accounts authentication required"
+    return AccountsAccessError(status, message)
+
+
 def _protected_hostname(handler: Any) -> str:
     """Find the unique installed Tunnel ingress for this listener's port."""
     if yaml is None:
-        raise AccountsAccessError(HTTPStatus.SERVICE_UNAVAILABLE, "Accounts access is not configured")
+        raise _access_error("ACCESS_DEPENDENCY_MISSING")
     config_path = Path.home() / ".cloudflared" / "config.yml"
     try:
         if config_path.stat().st_size > _MAX_CONFIG_BYTES:
@@ -60,7 +79,7 @@ def _protected_hostname(handler: Any) -> str:
             if not isinstance(service, str):
                 continue
             parsed = urlparse(service)
-            if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "::1"} or \
+            if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "::1", "localhost"} or \
                     parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment:
                 continue
             if parsed.port != port:
@@ -71,36 +90,41 @@ def _protected_hostname(handler: Any) -> str:
                 raise ValueError("Invalid protected hostname")
             hostnames.append(hostname)
         if len(hostnames) != 1:
-            raise ValueError("No unique protected Tunnel ingress")
+            raise _access_error("ACCESS_TUNNEL_INGRESS_NOT_UNIQUE")
         return hostnames[0]
+    except FileNotFoundError:
+        raise _access_error("ACCESS_TUNNEL_CONFIG_MISSING") from None
     except (OSError, UnicodeError, ValueError, TypeError, KeyError, yaml.YAMLError):
-        raise AccountsAccessError(HTTPStatus.SERVICE_UNAVAILABLE, "Accounts access is not configured") from None
+        raise _access_error("ACCESS_TUNNEL_CONFIG_INVALID") from None
 
 
 def authorize_accounts_request(handler: Any) -> None:
     hostname = _protected_hostname(handler)
     assertions = handler.headers.get_all("Cf-Access-Jwt-Assertion", [])
     if len(assertions) != 1:
-        raise AccountsAccessError(HTTPStatus.UNAUTHORIZED, "Accounts authentication required")
+        raise _access_error("ACCESS_ASSERTION_INVALID", HTTPStatus.UNAUTHORIZED)
     assertion = assertions[0].strip()
     if not 1 <= len(assertion) <= 16 * 1024 or assertion.count(".") != 2 or \
             any(char.isspace() for char in assertion):
-        raise AccountsAccessError(HTTPStatus.UNAUTHORIZED, "Accounts authentication required")
+        raise _access_error("ACCESS_ASSERTION_INVALID", HTTPStatus.UNAUTHORIZED)
 
     # Use only the configured Tunnel hostname. Access checks this application
     # token and its policy before answering the identity endpoint. A missing
     # Access application, bad token or network failure denies the local read.
     session = requests.Session()
     session.trust_env = False
+    diagnostic: _AccessDiagnostic = "ACCESS_IDENTITY_FETCH"
     try:
         with session.get(
             "https://" + hostname + "/cdn-cgi/access/get-identity",
             headers={"Cookie": "CF_Authorization=" + assertion, "Accept": "application/json"},
             timeout=(3.05, 10), allow_redirects=False, stream=True,
         ) as response:
-            if response.status_code != HTTPStatus.OK or \
-                    "application/json" not in response.headers.get("Content-Type", "").lower():
-                raise AccountsAccessError(HTTPStatus.UNAUTHORIZED, "Accounts authentication required")
+            if response.status_code != HTTPStatus.OK:
+                raise _access_error("ACCESS_IDENTITY_HTTP_REJECTED", HTTPStatus.UNAUTHORIZED, response.status_code)
+            diagnostic = "ACCESS_IDENTITY_RESPONSE_INVALID"
+            if "application/json" not in response.headers.get("Content-Type", "").lower():
+                raise ValueError("Invalid identity response")
             raw = bytearray()
             for chunk in response.iter_content(8192):
                 raw.extend(chunk)
@@ -117,6 +141,6 @@ def authorize_accounts_request(handler: Any) -> None:
     except AccountsAccessError:
         raise
     except (requests.RequestException, ValueError, TypeError, UnicodeError):
-        raise AccountsAccessError(HTTPStatus.UNAUTHORIZED, "Accounts authentication required") from None
+        raise _access_error(diagnostic, HTTPStatus.UNAUTHORIZED) from None
     finally:
         session.close()
