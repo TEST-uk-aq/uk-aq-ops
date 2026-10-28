@@ -6,7 +6,8 @@ workers_dev = false
 preview_urls = false
 
 [observability]
-# Email searches are sensitive even when invocation logging is enabled externally.
+# Redact subscriber search parameters from logged request URLs.
+enabled = true
 redact_query_string = true
 
 [vars]
