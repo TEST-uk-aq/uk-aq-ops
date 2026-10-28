@@ -1,3 +1,4 @@
+import { AccountsSourceError, accountsReadStage, logAccountsFailure, readAccountsJson } from '../lib/accounts_diagnostics';
 import { AccountsError, authorizeAccountsRequest } from '../lib/accounts_auth';
 import type { AccountsAccessContext } from '../lib/accounts_auth';
 import { readAccountsSubscriptions } from '../lib/direct';
@@ -116,6 +117,7 @@ async function subscriptions(url: URL, env: WorkerEnv): Promise<Response> {
       throw new Error();
     }
   } catch {
+    logAccountsFailure('SUPABASE_CONFIGURATION');
     throw new AccountsError('ACCOUNTS_SOURCE_NOT_CONFIGURED', 'Accounts IngestDB environment configuration is missing or invalid', 503);
   }
   const query = url.searchParams;
@@ -152,26 +154,6 @@ async function subscriptions(url: URL, env: WorkerEnv): Promise<Response> {
     pagination: pagination(result.pagination, paging) });
 }
 
-async function readBoundedJson(response: Response): Promise<unknown> {
-  if (!response.body) throw new Error('Missing response');
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let bytes = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      bytes += value.byteLength;
-      if (bytes > 512 * 1024) { await reader.cancel(); throw new Error('Response too large'); }
-      chunks.push(value);
-    }
-  } finally { reader.releaseLock(); }
-  const data = new Uint8Array(bytes);
-  let offset = 0;
-  for (const chunk of chunks) { data.set(chunk, offset); offset += chunk.length; }
-  return JSON.parse(new TextDecoder().decode(data));
-}
-
 async function delivery(url: URL, env: WorkerEnv): Promise<Response> {
   const query = url.searchParams;
   validateKeys(query, ['subscription_id', 'limit', 'offset', 'days']);
@@ -187,19 +169,23 @@ async function delivery(url: URL, env: WorkerEnv): Promise<Response> {
         base.search || base.hash || !token || token.length > 4096) throw new Error();
     target = new URL('/admin/news-email/delivery', base);
   } catch {
+    logAccountsFailure('MEDIA_ADMIN_CONFIGURATION');
     throw new AccountsError('EMAIL_DELIVERY_UNAVAILABLE', 'Email Delivery read access is not configured', 503);
   }
   target.searchParams.set('limit', String(paging.limit));
   target.searchParams.set('offset', String(paging.offset));
   target.searchParams.set('days', String(days));
   if (subscription) target.searchParams.set('subscription_id', subscription.toLowerCase());
-  const response = await fetch(target, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-    redirect: 'error', cache: 'no-store', signal: AbortSignal.timeout(15000) });
+  const request = await accountsReadStage('MEDIA_ADMIN_REQUEST_CONSTRUCTION', () => new Request(target, {
+    method: 'GET', headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    redirect: 'manual', cache: 'no-store', signal: AbortSignal.timeout(15000),
+  }));
+  const response = await accountsReadStage('MEDIA_ADMIN_FETCH', () => fetch(request));
   if (!response.ok) {
-    await response.body?.cancel();
-    throw new AccountsError('EMAIL_DELIVERY_UNAVAILABLE', 'Authoritative Email Delivery reads are unavailable', 503);
+    await response.body?.cancel().catch(() => undefined);
+    throw new AccountsSourceError('MEDIA_ADMIN_HTTP_REJECTED', response.status);
   }
-  const result = object(await readBoundedJson(response));
+  const result = object(await readAccountsJson(response, 'MEDIA_ADMIN'));
   if (result.available !== true || result.window_days !== days || !Array.isArray(result.summary) || result.summary.length > 24) {
     throw new Error('Invalid delivery read');
   }
@@ -235,10 +221,21 @@ export async function handleAccountsRoute(request: Request, env: WorkerEnv, ctx:
     const url = new URL(request.url);
     validateRequestQuery(url);
     if (request.body) badQuery();
-    if (url.pathname === '/api/accounts/email-delivery') return await delivery(url, env);
+    if (url.pathname === '/api/accounts/email-delivery') {
+      return await delivery(url, env).catch(error => {
+        if (error instanceof AccountsError || error instanceof AccountsSourceError) throw error;
+        throw new AccountsSourceError('MEDIA_ADMIN_RESPONSE_VALIDATION');
+      });
+    }
     return await subscriptions(url, env);
   } catch (error) {
     if (error instanceof AccountsError) return reply({ error: { code: error.code, message: error.message } }, error.status);
+    const diagnostic = error instanceof AccountsSourceError ? error.diagnostic : 'SUPABASE_RESPONSE_VALIDATION';
+    logAccountsFailure(diagnostic, error instanceof AccountsSourceError ? error.upstreamStatus : undefined);
+    if (diagnostic.startsWith('MEDIA_ADMIN_')) {
+      return reply({ error: { code: 'EMAIL_DELIVERY_UNAVAILABLE',
+        message: 'Authoritative Email Delivery reads are unavailable' } }, 503);
+    }
     // Do not return/log upstream error text, raw request URLs, email searches or identity claims.
     return reply({ error: { code: 'ACCOUNTS_SOURCE_UNAVAILABLE',
       message: 'Accounts source unavailable; verify its environment configuration and required migrations' } }, 502);

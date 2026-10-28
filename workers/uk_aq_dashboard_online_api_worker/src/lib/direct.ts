@@ -1,3 +1,4 @@
+import { AccountsSourceError, accountsReadStage, readAccountsJson } from "./accounts_diagnostics";
 import { assertHistoryPayload, historyResolution, type HistoryResolution } from "./history_generation";
 import { buildJsonResponse, errorEnvelope } from "./http";
 import type { WorkerEnv } from "./upstream";
@@ -412,18 +413,26 @@ async function fetchJsonObject(
 // Reuse the IngestDB PostgREST connection, never the ObsAQIDB Daily Tasks adapter.
 // The RPC owns validation/projection/grants; its body is not a URL or telemetry label.
 export async function readAccountsSubscriptions(env: WorkerEnv, query: Record<string, unknown>): Promise<JsonObject> {
-  const base = new URL(String(env.SUPABASE_URL || '').trim());
-  if (base.protocol !== 'https:' || base.username || base.password || base.port || base.pathname !== '/' ||
-      base.search || base.hash || !/^[a-z_][a-z0-9_]*$/.test(defaultPublicSchema(env))) {
-    throw new Error('Invalid IngestDB configuration');
+  const request = await accountsReadStage('SUPABASE_REQUEST_CONSTRUCTION', () => {
+    const headers = postgrestHeaders(requireServiceKey(env), defaultPublicSchema(env), true);
+    headers.set('Content-Type', 'application/json');
+    headers.set('Accept', 'application/json');
+    return new Request(`${ingestRestBase(env)}/rpc/uk_aq_news_subscriptions_admin_read`, {
+      method: 'POST', headers, body: JSON.stringify({ p_query: query }), cache: 'no-store',
+      // Workers supports manual/follow, not redirect: 'error'. Never follow a redirect with credentials.
+      redirect: 'manual', signal: AbortSignal.timeout(15000),
+    });
+  });
+  const response = await accountsReadStage('SUPABASE_FETCH', () => fetch(request));
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new AccountsSourceError('SUPABASE_HTTP_REJECTED', response.status);
   }
-  const headers = postgrestHeaders(requireServiceKey(env), defaultPublicSchema(env), true);
-  headers.set('Content-Type', 'application/json');
-  headers.set('Accept', 'application/json');
-  return fetchJsonObject(`${ingestRestBase(env)}/rpc/uk_aq_news_subscriptions_admin_read`, {
-    method: 'POST', headers, body: JSON.stringify({ p_query: query }), cache: 'no-store',
-    redirect: 'error', signal: AbortSignal.timeout(15000),
-  }, 'Accounts read unavailable', undefined, 512 * 1024);
+  const result = await readAccountsJson(response, 'SUPABASE');
+  if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    throw new AccountsSourceError('SUPABASE_RESPONSE_VALIDATION');
+  }
+  return result as JsonObject;
 }
 
 async function fetchJsonArray(
