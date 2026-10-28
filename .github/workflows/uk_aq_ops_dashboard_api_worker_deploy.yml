@@ -133,6 +133,11 @@ jobs:
             exit 1
           fi
 
+          if [ -z "${SUPABASE_URL}" ] || [ -z "${SB_SECRET_KEY}" ]; then
+            echo "Accounts routes require the IngestDB SUPABASE_URL and SB_SECRET_KEY, including in upstream mode."
+            exit 1
+          fi
+
           binding_enabled="$(printf '%s' "${UK_AQ_R2_METRICS_SERVICE_BINDING_ENABLED}" | tr '[:upper:]' '[:lower:]')"
           case "${binding_enabled}" in
             true|false) ;;

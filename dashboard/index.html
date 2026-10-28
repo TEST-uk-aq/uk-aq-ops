@@ -6,6 +6,7 @@
     <title>UK AQ Dashboard</title>
     <link rel="icon" type="image/png" href="assets/favicon.png" />
     <link rel="stylesheet" href="assets/media.css" />
+    <link rel="stylesheet" href="assets/accounts.css" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -1810,6 +1811,16 @@
           >
             Media
           </button>
+          <button
+            id="mode-accounts"
+            class="mode-switch-btn"
+            type="button"
+            data-mode="accounts"
+            role="tab"
+            aria-selected="false"
+          >
+            Accounts &amp; Subscriptions
+          </button>
         </div>
       </header>
 
@@ -1843,10 +1854,20 @@
       >
         Media
       </button>
+      <button
+        id="mode-accounts-bottom"
+        type="button"
+        class="dashboard-page-switcher__button"
+        data-mode="accounts"
+        aria-selected="false"
+      >
+        Accounts &amp; Subscriptions
+      </button>
     </nav>
 
     <script src="assets/config.js"></script>
     <script src="assets/media.js"></script>
+    <script src="assets/accounts.js"></script>
     <script>
       const DEFAULT_CONFIG = {
         envName: "local",
@@ -1915,9 +1936,11 @@
       const modeIngestBtn = document.getElementById("mode-ingest");
       const modeOperationsBtn = document.getElementById("mode-operations");
       const modeMediaBtn = document.getElementById("mode-media");
+      const modeAccountsBtn = document.getElementById("mode-accounts");
       const modeIngestBottomBtn = document.getElementById("mode-ingest-bottom");
       const modeOperationsBottomBtn = document.getElementById("mode-operations-bottom");
       const modeMediaBottomBtn = document.getElementById("mode-media-bottom");
+      const modeAccountsBottomBtn = document.getElementById("mode-accounts-bottom");
       const DASHBOARD_REFRESH_INGEST_STORAGE_KEY = "uk_aq_dashboard_refresh_ingest_seconds";
       const DASHBOARD_REFRESH_OPERATIONS_STORAGE_KEY = "uk_aq_dashboard_refresh_operations_seconds";
       const DAILY_TASK_RUNS_MODE_STORAGE_KEY = "ukAqDashboard.operations.dailyTaskRuns.mode";
@@ -1929,11 +1952,12 @@
         "finished_failed",
         "duration",
       ]);
-      const DASHBOARD_MODES = new Set(["ingest", "operations", "media"]);
+      const DASHBOARD_MODES = new Set(["ingest", "operations", "media", "accounts"]);
       const DASHBOARD_MODE_PATHS = Object.freeze({
         ingest: "/ingest",
         operations: "/ops",
         media: "/media",
+        accounts: "/accounts",
       });
       const DASHBOARD_PATH_MODES = new Map(
         Object.entries(DASHBOARD_MODE_PATHS).map(([mode, path]) => [path, mode])
@@ -1989,16 +2013,19 @@
         ingest: null,
         operations: null,
         media: null,
+        accounts: null,
       };
       const modeIsLoading = {
         ingest: false,
         operations: false,
         media: false,
+        accounts: false,
       };
       const modeLastLoadedAtMs = {
         ingest: 0,
         operations: 0,
         media: 0,
+        accounts: 0,
       };
       const MIN_OPERATIONS_AUTO_REFRESH_SECONDS = 3600;
       const refreshSecondsByMode = {
@@ -2971,7 +2998,8 @@
 
       function startRefreshTimer() {
         clearRefreshTimer();
-        if (!isPageActive()) {
+        // Private subscriber data is refreshed explicitly within its own page.
+        if (activeMode === "accounts" || !isPageActive()) {
           return;
         }
         const refreshSeconds = getActiveRefreshSeconds();
@@ -6572,6 +6600,11 @@
           modeMediaBtn.classList.toggle("is-active", isActive);
           modeMediaBtn.setAttribute("aria-selected", isActive ? "true" : "false");
         }
+        if (modeAccountsBtn) {
+          const isActive = activeMode === "accounts";
+          modeAccountsBtn.classList.toggle("is-active", isActive);
+          modeAccountsBtn.setAttribute("aria-selected", isActive ? "true" : "false");
+        }
         if (modeIngestBottomBtn) {
           const isActive = activeMode === "ingest";
           modeIngestBottomBtn.classList.toggle("is-active", isActive);
@@ -6586,6 +6619,11 @@
           const isActive = activeMode === "media";
           modeMediaBottomBtn.classList.toggle("is-active", isActive);
           modeMediaBottomBtn.setAttribute("aria-selected", isActive ? "true" : "false");
+        }
+        if (modeAccountsBottomBtn) {
+          const isActive = activeMode === "accounts";
+          modeAccountsBottomBtn.classList.toggle("is-active", isActive);
+          modeAccountsBottomBtn.setAttribute("aria-selected", isActive ? "true" : "false");
         }
       }
 
@@ -6696,6 +6734,14 @@
         applyModeSwitchUi();
         showModeContainer(activeMode);
         clearOperationsDropboxPollTimer();
+        if (activeMode === "accounts") {
+          const accountsContainer = getModeContainer("accounts");
+          if (accountsContainer && window.UKAQAccountsDashboard) {
+            // Accounts always uses same-origin /api/accounts, independent of API_BASE_URL.
+            window.UKAQAccountsDashboard.mount(accountsContainer);
+          }
+          return;
+        }
         if (activeMode === "media") {
           const mediaContainer = getModeContainer("media");
           if (mediaContainer && window.UKAQMediaDashboard) {
@@ -6829,6 +6875,9 @@
         if (activeMode === mode) {
           return;
         }
+        if (activeMode === "accounts" && window.UKAQAccountsDashboard) {
+          window.UKAQAccountsDashboard.unmount();
+        }
         activeMode = mode;
         startRefreshTimer();
         void loadCurrentMode({ forceRefresh: false, modeSwitch: true });
@@ -6850,6 +6899,9 @@
       if (modeMediaBtn) {
         modeMediaBtn.addEventListener("click", () => activateMode("media"));
       }
+      if (modeAccountsBtn) {
+        modeAccountsBtn.addEventListener("click", () => activateMode("accounts"));
+      }
       if (modeIngestBottomBtn) {
         modeIngestBottomBtn.addEventListener("click", () => activateMode("ingest"));
       }
@@ -6860,9 +6912,13 @@
         modeMediaBottomBtn.addEventListener("click", () => activateMode("media"));
       }
 
+      if (modeAccountsBottomBtn) {
+        modeAccountsBottomBtn.addEventListener("click", () => activateMode("accounts"));
+      }
+
       applyModeSwitchUi();
       startRefreshTimer();
-      if (isPageActive()) {
+      if (isPageActive() || activeMode === "accounts") {
         void loadCurrentMode({ forceRefresh: false });
       }
     </script>

@@ -1,3 +1,5 @@
 /ingest/ /ingest 301
 /ops/ /ops 301
 /media/ /media 301
+/accounts/ /accounts 301
+/accounts /index.html 200
