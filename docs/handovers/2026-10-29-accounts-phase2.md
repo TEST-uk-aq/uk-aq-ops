@@ -8,9 +8,9 @@ Authority: latest TEST system-docs Accounts dashboard contract section 8, Media 
 
 | Repository | Implementation |
 | --- | --- |
-| `uk-aq-schema` | Canonical private News schema; forward migration `20261029_001_ingest_news_subscriber_administration.sql`; permanent `blocked` status/metadata; service-only bounded admin mutation RPC; UUID/time deletion table; final recipient eligibility action. Applied migrations remain unchanged. |
-| `uk-aq-media` | `/operations/block` replaces `/operations/suppress`; typed subscription status; fresh eligibility before direct SMTP envelope and DATA; optional Pro rechecks eligibility after its own connection/auth delay and before DATA. Existing D1 history and message identities remain intact. |
-| `uk-aq-ops` | Shared subscription-detail controls; protected hosted/local mutation routes; blocked list/filter/count/projection; explicit confirmation, bounded bodies, stale-detail revision rejection, same-origin protection and no-store receipts. |
+| `uk-aq-schema` | Canonical private News schema; forward migrations `20261029_001_ingest_news_subscriber_administration.sql` and `20261029_002_ingest_news_email_retention.sql`; permanent `blocked` status/metadata; service-only bounded admin mutation RPC; UUID/time deletion table; final recipient eligibility action. Applied migrations remain unchanged. |
+| `uk-aq-media` | `/operations/block` replaces `/operations/suppress`; typed subscription status; fresh eligibility before direct SMTP envelope and DATA; optional Pro rechecks eligibility after its own connection/auth delay and before DATA. Existing D1 history and message identities remain intact at subscriber Delete; separate bounded retention removes eligible terminal history after thirty days. |
+| `uk-aq-ops` | Shared subscription-detail controls; protected hosted/local mutation routes; blocked list/filter/count/projection, plus Not retained labels for minimised inactive preference/consent fields; explicit confirmation, bounded bodies, stale-detail revision rejection, same-origin protection and no-store receipts. |
 | `TEST-uk-aq.github.io` | Inspected public `news/subscription.js` and subscription pages. They consume preference/ok responses, not permanent lifecycle status or block metadata. No change or PR is necessary. Existing neutral anti-enumeration responses remain. |
 
 Source archives are under each changed repository's `archive/2026-10-29/`, preserving source-relative paths. They are reference only, must stay in TEST and must not be promoted or executed. Imported Media snapshot newline artefacts were corrected against the real Git source before final validation.
@@ -37,9 +37,9 @@ Supabase and D1 have no shared transaction. The last eligibility check precedes 
 
 Review corrections preserve recovery across deletion/cancellation: a lost Pro cancellation receipt can retire unknown work without retrying, advancing the cursor or keeping a stale Daily window held; confirmation outcomes can reconcile authoritative historical evidence after token deletion only against the matching minimal tombstone. Neither path recreates private records or broadens manually entered SMTP evidence.
 
-## Outstanding deployment decisions
+## Deployment prerequisites and approved retention
 
-1. Agree and record the minimal tombstone retention/erasure period and linked historical D1 retention policy before enabling deletion. UUID-only history is pseudonymous, not assumed anonymous. No legal duration or automatic purge has been invented.
+1. Retention is resolved: thirty rolling UTC days under the updated Media section 26. The new restricted Schema RPC and Media scheduler/Queue implement expiry and minimisation; active identity, enforcing opt-out/block records, valid credentials and specific visible unresolved dependencies remain protected. UUID-only history is pseudonymous, not assumed anonymous.
 2. Review the final coordinated release and existing pending migrations/workflows. Main-path merges can automatically deploy Media email and Ops Pages; merging is therefore part of the separately authorised operational window, not an innocuous preparatory step.
 3. If the optional Pro transport is used, provision its existing TEST IngestDB URL/key through the ignored runtime environment and update/restart the sender during the pause. Its checked-in template has blank environment-specific URLs. No new persistent secret or variable name is introduced; existing GitHub secret target mappings remain unchanged.
 
@@ -47,15 +47,21 @@ Review corrections preserve recovery across deletion/cancellation: a lost Pro ca
 
 The order below is a future operator runbook, not permission granted or actions taken by this task. Use TEST settings only, and keep both public lifecycle requests and administrative APIs unavailable during the incompatible status cutover.
 
-1. Review all three PRs together and record retention agreement. Arrange a maintenance window. Disable News submissions and pause Queue/scheduler processing through the existing `NEWS_EMAIL_ENABLED` operational mechanism; stop the optional Pro sender. Wait for already-running invocations/SMTP attempts to settle and reconcile accepted/unknown outcomes through the existing procedure. Do not assume changing a variable cancels an invocation already running with old settings. Prevent old hosted/local/public lifecycle consumers from running against the new schema.
+1. Review all three PRs together, including the approved retention implementation. Arrange a maintenance window. Disable News submissions using `NEWS_EMAIL_ENABLED=false` AND explicitly pause the existing Queue/scheduler processing (retention now continues independently of the send switch); stop the optional Pro sender. Wait for already-running invocations/SMTP attempts to settle and reconcile accepted/unknown outcomes through the existing procedure. Do not assume changing a variable cancels an invocation already running with old settings. Prevent old hosted/local/public lifecycle consumers from running against the new schema.
 2. Merge the Schema PR (no application deployment). Apply only the new forward transition to the already-current TEST IngestDB, with the prior read capability migration present:
 
    ```sh
    psql "$TEST_INGEST_DATABASE_URL" -X --set ON_ERROR_STOP=1 --file schemas/migrations/20261029_001_ingest_news_subscriber_administration.sql
    ```
 
-   It executes as one transaction, takes a bounded table lock, changes old status values, renames the permanent metadata without rewriting timestamps/reasons/consent, and replaces all affected functions. A failed transaction rolls back fully. Use the existing PostgREST schema-cache reload procedure if required; never expose `uk_aq_news` or add broad grants. A clean install follows `schemas/CANONICAL_APPLY_ORDER.md`, not historical migrations.
-3. Merge Media only when its automatic TEST email deployment is explicitly authorised. Review existing pending D1 migrations first; this phase adds none and deletes no D1 history. Keep the rendered `NEWS_EMAIL_ENABLED=false` throughout deployment. If a manual run is needed, use the existing workflow:
+   Apply the new retention migration immediately afterwards, before any consumer resumes:
+
+   ```sh
+   psql "$TEST_INGEST_DATABASE_URL" -X --set ON_ERROR_STOP=1 --file schemas/migrations/20261029_002_ingest_news_email_retention.sql
+   ```
+
+   Each migration executes as one transaction. The first takes a bounded table lock, changes old status values, renames the permanent metadata without rewriting timestamps/reasons/consent, and replaces all affected functions. A failed transaction rolls back fully. Use the existing PostgREST schema-cache reload procedure if required; never expose `uk_aq_news` or add broad grants. A clean install follows `schemas/CANONICAL_APPLY_ORDER.md`, not historical migrations.
+3. Merge Media only when its automatic TEST email deployment is explicitly authorised. Review existing pending D1 migrations first; this extension adds `0055_news_email_retention.sql` and preserves editorial/shared data. Apply its additive D1 schema/indexes/triggers before starting the new Worker; only unattended eligible News-specific cleanup later deletes history. Keep the rendered `NEWS_EMAIL_ENABLED=false` throughout deployment. If a manual run is needed, use the existing workflow:
 
    ```sh
    gh workflow run uk_aq_media_email_deploy.yml --repo TEST-uk-aq/uk-aq-media --ref main
@@ -83,8 +89,19 @@ The order below is a future operator runbook, not permission granted or actions 
 
 ## Structural validation and rollback
 
-Validation performed before review: full Media `npm run typecheck`; dashboard Worker `tsc --noEmit`; `node --check` on shared Accounts UI and public subscription script; Python compile of both changed backends; PostgreSQL SQL and all PL/pgSQL function parsing; exact canonical/forward-definition comparison; scoped diff, archive and historical migration hygiene. No functional suite or subscriber data operation was run. Final structural checks passed: 26 canonical SQL statements and 22 migration statements, each with three parsed PL/pgSQL functions; all shared definitions match; nine reconciliation SQL statements compile against existing D1 constraints using EXPLAIN only; all 14 pre-change snapshots match their exact base Git sources. Independent review and follow-up found no remaining critical/important issues. PR links and commit IDs are recorded with delivery.
+Validation performed before review: full Media `npm run typecheck`; dashboard Worker `tsc --noEmit`; `node --check` on shared Accounts UI and public subscription script; Python compile of both changed backends; PostgreSQL SQL and all PL/pgSQL function parsing; exact canonical/forward-definition comparison; scoped diff, archive and historical migration hygiene. No functional suite or subscriber data operation was run. The retention extension additionally receives SQL/PLpgSQL parsing and canonical/forward consistency checks, D1 migration/statement compilation, TypeScript/Python/JavaScript checks, configuration parsing and unchanged-archive/historical-migration verification. Final counts/results and commit IDs are recorded with delivery. Independent review findings concerning fences, cleanup throughput, send pauses, minimum holds and Pro replay were corrected and re-reviewed.
 
 Before SQL commit, transaction failure leaves the old schema intact. After cutover, keep processing paused if a component fails and fix forward. Never roll back just one consumer to suppressed semantics against the blocked schema. A deliberate coordinated reverse migration would need to map blocked back to suppressed and rename metadata while preserving state; it is not supplied or authorised here. Deleted subscriber/token data cannot be restored from the tombstone; use the existing approved recovery/privacy process, never resurrect recipients automatically or erase D1 history to make rollback easier.
 
 Chat-mode documentation handover: after actual coordinated TEST acceptance, update current-runtime Accounts sections 1–7 and Media lifecycle sections to blocked/actions and record observed evidence. Keep section 26's future/current distinction accurate until then. No new contract correction is required by this implementation; the action DTO, eligibility snapshot and rollback/deployment details above are implementation notes, not a second source of behavioural authority.
+
+
+## Approved thirty-day retention extension
+
+The old unresolved-retention deployment blocker is removed. [Media retention implementation and TEST release notes](https://github.com/TEST-uk-aq/uk-aq-media/blob/codex/accounts-subscriptions-phase2/docs/news-email-retention.md) document the precise storage rules, indexed bounded cleanup phases, singleton lease, short D1 fences, minimal visible safety holds, dependency/FK ordering, non-recipient approval guard, Pro receipt protocol and failure recovery.
+
+The existing five-minute scheduler requests a retention message on the existing email Queue, including while sends are disabled. Supabase phases process five indexed keyset candidates; terminal D1 history processes up to100 roots atomically. Queue continuations drain known backlog without blocking behind held rows. No new credentials, cron or environment setting is required. The same complete application files run after future authorised TEST/LIVE promotion. Ops adds no retention control or audit page; it labels cleared inactive preferences/consent as Not retained, and private mode filters exclude those placeholders.
+
+Operational visibility uses the existing operator-secret-protected `GET /operations/retention`: last-run/success/error metadata, per-batch eligible/deleted/held/minimised/initialised counts, and a bounded opaque hold list. Pro's existing-secret-protected `POST /retention/status` reports its idle-loop receipt cleanup. No private addresses, tokens or request bodies enter these status responses/logs. Legacy rows without reliable completion timestamps receive a one-time, documented conservative observation window; new completion clocks do not reset merely because cleanup reads them.
+
+Extend the real TEST acceptance above with: terminal history/pending identity/tombstone crossing thirty days; active/blocked/opt-out enforcement retained; invalid-token cleanup without breaking valid credentials; inactive metadata minimised and labelled accurately; unknown/held work visibly retained; specific confirmation holds released on resolution; backlog capacity/continuations; interruption/authority-outage recovery; retention while sends are disabled; Pro stale-request/receipt pruning and deliberate safe retry; and no duplicate submission, unsafe cursor advancement or public/admin authentication regression. These operations require separate authorised deployment and are not performed by this task.
