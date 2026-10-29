@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const STATUSES = ["pending", "active", "unsubscribed", "suppressed"];
+  const STATUSES = ["pending", "active", "unsubscribed", "blocked"];
   const SORTS = [["created_at", "Created"], ["updated_at", "Updated"], ["email", "Email"], ["status", "Status"]];
   const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const MAX_OFFSET = 10000;
@@ -33,7 +33,7 @@
 
   function badge(value) {
     const tone = ["active", "accepted"].includes(value) ? "good"
-      : ["suppressed", "permanent_failure", "failed"].includes(value) ? "bad"
+      : ["blocked", "permanent_failure", "failed"].includes(value) ? "bad"
         : ["pending", "queued", "temporary_failure", "held", "unknown"].includes(value) ? "waiting" : "neutral";
     return `<span class="accounts-pill accounts-pill--${tone}">${esc(label(value))}</span>`;
   }
@@ -56,7 +56,8 @@
   function errorText(status) {
     if (status === 401) return "Administrative sign-in is required. Sign in and refresh this page.";
     if (status === 403) return "Your identity is not authorised to view this private data.";
-    if (status === 503) return "This read-only service is unavailable or has not been configured.";
+    if (status === 503) return "This private service is unavailable or has not been configured.";
+    if (status === 409) return "The subscription changed or this action is unavailable. Refresh its details before trying again.";
     if (status === 400) return "These search or pagination options could not be accepted. Adjust the filters and try again.";
     return "The private data could not be loaded. Try refreshing this section.";
   }
@@ -82,14 +83,17 @@
     return state === session && !controller.signal.aborted && session.requests.get(key) === controller;
   }
 
-  async function request(path, params, controller) {
+  async function request(path, params, controller, mutation = null) {
     // Subscriber queries must never use the public/configurable API base, storage or URL history.
     const query = params ? `?${params.toString()}` : "";
     const response = await fetch(`/api/accounts/${path}${query}`, {
-      method: "GET", credentials: "same-origin", cache: "no-store", redirect: "error",
-      headers: { Accept: "application/json" }, signal: controller.signal,
+      method: mutation ? "POST" : "GET", credentials: "same-origin", cache: "no-store", redirect: "error",
+      headers: { Accept: "application/json", ...(mutation ? {
+        "Content-Type": "application/json", "X-UKAQ-Accounts-Action": "1",
+      } : {}) }, signal: controller.signal,
+      ...(mutation ? { body: JSON.stringify(mutation) } : {}),
     });
-    if (response.status === 404 && /^subscriptions\/[0-9a-f-]{36}$/i.test(path)) {
+    if (!mutation && response.status === 404 && /^subscriptions\/[0-9a-f-]{36}$/i.test(path)) {
       return { subscription: null };
     }
     if (!response.ok) {
@@ -115,7 +119,7 @@
   }
 
   function renderShell(session) {
-    session.root.innerHTML = `<div class="accounts-dashboard"><section class="accounts-header"><h2>Accounts &amp; Subscriptions</h2><p>Read-only administration for AQ in the News subscriptions and email operations.</p><nav class="accounts-mini-nav" aria-label="Accounts &amp; Subscriptions sections">${[["subscriptions", "Subscriptions"], ["delivery", "Email Delivery"]].map(([tab, text]) => `<button type="button" data-accounts-tab="${tab}" aria-pressed="${session.tab === tab}" class="${session.tab === tab ? "is-active" : ""}">${text}</button>`).join("")}</nav></section><div data-accounts-view></div></div>`;
+    session.root.innerHTML = `<div class="accounts-dashboard"><section class="accounts-header"><h2>Accounts &amp; Subscriptions</h2><p>Private administration for AQ in the News subscriptions and email operations.</p><nav class="accounts-mini-nav" aria-label="Accounts &amp; Subscriptions sections">${[["subscriptions", "Subscriptions"], ["delivery", "Email Delivery"]].map(([tab, text]) => `<button type="button" data-accounts-tab="${tab}" aria-pressed="${session.tab === tab}" class="${session.tab === tab ? "is-active" : ""}">${text}</button>`).join("")}</nav></section><div data-accounts-view></div></div>`;
     const view = session.root.querySelector("[data-accounts-view]");
     if (session.tab === "subscriptions") {
       const filters = session.filters;
@@ -131,6 +135,7 @@
     const controller = begin(session, "list");
     cancel(session, "detail");
     session.selectedId = null;
+    session.subscription = null;
     session.items = [];
     const detail = session.root.querySelector("[data-subscription-detail]");
     detail.replaceChildren();
@@ -177,13 +182,74 @@
       }
       const subscription = payload?.subscription;
       if (!subscription || subscription.id !== id) throw new Error(errorText());
+      session.subscription = subscription;
       const dates = [["Created", "created_at"], ["Updated", "updated_at"], ["Confirmed", "confirmed_at"],
-        ["Unsubscribed", "unsubscribed_at"], ["Suppressed", "suppressed_at"],
+        ["Unsubscribed", "unsubscribed_at"], ["Blocked", "blocked_at"],
         ["Confirmation last sent", "confirmation_last_sent_at"], ["Confirmation held until", "confirmation_suppressed_until"],
         ["Consent recorded", "consent_recorded_at"]];
-      target.innerHTML = `<div class="accounts-heading"><h3>Subscription detail</h3><button type="button" class="accounts-button" data-close-detail>Close detail</button></div><p class="accounts-email">${esc(subscription.email)}</p><p class="accounts-id">${esc(subscription.id)}</p><dl class="accounts-detail-grid">${detailField("Family", "AQ in the News")}${detailField("Status", label(subscription.status))}${detailField("Confirmation", subscription.confirmed === true ? "Confirmed" : "Unconfirmed")}${detailField("Delivery mode", label(subscription.delivery_mode))}${subscription.delivery_mode === "daily" ? detailField("Daily wall time", dailyTime(subscription)) : ""}${detailField("Timezone", subscription.timezone || "Not recorded")}${detailField("Consent text version", subscription.consent_text_version)}${dates.filter(([, key]) => ["created_at", "updated_at", "confirmed_at"].includes(key) || Object.hasOwn(subscription, key)).map(([text, key]) => detailField(`${text} (UK)`, timestamp(subscription[key]))).join("")}${Object.hasOwn(subscription, "confirmation_send_count") ? detailField("Confirmation send count", count(subscription.confirmation_send_count)) : ""}${subscription.suppression_reason ? detailField("Suppression reason", subscription.suppression_reason) : ""}</dl><button type="button" class="accounts-button" data-history="${esc(id)}">View email delivery history</button>`;
+      target.innerHTML = `<div class="accounts-heading"><h3>Subscription detail</h3><button type="button" class="accounts-button" data-close-detail>Close detail</button></div><p class="accounts-email">${esc(subscription.email)}</p><p class="accounts-id">${esc(subscription.id)}</p><dl class="accounts-detail-grid">${detailField("Family", "AQ in the News")}${detailField("Status", label(subscription.status))}${detailField("Confirmation", subscription.confirmed === true ? "Confirmed" : "Unconfirmed")}${detailField("Delivery mode", label(subscription.delivery_mode))}${subscription.delivery_mode === "daily" ? detailField("Daily wall time", dailyTime(subscription)) : ""}${detailField("Timezone", subscription.timezone || "Not recorded")}${detailField("Consent text version", subscription.consent_text_version)}${dates.filter(([, key]) => ["created_at", "updated_at", "confirmed_at"].includes(key) || Object.hasOwn(subscription, key)).map(([text, key]) => detailField(`${text} (UK)`, timestamp(subscription[key]))).join("")}${Object.hasOwn(subscription, "confirmation_send_count") ? detailField("Confirmation send count", count(subscription.confirmation_send_count)) : ""}${subscription.block_reason ? detailField("Block reason", subscription.block_reason) : ""}</dl><button type="button" class="accounts-button" data-history="${esc(id)}">View email delivery history</button>${subscriberControls(subscription)}`;
     } catch (error) {
       if (current(session, "detail", controller)) target.innerHTML = notice(error instanceof TypeError || error instanceof SyntaxError ? errorText() : error.message, true);
+    }
+  }
+
+  function subscriberControls(subscription) {
+    const active = subscription.status === "active";
+    const blocked = subscription.status === "blocked";
+    return `<section><h4>Subscriber actions</h4>${active ? `<form class="accounts-filters" data-edit-preferences autocomplete="off"><label class="accounts-field"><span>Delivery mode</span><select name="delivery_mode"><option value="immediate" ${subscription.delivery_mode === "immediate" ? "selected" : ""}>Immediate</option><option value="daily" ${subscription.delivery_mode === "daily" ? "selected" : ""}>Daily</option></select></label><label class="accounts-field"><span>Daily time · Europe/London (GMT/BST)</span><input name="daily_time_local" type="time" step="60" required value="${esc(String(subscription.daily_time_local || "08:00").slice(0,5))}"></label><button type="submit" class="accounts-button">Save delivery preferences</button></form>` : `<p class="accounts-subtext">Delivery preferences can be edited while active.</p>`}<div class="accounts-actions">${blocked ? `<button type="button" class="accounts-button" data-subscriber-action="unblock">Unblock</button>` : `<button type="button" class="accounts-button" data-subscriber-action="block">Block</button>${subscription.status !== "unsubscribed" ? `<button type="button" class="accounts-button" data-subscriber-action="unsubscribe">Unsubscribe</button>` : ""}`}<button type="button" class="accounts-button" data-subscriber-action="delete">Delete subscription</button></div><p class="accounts-subtext">Unblock returns to pending. The subscriber must subscribe again and confirm their email before delivery resumes.</p><div data-action-result role="status"></div></section>`;
+  }
+
+  async function subscriberAction(session, action, preferences = {}) {
+    const subscription = session.subscription;
+    if (session.mutating || !subscription || subscription.id !== session.selectedId) return;
+    const id = subscription.id;
+    const descriptions = {
+      edit: `Save ${label(preferences.delivery_mode)} delivery${preferences.delivery_mode === "daily" ? ` at ${preferences.daily_time_local} Europe/London` : ""}?`,
+      block: "Block this subscriber? This prevents new News and confirmation sends, including public resubscription.",
+      unblock: "Unblock into pending? No email is sent by this action. Fresh public subscription and email confirmation are required before delivery resumes.",
+      unsubscribe: "Unsubscribe this subscriber and revoke their current management links? New News sends will stop.",
+      delete: "Permanently delete this subscription and its confirmation/management links? Historical email delivery records remain. This address may subscribe again with a new identity and fresh confirmation.",
+    };
+    if (!Object.hasOwn(descriptions, action)) return;
+    let reason;
+    if (action === "block") {
+      reason = window.prompt("Short reason for blocking (1–200 characters; do not include sensitive information):");
+      if (reason === null) return;
+      reason = reason.trim();
+      if (!reason || reason.length > 200 || /[\x00-\x1f\x7f]/.test(reason)) {
+        window.alert("Enter a reason of 1–200 characters on one line."); return;
+      }
+    }
+    if (!window.confirm(`${subscription.email}\n\n${descriptions[action]}`)) return;
+    session.mutating = true;
+    const controller = begin(session, "mutation");
+    const target = session.root.querySelector("[data-action-result]");
+    target.innerHTML = notice("Saving subscriber action…");
+    const controls = session.root.querySelectorAll("button, input, select");
+    controls.forEach(control => { control.dataset.wasDisabled = String(control.disabled); control.disabled = true; });
+    try {
+      const result = await request(`subscriptions/${encodeURIComponent(id)}/actions`, null, controller,
+        { action, confirmed: true, expected_updated_at: subscription.updated_at, ...preferences,
+          ...(action === "block" ? { reason } : {}) });
+      if (!current(session, "mutation", controller)) return;
+      if (result?.ok !== true || result.subscription_id !== id || (action === "delete" && result.deleted !== true)) {
+        throw new Error("The action result could not be confirmed. Refresh before trying again.");
+      }
+      await loadSubscriptions(session);
+      if (state !== session) return;
+      if (action !== "delete") {
+        await loadDetail(session, id);
+        const message = session.root.querySelector("[data-action-result]");
+        if (message) message.innerHTML = notice("Subscriber action saved.");
+      } else {
+        session.root.querySelector("[data-subscription-results]").insertAdjacentHTML("afterbegin", notice("Subscription deleted. Historical email delivery records are preserved."));
+      }
+    } catch (error) {
+      if (current(session, "mutation", controller)) target.innerHTML = notice(
+        `${error instanceof TypeError || error instanceof SyntaxError ? "The action result could not be confirmed." : error.message} Refresh before retrying.`, true);
+    } finally {
+      session.mutating = false;
+      controls.forEach(control => { control.disabled = control.dataset.wasDisabled === "true"; delete control.dataset.wasDisabled; });
     }
   }
 
@@ -223,6 +289,7 @@
     cancelAll(session);
     session.items = [];
     session.selectedId = null;
+    session.subscription = null;
     session.tab = tab;
     renderShell(session);
   }
@@ -230,13 +297,14 @@
   function closeDetail(session) {
     cancel(session, "detail");
     session.selectedId = null;
+    session.subscription = null;
     const target = session.root.querySelector("[data-subscription-detail]");
     target.replaceChildren();
     target.hidden = true;
   }
 
   function refresh() {
-    if (!state) return;
+    if (!state || state.mutating) return;
     if (state.tab === "subscriptions") void loadSubscriptions(state);
     else void loadDelivery(state);
   }
@@ -244,14 +312,16 @@
   function mount(root) {
     if (!root || state?.root === root) return;
     unmount();
-    const session = { root, tab: "subscriptions", requests: new Map(), items: [], selectedId: null,
+    const session = { root, tab: "subscriptions", requests: new Map(), items: [], selectedId: null, subscription: null, mutating: false,
       filters: { search: "", status: "", delivery_mode: "", sort: "created_at", direction: "desc" },
       limit: 25, offset: 0, deliveryOffset: 0, deliverySubscription: null, listeners: new AbortController() };
     state = session;
     root.addEventListener("click", event => {
       const button = event.target.closest("button");
-      if (!button || !root.contains(button) || button.disabled) return;
-      if (button.hasAttribute("data-accounts-tab")) {
+      if (!button || !root.contains(button) || button.disabled || session.mutating) return;
+      if (button.hasAttribute("data-subscriber-action")) {
+        void subscriberAction(session, button.dataset.subscriberAction);
+      } else if (button.hasAttribute("data-accounts-tab")) {
         if (session.tab !== button.dataset.accountsTab) setTab(session, button.dataset.accountsTab);
       } else if (button.hasAttribute("data-refresh")) refresh();
       else if (button.hasAttribute("data-detail")) void loadDetail(session, button.dataset.detail);
@@ -277,8 +347,16 @@
       }
     }, { signal: session.listeners.signal });
     root.addEventListener("submit", event => {
+      if (event.target.matches("[data-edit-preferences]")) {
+        event.preventDefault();
+        const values = new FormData(event.target);
+        void subscriberAction(session, "edit", { delivery_mode: String(values.get("delivery_mode")),
+          daily_time_local: String(values.get("daily_time_local")) });
+        return;
+      }
       if (!event.target.matches("[data-subscription-filters]")) return;
       event.preventDefault();
+      if (session.mutating) return;
       const values = new FormData(event.target);
       session.filters = { search: String(values.get("search") || "").trim().toLowerCase(),
         status: String(values.get("status") || ""), delivery_mode: String(values.get("delivery_mode") || ""),
@@ -301,6 +379,7 @@
     session.filters.search = "";
     session.items = [];
     session.selectedId = null;
+    session.subscription = null;
     session.deliverySubscription = null;
   }
 

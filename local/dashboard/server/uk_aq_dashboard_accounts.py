@@ -1,10 +1,11 @@
-"""Private, bounded, uncached Accounts reads from IngestDB and Media."""
+"""Private bounded Accounts administration and Media delivery reads."""
 
 from __future__ import annotations
 
 import json
 import os
 import re
+from datetime import datetime
 from http import HTTPStatus
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlparse
@@ -20,7 +21,7 @@ MAX_REQUEST_TARGET_BYTES = 4096
 MAX_RESPONSE_BYTES = 512 * 1024
 _SUBSCRIPTION_FIELDS = (
     "id", "email", "status", "delivery_mode", "daily_time_local", "timezone",
-    "confirmed_at", "created_at", "updated_at", "unsubscribed_at", "suppressed_at",
+    "confirmed_at", "created_at", "updated_at", "unsubscribed_at", "blocked_at", "block_reason",
     "consent_text_version", "mode_since_at", "confirmation_last_sent_at", "confirmed",
 )
 _DELIVERY_FIELDS = (
@@ -29,7 +30,7 @@ _DELIVERY_FIELDS = (
     "retry_hold", "error_class",
 )
 _OUTBOX_FIELDS = ("id", "work_type", "state", "created_at", "queued_at", "attempt_count", "error_class")
-_STATUS = {"pending", "active", "unsubscribed", "suppressed"}
+_STATUS = {"pending", "active", "unsubscribed", "blocked"}
 _MODE = {"immediate", "daily"}
 _DELIVERY_MODE = {"confirmation", "immediate", "daily"}
 _DELIVERY_STATE = {"pending", "sending", "accepted", "temporary_failure", "permanent_failure", "unknown", "cancelled"}
@@ -73,7 +74,7 @@ def _send_json(handler: Any, status: int, body: dict[str, Any]) -> None:
     handler.send_header("X-Content-Type-Options", "nosniff")
     handler.send_header("Referrer-Policy", "no-referrer")
     if status == HTTPStatus.METHOD_NOT_ALLOWED:
-        handler.send_header("Allow", "GET")
+        handler.send_header("Allow", "GET, POST")
     handler.end_headers()
     if handler.command != "HEAD":
         handler.wfile.write(payload)
@@ -175,7 +176,9 @@ def _safe_record(value: Any, fields: tuple[str, ...]) -> dict[str, Any]:
         item = value.get(name)
         if item is not None and not isinstance(item, (str, bool, int)):
             _invalid_source()
-        if isinstance(item, str) and (len(item) > 512 or any(ord(char) < 32 or ord(char) == 127 for char in item)):
+        # Preserve historical block-reason whitespace as JSON text; the UI escapes it.
+        if isinstance(item, str) and (len(item) > 512 or (
+                name != "block_reason" and any(ord(char) < 32 or ord(char) == 127 for char in item))):
             _invalid_source()
         result[name] = item
     return result
@@ -209,8 +212,7 @@ def _pagination(raw: Any, query: dict[str, Any]) -> dict[str, Any]:
     return {"limit": raw["limit"], "offset": raw["offset"], "has_more": raw["has_more"]}
 
 
-def _read_subscriptions(handler: Any, parsed: Any, headers_builder: Callable[..., dict[str, str]]) -> dict[str, Any]:
-    query, detail = _subscriptions_query(parsed)
+def _subscription_rpc(handler: Any, headers_builder: Callable[..., dict[str, str]], name: str, body: dict[str, Any]) -> Any:
     base = str(getattr(handler.server, "base_url", "") or "").strip().rstrip("/")
     key = str(getattr(handler.server, "service_role_key", "") or "").strip()
     schema = str(os.getenv("UK_AQ_PUBLIC_SCHEMA", "uk_aq_public")).strip()
@@ -227,7 +229,12 @@ def _read_subscriptions(handler: Any, parsed: Any, headers_builder: Callable[...
         raise AccountsRequestError(HTTPStatus.SERVICE_UNAVAILABLE, "Accounts source is not configured")
     headers = headers_builder(key, write=True, schema=schema)
     headers.update({"Content-Type": "application/json", "Accept": "application/json", "Cache-Control": "no-store"})
-    payload = _upstream_json("POST", base + "/rpc/uk_aq_news_subscriptions_admin_read", headers=headers, json={"p_query": query})
+    return _upstream_json("POST", base + "/rpc/" + name, headers=headers, json=body)
+
+
+def _read_subscriptions(handler: Any, parsed: Any, headers_builder: Callable[..., dict[str, str]]) -> dict[str, Any]:
+    query, detail = _subscriptions_query(parsed)
+    payload = _subscription_rpc(handler, headers_builder, "uk_aq_news_subscriptions_admin_read", {"p_query": query})
     if not isinstance(payload, dict):
         _invalid_source()
     if detail:
@@ -317,18 +324,92 @@ def _read_email_delivery(parsed: Any) -> dict[str, Any]:
     }
 
 
+def _write_subscription(handler: Any, parsed: Any, headers_builder: Callable[..., dict[str, str]]) -> tuple[int, dict[str, Any]]:
+    route = re.fullmatch(r"/api/accounts/subscriptions/([^/]+)/actions", parsed.path)
+    if not route:
+        raise AccountsRequestError(HTTPStatus.NOT_FOUND, "Accounts API route not found")
+    subscription_id = _uuid(route[1])
+    if parsed.query:
+        _bad_request()
+    origin = urlparse(handler.headers.get("Origin", ""))
+    if (handler.headers.get("X-UKAQ-Accounts-Action") != "1" or origin.scheme != "https"
+            or origin.netloc != handler.headers.get("Host") or origin.path or origin.query or origin.fragment
+            or origin.username or origin.password
+            or handler.headers.get("Sec-Fetch-Site") not in (None, "same-origin")):
+        raise AccountsRequestError(HTTPStatus.FORBIDDEN, "Same-origin administrative action required", "FORBIDDEN")
+    if (handler.headers.get("Content-Type", "").split(";")[0].strip().lower() != "application/json"
+            or handler.headers.get("Transfer-Encoding")):
+        _bad_request()
+    raw_length = handler.headers.get("Content-Length", "")
+    if not re.fullmatch(r"[1-9][0-9]{0,3}", raw_length) or not 0 < int(raw_length) <= 4096:
+        _bad_request()
+    handler.connection.settimeout(10)
+    raw = handler.rfile.read(int(raw_length))
+    if len(raw) != int(raw_length):
+        _bad_request()
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        _bad_request()
+    if not isinstance(body, dict):
+        _bad_request()
+    action = body.get("action")
+    revision = body.get("expected_updated_at")
+    if (not isinstance(action, str) or action not in {"edit", "block", "unblock", "unsubscribe", "delete"}
+            or body.get("confirmed") is not True or not isinstance(revision, str)
+            or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})", revision)):
+        _bad_request()
+    try:
+        datetime.fromisoformat(revision)
+    except ValueError:
+        _bad_request()
+    allowed = {"action", "confirmed", "expected_updated_at"}
+    if action == "edit":
+        allowed |= {"delivery_mode", "daily_time_local"}
+        if (not isinstance(body.get("delivery_mode"), str) or body["delivery_mode"] not in _MODE
+                or not isinstance(body.get("daily_time_local"), str)
+                or not re.fullmatch(r"([01][0-9]|2[0-3]):[0-5][0-9]", body["daily_time_local"])):
+            _bad_request()
+    if action == "block":
+        allowed.add("reason")
+        reason = body.get("reason")
+        if (not isinstance(reason, str) or not reason.strip() or len(reason) > 200
+                or any(ord(c) < 32 or ord(c) == 127 for c in reason)):
+            _bad_request()
+    if body.keys() - allowed:
+        _bad_request()
+    payload = _subscription_rpc(handler, headers_builder, "uk_aq_news_subscriptions_admin_write",
+                                {"p_request": {**body, "subscription_id": subscription_id}})
+    if not isinstance(payload, dict):
+        _invalid_source()
+    if payload.get("ok") is False and payload.get("code") in {"NOT_FOUND", "CONFLICT"}:
+        missing = payload["code"] == "NOT_FOUND"
+        return (HTTPStatus.NOT_FOUND if missing else HTTPStatus.CONFLICT), {"error": {
+            "code": payload["code"], "message": "Subscription no longer exists" if missing else
+            "Subscription changed or action is unavailable; refresh detail"}}
+    if (payload.get("ok") is not True or payload.get("subscription_id") != subscription_id
+            or (action == "delete" and payload.get("deleted") is not True)):
+        _invalid_source()
+    return HTTPStatus.OK, {"ok": True, "subscription_id": subscription_id,
+                           **({"deleted": True} if action == "delete" else {})}
+
+
 def serve_accounts_request(handler: Any, headers_builder: Callable[..., dict[str, str]]) -> None:
     """Runs before existing optional bearer auth, response caches and dispatch."""
     try:
         authorize_accounts_request(handler)
-        if handler.command != "GET":
-            raise AccountsRequestError(HTTPStatus.METHOD_NOT_ALLOWED, "Accounts API is read-only")
         if len(handler.path.encode("utf-8")) > MAX_REQUEST_TARGET_BYTES:
             raise AccountsRequestError(HTTPStatus.REQUEST_URI_TOO_LONG, "Accounts request is too large")
-        if handler.headers.get("Transfer-Encoding") or handler.headers.get("Content-Length", "0") != "0":
-            _bad_request()
         parsed = urlparse(handler.path)
         if parsed.fragment or parsed.params:
+            _bad_request()
+        if handler.command == "POST":
+            status, payload = _write_subscription(handler, parsed, headers_builder)
+            _send_json(handler, status, payload)
+            return
+        if handler.command != "GET":
+            raise AccountsRequestError(HTTPStatus.METHOD_NOT_ALLOWED, "Unsupported Accounts method")
+        if handler.headers.get("Transfer-Encoding") or handler.headers.get("Content-Length", "0") != "0":
             _bad_request()
         if parsed.path == "/api/accounts/email-delivery":
             payload = _read_email_delivery(parsed)
