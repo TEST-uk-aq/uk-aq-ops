@@ -289,8 +289,11 @@ most three sequential subprocess attempts, with 1-second then 3-second backoff
 plus 0–200 ms jitter. Recognised network, timeout, rate-limit and server failures,
 and otherwise unclassified nonzero exits, may retry. Known missing/path,
 authentication/permission, configuration/start, interruption, integrity and
-resource-limit failures stop. Successful transfer bytes still have to pass every
-existing source-identity, stability and data-validation gate; those failures never
+resource-limit failures stop. Exit codes 2 (syntax/usage), 6 (NoRetry) and 9 (no
+files transferred) stop regardless of transient-looking stderr. Exit code 1
+retains bounded retries unless a permanent-error diagnostic applies.
+Successful transfer bytes still have to pass every existing source-identity,
+stability and data-validation gate; those failures never
 enter the transport retry loop. Failed-attempt buffers are discarded.
 
 Every subprocess attempt counts against the read-command budget. All stdout

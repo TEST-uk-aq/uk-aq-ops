@@ -18,6 +18,10 @@ function classifyRcloneFailure(code, diagnostic) {
   // Only these fixed categories escape the transport. Never attach upstream
   // text, command arguments or spawn errors to a reportable Error.
   const failure = (category, retryable = false) => ({ category, retryable });
+  // Known non-retryable exits take precedence over transient-looking stderr.
+  if (code === 2) return failure('syntax_or_usage');
+  if (code === 6) return failure('no_retry');
+  if (code === 9) return failure('no_files_transferred');
   if (/checksum.*(?:mismatch|differ)|(?:hash|size).*mismatch|corrupt(?:ion|ed)?|inconsistent (?:source|bytes)/i.test(diagnostic))
     return failure('integrity_failure');
   if (/context cancel(?:led|ed)|operation cancel(?:led|ed)|interrupted|signal received/i.test(diagnostic))
@@ -34,7 +38,7 @@ function classifyRcloneFailure(code, diagnostic) {
     return failure('invalid_configuration');
   if (/path\/malformed_path|invalid (?:path|url)|malformed (?:path|url)|disallowed_name|\b400\b/i.test(diagnostic))
     return failure('permanent_path');
-  if ([3, 4, 9].includes(code)) return failure('missing_object_or_path');
+  if ([3, 4].includes(code)) return failure('missing_object_or_path');
   if ([8, 10, 11].includes(code)) return failure('resource_limit');
   if ([130, 137, 143].includes(code)) return failure('interrupted');
   if (code === 7) return failure('permanent_failure');
