@@ -1,216 +1,222 @@
-# Media → D1 Usage: TEST implementation and operator handover
+# Media D1 Usage implementation handover
 
-Implementation only, 29 October 2026. No dashboard deployment, credential
-provisioning, D1 SQL, database changes or LIVE application changes were performed.
-The authoritative contracts in `uk-aq-system-docs/system_docs/` remain read-only.
+This corrects merged [PR #145](https://github.com/TEST-uk-aq/uk-aq-ops/pull/145).
+Its dual-account architecture and configuration instructions are superseded.
+Authority is the 29 October 2026 correction to
+[Media dashboard section 11](https://github.com/TEST-uk-aq/uk-aq-system-docs/blob/main/system_docs/dashboards/media_dashboard_contract.md#11-media-d1-usage-mini-page-environment-local-analytics-corrected-29-october-2026),
+together with `hosted_dashboard.md`, `local_dashboard.md` and
+`architecture_contract.md` in that authoritative area. System documentation
+remains read-only for this implementation.
 
-## Behaviour
+## Architecture
 
-`dashboard/assets/media.js` adds D1 Usage immediately after Sources, retains
-Articles as the default and uses the existing Media cards, pills and errors.
-The shared frontend calls only same-origin `GET /api/media/d1-usage`.
+**One dashboard = one environment = one Media Cloudflare account.**
+The separately deployed TEST dashboard reads only its configured TEST Media
+account. After acceptance, the operator may separately promote complete approved
+files to LIVE with LIVE external values. Both use identical code, setting names
+and templates. There is no account selector, comparison graph, second summary,
+environment-labelled credential lookup or fallback. Hostname, environment label
+and browser storage cannot select an account.
 
-The 7/30/90 UTC-day view includes today. A rows-read/rows-written graph has
-separate LIVE and TEST series, gaps for missing days, and an accessible bounded
-daily table. A UTC-day selector drives both account summaries and the query day.
-Today is marked partial. Account-wide totals include **all D1 databases in that
-account**, matching account-wide quotas. They are never combined across accounts.
-The separate on-demand Top D1 Queries section is scoped to the explicitly
-configured Media database in the selected account. It returns at most five
-Cloudflare query groups ordered by total rows read, with executions, total reads,
-reads/execution and writes where available. SQL text is replaced on the backend
-with an allowlisted operation label and a 20-character SHA-256 fingerprint. No
-literal, identifier, comment or other provider SQL text reaches the browser/logs.
-Fingerprints preserve provider group identity; this is not a SQL replay tool or
-an application-specific query classifier.
+Media → D1 Usage retains 7/30/90 UTC-day history, rows-read/rows-written metric
+selection, an accessible table, selected-day summary, today/partial labels,
+missing/retention gaps, allowance progress, warning/critical indicators,
+on-demand top-five fingerprints and manual Refresh. Other Media pages and
+health operate independently of analytics availability.
 
-Each account has independent availability, retrieval timestamps, plan and limits.
-Only a confirmed `free` plan with positive configured daily limits produces
-percentages. A `paid`, unknown or invalid plan/allowance never receives an assumed
-Free allowance. Advisory thresholds are injected settings; the deployment
-workflow and local template propose 75% and 90%. Analytics are adaptive and may
-be delayed; they are not an exact billing counter or proof of optimisation savings.
+Cloudflare GraphQL account analytics is the source. Daily totals include **all
+D1 databases in the current Media account**, matching the account-wide Free
+allowance. Query insights use only its explicitly configured Media database UUID.
+The dashboard never runs SQL against Media tables to measure usage and never
+persists analytics in D1 or MySQL. Adaptive analytics may be delayed or sampled;
+missing data is unknown, not zero.
 
-## Provider structural evidence and bounds
+## Three required settings
 
-Reviewed Cloudflare's [D1 analytics documentation](https://developers.cloudflare.com/d1/observability/metrics-analytics/),
-[settings-node documentation](https://developers.cloudflare.com/analytics/graphql-api/features/discovery/settings/),
-[D1 pricing](https://developers.cloudflare.com/d1/platform/pricing/) and
-[current Wrangler insight implementation](https://github.com/cloudflare/workers-sdk/blob/main/packages/wrangler/src/d1/insights.ts)
-on 29 October 2026. The latter uses query count, `sum.rowsRead`, `sum.rowsWritten`,
-query/database dimensions, hour filters and `sum_rowsRead_DESC`; its current CLI
-limits an insight interval to 31 days. This page requests one UTC day for insights.
+The same names apply to hosted and local backends:
 
-Both runtimes load the same fixed queries from
-`workers/uk_aq_dashboard_online_api_worker/src/lib/media_d1_queries.json`. Daily sums use
-`d1AnalyticsAdaptiveGroups`, grouped **only by date**, with no database filter.
-Insights use `d1QueriesAdaptiveGroups`, grouped by query and filtered by the
-configured database UUID. The account is always separately specified.
+| Name | TEST Ops GitHub source | Meaning |
+| --- | --- | --- |
+| `UK_AQ_MEDIA_CLOUDFLARE_ACCOUNT_ID` | Actions Variable | Current environment's Media account ID |
+| `UK_AQ_MEDIA_CFLARE_D1DB_ID` | Actions Variable | Its Media database UUID, not a name |
+| `UK_AQ_MEDIA_D1_ANALYTICS_TOKEN` | Actions Secret | Account Analytics: Read token scoped to that account |
 
-Before data retrieval, the settings query checks dataset availability, required
-fields, `maxDuration`, `maxPageSize` and `notOlderThan` for the actual account.
-Optional read/write query counts and insight writes are selected only when
-available. Daily requests are chunked into at most 31 days, further reduced by
-the actual provider query/page limits, with at most 12 daily requests plus one
-settings request per account. Insights require a supported one-day window and
-five groups, and use at most two requests. Unsupported windows fail explicitly.
-Provider responses are capped at 768 KiB each; SQL input is bounded to 100,000
-characters before hashing; the browser receives at most 90 daily rows/account
-or five insight rows. No raw provider response/error body is returned or logged.
+The first two reuse Media's existing identity names; their Ops target catalogue
+entries were absent and are added exactly once. The analytics token is distinct
+from write-capable deployment and Media admin tokens. All values remain in
+server-side settings, never generated browser configuration. Missing/invalid
+account, database or token configuration makes this feature explicitly
+unavailable before cache/provider reads, without disrupting the rest of Media.
 
-**90-day selection does not imply 90-day retention.** Fully available UTC days
-are queried within each account's reported retention. Older days are marked
-`outside_retention`; absent groups are `missing`, with null metrics. Only an
-explicit provider zero becomes zero. No ingestion/storage is added to fabricate
-older history. Account-specific schema/retention access has not been observed
-here because no read-only analytics credentials were configured in Codex Cloud.
+### Operator token migration and cleanup
 
-The deployed implementation baseline was inspected through successful TEST
-[Pages run 40901253630](https://github.com/TEST-uk-aq/uk-aq-ops/actions/runs/40901253630)
-and [Worker orchestrator run 40901253835](https://github.com/TEST-uk-aq/uk-aq-ops/actions/runs/40901253835),
-both at `89f40166394b74202046f271e168c1d12956ddfe`. The orchestrator's
-`deploy_dashboard_api / deploy` job succeeded. Its checked-in Media frontend,
-route wiring, Accounts trust helpers and deployment configuration were inspected.
-No authenticated browser session or deployed analytics route was available;
-this is source/deployment provenance, not functional acceptance of this feature.
+The existing TEST analytics-only token is currently stored under
+**`UK_AQ_MEDIA_D1_TEST_ANALYTICS_TOKEN`**. The operator must re-add its **existing
+value**, without revealing it or rotating it for this correction, under
+**`UK_AQ_MEDIA_D1_ANALYTICS_TOKEN`** in **TEST Ops GitHub Secrets and local TEST
+Ops `.env`**. Codex has not read, exposed, copied or modified the secret value.
+There is no automatic fallback to the old name.
 
-## API and cache
+Remove obsolete `UK_AQ_MEDIA_D1_LIVE_*` and `UK_AQ_MEDIA_D1_TEST_*` entries from
+the operator's active local `.env`/catalogue. Separately review obsolete TEST
+GitHub/Worker bindings after acceptance; remote cleanup requires separate
+operator authorisation. This PR does not delete or synchronise remote secrets.
+Unused old bindings cannot select a target in the corrected code. Preserve the
+existing Media identity settings and all unrelated bindings. No LIVE changes
+are authorised here.
 
-Allowed selectors only:
+## Shared Free-plan defaults
 
-```text
-GET /api/media/d1-usage?days=7
-GET /api/media/d1-usage?days=30&refresh=1
-GET /api/media/d1-usage?days=90&view=queries&account=LIVE&day=YYYY-MM-DD
-```
+Both Media accounts permanently use Cloudflare D1 Free. No PLAN setting or
+plan-dependent runtime branch remains. Both backends define these common
+product limits/UI policy in code; no override variables are required:
 
-`days` is 7, 30 or 90; `view` is daily (default) or queries; `refresh` is 0 or 1.
-The account is LIVE or TEST and is accepted only for insights. The day must be
-one of the selected range's UTC dates. Duplicate/unknown selectors and arbitrary
-URLs, account IDs, tokens, SQL or GraphQL are rejected. Daily selectors cannot
-carry an insight account/day. Request queries are limited to 256 characters.
+| Setting | Built-in default | Optional environment-neutral override |
+| --- | ---: | --- |
+| Daily rows read | 5,000,000 | `UK_AQ_MEDIA_D1_DAILY_READ_LIMIT` |
+| Daily rows written | 100,000 | `UK_AQ_MEDIA_D1_DAILY_WRITE_LIMIT` |
+| Warning | 75% | `UK_AQ_MEDIA_D1_WARNING_PERCENT` |
+| Critical | 90% | `UK_AQ_MEDIA_D1_CRITICAL_PERCENT` |
 
-Privileged responses, including auth errors, are always `Cache-Control: no-store`.
-No analytics response enters the compatibility edge cache, MySQL or D1. The
-15-minute backend cache is process/isolate memory with at most 32 DTO entries,
-keyed by credential/account/database identity, product, range and insight day.
-Both daily row metrics are cached together. It is best effort and resets when
-the Python process or Worker isolate restarts; no globally distributed throttle
-or durable cache is claimed. Requests authenticate before any cache lookup.
+Supplied overrides must be positive decimal safe integers; thresholds must
+satisfy `0 < warning < critical <= 100`. Explicit empty, malformed, non-positive
+or invalidly ordered runtime values produce `INVALID_ALLOWANCES` and clear
+unavailability, never silent defaults. Leave local overrides **unset**, not
+empty, to use defaults. Limits are currently confirmed Free-plan allowances,
+not a guarantee that Cloudflare will never change them.
 
-Manual refresh is limited to once per minute per account/product. New cache
-misses are limited to four per minute per account/product, permitting range/day
-selection without an upstream request on every parent Media rerender. Concurrent
-hosted identical requests coalesce; concurrent local requests use a bounded busy
-state. Network/5xx failure may return explicitly stale data, at most one hour old,
-with its original successful-retrieval timestamp. Known access/schema failures
-clear affected credentials' cached DTOs. Missing/replaced credentials never
-select another account's cache. The UI retains only current display state in
-memory, does not persist analytics in browser storage and labels aged data stale.
+## Hosted and local configuration
 
-## Configuration to provision later (no values in source)
+The TEST deployment workflow reads the two identity Actions Variables and the
+analytics Actions Secret through its existing private temporary `--secrets-file`
+mechanism with pinned Wrangler. Optional overrides are passed only when non-empty
+in Actions; they are not deployment prerequisites. Only the three required
+feature names are included even when empty, preventing a missing required value
+from silently retaining an old target. Unrelated empty settings remain omitted.
+No secret deletion/synchronisation or full replacement of bindings is added.
 
-For **each** `<ACCOUNT>` equal to `LIVE` and `TEST`:
+Omitted optional overrides preserve existing remote bindings under Wrangler's
+normal behaviour. To restore a previously configured Worker override to its code
+default, the operator must separately remove that exact override binding;
+clearing its GitHub Variable alone does not delete it. Do not delete unrelated
+bindings. This PR performs no such action.
 
-| Name | GitHub target / local source | Meaning |
-|---|---|---|
-| `UK_AQ_MEDIA_D1_<ACCOUNT>_ACCOUNT_ID` | variable / local .env | Explicit Cloudflare account ID |
-| `UK_AQ_MEDIA_D1_<ACCOUNT>_DATABASE_ID` | variable / local .env | That account's Media database UUID; required for insights |
-| `UK_AQ_MEDIA_D1_<ACCOUNT>_ANALYTICS_TOKEN` | secret / local .env | Account Analytics: Read, scoped only to the intended account(s) |
-| `UK_AQ_MEDIA_D1_<ACCOUNT>_PLAN` | variable / local .env | Confirmed `free`, `paid` or `unknown` |
-| `UK_AQ_MEDIA_D1_<ACCOUNT>_DAILY_READ_LIMIT` | variable / local .env | Positive daily rows-read allowance, used only for confirmed Free |
-| `UK_AQ_MEDIA_D1_<ACCOUNT>_DAILY_WRITE_LIMIT` | variable / local .env | Positive daily rows-written allowance, used only for confirmed Free |
+Local TEST uses its own checkout's existing `.env` loader; see
+`local/dashboard/media-d1-env.example`. Reuse the existing Accounts signed Access
+JWT verifier, local-only `UK_AQ_LOCAL_ACCOUNTS_ACCESS_ISSUER` and
+`UK_AQ_LOCAL_ACCOUNTS_ACCESS_AUD`, and installed `PyJWT[crypto]` dependency from
+`local/dashboard/server/requirements.txt`. Preserve the working Tunnel, listener
+and local Access application. A hosted hostname is not a substitute for local
+Access trust. The supported entrypoint is `local/scripts/run_dashboard.sh`.
 
-Also set `UK_AQ_MEDIA_D1_WARNING_PERCENT=75` and
-`UK_AQ_MEDIA_D1_CRITICAL_PERCENT=90` (ordered positive integers at most 100).
-Cloudflare currently documents 5,000,000 daily reads and 100,000 daily writes for
-Free, but the operator must confirm each account's plan and allowance before
-configuring those limits. None are inferred from deployment credentials.
+The operator's private `env-vars-master.csv` is not tracked or available in Codex
+Cloud. Align its three required names and, only if used, optional common names
+with `config/uk_aq_github_env_targets.csv`; remove obsolete dual-account/PLAN
+entries. Do not run environment synchronisation scripts as part of this PR.
 
-Two narrowly scoped tokens are preferred. One token explicitly scoped read-only
-to both accounts can instead be supplied separately under the two token names.
-Never supply a deployment/admin token or give this feature D1/write privileges.
-The existing general Cloudflare read credential is deliberately not reused:
-its account/scope semantics do not express these independent Media mappings.
-Equal LIVE/TEST account IDs are rejected. Database names are not used for identity.
+## Endpoint and DTO
 
-The checked-in target catalogue `config/uk_aq_github_env_targets.csv` and existing
-API Worker deployment workflow contain all names. Runtime settings pass through
-the workflow's existing server-only secrets-file mechanism; they are excluded
-from generated frontend config. Empty D1 settings are preserved in that file so
-a later authorised deployment can disable a previously configured account instead
-of silently retaining an old Worker secret. This code change does not itself
-provision, remove or change any remote setting. The private ignored
-`env-vars-master.csv` is absent in Codex Cloud: the operator must add these names
-to their existing catalogue before using its normal secure sync process.
+Both backends expose `GET /api/media/d1-usage`, allowing only:
 
-Use `local/dashboard/media-d1-env.example` as the local configuration template.
-Reuse existing `UK_AQ_LOCAL_ACCOUNTS_ACCESS_ISSUER` and
-`UK_AQ_LOCAL_ACCOUNTS_ACCESS_AUD`; they identify the **local** Access application.
-Use the installed backend's existing `requirements.txt`, including PyJWT[crypto].
-The complete repository must be present because Python reads the shared GraphQL
-template from the Worker source directory. Template changes are covered by the existing Worker deployment path filter. No Tunnel/LaunchAgent/listener changes are needed.
+- `days=7|30|90` (default `7`);
+- `view=daily|queries` (default `daily`);
+- `day=YYYY-MM-DD` for queries only, within the selected UTC range (default today);
+- `refresh=0|1` (default `0`).
 
-## Authentication decisions
+Unknown/duplicate parameters, malformed queries and all account/environment/
+database selectors are rejected. Responses have bounded `view`, `days`, `dates`,
+`selected_day`, `today` and one **`usage` object**, replacing `accounts`.
+`usage` includes `daily_limits`, `thresholds`, `status`, `error`, `retrieved_at`,
+`rows`, and provider `scope`/`retention_start` when available. Configuration
+failures have null limits/thresholds, null retrieval, an error code and no rows.
 
-The hosted endpoint reuses `authorizeAccountsRequest`: a personal identity from
-the runtime's `ctx.access.getIdentity()`, rejecting missing runtime context and
-service-token identities. Caller-provided Access headers are insufficient. The
-handler is dispatched before OPTIONS, Media forwarding, upstream mode and caches.
-Direct Worker access without runtime-verified identity fails closed.
+Daily rows contain UTC date, partial flag, availability, reads/writes and query
+counts when available. Insights return at most five execution/read/write totals,
+average reads and safe operation/fingerprint descriptions. Account/database IDs,
+credentials, raw SQL and Cloudflare error bodies never reach the browser. SQL is
+length-bounded and hashed server-side; only an opaque digest and operation label
+are returned. There is no arbitrary GraphQL, target or SQL proxy.
 
-The local endpoint reuses `authorize_accounts_request`, which verifies the local
-Access JWT using the configured issuer, audience, RS256 signing key, validity
-claims and personal identity. It intercepts every HTTP method in `parse_request`
-before optional bearer auth, Media dispatch and compatibility/MySQL caches. Direct
-localhost calls cannot bypass this check. Authentication is not relaxed when
-analytics credentials or JWT dependencies are absent. No browser token input,
-new login flow or general Cloudflare proxy is introduced.
+## Preserved security, bounds and caches
 
-## Structural verification
+Authentication remains before method/parameter handling, cache/provider reads,
+upstream forwarding and compatibility/MySQL caches. Hosted requests require the
+runtime-provided personal Access identity; caller-supplied headers cannot supply
+it. Local requests, including direct localhost and every method, require the
+existing signed personal Access JWT verifier. All privileged responses remain
+`Cache-Control: no-store`.
 
-The following checks passed, from the Ops repository root unless stated otherwise:
+The shared GraphQL templates remain unchanged: `d1AnalyticsAdaptiveGroups`,
+`d1QueriesAdaptiveGroups` and dataset settings. Retention, available fields,
+max duration/page size, at most twelve daily chunks plus one settings request
+(or settings plus one top-five insights request), 768 KiB response limits,
+timeouts and redirect denial remain enforced. No alternate account or credential
+is attempted after errors.
 
-```bash
-node --check dashboard/assets/media.js
-npm --prefix workers/uk_aq_dashboard_online_api_worker run check
-python3 -m py_compile local/dashboard/server/uk_aq_dashboard_media_d1_usage.py local/dashboard/server/uk_aq_dashboard_api_core.py
-git diff --check
-```
+Backend caching remains process/isolate-local, best effort, about 15 minutes,
+32 entries maximum, keyed by a credential/identity digest, range and query day.
+There is one refresh gate per view: at most four attempts/minute, one manual
+refresh/minute and one in-flight retrieval. Transient failures may return clearly
+stale data up to an hour; known access/schema failures invalidate that identity's
+cache. No raw credentials enter keys or logs. Parent dashboard rerenders do not
+repeatedly fetch the mini-page. Cache loss affects availability only.
 
-Worker packaging passed using its existing Wrangler 4.130.0 installation with a
-local-only dry run and workspace configuration/log/output paths. A disposable hosted boundary
-check exercises missing runtime auth (GET/HEAD/POST/OPTIONS), forged Access
-headers, bounded/rejected selectors and missing per-account configuration with
-zero provider calls. A targeted Python AST check verifies the early all-method
-local interception and authentication before account retrieval. Shared query
-templates, all 14 workflow variable/secret/target mappings and six exact archive
-copies passed structural checks. All three existing workflow shell blocks pass
-`bash -n`. No new committed functional test suite is introduced. These checks
-do not establish deployed authentication, account access or metric accuracy.
+## Validation and deployment prerequisites
 
-## Later authorised TEST operation: all acceptance checks pending
+Pre-deployment checks establish structural viability only: frontend syntax,
+Worker TypeScript/local bundle, Python compilation, directly relevant endpoint
+bounds/auth/configuration checks without provider calls, workflow parsing and
+shell/secret-payload structure, catalogue uniqueness and archive/diff hygiene.
+No speculative functional suite, remote SQL, database change, deployment or LIVE
+action is included. Compilation does **not** establish operational acceptance.
 
-Do not infer any of these from syntax/type/build checks:
+Before separately authorised TEST deployment, the operator must migrate the token
+name, configure TEST Media account/database values in hosted/local settings,
+align the private catalogue and confirm dataset permissions/retention and
+existing Access setup. Deploy matching Pages and API Worker revisions because
+the DTO changed. Update and restart the local TEST process only when separately
+authorised. The operator-confirmed local TEST LaunchAgent restart is
+`launchctl kickstart -k "gui/$(id -u)/uk.co.ukaq.dashboard.test"` after updating
+the complete TEST checkout and `.env`; this command was not run here.
 
-- [ ] Hosted Media → D1 Usage loads through administrative Access.
-- [ ] Updated local dashboard shows the same information through its local Access app.
-- [ ] LIVE and TEST account-wide daily totals independently match their Cloudflare accounts; insight database UUIDs are correct.
-- [ ] 7/30/90 UTC-day views work, including honest retention gaps and missing versus zero.
-- [ ] Today is labelled partial in graph, summaries, table and insights.
-- [ ] Confirmed Free limits, percentages and 75%/90% indicators are correct; paid/unknown plans have no invented daily allowance.
-- [ ] Top five query attribution, counts, reads/execution and writes match Cloudflare; fingerprints expose no SQL literals or metadata.
-- [ ] Manual refresh, rate limits, 15-minute cache, aged display and transient-failure stale labels behave correctly.
-- [ ] Missing/invalid/revoked credentials fail independently, including both accounts absent, with no cross-account fallback.
-- [ ] Direct unauthorised Worker/local API calls and forged/expired/wrong-audience JWTs are denied; service identities are rejected.
-- [ ] Browser payloads, page source and logs contain no credentials, account IDs or raw SQL.
-- [ ] Existing Articles, AI-title controls, Runs and Sources continue working.
+## Real TEST acceptance after separately authorised deployment
 
-After PR review/merge is separately authorised, use the existing TEST Pages/API
-deployment workflows and local TEST update/restart procedure. No deployment or
-remote secret-setting command is part of this handover's authorised execution.
-Rollback uses the previous compatible TEST Pages/API revision and previous local
-revision/restart. There are no schema/data writes to reverse. Exact pre-change
-active code is retained under `archive/2026-10-29/` and is never executed.
-No contract changes are required; ChatGPT in Chat mode can later update the
-authoritative implementation/deployment status after real TEST evidence exists.
+1. Hosted TEST Media → D1 Usage shows only TEST Media: one series, one summary,
+   no switching. Confirm daily values agree with Cloudflare account analytics.
+2. Local TEST shows the same TEST account and figures through its protected
+   hostname; neither dashboard makes cross-environment requests.
+3. Exercise 7/30/90 UTC-day ranges, both metrics, daily table, selected day,
+   today/partial labels, true zero and missing/outside-retention gaps.
+4. With overrides unset, confirm 5,000,000 read / 100,000 write limits and 75%
+   warning / 90% critical thresholds. Observe boundaries through real available
+   TEST usage or separately authorised temporary overrides; do not generate
+   expensive D1 work to reach a threshold. Record unobserved cases as pending.
+   Invalid supplied overrides must produce explicit unavailability.
+5. Check top-five query ranking/counts against the configured TEST Media database
+   for a selected UTC day. Verify safe fingerprints and no SQL/ID leakage.
+6. Check Refresh, fresh/cached timestamps, repeat-refresh bounds, and explicit
+   stale/unavailable information; analytics delay is not real-time measurement.
+7. Confirm personal Access authentication on hosted/local paths and direct
+   origin/listener denial. Missing, forged, expired, wrong-audience and service
+   identities must fail before cache/provider access on every method.
+8. Under separately controlled TEST configuration, missing/invalid account,
+   database or token must fail closed clearly with no fallback or credential/
+   provider-error leakage. Reject unknown/duplicate parameters and selectors.
+9. Confirm existing Articles, AI-title workflow, Runs, Sources, health and other
+   dashboard functions work with analytics both available and unavailable.
+10. Record real hosted/local evidence before operator-led LIVE promotion.
+
+## Rollback and archives
+
+Prefer disabling only D1 Usage by invalidating/removing its analytics token under
+separate operator authorisation; normal Media functions remain independent.
+If code rollback is required, restore matching Pages, Worker and local revisions
+together because the DTO changed. **Do not re-enable PR #145's dual-account
+analytics or provision its obsolete credentials as a rollback shortcut.** Keep
+this feature unavailable until a safe single-account revision is restored.
+
+Existing 29 October archives are reused unchanged. Exact new pre-change
+snapshots cover only the two newly modified analytics backends. Archive code is
+never executed or promoted. Git history retains PR #145 for reference. This
+correction performs no merge, deployment, secret/settings changes, LIVE work or
+authoritative system-documentation edits.
