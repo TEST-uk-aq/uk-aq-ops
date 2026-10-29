@@ -65,6 +65,14 @@ function authenticatedSourceDay(day, dayUtc) {
     && day.manifest_key === null && day.copied_at === null;
 }
 
+// The existing copied whole-day proof is conservative source authority, not a
+// requirement that the represented AQI day wait another day to become eligible.
+// An omitted or in-progress timestamp-day cannot prove terminal input absence.
+export function authenticatedTerminalSourceDay(day, dayUtc) {
+  return authenticatedSourceDay(day, dayUtc) && day.state === 'authenticated_membership'
+    && Date.parse(day.copied_at) >= Date.parse(`${dayUtc}T00:00:00.000Z`) + 86_400_000;
+}
+
 export function compareCompleteMonthAuthority(scope, currentMonth) {
   const sourceEvidence = scope.source_month_evidence;
   const sourceHash = scope.source_month_hash;
@@ -202,39 +210,50 @@ export async function readCurrentObservationScopes(scopes, {
       const currentness = scope.mode === 'complete_month'
         ? compareCompleteMonthAuthority(scope, currentMonth)
         : compareAuthenticatedPartialDays(scope, currentMonth);
-      const contextResults = [];
-      for (const contextDay of scope.context_days || []) {
-        try {
-          const contextMonth = await month(contextDay.slice(0, 7));
-          const contextHash = contextMonth.manifest?.children.find(child => child.day_utc === contextDay)?.manifest_hash || null;
-          const sourceDay = scope.source_context_days?.find(day => day?.day_utc === contextDay);
-          const sourceHash = sourceDay?.manifest_hash || null;
-          const sourceAuthorityEstablished = authenticatedSourceDay(sourceDay, contextDay);
-          const canonicalAuthorityEstablished = contextMonth.manifest
-            ? Boolean(contextMonth.reference?.key) : contextMonth.absence_authorized === true;
-          contextResults.push({ day_utc: contextDay, source_manifest_hash: sourceHash,
-            canonical_manifest_hash: contextHash,
-            source_authority_established: sourceAuthorityEstablished,
-            canonical_authority_established: canonicalAuthorityEstablished,
-            matches: sourceAuthorityEstablished && canonicalAuthorityEstablished && sourceHash === contextHash,
-            proof_state: sourceAuthorityEstablished && canonicalAuthorityEstablished ? 'established' : 'not_established',
-            root: rootResult.reference,
-            year: contextMonth.year.reference, month: contextMonth.reference });
-        } catch (error) {
-          assertHeld();
-          contextResults.push({ day_utc: contextDay, matches: false,
-            proof_state: 'not_established', error: error.message });
+      async function compareDependencyDays(selectedDays, sourceDays, terminal = false) {
+        const results = [];
+        for (const contextDay of selectedDays) {
+          try {
+            const contextMonth = await month(contextDay.slice(0, 7));
+            const contextHash = contextMonth.manifest?.children.find(child => child.day_utc === contextDay)?.manifest_hash || null;
+            const sourceDay = sourceDays?.find(day => day?.day_utc === contextDay);
+            const sourceHash = sourceDay?.manifest_hash || null;
+            const sourceAuthorityEstablished = terminal
+              ? authenticatedTerminalSourceDay(sourceDay, contextDay)
+              : authenticatedSourceDay(sourceDay, contextDay);
+            const canonicalAuthorityEstablished = contextMonth.manifest
+              ? Boolean(contextMonth.reference?.key) : contextMonth.absence_authorized === true;
+            results.push({ day_utc: contextDay, source_manifest_hash: sourceHash,
+              ...(terminal ? { dependency_role: 'aqi_terminal_endpoint',
+                source_proof: 'completed_timestamp_day', source_copied_at: sourceDay?.copied_at || null } : {}),
+              canonical_manifest_hash: contextHash,
+              source_authority_established: sourceAuthorityEstablished,
+              canonical_authority_established: canonicalAuthorityEstablished,
+              matches: sourceAuthorityEstablished && canonicalAuthorityEstablished && sourceHash === contextHash,
+              proof_state: sourceAuthorityEstablished && canonicalAuthorityEstablished ? 'established' : 'not_established',
+              root: rootResult.reference,
+              year: contextMonth.year.reference, month: contextMonth.reference });
+          } catch (error) {
+            assertHeld();
+            results.push({ day_utc: contextDay, matches: false,
+              proof_state: 'not_established', error: error.message });
+          }
         }
+        return results;
       }
+      const contextResults = await compareDependencyDays(scope.context_days || [], scope.source_context_days);
+      const terminalResults = await compareDependencyDays(scope.terminal_days || [], scope.source_terminal_days, true);
       results.push({ month_utc: scope.month_utc, currentness,
-        context_days: contextResults, matches: currentness.matches && contextResults.every(day => day.matches),
+        context_days: contextResults, terminal_days: terminalResults,
+        matches: currentness.matches && contextResults.every(day => day.matches)
+          && terminalResults.length === 1 && terminalResults.every(day => day.matches),
         canonical_scope: rootEvidence, proof_state: currentness.state });
     } catch (error) {
       // A lost lock is invocation-wide: never downgrade it to one failed month.
       assertHeld();
       results.push({ month_utc: scope.month_utc,
         currentness: { mode: scope.mode, matches: false, state: 'not_established' },
-        context_days: [], matches: false, proof_state: 'not_established', error: error.message });
+        context_days: [], terminal_days: [], matches: false, proof_state: 'not_established', error: error.message });
     }
   }
   return { root: rootResult.reference, root_content_hash: root.content_hash,

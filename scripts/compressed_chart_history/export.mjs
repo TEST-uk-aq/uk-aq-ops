@@ -60,12 +60,80 @@ function parseOptions(args) {
   return { timeseriesId, pollutant: supplied.pollutant, start, end, generations, maxBytes: mib * 1024 ** 2, output: path.resolve(supplied["output-dir"]) };
 }
 function aqiInputRows(result) {
-  return [...result.contextRows, ...result.rows].map((row) => ({
+  return [...result.contextRows, ...result.rows, ...(result.terminalRows || [])].map((row) => ({
     connector_id: result.binding.connector_id, station_id: row[2], timeseries_id: result.binding.timeseries_id,
     pollutant_code: result.binding.pollutant_code, observed_at: row[0], value: row[1],
     source_status: row[3], verification_status: row[4], source: "json",
   }));
 }
+
+export function evaluatedAqiStatus(status, reason) {
+  return status === "ok" || (status === "insufficient_samples" && reason === "insufficient_rolling_24h_hours")
+    || (status === "missing_input" && reason === "no_input_value");
+}
+
+// Counts alone accept the displaced [S,E) grid. Validate canonical periods and
+// every ordered endpoint against the represented interval, including ownership
+// of closing midnight by the preceding daily batch.
+export function aqiEndpointCompleteness(aqi, startUtc, endUtc, batches) {
+  const start = Date.parse(startUtc), end = Date.parse(endUtc);
+  const expected = (end - start) / HOUR;
+  const rows = aqi.rows;
+  const validRange = Number.isSafeInteger(expected) && expected > 0
+    && start % HOUR === 0 && end % HOUR === 0;
+  const expectedFirst = validRange ? new Date(start + HOUR).toISOString() : null;
+  const expectedLast = validRange ? new Date(end).toISOString() : null;
+  const seen = new Set();
+  const expectedSet = new Set(validRange ? Array.from({ length: expected },
+    (_, index) => new Date(start + (index + 1) * HOUR).toISOString()) : []);
+  let invalid = 0;
+  rows.forEach((row, index) => {
+    const timestamp = Date.parse(row.timestamp_hour_utc);
+    const canonical = Number.isFinite(timestamp) && new Date(timestamp).toISOString();
+    if (!validRange || row.timestamp_hour_utc !== canonical || timestamp !== start + (index + 1) * HOUR
+      || row.period_end_utc !== canonical
+      || row.period_start_utc !== new Date(timestamp - HOUR).toISOString()) invalid++;
+    seen.add(row.timestamp_hour_utc);
+  });
+  let cursor = start, batchRowCount = 0;
+  const dailyComplete = Array.isArray(batches) && batches.length === Math.ceil((end - start) / DAY)
+    && batches.every(batch => {
+      const batchEnd = Math.min(cursor + DAY, end);
+      const owned = rows.filter(row => Date.parse(row.timestamp_hour_utc) > cursor
+        && Date.parse(row.timestamp_hour_utc) <= batchEnd);
+      const matches = batch.day_utc === new Date(cursor).toISOString().slice(0, 10)
+        && batch.output_start_utc === new Date(cursor).toISOString()
+        && batch.output_end_utc === new Date(batchEnd).toISOString()
+        && batch.output_end_exclusive_utc === new Date(batchEnd).toISOString()
+        && batch.first_endpoint_utc === new Date(cursor + HOUR).toISOString()
+        && batch.last_endpoint_utc === new Date(batchEnd).toISOString()
+        && batch.row_count === (batchEnd - cursor) / HOUR && batch.row_count === owned.length;
+      cursor = batchEnd; batchRowCount += owned.length;
+      return matches;
+    }) && cursor === end && batchRowCount === rows.length;
+  const metadataMatches = aqi.output_start_utc === startUtc && aqi.output_end_utc === endUtc;
+  return { complete: validRange && rows.length === expected && seen.size === rows.length
+      && invalid === 0 && dailyComplete && metadataMatches,
+    endpoint_convention: 'S < n <= E; period (n-1h,n]',
+    expected_endpoint_count: expected, expected_first_endpoint_utc: expectedFirst,
+    expected_last_endpoint_utc: expectedLast, first_endpoint_utc: rows[0]?.timestamp_hour_utc || null,
+    last_endpoint_utc: rows.at(-1)?.timestamp_hour_utc || null, unique_endpoint_count: seen.size,
+    duplicate_endpoint_count: rows.length - seen.size,
+    missing_endpoint_count: [...expectedSet].filter(endpoint => !seen.has(endpoint)).length,
+    extra_endpoint_count: [...seen].filter(endpoint => !expectedSet.has(endpoint)).length,
+    invalid_endpoint_or_period_count: invalid, daily_ownership_complete: dailyComplete,
+    output_metadata_matches: metadataMatches };
+}
+
+export function indexCompleteness(aqi, index, endpoints) {
+  const evaluated = aqi.rows.filter(row => evaluatedAqiStatus(row[`${index}_calculation_status`],
+    row[`${index}_missing_reason`]));
+  return { evaluated_complete: endpoints.complete && evaluated.length === endpoints.expected_endpoint_count,
+    available_endpoint_count: aqi.rows.filter(row => row[`${index}_calculation_status`] === 'ok').length,
+    unavailable_endpoint_count: evaluated.filter(row => row[`${index}_calculation_status`] !== 'ok').length,
+    unevaluated_endpoint_count: Math.max(0, endpoints.expected_endpoint_count - evaluated.length) };
+}
+
 export async function calculateMonthAqi(result, month, options) {
   const connectorId = result.binding.connector_id;
   const allRows = aqiInputRows(result);
@@ -79,11 +147,11 @@ export async function calculateMonthAqi(result, month, options) {
   const batches = [], rows = [], gapRanges = [], reasons = new Set(), seen = new Set();
   for (let dayMs = Date.parse(month.requested_start_utc); dayMs < Date.parse(month.requested_end_exclusive_utc); dayMs += DAY) {
     const endExclusive = Math.min(dayMs + DAY, Date.parse(month.requested_end_exclusive_utc));
-    const outputStartMs = dayMs - HOUR, outputEndMs = endExclusive - HOUR;
+    const outputStartMs = dayMs, outputEndMs = endExclusive;
     const inputStart = outputStartMs - (options.pollutant === "no2" ? 0 : 23 * HOUR);
     const inputEnd = outputEndMs + 1;
     const scoped = allRows.filter((row) => { const t = Date.parse(row.observed_at); return t >= inputStart && t < inputEnd; });
-    const requiredDays = [...result.contextDays, ...result.days].filter((day) => {
+    const requiredDays = [...result.contextDays, ...result.days, ...(result.terminalDays || [])].filter((day) => {
       const t = Date.parse(`${day.day_utc}T00:00:00.000Z`);
       return t < inputEnd && t + DAY > inputStart;
     });
@@ -102,27 +170,36 @@ export async function calculateMonthAqi(result, month, options) {
     gapRanges.push(...calculated.aqi.gap_ranges);
     calculated.aqi.partial_reasons.forEach((reason) => reasons.add(reason));
     batches.push({ day_utc: new Date(dayMs).toISOString().slice(0, 10),
-      output_start_utc: new Date(dayMs).toISOString(), output_end_exclusive_utc: new Date(endExclusive).toISOString(),
+      output_start_utc: new Date(dayMs).toISOString(), output_end_utc: new Date(endExclusive).toISOString(),
+      // Retain the existing calendar work-unit bound; it is not an exclusive AQI endpoint.
+      output_end_exclusive_utc: new Date(endExclusive).toISOString(),
+      first_endpoint_utc: new Date(dayMs + HOUR).toISOString(), last_endpoint_utc: new Date(endExclusive).toISOString(),
       required_context_start_utc: new Date(inputStart).toISOString(), context_complete: contextComplete,
       response_complete: calculated.aqi.response_complete, has_gap: calculated.aqi.has_gap,
       partial_reasons: calculated.aqi.partial_reasons, row_count: calculated.aqi.rows.length });
   }
   rows.sort((a, b) => a.timestamp_hour_utc.localeCompare(b.timestamp_hour_utc));
-  const complete = batches.every((batch) => batch.response_complete);
+  const endpointMetadata = { rows, output_start_utc: month.requested_start_utc,
+    output_end_utc: month.requested_end_exclusive_utc };
+  const endpoints = aqiEndpointCompleteness(endpointMetadata, month.requested_start_utc,
+    month.requested_end_exclusive_utc, batches);
+  if (!endpoints.complete) reasons.add('aqi_endpoint_grid_incomplete');
+  const complete = endpoints.complete && batches.every((batch) => batch.response_complete);
   return { schema_version: 2, kind: "uk_aq_compressed_chart_aqi_month",
     identity: { connector_id: connectorId, timeseries_id: options.timeseriesId,
       station_id: result.binding.station_id, pollutant_code: options.pollutant },
     source: { generation: result.generation, bucket: result.bucket,
       source_evidence: result.evidence, algorithm_version: AQI_ALGORITHM_VERSION },
     coverage: { ...month, response_complete: complete, daily_batches: batches,
-      context_days: result.contextDays, row_count: rows.length },
+      context_days: result.contextDays, terminal_days: result.terminalDays || [],
+      endpoints, row_count: rows.length },
     aqi: { enabled: true, calculation_source: "calculated_from_observations",
       publication_source: "precomputed_compressed_json", response_contract: "aqi_hour_interval_v2",
       algorithm_version: AQI_ALGORITHM_VERSION, rows, response_complete: complete,
-      has_gap: batches.some((batch) => batch.has_gap), gap_ranges: gapRanges,
+      has_gap: !endpoints.complete || batches.some((batch) => batch.has_gap), gap_ranges: gapRanges,
       partial_reasons: [...reasons].sort(), required_context_start_utc: batches[0]?.required_context_start_utc,
       output_start_utc: month.requested_start_utc,
-      output_end_utc: new Date(Date.parse(month.requested_end_exclusive_utc) - HOUR).toISOString(),
+      output_end_utc: month.requested_end_exclusive_utc,
       source_counts: { calculated_from_observations: rows.length } } };
 }
 function monthsBetween(start, end) {
@@ -171,7 +248,7 @@ async function prepareFiles(result, options) {
   const started = performance.now(), cpuStarted = process.cpuUsage();
   const objects = [];
   if (result.state === "failed") return objects;
-  const evidence = { schema_version: 1, kind: "uk_aq_chart_history_source_evidence", source_generation: result.generation, bucket: result.bucket, binding: result.binding, verification: result.verification, source_objects: result.source_objects, context_days: result.contextDays };
+  const evidence = { schema_version: 1, kind: "uk_aq_chart_history_source_evidence", source_generation: result.generation, bucket: result.bucket, binding: result.binding, verification: result.verification, source_objects: result.source_objects, context_days: result.contextDays, terminal_days: result.terminalDays || [] };
   const evidenceBody = canonicalJson(evidence);
   const evidenceSha = sha256(evidenceBody);
   const evidencePath = `${result.generation}/source-evidence.${evidenceSha}.json`;
@@ -261,7 +338,7 @@ async function main() {
     console.log(`${version}: ${result.state}, ${result.metrics.row_count} rows, ${result.metrics.source_bytes_read} source bytes`);
   }
   const comparison = compareSources(results);
-  const manifest = { schema_version: 2, kind: "uk_aq_chart_history_candidate_manifest", publication_state: "local_only_not_published", export_schema_version: 2, environment: "TEST", requested_interval: { start_utc: options.start, end_exclusive_utc: options.end }, identity: { connector_id: 1, timeseries_id: options.timeseriesId, pollutant_code: options.pollutant }, complete: results.every((r) => r.state === "complete"), sources: results.map((r) => ({ generation: r.generation, state: r.state, binding: r.binding || null, source_evidence: r.evidence || null, days: r.days, context_days: r.contextDays, error: r.error || null })), objects, publication_rule: "Verify paired observation/AQI gzip and evidence objects before publishing a new complete manifest; retain prior complete selection on failure." };
+  const manifest = { schema_version: 2, kind: "uk_aq_chart_history_candidate_manifest", publication_state: "local_only_not_published", export_schema_version: 2, environment: "TEST", requested_interval: { start_utc: options.start, end_exclusive_utc: options.end }, identity: { connector_id: 1, timeseries_id: options.timeseriesId, pollutant_code: options.pollutant }, complete: results.every((r) => r.state === "complete"), sources: results.map((r) => ({ generation: r.generation, state: r.state, binding: r.binding || null, source_evidence: r.evidence || null, days: r.days, context_days: r.contextDays, terminal_days: r.terminalDays || [], error: r.error || null })), objects, publication_rule: "Verify paired observation/AQI gzip and evidence objects before publishing a new complete manifest; retain prior complete selection on failure." };
   const manifestBody = canonicalJson(manifest);
   const manifestPath = `candidate-manifest.${sha256(manifestBody)}.json`;
   // Manifest last, only after referenced local outputs pass checks. State never

@@ -7,15 +7,15 @@ import { gzipSync, gunzipSync } from 'node:zlib';
 import { canonicalJson, requireValid as check, assertIdentity, newPubID, publicationPrefix } from '../schema.mjs';
 import { sha256Hex } from '../../backup_r2/lib/rclone.mjs';
 import { decodeCanonicalObservations, daysBetween } from '../../compressed_chart_history/extract.mjs';
-import { calculateMonthAqi } from '../../compressed_chart_history/export.mjs';
+import { calculateMonthAqi, aqiEndpointCompleteness, indexCompleteness } from '../../compressed_chart_history/export.mjs';
 import { observationHistoryPhysicalSchemasFromManifest } from '../../../workers/shared/uk_aq_observation_history_schema.mjs';
 import { AQI_ALGORITHM_VERSION, DAQI_PM_ROLLING24H_WINDOW_HOURS,
   DAQI_PM_ROLLING24H_REQUIRED_HOURS } from '../../../lib/aqi/aqi_levels.mjs';
 import { createDropboxReader, resolveDropboxSource, CHECKPOINT_KEY } from './dropbox-reader.mjs';
 import { openBackupSource } from './source.mjs';
-import { readCurrentObservationScopes, withBootstrapObservationLock } from './currentness.mjs';
+import { authenticatedTerminalSourceDay, readCurrentObservationScopes, withBootstrapObservationLock } from './currentness.mjs';
 
-const DAY = 86_400_000, HOUR = 3_600_000, MIB = 1024 ** 2;
+const DAY = 86_400_000, MIB = 1024 ** 2;
 const scopeKey = scope => `${scope.connector_id}/${scope.pollutant_code}/${scope.month_utc}`;
 export const HELP = `Manual, local-only TEST Dropbox historical JSONgen bootstrap.
 No execution occurs on import. No R2/database/Dropbox writes or publication.
@@ -165,7 +165,8 @@ export async function buildCurrentnessScopes(source, periods, pollutants) {
     const selectedDays = daysBetween(period.requested_start_utc, period.requested_end_exclusive_utc);
     const contextDay = wantsPmContext
       ? new Date(Date.parse(period.requested_start_utc) - DAY).toISOString().slice(0, 10) : null;
-    for (const day of [...selectedDays, ...(contextDay ? [contextDay] : [])]) {
+    const terminalDay = period.requested_end_exclusive_utc.slice(0, 10);
+    for (const day of [...selectedDays, ...(contextDay ? [contextDay] : []), terminalDay]) {
       if (!daysByMonth.has(day.slice(0, 7))) daysByMonth.set(day.slice(0, 7), new Set());
       daysByMonth.get(day.slice(0, 7)).add(day);
     }
@@ -173,7 +174,8 @@ export async function buildCurrentnessScopes(source, periods, pollutants) {
     const monthEnd = (() => { const date = new Date(monthStart); date.setUTCMonth(date.getUTCMonth() + 1); return date.toISOString(); })();
     return { ...period, mode: period.requested_start_utc === monthStart
       && period.requested_end_exclusive_utc === monthEnd ? 'complete_month' : 'partial_completed_days',
-    selected_days: selectedDays, context_days: contextDay ? [contextDay] : [] };
+    selected_days: selectedDays, context_days: contextDay ? [contextDay] : [],
+    terminal_days: [terminalDay], terminal_endpoint_utc: period.requested_end_exclusive_utc };
   });
   const sourceMonths = new Map();
   for (const [monthUtc, selectedDays] of daysByMonth) {
@@ -191,23 +193,34 @@ export async function buildCurrentnessScopes(source, periods, pollutants) {
         .selected_days.find(day => day.day_utc === dayUtc)),
       source_month_evidence: month,
       context_month_evidence: period.context_days.map(dayUtc => sourceMonths.get(dayUtc.slice(0, 7))),
+      terminal_endpoint_utc: period.terminal_endpoint_utc,
+      terminal_days: period.terminal_days,
+      source_terminal_days: period.terminal_days.map(dayUtc => sourceMonths.get(dayUtc.slice(0, 7))
+        .selected_days.find(day => day.day_utc === dayUtc)),
+      terminal_month_evidence: period.terminal_days.map(dayUtc => sourceMonths.get(dayUtc.slice(0, 7))),
     };
   });
   return { source_months: Object.fromEntries(sourceMonths), scopes };
 }
 
-export function classifyPeriodCurrentness(sourceScope, canonicalScope, requirePmContext = true) {
+export function classifyPeriodCurrentness(sourceScope, canonicalScope, requirePmContext = sourceScope.context_days?.length > 0) {
   const established = canonicalScope.proof_state === 'established';
-  const monthMatches = established && (sourceScope.mode === 'complete_month'
+  const monthMatches = established && canonicalScope.currentness.matches && (sourceScope.mode === 'complete_month'
     ? (sourceScope.source_month_hash || null) === (canonicalScope.currentness.canonical_content_hash || null)
     : canonicalScope.currentness.matches);
-  const contextMatches = (canonicalScope.context_days || []).every(day => day.matches);
-  return { matches: monthMatches && (!requirePmContext || contextMatches),
+  const contextMatches = (canonicalScope.context_days || []).length === (sourceScope.context_days || []).length
+    && (canonicalScope.context_days || []).every(day => day.matches);
+  const terminalMatches = sourceScope.terminal_days?.length === 1
+    && canonicalScope.terminal_days?.length === 1
+    && canonicalScope.terminal_days[0].day_utc === sourceScope.terminal_days[0]
+    && canonicalScope.terminal_days[0].matches === true;
+  return { matches: monthMatches && (!requirePmContext || contextMatches) && terminalMatches,
     month_matches: monthMatches, context_matches: contextMatches,
-    context_required: requirePmContext };
+    terminal_matches: terminalMatches, context_required: requirePmContext };
 }
 
-export function scopedSourceStabilityKeys(source, sourceProof, reader, scope, timeseriesIds = [], requirePmContext = true) {
+export function scopedSourceStabilityKeys(source, sourceProof, reader, scope, timeseriesIds = [], requirePmContext = true,
+  requireTerminal = true) {
   const scopeProof = sourceProof.scopes.find(item => item.month_utc === scope.month_utc);
   check(scopeProof, `scoped metadata proof missing for ${scope.month_utc}`);
   const networkKeys = new Set();
@@ -215,7 +228,9 @@ export function scopedSourceStabilityKeys(source, sourceProof, reader, scope, ti
   if (source.bindingPackRootEvidence?.key) cachedProofKeys.add(source.bindingPackRootEvidence.key);
   if (source.verificationLatestEvidence?.key) cachedProofKeys.add(source.verificationLatestEvidence.key);
   const monthEvidence = scopeProof.source_month_evidence;
-  for (const evidence of [monthEvidence, ...(scopeProof.context_month_evidence || [])]) {
+  for (const evidence of [monthEvidence,
+    ...(requirePmContext ? scopeProof.context_month_evidence || [] : []),
+    ...(requireTerminal ? scopeProof.terminal_month_evidence || [] : [])]) {
     if (!evidence) continue;
     for (const reference of [evidence.observations_root_manifest, evidence.year_manifest,
       evidence.month_manifest, evidence.month_state_shard]) {
@@ -231,7 +246,8 @@ export function scopedSourceStabilityKeys(source, sourceProof, reader, scope, ti
     }
   }
   const selectedDays = [...scopeProof.selected_days,
-    ...(requirePmContext ? (scopeProof.context_days || []) : [])];
+    ...(requirePmContext ? (scopeProof.context_days || []) : []),
+    ...(requireTerminal ? (scopeProof.terminal_days || []) : [])];
   for (const dayUtc of selectedDays) {
     const evidence = sourceProof.source_months[dayUtc.slice(0, 7)];
     const day = evidence?.selected_days?.find(item => item.day_utc === dayUtc);
@@ -259,18 +275,6 @@ export function scopedSourceStabilityKeys(source, sourceProof, reader, scope, ti
 const sortedRows = rows => rows.sort((a,b) => a.observed_at_utc.localeCompare(b.observed_at_utc)
   || a.value - b.value || canonicalJson(a).localeCompare(canonicalJson(b)));
 const tuples = rows => rows.map(r => [r.observed_at_utc, r.value, r.station_id, r.source_status, r.verification_status]);
-function evaluated(status, reason) {
-  return status === 'ok' || (status === 'insufficient_samples' && reason === 'insufficient_rolling_24h_hours')
-    || (status === 'missing_input' && reason === 'no_input_value');
-}
-function indexCompleteness(aqi, index, expectedEndpoints) {
-  const rows = aqi.rows;
-  return { evaluated_complete: rows.length === expectedEndpoints
-      && rows.every(r => evaluated(r[`${index}_calculation_status`], r[`${index}_missing_reason`])),
-    available_endpoint_count: rows.filter(r => r[`${index}_calculation_status`] === 'ok').length,
-    unavailable_endpoint_count: rows.filter(r => r[`${index}_calculation_status`] !== 'ok').length,
-    unevaluated_endpoint_count: expectedEndpoints - rows.length };
-}
 
 export async function runBootstrap(options) {
   check(process.env.UK_AQ_ENV_NAME === 'TEST', 'UK_AQ_ENV_NAME must be TEST');
@@ -385,7 +389,8 @@ export async function runBootstrap(options) {
       r2_manifest_reads: initial.reads,
       scopes: initialScopes.map(scope => ({ month_utc: scope.month_utc, mode: scope.mode,
         result: scope.result, currentness: scope.canonical.currentness,
-        context_days: scope.canonical.context_days, canonical_scope: scope.canonical.canonical_scope })),
+        context_days: scope.canonical.context_days, terminal_days: scope.canonical.terminal_days,
+        canonical_scope: scope.canonical.canonical_scope })),
     };
     report.currentness.source_as_of = initial.checked_at_utc;
     report.currentness.status = initialScopes.every(scope => scope.result.matches)
@@ -418,16 +423,24 @@ export async function runBootstrap(options) {
         try {
         const monthCurrentness = periodCurrentness.get(month.month_utc);
         const needsPmContext = pollutant === 'pm25' || pollutant === 'pm10';
-        if (!monthCurrentness?.result.month_matches
-          || (needsPmContext && !monthCurrentness.result.context_matches)) {
+        if (!monthCurrentness?.result.month_matches) {
           report.incomplete_scopes.push({ ...active, timeseries_ids: options.timeseries,
-            reason: !monthCurrentness?.result.month_matches ? 'initial_month_currentness_mismatch'
-              : 'initial_pm_context_currentness_mismatch', currentness: monthCurrentness?.canonical || null });
+            reason: 'initial_month_currentness_mismatch', currentness: monthCurrentness?.canonical || null });
           continue;
         }
         const contextStart = needsPmContext
           ? new Date(Date.parse(month.requested_start_utc) - DAY).toISOString()
           : month.requested_start_utc;
+        const sourceScope = sourceScopeProof.scopes.find(scope => scope.month_utc === month.month_utc);
+        const terminalDay = month.requested_end_exclusive_utc.slice(0, 10);
+        const terminalSourceDay = sourceScope.source_terminal_days[0];
+        const terminalSourceEstablished = authenticatedTerminalSourceDay(terminalSourceDay, terminalDay);
+        const terminalDependency = { dependency_role: 'aqi_terminal_endpoint',
+          endpoint_utc: month.requested_end_exclusive_utc, day_utc: terminalDay,
+          proof_method: 'completed_timestamp_day', source_day: terminalSourceDay,
+          source_authority_established: terminalSourceEstablished,
+          state: terminalSourceEstablished ? 'authenticated_source_day' : 'pending_terminal_source_authority',
+          limitation: 'no partial_timestamp_day_or_exact_midnight_authority_implemented' };
         const groups = new Map(), days = [], files = [], selectedIds = options.timeseries ? new Set(options.timeseries) : null;
         let selectedRows = 0;
         const group = async id => {
@@ -442,11 +455,15 @@ export async function runBootstrap(options) {
           if (b.connector_id === connectorId && b.pollutant_code === pollutant) await group(id);
         }
         const authority = await source.authority(connectorId);
-        for (const day of daysBetween(contextStart, month.requested_end_exclusive_utc)) {
+        const sourceDays = daysBetween(contextStart, month.requested_end_exclusive_utc);
+        if (terminalSourceEstablished) sourceDays.push(terminalDay);
+        for (const day of sourceDays) {
           reader.deadline();
+          const dependencyRole = day === terminalDay ? 'aqi_terminal_endpoint'
+            : day < month.requested_start_utc.slice(0, 10) ? 'pm_rolling_context' : 'raw_observations';
           const manifest = await source.pollutant(day, connectorId, pollutant);
           if (!manifest) { days.push({ day_utc: day, state: 'authoritative_absence',
-            source_state: 'authoritative_absence', row_count: 0 }); continue; }
+            dependency_role: dependencyRole, source_state: 'authoritative_absence', row_count: 0 }); continue; }
           for (const physical of observationHistoryPhysicalSchemasFromManifest(manifest)) source.assertStatusMode(physical, connectorId, authority);
           const before = selectedRows, perSeries = new Map();
           for (const file of manifest.files) {
@@ -463,13 +480,17 @@ export async function runBootstrap(options) {
                   && entry.pollutant_code === pollutant, 'verification/physical binding identity mismatch');
                 check(++selectedRows <= options.limits.selectedRows, 'selected-row memory limit exceeded; select a smaller batch');
                 perSeries.set(row.timeseries_id, (perSeries.get(row.timeseries_id) || 0) + 1);
+                // Authenticate/count the whole admitted source day, but retain
+                // only E from the terminal day as a calculation dependency.
+                if (day === terminalDay && row.observed_at_utc !== month.requested_end_exclusive_utc) return;
                 const target = await group(row.timeseries_id);
-                target.rows.push(row); target.schemas.set(JSON.stringify(physical), physical);
+                target.rows.push(row);
+                if (dependencyRole === 'raw_observations') target.schemas.set(JSON.stringify(physical), physical);
               },
             }, authority, stats);
             const used = process.cpuUsage(beforeCpu);
             stats.decode_cpu_ms += (used.user + used.system) / 1000;
-            files.push(reader.inventory.get(file.key));
+            files.push({ ...reader.inventory.get(file.key), dependency_role: dependencyRole });
           }
           if (manifest.timeseries_row_counts) for (const [id, count] of Object.entries(manifest.timeseries_row_counts)) {
             if (!selectedIds || selectedIds.has(Number(id))) check((perSeries.get(Number(id)) || 0) === count,
@@ -478,8 +499,13 @@ export async function runBootstrap(options) {
           if (manifest.timeseries_row_counts) check([...perSeries.keys()].every(id => Object.hasOwn(manifest.timeseries_row_counts, String(id))),
             'canonical timeseries counts omit decoded physical identity');
           days.push({ day_utc: day, state: 'exported', source_state: 'authenticated_membership',
-            row_count: selectedRows - before });
+            dependency_role: dependencyRole, row_count: selectedRows - before });
         }
+        if (!terminalSourceEstablished) days.push({ day_utc: terminalDay,
+          dependency_role: 'aqi_terminal_endpoint', state: 'pending_terminal_source_authority',
+          source_state: 'not_established', row_count: 0 });
+        terminalDependency.day_accounting = days.filter(day => day.dependency_role === 'aqi_terminal_endpoint');
+        terminalDependency.source_bytes_authenticated = terminalSourceEstablished;
         await retainMetadata();
         const sourceEvidence = await contentJson('evidence/source-evidence', {
           schema_version: 1, kind: 'uk_aq_jsongen_dropbox_bootstrap_source_evidence', environment: 'TEST',
@@ -494,6 +520,7 @@ export async function runBootstrap(options) {
           physical_binding_authority: 'authenticated_backup_pack_membership_corroborated_by_physical_rows; matching_Core_publication_not_independently_authenticated',
           metadata_objects: [...reader.metadata.values()].sort((a,b) => a.key.localeCompare(b.key)),
           consumed_parquet: files, days, context_start_utc: contextStart,
+          terminal_dependency: terminalDependency,
           raw_source_status_rule: 'embedded verification_status is never represented as original provider status',
           source_timestamp_precision: 'canonical millisecond UTC; no rounding or truncation',
         });
@@ -504,16 +531,19 @@ export async function runBootstrap(options) {
           const rows = sortedRows(groupValue.rows);
           const visible = rows.filter(r => r.observed_at_utc >= month.requested_start_utc && r.observed_at_utc < month.requested_end_exclusive_utc);
           const context = rows.filter(r => r.observed_at_utc < month.requested_start_utc);
+          const terminal = rows.filter(r => r.observed_at_utc === month.requested_end_exclusive_utc);
           const pubID = newPubID();
           const algorithm = { version: AQI_ALGORITHM_VERSION, daqi_pm_window_hours: DAQI_PM_ROLLING24H_WINDOW_HOURS,
             daqi_pm_required_valid_hours: DAQI_PM_ROLLING24H_REQUIRED_HOURS,
-            endpoint_convention: 'hour-ending (n-1h,n]; visible endpoints in [requested_start,requested_end)',
-            dependency_start_utc: contextStart, dependency_end_exclusive_utc: month.requested_end_exclusive_utc,
+            endpoint_convention: 'hour-ending (n-1h,n]; requested_start < n <= requested_end',
+            dependency_start_utc: contextStart,
+            dependency_end_exclusive_utc: new Date(Date.parse(month.requested_end_exclusive_utc) + 1).toISOString(),
+            terminal_dependency: terminalDependency,
             dependency_evidence: sourceEvidence, preceding_managed_publication: null };
           const common = { schema_version: 1, environment: 'TEST', pub_id: pubID, identity, month_utc: month.month_utc,
             source_checkpoint: source.checkpoint, source_evidence: sourceEvidence, calculation_dependencies: algorithm,
             publication_state: 'local_private_candidate_not_managed_publication', coverage: month };
-          const provenance = [...new Set(rows.map(r => r.source_status_provenance))].sort();
+          const provenance = [...new Set(visible.map(r => r.source_status_provenance))].sort();
           const unique = new Set(visible.map(r => r.observed_at_utc)).size;
           const observations = { ...common, kind: 'uk_aq_jsongen_bootstrap_observations_candidate',
             physical_schemas: [...groupValue.schemas.values()], source_status_provenance: provenance.length ? provenance : ['no_source_rows'],
@@ -524,7 +554,8 @@ export async function runBootstrap(options) {
               days: days.filter(d => d.day_utc >= month.requested_start_utc.slice(0,10)
                 && d.day_utc < month.requested_end_exclusive_utc.slice(0,10)).map(d => ({
                 day_utc: d.day_utc, source_state: d.source_state,
-                measurement_state: d.row_count > 0 ? 'measurements_present' : 'natural_measurement_gap',
+                measurement_state: visible.some(row => row.observed_at_utc.startsWith(d.day_utc))
+                  ? 'measurements_present' : 'natural_measurement_gap',
                 row_count: visible.filter(r => r.observed_at_utc.startsWith(d.day_utc)).length })) },
             row_columns: ['observed_at_utc', 'value', 'station_id', 'source_status', 'verification_status',
               'embedded_verification_status', 'source_status_provenance'],
@@ -534,7 +565,9 @@ export async function runBootstrap(options) {
           let calculated;
           try {
             const result = { binding: groupValue.binding, rows: tuples(visible), contextRows: tuples(context),
-              days: days.filter(d => d.day_utc >= month.requested_start_utc.slice(0,10)),
+              terminalRows: tuples(terminal),
+              days: days.filter(d => d.dependency_role === 'raw_observations'),
+              terminalDays: days.filter(d => d.dependency_role === 'aqi_terminal_endpoint'),
               contextDays: needsPmContext
                 ? days.filter(d => d.day_utc < month.requested_start_utc.slice(0,10)) : [],
               state: 'complete', generation: 'v3', bucket: 'dropbox_backup_not_r2', evidence: sourceEvidence };
@@ -549,13 +582,22 @@ export async function runBootstrap(options) {
             report.aqi_calculation_wall_ms += performance.now() - aqBegin;
             report.aqi_calculation_cpu_ms += (used.user + used.system) / 1000;
           }
+          const endpoints = aqiEndpointCompleteness(calculated.aqi, month.requested_start_utc,
+            month.requested_end_exclusive_utc, calculated.coverage.daily_batches);
           const aqi = { ...common, kind: 'uk_aq_jsongen_bootstrap_aqi_candidate',
             algorithm_version: AQI_ALGORITHM_VERSION, daily_batches: calculated.coverage.daily_batches,
+            // Original exact-E inputs retain identity, statuses and provenance
+            // as derived dependencies, outside the raw [S,E) observation product.
+            terminal_source_inputs: terminal,
             completeness: { response_complete: calculated.aqi.response_complete,
-              daqi: indexCompleteness(calculated.aqi, 'daqi', (Date.parse(month.requested_end_exclusive_utc) - Date.parse(month.requested_start_utc)) / HOUR),
-              eaqi: indexCompleteness(calculated.aqi, 'eaqi', (Date.parse(month.requested_end_exclusive_utc) - Date.parse(month.requested_start_utc)) / HOUR),
-              context_source_complete: !needsPmContext || days.filter(d => d.day_utc < month.requested_start_utc.slice(0,10))
-                .every(d => d.source_state),
+              endpoints,
+              daqi: indexCompleteness(calculated.aqi, 'daqi', endpoints),
+              eaqi: indexCompleteness(calculated.aqi, 'eaqi', endpoints),
+              terminal_source_complete: terminalSourceEstablished,
+              terminal_dependency: { ...terminalDependency, input_row_count: terminal.length },
+              context_source_complete: !needsPmContext || (days.filter(d => d.dependency_role === 'pm_rolling_context').length === 1
+                && days.filter(d => d.dependency_role === 'pm_rolling_context')
+                  .every(d => ['authenticated_membership', 'authoritative_absence'].includes(d.source_state))),
               context_day_accounting: needsPmContext
                 ? days.filter(d => d.day_utc < month.requested_start_utc.slice(0,10)) : [],
               currentness_evidence_in_candidate_descriptor: true, partial_reasons: calculated.aqi.partial_reasons,
@@ -563,7 +605,6 @@ export async function runBootstrap(options) {
           const prefix = `candidates/${publicationPrefix(identity, month.month_utc, pubID)}`;
           const observationRef = await gzipProduct(prefix, 'observations', observations);
           const aqiRef = await gzipProduct(prefix, 'aqi', aqi);
-          const sourceScope = sourceScopeProof.scopes.find(scope => scope.month_utc === month.month_utc);
           const candidate = { ...common, kind: 'uk_aq_jsongen_bootstrap_monthly_pair_candidate',
             observations: observationRef, aqi: aqiRef, observation_count: visible.length,
             observation_completeness: observations.completeness, aqi_completeness: aqi.completeness,
@@ -580,6 +621,7 @@ export async function runBootstrap(options) {
               'no_authenticated_managed_monthly_baseline', 'no_managed_preceding_month_publication'] };
           const summary = { identity, month_utc: month.month_utc, included_start_utc: month.requested_start_utc,
             included_end_exclusive_utc: month.requested_end_exclusive_utc, partial_month: month.partial_month,
+            aqi_first_endpoint_utc: endpoints.first_endpoint_utc, aqi_last_endpoint_utc: endpoints.last_endpoint_utc,
             observation_count: visible.length, aqi_row_count: calculated.aqi.rows.length,
             aqi_response_complete: calculated.aqi.response_complete, source_complete: true,
             context_complete: aqi.completeness.context_source_complete, local_candidate_complete: false,
@@ -589,7 +631,10 @@ export async function runBootstrap(options) {
           stagedCandidates.push({ prefix, candidate, summary, month_utc: month.month_utc,
             connector_id: connectorId, pollutant_code: pollutant, timeseries_id: timeseriesId,
             source_object_keys: files.map(file => file.key),
-            aqi_complete: calculated.aqi.response_complete,
+            raw_source_object_keys: files.filter(file => file.dependency_role === 'raw_observations').map(file => file.key),
+            aqi_complete: calculated.aqi.response_complete && endpoints.complete
+              && aqi.completeness.daqi.evaluated_complete && aqi.completeness.eaqi.evaluated_complete,
+            terminal_complete: terminalSourceEstablished,
             context_complete: aqi.completeness.context_source_complete });
           report.observation_count += visible.length;
         }
@@ -599,6 +644,7 @@ export async function runBootstrap(options) {
           selected_day_accounting: days.filter(d => d.day_utc >= month.requested_start_utc.slice(0,10)
             && d.day_utc < month.requested_end_exclusive_utc.slice(0,10)),
           pm_context_day_accounting: days.filter(d => d.day_utc < month.requested_start_utc.slice(0,10)),
+          terminal_dependency: terminalDependency,
           physical_series_count: groups.size, candidate_count: groups.size });
         } catch (error) {
           const key = scopeKey(active);
@@ -623,6 +669,10 @@ export async function runBootstrap(options) {
     for (const staged of stagedCandidates) {
       const proofKeys = scopedSourceStabilityKeys(source, sourceScopeProof, reader, staged,
         [staged.timeseries_id], staged.pollutant_code === 'pm25' || staged.pollutant_code === 'pm10');
+      const rawProofKeys = scopedSourceStabilityKeys(source, sourceScopeProof, reader, staged,
+        [staged.timeseries_id], false, false);
+      staged.raw_proof_keys = new Set([...rawProofKeys.network_keys,
+        ...rawProofKeys.cached_proof_keys, ...staged.raw_source_object_keys]);
       const networkKeys = new Set(proofKeys.network_keys);
       const cachedKeys = new Set([...proofKeys.cached_proof_keys, ...proofKeys.network_keys,
         ...staged.source_object_keys]);
@@ -630,10 +680,15 @@ export async function runBootstrap(options) {
       for (const key of cachedKeys) addConsumer(cachedConsumers, key, staged);
     }
     const sourceFailures = new Map();
+    const rawSourceFailures = new Map();
     const failSourceConsumers = (key, error, consumers) => {
       for (const staged of consumers || stagedCandidates) {
         if (!sourceFailures.has(staged)) sourceFailures.set(staged, []);
         sourceFailures.get(staged).push({ key, reason: error.message });
+        if (staged.raw_proof_keys.has(key)) {
+          if (!rawSourceFailures.has(staged)) rawSourceFailures.set(staged, []);
+          rawSourceFailures.get(staged).push({ key, reason: error.message });
+        }
       }
     };
     try { await reader.verifyCachedObjects([CHECKPOINT_KEY]); }
@@ -662,6 +717,10 @@ export async function runBootstrap(options) {
     report.source_stability.selected_scopes = stagedCandidates.map(staged => ({
       scope: scopeKey(staged), timeseries_id: staged.timeseries_id,
       state: sourceFailures.has(staged) ? 'not_established' : 'original_selected_proof_revalidated',
+      raw_observation_state: rawSourceFailures.has(staged) ? 'not_established' : 'original_selected_proof_revalidated',
+      terminal_endpoint_utc: staged.candidate.calculation_dependencies.terminal_dependency.endpoint_utc,
+      terminal_source_object_keys: staged.source_object_keys.filter(key => key.includes(
+        `/day_utc=${staged.candidate.calculation_dependencies.terminal_dependency.day_utc}/`)),
       failures: sourceFailures.get(staged) || [],
     }));
     const finalStarted = performance.now();
@@ -686,6 +745,7 @@ export async function runBootstrap(options) {
       r2_manifest_reads: final.canonical.reads,
       scopes: [...finalByMonth.values()].map(scope => ({ month_utc: scope.month_utc,
         result: scope.result, currentness: scope.currentness, context_days: scope.context_days,
+        terminal_days: scope.terminal_days,
         canonical_scope: scope.canonical_scope })) };
     const rootHashChanged = report.currentness.start.canonical_root_content_hash
       !== final.canonical.root_content_hash;
@@ -698,7 +758,11 @@ export async function runBootstrap(options) {
       ? 'initial_and_final_scoped_checks_match' : 'initial_or_final_scoped_mismatch';
     report.currentness.scope_results = [...finalByMonth.values()].map(scope => ({ month_utc: scope.month_utc,
       mode: scope.currentness.mode, start_matches: periodCurrentness.get(scope.month_utc)?.result.matches === true,
-      final_matches: scope.result.matches }));
+      final_matches: scope.result.matches,
+      raw_start_matches: periodCurrentness.get(scope.month_utc)?.result.month_matches === true,
+      raw_final_matches: scope.result.month_matches,
+      terminal_start_matches: periodCurrentness.get(scope.month_utc)?.result.terminal_matches === true,
+      terminal_final_matches: scope.result.terminal_matches }));
     await retainMetadata();
     for (const staged of stagedCandidates) {
       const canonicalScope = finalByMonth.get(staged.month_utc);
@@ -709,27 +773,40 @@ export async function runBootstrap(options) {
       const finalScope = canonicalScope ? { ...canonicalScope, result: finalResult } : null;
       const startResult = periodCurrentness.get(staged.month_utc)?.result;
       const initiallyCurrent = startResult?.month_matches === true
-        && (!needsPmContext || startResult.context_matches === true);
+        && (!needsPmContext || startResult.context_matches === true) && startResult.terminal_matches === true;
       const sourceFailure = sourceFailures.get(staged) || [];
+      const rawSourceFailure = rawSourceFailures.get(staged) || [];
       const generationFailure = failedScopes.get(scopeKey(staged)) || null;
+      const rawComplete = startResult?.month_matches === true && finalResult.month_matches === true
+        && rawSourceFailure.length === 0 && !generationFailure;
       const localComplete = initiallyCurrent && finalScope?.result.matches === true
         && finalResult.matches === true && canonicalScope?.proof_state === 'established'
         && sourceFailure.length === 0 && !generationFailure
-        && staged.aqi_complete && staged.context_complete;
+        && staged.aqi_complete && staged.context_complete && staged.terminal_complete;
       staged.candidate.currentness.final = finalScope || null;
       staged.candidate.source_stability = { state: sourceFailure.length ? 'not_established'
         : generationFailure ? 'scope_generation_failed' : 'original_selected_proof_revalidated',
-        failures: sourceFailure, generation_failure: generationFailure };
+        failures: sourceFailure, generation_failure: generationFailure,
+        raw_observation_state: rawSourceFailure.length ? 'not_established' : 'original_selected_proof_revalidated',
+        raw_observation_failures: rawSourceFailure };
+      staged.candidate.raw_observation_candidate_complete = rawComplete;
+      staged.candidate.derived_aqi_candidate_complete = localComplete;
       staged.candidate.local_candidate_complete = localComplete;
       staged.candidate.manual_review_eligible = localComplete;
       staged.candidate.completion_rule = 'requires final invocation COMPLETE.json, matching report and candidate manifest';
       staged.summary.local_candidate_complete = localComplete;
+      staged.summary.raw_observation_candidate_complete = rawComplete;
+      staged.summary.derived_aqi_candidate_complete = localComplete;
       try {
         staged.summary.candidate = await contentJson(`${staged.prefix}/candidate`, staged.candidate);
       } catch (error) {
         staged.candidate.local_candidate_complete = false;
+        staged.candidate.raw_observation_candidate_complete = false;
+        staged.candidate.derived_aqi_candidate_complete = false;
         staged.candidate.manual_review_eligible = false;
         staged.summary.local_candidate_complete = false;
+        staged.summary.raw_observation_candidate_complete = false;
+        staged.summary.derived_aqi_candidate_complete = false;
         report.candidates.push({ ...staged.summary, candidate: null,
           staged_products: { observations: staged.candidate.observations, aqi: staged.candidate.aqi } });
         report.errors.push({ scope: staged.candidate.identity, message: error.message });
@@ -744,16 +821,24 @@ export async function runBootstrap(options) {
         identity: staged.summary.identity,
         reason: generationFailure ? 'source_scope_generation_failed'
           : sourceFailure.length ? 'selected_source_revalidation_not_established'
+            : !staged.terminal_complete ? 'pending_terminal_source_authority'
+              : !startResult?.terminal_matches || !finalResult.terminal_matches ? 'terminal_dependency_currentness_mismatch'
             : finalScope?.proof_state !== 'established' ? 'final_currentness_not_established'
               : 'final_local_candidate_gate_failed',
         currentness: finalScope, aqi_complete: staged.aqi_complete,
-        context_complete: staged.context_complete, source_failures: sourceFailure });
+        context_complete: staged.context_complete, terminal_complete: staged.terminal_complete,
+        raw_observation_candidate_complete: rawComplete, source_failures: sourceFailure });
     }
     const manifest = await contentJson('candidate-manifest', { schema_version: 1,
       kind: 'uk_aq_jsongen_dropbox_bootstrap_candidate_manifest', environment: 'TEST',
       source_checkpoint: source.checkpoint, requested_period: report.requested_period,
-      source_complete: report.completed_periods.every(period => period.source_complete),
-      aqi_complete: report.candidates.every(c => c.aqi_response_complete),
+      source_complete: report.completed_periods.length === periods.length * options.connectors.length * options.pollutants.length
+        && report.candidates.length > 0
+        && report.candidates.every(candidate => candidate.raw_observation_candidate_complete),
+      terminal_source_complete: report.completed_periods.length === periods.length * options.connectors.length * options.pollutants.length
+        && report.completed_periods.every(period => period.terminal_dependency.source_authority_established),
+      aqi_complete: report.candidates.length > 0 && report.incomplete_scopes.length === 0
+        && report.candidates.every(candidate => candidate.derived_aqi_candidate_complete),
       currentness: report.currentness,
       publication_state: 'local_private_candidate_not_managed_publication',
       managed_publication_eligible: false, candidates: report.candidates });
@@ -770,8 +855,12 @@ export async function runBootstrap(options) {
     for (const staged of stagedCandidates) {
       if (reportedCandidateIds.has(staged.summary.pub_id)) continue;
       staged.candidate.local_candidate_complete = false;
+      staged.candidate.raw_observation_candidate_complete = false;
+      staged.candidate.derived_aqi_candidate_complete = false;
       staged.candidate.manual_review_eligible = false;
       staged.summary.local_candidate_complete = false;
+      staged.summary.raw_observation_candidate_complete = false;
+      staged.summary.derived_aqi_candidate_complete = false;
       report.candidates.push({ ...staged.summary, candidate: null,
         staged_products: { observations: staged.candidate.observations, aqi: staged.candidate.aqi } });
       report.incomplete_scopes.push({ month_utc: staged.month_utc,

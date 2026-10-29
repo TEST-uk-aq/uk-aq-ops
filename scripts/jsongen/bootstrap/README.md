@@ -5,8 +5,8 @@ It has no workflow, scheduler, uploader, managed selection or chart integration.
 Imports are inert. The first real TEST operation requires separate authorisation
 after code review. Development did not run a backfill or fetch Dropbox history.
 
-Authoritative TEST system-docs were read at `main`
-`fdc9d41560958819d47f1cbd11bce95bf7bb0084`, following the JSONgen, compressed-history,
+For the 29 October reporting-boundary correction, authoritative TEST system-docs
+were read at `main` `ca05b051829157a9d30ce4778485a067193c7fe6`, following the JSONgen, compressed-history,
 precomputed-AQI, canonical observation hierarchy/schema/generation, verification,
 station-history AQI and Dropbox checkpoint/pack routes. No authoritative docs or
 plans were edited. This README describes implementation, not a replacement contract.
@@ -175,6 +175,13 @@ If the canonical state changes while source preparation is underway, the pinned
 source proof is compared under the lock and the scope fails closed; no newer
 Dropbox checkpoint is adopted.
 
+Every represented period also has a distinct `terminal_days` scope at its exact
+closing midnight, for all three pollutants. Initial and final comparisons use
+that source day's manifest hash authenticated through the current root/year/month
+chain. The whole following month's hash is not an equality gate: unrelated later
+days can advance without invalidating the earlier AQI candidate. A changed closing
+day fails derived AQI currentness independently of the requested raw month.
+
 The original checkpoint and root/year ancestry remain pinned as provenance, but
 their mutable global keys need not stay byte-identical. The tool records the
 current checkpoint digest for diagnosis and never adopts it. Full-month scopes
@@ -323,9 +330,44 @@ Daily AQI batches reuse the existing `calculateMonthAqi()`,
 `aqilevels_hourly_v2`, with the imported PM window/minimum constants (24/18).
 The shared implementation owns NO2 hourly DAQI, PM rolling DAQI, hourly EAQI,
 invalid/missing inputs, independent index statuses and `(n-1h,n]` intervals.
-Visible endpoints lie in the requested half-open range. The prior UTC day covers
-the preceding partial hour plus 23-hour PM context, including June for July when
-authenticated by the selected backup. Context is never duplicated as visible rows.
+Raw observations retain `S <= observed_at_utc < E`. Derived AQI endpoints are
+exactly `S < n <= E`: each reporting day owns 01:00 through the following 00:00.
+September 2026 therefore owns 720 unique endpoints from 1 September 01:00 through
+1 October 00:00. The adapter now passes `D` and `nextD` to the shared calculator;
+previously it passed both bounds minus one hour and produced the displaced
+`[S,E)` endpoint set. AQI `output_start_utc` is the represented start boundary `S`,
+and `output_end_utc` is the included endpoint `E`. Each daily descriptor adds
+`output_end_utc`, `first_endpoint_utc` and `last_endpoint_utc`. Its existing
+`output_end_exclusive_utc` remains the calendar work-unit boundary, not the AQI
+endpoint-membership rule. Requested raw range fields retain their existing meaning.
+
+The prior UTC day supplies PM rolling context, including June for July when
+authenticated by the selected backup. NO2 has no predecessor dependency. All three
+pollutants independently authenticate the source day containing `E` under the
+same original checkpoint. The existing root/year/month and copied-day proof,
+day/connector/pollutant membership, every referenced Parquet SHA/size/schema/count,
+physical binding and verification/status checks apply to this dependency too.
+Whole admitted source objects are decoded/accounted for, including other physical
+timeseries; only rows exactly at `E` are retained from the terminal day for
+calculation. They never enter the raw observation candidate. No timestamps,
+canonical partitions, source hashes or measurements are changed.
+
+The supported conservative boundary proof requires authenticated terminal-day
+membership with checkpoint `copied_at` at or after the end of that timestamp-day.
+Once that proof is established, authenticated connector/pollutant omission or no
+measurement at `E` can produce a normal evaluated blank. A missing day, a failed
+manifest read, or a copy made before the timestamp-day closed cannot prove absence.
+There is no new partial-day or exact-midnight authority. Such a dependency is
+`pending_terminal_source_authority`, keeps the pair incomplete and omits `COMPLETE`.
+This is an implementation limitation, not a semantic extra-day delay: the
+represented period is eligible for finalisation at `E`, including for an explicit
+partial-month cutoff, but source completeness still requires accepted proof.
+
+Terminal source evidence and object roles are separate from raw days and PM
+context in source evidence, calculation dependencies and completed-period reports.
+Original terminal metadata/cache bytes and source Parquet are revalidated outside
+the locks. Both locked callbacks compare bounded canonical metadata only; Dropbox
+reads, Parquet decoding and the existing retry/backoff remain outside the locks.
 
 Shared AQI may merge samples/calculate hourly means as its algorithm requires;
 these operations never alter raw observation candidates. Conflicting duplicate
@@ -369,10 +411,17 @@ Bootstrap `schema_version:1` formats are deliberately distinct from managed sche
   physical station, genuine source status or null, effective status, embedded
   verification status and per-row source-status provenance. Multiplicity is kept.
 - `uk_aq_jsongen_bootstrap_aqi_candidate`: identical common pins, algorithm/context,
-  daily batches, independent DAQI/EAQI completeness/availability and the shared
+  daily batches, exact endpoint/period/spacing/uniqueness and daily-ownership
+  evidence, terminal dependency, independent DAQI/EAQI completeness/availability and the shared
   station-history `aqi` response with per-hour statuses/missing reasons.
+  `terminal_source_inputs` retains original exact-`E` observations with physical
+  identity, status and verification provenance as calculation-only dependencies.
 - `uk_aq_jsongen_bootstrap_monthly_pair_candidate`: common pins, paired object
-  descriptors, proposed keys and explicit unresolved managed authority.
+  descriptors, proposed keys and explicit unresolved managed authority. Additive
+  `raw_observation_candidate_complete` and `derived_aqi_candidate_complete` fields
+  separate raw-month authority from terminal/PM-dependent AQI authority. An
+  unchanged authenticated raw candidate can remain complete when the derived
+  candidate fails terminal currentness; the pair remains incomplete.
 - `uk_aq_jsongen_dropbox_bootstrap_candidate_manifest`: all local pair descriptors,
   source completeness and AQI completeness. Never insert it into managed control.
 
@@ -390,7 +439,8 @@ byte cap; reference counts are bounded by object/series/range limits.
 ## Failure, restart and rollback
 
 `COMPLETE.json` is written only when every requested local candidate passes
-original source-proof, selected month/day, applicable PM context, AQI response
+original source-proof, selected month/day, applicable PM context, terminal source,
+exact hourly endpoint grid/canonical periods/daily ownership, AQI response
 and initial/final currentness checks. It proves local private readiness and
 report/candidate-chain integrity only; it does not grant managed-publication
 eligibility. A failed month or PM dependency leaves its products as diagnostics
@@ -408,6 +458,50 @@ directory. Partial private files remain unselected. A hard kill can leave the
 bounded `work/source-cache`; preserve useful evidence then delete only that exact
 unselected invocation if desired. Rollback is to stop invoking the tool/remove
 private output. There are no deployed changes to undo.
+
+The directly coupled experimental paired publisher now validates `(S,E]`, exact
+canonical periods and daily ownership, and accepts evaluated
+`missing_input/no_input_value` and
+`insufficient_samples/insufficient_rolling_24h_hours` independently of availability.
+It also requires matching terminal-day evidence. Bootstrap v1 candidates remain
+distinct from that pilot's schemas and cannot be passed to its publisher. The old
+R2 comparison extractor has no terminal-day acquisition path; its AQI result now
+fails completeness at that boundary and paired publication preflight rejects it.
+Extending that separate source transport is outside this Dropbox correction.
+No existing immutable object or selected publication is rewritten.
+
+No public/managed schema, receipt, control or selector meaning changes here.
+Existing private candidates are not repaired in place; regenerate under new UUIDs
+after review/merge and separate operator authorisation. Future managed
+receipt/affected-month terminal dependencies still need their separately approved
+version/compatibility decision; this implementation does not supply it.
+
+## Post-merge private TEST acceptance handover
+
+After separate operator authorisation, freshly re-pin the selected checkpoint and
+run September 2026 connector-1 NO2 timeseries 525 (station 1358), PM2.5 timeseries
+212 and 324, and PM10 timeseries 6 in bounded private operations. Use the existing
+reviewed command forms and verification-mode admission; this README does not
+authorise an invocation. Inspect each run for:
+
+- Original checkpoint/generation, exact source byte hashes and selected-source
+  stability evidence; separately authenticated 1 October terminal source day.
+- Matching initial/final raw-month and terminal-day currentness; PM predecessor
+  context retained, with no artificial NO2 predecessor scope.
+- Exactly 720 unique endpoints, 1 September 01:00 through 1 October 00:00;
+  zero missing/extra/duplicate endpoints, canonical hourly periods and 30 daily
+  batches of 24, with midnight owned by the preceding reporting day.
+- Raw September tuple/value/timestamp/status/multiplicity fidelity, preserving
+  negative values and excluding terminal-only observations; independent evaluated
+  completeness and available/unavailable DAQI/EAQI counts. Previous displaced
+  output counts (including NO2 679/41) are not expected-value assertions.
+- Candidate gzip/JSON/descriptor/manifest hashes and `COMPLETE.json` report digest;
+  no incomplete scope or unsupported source-completeness claim.
+- Source/row/read-command/memory/CPU/wall budgets and transport retry metrics.
+  A normal first-attempt read does not prove retry recovery was exercised.
+
+These checks establish only private bootstrap evidence. Managed publication,
+writer freshness/Core/transition acceptance and website serving remain separate.
 
 ## Later months and separate first-run authorisation
 

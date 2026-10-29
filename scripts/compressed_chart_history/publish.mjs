@@ -5,7 +5,7 @@ import path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { r2GetObject, r2PutObject } from "../../workers/shared/r2_sigv4.mjs";
-import { canonicalJson } from "./export.mjs";
+import { canonicalJson, aqiEndpointCompleteness, evaluatedAqiStatus } from "./export.mjs";
 import { sha256, requireCondition as check } from "./source_reader.mjs";
 import {
   COMPRESSED_CHART_ROOT as ROOT,
@@ -146,6 +146,11 @@ export async function preparePublication({ candidatePath, sampleId }) {
       && aqi.coverage?.response_complete === descriptor.response_complete
       && JSON.stringify(aqi.coverage?.context_days) === JSON.stringify(evidenceJson.context_days || [])
       && JSON.stringify(source.context_days || []) === JSON.stringify(evidenceJson.context_days || [])
+      && JSON.stringify(aqi.coverage?.terminal_days) === JSON.stringify(evidenceJson.terminal_days || [])
+      && JSON.stringify(source.terminal_days || []) === JSON.stringify(evidenceJson.terminal_days || [])
+      && Array.isArray(evidenceJson.terminal_days) && evidenceJson.terminal_days.length === 1
+      && evidenceJson.terminal_days[0].day_utc === sample.end.slice(0, 10)
+      && ["exported", "authoritative_absence"].includes(evidenceJson.terminal_days[0].state)
       && aqi.aqi?.algorithm_version === AQI_ALGORITHM
       && aqi.aqi?.calculation_source === "calculated_from_observations"
       && aqi.aqi?.publication_source === "precomputed_compressed_json"
@@ -165,11 +170,13 @@ export async function preparePublication({ candidatePath, sampleId }) {
       && (!descriptor.response_complete || (aqi.aqi.has_gap === false
         && Array.isArray(aqi.aqi.partial_reasons) && aqi.aqi.partial_reasons.length === 0)),
     "Paired AQI source, identity or completeness invalid");
+    check(aqiEndpointCompleteness(aqi.aqi, sample.start, sample.end,
+      aqi.coverage.daily_batches).complete, "Paired AQI endpoint grid, periods or daily ownership invalid");
     let previousHour = "";
     for (const row of aqi.aqi.rows) {
       check(row && row.connector_id === 1 && row.station_id === 248 && row.timeseries_id === 212
         && row.pollutant_code === "pm25" && row.timestamp_hour_utc > previousHour
-        && row.timestamp_hour_utc >= sample.start && row.timestamp_hour_utc < sample.end
+        && row.timestamp_hour_utc > sample.start && row.timestamp_hour_utc <= sample.end
         && row.period_end_utc === row.timestamp_hour_utc
         && Date.parse(row.period_start_utc) === Date.parse(row.timestamp_hour_utc) - 3_600_000
         && typeof row.daqi_calculation_status === "string"
@@ -177,12 +184,13 @@ export async function preparePublication({ candidatePath, sampleId }) {
       previousHour = row.timestamp_hour_utc;
     }
     for (const batch of aqi.coverage.daily_batches) {
-      const batchRows = aqi.aqi.rows.filter((row) => row.timestamp_hour_utc >= batch.output_start_utc
-        && row.timestamp_hour_utc < batch.output_end_exclusive_utc);
+      const batchRows = aqi.aqi.rows.filter((row) => row.timestamp_hour_utc > batch.output_start_utc
+        && row.timestamp_hour_utc <= batch.output_end_utc);
       check(batchRows.length === batch.row_count && (!batch.response_complete ||
-        (batchRows.length === (Date.parse(batch.output_end_exclusive_utc) - Date.parse(batch.output_start_utc)) / 3_600_000
-          && batchRows.every((row) => row.daqi_calculation_status === "ok"
-            && row.eaqi_calculation_status === "ok"))), "Paired AQI daily completeness contradiction");
+        (batchRows.length === (Date.parse(batch.output_end_utc) - Date.parse(batch.output_start_utc)) / 3_600_000
+          && batchRows.every((row) => evaluatedAqiStatus(row.daqi_calculation_status, row.daqi_missing_reason)
+            && evaluatedAqiStatus(row.eaqi_calculation_status, row.eaqi_missing_reason)))),
+      "Paired AQI daily completeness contradiction");
     }
     const aqiKey = `${ROOT}/objects/connector_id=1/timeseries_id=212/generation=${sample.generation}/month_utc=2026-09/aqi.${descriptor.sha256}.json.gz`;
     aqiObject = { key: aqiKey, byte_size: aqiGzip.length, sha256: descriptor.sha256,
