@@ -15,6 +15,7 @@ import { flushDashboardServiceEgressMetrics } from "./lib/service_egress_metrics
 import { handleMediaRoute, isMediaRoute } from "./routes/media";
 import { handleAccountsRoute, isAccountsPath } from "./routes/accounts";
 import type { AccountsAccessContext } from "./lib/accounts_auth";
+import { handleMediaD1Usage } from "./routes/media_d1_usage";
 
 type WorkerExecutionContext = AccountsAccessContext & {
   waitUntil(promise: Promise<unknown>): void;
@@ -32,6 +33,10 @@ export default {
   async fetch(request: Request, env: WorkerEnv, ctx: WorkerExecutionContext): Promise<Response> {
     try {
       const pathname = getPathname(request);
+
+      if (pathname === '/api/media/d1-usage') {
+        return await handleMediaD1Usage(request, env, ctx);
+      }
 
       // Private routes authenticate before OPTIONS, compatibility caches or upstream proxying.
       if (isAccountsPath(pathname)) {

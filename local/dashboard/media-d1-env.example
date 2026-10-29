@@ -1,0 +1,25 @@
+# Backend-only analytics configuration; copy approved values into the TEST local .env.
+# Use Account Analytics: Read only, explicitly scoped to the intended account(s).
+# No fallback to Media admin, deployment or general Cloudflare credentials.
+# For each account, set its own ACCOUNT_ID and DATABASE_ID, never a database name.
+# PLAN is free, paid or unknown. Limits apply only for explicitly confirmed free.
+# Leave unknown allowances blank; confirm current values before configuring them.
+UK_AQ_MEDIA_D1_LIVE_ACCOUNT_ID=
+UK_AQ_MEDIA_D1_LIVE_DATABASE_ID=
+UK_AQ_MEDIA_D1_LIVE_ANALYTICS_TOKEN=
+UK_AQ_MEDIA_D1_LIVE_PLAN=unknown
+UK_AQ_MEDIA_D1_LIVE_DAILY_READ_LIMIT=
+UK_AQ_MEDIA_D1_LIVE_DAILY_WRITE_LIMIT=
+UK_AQ_MEDIA_D1_TEST_ACCOUNT_ID=
+UK_AQ_MEDIA_D1_TEST_DATABASE_ID=
+UK_AQ_MEDIA_D1_TEST_ANALYTICS_TOKEN=
+UK_AQ_MEDIA_D1_TEST_PLAN=unknown
+UK_AQ_MEDIA_D1_TEST_DAILY_READ_LIMIT=
+UK_AQ_MEDIA_D1_TEST_DAILY_WRITE_LIMIT=
+UK_AQ_MEDIA_D1_WARNING_PERCENT=75
+UK_AQ_MEDIA_D1_CRITICAL_PERCENT=90
+
+# Reuse the signed personal Access JWT trust settings already used by Accounts:
+UK_AQ_LOCAL_ACCOUNTS_ACCESS_ISSUER=
+UK_AQ_LOCAL_ACCOUNTS_ACCESS_AUD=
+# Install the existing server/requirements.txt (PyJWT[crypto] included).

@@ -2,6 +2,20 @@ import type { HistoryResolution } from "./history_generation";
 import { errorEnvelope, withCorsAndCacheControl, withCorsAndNoStore } from "./http";
 
 export type WorkerEnv = {
+  UK_AQ_MEDIA_D1_LIVE_ACCOUNT_ID?: string;
+  UK_AQ_MEDIA_D1_LIVE_DATABASE_ID?: string;
+  UK_AQ_MEDIA_D1_LIVE_ANALYTICS_TOKEN?: string;
+  UK_AQ_MEDIA_D1_LIVE_PLAN?: string;
+  UK_AQ_MEDIA_D1_LIVE_DAILY_READ_LIMIT?: string;
+  UK_AQ_MEDIA_D1_LIVE_DAILY_WRITE_LIMIT?: string;
+  UK_AQ_MEDIA_D1_TEST_ACCOUNT_ID?: string;
+  UK_AQ_MEDIA_D1_TEST_DATABASE_ID?: string;
+  UK_AQ_MEDIA_D1_TEST_ANALYTICS_TOKEN?: string;
+  UK_AQ_MEDIA_D1_TEST_PLAN?: string;
+  UK_AQ_MEDIA_D1_TEST_DAILY_READ_LIMIT?: string;
+  UK_AQ_MEDIA_D1_TEST_DAILY_WRITE_LIMIT?: string;
+  UK_AQ_MEDIA_D1_WARNING_PERCENT?: string;
+  UK_AQ_MEDIA_D1_CRITICAL_PERCENT?: string;
   historyResolution?: HistoryResolution;
   DASHBOARD_UPSTREAM_BASE_URL?: string;
   DASHBOARD_UPSTREAM_BEARER_TOKEN?: string;

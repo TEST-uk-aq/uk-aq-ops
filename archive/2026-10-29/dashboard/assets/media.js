@@ -1,0 +1,1855 @@
+(() => {
+  "use strict";
+
+  const TABS = ["articles", "runs", "sources"];
+  const TAB_LABELS = { articles: "Articles", runs: "Runs", sources: "Sources" };
+  const RUN_KINDS = ["publisher", "gdelt"];
+  const SORTS = [
+    ["published_desc", "Published Date: Newest to Oldest"],
+    ["published_asc", "Published Date: Oldest to Newest"],
+    ["approved_desc", "Approved Date: Newest to Oldest"],
+    ["approved_asc", "Approved Date: Oldest to Newest"],
+    ["discovered_desc", "Discovered Date: Newest to Oldest"],
+    ["updated_desc", "Recently Updated"],
+  ];
+  const STATUS_LABELS = { approved: "Approved", pending: "Pending", rejected: "Rejected", hidden: "Hidden" };
+  const POSSIBLE_DUPLICATE_REASON_LABELS = {
+    same_source_exact_title_same_published_at: "Same source, exact publisher title and publication time",
+  };
+  const BLUESKY_REASON_LABELS = {
+    auto_approved: "Automatically approved",
+    pending_approved: "Approved from Pending",
+    rejected_repost: "Approved from Rejected",
+    unhidden_repost: "Approved from Hidden",
+    manual_post: "Manual post",
+    manual_repost: "Manual repost",
+  };
+  const STATUS_ACTIONS = {
+    pending: [["approved", "Approve", "approve"], ["rejected", "Reject", "reject"]],
+    approved: [["hidden", "Hide", "hide"], ["rejected", "Reject", "reject"]],
+    rejected: [["approved", "Approve", "approve"]],
+    hidden: [["approved", "Approve", "unhide"], ["rejected", "Reject", "reject"]],
+  };
+  const MAX_BATCH_SELECTION = 50;
+  const BLUESKY_TEMPLATE_LIMIT = 120;
+  const BLUESKY_POST_LIMIT = 300;
+  const BLUESKY_PLACEHOLDERS = ["{publisher}", "{publisher_mention}"];
+  const FACEBOOK_PLACEHOLDERS = ["{publisher}"];
+  const articleDetailCache = new Map();
+  let articleRefreshSequence = 0;
+  let sourceRefreshSequence = 0;
+
+  const state = {
+    root: null,
+    apiBase: "/api",
+    tab: "articles",
+    loaded: new Set(),
+    selectors: { publications: [], authors: [] },
+    articles: [],
+    articleCursor: null,
+    articleHasMore: false,
+    filters: { status: new Set(["pending"]), source: new Set(), author: new Set(), hasImage: "", titleState: new Set(), q: "", sort: "published_desc" },
+    selectedArticleIds: new Set(),
+    expandedArticleIds: new Set(),
+    titleMessages: new Map(),
+    aiUsage: null,
+    aiUsageUnavailable: false,
+    batchMessage: "",
+    sourcesVisibility: "non_blocked",
+    sourcesFeedback: "",
+    sourcesRows: [],
+    sourceDomainRows: [],
+    sourceAuthorRules: [],
+    sourcesOffset: 0,
+    sourceDomainsOffset: 0,
+    runsKind: "publisher",
+    publisherRuns: { rows: null, error: "", loading: false },
+    gdeltRuns: { rows: null, error: "", loading: false },
+  };
+
+  // Presentation-only: keep a hyphenated term together unless CSS must wrap it.
+  // Do not change stored titles, edit fields, search, or accessible article labels.
+  function displayTitleWrapping(value) {
+    return String(value).replace(/([\p{L}\p{N}])([-\u2010])(?=[\p{L}\p{N}])/gu, "$1$2\u2060");
+  }
+
+  function esc(value) {
+    return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  function formatUtcDateTime(value, includeUtcSuffix = true) {
+    if (!value) return "—";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "—";
+    const formatted = new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric",
+      hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" }).format(date).replace(",", "");
+    return includeUtcSuffix ? `${formatted} UTC` : formatted;
+  }
+
+  function isDateOnly(value) {
+    return /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));
+  }
+
+  function formatPublishedDateTime(value, includeUtcSuffix = true) {
+    if (isDateOnly(value)) return formatPublicationDate(value) || "—";
+    return formatUtcDateTime(value, includeUtcSuffix);
+  }
+
+  function formatPublicationDate(value) {
+    const match = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})(?:T|$)/);
+    if (!match || Number.isNaN(Date.parse(value))) return "";
+    const date = new Date(`${match[1]}-${match[2]}-${match[3]}T00:00:00Z`);
+    if (Number.isNaN(date.getTime()) || date.getUTCFullYear() !== Number(match[1])
+      || date.getUTCMonth() + 1 !== Number(match[2]) || date.getUTCDate() !== Number(match[3])) return "";
+    return `${match[3]}/${match[2]}/${match[1]}`;
+  }
+
+  function formatUtcDateTimeInput(value) {
+    if (!value) return "";
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? "" : date.toISOString().slice(0, 16);
+  }
+
+  function publicationDateInputs(value) {
+    if (!value) return { date: "", time: "" };
+    if (isDateOnly(value)) return { date: String(value), time: "" };
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return { date: "", time: "" };
+    const iso = parsed.toISOString();
+    return { date: iso.slice(0, 10), time: iso.slice(11, 16) };
+  }
+
+  function duration(start, finish) {
+    const startMs = Date.parse(start || "");
+    const finishMs = Date.parse(finish || "");
+    if (!Number.isFinite(startMs) || !Number.isFinite(finishMs) || finishMs < startMs) return "—";
+    const seconds = Math.round((finishMs - startMs) / 1000);
+    return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  }
+
+  function idempotencyKey(prefix = "media") {
+    return `${prefix}_${crypto.randomUUID().replace(/-/g, "")}`;
+  }
+
+  function apiUrl(path, params) {
+    const url = `${state.apiBase}/media/${String(path).replace(/^\/+/, "")}`;
+    const query = params instanceof URLSearchParams ? params.toString() : "";
+    return query ? `${url}?${query}` : url;
+  }
+
+  function articleImageUrl(article) {
+    const id = Number(article?.id);
+    const version = String(article?.admin_preview_image_version || article?.updated_at || "").trim();
+    if (!Number.isInteger(id) || id < 1 || !version) return null;
+    return apiUrl(`articles/${id}/image`, new URLSearchParams({ v: version }));
+  }
+
+  async function request(path, options = {}) {
+    const headers = new Headers(options.headers || {});
+    if (options.body !== undefined) headers.set("Content-Type", "application/json");
+    if (options.idempotent) headers.set("Idempotency-Key", idempotencyKey(options.idempotent));
+    if (options.revision !== undefined) headers.set("If-Match", String(options.revision));
+    let response;
+    try {
+      response = await fetch(apiUrl(path, options.params), { method: options.method || "GET", headers,
+        body: options.body === undefined ? undefined : JSON.stringify(options.body) });
+    } catch (_error) {
+      throw new Error("Media admin unavailable.");
+    }
+    const contentType = String(response.headers.get("Content-Type") || "");
+    const payload = contentType.includes("json") ? await response.json().catch(() => null) : null;
+    if (!response.ok) {
+      const error = new Error(String(payload?.error?.message || payload?.error || payload?.message || `Media request failed (${response.status})`));
+      error.payload = payload;
+      throw error;
+    }
+    return payload;
+  }
+
+  async function binaryRequest(path, options) {
+    const headers = new Headers(options.headers || {});
+    if (options.idempotent) headers.set("Idempotency-Key", idempotencyKey(options.idempotent));
+    if (options.revision !== undefined) headers.set("If-Match", String(options.revision));
+    let response;
+    try {
+      response = await fetch(apiUrl(path), { method: options.method, headers, body: options.body });
+    } catch (_error) { throw new Error("Media admin unavailable."); }
+    const contentType = String(response.headers.get("Content-Type") || "");
+    const payload = contentType.includes("json") ? await response.json().catch(() => null) : null;
+    if (!response.ok) {
+      throw new Error(String(payload?.error?.message || payload?.error || payload?.message ||
+        `Media request failed (${response.status})`));
+    }
+    return payload;
+  }
+
+  function articleImageState(article) {
+    if (article.image_policy === "local_copy_permitted" &&
+        article.source_image_policy === "local_copy_permitted") {
+      return article.local_image?.exists || article.local_image_exists
+        ? ["retained", "Retained local copy"]
+        : ["unavailable", "Image unavailable · retained copy required"];
+    }
+    if (article.image_policy === "remote_preview" &&
+        article.source_image_policy === "remote_preview" && article.og_image_url) {
+      return ["remote", "Publisher remote preview"];
+    }
+    return ["unavailable", "Image unavailable"];
+  }
+
+  function message(text, kind = "") {
+    return `<div class="media-message${kind ? ` media-message--${kind}` : ""}" role="status">${esc(text)}</div>`;
+  }
+
+  function possibleDuplicateReasonLabel(reason) {
+    return POSSIBLE_DUPLICATE_REASON_LABELS[reason] || "Strong same-article evidence";
+  }
+
+  function graphemeCount(value) {
+    const text = String(value ?? "");
+    return [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)].length;
+  }
+
+  function literalTemplate(value) {
+    return BLUESKY_PLACEHOLDERS.reduce((text, placeholder) => text.split(placeholder).join(""), String(value ?? ""));
+  }
+
+  function unknownPlaceholders(value) {
+    return [...String(value ?? "").matchAll(/\{[^{}]+\}/g)].map(match => match[0]).filter(token => !BLUESKY_PLACEHOLDERS.includes(token));
+  }
+
+  function renderBlueskyExample(template) {
+    const messageText = String(template ?? "")
+      .split("{publisher}").join("Example Publisher")
+      .split("{publisher_mention}").join("@example.bsky.social");
+    return `Example original publisher headline for an air-quality article\n${messageText}`;
+  }
+
+  function renderFacebookExample(template) {
+    const messageText = String(template ?? "").split("{publisher}").join("Example Publisher");
+    return `Example original publisher headline\n${messageText}`;
+  }
+
+  function setView(html) {
+    const view = state.root?.querySelector("[data-media-view]");
+    if (view) view.innerHTML = html;
+  }
+
+  function setTab(tab) {
+    if (!TABS.includes(tab)) return;
+    state.tab = tab;
+    state.root.querySelectorAll("[data-media-tab]").forEach(button => {
+      const active = button.dataset.mediaTab === tab;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-selected", active ? "true" : "false");
+    });
+    if (tab === "articles") void renderArticles(false);
+    if (tab === "runs") void renderRuns(true);
+    if (tab === "sources") {
+      state.sourcesVisibility = "non_blocked";
+      state.sourcesFeedback = "";
+      void renderSources();
+    }
+  }
+
+  function checkedFilter(group, value) {
+    return state.filters[group].has(value) ? " checked" : "";
+  }
+
+  function articleParams(cursor = null) {
+    const params = new URLSearchParams({ limit: "20", sort: state.filters.sort });
+    state.filters.status.forEach(value => params.append("status", value));
+    state.filters.source.forEach(value => params.append("source", value));
+    state.filters.author.forEach(value => params.append("author", value));
+    state.filters.titleState.forEach(value => params.append("title_state", value));
+    if (state.filters.hasImage) params.set("has_image", state.filters.hasImage);
+    if (state.filters.q) params.set("q", state.filters.q);
+    if (cursor) params.set("cursor", cursor);
+    return params;
+  }
+
+  async function ensureSelectors() {
+    if (state.selectors.publications.length || state.selectors.authors.length) return;
+    const data = await request("articles/selectors");
+    state.selectors = { publications: data.publications || [], authors: data.authors || [] };
+  }
+
+  function filterPanel() {
+    const status = ["pending", "approved", "rejected", "hidden"].map(value =>
+      `<label><input type="checkbox" data-filter="status" value="${value}"${checkedFilter("status", value)}> ${STATUS_LABELS[value]}</label>`).join("");
+    const publications = state.selectors.publications.map(source =>
+      `<label><input type="checkbox" data-filter="source" value="${esc(source.source_key)}"${checkedFilter("source", source.source_key)}> ${esc(source.name)}</label>`).join("");
+    const authors = state.selectors.authors.map(author =>
+      `<label data-author-option="${esc(String(author).toLowerCase())}"><input type="checkbox" data-filter="author" value="${esc(author)}"${checkedFilter("author", author)}> ${esc(author)}</label>`).join("");
+    const titleStates = [["original", "Original"], ["publisher", "Publisher"], ["human", "Human"], ["ai", "AI Accepted"], ["pending_ai", "AI Pending"], ["rejected_ai", "AI Rejected"]]
+      .map(([value, label]) => `<label><input type="checkbox" data-filter="titleState" value="${value}"${checkedFilter("titleState", value)}> ${label}</label>`).join("");
+    const open = window.matchMedia("(min-width: 641px)").matches ? " open" : "";
+    return `<details class="media-filter-disclosure" data-filter-disclosure${open}><summary class="media-filter-disclosure__summary">Filters</summary><div class="media-filter-panel" aria-label="Article filters">
+      <fieldset class="media-filter-group"><legend>Has image</legend><div class="media-filter-options">
+        <label><input type="radio" name="media-has-image" data-filter-radio="hasImage" value=""${!state.filters.hasImage ? " checked" : ""}> Any</label>
+        <label><input type="radio" name="media-has-image" data-filter-radio="hasImage" value="yes"${state.filters.hasImage === "yes" ? " checked" : ""}> Yes</label>
+        <label><input type="radio" name="media-has-image" data-filter-radio="hasImage" value="no"${state.filters.hasImage === "no" ? " checked" : ""}> No</label>
+      </div></fieldset>
+      <fieldset class="media-filter-group"><legend>Title Status</legend><div class="media-filter-options">${titleStates}</div></fieldset>
+      <fieldset class="media-filter-group media-filter-group--publication"><legend>Publication</legend>${filterScroll("publications", publications || "No publications")}</fieldset>
+      <fieldset class="media-filter-group"><legend>Author</legend><label class="media-field"><input data-author-search type="search" placeholder="Find author"></label>${filterScroll("authors", authors || "No authors")}</fieldset>
+      <fieldset class="media-filter-group"><legend>Article Status</legend><div class="media-filter-options">${status}</div></fieldset>
+    </div></details><div class="media-active-filters" data-active-filters>${esc(activeFilterSummary())}</div>`;
+  }
+
+  function filterScroll(name, options) {
+    const label = name === "publications" ? "publications" : "authors";
+    return `<div class="media-filter-scroll" data-filter-scroll>
+      <div class="media-filter-scroll__fade media-filter-scroll__fade--top" data-scroll-fade="up" aria-hidden="true" hidden></div>
+      <button type="button" class="media-filter-scroll__indicator media-filter-scroll__indicator--top" data-scroll-direction="up" aria-label="Scroll ${label} up" hidden><span aria-hidden="true">▲</span></button>
+      <div class="media-filter-options media-filter-scroll__viewport" data-filter-scroll-viewport tabindex="0">${options}</div>
+      <div class="media-filter-scroll__fade media-filter-scroll__fade--bottom" data-scroll-fade="down" aria-hidden="true" hidden></div>
+      <button type="button" class="media-filter-scroll__indicator media-filter-scroll__indicator--bottom" data-scroll-direction="down" aria-label="Scroll ${label} down" hidden><span aria-hidden="true">▼</span></button>
+    </div>`;
+  }
+
+  function updateFilterScroll(scroll) {
+    const viewport = scroll.querySelector("[data-filter-scroll-viewport]");
+    if (!viewport) return;
+    const tolerance = 2;
+    const canScroll = viewport.scrollHeight > viewport.clientHeight + tolerance;
+    const top = scroll.querySelector('[data-scroll-direction="up"]');
+    const bottom = scroll.querySelector('[data-scroll-direction="down"]');
+    const topHidden = !canScroll || viewport.scrollTop <= tolerance;
+    const bottomHidden = !canScroll || viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - tolerance;
+    if (top) top.hidden = topHidden;
+    if (bottom) bottom.hidden = bottomHidden;
+    const topFade = scroll.querySelector('[data-scroll-fade="up"]');
+    const bottomFade = scroll.querySelector('[data-scroll-fade="down"]');
+    if (topFade) topFade.hidden = topHidden;
+    if (bottomFade) bottomFade.hidden = bottomHidden;
+  }
+
+  function updateFilterScrolls() {
+    state.root.querySelectorAll("[data-filter-scroll]").forEach(updateFilterScroll);
+  }
+
+  function bindFilterScrolls() {
+    state.root.querySelectorAll("[data-filter-scroll]").forEach(scroll => {
+      const viewport = scroll.querySelector("[data-filter-scroll-viewport]");
+      if (!viewport) return;
+      viewport.addEventListener("scroll", () => updateFilterScroll(scroll), { passive: true });
+      scroll.querySelectorAll("[data-scroll-direction]").forEach(button => button.addEventListener("click", () => {
+        viewport.scrollBy({ top: (button.dataset.scrollDirection === "up" ? -1 : 1) * viewport.clientHeight, behavior: "smooth" });
+      }));
+      updateFilterScroll(scroll);
+    });
+    state.root.querySelector("[data-filter-disclosure]")?.addEventListener("toggle", event => {
+      if (event.currentTarget.open) requestAnimationFrame(updateFilterScrolls);
+    });
+    requestAnimationFrame(updateFilterScrolls);
+  }
+
+  function activeFilterSummary() {
+    const parts = [];
+    if (state.filters.status.size) parts.push(`Article Status: ${[...state.filters.status].map(v => STATUS_LABELS[v]).join(", ")}`);
+    if (state.filters.source.size) parts.push(`${state.filters.source.size} publication filter${state.filters.source.size === 1 ? "" : "s"}`);
+    if (state.filters.author.size) parts.push(`${state.filters.author.size} author filter${state.filters.author.size === 1 ? "" : "s"}`);
+    if (state.filters.hasImage) parts.push(`Image: ${state.filters.hasImage}`);
+    if (state.filters.titleState.size) parts.push(`${state.filters.titleState.size} Title Status filter${state.filters.titleState.size === 1 ? "" : "s"}`);
+    if (state.filters.q) parts.push(`Search: “${state.filters.q}”`);
+    return parts.length ? `Active filters · ${parts.join(" · ")}` : "No active filters";
+  }
+
+  function statusOptions(status) {
+    return [`<option value="${status}">${STATUS_LABELS[status]}</option>`]
+      .concat((STATUS_ACTIONS[status] || []).map(([target, label, action]) =>
+        `<option value="${target}" data-action="${action}">${label}</option>`)).join("");
+  }
+
+  function statusActionForTarget(status, target) {
+    return (STATUS_ACTIONS[status] || []).find(([next]) => next === target)?.[2] || null;
+  }
+
+  function selectedArticles() {
+    return state.articles.filter(article => state.selectedArticleIds.has(String(article.id)));
+  }
+
+  function pruneArticleSelectionToLoadedRows() {
+    const loadedIds = new Set(state.articles.map(article => String(article.id)));
+    state.selectedArticleIds = new Set([...state.selectedArticleIds].filter(id => loadedIds.has(id)));
+  }
+
+  function bulkStatusTargetEligible(article, target) {
+    return article.status === target || Boolean(statusActionForTarget(article.status, target));
+  }
+
+  function bulkStatusOptions(selected = selectedArticles()) {
+    const targets = ["approved", "rejected", "hidden"].filter(target => selected.every(article =>
+      bulkStatusTargetEligible(article, target)));
+    return `<option value="">Choose status…</option>${targets.map(target =>
+      `<option value="${target}">${STATUS_LABELS[target]}</option>`).join("")}`;
+  }
+
+  function statusControl(article) {
+    return `<div class="media-status-control" data-status-control data-id="${article.id}" data-current="${article.status}">
+      <select aria-label="Article Status for ${esc(article.title)}">${statusOptions(article.status)}</select>
+      <span class="media-save-state" title="Saved/current" aria-label="Saved/current">💾</span>
+    </div>`;
+  }
+
+  function titleStatus(article) {
+    if (article.display_title_origin === "human" && article.display_title) return ["human", "Human"];
+    if (article.display_title_origin === "ai" && article.display_title) return ["ai", "AI Accepted"];
+    if (article.ai_title_suggestion_state === "pending") return ["pending_ai", "AI Pending"];
+    if (article.ai_title_suggestion_state === "rejected") return ["rejected_ai", "AI Rejected"];
+    if (article.display_title_origin === "publisher" && article.display_title) return ["publisher", "Publisher"];
+    return ["original", "Original"];
+  }
+
+  function aiSuggestionLabel(article) {
+    const states = { pending: "Pending", accepted: "Accepted", rejected: "Rejected" };
+    const state = states[article.ai_title_suggestion_state];
+    return article.ai_title_suggestion && state ? `AI suggestion · ${state}` : "AI suggestion";
+  }
+
+  function articleSortControl() {
+    return `<label class="media-field media-article-sort"><span>Sort</span><select data-article-sort>${SORTS.map(([value, label]) => `<option value="${value}"${state.filters.sort === value ? " selected" : ""}>${label}</option>`).join("")}</select></label>`;
+  }
+
+  function aiUsageHtml() {
+    if (state.aiUsageUnavailable) {
+      return `<details class="media-ai-usage"><summary>AI Usage</summary>${message("AI Usage unavailable", "error")}</details>`;
+    }
+    const day = state.aiUsage?.usage_days?.[0] || {};
+    const entries = [[day.calculated_neurons_used, "Calculated neurons used today"], [day.media_daily_neuron_budget, "Media daily neuron budget"], [day.media_budget_remaining, "Media budget remaining"], [day.configured_cloudflare_free_allocation_neurons, "Configured Cloudflare free allowance"], [day.estimated_cloudflare_free_neurons_remaining, "Estimated Cloudflare allowance remaining"], [day.ai_requests, "Request count"], [day.ai_titles_attempted, "Titles attempted"], [day.titles_generated_successfully, "Titles generated"], [day.prompt_tokens, "Input tokens"], [day.completion_tokens, "Output tokens"], [day.outstanding_reserved_neurons, "Outstanding reserved neurons"]];
+    return `<details class="media-ai-usage" data-ai-usage><summary>AI Usage</summary><p>Media’s local budget is enforced here; Cloudflare allowance values are estimates, not billing authority.</p><div class="media-stats">${entries.map(([value, label]) => `<div class="media-stat"><strong>${esc(value ?? 0)}</strong><span>${esc(label)}</span></div>`).join("")}</div></details>`;
+  }
+
+  function inlineAiReview(article) {
+    const pendingActions = article.ai_title_suggestion_state === "pending"
+      ? `<button class="media-button media-button--primary" data-ai-action="accept-ai">Accept AI title</button><button class="media-button" data-ai-action="reject-ai">Reject AI / use original</button>` : "";
+    const published = formatPublicationDate(article.published_at);
+    const sourceRow = `${esc(article.publisher)}<span data-ai-preview-date>${published ? ` · ${esc(published)}` : ""}</span>`;
+    const currentTitle = article.display_title || article.title;
+    const provenance = article.ai_title_generated_at
+      ? `Generated ${esc(formatUtcDateTime(article.ai_title_generated_at))}${article.ai_title_model ? ` · ${esc(article.ai_title_model)}` : ""}${article.ai_title_prompt_version ? ` · ${esc(article.ai_title_prompt_version)}` : ""}`
+      : "No AI title has been generated.";
+    const generateLabel = article.ai_title_suggestion ? "Refresh AI title" : "Generate AI title";
+    const imageUrl = articleImageUrl(article);
+    const image = article.admin_preview_image_path && imageUrl
+      ? `<img class="media-site-preview__image" loading="lazy" src="${esc(imageUrl)}" alt="" data-ai-preview-image>` : "";
+    const savedMessage = state.titleMessages.get(String(article.id));
+    const homepagePublished = formatPublicationDate(article.published_at);
+    const homepageSourceRow = `${esc(article.publisher)}<span data-homepage-preview-date>${homepagePublished ? ` · ${esc(homepagePublished)}` : ""}</span>`;
+    const externalLinkIcon = `<svg class="media-homepage-mobile-preview__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 5h5v5M19 5l-9 9M18 13v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    return `<section class="media-review" data-ai-id="${article.id}" data-publisher-title="${esc(article.title)}" data-ai-published="${published ? "true" : "false"}"><div class="media-review__layout"><div class="media-preview-stack"><div class="media-site-preview-wrap"><div class="media-site-preview" aria-label="Website image article card preview"><span class="media-site-preview__fallback">No permitted preview</span>${image}<div class="media-site-preview__gradient" aria-hidden="true"></div><div class="media-site-preview__overlay"><div class="media-site-preview__source-row">${sourceRow}</div><div class="media-site-preview__title" data-ai-preview-title>${esc(displayTitleWrapping(currentTitle))}</div></div></div></div><div class="media-homepage-mobile-preview-wrap"><div class="media-homepage-mobile-preview__label">Homepage mobile · 360px</div><div class="media-homepage-mobile-preview" aria-label="Homepage non-image article card at a 360 pixel viewport"><div class="media-homepage-mobile-preview__container"><div class="media-homepage-mobile-preview__card">${externalLinkIcon}<p class="media-homepage-mobile-preview__source">${homepageSourceRow}</p><h5 class="media-homepage-mobile-preview__headline"><span data-ai-preview-title>${esc(displayTitleWrapping(currentTitle))}</span></h5></div></div></div></div></div><div class="media-review__controls"><span class="media-subtext">${provenance}</span><div class="media-review__titles"><div class="media-review__title"><span>Publisher original</span>${esc(article.title)}</div><div class="media-review__title"><span>Current display title</span>${esc(currentTitle)}</div><div class="media-review__title"><span>Title origin / status</span>${esc(article.display_title_origin || "original")} · ${esc(titleStatus(article)[1])}</div><div class="media-review__title"><span>${esc(aiSuggestionLabel(article))}</span>${esc(article.ai_title_suggestion || "—")}</div></div><div class="media-actions"><button class="media-button" data-ai-action="generate">${generateLabel}</button>${pendingActions}<label class="media-field media-field--grow"><span>Edit as human title</span><input data-ai-edit value="${esc(article.display_title || "")}" maxlength="500"></label><button class="media-button" data-ai-action="edit">Save human title</button>${article.display_title ? `<button class="media-button" data-ai-action="clear">Clear display title</button>` : ""}</div><div data-ai-message>${savedMessage ? message(savedMessage.text, savedMessage.kind) : ""}</div></div></div></section>`;
+  }
+
+  function articleRow(article) {
+    const title = article.display_title || article.title;
+    const [titleState, titleLabel] = titleStatus(article);
+    const isExpanded = state.expandedArticleIds.has(String(article.id));
+    const imageUrl = articleImageUrl(article);
+    const thumb = article.admin_preview_image_path && imageUrl
+      ? `<img class="media-thumb" loading="lazy" src="${esc(imageUrl)}" alt="" data-media-thumb>`
+      : `<span class="media-thumb-fallback">No image</span>`;
+    const imageState = articleImageState(article);
+    const possibleDuplicate = Number(article.possible_duplicate_active) === 1
+      ? `<span class="media-possible-duplicate">Possible duplicate</span><span class="media-subtext">${esc(possibleDuplicateReasonLabel(article.possible_duplicate_reason_code))}</span>`
+      : "";
+    return `<tr data-article-id="${article.id}"><td class="media-select-cell"><input type="checkbox" data-select-article aria-label="Select ${esc(title)}"${state.selectedArticleIds.has(String(article.id)) ? " checked" : ""}></td><td>${thumb}<span class="media-image-state media-image-state--${esc(imageState[0])}">${esc(imageState[1])}</span></td>
+      <td class="media-title-cell"><button type="button" class="media-title-button" data-open-article>${esc(displayTitleWrapping(title))}</button>${article.display_title ? `<span class="media-subtext">Original: ${esc(article.title)}</span>` : ""}${possibleDuplicate}</td>
+      <td>${esc(article.publisher)}</td><td>${esc(article.author || "—")}</td>
+      <td>${esc(formatPublishedDateTime(article.published_at, false))}</td><td>${esc(formatUtcDateTime(article.approved_at, false))}</td>
+      <td><span class="media-title-status media-title-status--${esc(titleState)}">${esc(titleLabel)}</span><button type="button" class="media-ai-disclosure" data-toggle-ai aria-expanded="${isExpanded}">${isExpanded ? "▴ Title" : "▾ Title"}</button></td><td>${statusControl(article)}</td></tr>${isExpanded ? `<tr class="media-ai-expanded"><td colspan="9">${inlineAiReview(article)}</td></tr>` : ""}`;
+  }
+
+  function bulkToolbarHtml() {
+    const count = state.selectedArticleIds.size;
+    return `<div class="media-bulk-toolbar"><strong>${count} selected</strong><label class="media-field"><span>Change Article Status to</span><select data-bulk-status ${count ? "" : "disabled"}>${bulkStatusOptions()}</select></label><div class="media-social-options" data-bulk-social hidden><label class="media-toggle" data-bulk-bluesky><input type="checkbox"> <span data-bulk-bluesky-label>Post to Bluesky @ukaq.co.uk</span></label><label class="media-toggle" data-bulk-facebook><input type="checkbox"> <span data-bulk-facebook-label>Post to Facebook UK AQ - ukaq.co.uk</span></label></div><button type="button" class="media-button media-button--primary" data-save-bulk ${count ? "" : "disabled"}>Save</button><span class="media-subtext">Current loaded rows only · maximum ${MAX_BATCH_SELECTION}</span><div data-bulk-message>${state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : ""}</div></div>`;
+  }
+
+  function articleTableHtml(error = "") {
+    const rows = state.articles.map(articleRow).join("");
+    const selectedLoaded = state.articles.filter(article => state.selectedArticleIds.has(String(article.id))).length;
+    const allSelected = state.articles.length > 0 && selectedLoaded === state.articles.length;
+    return `${error ? message(error, "error") : ""}${bulkToolbarHtml()}<div class="media-table-wrap"><table class="media-table">
+      <thead><tr><th class="media-select-cell"><input type="checkbox" data-select-all aria-label="Select all currently loaded articles"${allSelected ? " checked" : ""}></th><th>Image</th><th>Title</th><th>Publication</th><th>Author</th><th>Published UTC</th><th>Approved UTC</th><th>Title Status</th><th>Article Status</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="9" class="media-empty">No articles match these filters.</td></tr>`}</tbody>
+    </table></div>${state.articleHasMore ? `<div class="media-actions"><button class="media-button" data-load-more-articles>Load more</button></div>` : ""}`;
+  }
+
+  async function renderArticles(append) {
+    articleRefreshSequence += 1;
+    if (!append) {
+      setView(`<section class="media-card"><div class="media-loading">Loading Articles…</div></section>`);
+    }
+    try {
+      await ensureSelectors();
+      const cursor = append ? state.articleCursor : null;
+      let aiUsageUnavailable = false;
+      const [data, usage] = await Promise.all([request("articles", { params: articleParams(cursor) }), request("ai-usage", { params: new URLSearchParams({ limit: "1" }) }).catch(() => {
+        aiUsageUnavailable = true;
+        return null;
+      })]);
+      state.aiUsage = usage;
+      state.aiUsageUnavailable = aiUsageUnavailable;
+      state.articles = append ? state.articles.concat(data.articles || []) : (data.articles || []);
+      pruneArticleSelectionToLoadedRows();
+      state.articleCursor = data.page?.next_cursor || null;
+      state.articleHasMore = Boolean(data.page?.has_more);
+      setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Articles</h3><p>Authoritative Media D1 editorial state.</p></div>
+        <div class="media-actions"><button class="media-button" data-open-bluesky>Bluesky</button><button class="media-button" data-open-facebook>Facebook</button></div></div>
+        <form class="media-url-form" data-url-lookup><label class="media-field media-field--grow"><span>Search / Add article URL</span><input name="url" type="url" required placeholder="https://publisher.example/article"></label><button class="media-button media-button--primary">Search</button></form>
+        <div data-url-result></div>${aiUsageHtml()}</section>
+        <section class="media-card"><div class="media-toolbar"><form class="media-toolbar__group" data-table-search><label class="media-field"><span>Search existing rows</span><input name="q" type="search" value="${esc(state.filters.q)}" placeholder="Title, URL or author"></label><button class="media-button">Search</button><button type="button" class="media-button" data-clear-filters>Clear filters</button></form></div>
+          ${filterPanel()}<div class="media-article-controls">${articleSortControl()}</div><div data-article-table>${articleTableHtml()}</div></section>`);
+      bindArticleEvents();
+    } catch (error) {
+      setView(`<section class="media-card"><h3>Articles</h3>${message(error.message || "Media admin unavailable.", "error")}</section>`);
+    }
+  }
+
+  async function refreshArticleTable(append = false) {
+    const table = state.root.querySelector("[data-article-table]");
+    if (!table) return;
+    const refreshSequence = ++articleRefreshSequence;
+    const summary = state.root.querySelector("[data-active-filters]");
+    if (summary) summary.textContent = activeFilterSummary();
+    table.setAttribute("aria-busy", "true");
+    const loadMore = table.querySelector("[data-load-more-articles]");
+    if (loadMore) loadMore.disabled = true;
+    try {
+      const cursor = append ? state.articleCursor : null;
+      const data = await request("articles", { params: articleParams(cursor) });
+      if (refreshSequence !== articleRefreshSequence) return;
+      state.articles = append ? state.articles.concat(data.articles || []) : (data.articles || []);
+      pruneArticleSelectionToLoadedRows();
+      state.articleCursor = data.page?.next_cursor || null;
+      state.articleHasMore = Boolean(data.page?.has_more);
+      table.innerHTML = articleTableHtml();
+      bindArticleTableEvents();
+    } catch (error) {
+      if (refreshSequence !== articleRefreshSequence) return;
+      table.innerHTML = articleTableHtml(error.message || "Media admin unavailable.");
+      bindArticleTableEvents();
+    } finally {
+      if (refreshSequence === articleRefreshSequence) table.removeAttribute("aria-busy");
+    }
+  }
+
+  function syncArticleFilterControls() {
+    const search = state.root.querySelector("[data-table-search] input[name='q']");
+    if (search) search.value = state.filters.q;
+    const sort = state.root.querySelector("[data-article-sort]");
+    if (sort) sort.value = state.filters.sort;
+    state.root.querySelectorAll("[data-filter]").forEach(input => {
+      input.checked = state.filters[input.dataset.filter].has(input.value);
+    });
+    state.root.querySelectorAll("[data-filter-radio]").forEach(input => {
+      input.checked = state.filters[input.dataset.filterRadio] === input.value;
+    });
+    updateFilterScrolls();
+  }
+
+  function bindArticleEvents() {
+    state.root.querySelector("[data-open-bluesky]")?.addEventListener("click", () => void openBlueskySettings());
+    state.root.querySelector("[data-open-facebook]")?.addEventListener("click", () => void openFacebookSettings());
+    state.root.querySelector("[data-url-lookup]")?.addEventListener("submit", event => { event.preventDefault(); void lookupUrl(new FormData(event.currentTarget).get("url")); });
+    state.root.querySelector("[data-table-search]")?.addEventListener("submit", event => { event.preventDefault(); state.filters.q = String(new FormData(event.currentTarget).get("q") || "").trim(); clearArticleSelection(); void refreshArticleTable(); });
+    state.root.querySelector("[data-clear-filters]")?.addEventListener("click", () => {
+      state.filters = { status: new Set(["pending"]), source: new Set(), author: new Set(), hasImage: "", titleState: new Set(), q: "", sort: "published_desc" };
+      clearArticleSelection();
+      syncArticleFilterControls();
+      const authorSearch = state.root.querySelector("[data-author-search]");
+      if (authorSearch) authorSearch.value = "";
+      state.root.querySelectorAll("[data-author-option]").forEach(option => { option.hidden = false; });
+      state.root.querySelectorAll("[data-filter-scroll-viewport]").forEach(viewport => { viewport.scrollTop = 0; });
+      updateFilterScrolls();
+      void refreshArticleTable();
+    });
+    state.root.querySelector("[data-article-sort]")?.addEventListener("change", event => { state.filters.sort = event.target.value; clearArticleSelection(); void refreshArticleTable(); });
+    state.root.querySelectorAll("[data-filter]").forEach(input => input.addEventListener("change", event => {
+      const set = state.filters[event.target.dataset.filter]; event.target.checked ? set.add(event.target.value) : set.delete(event.target.value); clearArticleSelection(); void refreshArticleTable();
+    }));
+    state.root.querySelectorAll("[data-filter-radio]").forEach(input => input.addEventListener("change", event => { state.filters[event.target.dataset.filterRadio] = event.target.value; clearArticleSelection(); void refreshArticleTable(); }));
+    state.root.querySelector("[data-author-search]")?.addEventListener("input", event => {
+      const query = event.target.value.toLowerCase(); state.root.querySelectorAll("[data-author-option]").forEach(option => { option.hidden = !option.dataset.authorOption.includes(query); });
+      updateFilterScrolls();
+    });
+    bindFilterScrolls();
+    bindArticleTableEvents();
+  }
+
+  function bindArticleTableEvents() {
+    state.root.querySelector("[data-load-more-articles]")?.addEventListener("click", () => void refreshArticleTable(true));
+    state.root.querySelector("[data-select-all]")?.addEventListener("change", event => {
+      const ids = state.articles.map(article => String(article.id));
+      if (event.target.checked) ids.forEach(id => state.selectedArticleIds.add(id));
+      else ids.forEach(id => state.selectedArticleIds.delete(id));
+      refreshSelectionControls();
+    });
+    state.root.querySelectorAll("[data-select-article]").forEach(input => input.addEventListener("change", event => {
+      const id = String(event.target.closest("[data-article-id]").dataset.articleId);
+      if (event.target.checked) state.selectedArticleIds.add(id); else state.selectedArticleIds.delete(id);
+      refreshSelectionControls();
+    }));
+    state.root.querySelector("[data-bulk-status]")?.addEventListener("change", event => {
+      const social = state.root.querySelector("[data-bulk-social]");
+      if (social) {
+        social.hidden = event.currentTarget.value !== "approved";
+        social.querySelectorAll("input").forEach(input => { input.checked = false; });
+      }
+      refreshSelectionControls();
+    });
+    state.root.querySelector("[data-save-bulk]")?.addEventListener("click", () => void saveBulkStatus());
+    state.root.querySelectorAll("[data-bulk-social] input").forEach(input => input.addEventListener("change", refreshSelectionControls));
+    state.root.querySelectorAll("[data-status-control] select").forEach(select => select.addEventListener("change", event => {
+      const control = event.target.closest("[data-status-control]");
+      const current = control.dataset.current;
+      const saved = control.querySelector(".media-save-state");
+      if (event.target.value === current) {
+        saved.outerHTML = `<span class="media-save-state" title="Saved/current" aria-label="Saved/current">💾</span>`;
+      } else {
+        saved.outerHTML = `<button type="button" class="media-save-state is-unsaved" title="Save status change" aria-label="Save status change">💾</button>`;
+        control.querySelector("button")?.addEventListener("click", () => void saveStatus(control));
+      }
+    }));
+    state.root.querySelectorAll("[data-article-id]").forEach(row => row.addEventListener("click", event => {
+      if (event.target.closest("button,select,input,a")) return;
+      void openArticle(Number(row.dataset.articleId));
+    }));
+    state.root.querySelectorAll("[data-open-article]").forEach(button => button.addEventListener("click", () => {
+      void openArticle(Number(button.closest("[data-article-id]").dataset.articleId));
+    }));
+    state.root.querySelectorAll("[data-toggle-ai]").forEach(button => button.addEventListener("click", () => {
+      const id = String(button.closest("[data-article-id]").dataset.articleId);
+      state.expandedArticleIds.has(id) ? state.expandedArticleIds.delete(id) : state.expandedArticleIds.add(id);
+      const table = state.root.querySelector("[data-article-table]"); table.innerHTML = articleTableHtml(); bindArticleTableEvents(); hydrateAiPreviewDetails();
+    }));
+    state.root.querySelectorAll("[data-media-thumb]").forEach(image => image.addEventListener("error", () => { image.outerHTML = `<span class="media-thumb-fallback">Image unavailable</span>`; }, { once: true }));
+    bindAiActions();
+    hydrateAiPreviewDetails();
+  }
+
+  function clearArticleSelection() { state.selectedArticleIds.clear(); state.batchMessage = ""; }
+
+  function refreshSelectionControls() {
+    const table = state.root.querySelector("[data-article-table]");
+    if (!table) return;
+    const count = state.selectedArticleIds.size;
+    const selectedLoaded = state.articles.filter(article => state.selectedArticleIds.has(String(article.id))).length;
+    const all = table.querySelector("[data-select-all]");
+    if (all) { all.checked = state.articles.length > 0 && selectedLoaded === state.articles.length; all.indeterminate = selectedLoaded > 0 && selectedLoaded < state.articles.length; }
+    table.querySelectorAll("[data-select-article]").forEach(input => { input.checked = state.selectedArticleIds.has(String(input.closest("[data-article-id]").dataset.articleId)); });
+    const label = table.querySelector(".media-bulk-toolbar strong"); if (label) label.textContent = `${count} selected`;
+    const target = table.querySelector("[data-bulk-status]"); const save = table.querySelector("[data-save-bulk]");
+    if (target) {
+      const previous = target.value;
+      target.innerHTML = bulkStatusOptions(selectedArticles());
+      if ([...target.options].some(option => option.value === previous)) target.value = previous;
+      target.disabled = count === 0;
+    }
+    const social = table.querySelector("[data-bulk-social]");
+    if (social) {
+      const visible = count > 0 && target?.value === "approved";
+      social.hidden = !visible;
+      if (!visible) {
+        social.querySelectorAll("input").forEach(input => { input.checked = false; });
+      }
+      const allApproved = count > 0 && selectedArticles().every(article => article.status === "approved");
+      const blueskyLabel = social.querySelector("[data-bulk-bluesky-label]");
+      const facebookLabel = social.querySelector("[data-bulk-facebook-label]");
+      if (blueskyLabel) blueskyLabel.textContent = allApproved ? "Post/repost selected to Bluesky" : "Post to Bluesky @ukaq.co.uk";
+      if (facebookLabel) facebookLabel.textContent = allApproved ? "Post/repost selected to Facebook" : "Post to Facebook UK AQ - ukaq.co.uk";
+    }
+    const directPublishMode = target?.value === "approved" && count > 0
+      && selectedArticles().every(article => article.status === "approved");
+    const socialSelected = social?.querySelector("input:checked") !== null;
+    if (save) save.disabled = count === 0 || count > MAX_BATCH_SELECTION || !target?.value
+      || (directPublishMode && !socialSelected);
+    const output = table.querySelector("[data-bulk-message]"); if (output) output.innerHTML = state.batchMessage ? message(state.batchMessage.text, state.batchMessage.kind) : "";
+  }
+
+  async function saveBulkStatus() {
+    const table = state.root.querySelector("[data-article-table]"); const target = table?.querySelector("[data-bulk-status]")?.value;
+    if (!target || !["approved", "rejected", "hidden"].includes(target)) return;
+    const selected = selectedArticles();
+    if (selected.length > MAX_BATCH_SELECTION) { state.batchMessage = { text: `Apply Article Status to at most ${MAX_BATCH_SELECTION} selected rows at a time.`, kind: "error" }; refreshSelectionControls(); return; }
+    if (!selected.every(article => bulkStatusTargetEligible(article, target))) {
+      state.batchMessage = { text: `Selected rows cannot all move to ${STATUS_LABELS[target]}.`, kind: "error" };
+      refreshSelectionControls();
+      return;
+    }
+    const changes = selected.map(article => ({ article, action: statusActionForTarget(article.status, target) })).filter(item => item.action);
+    const save = table.querySelector("[data-save-bulk]"); save.disabled = true;
+    const postToBluesky = target === "approved" && table.querySelector("[data-bulk-bluesky] input")?.checked === true;
+    const postToFacebook = target === "approved" && table.querySelector("[data-bulk-facebook] input")?.checked === true;
+    if (postToBluesky || postToFacebook) {
+      const approvedCount = selected.filter(article => article.status === "approved").length;
+      if (approvedCount > 0 && approvedCount < selected.length) {
+        state.batchMessage = { text: "For social publishing, select either only articles already Approved or only articles being moved to Approved.", kind: "error" };
+        refreshSelectionControls();
+        return;
+      }
+      try {
+        const directPublish = approvedCount === selected.length;
+        await request(directPublish ? "articles/bulk-publish" : "articles/bulk-approve", {
+          method: "POST",
+          idempotent: directPublish ? "bulk-publish" : "bulk-approve",
+          body: {
+            article_ids: directPublish ? selected.map(article => article.id) : changes.map(({ article }) => article.id),
+            post_to_bluesky: postToBluesky,
+            post_to_facebook: postToFacebook,
+          },
+        });
+        state.batchMessage = directPublish
+          ? { text: `Social publication requests accepted for ${selected.length} selected article${selected.length === 1 ? "" : "s"}.`, kind: "success" }
+          : { text: `${changes.length} changed. Social publication requests accepted.`, kind: "success" };
+        await refreshArticleTable(false);
+      } catch (error) {
+        const failures = Array.isArray(error.payload?.failures) ? error.payload.failures : [];
+        const detail = failures.slice(0, MAX_BATCH_SELECTION).map(failure => {
+          const platform = failure.platform ? ` (${failure.platform === "bluesky" ? "Bluesky" : "Facebook"})` : "";
+          return `article ${boundedCode(failure.article_id)}${platform}: ${directPublishUnavailableMessage(platform || "Social", failure.error)}`;
+        }).join(" ");
+        state.batchMessage = { text: detail ? `Bulk publish rejected. ${detail}` : error.message, kind: "error" };
+        refreshSelectionControls();
+      }
+      return;
+    }
+    const results = await Promise.allSettled(changes.map(({ article, action }) => request(`articles/${article.id}/${action}`, { method: "POST", idempotent: "status" })));
+    const succeeded = results.filter(result => result.status === "fulfilled").length;
+    const failed = results.length - succeeded;
+    state.batchMessage = { text: `${succeeded} changed${selected.length - changes.length ? `; ${selected.length - changes.length} already ${STATUS_LABELS[target]}` : ""}${failed ? `; ${failed} failed` : ""}.`, kind: failed ? "error" : "success" };
+    if (succeeded || selected.length !== changes.length) await refreshArticleTable(false);
+    else refreshSelectionControls();
+  }
+
+  async function saveStatus(control) {
+    const select = control.querySelector("select");
+    const option = select.selectedOptions[0];
+    const action = option.dataset.action;
+    if (!action) return;
+    const nextStatus = option.value;
+    if (nextStatus === "approved" && control.dataset.current !== "approved") {
+      select.value = control.dataset.current;
+      control.querySelector(".media-save-state").outerHTML = `<span class="media-save-state" title="Saved/current" aria-label="Saved/current">💾</span>`;
+      await openArticle(Number(control.dataset.id), "", "approved");
+      return;
+    }
+    const button = control.querySelector("button"); button.disabled = true;
+    try {
+      await request(`articles/${control.dataset.id}/${action}`, { method: "POST", idempotent: "status" });
+      await refreshArticleTable(false);
+    } catch (error) {
+      button.disabled = false;
+      const prior = control.parentElement.querySelector(".media-message"); prior?.remove();
+      control.parentElement.insertAdjacentHTML("beforeend", message(error.message, "error"));
+    }
+  }
+
+  async function lookupUrl(value) {
+    const result = state.root.querySelector("[data-url-result]");
+    result.innerHTML = message("Checking canonical Media identity…");
+    try {
+      const data = await request("articles/lookup", { method: "POST", body: { url: String(value) } });
+      if (data.article) {
+        result.innerHTML = `${message(`Existing ${STATUS_LABELS[data.article.status] || data.article.status} article found.`, "success")}<button class="media-button" data-open-found>Open article</button>`;
+        result.querySelector("[data-open-found]")?.addEventListener("click", () => void openArticle(data.article.id));
+        return;
+      }
+      const metadata = data.metadata || {};
+      result.innerHTML = `${data.metadata_error ? message(`Automatic metadata unavailable: ${data.metadata_error}. Supply the missing public fields manually.`) : message("New canonical article. Review metadata before adding.", "success")}
+        <form class="media-inline-form" data-add-manual>
+          <input type="hidden" name="url" value="${esc(data.canonical_url)}">
+          <div class="media-manual-fields">
+            <label class="media-field media-field--grow"><span>Publisher title</span><input name="title" required maxlength="1000" value="${esc(metadata.title || "")}"></label>
+            <label class="media-field"><span>Publication</span><input name="publisher" required maxlength="200" value="${esc(metadata.publisher || data.source?.name || "")}"></label>
+            <label class="media-field"><span>Author</span><input name="author" maxlength="500" value="${esc(metadata.author || "")}"></label>
+            <label class="media-field"><span>Published UTC</span><input name="published_at" type="datetime-local" value="${esc(formatUtcDateTimeInput(metadata.published_at))}"></label>
+          </div>
+          <input type="hidden" name="preview_image_url" value="${esc(metadata.image_url || "")}">
+          <div class="media-actions media-manual-actions">
+            <button class="media-button" data-initial-status="pending">Add Pending</button>
+            <button class="media-button media-button--primary" data-initial-status="approved">Add Approved</button>
+          </div>
+        </form><p class="media-subtext">Pending creates the article without approval; Approved creates it with Manual approval provenance. ${data.source?.will_create_disabled_definition ? "A conservative disabled publisher definition will also be created." : ""}</p>`;
+      result.querySelector("[data-add-manual]")?.addEventListener("submit", event => {
+        event.preventDefault();
+        void addManualArticle(event.currentTarget, result, event.submitter?.dataset.initialStatus);
+      });
+    } catch (error) { result.innerHTML = message(error.message, "error"); }
+  }
+
+  async function addManualArticle(form, result, initialStatus) {
+    const values = new FormData(form);
+    const published = String(values.get("published_at") || "");
+    const status = initialStatus === "approved" ? "approved" : "pending";
+    try {
+      const data = await request("articles", { method: "POST", idempotent: "add", body: {
+        url: values.get("url"), title: values.get("title"), publisher: values.get("publisher"),
+        author: String(values.get("author") || "").trim() || null,
+        published_at: published ? new Date(`${published}Z`).toISOString() : null,
+        preview_image_url: String(values.get("preview_image_url") || "").trim() || null,
+        initial_status: status,
+      } });
+      result.innerHTML = message(status === "approved"
+        ? "Article added and approved with manual provenance."
+        : "Article added as Pending.", "success");
+      await renderArticles(false); await openArticle(data.article.id);
+    } catch (error) { result.insertAdjacentHTML("afterbegin", message(error.message, "error")); }
+  }
+
+  function detailDialog() {
+    let dialog = document.getElementById("media-article-detail");
+    if (!dialog) { dialog = document.createElement("dialog"); dialog.id = "media-article-detail"; dialog.className = "media-detail"; document.body.appendChild(dialog); }
+    return dialog;
+  }
+
+  function blueskyDialog() {
+    let dialog = document.getElementById("media-bluesky-settings");
+    if (!dialog) { dialog = document.createElement("dialog"); dialog.id = "media-bluesky-settings"; dialog.className = "media-detail media-bluesky"; document.body.appendChild(dialog); }
+    return dialog;
+  }
+
+  function blueskySettingsFrom(data) { return data?.settings || data?.bluesky || data || {}; }
+
+  async function openBlueskySettings(notice = "") {
+    const dialog = blueskyDialog();
+    dialog.innerHTML = `<div class="media-detail__inner"><div class="media-loading">Loading Bluesky settings…</div></div>`;
+    if (!dialog.open) dialog.showModal();
+    try {
+      const data = await request("bluesky/settings");
+      const settings = blueskySettingsFrom(data);
+      const template = settings.default_message_template ?? settings.default_message ?? "";
+      const cooldownSeconds = Number(settings.cooldown_seconds);
+      const cooldownMinutes = Number.isFinite(cooldownSeconds) ? cooldownSeconds / 60 : "";
+      const minMinutes = Number(data?.constraints?.cooldown_minutes_min);
+      const maxMinutes = Number(data?.constraints?.cooldown_minutes_max);
+      const min = Number.isFinite(minMinutes) ? ` min="${minMinutes}"` : "";
+      const max = Number.isFinite(maxMinutes) ? ` max="${maxMinutes}"` : "";
+      dialog.innerHTML = `<form class="media-detail__inner" data-bluesky-form><div class="media-detail__header"><div><h3>Bluesky</h3><p>Account: <strong>@ukaq.co.uk</strong></p></div></div>${notice ? message(notice, "success") : ""}
+        <label class="media-toggle"><input name="publishing_enabled" type="checkbox"${settings.publishing_enabled ? " checked" : ""}> <span>Publishing enabled</span></label>
+        <label class="media-field"><span>Default message</span><textarea name="default_message_template" required>${esc(template)}</textarea></label>
+        <div class="media-counter" data-template-count></div><p class="media-subtext">Available placeholders: <code>{publisher}</code> <code>{publisher_mention}</code></p>
+        <section class="media-bluesky__preview"><h4>Example preview</h4><pre data-example-preview></pre><div class="media-counter" data-example-count></div><p class="media-subtext">Example only. Real titles and publisher details vary; Media validates and constructs the final post.</p></section>
+        <label class="media-field media-bluesky__cooldown"><span>Post cooldown (minutes)</span><input name="cooldown_minutes" type="number" required step="1" value="${esc(cooldownMinutes)}"${min}${max}></label>
+        <div data-bluesky-message></div><div class="media-actions media-bluesky__actions"><button type="button" class="media-button" data-cancel-bluesky>Cancel</button><button class="media-button media-button--primary" data-save-bluesky>Save</button></div></form>`;
+      const form = dialog.querySelector("[data-bluesky-form]");
+      const textarea = form.querySelector("textarea");
+      const update = () => {
+        const literalCount = graphemeCount(literalTemplate(textarea.value));
+        const example = renderBlueskyExample(textarea.value);
+        const unknown = unknownPlaceholders(textarea.value);
+        form.querySelector("[data-template-count]").textContent = `${literalCount} / ${BLUESKY_TEMPLATE_LIMIT}`;
+        form.querySelector("[data-example-preview]").textContent = example;
+        form.querySelector("[data-example-count]").textContent = `${graphemeCount(example)} / ${BLUESKY_POST_LIMIT}`;
+        form.querySelector("[data-save-bluesky]").disabled = literalCount > BLUESKY_TEMPLATE_LIMIT || unknown.length > 0;
+        form.querySelector("[data-bluesky-message]").innerHTML = unknown.length ? message(`Unsupported placeholder: ${unknown.join(", ")}`, "error") : "";
+      };
+      textarea.addEventListener("input", update); update();
+      form.querySelector("[data-cancel-bluesky]").addEventListener("click", () => dialog.close());
+      form.addEventListener("submit", async event => {
+        event.preventDefault();
+        const output = form.querySelector("[data-bluesky-message]"); const save = form.querySelector("[data-save-bluesky]");
+        const minutes = Number(form.elements.cooldown_minutes.value);
+        if (!Number.isInteger(minutes)) { output.innerHTML = message("Cooldown must be a whole number of minutes.", "error"); return; }
+        save.disabled = true; save.textContent = "Saving…";
+        try {
+          await request("bluesky/settings", { method: "PUT", idempotent: "bluesky-settings", body: {
+            publishing_enabled: form.elements.publishing_enabled.checked,
+            default_message_template: textarea.value,
+            cooldown_minutes: minutes,
+          } });
+          await openBlueskySettings("Bluesky settings saved.");
+        } catch (error) { save.disabled = false; save.textContent = "Save"; output.innerHTML = message(error.message, "error"); }
+      });
+    } catch (error) { dialog.innerHTML = `<div class="media-detail__inner"><h3>Bluesky</h3>${message(error.message, "error")}<div class="media-actions"><button class="media-button" onclick="this.closest('dialog').close()">Close</button></div></div>`; }
+  }
+
+  function facebookDialog() {
+    let dialog = document.getElementById("media-facebook-settings");
+    if (!dialog) { dialog = document.createElement("dialog"); dialog.id = "media-facebook-settings"; dialog.className = "media-detail media-social-settings"; document.body.appendChild(dialog); }
+    return dialog;
+  }
+
+  function facebookSettingsFrom(data) { return data?.settings || data?.facebook || data || {}; }
+
+  function boundedCode(value) { return value ? String(value).slice(0, 160) : "—"; }
+
+  function facebookIdentityFingerprint(settings) {
+    return JSON.stringify([settings.last_identity_checked_at, settings.last_identity_verified_at,
+      settings.last_identity_observed_name, settings.last_identity_name_drift, settings.last_identity_error_code]);
+  }
+
+  async function pollFacebookIdentity(previousFingerprint) {
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      const data = await request("facebook/settings");
+      const settings = facebookSettingsFrom(data);
+      if (facebookIdentityFingerprint(settings) !== previousFingerprint) return data;
+    }
+    return null;
+  }
+
+  async function openFacebookSettings(notice = "", suppliedData = null) {
+    const dialog = facebookDialog();
+    dialog.innerHTML = `<div class="media-detail__inner"><div class="media-loading">Loading Facebook settings…</div></div>`;
+    if (!dialog.open) dialog.showModal();
+    try {
+      const data = suppliedData || await request("facebook/settings");
+      const settings = facebookSettingsFrom(data);
+      const template = settings.default_message_template ?? settings.default_message ?? "";
+      const cooldownMinutes = settings.cooldown_minutes ?? (Number.isFinite(Number(settings.cooldown_seconds)) ? Number(settings.cooldown_seconds) / 60 : "");
+      const minMinutes = Number(data?.constraints?.cooldown_minutes_min);
+      const maxMinutes = Number(data?.constraints?.cooldown_minutes_max);
+      const cooldownBounds = `${Number.isFinite(minMinutes) ? ` min="${minMinutes}"` : ""}${Number.isFinite(maxMinutes) ? ` max="${maxMinutes}"` : ""}`;
+      const drift = settings.last_identity_name_drift === true;
+      const verified = Boolean(settings.last_identity_verified_at) && !settings.last_identity_error_code;
+      dialog.innerHTML = `<form class="media-detail__inner" data-facebook-form><div class="media-detail__header"><div><h3>Facebook</h3><p>UK AQ - ukaq.co.uk</p></div><button type="button" class="media-button" data-close-facebook>Close</button></div>${notice ? message(notice, notice.includes("not updated") ? "" : "success") : ""}
+        <div class="media-social-identity${drift ? " is-warning" : verified ? " is-verified" : ""}"><dl>
+          <dt>Configured Page name</dt><dd>${esc(settings.configured_page_name ?? settings.page_name ?? "—")}</dd>
+          <dt>Page ID</dt><dd>${esc(settings.page_id || "—")}</dd><dt>Graph API version</dt><dd>${esc(settings.graph_api_version || "—")}</dd>
+          <dt>Identity</dt><dd>${verified ? "Verified" : "Not currently verified"}</dd><dt>Last identity checked</dt><dd>${esc(formatUtcDateTime(settings.last_identity_checked_at))}</dd>
+          <dt>Last identity verified</dt><dd>${esc(formatUtcDateTime(settings.last_identity_verified_at))}</dd><dt>Observed Page name</dt><dd>${esc(settings.last_identity_observed_name || "—")}</dd>
+          <dt>Page-name drift</dt><dd>${drift ? "Yes — configured and observed names differ" : "No"}</dd><dt>Identity error</dt><dd>${esc(boundedCode(settings.last_identity_error_code))}</dd>
+          <dt>Last successful post</dt><dd>${esc(formatUtcDateTime(settings.last_successful_post_at))}</dd></dl></div>
+        <label class="media-toggle"><input name="publishing_enabled" type="checkbox"${settings.publishing_enabled ? " checked" : ""}> <span>Publishing enabled</span></label>
+        <label class="media-field"><span>Default message template</span><textarea name="default_message_template" required>${esc(template)}</textarea></label>
+        <p class="media-subtext">Available placeholder: <code>{publisher}</code>. The Page token is held only by the Media service and is never displayed or requested here.</p>
+        <section class="media-social-settings__preview"><h4>Example preview</h4><pre data-facebook-preview></pre><p class="media-subtext">The original publisher headline is prepended by Media. The canonical publisher article URL is supplied separately as the Facebook link.</p></section>
+        <label class="media-field media-social-settings__cooldown"><span>Post cooldown (minutes)</span><input name="cooldown_minutes" type="number" required step="1" value="${esc(cooldownMinutes)}"${cooldownBounds}></label>
+        <div data-facebook-message></div><div class="media-actions media-social-settings__actions"><button type="button" class="media-button" data-check-facebook>Check connection</button><button type="button" class="media-button" data-cancel-facebook>Cancel</button><button class="media-button media-button--primary" data-save-facebook>Save settings</button></div></form>`;
+      const form = dialog.querySelector("[data-facebook-form]");
+      const textarea = form.querySelector("textarea");
+      const update = () => {
+        const unknown = [...String(textarea.value).matchAll(/\{[^{}]+\}/g)].map(match => match[0]).filter(token => !FACEBOOK_PLACEHOLDERS.includes(token));
+        form.querySelector("[data-facebook-preview]").textContent = renderFacebookExample(textarea.value);
+        form.querySelector("[data-save-facebook]").disabled = unknown.length > 0;
+        form.querySelector("[data-facebook-message]").innerHTML = unknown.length ? message(`Unsupported placeholder: ${unknown.join(", ")}`, "error") : "";
+      };
+      textarea.addEventListener("input", update); update();
+      form.querySelector("[data-close-facebook]").addEventListener("click", () => dialog.close());
+      form.querySelector("[data-cancel-facebook]").addEventListener("click", () => dialog.close());
+      form.querySelector("[data-check-facebook]").addEventListener("click", async event => {
+        const button = event.currentTarget; const output = form.querySelector("[data-facebook-message]");
+        button.disabled = true; button.textContent = "Requesting…";
+        try {
+          const fingerprint = facebookIdentityFingerprint(settings);
+          await request("facebook/connection-check", { method: "POST", idempotent: "facebook-connection-check" });
+          output.innerHTML = message("Connection check accepted. Waiting for the queued identity result…");
+          const updated = await pollFacebookIdentity(fingerprint);
+          await openFacebookSettings(updated ? "Connection check result updated." : "Connection check requested; status not updated yet.", updated);
+        } catch (error) { button.disabled = false; button.textContent = "Check connection"; output.innerHTML = message(error.message, "error"); }
+      });
+      form.addEventListener("submit", async event => {
+        event.preventDefault(); const output = form.querySelector("[data-facebook-message]"); const save = form.querySelector("[data-save-facebook]");
+        const minutes = Number(form.elements.cooldown_minutes.value);
+        if (!Number.isInteger(minutes)) { output.innerHTML = message("Cooldown must be a whole number of minutes.", "error"); return; }
+        save.disabled = true; save.textContent = "Saving…";
+        try {
+          await request("facebook/settings", { method: "PUT", idempotent: "facebook-settings", body: {
+            publishing_enabled: form.elements.publishing_enabled.checked,
+            default_message_template: textarea.value,
+            cooldown_minutes: minutes,
+          } });
+          await openFacebookSettings("Facebook settings saved.");
+        } catch (error) { save.disabled = false; save.textContent = "Save settings"; output.innerHTML = message(error.message, "error"); }
+      });
+    } catch (error) { dialog.innerHTML = `<div class="media-detail__inner"><h3>Facebook</h3>${message(error.message, "error")}<div class="media-actions"><button class="media-button" onclick="this.closest('dialog').close()">Close</button></div></div>`; }
+  }
+
+  function blueskyState(data, article) {
+    const social = { ...(article || {}), ...(article?.bluesky || {}), ...(data?.bluesky || {}) };
+    if ((social.publications || []).some(item => item.publication_reason === "auto_approved"
+      && item.status === "blocked" && item.last_error_code === "thumbnail_pending")) {
+      social.direct_publish_available = false;
+      social.direct_publish_unavailable_reason = "publication_in_progress";
+      social.manual_post_available = false;
+      social.manual_post_unavailable_reason = "publication_in_progress";
+    }
+    return social;
+  }
+
+  function blueskyReasonLabel(reason) {
+    return BLUESKY_REASON_LABELS[reason] || reason || "—";
+  }
+
+  function blueskyStatusLabel(item) {
+    const error = item.last_error_code || item.error_code;
+    if (item.status === "blocked" && error === "thumbnail_pending") return "Waiting for thumbnail";
+    if (item.status === "blocked" && error === "operator_cancelled") return "Cancelled";
+    return item.status_label || ({ queued: "Queued", posting: "Posting", posted: "Posted",
+      failed: "Failed", blocked: "Blocked" })[item.status] || item.status || "—";
+  }
+
+  function blueskyHistoryHtml(data, article) {
+    const bluesky = blueskyState(data, article); const publications = bluesky.publications || [];
+    const rows = publications.map(item => {
+      const href = item.post_url || (String(item.post_uri || "").startsWith("https://") ? item.post_uri : "");
+      const post = href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">Open post ↗</a>` : esc(item.post_uri || "—");
+      const reason = blueskyReasonLabel(item.publication_reason);
+      const error = item.last_error_code || item.error_code;
+      const detail = error === "thumbnail_pending" ? "Awaiting an eligible thumbnail"
+        : error === "operator_cancelled" ? "Cancelled by operator" : error || "—";
+      return `<tr><td>${esc(blueskyStatusLabel(item))}</td><td>${esc(reason)}</td><td>${esc(formatUtcDateTime(item.posted_at || item.updated_at || item.created_at))}</td><td>${esc(detail)}</td><td>${post}</td></tr>`;
+    }).join("");
+    const latestStatus = bluesky.latest_status_label || blueskyStatusLabel(publications[0] || {
+      status: bluesky.latest_status, last_error_code: bluesky.latest_error_code });
+    return `<section><h4>Bluesky publication</h4><div class="media-stats"><div class="media-stat"><strong>${esc(bluesky.post_count ?? 0)}</strong><span>Successful posts</span></div><div class="media-stat"><strong>${esc(bluesky.publication_count ?? publications.length)}</strong><span>Publication requests</span></div><div class="media-stat"><strong>${esc(latestStatus)}</strong><span>Latest status</span></div></div>${rows ? `<div class="media-table-wrap"><table class="media-table media-table--bluesky"><thead><tr><th>Status</th><th>Reason</th><th>Relevant time</th><th>Details</th><th>Post</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="media-subtext">No Bluesky publication history.</p>`}</section>`;
+  }
+
+  function facebookState(data, article) {
+    return { ...(article || {}), ...(article?.facebook || {}), ...(data?.facebook || {}) };
+  }
+
+  function socialReasonLabel(reason) { return BLUESKY_REASON_LABELS[reason] || reason || "—"; }
+
+  function directPublishUnavailableMessage(platform, reason) {
+    const messages = {
+      thumbnail_missing: "Bluesky posting unavailable because no eligible thumbnail is available.",
+      publication_in_progress: platform === "Bluesky"
+        ? "A Bluesky publication is already waiting for a thumbnail, queued or in progress."
+        : "A publication is already queued or in progress.",
+      unknown_remote_state: "Facebook publication state is unknown and is being held to prevent a possible duplicate post.",
+      facebook_publishing_disabled: "Facebook publishing is disabled.",
+      article_not_approved: "Direct publishing is only available for Approved articles.",
+    };
+    return messages[reason] || `${platform} direct publishing is currently unavailable.`;
+  }
+
+  function directPublishOption(platform, social) {
+    const name = platform === "Bluesky" ? "Bluesky @ukaq.co.uk" : "Facebook UK AQ - ukaq.co.uk";
+    const key = platform.toLowerCase();
+    if (social.direct_publish_available === true) {
+      const verb = social.direct_publish_reason === "manual_repost" ? "Repost" : "Post";
+      return `<label class="media-toggle" data-direct-${key}><input type="checkbox"> <span>${verb} to ${name}</span></label>`;
+    }
+    const reason = social.direct_publish_unavailable_reason;
+    const held = platform === "Facebook" && reason === "unknown_remote_state";
+    return `<div class="media-message${held ? " media-message--error media-publication-state--held" : ""}">${esc(directPublishUnavailableMessage(platform, reason))}</div>`;
+  }
+
+  function directPublishHtml(data, article) {
+    if (article.status !== "approved") return "";
+    const bluesky = blueskyState(data, article);
+    const facebook = facebookState(data, article);
+    return `<section><h4>Direct social publishing</h4><p class="media-subtext">Queue a deliberate post or repost without changing this article’s Approved status.</p><div class="media-social-options">${directPublishOption("Bluesky", bluesky)}${directPublishOption("Facebook", facebook)}</div><div class="media-actions"><button type="button" class="media-button media-button--primary" data-direct-publish disabled>Publish selected</button></div><div data-direct-publish-message></div></section>`;
+  }
+
+  function facebookStatusLabel(item) {
+    if (item.status === "queued" && item.next_attempt_at) return "Retry scheduled";
+    return ({ queued: "Queued", posting: "Posting", posted: "Posted", failed: "Failed", blocked: "Blocked",
+      unknown_remote_state: "Unknown remote state — held for operator review" })[item.status] || item.status || "—";
+  }
+
+  function facebookHistoryHtml(data, article) {
+    const facebook = facebookState(data, article); const publications = facebook.publications || [];
+    const rows = publications.map(item => {
+      const permalink = item.facebook_permalink_url
+        ? `<a href="${esc(item.facebook_permalink_url)}" target="_blank" rel="noopener noreferrer">Open post ↗</a>` : "—";
+      const remoteId = item.facebook_post_id ? `<code>${esc(item.facebook_post_id)}</code>` : "—";
+      const relevantTime = item.posted_at || item.next_attempt_at || item.last_attempted_at || item.updated_at || item.created_at;
+      const held = item.status === "unknown_remote_state" ? " media-publication-state--held" : "";
+      return `<tr class="media-publication-state--${esc(item.status || "unknown")}${held}"><td>${esc(facebookStatusLabel(item))}</td><td>${esc(socialReasonLabel(item.publication_reason))}</td><td>${esc(item.attempt_count ?? 0)}</td><td>${esc(formatUtcDateTime(relevantTime))}</td><td>${esc(boundedCode(item.last_error_code || item.error_code))}</td><td>${remoteId}</td><td>${permalink}</td><td>${esc(item.reconciliation_method || "—")}</td></tr>`;
+    }).join("");
+    return `<section><h4>Facebook publication</h4><div class="media-stats"><div class="media-stat"><strong>${esc(facebook.post_count ?? facebook.successful_post_count ?? 0)}</strong><span>Successful posts</span></div><div class="media-stat"><strong>${esc(facebook.publication_count ?? publications.length)}</strong><span>Publication requests</span></div><div class="media-stat"><strong>${esc(facebookStatusLabel({ status: facebook.latest_status }))}</strong><span>Latest status</span></div></div>${rows ? `<div class="media-table-wrap"><table class="media-table media-table--facebook"><thead><tr><th>Status</th><th>Reason</th><th>Attempts</th><th>Relevant time</th><th>Error code</th><th>Facebook post ID</th><th>Post</th><th>Reconciliation</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="media-subtext">No Facebook publication history.</p>`}</section>`;
+  }
+
+  function manualBlueskyHtml(article, data) {
+    const bluesky = blueskyState(data, article);
+    if (article.status === "approved") return "";
+    if (bluesky.manual_post_available === true) return `<label class="media-toggle" data-manual-bluesky><input type="checkbox"> <span>Post to Bluesky @ukaq.co.uk</span></label>${bluesky.manual_post_reason ? `<p class="media-subtext">Reason: ${esc(blueskyReasonLabel(bluesky.manual_post_reason))}</p>` : ""}`;
+    const reason = bluesky.manual_post_unavailable_reason || bluesky.manual_post_reason;
+    return reason ? `<p class="media-message">${esc(directPublishUnavailableMessage("Bluesky", reason))}</p>` : "";
+  }
+
+  function manualFacebookHtml(article) {
+    if (article.status === "approved") return "";
+    return `<label class="media-toggle" data-manual-facebook><input type="checkbox"> <span>Post to Facebook UK AQ - ukaq.co.uk</span></label>`;
+  }
+
+  function localCopyEvidenceHtml(evidence) {
+    return evidence?.permission_basis
+      ? `<p><strong>Latest recorded local-copy permission/basis:</strong> ${esc(evidence.permission_basis)}<span class="media-subtext">Recorded ${esc(formatUtcDateTime(evidence.recorded_at))}</span></p>`
+      : `<p class="media-subtext">No local-copy permission/basis evidence has been recorded through this workflow.</p>`;
+  }
+
+  function articleImagePolicyHtml(article) {
+    const sourceAllowsLocalCopy = article.source_image_policy === "local_copy_permitted";
+    const retainedWarning = article.image_policy === "local_copy_permitted"
+      ? `<div class="media-message">Changing away from local_copy_permitted makes any retained image immediately ineligible for delivery and Bluesky. The R2 object is not automatically deleted.</div>` : "";
+    return `<section><h4>Image policy</h4><p>Article: <strong>${esc(article.image_policy)}</strong> · Source: <strong>${esc(article.source_image_policy)}</strong></p>${retainedWarning}<form class="media-inline-form" data-article-image-policy><label class="media-field"><span>Article image policy</span><select name="image_policy"><option value="blocked"${article.image_policy === "blocked" ? " selected" : ""}>blocked</option><option value="remote_preview"${article.image_policy === "remote_preview" ? " selected" : ""}>remote_preview</option><option value="local_copy_permitted"${article.image_policy === "local_copy_permitted" ? " selected" : ""}${sourceAllowsLocalCopy ? "" : " disabled"}>local_copy_permitted</option></select></label><label class="media-toggle"><input name="confirm_local_copy_permitted" type="checkbox"> <span>I explicitly confirm that the recorded permission, licence or other right permits this article’s image to be retained locally.</span></label><button type="submit" class="media-button media-button--primary">Save image policy</button></form><p class="media-subtext">A retained image can be uploaded only after both source and article policies are local_copy_permitted.</p><div data-article-image-policy-message></div></section>`;
+  }
+
+  function possibleDuplicateDetailHtml(possibleDuplicate) {
+    if (!possibleDuplicate?.candidate) return "";
+    const candidate = possibleDuplicate.candidate;
+    const stateLabel = possibleDuplicate.active
+      ? `<span class="media-possible-duplicate">Active hold</span>`
+      : `<span class="media-possible-duplicate media-possible-duplicate--resolved">Resolved ${esc(possibleDuplicate.resolution || "")}</span>`;
+    const resolution = possibleDuplicate.active ? ""
+      : `<p class="media-subtext">Resolved ${esc(formatUtcDateTime(possibleDuplicate.resolved_at))}. Evidence is retained for audit.</p>`;
+    return `<section class="media-possible-duplicate-detail"><h4>Possible duplicate ${stateLabel}</h4><p>${esc(possibleDuplicateReasonLabel(possibleDuplicate.reason_code))}</p><dl><dt>Candidate title</dt><dd>${esc(candidate.title || "—")}</dd><dt>Candidate URL</dt><dd>${candidate.canonical_url ? `<a href="${esc(candidate.canonical_url)}" target="_blank" rel="noopener noreferrer">${esc(candidate.canonical_url)} ↗</a>` : "—"}</dd><dt>Candidate status</dt><dd>${esc(STATUS_LABELS[candidate.status] || candidate.status || "—")}</dd><dt>Candidate published</dt><dd>${esc(formatPublishedDateTime(candidate.published_at))}</dd><dt>Candidate author</dt><dd>${esc(candidate.author || "—")}</dd></dl>${possibleDuplicate.active ? `<p class="media-subtext">Automatic approval is held. Approve or reject only through the normal Article Status control after review; social posting remains an explicit manual choice.</p>` : resolution}</section>`;
+  }
+
+  async function openArticle(id, notice = "", selectedStatus = "") {
+    const dialog = detailDialog();
+    dialog.innerHTML = `<div class="media-detail__inner"><div class="media-loading">Loading article…</div></div>`;
+    if (!dialog.open) dialog.showModal();
+    try {
+      const data = await request(`articles/${id}`); const article = data.article;
+      const guardianRouteKeys = article.source_key === "the-guardian"
+        ? [...new Set((data.discovery_evidence || []).map(item => item.route_key).filter(Boolean))]
+        : [];
+      const detailAiActions = article.ai_title_suggestion_state === "pending"
+        ? `<button type="button" class="media-button media-button--primary" data-detail-ai-decision="accept-ai">Accept AI title</button><button type="button" class="media-button" data-detail-ai-decision="reject-ai">Reject AI / use original</button>` : "";
+      const publicationInputs = publicationDateInputs(article.published_at);
+      const imageUrl = articleImageUrl(article);
+      const imageState = articleImageState(article);
+      const localImageControls = article.image_policy === "local_copy_permitted" &&
+        article.source_image_policy === "local_copy_permitted"
+        ? `<section><h4>Retained local image</h4><p class="media-image-state media-image-state--${esc(imageState[0])}">${esc(imageState[1])}</p>${article.local_image?.exists ? `<dl class="media-local-image-meta"><dt>Type</dt><dd>${esc(article.local_image.content_type)}</dd><dt>Size</dt><dd>${esc(Number(article.local_image.byte_size || 0).toLocaleString("en-GB"))} bytes</dd><dt>Stored</dt><dd>${esc(formatUtcDateTime(article.local_image.stored_at))}</dd><dt>Acquisition</dt><dd>${esc(article.local_image.acquisition_method)}</dd></dl>` : `<p class="media-subtext">A retained copy is required for reliable Bluesky posting. Upload only when copying permission has been recorded for both the source and article.</p>`}<form class="media-inline-form" data-local-image-upload><label class="media-field media-field--grow"><span>${article.local_image?.exists ? "Replacement image" : "Image file"}</span><input name="image" type="file" accept="image/jpeg,image/png,image/webp" required></label><button type="submit" class="media-button media-button--primary">${article.local_image?.exists ? "Replace retained image" : "Upload retained image"}</button>${article.local_image?.exists ? `<button type="button" class="media-button media-button--danger" data-remove-local-image>Remove retained image</button>` : ""}</form><p class="media-subtext">JPEG, PNG or WebP · maximum 5 MiB. The destination is fixed to this article.</p><div data-local-image-message></div></section>` : "";
+      dialog.innerHTML = `<div class="media-detail__inner"><div class="media-detail__header"><div><h3>${esc(article.display_title || article.title)}</h3><p>${esc(article.publisher)} · ${esc(STATUS_LABELS[article.status] || article.status)}</p></div><button class="media-button" data-close-detail>Close</button></div>${notice ? message(notice, "success") : ""}
+        <div class="media-detail__grid"><div>${article.admin_preview_image_path && imageUrl ? `<img class="media-detail__preview" src="${esc(imageUrl)}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}<span class="media-image-state media-image-state--${esc(imageState[0])}">${esc(imageState[1])}</span></div>
+        <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title Status</dt><dd>${esc(titleStatus(article)[1])}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>${esc(aiSuggestionLabel(article))}</dt><dd>${esc(article.ai_title_suggestion || "—")}</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatPublishedDateTime(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatUtcDateTime(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatUtcDateTime(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatUtcDateTime(article.updated_at))}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
+        <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div><div class="media-social-options" data-manual-social hidden><div>${manualBlueskyHtml(article, data)}</div><div>${manualFacebookHtml(article)}</div></div><div data-detail-status-message></div></section>
+        ${possibleDuplicateDetailHtml(data.possible_duplicate)}
+        ${directPublishHtml(data, article)}
+        ${blueskyHistoryHtml(data, article)}
+        ${facebookHistoryHtml(data, article)}
+        <section><h4>Author</h4><form class="media-inline-form" data-detail-author><label class="media-field media-field--grow"><span>Author</span><input name="author" maxlength="500" value="${esc(article.author || "")}" autocomplete="off"></label><button class="media-button media-button--primary">Save Author</button></form><p class="media-subtext">Single line, maximum 500 characters. Saving a blank value clears the authoritative Author.</p><div data-detail-author-message></div></section>
+        <section><h4>Publication date</h4><form class="media-inline-form" data-detail-publication-date><label class="media-field media-field--grow"><span>Publication date</span><input name="publication_date" type="date" value="${esc(publicationInputs.date)}"></label><label class="media-field media-field--grow"><span>Publication time (UTC, optional)</span><input name="publication_time" type="time" value="${esc(publicationInputs.time)}"></label><button class="media-button media-button--primary" data-save-publication-date>Save publication date</button>${article.published_at ? `<button type="button" class="media-button" data-clear-publication-date>Clear publication date</button>` : ""}</form><div data-detail-publication-date-message></div></section>
+        <section><h4>Display title</h4><p>${esc(aiSuggestionLabel(article))}${article.ai_title_generated_at ? ` · ${esc(formatUtcDateTime(article.ai_title_generated_at))}${article.ai_title_model ? ` · ${esc(article.ai_title_model)}` : ""}` : ""}</p><p>${esc(article.ai_title_suggestion || "—")}</p><div class="media-actions"><button type="button" class="media-button" data-detail-generate-ai>${article.ai_title_suggestion ? "Refresh AI title" : "Generate AI title"}</button>${detailAiActions}</div><form class="media-inline-form" data-detail-title><label class="media-field media-field--grow"><span>Human display title</span><input name="display_title" maxlength="500" value="${esc(article.display_title || "")}"></label><button class="media-button media-button--primary">Save human title</button><button type="button" class="media-button" data-clear-title>Use publisher original</button></form><div data-detail-title-message></div></section>
+        ${articleImagePolicyHtml(article)}
+        ${localImageControls}
+        <section><h4>Reload metadata</h4><p>Fetches only source-policy-permitted bounded presentation metadata. Preview happens before mutation.</p>${article.source_key === "the-guardian" ? `<label class="media-field"><span>Guardian RSS route</span><select data-guardian-route>${guardianRouteKeys.length ? guardianRouteKeys.map(route => `<option value="${esc(route)}">${esc(route)}</option>`).join("") : `<option value="">No stored route evidence</option>`}</select></label>` : ""}<button class="media-button" data-reload-metadata>Reload metadata</button><div data-metadata-result></div></section>
+        <section><details><summary>Discovery evidence and recent events (raw ISO UTC)</summary><pre>${esc(JSON.stringify({ discovery_evidence: data.discovery_evidence, events: data.events }, null, 2))}</pre></details></section></div>`;
+      dialog.querySelector("[data-close-detail]")?.addEventListener("click", () => dialog.close());
+      const detailStatus = dialog.querySelector("[data-detail-status]");
+      detailStatus?.querySelector("select")?.addEventListener("change", event => {
+        const button = detailStatus.querySelector("button");
+        button.disabled = !event.currentTarget.value;
+        button.classList.toggle("is-unsaved", Boolean(event.currentTarget.value));
+        button.setAttribute("aria-label", event.currentTarget.value ? "Save status change" : "Saved/current");
+        button.title = event.currentTarget.value ? "Save status change" : "Saved/current";
+        const manual = dialog.querySelector("[data-manual-social]");
+        if (manual) { manual.hidden = event.currentTarget.value !== "approved"; manual.querySelectorAll("input").forEach(input => { input.checked = false; }); }
+      });
+      detailStatus?.querySelector("button")?.addEventListener("click", () => void saveDetailStatus(id, detailStatus, dialog));
+      const directPublish = dialog.querySelector("[data-direct-publish]");
+      dialog.querySelectorAll("[data-direct-bluesky] input, [data-direct-facebook] input").forEach(input => input.addEventListener("change", () => {
+        directPublish.disabled = !dialog.querySelector("[data-direct-bluesky] input:checked, [data-direct-facebook] input:checked");
+      }));
+      directPublish?.addEventListener("click", () => void publishArticle(id, dialog));
+      if (selectedStatus) {
+        const select = detailStatus?.querySelector("select");
+        if (select && [...select.options].some(option => option.value === selectedStatus)) {
+          select.value = selectedStatus;
+          select.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+      }
+      dialog.querySelector("[data-detail-author]")?.addEventListener("submit", event => { event.preventDefault(); void saveDetailAuthor(id, new FormData(event.currentTarget).get("author"), dialog); });
+      dialog.querySelector("[data-detail-publication-date]")?.addEventListener("submit", event => { event.preventDefault(); void savePublicationDate(id, event.currentTarget, dialog); });
+      dialog.querySelector("[data-clear-publication-date]")?.addEventListener("click", () => void clearPublicationDate(id, dialog));
+      dialog.querySelector("[data-detail-title]")?.addEventListener("submit", event => { event.preventDefault(); void saveDetailTitle(id, new FormData(event.currentTarget).get("display_title"), dialog); });
+      dialog.querySelector("[data-clear-title]")?.addEventListener("click", () => void saveDetailTitle(id, null, dialog));
+      dialog.querySelector("[data-detail-generate-ai]")?.addEventListener("click", event => void generateDetailAiTitle(id, event.currentTarget, dialog));
+      dialog.querySelectorAll("[data-detail-ai-decision]").forEach(button => button.addEventListener("click", () => void decideDetailAiTitle(id, button.dataset.detailAiDecision, dialog)));
+      dialog.querySelector("[data-reload-metadata]")?.addEventListener("click", () => void reloadMetadata(id, article, dialog));
+      dialog.querySelector("[data-article-image-policy]")?.addEventListener("submit", event => {
+        event.preventDefault(); void saveArticleImagePolicy(id, article, event.currentTarget, dialog);
+      });
+      dialog.querySelector("[data-local-image-upload]")?.addEventListener("submit", event => {
+        event.preventDefault(); void uploadLocalImage(id, article, event.currentTarget, dialog);
+      });
+      dialog.querySelector("[data-remove-local-image]")?.addEventListener("click", () => {
+        if (window.confirm("Remove this article’s retained local image? The publisher image provenance will be preserved.")) {
+          void removeLocalImage(id, article, dialog);
+        }
+      });
+      dialog.querySelector(".media-detail__preview[src]")?.addEventListener("error", event => { event.currentTarget.outerHTML = `<div class="media-thumb-fallback media-detail__preview">Image unavailable</div>`; }, { once: true });
+    } catch (error) { dialog.innerHTML = `<div class="media-detail__inner">${message(error.message, "error")}<button class="media-button" onclick="this.closest('dialog').close()">Close</button></div>`; }
+  }
+
+  async function saveArticleImagePolicy(id, article, form, dialog) {
+    const output = dialog.querySelector("[data-article-image-policy-message]");
+    const values = new FormData(form);
+    const imagePolicy = String(values.get("image_policy") || "");
+    const confirmed = values.get("confirm_local_copy_permitted") === "on";
+    if (imagePolicy === "local_copy_permitted" && !confirmed) {
+      output.innerHTML = message("Explicitly confirm the local-copy permission decision before saving.", "error"); return;
+    }
+    if (article.image_policy === "local_copy_permitted" && imagePolicy !== "local_copy_permitted" &&
+        !window.confirm("Changing this article away from local_copy_permitted immediately makes its retained image ineligible for delivery and Bluesky. The R2 object will not be automatically deleted. Continue?")) return;
+    const button = form.querySelector("button[type='submit']");
+    button.disabled = true;
+    const body = { image_policy: imagePolicy,
+      confirm_local_copy_permitted: imagePolicy === "local_copy_permitted" && confirmed };
+    try {
+      await request(`articles/${id}/image-policy`, { method: "PUT", idempotent: "image_policy",
+        revision: article.revision, body });
+      await renderArticles(false);
+      await openArticle(id, imagePolicy === article.image_policy
+        ? imagePolicy === "local_copy_permitted"
+          ? "Local-copy permission confirmed."
+          : "Article image policy is unchanged."
+        : "Article image policy updated.");
+    } catch (error) { button.disabled = false; output.innerHTML = message(error.message, "error"); }
+  }
+
+  async function uploadLocalImage(id, article, form, dialog) {
+    const output = dialog.querySelector("[data-local-image-message]");
+    const file = new FormData(form).get("image");
+    if (!(file instanceof File) || !file.size) {
+      output.innerHTML = message("Choose an image file.", "error"); return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      output.innerHTML = message("The image exceeds the 5 MiB maximum.", "error"); return;
+    }
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+      output.innerHTML = message("Choose a JPEG, PNG or WebP image.", "error"); return;
+    }
+    const button = form.querySelector("button[type='submit']");
+    if (!button) {
+      output.innerHTML = message("Retained image upload is unavailable. Reload the dashboard and try again.", "error");
+      return;
+    }
+    button.disabled = true;
+    try {
+      await binaryRequest(`articles/${id}/local-image`, { method: "PUT", idempotent: "local_image",
+        revision: article.revision, headers: { "Content-Type": file.type }, body: file });
+      await renderArticles(false);
+      await openArticle(id, article.local_image?.exists
+        ? "Retained local image replaced." : "Retained local image uploaded.");
+    } catch (error) { button.disabled = false; output.innerHTML = message(error.message, "error"); }
+  }
+
+  async function removeLocalImage(id, article, dialog) {
+    const output = dialog.querySelector("[data-local-image-message]");
+    const button = dialog.querySelector("[data-remove-local-image]");
+    button.disabled = true;
+    try {
+      await binaryRequest(`articles/${id}/local-image`, { method: "DELETE",
+        idempotent: "local_image_remove", revision: article.revision });
+      await renderArticles(false);
+      await openArticle(id, "Retained local image removed. Publisher provenance is unchanged.");
+    } catch (error) { button.disabled = false; output.innerHTML = message(error.message, "error"); }
+  }
+
+  async function saveDetailStatus(id, control, dialog) {
+    const select = control.querySelector("select");
+    const action = select.selectedOptions[0]?.dataset.action;
+    const output = dialog.querySelector("[data-detail-status-message]");
+    if (!action) return;
+    control.querySelector("button").disabled = true;
+    try {
+      const manual = dialog.querySelector("[data-manual-bluesky] input");
+      const facebook = dialog.querySelector("[data-manual-facebook] input");
+      const body = { post_to_bluesky: manual?.checked === true, post_to_facebook: facebook?.checked === true };
+      await request(`articles/${id}/${action}`, { method: "POST", idempotent: "status", body });
+      await renderArticles(false);
+      await openArticle(id);
+    } catch (error) {
+      control.querySelector("button").disabled = false;
+      output.innerHTML = message(error.message, "error");
+    }
+  }
+
+  async function publishArticle(id, dialog) {
+    const button = dialog.querySelector("[data-direct-publish]");
+    const output = dialog.querySelector("[data-direct-publish-message]");
+    const body = {
+      post_to_bluesky: dialog.querySelector("[data-direct-bluesky] input")?.checked === true,
+      post_to_facebook: dialog.querySelector("[data-direct-facebook] input")?.checked === true,
+    };
+    if (!body.post_to_bluesky && !body.post_to_facebook) return;
+    button.disabled = true;
+    try {
+      await request(`articles/${id}/publish`, { method: "POST", idempotent: "publish", body });
+      await renderArticles(false);
+      await openArticle(id, "Selected social publication request(s) accepted.");
+    } catch (error) {
+      button.disabled = false;
+      output.innerHTML = message(error.message, "error");
+    }
+  }
+
+  async function saveDetailTitle(id, value, dialog) {
+    const output = dialog.querySelector("[data-detail-title-message]");
+    try { await request(`articles/${id}/display-title`, { method: "PUT", body: { display_title: value === null ? null : String(value) } }); output.innerHTML = message(value === null ? "Publisher original restored." : "Human display title saved.", "success"); void renderArticles(false); }
+    catch (error) { output.innerHTML = message(error.message, "error"); }
+  }
+
+  async function saveDetailAuthor(id, value, dialog) {
+    const output = dialog.querySelector("[data-detail-author-message]");
+    const saveButton = dialog.querySelector("[data-detail-author] button");
+    const rawAuthor = String(value ?? "");
+    if (/[\r\n\u2028\u2029]/u.test(rawAuthor)) {
+      output.innerHTML = message("Author must be a single line.", "error");
+      return;
+    }
+    const author = rawAuthor.trim() || null;
+    saveButton.disabled = true;
+    try {
+      await request(`articles/${id}/author`, {
+        method: "PUT",
+        idempotent: "author",
+        body: { author },
+      });
+      state.selectors = { publications: [], authors: [] };
+      await renderArticles(false);
+      await openArticle(id, author === null ? "Author cleared." : "Author saved.");
+    } catch (error) {
+      saveButton.disabled = false;
+      output.innerHTML = message(error.message, "error");
+    }
+  }
+
+  async function updatePublicationDate(id, publishedAt, dialog, successMessage) {
+    const form = dialog.querySelector("[data-detail-publication-date]");
+    const output = dialog.querySelector("[data-detail-publication-date-message]");
+    const buttons = form.querySelectorAll("button");
+    buttons.forEach(button => { button.disabled = true; });
+    try {
+      const data = await request(`articles/${id}/published-at`, {
+        method: "PUT",
+        idempotent: "published-at",
+        body: { published_at: publishedAt },
+      });
+      updateArticleFromMutation(id, data?.article);
+      await renderArticles(false);
+      await openArticle(id, successMessage);
+    } catch (error) {
+      buttons.forEach(button => { button.disabled = false; });
+      output.innerHTML = message(error.message, "error");
+    }
+  }
+
+  async function savePublicationDate(id, form, dialog) {
+    const values = new FormData(form);
+    const date = String(values.get("publication_date") || "");
+    const time = String(values.get("publication_time") || "");
+    const output = dialog.querySelector("[data-detail-publication-date-message]");
+    if (time && !date) {
+      output.innerHTML = message("Enter a publication date before adding a UTC time.", "error");
+      return;
+    }
+    if (!date) {
+      output.innerHTML = message("Enter a publication date, or use Clear publication date.", "error");
+      return;
+    }
+    const publishedAt = time ? new Date(`${date}T${time}:00.000Z`).toISOString() : date;
+    await updatePublicationDate(id, publishedAt, dialog, "Publication date saved.");
+  }
+
+  async function clearPublicationDate(id, dialog) {
+    await updatePublicationDate(id, null, dialog, "Publication date cleared.");
+  }
+
+  async function generateDetailAiTitle(id, button, dialog) {
+    const output = dialog.querySelector("[data-detail-title-message]");
+    button.disabled = true; button.textContent = "Generating AI title…";
+    output.innerHTML = message("Generating one accounted AI title suggestion…");
+    try {
+      const data = await request(`articles/${id}/display-title/generate-ai`, { method: "POST", idempotent: "ai-title" });
+      updateArticleFromMutation(id, data.article);
+      rerenderArticleTable();
+      void refreshAiUsage();
+      await openArticle(id, data.generation?.outcome === "no_change"
+        ? "AI found no useful title change; the matching suggestion is pending for review."
+        : "AI title suggestion generated and left pending for review.");
+    } catch (error) {
+      button.disabled = false;
+      button.textContent = "Generate / refresh AI title";
+      output.innerHTML = message(error.message, "error");
+    }
+  }
+
+  async function decideDetailAiTitle(id, action, dialog) {
+    const output = dialog.querySelector("[data-detail-title-message]");
+    try {
+      const data = await request(`articles/${id}/display-title/${action}`, { method: "POST" });
+      updateArticleFromMutation(id, data.article);
+      rerenderArticleTable();
+      await openArticle(id, "Title decision saved.");
+    } catch (error) { output.innerHTML = message(error.message, "error"); }
+  }
+
+  async function reloadMetadata(id, article, dialog) {
+    const output = dialog.querySelector("[data-metadata-result]"); output.innerHTML = message("Reloading bounded publisher metadata…");
+    try {
+      if (article.source_key === "the-guardian") {
+        const routeKey = dialog.querySelector("[data-guardian-route]")?.value;
+        if (!routeKey) { output.innerHTML = message("No stored Guardian RSS route evidence is available for this article.", "error"); return; }
+        const data = await request(`articles/${id}/guardian-image-refresh/preview`, { method: "POST", body: { route_key: routeKey } });
+        const refresh = data.refresh;
+        if (!refresh?.proposed_image || refresh.current_image?.url === refresh.proposed_image.url) {
+          output.innerHTML = message("No useful metadata change found."); return;
+        }
+        output.innerHTML = `<div class="media-message"><strong>Proposed Guardian RSS image (raw ISO UTC timestamps)</strong><pre>${esc(JSON.stringify({ current: refresh.current_image, proposed: refresh.proposed_image }, null, 2))}</pre><button class="media-button media-button--primary" data-apply-guardian-image>${refresh.replacement_required ? "Replace image" : "Apply metadata"}</button></div>`;
+        output.querySelector("[data-apply-guardian-image]")?.addEventListener("click", async () => {
+          try {
+            await request(`articles/${id}/guardian-image-refresh/apply`, { method: "POST", body: {
+              route_key: routeKey,
+              expected_current_image_url: refresh.current_image?.url ?? null,
+              proposed_image_url: refresh.proposed_image.url,
+              confirm_replace_existing: true,
+            } });
+            output.innerHTML = message("Guardian RSS preview image applied without changing editorial state.", "success");
+            void renderArticles(false);
+          } catch (error) { output.innerHTML = message(error.message, "error"); }
+        });
+        return;
+      }
+      const data = await request(`articles/${id}/metadata/preview`, { method: "POST" });
+      if (!data.has_useful_change) { output.innerHTML = message("No useful metadata change found."); return; }
+      output.innerHTML = `<div class="media-message"><strong>Proposed changes (raw ISO UTC timestamps)</strong><pre>${esc(JSON.stringify(data.changes, null, 2))}</pre><button class="media-button media-button--primary" data-apply-metadata>Apply metadata${data.changes.image?.replacement_required ? " / replace image" : ""}</button></div>`;
+      output.querySelector("[data-apply-metadata]")?.addEventListener("click", async () => {
+        try { await request(`articles/${id}/metadata/apply`, { method: "PUT", idempotent: "metadata", body: {
+          expected_current_image_url: data.changes.image?.current ?? article.og_image_url ?? null,
+          expected_proposed_image_url: data.changes.image?.expected_proposed_image_url ?? null,
+          replace_existing_image: Boolean(data.changes.image?.replacement_required),
+          apply_publisher_display_title: true,
+          expected_current_published_at: data.changes.published_at?.current ?? null,
+          expected_proposed_published_at: data.changes.published_at?.proposed ?? null,
+          apply_publisher_published_at: Boolean(data.changes.published_at),
+        } }); output.innerHTML = message("Metadata applied without changing editorial state.", "success"); void renderArticles(false); }
+        catch (error) { output.innerHTML = message(error.message, "error"); }
+      });
+    } catch (error) { output.innerHTML = message(error.message, "error"); }
+  }
+
+  async function hydrateAiPreviewDetail(row) {
+    const id = row.dataset.aiId;
+    if (!id || row.dataset.aiPublished === "true") return;
+    let detail = articleDetailCache.get(id);
+    if (!detail) {
+      detail = request(`articles/${id}`).then(data => data?.article || null).catch(() => null);
+      articleDetailCache.set(id, detail);
+    }
+    const article = await detail;
+    const published = formatPublicationDate(article?.published_at);
+    if (!published || !row.isConnected) return;
+    const date = row.querySelector("[data-ai-preview-date]");
+    if (date) date.textContent = ` · ${published}`;
+    const homepageDate = formatPublicationDate(article?.published_at);
+    const homepageDateNode = row.querySelector("[data-homepage-preview-date]");
+    if (homepageDateNode && homepageDate) homepageDateNode.textContent = ` · ${homepageDate}`;
+    row.dataset.aiPublished = "true";
+  }
+
+  function hydrateAiPreviewDetails() {
+    const rows = [...state.root.querySelectorAll("[data-ai-id]")];
+    const pending = rows.filter(row => row.dataset.aiPublished !== "true");
+    if (!("IntersectionObserver" in window)) {
+      pending.forEach(row => void hydrateAiPreviewDetail(row));
+      return;
+    }
+    const observer = new IntersectionObserver(entries => entries.forEach(entry => {
+      if (!entry.isIntersecting) return;
+      observer.unobserve(entry.target);
+      void hydrateAiPreviewDetail(entry.target);
+    }), { rootMargin: "160px" });
+    pending.forEach(row => observer.observe(row));
+  }
+
+  function updateArticleFromMutation(id, changed) {
+    const index = state.articles.findIndex(article => String(article.id) === String(id));
+    if (index >= 0 && changed) state.articles[index] = { ...state.articles[index], ...changed };
+    articleDetailCache.delete(String(id));
+  }
+
+  function rerenderArticleTable() {
+    const table = state.root.querySelector("[data-article-table]");
+    if (!table) return;
+    table.innerHTML = articleTableHtml();
+    bindArticleTableEvents();
+  }
+
+  async function refreshAiUsage() {
+    const current = state.root.querySelector("[data-ai-usage]");
+    if (!current) return;
+    const usage = await request("ai-usage", { params: new URLSearchParams({ limit: "1" }) }).catch(() => null);
+    if (!usage) return;
+    state.aiUsage = usage;
+    current.outerHTML = aiUsageHtml();
+  }
+
+  function bindAiActions() {
+    state.root.querySelectorAll("[data-ai-edit]").forEach(input => input.addEventListener("input", () => {
+      const row = input.closest("[data-ai-id]");
+      const title = input.value.trim() || row?.dataset.publisherTitle || "";
+      row?.querySelectorAll("[data-ai-preview-title]").forEach(preview => { preview.textContent = displayTitleWrapping(title); });
+    }));
+    state.root.querySelectorAll("[data-ai-preview-image]").forEach(image => image.addEventListener("error", () => image.remove(), { once: true }));
+    state.root.querySelectorAll("[data-ai-action]").forEach(button => button.addEventListener("click", async () => {
+      const row = button.closest("[data-ai-id]"); const id = row.dataset.aiId; const action = button.dataset.aiAction; const output = row.querySelector("[data-ai-message]");
+      const originalButtonText = button.textContent;
+      try {
+        let data;
+        if (action === "generate") {
+          button.disabled = true; button.textContent = "Generating AI title…";
+          output.innerHTML = message("Generating one accounted AI title suggestion…");
+          data = await request(`articles/${id}/display-title/generate-ai`, { method: "POST", idempotent: "ai-title" });
+          state.titleMessages.set(String(id), { text: data.generation?.outcome === "no_change"
+            ? "AI found no useful title change; the matching suggestion is pending for review."
+            : "AI title suggestion generated and left pending for review.", kind: "success" });
+          void refreshAiUsage();
+        }
+        if (action === "accept-ai" || action === "reject-ai") {
+          data = await request(`articles/${id}/display-title/${action}`, { method: "POST" });
+          state.titleMessages.set(String(id), { text: "Title decision saved.", kind: "success" });
+        }
+        if (action === "edit") {
+          data = await request(`articles/${id}/display-title`, { method: "PUT", body: { display_title: row.querySelector("[data-ai-edit]").value } });
+          state.titleMessages.set(String(id), { text: "Human display title saved.", kind: "success" });
+        }
+        if (action === "clear") {
+          data = await request(`articles/${id}/display-title`, { method: "PUT", body: { display_title: null } });
+          state.titleMessages.set(String(id), { text: "Publisher original restored.", kind: "success" });
+        }
+        updateArticleFromMutation(id, data?.article);
+        rerenderArticleTable();
+      } catch (error) {
+        button.disabled = false; button.textContent = originalButtonText;
+        output.innerHTML = message(error.message, "error");
+      }
+    }));
+  }
+
+  function runsState(kind) {
+    return kind === "gdelt" ? state.gdeltRuns : state.publisherRuns;
+  }
+
+  function formatGdeltMinute(value) {
+    const match = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})00$/.exec(String(value || ""));
+    return match ? `${match[3]}/${match[2]}/${match[1]} ${match[4]}:${match[5]} UTC` : formatUtcDateTime(value, false);
+  }
+
+
+  const HEALTH_REASONS = {
+    no_discovery_runs: "No discovery attempts recorded",
+    not_scheduled_configuration_mismatch: "Enabled, but not scheduled due to configuration mismatch",
+    repeated_discovery_failure: "Repeated discovery failures",
+    no_recent_success: "No successful discovery in five hours",
+    latest_run_failed: "Latest run failed",
+    latest_run_skipped: "Latest run skipped",
+    stalled_run: "Discovery appears stalled",
+  };
+
+  function healthIssue(source) {
+    const broken = (source.routes || []).filter(route => route.status !== "healthy");
+    const reason = source.reason ? (HEALTH_REASONS[source.reason] || source.reason)
+      : broken.slice(0, 4).map(route => (route.route_key || "Source-wide") + ": " +
+          (HEALTH_REASONS[route.reason] || route.reason || "Unknown") +
+          (route.latest_error_code ? " (" + route.latest_error_code + ")" : "")).join("; ") +
+        (broken.length > 4 ? "; and " + (broken.length - 4) + " more" : "");
+    return '<li class="media-health__issue media-health__issue--' + esc(source.status) +
+      '"><strong>' + esc(source.name) + '</strong>' +
+      (source.auto_approval ? ' <small>Auto-approval</small>' : '') +
+      '<span>' + esc(reason) + '</span></li>';
+  }
+
+  function renderMediaHealth(data, error = "") {
+    const el = state.root?.querySelector("[data-media-health]");
+    if (!el) return;
+    const heading = '<div class="media-health__heading"><h3>Discovery and automatic publishing health</h3>' +
+      '<button class="media-button" type="button" data-media-health-refresh>Refresh</button></div>';
+    let body = '<p>Loading health…</p>';
+    if (error) {
+      body = '<p class="media-health__error">Unable to load health: ' + esc(error) + '</p>';
+    } else if (data) {
+      const sources = Array.isArray(data.sources) ? data.sources : [];
+      const social = Array.isArray(data.social) ? data.social : [];
+      const affected = sources.filter(source => source.status !== "healthy").sort((a, b) =>
+        Number(b.auto_approval) - Number(a.auto_approval) ||
+        (a.status === "critical" ? -1 : 1) - (b.status === "critical" ? -1 : 1));
+      const severe = affected.some(source => source.status === "critical") ||
+        social.some(row => row.severity === "critical");
+      body = '<p><strong>' + esc(severe ? "Needs attention" :
+        affected.length || social.length ? "Warnings" : "Healthy") + '</strong> · ' +
+        affected.length + ' publishers affected · ' + social.length +
+        ' unresolved automatic social publications · Updated ' +
+        esc(formatUtcDateTime(data.generated_at)) + '</p>';
+      body += affected.length ? '<h4>Publisher discovery</h4><ul class="media-health__issues">' +
+        affected.map(healthIssue).join("") + '</ul>' : '<p>No publisher discovery problems detected.</p>';
+      if (social.length) body += '<h4>Automatic social publications</h4><ul class="media-health__issues">' +
+        social.map(row => '<li class="media-health__issue media-health__issue--' +
+          esc(row.severity) + '"><strong>' + esc(row.channel) + ' · article ' +
+          esc(row.article_id) + '</strong><span>' + esc(row.status) +
+          (row.last_error_code ? " · " + esc(row.last_error_code) : "") +
+          '</span></li>').join("") + '</ul>';
+      const routeRows = sources.flatMap(source => (source.routes || []).map(route =>
+        '<tr><td>' + esc(source.name) + (source.auto_approval ? ' (Auto)' : '') +
+        '</td><td>' + esc(route.route_key || "Source-wide") + '</td><td>' +
+        esc(route.status) + '</td><td>' + esc(formatUtcDateTime(route.last_success_at)) +
+        '</td><td>' + esc(formatUtcDateTime(route.last_attempt_at)) +
+        '</td><td>' + esc(route.latest_error_code || "—") + '</td></tr>'));
+      routeRows.push(...sources.filter(source => source.reason).map(source =>
+        '<tr><td>' + esc(source.name) + '</td><td>Configuration</td><td>Critical</td>' +
+        '<td>—</td><td>—</td><td>' + esc(HEALTH_REASONS[source.reason] || source.reason) +
+        '</td></tr>'));
+      body += '<details class="media-health__details"><summary>All enabled publisher routes (' +
+        routeRows.length + ')</summary><div class="media-table-wrap"><table class="media-table media-health__table">' +
+        '<thead><tr><th>Publisher</th><th>Route</th><th>Health</th>' +
+        '<th>Last success UTC</th><th>Last attempt UTC</th><th>Last error</th></tr></thead><tbody>' +
+        routeRows.join("") + '</tbody></table></div></details>';
+    }
+    el.innerHTML = '<section class="media-card media-health">' + heading + body + '</section>';
+    el.querySelector("[data-media-health-refresh]")?.addEventListener("click", () =>
+      void refreshMediaHealth());
+  }
+
+  async function refreshMediaHealth() {
+    renderMediaHealth(null);
+    try { renderMediaHealth(await request("health")); }
+    catch (error) { renderMediaHealth(null, error.message || "Unknown error"); }
+  }
+
+  function publisherRunsTable(rows) {
+    return `<div class="media-table-wrap"><table class="media-table"><thead><tr><th>Publication</th><th>Route</th><th>Started UTC</th><th>Duration</th><th>Status</th><th>Seen</th><th>Inserted</th><th>Updated</th><th>Filtered</th><th>Invalid</th><th>Diagnostics</th></tr></thead><tbody>${rows.length ? rows.map(run => `<tr><td>${esc(run.source_name || run.source_key || "System")}</td><td>${esc(run.discovery_route_key || "—")}</td><td>${esc(formatUtcDateTime(run.started_at, false))}</td><td>${esc(duration(run.started_at, run.finished_at))}</td><td>${esc(run.status)}</td><td>${esc(run.items_seen)}</td><td>${esc(run.items_inserted)}</td><td>${esc(run.items_updated)}</td><td>${esc(run.items_filtered ?? 0)}</td><td>${esc(run.items_invalid)}</td><td>${run.error_code ? `<details><summary>${esc(run.error_code)} · raw ISO UTC evidence</summary><pre>${esc(JSON.stringify(run, null, 2))}</pre></details>` : "—"}</td></tr>`).join("") : `<tr><td colspan="11" class="media-empty">No discovery runs found.</td></tr>`}</tbody></table></div>`;
+  }
+
+  function gdeltRunsTable(rows) {
+    return `<div class="media-table-wrap"><table class="media-table media-table--gdelt"><thead><tr><th>Started<br>UTC</th><th>Duration</th><th>Status</th><th>Window</th><th>Completed<br>through</th><th>Pairs<br>processed</th><th>Pairs<br>replayed</th><th>Missing<br>minutes</th><th>Matches</th><th>Candidates<br>inserted</th><th>Candidates<br>updated</th><th>UK<br>candidates</th><th>UK<br>promoted</th><th>Blocked<br>skipped</th><th>Malformed</th><th>Diagnostics</th></tr></thead><tbody>${rows.length ? rows.map(run => `<tr><td>${esc(formatUtcDateTime(run.started_at, false))}</td><td>${esc(duration(run.started_at, run.finished_at))}</td><td>${esc(run.status)}</td><td class="media-gdelt-window">${esc(formatGdeltMinute(run.window_start))} →<br>${esc(formatGdeltMinute(run.window_end))}</td><td>${esc(formatGdeltMinute(run.completed_through))}</td><td>${esc(run.complete_pairs_processed)}</td><td>${esc(run.complete_pairs_replayed)}</td><td>${esc(run.missing_minutes)}</td><td>${esc(run.matches_seen)}</td><td>${esc(run.candidates_inserted)}</td><td>${esc(run.candidates_updated)}</td><td>${esc(run.candidates_uk)}</td><td>${esc(run.uk_promoted)}</td><td>${esc(run.blocked_skipped ?? 0)}</td><td>${esc(run.malformed_rows)}</td><td>${run.error_code ? `<details><summary>${esc(run.error_code)} · stored run evidence</summary><pre>${esc(JSON.stringify(run, null, 2))}</pre></details>` : "—"}</td></tr>`).join("") : `<tr><td colspan="16" class="media-empty">No GDELT runs found.</td></tr>`}</tbody></table></div>`;
+  }
+
+  function renderRunsView() {
+    const kind = state.runsKind;
+    const current = runsState(kind);
+    const table = current.loading ? `<div class="media-loading">Loading ${kind === "gdelt" ? "GDELT" : "Publisher"} Runs…</div>`
+      : current.error ? message(current.error, "error")
+        : kind === "gdelt" ? gdeltRunsTable(current.rows || []) : publisherRunsTable(current.rows || []);
+    setView(`<section class="media-card"><h3>Recent discovery runs</h3><p>Newest first; diagnostics are bounded to stored run evidence.</p><nav class="media-mini-nav" role="tablist" aria-label="Run type">${RUN_KINDS.map(runKind => `<button type="button" data-run-kind="${runKind}" role="tab" aria-selected="${runKind === kind}" class="${runKind === kind ? "is-active" : ""}">${runKind === "gdelt" ? "GDELT" : "Publisher"}</button>`).join("")}</nav>${table}</section>`);
+    state.root.querySelectorAll("[data-run-kind]").forEach(button => button.addEventListener("click", () => {
+      const nextKind = button.dataset.runKind;
+      if (!RUN_KINDS.includes(nextKind) || nextKind === state.runsKind) return;
+      state.runsKind = nextKind;
+      void renderRuns(false);
+    }));
+  }
+
+  async function renderRuns(refresh) {
+    const kind = state.runsKind;
+    const current = runsState(kind);
+    if (!refresh && (current.rows !== null || current.loading)) {
+      renderRunsView();
+      return;
+    }
+    current.loading = true;
+    current.error = "";
+    renderRunsView();
+    try {
+      const data = await request(kind === "gdelt" ? "runs/gdelt" : "runs", { params: new URLSearchParams({ limit: "20" }) });
+      current.rows = data.runs || [];
+    } catch (error) {
+      current.error = error.message;
+    } finally {
+      current.loading = false;
+      if (state.tab === "runs" && state.runsKind === kind) renderRunsView();
+    }
+  }
+
+  async function renderSources(append = false) {
+    const sequence = ++sourceRefreshSequence;
+    const visibility = state.sourcesVisibility;
+    if (!append) {
+      state.sourcesRows = []; state.sourceDomainRows = []; state.sourceAuthorRules = [];
+      state.sourcesOffset = 0; state.sourceDomainsOffset = 0;
+    }
+    setView(`<section class="media-card">${state.sourcesFeedback ? message(state.sourcesFeedback, "success") : ""}<div class="media-loading">Loading Sources…</div></section>`);
+    try {
+      const data = await request("sources", { params: new URLSearchParams({ visibility,
+        offset: String(state.sourcesOffset), domain_offset: String(state.sourceDomainsOffset) }) });
+      if (sequence !== sourceRefreshSequence || state.tab !== "sources") return;
+      state.sourcesRows.push(...(data.sources || []));
+      state.sourceDomainRows.push(...(data.domain_blocks || []));
+      const rules = new Map(state.sourceAuthorRules.map(rule => [rule.author_key, rule]));
+      (data.author_rules || []).forEach(rule => rules.set(rule.author_key, rule));
+      state.sourceAuthorRules = [...rules.values()];
+      state.sourcesOffset = data.next_offset;
+      state.sourceDomainsOffset = data.next_domain_offset;
+      const rulesBySource = new Map(); state.sourceAuthorRules.forEach(rule => { const group = rulesBySource.get(rule.source_key) || []; group.push(rule); rulesBySource.set(rule.source_key, group); });
+      setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Sources</h3><p>Publication and author-rule changes apply to future discovery. Image-policy revocation takes effect immediately.</p></div><label class="media-source-visibility">Show: <select data-source-visibility aria-label="Source visibility">${[["non_blocked", "Non-blocked"], ["blocked", "Blocked"], ["all", "All"]].map(([value, label]) => `<option value="${value}"${visibility === value ? " selected" : ""}>${label}</option>`).join("")}</select></label><button class="media-button media-button--primary" data-toggle-add-source>+ Add Source</button></div>
+        <div role="status">${state.sourcesFeedback ? message(state.sourcesFeedback, "success") : ""}</div><div data-add-source></div>
+        <details class="media-domain-add"><summary>Block a publisher domain</summary><form class="media-inline-form" data-block-domain-form><label class="media-field"><span>Domain</span><input name="domain" required maxlength="254" placeholder="publisher.co.uk"></label><label class="media-field media-field--grow"><span>Reason (optional)</span><input name="reason" maxlength="1000"></label><button class="media-button" type="submit">Block domain</button></form><div data-domain-add-message></div></details>
+        <div class="media-source-list">${state.sourcesRows.map(source => sourceCard(source, rulesBySource.get(source.source_key) || [])).join("")}${state.sourceDomainRows.map(domainBlockCard).join("")}${!state.sourcesRows.length && !state.sourceDomainRows.length ? `<div class="media-empty">No matching sources or domain decisions.</div>` : ""}</div>${data.has_more ? `<button class="media-button" data-more-sources>Load more</button>` : ""}</section>`);
+      bindSourceActions();
+      state.root.querySelector("[data-source-visibility]")?.addEventListener("change", event => {
+        state.sourcesVisibility = event.target.value; state.sourcesFeedback = ""; void renderSources();
+      });
+      state.root.querySelector("[data-more-sources]")?.addEventListener("click", () => void renderSources(true));
+      state.root.querySelectorAll("[data-domain-action]").forEach(button => button.addEventListener("click", () => void saveDomainBlock(button)));
+      state.root.querySelector("[data-block-domain-form]")?.addEventListener("submit", event => {
+        event.preventDefault(); void addDomainBlock(event.currentTarget);
+      });
+    } catch (error) {
+      if (sequence === sourceRefreshSequence && state.tab === "sources") {
+        setView(`<section class="media-card"><h3>Sources</h3>${state.sourcesFeedback ? message(state.sourcesFeedback, "success") : ""}${message(error.message, "error")}<button class="media-button" data-retry-sources>Refresh Sources</button></section>`);
+        state.root.querySelector("[data-retry-sources]")?.addEventListener("click", () => void renderSources());
+      }
+    }
+  }
+
+  function domainBlockControls(domain, blocked, reason) {
+    return `<section class="media-domain-controls"><h4>Publisher domain</h4><p><strong>${blocked ? "Blocked" : "Not blocked"}</strong> · ${esc(domain)}</p><div class="media-inline-form"><label class="media-field media-field--grow"><span>Reason (optional)</span><input data-domain-reason maxlength="1000" value="${esc(reason || "")}"></label><button class="media-button" data-domain-action="${blocked ? "unblock" : "block"}" data-domain="${esc(domain)}">${blocked ? "Unblock" : "Block"}</button></div><div data-domain-message></div></section>`;
+  }
+
+  function domainBlockCard(block) {
+    return `<details class="media-source"><summary>${esc(block.domain)} · No source definition · ${block.blocked ? "Blocked" : "Not blocked"}</summary>${domainBlockControls(block.domain, block.blocked, block.reason)}</details>`;
+  }
+
+  async function saveDomainBlock(button) {
+    const controls = button.closest(".media-domain-controls");
+    const output = controls.querySelector("[data-domain-message]");
+    const blocked = button.dataset.domainAction === "block";
+    const domain = button.dataset.domain;
+    button.disabled = true;
+    try {
+      const result = await request("source-domain-blocks", { method: "PUT", idempotent: "domain_block",
+        body: { domain, blocked, reason: controls.querySelector("[data-domain-reason]").value.trim() } });
+      state.sourcesFeedback = `${result.domain_block.domain} ${result.domain_block.blocked ? "blocked" : "unblocked"}. Sources refreshed; the domain may move out of this view. Saved source policies and historical articles are preserved.`;
+      await renderSources();
+    } catch (error) { button.disabled = false; output.innerHTML = message(error.message, "error"); }
+  }
+
+  async function addDomainBlock(form) {
+    const values = new FormData(form);
+    const button = form.querySelector("button");
+    button.disabled = true;
+    try {
+      const result = await request("source-domain-blocks", { method: "PUT", idempotent: "domain_block",
+        body: { domain: String(values.get("domain") || "").trim(), blocked: true,
+          reason: String(values.get("reason") || "").trim() } });
+      state.sourcesFeedback = `${result.domain_block.domain} blocked. Use the Blocked or All view to inspect it.`;
+      await renderSources();
+    } catch (error) {
+      button.disabled = false;
+      form.parentElement.querySelector("[data-domain-add-message]").innerHTML = message(error.message, "error");
+    }
+  }
+
+  function sourceImagePolicyHtml(source) {
+    const revocationWarning = source.image_policy === "local_copy_permitted"
+      ? `<div class="media-message">Changing away from local_copy_permitted immediately makes retained copies for this source ineligible for delivery and Bluesky. R2 objects and audit metadata are not automatically deleted.</div>` : "";
+    return `<section><h4>Image policy</h4><p>Current source image policy: <strong>${esc(source.image_policy)}</strong></p>${localCopyEvidenceHtml(source.local_copy_permission_evidence)}<div class="media-message">Granting local_copy_permitted is a source-wide permission decision. Existing article policies are not bulk-updated. Future newly created or discovered article rows currently inherit the source image policy.</div>${revocationWarning}<form class="media-inline-form" data-source-image-policy-form><label class="media-field"><span>Source image policy</span><select name="image_policy" data-source-image-policy><option value="blocked"${source.image_policy === "blocked" ? " selected" : ""}>blocked</option><option value="remote_preview"${source.image_policy === "remote_preview" ? " selected" : ""}>remote_preview</option><option value="local_copy_permitted"${source.image_policy === "local_copy_permitted" ? " selected" : ""}>local_copy_permitted</option></select></label><label class="media-field media-field--grow"><span>Permission/basis note</span><textarea name="permission_basis" maxlength="1000" placeholder="Required when granting or refreshing source-wide local-copy permission"></textarea></label><label class="media-toggle"><input name="confirm_local_copy_permitted" type="checkbox"> <span>I explicitly confirm source-wide permission for retained images and future article inheritance.</span></label><button type="submit" class="media-button media-button--primary">Save image policy</button></form><div data-source-image-message></div></section>`;
+  }
+
+  function sourceCard(source, rules) {
+    let config = source.discovery_config_json; try { config = JSON.stringify(JSON.parse(config), null, 2); } catch (_error) {}
+    const domains = source.publisher_domains || [{ domain: source.canonical_domain,
+      blocked: source.domain_blocked, block_domain: source.domain_block_domain,
+      reason: source.domain_block_reason }];
+    const blockedCount = domains.filter(domain => domain.blocked).length;
+    const domainStatus = blockedCount === domains.length ? "Blocked" : blockedCount ? "Some domains blocked" : "Not blocked";
+    return `<details class="media-source${source.enabled ? "" : " media-danger-zone"}" data-source-key="${esc(source.source_key)}" data-current-image-policy="${esc(source.image_policy)}"><summary>${esc(source.name)} · ${source.enabled ? "Enabled" : "Disabled"} · ${domainStatus} · ${esc(source.publication_policy)}</summary><div class="media-source__grid">
+      ${[["Canonical domain", source.canonical_domain], ["Source type", source.source_type], ["Discovery adapter", source.discovery_method], ["Review level", source.review_level], ["Content fetch", source.content_fetch_policy], ["AI content", source.ai_content_policy], ["Image policy", source.image_policy], ["Recent run", source.recent_run_status ? `${source.recent_run_status} · ${formatUtcDateTime(source.recent_run_started_at)}` : "No run"]].map(([label, value]) => `<div><span class="media-subtext">${label}</span>${esc(value)}</div>`).join("")}
+      <label class="media-field"><span>Publication policy</span><select data-source-policy><option value="manual"${source.publication_policy === "manual" ? " selected" : ""}>manual</option><option value="auto_approve"${source.publication_policy === "auto_approve" ? " selected" : ""}>auto_approve</option></select></label>
+      <label class="media-field"><span>Enabled</span><select data-source-enabled><option value="false"${!source.enabled ? " selected" : ""}>No</option><option value="true"${source.enabled ? " selected" : ""}>Yes</option></select></label>
+      <button class="media-button media-button--primary" data-save-source>Save source policy</button></div>
+      <details><summary>Bounded route/configuration</summary><pre>${esc(config)}</pre></details><div data-source-message></div>
+      ${domains.length > 1 ? `<p>Each publisher domain has its own decision. Unblocked alternatives remain eligible; a partly blocked source appears in both visibility views.</p>` : ""}
+      ${domains.map(domain => domainBlockControls(domain.block_domain || domain.domain, domain.blocked, domain.reason)).join("")}
+      ${sourceImagePolicyHtml(source)}
+      <div class="media-author-rules"><div class="media-toolbar"><h4>Author rules</h4>${source.source_key === "the-guardian" ? `<button class="media-button" data-add-author>+ Add author rule</button>` : ""}</div><div data-add-author-form></div>
+      ${rules.length ? rules.map(authorRuleRow).join("") : `<p>No author rules.</p>`}</div></details>`;
+  }
+
+  function authorRuleRow(rule) {
+    let aliases = rule.byline_aliases;
+    if (typeof aliases === "string") { try { aliases = JSON.parse(aliases); } catch (_error) { aliases = [aliases]; } }
+    const identity = [rule.author_key, rule.profile_url, rule.profile_rss_url, ...(Array.isArray(aliases) ? aliases : [])].filter(Boolean).join(" · ");
+    return `<div class="media-author-rule" data-author-key="${esc(rule.author_key)}"><div><strong>${esc(rule.display_name)}</strong><span class="media-subtext">${esc(identity)}</span></div><label class="media-field"><span>Inclusion</span><select data-author-inclusion><option value="normal"${rule.inclusion_policy === "normal" ? " selected" : ""}>normal</option><option value="always_include"${rule.inclusion_policy === "always_include" ? " selected" : ""}>always_include</option></select></label><label class="media-field"><span>Publication</span><select data-author-publication><option value="inherit_source"${rule.publication_policy === "inherit_source" ? " selected" : ""}>inherit_source</option><option value="pending"${rule.publication_policy === "pending" ? " selected" : ""}>pending</option><option value="auto_approve"${rule.publication_policy === "auto_approve" ? " selected" : ""}>auto_approve</option></select></label><label class="media-field"><span>Enabled</span><select data-author-enabled><option value="true"${rule.enabled ? " selected" : ""}>Yes</option><option value="false"${!rule.enabled ? " selected" : ""}>No</option></select></label><button class="media-button" data-save-author>Save rule</button></div>`;
+  }
+
+  function bindSourceActions() {
+    state.root.querySelector("[data-toggle-add-source]")?.addEventListener("click", () => {
+      const target = state.root.querySelector("[data-add-source]"); target.innerHTML = `<form class="media-inline-form media-message" data-add-source-form><label class="media-field"><span>Stable source key</span><input name="source_key" required pattern="[a-z0-9]+(?:-[a-z0-9]+)*"></label><label class="media-field"><span>Display name</span><input name="name" required></label><label class="media-field"><span>Canonical domain</span><input name="canonical_domain" required placeholder="example.org"></label><label class="media-field"><span>Source type</span><select name="source_type"><option value="publisher">publisher</option><option value="government">government</option></select></label><button class="media-button media-button--primary">Create disabled definition</button></form><p class="media-subtext">Defaults: disabled, manual, standard, discovery metadata only, AI disabled, image blocked. No adapter or schedule is created.</p>`;
+      target.querySelector("form")?.addEventListener("submit", event => { event.preventDefault(); void submitAddSource(event.currentTarget, target); });
+    });
+    state.root.querySelectorAll("[data-save-source]").forEach(button => button.addEventListener("click", () => void saveSource(button.closest("[data-source-key]"))));
+    state.root.querySelectorAll("[data-source-image-policy-form]").forEach(form => form.addEventListener("submit", event => {
+      event.preventDefault(); void saveSourceImagePolicy(event.currentTarget.closest("[data-source-key]"), event.currentTarget);
+    }));
+    state.root.querySelectorAll("[data-save-author]").forEach(button => button.addEventListener("click", () => void saveAuthor(button.closest("[data-author-key]"))));
+    state.root.querySelectorAll("[data-add-author]").forEach(button => button.addEventListener("click", () => showAddAuthor(button.closest("[data-source-key]"))));
+  }
+
+  async function saveSource(container) {
+    const policy = container.querySelector("[data-source-policy]").value;
+    const enabled = container.querySelector("[data-source-enabled]").value === "true";
+    if (policy === "auto_approve" && !confirm("Auto-approve is a broad editorial decision for FUTURE discoveries. Existing rows will not change. Continue?")) return;
+    const output = container.querySelector("[data-source-message]");
+    try { await request(`sources/${container.dataset.sourceKey}`, { method: "PUT", idempotent: "source", body: { publication_policy: policy, enabled } }); output.innerHTML = message("Source policy saved for future discovery.", "success"); }
+    catch (error) { output.innerHTML = message(error.message, "error"); }
+  }
+
+  async function saveSourceImagePolicy(container, form) {
+    const output = container.querySelector("[data-source-image-message]");
+    const values = new FormData(form);
+    const imagePolicy = String(values.get("image_policy") || "");
+    const permissionBasis = String(values.get("permission_basis") || "").trim();
+    const confirmed = values.get("confirm_local_copy_permitted") === "on";
+    if (imagePolicy === "local_copy_permitted" && !permissionBasis) {
+      output.innerHTML = message("Enter the source-wide permission, licence or other basis for retaining images locally.", "error"); return;
+    }
+    if (imagePolicy === "local_copy_permitted" && !confirmed) {
+      output.innerHTML = message("Explicitly confirm the source-wide local-copy permission decision before saving.", "error"); return;
+    }
+    if (container.dataset.currentImagePolicy === "local_copy_permitted" &&
+        imagePolicy !== "local_copy_permitted" &&
+        !window.confirm("Changing this source away from local_copy_permitted immediately makes retained copies ineligible for delivery and Bluesky. R2 objects will not be automatically deleted. Continue?")) return;
+    const button = form.querySelector("button[type='submit']");
+    button.disabled = true;
+    const body = { image_policy: imagePolicy,
+      confirm_local_copy_permitted: imagePolicy === "local_copy_permitted" && confirmed };
+    if (permissionBasis) body.permission_basis = permissionBasis;
+    try {
+      await request(`sources/${container.dataset.sourceKey}`, { method: "PUT",
+        idempotent: "source_image_policy", body });
+      output.innerHTML = message(imagePolicy === container.dataset.currentImagePolicy
+        ? imagePolicy === "local_copy_permitted"
+          ? "Source local-copy permission/basis evidence recorded."
+          : "Source image policy is unchanged."
+        : "Source image policy updated. Existing article policies were not changed.", "success");
+      setTimeout(() => void renderSources(), 350);
+    } catch (error) { button.disabled = false; output.innerHTML = message(error.message, "error"); }
+  }
+
+  async function saveAuthor(container) {
+    const output = container.closest(".media-author-rules").querySelector("[data-source-message]") || container.closest(".media-source").querySelector("[data-source-message]");
+    try { await request(`author-rules/${container.dataset.authorKey}`, { method: "PUT", idempotent: "author", body: { inclusion_policy: container.querySelector("[data-author-inclusion]").value, publication_policy: container.querySelector("[data-author-publication]").value, enabled: container.querySelector("[data-author-enabled]").value === "true" } }); if (output) output.innerHTML = message("Author rule saved for future discovery.", "success"); }
+    catch (error) { if (output) output.innerHTML = message(error.message, "error"); else alert(error.message); }
+  }
+
+  function showAddAuthor(sourceContainer) {
+    const target = sourceContainer.querySelector("[data-add-author-form]");
+    target.innerHTML = `<form class="media-inline-form media-message" data-add-author-rule><label class="media-field"><span>Stable author key</span><input name="author_key" required placeholder="guardian:name-slug"></label><label class="media-field"><span>Display name</span><input name="display_name" required></label><label class="media-field media-field--grow"><span>Profile URL</span><input name="profile_url" type="url" required></label><label class="media-field"><span>Byline aliases (comma separated)</span><input name="aliases" required></label><button class="media-button media-button--primary">Add rule</button></form><p class="media-subtext">Guardian byline rules are supported. Adding a rule does not change source-wide policy.</p>`;
+    target.querySelector("form")?.addEventListener("submit", event => { event.preventDefault(); void submitAddAuthor(event.currentTarget, sourceContainer.dataset.sourceKey, target); });
+  }
+
+  async function submitAddAuthor(form, sourceKey, target) {
+    const values = new FormData(form);
+    try { await request("author-rules", { method: "POST", idempotent: "author", body: { author_key: values.get("author_key"), source_key: sourceKey, display_name: values.get("display_name"), profile_url: values.get("profile_url"), profile_rss_url: null, profile_rss_route_key: null, inclusion_policy: "normal", publication_policy: "inherit_source", enabled: true, byline_aliases: String(values.get("aliases") || "").split(",").map(value => value.trim()).filter(Boolean) } }); target.innerHTML = message("Author rule added. It affects future discovery only.", "success"); setTimeout(() => void renderSources(), 350); }
+    catch (error) { target.insertAdjacentHTML("afterbegin", message(error.message, "error")); }
+  }
+
+  async function submitAddSource(form, target) {
+    const values = Object.fromEntries(new FormData(form));
+    try { await request("sources", { method: "POST", idempotent: "source", body: values }); target.innerHTML = message("Disabled source definition created. It is not scheduled or trusted.", "success"); setTimeout(() => void renderSources(), 350); }
+    catch (error) { target.insertAdjacentHTML("afterbegin", message(error.message, "error")); }
+  }
+
+  function mount(container, options = {}) {
+    if (!container) return;
+    state.root = container;
+    state.apiBase = String(options.apiBaseUrl || "/api").replace(/\/+$/, "");
+    if (!container.querySelector(".media-dashboard")) {
+      container.innerHTML = `<div class="media-dashboard"><section class="media-header"><h2>Media</h2><p>Editorial administration for authoritative UK AQ Media D1.</p><nav class="media-mini-nav" role="tablist" aria-label="Media sections">${TABS.map(tab => `<button type="button" data-media-tab="${tab}" role="tab" aria-selected="${tab === state.tab}" class="${tab === state.tab ? "is-active" : ""}">${TAB_LABELS[tab]}</button>`).join("")}</nav></section><div data-media-health aria-live="polite"></div><div data-media-view></div></div>`;
+      container.querySelectorAll("[data-media-tab]").forEach(button => button.addEventListener("click", () => setTab(button.dataset.mediaTab)));
+    }
+    setTab(state.tab);
+    void refreshMediaHealth();
+  }
+
+  window.UKAQMediaDashboard = { mount, refresh: () => setTab(state.tab) };
+})();

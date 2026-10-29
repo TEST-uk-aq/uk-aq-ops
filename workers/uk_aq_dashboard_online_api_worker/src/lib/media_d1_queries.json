@@ -1,0 +1,5 @@
+{
+  "settings": "query MediaD1Settings($account: string!) { viewer { accounts(filter: {accountTag: $account}) { settings { daily: d1AnalyticsAdaptiveGroups { enabled availableFields maxDuration maxPageSize notOlderThan } queries: d1QueriesAdaptiveGroups { enabled availableFields maxDuration maxPageSize notOlderThan } } } } }",
+  "daily": "query MediaD1Daily($account: string!, $start: Date!, $end: Date!) { viewer { accounts(filter: {accountTag: $account}) { daily: d1AnalyticsAdaptiveGroups(limit: LIMIT, filter: {date_geq: $start, date_leq: $end}, orderBy: [date_ASC]) { dimensions { date } sum { METRICS } } } } }",
+  "queries": "query MediaD1Queries($account: string!, $database: string!, $start: Time!, $end: Time!) { viewer { accounts(filter: {accountTag: $account}) { queries: d1QueriesAdaptiveGroups(limit: 5, filter: {databaseId: $database, datetimeHour_geq: $start, datetimeHour_lt: $end}, orderBy: [sum_rowsRead_DESC]) { dimensions { query } count sum { METRICS } } } } }"
+}
