@@ -12,6 +12,9 @@ optional fallback/manual path.
 
 DB size metrics are written via `uk_aq_public.uk_aq_rpc_db_size_metric_upsert`.
 R2 domain metrics are written via `uk_aq_public.uk_aq_rpc_r2_domain_size_metric_upsert`.
+Observation-history storage is measured under the prefix selected by `UK_AQ_R2_HISTORY_VERSION`,
+using the shared observation-generation resolver; an independent observations-prefix override
+is no longer used. The legacy AQI-levels metrics prefix remains separately configurable.
 If Cloud Run schema sampling is explicitly enabled, schema metrics are written via
 `uk_aq_public.uk_aq_rpc_schema_size_metric_upsert`.
 
@@ -34,6 +37,7 @@ and continues; it only fails when both DB sources fail in the same run.
 - `SB_SECRET_KEY`
 - `OBS_AQIDB_SUPABASE_URL`
 - `OBS_AQIDB_SECRET_KEY`
+- `UK_AQ_R2_HISTORY_VERSION` (`v2` or `v3`; selects the matching canonical observations prefix)
 
 ## Optional env vars
 
@@ -61,8 +65,7 @@ and continues; it only fails when both DB sources fail in the same run.
 - `UK_AQ_R2_DOMAIN_SIZE_UPSERT_RPC` (default `uk_aq_rpc_r2_domain_size_metric_upsert`)
 - `UK_AQ_R2_DOMAIN_SIZE_CLEANUP_RPC` (default `uk_aq_rpc_r2_domain_size_metric_cleanup`)
 - `UK_AQ_R2_DOMAIN_SIZE_RETENTION_DAYS` (default `120`)
-- `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (default `history/v1/observations`)
-- `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX` (default `history/v1/aqilevels/hourly`)
+- `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX` (default `history/v1/aqilevels/hourly`; independent legacy AQI-levels dataset)
 - `CFLARE_R2_ENDPOINT` (fallback `R2_ENDPOINT`)
 - `CFLARE_R2_BUCKET` (fallback `R2_BUCKET`)
 - `CFLARE_R2_REGION` (fallback `R2_REGION`, default `auto`)

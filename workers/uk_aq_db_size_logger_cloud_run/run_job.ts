@@ -3,6 +3,7 @@ import {
   normalizePrefix,
   r2ListAllObjects,
 } from "../shared/r2_sigv4.mjs";
+import { resolveObservationHistoryGeneration } from "../shared/uk_aq_observation_history_generation.mjs";
 
 type RpcError = { message: string };
 
@@ -109,10 +110,8 @@ const R2_DOMAIN_SIZE_RETENTION_DAYS = parsePositiveInt(
   120,
 );
 
-const R2_HISTORY_OBSERVATIONS_PREFIX = parseHistoryPrefix(
-  optionalEnv("UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX") ||
-    "history/v1/observations",
-);
+const R2_HISTORY_OBSERVATIONS_PREFIX =
+  resolveObservationHistoryGeneration(Deno.env.toObject()).observations_prefix;
 const R2_HISTORY_AQILEVELS_PREFIX = parseHistoryPrefix(
   optionalEnv("UK_AQ_R2_HISTORY_AQILEVELS_PREFIX") ||
     "history/v1/aqilevels/hourly",
