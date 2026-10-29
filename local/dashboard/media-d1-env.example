@@ -1,25 +1,23 @@
-# Backend-only analytics configuration; copy approved values into the TEST local .env.
-# Use Account Analytics: Read only, explicitly scoped to the intended account(s).
-# No fallback to Media admin, deployment or general Cloudflare credentials.
-# For each account, set its own ACCOUNT_ID and DATABASE_ID, never a database name.
-# PLAN is free, paid or unknown. Limits apply only for explicitly confirmed free.
-# Leave unknown allowances blank; confirm current values before configuring them.
-UK_AQ_MEDIA_D1_LIVE_ACCOUNT_ID=
-UK_AQ_MEDIA_D1_LIVE_DATABASE_ID=
-UK_AQ_MEDIA_D1_LIVE_ANALYTICS_TOKEN=
-UK_AQ_MEDIA_D1_LIVE_PLAN=unknown
-UK_AQ_MEDIA_D1_LIVE_DAILY_READ_LIMIT=
-UK_AQ_MEDIA_D1_LIVE_DAILY_WRITE_LIMIT=
-UK_AQ_MEDIA_D1_TEST_ACCOUNT_ID=
-UK_AQ_MEDIA_D1_TEST_DATABASE_ID=
-UK_AQ_MEDIA_D1_TEST_ANALYTICS_TOKEN=
-UK_AQ_MEDIA_D1_TEST_PLAN=unknown
-UK_AQ_MEDIA_D1_TEST_DAILY_READ_LIMIT=
-UK_AQ_MEDIA_D1_TEST_DAILY_WRITE_LIMIT=
-UK_AQ_MEDIA_D1_WARNING_PERCENT=75
-UK_AQ_MEDIA_D1_CRITICAL_PERCENT=90
+# Backend-only Media analytics for this dashboard's environment.
+# Identical names in every checkout; supply only its own environment's values.
+# Account Analytics: Read only, scoped to the single Media Cloudflare account.
+UK_AQ_MEDIA_CLOUDFLARE_ACCOUNT_ID=
+UK_AQ_MEDIA_CFLARE_D1DB_ID=
+UK_AQ_MEDIA_D1_ANALYTICS_TOKEN=
 
-# Reuse the signed personal Access JWT trust settings already used by Accounts:
+# The operator must re-add the existing TEST analytics-only token's value under
+# the unsuffixed name above in TEST Ops GitHub Secrets and local TEST Ops .env.
+# No fallback to obsolete token names, Media admin or deployment credentials.
+
+# Optional overrides: leave UNSET to use the built-in Free-plan defaults.
+# Explicit empty, malformed, non-positive or invalidly ordered values fail closed.
+# UK_AQ_MEDIA_D1_DAILY_READ_LIMIT=5000000
+# UK_AQ_MEDIA_D1_DAILY_WRITE_LIMIT=100000
+# UK_AQ_MEDIA_D1_WARNING_PERCENT=75
+# UK_AQ_MEDIA_D1_CRITICAL_PERCENT=90
+
+# Reuse existing signed personal Access JWT trust settings used by Accounts.
+# Preserve the local application's issuer and audience; do not change Tunnel.
 UK_AQ_LOCAL_ACCOUNTS_ACCESS_ISSUER=
 UK_AQ_LOCAL_ACCOUNTS_ACCESS_AUD=
 # Install the existing server/requirements.txt (PyJWT[crypto] included).

@@ -4,8 +4,7 @@ import type { AccountsAccessContext } from '../lib/accounts_auth';
 import type { WorkerEnv } from '../lib/upstream';
 
 type Json = Record<string, any>;
-type Account = 'LIVE' | 'TEST';
-type Config = { account: string; database: string; token: string; plan: string; limits: Json };
+type Config = { account: string; database: string; token: string; limits: Json; thresholds: Json };
 type Entry = { at: number; data: Json };
 const DAY = 86400000;
 const TTL = 900000;
@@ -39,18 +38,29 @@ function reply(data: unknown, status = 200): Response {
     ...(status === 405 ? { Allow: 'GET' } : {}),
   } });
 }
-function configuration(env: WorkerEnv, label: Account): Config {
-  const get = (suffix: string) => String(env[`UK_AQ_MEDIA_D1_${label}_${suffix}` as keyof WorkerEnv] || '').trim();
-  const account = get('ACCOUNT_ID');
-  const database = get('DATABASE_ID');
-  const token = get('ANALYTICS_TOKEN');
-  const other = String(env[`UK_AQ_MEDIA_D1_${label === 'LIVE' ? 'TEST' : 'LIVE'}_ACCOUNT_ID`] || '').trim();
-  if (!/^[a-f0-9]{32}$/i.test(account) || !token || token.length > 4096 || /\s/.test(token) ||
-      account.toLowerCase() === other.toLowerCase()) throw new SourceError('NOT_CONFIGURED');
-  const plan = ['free', 'paid'].includes(get('PLAN')) ? get('PLAN') : 'unknown';
-  const limits = { rows_read: plan === 'free' ? positive(get('DAILY_READ_LIMIT')) : null,
-    rows_written: plan === 'free' ? positive(get('DAILY_WRITE_LIMIT')) : null };
-  return { account, database, token, plan, limits };
+// Common Cloudflare D1 Free-plan limits and dashboard warning policy.
+// These product defaults are independent of the deployment's account identity.
+const DEFAULTS = { DAILY_READ_LIMIT: 5000000, DAILY_WRITE_LIMIT: 100000,
+  WARNING_PERCENT: 75, CRITICAL_PERCENT: 90 };
+function configuration(env: WorkerEnv): Config {
+  const account = String(env.UK_AQ_MEDIA_CLOUDFLARE_ACCOUNT_ID || '').trim();
+  const database = String(env.UK_AQ_MEDIA_CFLARE_D1DB_ID || '').trim();
+  const token = String(env.UK_AQ_MEDIA_D1_ANALYTICS_TOKEN || '').trim();
+  if (!/^[a-f0-9]{32}$/i.test(account) || !token || token.length > 4096 || /\s/.test(token)) {
+    throw new SourceError('NOT_CONFIGURED');
+  }
+  if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(database)) throw new SourceError('DATABASE_NOT_CONFIGURED');
+  const override = (name: keyof typeof DEFAULTS): number => {
+    const value = env[`UK_AQ_MEDIA_D1_${name}` as keyof WorkerEnv];
+    if (value === undefined) return DEFAULTS[name];
+    const parsed = positive(value);
+    if (parsed === null) throw new SourceError('INVALID_ALLOWANCES');
+    return parsed;
+  };
+  const limits = { rows_read: override('DAILY_READ_LIMIT'), rows_written: override('DAILY_WRITE_LIMIT') };
+  const thresholds = { warning: override('WARNING_PERCENT'), critical: override('CRITICAL_PERCENT') };
+  if (thresholds.warning >= thresholds.critical || thresholds.critical > 100) throw new SourceError('INVALID_ALLOWANCES');
+  return { account, database, token, limits, thresholds };
 }
 async function digest(value: string): Promise<string> {
   return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))))
@@ -102,7 +112,6 @@ function settings(value: unknown, fields: string[]): Json {
   return info;
 }
 async function retrieve(config: Config, mode: string, dates: string[], selected: string, now: number): Promise<Json> {
-  if (mode === 'queries' && !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(config.database)) throw new SourceError('DATABASE_NOT_CONFIGURED');
   const info = object((await graphql(config, templates.settings, {})).settings);
   const dataset = mode === 'daily' ? 'daily' : 'queries';
   const limits = settings(info[dataset], mode === 'daily' ? ['dimensions_date', 'sum_rowsRead', 'sum_rowsWritten'] :
@@ -154,16 +163,17 @@ async function retrieve(config: Config, mode: string, dates: string[], selected:
     status: byDay.has(date) ? 'available' : Date.parse(`${date}T00:00:00Z`) < oldest ? 'outside_retention' : 'missing',
     rows_read: null, rows_written: null, read_queries: null, write_queries: null, ...byDay.get(date) })) };
 }
-async function accountData(env: WorkerEnv, label: Account, mode: string, dates: string[], selected: string, refresh: boolean): Promise<Json> {
+async function usageData(env: WorkerEnv, mode: string, dates: string[], selected: string, refresh: boolean): Promise<Json> {
   let config: Config;
-  try { config = configuration(env, label); }
-  catch { return { account: label, status: 'unavailable', error: 'NOT_CONFIGURED', retrieved_at: null, rows: [] }; }
+  try { config = configuration(env); }
+  catch (error) { return { status: 'unavailable', error: error instanceof SourceError ? error.code : 'NOT_CONFIGURED',
+    daily_limits: null, thresholds: null, retrieved_at: null, rows: [] }; }
   const now = Date.now();
   const identity = await digest(JSON.stringify([config.account, config.database, config.token]));
   const key = `${identity}:${mode}:${dates[0]}:${dates[dates.length - 1]}:${mode === 'queries' ? selected : ''}`;
-  const gate = `${label}:${mode}`;
+  const gate = mode;
   const entry = cache.get(key);
-  const base = { account: label, plan: config.plan, daily_limits: config.limits };
+  const base = { daily_limits: config.limits, thresholds: config.thresholds };
   if (!refresh && entry && now - entry.at < TTL) return { ...base, ...entry.data, status: 'cached', error: null };
   if (pending.has(key)) return { ...base, ...await pending.get(key)! };
   const recentAttempts = (attempts.get(gate) || []).filter(at => now - at < 60000);
@@ -199,20 +209,17 @@ export async function handleMediaD1Usage(request: Request, env: WorkerEnv, ctx: 
     const url = new URL(request.url), query = url.searchParams;
     if (url.search.length > 256 || /%(?![0-9a-f]{2})/i.test(url.search) ||
         (url.search && url.search.slice(1).split('&').some(part => !part.includes('=')))) throw new Error('query');
-    query.forEach((_, key) => { if (!['days', 'account', 'day', 'view', 'refresh'].includes(key) || query.getAll(key).length !== 1) throw new Error('query'); });
-    const days = query.get('days') ?? '7', mode = query.get('view') ?? 'daily', label = query.get('account');
+    query.forEach((_, key) => { if (!['days', 'day', 'view', 'refresh'].includes(key) || query.getAll(key).length !== 1) throw new Error('query'); });
+    const days = query.get('days') ?? '7', mode = query.get('view') ?? 'daily';
     const refresh = query.get('refresh') ?? '0';
     if (!['7', '30', '90'].includes(days) || !['daily', 'queries'].includes(mode) || !['0', '1'].includes(refresh) ||
-        (mode === 'daily' && (label !== null || query.has('day'))) || (mode === 'queries' && !['LIVE', 'TEST'].includes(label || ''))) throw new Error('query');
+        (mode === 'daily' && query.has('day'))) throw new Error('query');
     const today = Math.floor(Date.now() / DAY) * DAY;
     const dates = Array.from({ length: Number(days) }, (_, index) => day(today - (Number(days) - index - 1) * DAY));
     const selected = query.get('day') ?? dates[dates.length - 1];
     if (!dates.includes(selected)) throw new Error('query');
-    const warning = positive(env.UK_AQ_MEDIA_D1_WARNING_PERCENT), critical = positive(env.UK_AQ_MEDIA_D1_CRITICAL_PERCENT);
-    const thresholds = warning && critical && warning < critical && critical <= 100 ? { warning, critical } : null;
-    const accounts = await Promise.all((mode === 'daily' ? ['LIVE', 'TEST'] : [label]).map(account =>
-      accountData(env, account as Account, mode, dates, selected, refresh === '1')));
-    return reply({ view: mode, days: Number(days), dates, selected_day: selected, today: day(today), thresholds, accounts });
+    const usage = await usageData(env, mode, dates, selected, refresh === '1');
+    return reply({ view: mode, days: Number(days), dates, selected_day: selected, today: day(today), usage });
   } catch (error) {
     if (error instanceof AccountsError) return reply({ error: { code: error.code, message: error.message } }, error.status);
     return reply({ error: { code: 'INVALID_QUERY', message: 'Invalid D1 Usage parameters' } }, 400);

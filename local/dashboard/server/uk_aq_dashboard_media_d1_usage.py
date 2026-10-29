@@ -57,18 +57,34 @@ def _positive(value):
     return int(raw) if re.fullmatch(r'[1-9][0-9]{0,15}', raw) and int(raw) <= 9007199254740991 else None
 
 
-def _config(label: str) -> dict:
-    def get(suffix):
-        return os.getenv(f'UK_AQ_MEDIA_D1_{label}_{suffix}', '').strip()
-    account, database, token = get('ACCOUNT_ID'), get('DATABASE_ID'), get('ANALYTICS_TOKEN')
-    other = os.getenv(f'UK_AQ_MEDIA_D1_{"TEST" if label == "LIVE" else "LIVE"}_ACCOUNT_ID', '').strip()
-    if not re.fullmatch(r'[a-fA-F0-9]{32}', account) or not token or len(token) > 4096 or re.search(r'\s', token) or account.lower() == other.lower():
+# Common Cloudflare D1 Free-plan limits and dashboard policy, independent of identity.
+DEFAULTS = {'DAILY_READ_LIMIT': 5000000, 'DAILY_WRITE_LIMIT': 100000,
+            'WARNING_PERCENT': 75, 'CRITICAL_PERCENT': 90}
+
+
+def _config() -> dict:
+    account = os.getenv('UK_AQ_MEDIA_CLOUDFLARE_ACCOUNT_ID', '').strip()
+    database = os.getenv('UK_AQ_MEDIA_CFLARE_D1DB_ID', '').strip()
+    token = os.getenv('UK_AQ_MEDIA_D1_ANALYTICS_TOKEN', '').strip()
+    if not re.fullmatch(r'[a-fA-F0-9]{32}', account) or not token or len(token) > 4096 or re.search(r'\s', token):
         raise SourceError('NOT_CONFIGURED')
-    plan = get('PLAN') if get('PLAN') in {'free', 'paid'} else 'unknown'
-    return {'account': account, 'database': database, 'token': token, 'plan': plan, 'limits': {
-        'rows_read': _positive(get('DAILY_READ_LIMIT')) if plan == 'free' else None,
-        'rows_written': _positive(get('DAILY_WRITE_LIMIT')) if plan == 'free' else None,
-    }}
+    if not re.fullmatch(r'[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}', database):
+        raise SourceError('DATABASE_NOT_CONFIGURED')
+
+    def override(name):
+        value = os.getenv('UK_AQ_MEDIA_D1_' + name)
+        if value is None:
+            return DEFAULTS[name]
+        parsed = _positive(value)
+        if parsed is None:
+            raise SourceError('INVALID_ALLOWANCES')
+        return parsed
+
+    limits = {'rows_read': override('DAILY_READ_LIMIT'), 'rows_written': override('DAILY_WRITE_LIMIT')}
+    thresholds = {'warning': override('WARNING_PERCENT'), 'critical': override('CRITICAL_PERCENT')}
+    if not thresholds['warning'] < thresholds['critical'] <= 100:
+        raise SourceError('INVALID_ALLOWANCES')
+    return {'account': account, 'database': database, 'token': token, 'limits': limits, 'thresholds': thresholds}
 
 
 def _graphql(config: dict, query: str, variables: dict) -> dict:
@@ -110,8 +126,6 @@ def _settings(value, fields: list[str]) -> dict:
 
 
 def _retrieve(config: dict, mode: str, dates: list[str], selected: str, now: float) -> dict:
-    if mode == 'queries' and not re.fullmatch(r'[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}', config['database']):
-        raise SourceError('DATABASE_NOT_CONFIGURED')
     info = _object(_graphql(config, TEMPLATES['settings'], {}).get('settings'))
     limits = _settings(info.get(mode), ['dimensions_date', 'sum_rowsRead', 'sum_rowsWritten'] if mode == 'daily'
                        else ['dimensions_query', 'count', 'sum_rowsRead'])
@@ -172,16 +186,16 @@ def _retrieve(config: dict, mode: str, dates: list[str], selected: str, now: flo
          'read_queries': None, 'write_queries': None, **by_day.get(date, {})} for date in dates]}
 
 
-def _account_data(label: str, mode: str, dates: list[str], selected: str, refresh: bool) -> dict:
+def _usage_data(mode: str, dates: list[str], selected: str, refresh: bool) -> dict:
     try:
-        config = _config(label)
-    except SourceError:
-        return {'account': label, 'status': 'unavailable', 'error': 'NOT_CONFIGURED', 'retrieved_at': None, 'rows': []}
+        config = _config()
+    except SourceError as error:
+        return {'status': 'unavailable', 'error': error.code, 'daily_limits': None, 'thresholds': None, 'retrieved_at': None, 'rows': []}
     now = time.time()
     identity = hashlib.sha256(json.dumps([config['account'], config['database'], config['token']], separators=(',', ':')).encode()).hexdigest()
     key = f'{identity}:{mode}:{dates[0]}:{dates[-1]}:{selected if mode == "queries" else ""}'
-    gate = f'{label}:{mode}'
-    base = {'account': label, 'plan': config['plan'], 'daily_limits': config['limits']}
+    gate = mode
+    base = {'daily_limits': config['limits'], 'thresholds': config['thresholds']}
     with _lock:
         entry = _cache.get(key)
         if not refresh and entry and now - entry[0] < TTL:
@@ -221,16 +235,13 @@ def _account_data(label: str, mode: str, dates: list[str], selected: str, refres
 def _query(raw: str) -> dict:
     if len(raw) > 256 or re.search(r'%(?![a-fA-F0-9]{2})', raw):
         raise ValueError()
-    rows = parse_qsl(raw, keep_blank_values=True, strict_parsing=True, max_num_fields=5, errors='strict')
+    rows = parse_qsl(raw, keep_blank_values=True, strict_parsing=True, max_num_fields=4, errors='strict')
     query = dict(rows)
-    if len(query) != len(rows) or set(query) - {'days', 'account', 'day', 'view', 'refresh'}:
+    if len(query) != len(rows) or set(query) - {'days', 'day', 'view', 'refresh'}:
         raise ValueError()
     if query.get('days', '7') not in {'7', '30', '90'} or query.get('view', 'daily') not in {'daily', 'queries'} or query.get('refresh', '0') not in {'0', '1'}:
         raise ValueError()
-    if query.get('view', 'daily') == 'daily':
-        if 'account' in query or 'day' in query:
-            raise ValueError()
-    elif query.get('account') not in {'LIVE', 'TEST'}:
+    if query.get('view', 'daily') == 'daily' and 'day' in query:
         raise ValueError()
     return query
 
@@ -268,10 +279,6 @@ def serve_d1_usage(handler):
     except (ValueError, UnicodeError):
         _send(handler, {'error': {'code': 'INVALID_QUERY', 'message': 'Invalid D1 Usage parameters'}}, 400)
         return
-    warning = _positive(os.getenv('UK_AQ_MEDIA_D1_WARNING_PERCENT'))
-    critical = _positive(os.getenv('UK_AQ_MEDIA_D1_CRITICAL_PERCENT'))
-    thresholds = {'warning': warning, 'critical': critical} if warning and critical and warning < critical <= 100 else None
-    accounts = [_account_data(label, mode, dates, selected, query.get('refresh') == '1')
-                for label in (['LIVE', 'TEST'] if mode == 'daily' else [query['account']])]
+    usage = _usage_data(mode, dates, selected, query.get('refresh') == '1')
     _send(handler, {'view': mode, 'days': days, 'dates': dates, 'selected_day': selected,
-                    'today': _day(today), 'thresholds': thresholds, 'accounts': accounts})
+                    'today': _day(today), 'usage': usage})

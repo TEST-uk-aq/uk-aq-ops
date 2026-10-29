@@ -50,7 +50,6 @@
 .media-card p { color: var(--muted); }
 
 .media-d1 { display: grid; gap: 16px; min-width: 0; }
-.media-d1-summaries { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .media-d1-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .media-d1-stats dt { color: var(--muted); }
 .media-d1-stats dd { margin: 4px 0 0; font-size: 1.25rem; font-weight: 650; overflow-wrap: anywhere; }
@@ -66,15 +65,9 @@
 .media-d1-grid { stroke: var(--border); }
 .media-d1-series path { fill: none; stroke: currentColor; stroke-width: 2.5; }
 .media-d1-series circle { fill: currentColor; }
-.media-d1-series--live, .media-d1-legend--live { color: #14746d; }
-.media-d1-series--test, .media-d1-legend--test { color: #8c4799; }
-.media-d1-series--test path { stroke-dasharray: 7 4; }
-.media-d1-legend { font-weight: 650; margin-right: 12px; }
+.media-d1-series { color: #14746d; }
 .media-d1 .media-table caption { text-align: left; padding: 12px 0; color: var(--muted); }
 .media-d1 code { white-space: normal; overflow-wrap: anywhere; }
-@media (max-width: 640px) {
-  .media-d1-summaries { grid-template-columns: minmax(0, 1fr); }
-}
 
 .media-mini-nav {
   display: inline-flex;

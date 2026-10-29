@@ -3,7 +3,7 @@
 
   const TABS = ["articles", "runs", "sources", "d1-usage"];
   const TAB_LABELS = { articles: "Articles", runs: "Runs", sources: "Sources", "d1-usage": "D1 Usage" };
-  const d1 = { days: "7", metric: "rows_read", account: "LIVE", day: "", daily: new Map(), queries: new Map(),
+  const d1 = { days: "7", metric: "rows_read", day: "", daily: new Map(), queries: new Map(),
     loading: new Set(), errors: new Map(), lastRefresh: new Map() };
   const RUN_KINDS = ["publisher", "gdelt"];
   const SORTS = [
@@ -1847,118 +1847,115 @@
 
   function d1Today() { return new Date().toISOString().slice(0, 10); }
   function d1DailyKey() { return `${d1Today()}:${d1.days}`; }
-  function d1QueryKey() { return `${d1DailyKey()}:${d1.account}:${d1.day}`; }
+  function d1QueryKey() { return `${d1DailyKey()}:${d1.day}`; }
   function d1Number(value) { return typeof value === "number" ? value.toLocaleString("en-GB", { maximumFractionDigits: 2 }) : "Unknown"; }
-  function d1Status(account) {
-    if (!account || account.status === "unavailable") return "Unavailable";
-    const age = Date.now() - Date.parse(account.retrieved_at);
-    return account.status === "stale" || age >= 900000 ? "Stale" : account.status === "fresh" ? "Fresh" : "Cached";
+  function d1Status(usage) {
+    if (!usage || usage.status === "unavailable") return "Unavailable";
+    const age = Date.now() - Date.parse(usage.retrieved_at);
+    return usage.status === "stale" || age >= 900000 ? "Stale" : usage.status === "fresh" ? "Fresh" : "Cached";
   }
   function d1Error(code) {
-    return ({ NOT_CONFIGURED: "Account analytics settings are missing or invalid.", DATABASE_NOT_CONFIGURED: "The Media database identity is not configured for insights.",
+    return ({ NOT_CONFIGURED: "Media analytics settings are missing or invalid.", INVALID_ALLOWANCES: "Invalid optional D1 allowance settings: limits must be positive integers and thresholds must satisfy 0 < warning < critical ≤ 100.", DATABASE_NOT_CONFIGURED: "The Media database identity is missing or invalid.",
       OUTSIDE_RETENTION: "This day is outside the account’s available query retention.", REFRESH_RATE_LIMITED: "Refresh is temporarily limited. Wait a minute before trying again.",
       ANALYTICS_ACCESS_DENIED: "Read-only account analytics access was denied.", ANALYTICS_REJECTED: "Cloudflare rejected the analytics request. Check account permissions and supported fields.",
       DATASET_UNAVAILABLE: "The required analytics dataset or fields are unavailable for this account.",
       UNSUPPORTED_WINDOW: "The account’s analytics limits do not support this bounded request." })[code] || "Cloudflare analytics is unavailable. Try again later.";
   }
-  function d1Quota(account, row, metric, thresholds) {
-    const limit = account.daily_limits?.[metric], usage = row?.[metric];
-    if (account.plan !== "free" || !(limit > 0)) return `<span class="media-subtext">Daily allowance not configured for this plan.</span>`;
-    if (typeof usage !== "number") return `<span class="media-subtext">Daily allowance ${esc(d1Number(limit))}; consumption unknown.</span>`;
-    const percent = usage / limit * 100;
+  function d1Quota(usage, row, metric, thresholds) {
+    const limit = usage.daily_limits?.[metric], consumed = row?.[metric];
+    if (!(limit > 0)) return `<span class="media-subtext">Daily allowance unavailable.</span>`;
+    if (typeof consumed !== "number") return `<span class="media-subtext">Daily allowance ${esc(d1Number(limit))}; consumption unknown.</span>`;
+    const percent = consumed / limit * 100;
     const level = thresholds && percent >= thresholds.critical ? "critical" : thresholds && percent >= thresholds.warning ? "warning" : "normal";
     return `<div class="media-d1-quota media-d1-quota--${level}"><span>${esc(d1Number(percent))}% of ${esc(d1Number(limit))} daily allowance${level === "normal" ? "" : ` · ${level}`}</span>
-      <progress max="100" value="${Math.min(percent, 100)}" aria-label="${esc(account.account)} ${metric === "rows_read" ? "rows read" : "rows written"} daily allowance">${esc(d1Number(percent))}%</progress></div>`;
+      <progress max="100" value="${Math.min(percent, 100)}" aria-label="Media ${metric === "rows_read" ? "rows read" : "rows written"} daily allowance">${esc(d1Number(percent))}%</progress></div>`;
   }
-  function d1Summary(account, data) {
-    const row = account.rows?.find(item => item.date === d1.day);
-    return `<section class="media-card"><h3>${esc(account.account)} UK AQ Media</h3><p>${esc(d1.day)} UTC${d1.day === data.today ? " · today / partial" : ""} · ${d1Status(account)}</p>
-      ${account.error ? message(d1Error(account.error), "error") : ""}
+  function d1Summary(usage, data) {
+    const row = usage.rows?.find(item => item.date === d1.day);
+    return `<section class="media-card"><h3>UK AQ Media · selected day</h3><p>${esc(d1.day)} UTC${d1.day === data.today ? " · today / partial" : ""} · ${d1Status(usage)}</p>
+      ${usage.error ? message(d1Error(usage.error), "error") : ""}
       ${row && row.status !== "available" ? message(row.status === "outside_retention" ? "Outside provider retention; usage unknown." : "No daily data returned; usage unknown.") : ""}
       <dl class="media-d1-stats"><div><dt>Rows read</dt><dd>${esc(d1Number(row?.rows_read))}</dd></div><div><dt>Rows written</dt><dd>${esc(d1Number(row?.rows_written))}</dd></div>
       <div><dt>Read queries</dt><dd>${esc(d1Number(row?.read_queries))}</dd></div><div><dt>Write queries</dt><dd>${esc(d1Number(row?.write_queries))}</dd></div></dl>
-      <p>Rows read</p>${d1Quota(account, row, "rows_read", data.thresholds)}<p>Rows written</p>${d1Quota(account, row, "rows_written", data.thresholds)}
-      <p class="media-subtext">Plan: ${esc(account.plan || "unknown")}. Last successful retrieval: ${esc(formatUtcDateTime(account.retrieved_at))}.</p></section>`;
+      <p>Rows read</p>${d1Quota(usage, row, "rows_read", usage.thresholds)}<p>Rows written</p>${d1Quota(usage, row, "rows_written", usage.thresholds)}
+      <p class="media-subtext">Cloudflare D1 Free-plan allowances. Source: Cloudflare account analytics. Last successful retrieval: ${esc(formatUtcDateTime(usage.retrieved_at))}.</p></section>`;
   }
   function d1Graph(data) {
+    const usage = data.usage;
     const metricLabel = d1.metric === "rows_read" ? "Rows read" : "Rows written";
-    const values = data.accounts.flatMap(account => account.rows.map(row => row[d1.metric])).filter(value => typeof value === "number");
+    const values = usage.rows.map(row => row[d1.metric]).filter(value => typeof value === "number");
     const max = Math.max(1, ...values);
     const x = index => 74 + index * 720 / Math.max(1, data.dates.length - 1);
     const y = value => 210 - value / max * 180;
-    const series = data.accounts.map(account => {
-      let path = "", connected = false;
-      const points = data.dates.map((date, index) => {
-        const row = account.rows.find(item => item.date === date), value = row?.[d1.metric];
-        if (typeof value !== "number") { connected = false; return ""; }
-        path += `${connected ? "L" : "M"}${x(index).toFixed(2)},${y(value).toFixed(2)} `; connected = true;
-        return `<circle cx="${x(index)}" cy="${y(value)}" r="3"><title>${esc(account.account)} · ${date} UTC${row.partial ? " / partial" : ""}: ${esc(d1Number(value))}</title></circle>`;
-      }).join("");
-      return `<g class="media-d1-series media-d1-series--${account.account.toLowerCase()}"><path d="${path}"/>${points}</g>`;
+    let path = "", connected = false;
+    const points = data.dates.map((date, index) => {
+      const row = usage.rows.find(item => item.date === date), value = row?.[d1.metric];
+      if (typeof value !== "number") { connected = false; return ""; }
+      path += `${connected ? "L" : "M"}${x(index).toFixed(2)},${y(value).toFixed(2)} `; connected = true;
+      return `<circle cx="${x(index)}" cy="${y(value)}" r="3"><title>Media · ${date} UTC${row.partial ? " / partial" : ""}: ${esc(d1Number(value))}</title></circle>`;
     }).join("");
     return `<figure class="media-d1-figure"><svg viewBox="0 0 830 260" role="img" aria-labelledby="media-d1-chart-title media-d1-chart-desc">
-      <title id="media-d1-chart-title">${metricLabel} per UTC day, LIVE and TEST</title><desc id="media-d1-chart-desc">Missing days break each line. Today is partial. The daily data table below provides all values.</desc>
+      <title id="media-d1-chart-title">${metricLabel} per UTC day, current Media account</title><desc id="media-d1-chart-desc">Missing days break the line. Today is partial. The daily data table below provides all values.</desc>
       ${[0, 0.5, 1].map(ratio => `<line x1="74" x2="794" y1="${y(max * ratio)}" y2="${y(max * ratio)}" class="media-d1-grid"/><text x="66" y="${y(max * ratio) + 4}" text-anchor="end">${esc(new Intl.NumberFormat("en-GB", { notation: "compact" }).format(max * ratio))}</text>`).join("")}
-      ${series}<text x="74" y="242">${data.dates[0]}</text><text x="794" y="242" text-anchor="end">${data.today} / partial</text></svg>
-      <figcaption><span class="media-d1-legend media-d1-legend--live">━ LIVE</span> <span class="media-d1-legend media-d1-legend--test">┄ TEST</span> · ${metricLabel}. Gaps mean unknown usage.</figcaption></figure>`;
+      <g class="media-d1-series"><path d="${path}"/>${points}</g><text x="74" y="242">${data.dates[0]}</text><text x="794" y="242" text-anchor="end">${data.today} / partial</text></svg>
+      <figcaption>Media · ${metricLabel}. Gaps mean unknown usage.</figcaption></figure>`;
   }
   function d1DailyTable(data) {
-    return `<details><summary>Daily data · ${data.days} UTC days</summary><div class="media-table-wrap"><table class="media-table"><caption>Account-level D1 usage; Unknown is distinct from zero.</caption>
-      <thead><tr><th scope="col">UTC day</th><th scope="col">Account</th><th scope="col">Rows read</th><th scope="col">Rows written</th><th scope="col">Read queries</th><th scope="col">Write queries</th><th scope="col">Availability</th></tr></thead><tbody>
-      ${data.dates.slice().reverse().map(date => data.accounts.map(account => {
-        const row = account.rows.find(item => item.date === date);
-        return `<tr><th scope="row">${date}${date === data.today ? " / partial" : ""}</th><td>${esc(account.account)}</td>${["rows_read", "rows_written", "read_queries", "write_queries"].map(field => `<td>${esc(d1Number(row?.[field]))}</td>`).join("")}
-          <td>${esc(row?.status === "outside_retention" ? "Outside retention" : row?.status === "available" ? d1Status(account) : "Missing / unavailable")}</td></tr>`;
-      }).join("")).join("")}</tbody></table></div></details>`;
+    const usage = data.usage;
+    return `<details><summary>Daily data · ${data.days} UTC days</summary><div class="media-table-wrap"><table class="media-table"><caption>Current Media account’s D1 usage; Unknown is distinct from zero.</caption>
+      <thead><tr><th scope="col">UTC day</th><th scope="col">Rows read</th><th scope="col">Rows written</th><th scope="col">Read queries</th><th scope="col">Write queries</th><th scope="col">Availability</th></tr></thead><tbody>
+      ${data.dates.slice().reverse().map(date => {
+        const row = usage.rows.find(item => item.date === date);
+        return `<tr><th scope="row">${date}${date === data.today ? " / partial" : ""}</th>${["rows_read", "rows_written", "read_queries", "write_queries"].map(field => `<td>${esc(d1Number(row?.[field]))}</td>`).join("")}
+          <td>${esc(row?.status === "outside_retention" ? "Outside retention" : row?.status === "available" ? d1Status(usage) : "Missing / unavailable")}</td></tr>`;
+      }).join("")}</tbody></table></div></details>`;
   }
   function d1QuerySection(data) {
-    const key = d1QueryKey(), result = d1.queries.get(key), account = result?.accounts?.[0];
+    const key = d1QueryKey(), result = d1.queries.get(key), usage = result?.usage;
     return `<section class="media-card"><h3>Top D1 Queries</h3><p>The five most expensive query shapes in the configured Media database, ranked by rows read. Query text is replaced with safe fingerprints. Insights load only on request.</p>
-      <div class="media-toolbar"><label class="media-field"><span>Account</span><select data-d1-account>${["LIVE", "TEST"].map(label => `<option${label === d1.account ? " selected" : ""}>${label}</option>`).join("")}</select></label>
-      <button class="media-button" data-d1-queries${d1.loading.has(key) ? " disabled" : ""}>${d1.loading.has(key) ? "Loading…" : account ? "Refresh Top D1 Queries" : "Load Top D1 Queries"}</button></div>
+      <div class="media-toolbar"><button class="media-button" data-d1-queries${d1.loading.has(key) ? " disabled" : ""}>${d1.loading.has(key) ? "Loading…" : usage ? "Refresh Top D1 Queries" : "Load Top D1 Queries"}</button></div>
       <p>${esc(d1.day)} UTC${d1.day === data.today ? " · today / partial" : ""}</p>
-      ${d1.errors.has(key) ? message(d1.errors.get(key), "error") : ""}${account?.error ? message(d1Error(account.error), "error") : ""}
-      ${account ? `<p>${d1Status(account)} · Last successful retrieval: ${esc(formatUtcDateTime(account.retrieved_at))}</p>` : ""}
-      ${account && account.status !== "unavailable" ? `<div class="media-table-wrap"><table class="media-table"><thead><tr><th>Query shape</th><th>Executions</th><th>Total rows read</th><th>Average reads / execution</th><th>Rows written</th></tr></thead><tbody>
-        ${account.rows.length ? account.rows.map(row => `<tr><td><code>${esc(row.description)}</code></td>${["executions", "rows_read", "average_rows_read", "rows_written"].map(field => `<td>${esc(d1Number(row[field]))}</td>`).join("")}</tr>`).join("") : '<tr><td colspan="5">No query insights returned for this day; this does not establish zero usage.</td></tr>'}
+      ${d1.errors.has(key) ? message(d1.errors.get(key), "error") : ""}${usage?.error ? message(d1Error(usage.error), "error") : ""}
+      ${usage ? `<p>${d1Status(usage)} · Last successful retrieval: ${esc(formatUtcDateTime(usage.retrieved_at))}</p>` : ""}
+      ${usage && usage.status !== "unavailable" ? `<div class="media-table-wrap"><table class="media-table"><thead><tr><th>Query shape</th><th>Executions</th><th>Total rows read</th><th>Average reads / execution</th><th>Rows written</th></tr></thead><tbody>
+        ${usage.rows.length ? usage.rows.map(row => `<tr><td><code>${esc(row.description)}</code></td>${["executions", "rows_read", "average_rows_read", "rows_written"].map(field => `<td>${esc(d1Number(row[field]))}</td>`).join("")}</tr>`).join("") : '<tr><td colspan="5">No query insights returned for this day; this does not establish zero usage.</td></tr>'}
       </tbody></table></div>` : ""}</section>`;
   }
   function renderD1Usage() {
     if (state.tab !== "d1-usage") return;
     const key = d1DailyKey(), data = d1.daily.get(key);
     if (data && !data.dates.includes(d1.day)) d1.day = data.today;
-    setView(`<div class="media-d1"><section class="media-card"><h3>D1 Usage</h3><p>Independent LIVE and TEST Cloudflare accounts. Daily totals include all D1 databases in each account; allowances are separate.</p>
+    setView(`<div class="media-d1"><section class="media-card"><h3>D1 Usage</h3><p>Cloudflare analytics for this dashboard’s configured Media account. Daily totals include all D1 databases in that account; query insights cover its configured Media database.</p>
       <div class="media-toolbar"><label class="media-field"><span>History</span><select data-d1-days>${["7", "30", "90"].map(days => `<option value="${days}"${days === d1.days ? " selected" : ""}>Last ${days} UTC days</option>`).join("")}</select></label>
       <label class="media-field"><span>Trend metric</span><select data-d1-metric><option value="rows_read"${d1.metric === "rows_read" ? " selected" : ""}>Rows read</option><option value="rows_written"${d1.metric === "rows_written" ? " selected" : ""}>Rows written</option></select></label>
       ${data ? `<label class="media-field"><span>Summary and query UTC day</span><select data-d1-day>${data.dates.slice().reverse().map(date => `<option value="${date}"${date === d1.day ? " selected" : ""}>${date}${date === data.today ? " / partial" : ""}</option>`).join("")}</select></label>` : ""}
       <button class="media-button" data-d1-refresh${d1.loading.has(key) ? " disabled" : ""}>${d1.loading.has(key) ? "Loading…" : "Refresh"}</button></div>
       <p class="media-subtext">Cloudflare adaptive analytics can be delayed or sampled. Percentages are advisory estimates. Older days may fall outside provider retention. Server cache: about 15 minutes; manual refresh: at most once per minute.</p>
       ${d1.errors.has(key) ? message(d1.errors.get(key), "error") : ""}</section>
-      ${data ? `<div class="media-d1-summaries">${data.accounts.map(account => d1Summary(account, data)).join("")}</div><section class="media-card">${d1Graph(data)}${d1DailyTable(data)}</section>${d1QuerySection(data)}` : message(d1.loading.has(key) ? "Loading D1 analytics…" : "D1 Usage unavailable.")}</div>`);
+      ${data ? `${d1Summary(data.usage, data)}<section class="media-card">${d1Graph(data)}${d1DailyTable(data)}</section>${d1QuerySection(data)}` : message(d1.loading.has(key) ? "Loading D1 analytics…" : "D1 Usage unavailable.")}</div>`);
     state.root.querySelector("[data-d1-days]")?.addEventListener("change", event => { d1.days = event.target.value; renderD1Usage(); if (!d1.daily.has(d1DailyKey())) void loadD1Usage(false); });
     state.root.querySelector("[data-d1-metric]")?.addEventListener("change", event => { d1.metric = event.target.value; renderD1Usage(); });
     state.root.querySelector("[data-d1-day]")?.addEventListener("change", event => { d1.day = event.target.value; renderD1Usage(); });
-    state.root.querySelector("[data-d1-account]")?.addEventListener("change", event => { d1.account = event.target.value; renderD1Usage(); });
     state.root.querySelector("[data-d1-refresh]")?.addEventListener("click", () => void loadD1Usage(true));
     state.root.querySelector("[data-d1-queries]")?.addEventListener("click", () => void loadD1Usage(d1.queries.has(d1QueryKey()), true));
   }
   async function loadD1Usage(refresh, queries = false) {
     const key = queries ? d1QueryKey() : d1DailyKey();
     if (d1.loading.has(key)) return;
-    const gate = queries ? `queries:${d1.account}` : "daily";
+    const gate = queries ? "queries" : "daily";
     if (refresh && Date.now() - (d1.lastRefresh.get(gate) || 0) < 60000) {
       d1.errors.set(key, "Wait a minute before refreshing again."); renderD1Usage(); return;
     }
     if (refresh) d1.lastRefresh.set(gate, Date.now());
     d1.loading.add(key); d1.errors.delete(key); renderD1Usage();
     const params = new URLSearchParams({ days: d1.days, view: queries ? "queries" : "daily" });
-    if (queries) { params.set("account", d1.account); params.set("day", d1.day); }
+    if (queries) params.set("day", d1.day);
     if (refresh) params.set("refresh", "1");
     try {
       const response = await fetch(`/api/media/d1-usage?${params}`, { cache: "no-store", credentials: "same-origin" });
       const data = await response.json().catch(() => null);
       if (!response.ok) throw new Error(String(data?.error?.message || "D1 Usage is unavailable. Check your administrative Access session."));
-      if (!data || !Array.isArray(data.accounts) || !Array.isArray(data.dates)) throw new Error("Invalid D1 analytics response.");
+      if (!data || !data.usage || !Array.isArray(data.usage.rows) || !Array.isArray(data.dates)) throw new Error("Invalid D1 analytics response.");
       const target = queries ? d1.queries : d1.daily;
       if (target.size >= 32) target.delete(target.keys().next().value);
       target.set(key, data);
