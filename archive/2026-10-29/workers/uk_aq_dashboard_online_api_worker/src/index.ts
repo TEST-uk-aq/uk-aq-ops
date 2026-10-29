@@ -1,0 +1,96 @@
+import { errorEnvelope, optionsResponse } from "./lib/http";
+import { isCompatRoute, handleCompatRoute } from "./routes/compat";
+import {
+  handleHealthRoute,
+  handleHistoryManifestsRoute,
+  handleHistoryRunsRoute,
+  handleStatusDbRoute,
+  handleStatusFeedsRoute,
+  handleStatusHistoryRoute,
+  handleStatusSummaryRoute,
+} from "./routes/status";
+import type { WorkerEnv } from "./lib/upstream";
+import { handleStationSnapshotV2Rows, handleStationSnapshotV2Search } from "./lib/station_snapshot_v2";
+import { flushDashboardServiceEgressMetrics } from "./lib/service_egress_metrics";
+import { handleMediaRoute, isMediaRoute } from "./routes/media";
+import { handleAccountsRoute, isAccountsPath } from "./routes/accounts";
+import type { AccountsAccessContext } from "./lib/accounts_auth";
+
+type WorkerExecutionContext = AccountsAccessContext & {
+  waitUntil(promise: Promise<unknown>): void;
+};
+
+function getPathname(request: Request): string {
+  return new URL(request.url).pathname;
+}
+
+function isApiRoute(pathname: string): boolean {
+  return pathname === "/api" || pathname.startsWith("/api/");
+}
+
+export default {
+  async fetch(request: Request, env: WorkerEnv, ctx: WorkerExecutionContext): Promise<Response> {
+    try {
+      const pathname = getPathname(request);
+
+      // Private routes authenticate before OPTIONS, compatibility caches or upstream proxying.
+      if (isAccountsPath(pathname)) {
+        return await handleAccountsRoute(request, env, ctx);
+      }
+
+      if (request.method === "OPTIONS" && isApiRoute(pathname)) {
+        return optionsResponse();
+      }
+
+      if (isMediaRoute(pathname)) {
+        return handleMediaRoute(request, env, ctx);
+      }
+
+      if (pathname === "/api/health") {
+        if (request.method !== "GET") {
+          return errorEnvelope("METHOD_NOT_ALLOWED", "Only GET is supported for this route", 405);
+        }
+        return handleHealthRoute(env);
+      }
+
+      const search = new URL(request.url).searchParams;
+
+      if (pathname === "/api/status/summary") {
+        return handleStatusSummaryRoute(env, search);
+      }
+      if (pathname === "/api/status/feeds") {
+        return handleStatusFeedsRoute(env, search);
+      }
+      if (pathname === "/api/status/db") {
+        return handleStatusDbRoute(env, search);
+      }
+      if (pathname === "/api/status/history") {
+        return handleStatusHistoryRoute(env, search);
+      }
+      if (pathname === "/api/history/manifests") {
+        return handleHistoryManifestsRoute(env, search);
+      }
+      if (pathname === "/api/history/runs") {
+        return handleHistoryRunsRoute(env, search);
+      }
+      if (pathname === "/api/station-snapshot-v2/search-stations") {
+        return handleStationSnapshotV2Search(env, search);
+      }
+      if (pathname === "/api/station-snapshot-v2/rows") {
+        return handleStationSnapshotV2Rows(env, search);
+      }
+
+      if (isCompatRoute(pathname)) {
+        return handleCompatRoute(request, env, pathname);
+      }
+
+      if (isApiRoute(pathname)) {
+        return errorEnvelope("NOT_FOUND", "API route not found", 404);
+      }
+
+      return errorEnvelope("NOT_FOUND", "Not found", 404);
+    } finally {
+      ctx.waitUntil(flushDashboardServiceEgressMetrics(env));
+    }
+  },
+};

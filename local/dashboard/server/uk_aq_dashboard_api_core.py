@@ -4498,6 +4498,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def parse_request(self) -> bool:
         if not super().parse_request():
             return False
+        if urlparse(self.path).path == '/api/media/d1-usage':
+            from uk_aq_dashboard_media_d1_usage import serve_d1_usage
+            # Authenticate all methods before the optional bearer gate, Media
+            # forwarding and compatibility/MySQL caches, including localhost.
+            serve_d1_usage(self)
+            return False
         from uk_aq_dashboard_accounts import is_accounts_path, serve_accounts_request
 
         if is_accounts_path(urlparse(self.path).path):
