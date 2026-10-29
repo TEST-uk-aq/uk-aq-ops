@@ -412,13 +412,23 @@ async function fetchJsonObject(
 
 // Reuse the IngestDB PostgREST connection, never the ObsAQIDB Daily Tasks adapter.
 // The RPC owns validation/projection/grants; its body is not a URL or telemetry label.
-export async function readAccountsSubscriptions(env: WorkerEnv, query: Record<string, unknown>): Promise<JsonObject> {
+export function readAccountsSubscriptions(env: WorkerEnv, query: Record<string, unknown>): Promise<JsonObject> {
+  return accountsSubscriptionRpc(env, 'uk_aq_news_subscriptions_admin_read', { p_query: query });
+}
+
+export function writeAccountsSubscription(env: WorkerEnv, request: Record<string, unknown>): Promise<JsonObject> {
+  return accountsSubscriptionRpc(env, 'uk_aq_news_subscriptions_admin_write', { p_request: request });
+}
+
+async function accountsSubscriptionRpc(env: WorkerEnv,
+  name: 'uk_aq_news_subscriptions_admin_read' | 'uk_aq_news_subscriptions_admin_write',
+  body: Record<string, unknown>): Promise<JsonObject> {
   const request = await accountsReadStage('SUPABASE_REQUEST_CONSTRUCTION', () => {
     const headers = postgrestHeaders(requireServiceKey(env), defaultPublicSchema(env), true);
     headers.set('Content-Type', 'application/json');
     headers.set('Accept', 'application/json');
-    return new Request(`${ingestRestBase(env)}/rpc/uk_aq_news_subscriptions_admin_read`, {
-      method: 'POST', headers, body: JSON.stringify({ p_query: query }), cache: 'no-store',
+    return new Request(`${ingestRestBase(env)}/rpc/${name}`, {
+      method: 'POST', headers, body: JSON.stringify(body), cache: 'no-store',
       // Workers supports manual/follow, not redirect: 'error'. Never follow a redirect with credentials.
       redirect: 'manual', signal: AbortSignal.timeout(15000),
     });

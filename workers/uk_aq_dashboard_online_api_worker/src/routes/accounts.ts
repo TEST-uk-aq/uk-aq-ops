@@ -1,18 +1,18 @@
 import { AccountsSourceError, accountsReadStage, logAccountsFailure, readAccountsJson } from '../lib/accounts_diagnostics';
 import { AccountsError, authorizeAccountsRequest } from '../lib/accounts_auth';
 import type { AccountsAccessContext } from '../lib/accounts_auth';
-import { readAccountsSubscriptions } from '../lib/direct';
+import { readAccountsSubscriptions, writeAccountsSubscription } from '../lib/direct';
 import type { WorkerEnv } from '../lib/upstream';
 
 type Json = Record<string, unknown>;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SUBSCRIPTION_FIELDS = ['id', 'email', 'status', 'delivery_mode', 'daily_time_local', 'timezone',
-  'confirmed_at', 'created_at', 'updated_at', 'unsubscribed_at', 'suppressed_at', 'consent_text_version',
+  'confirmed_at', 'created_at', 'updated_at', 'unsubscribed_at', 'blocked_at', 'block_reason', 'consent_text_version',
   'mode_since_at', 'confirmation_last_sent_at', 'confirmed'] as const;
 const DELIVERY_FIELDS = ['id', 'subscription_id', 'delivery_mode', 'state', 'created_at', 'sent_at',
   'failed_at', 'attempt_count', 'selected_transport', 'attempt_transport', 'retry_hold', 'error_class'] as const;
 const OUTBOX_FIELDS = ['id', 'work_type', 'state', 'created_at', 'queued_at', 'attempt_count', 'error_class'] as const;
-const STATUSES = ['pending', 'active', 'unsubscribed', 'suppressed'];
+const STATUSES = ['pending', 'active', 'unsubscribed', 'blocked'];
 const MODES = ['confirmation', 'immediate', 'daily'];
 const STATES = ['pending', 'sending', 'accepted', 'temporary_failure', 'permanent_failure', 'unknown', 'cancelled'];
 const TRANSPORTS = [null, 'cloudflare_xoauth2', 'pro_app_password'];
@@ -23,7 +23,7 @@ function reply(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: {
     'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
-    ...(status === 405 ? { Allow: 'GET' } : {}),
+    ...(status === 405 ? { Allow: 'GET, POST' } : {}),
   } });
 }
 
@@ -46,7 +46,9 @@ function project(value: unknown, fields: readonly string[]): Json {
     const item = row[field] ?? null;
     if (item !== null && typeof item !== 'string' && typeof item !== 'boolean' &&
         !(typeof item === 'number' && Number.isSafeInteger(item))) throw new Error('Invalid read field');
-    if (typeof item === 'string' && (item.length > 512 || /[\x00-\x1f\x7f]/.test(item))) throw new Error('Invalid read field');
+    // Legacy block reasons may contain line breaks; JSON and the escaped UI keep them text.
+    if (typeof item === 'string' && (item.length > 512 ||
+        (field !== 'block_reason' && /[\x00-\x1f\x7f]/.test(item)))) throw new Error('Invalid read field');
     return [field, item];
   }));
 }
@@ -108,7 +110,7 @@ function rows(value: unknown, limit: number, fields: readonly string[]): Json[] 
   return value.map(item => project(item, fields));
 }
 
-async function subscriptions(url: URL, env: WorkerEnv): Promise<Response> {
+function assertSubscriptionSource(env: WorkerEnv): void {
   try {
     const base = new URL(String(env.SUPABASE_URL || '').trim());
     const schema = String(env.UK_AQ_PUBLIC_SCHEMA || 'uk_aq_public').trim();
@@ -120,6 +122,10 @@ async function subscriptions(url: URL, env: WorkerEnv): Promise<Response> {
     logAccountsFailure('SUPABASE_CONFIGURATION');
     throw new AccountsError('ACCOUNTS_SOURCE_NOT_CONFIGURED', 'Accounts IngestDB environment configuration is missing or invalid', 503);
   }
+}
+
+async function subscriptions(url: URL, env: WorkerEnv): Promise<Response> {
+  assertSubscriptionSource(env);
   const query = url.searchParams;
   const detail = /^\/api\/accounts\/subscriptions\/([^/]+)$/.exec(url.pathname);
   if (detail) {
@@ -138,14 +144,14 @@ async function subscriptions(url: URL, env: WorkerEnv): Promise<Response> {
   if (search.length > 254 || /[\x00-\x1f\x7f]/.test(search)) badQuery();
   const paging = page(query);
   const result = object(await readAccountsSubscriptions(env, { ...paging, search,
-    status: choice(query, 'status', '', ['', 'pending', 'active', 'unsubscribed', 'suppressed']),
+    status: choice(query, 'status', '', ['', 'pending', 'active', 'unsubscribed', 'blocked']),
     delivery_mode: choice(query, 'delivery_mode', '', ['', 'immediate', 'daily']),
     sort: choice(query, 'sort', 'created_at', ['email', 'created_at', 'updated_at', 'status']),
     direction: choice(query, 'direction', 'desc', ['asc', 'desc']),
   }));
   const sourceCounts = object(result.counts);
   const counts: Json = {};
-  for (const status of ['pending', 'active', 'unsubscribed', 'suppressed']) {
+  for (const status of ['pending', 'active', 'unsubscribed', 'blocked']) {
     const count = sourceCounts[status];
     if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0) throw new Error('Invalid counts');
     counts[status] = count;
@@ -214,12 +220,65 @@ async function delivery(url: URL, env: WorkerEnv): Promise<Response> {
     summary, deliveries, outbox, pagination: pagination(result.pagination, paging) });
 }
 
+
+async function mutateSubscription(request: Request, url: URL, env: WorkerEnv): Promise<Response> {
+  const route = /^\/api\/accounts\/subscriptions\/([^/]+)\/actions$/.exec(url.pathname);
+  if (!route) throw new AccountsError('NOT_FOUND', 'Accounts API route not found', 404);
+  if (!UUID.test(route[1]) || url.search) badQuery();
+  // A custom header + JSON prohibits simple cross-origin form requests; no CORS preflight is allowed.
+  if (request.headers.get('X-UKAQ-Accounts-Action') !== '1' ||
+      request.headers.get('Origin') !== url.origin ||
+      ![null, 'same-origin'].includes(request.headers.get('Sec-Fetch-Site'))) {
+    throw new AccountsError('FORBIDDEN', 'Same-origin administrative action required', 403);
+  }
+  if (request.headers.get('Content-Type')?.split(';')[0]?.trim().toLowerCase() !== 'application/json') badQuery();
+  if (Number(request.headers.get('Content-Length')) > 4096 || !request.body) badQuery();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = []; let size = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read(); if (done) break;
+      size += value.byteLength;
+      if (size > 4096) { await reader.cancel(); badQuery(); }
+      chunks.push(value);
+    }
+  } finally { reader.releaseLock(); }
+  const bytes = new Uint8Array(size); let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  let body: Json;
+  try { body = object(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes))); }
+  catch { badQuery(); }
+  const action = body.action;
+  if (typeof action !== 'string' || !['edit','block','unblock','unsubscribe','delete'].includes(action) ||
+      body.confirmed !== true || typeof body.expected_updated_at !== 'string' ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/.test(body.expected_updated_at) ||
+      !Number.isFinite(Date.parse(body.expected_updated_at))) badQuery();
+  const allowed = ['action','confirmed','expected_updated_at',
+    ...(action === 'edit' ? ['delivery_mode','daily_time_local'] : action === 'block' ? ['reason'] : [])];
+  if (Object.keys(body).some(key => !allowed.includes(key))) badQuery();
+  if (action === 'edit' && (!['immediate','daily'].includes(String(body.delivery_mode)) ||
+      typeof body.daily_time_local !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(body.daily_time_local))) badQuery();
+  if (action === 'block' && (typeof body.reason !== 'string' || !body.reason.trim() ||
+      body.reason.length > 200 || /[\x00-\x1f\x7f]/.test(body.reason))) badQuery();
+  assertSubscriptionSource(env);
+  const id = route[1].toLowerCase();
+  const result = object(await writeAccountsSubscription(env, { ...body, subscription_id: id }));
+  if (result.ok === false && result.code === 'NOT_FOUND') return reply({ error: {
+    code: 'NOT_FOUND', message: 'Subscription no longer exists' } }, 404);
+  if (result.ok === false && result.code === 'CONFLICT') return reply({ error: {
+    code: 'CONFLICT', message: 'Subscription changed or action is unavailable; refresh detail' } }, 409);
+  if (result.ok !== true || result.subscription_id !== id ||
+      (action === 'delete' && result.deleted !== true)) throw new Error('Invalid action receipt');
+  return reply({ ok: true, subscription_id: id, ...(action === 'delete' ? { deleted: true } : {}) });
+}
+
 export async function handleAccountsRoute(request: Request, env: WorkerEnv, ctx: AccountsAccessContext): Promise<Response> {
   try {
     await authorizeAccountsRequest(ctx);
-    if (request.method !== 'GET') throw new AccountsError('METHOD_NOT_ALLOWED', 'Accounts API supports GET only', 405);
     const url = new URL(request.url);
     validateRequestQuery(url);
+    if (request.method === 'POST') return await mutateSubscription(request, url, env);
+    if (request.method !== 'GET') throw new AccountsError('METHOD_NOT_ALLOWED', 'Unsupported Accounts method', 405);
     if (request.body) badQuery();
     if (url.pathname === '/api/accounts/email-delivery') {
       return await delivery(url, env).catch(error => {
