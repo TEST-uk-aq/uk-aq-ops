@@ -282,13 +282,41 @@ Memory includes one decoded file, the month's rows, a binding range and JSON/gzi
 buffers; the proposed Node heap cap adds a process guard. Use smaller explicit
 series batches when needed. Limits are protective, not measured throughput claims.
 
-Dropbox subprocesses have a 45-second deadline, bounded by the invocation's
-remaining time, 15-second connect/30-second idle limits and one rclone attempt/
-low-level retry setting. Progress prints every 15 seconds while the event loop
-can run. Network bytes include context and metadata rechecks. Read commands are
-counted; exact Dropbox API requests are `null` because rclone may perform extra
-metadata/auth requests. CPU metrics cover Node, excluding child-rclone CPU;
-decode time includes row validation/binding work.
+Each Dropbox subprocess has a 45-second deadline, bounded by the invocation's
+remaining time, 15-second connect/30-second idle limits and unchanged
+`--retries 1 --low-level-retries 1`. A read of the same admitted key may use at
+most three sequential subprocess attempts, with 1-second then 3-second backoff
+plus 0–200 ms jitter. Recognised network, timeout, rate-limit and server failures,
+and otherwise unclassified nonzero exits, may retry. Known missing/path,
+authentication/permission, configuration/start, interruption, integrity and
+resource-limit failures stop. Exit codes 2 (syntax/usage), 6 (NoRetry) and 9 (no
+files transferred) stop regardless of transient-looking stderr. Exit code 1
+retains bounded retries unless a permanent-error diagnostic applies.
+Successful transfer bytes still have to pass every existing source-identity,
+stability and data-validation gate; those failures never
+enter the transport retry loop. Failed-attempt buffers are discarded.
+
+Every subprocess attempt counts against the read-command budget. All stdout
+bytes, including failed-attempt bytes, count against source and Parquet/metadata
+byte totals. Attempt time and backoff count in read wall time and the invocation
+deadline; budgets are rechecked before sleeping and before each attempt. Dropbox
+reads/retries remain outside the brief currentness locks, with no source fallback.
+Progress prints every 15 seconds while the event loop can run. Exact Dropbox API
+requests remain `null` because rclone may perform extra metadata/auth requests.
+CPU metrics cover Node, excluding child-rclone CPU; decode time includes row
+validation/binding work.
+
+`report.metrics.transport_retry_attempts` counts additional attempts beyond the
+first. `transport_retry_objects_recovered` counts distinct keys with a successful
+transfer after retry, and `transport_retry_objects_exhausted` counts distinct keys
+whose third attempt failed. First-attempt successes do not
+increment either object counter. Recovery describes transport only, never source
+validation or candidate eligibility. A budget stop, or a permanent failure before
+the third attempt, is not retry exhaustion. `transport_failure_counts` records
+failed attempts by fixed sanitised category. Errors retain only category,
+attempt count and the safe relative source
+key. Stderr is scanned internally in windows of at most 8 KiB and never logged,
+persisted or attached to reported errors.
 
 Daily AQI batches reuse the existing `calculateMonthAqi()`,
 `buildCalculatedHistory()` and `lib/aqi/aqi_levels.mjs`. Algorithm identity is
