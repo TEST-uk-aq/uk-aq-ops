@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uk_aq_dashboard_r2_billing as r2_billing
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -666,6 +667,7 @@ def read_service_egress(role: str = "writer", lookback_hours: int = 24) -> List[
 def store_r2_usage(usage: Optional[Dict[str, Any]]) -> None:
     if not isinstance(usage, dict):
         return
+    usage = r2_billing.guard_usage(usage)
     now = _utcnow()
     bucket = now.replace(minute=0, second=0, microsecond=0)
     source_generated = _parse_ts(usage.get("as_of_utc"))
@@ -695,7 +697,7 @@ def read_latest_r2_usage(role: str = "writer") -> Optional[Dict[str, Any]]:
         with connection.cursor() as cursor:
             cursor.execute("SELECT payload FROM r2_usage_hourly ORDER BY bucket_hour DESC LIMIT 1")
             row = cursor.fetchone()
-    return _decode_json((row or {}).get("payload")) if row else None
+    return r2_billing.guard_usage(_decode_json((row or {}).get("payload"))) if row else None
 
 
 def read_r2_usage_history(role: str = "reader", lookback_days: int = 30) -> List[Dict[str, Any]]:
@@ -705,11 +707,20 @@ def read_r2_usage_history(role: str = "reader", lookback_days: int = 30) -> List
         with connection.cursor() as cursor:
             cursor.execute("SELECT * FROM r2_usage_hourly WHERE bucket_hour >= %s ORDER BY bucket_hour ASC", (since,))
             rows = cursor.fetchall() or []
-    return [{
-        "bucket_hour": _iso(row.get("bucket_hour")), "standard_used_bytes": row.get("standard_used_bytes"),
-        "standard_objects": row.get("standard_objects"), "class_a_used_requests": row.get("class_a_used_requests"),
-        "class_b_used_requests": row.get("class_b_used_requests"), "source_generated_at": _iso(row.get("source_generated_at")),
-    } for row in rows]
+    result = []
+    for row in rows:
+        payload = _decode_json(row.get("payload")) or {}
+        # Cumulative snapshots, not additive hourly usage. Legacy periods remain unknown.
+        result.append({
+            "bucket_hour": _iso(row.get("bucket_hour")), "standard_used_bytes": row.get("standard_used_bytes"),
+            "standard_objects": row.get("standard_objects"), "class_a_used_requests": row.get("class_a_used_requests"),
+            "class_b_used_requests": row.get("class_b_used_requests"), "source_generated_at": _iso(row.get("source_generated_at")),
+            **{key: payload.get(key) for key in (
+                "billing_period_start_utc", "billing_period_end_utc", "billing_period_source",
+                "class_ops_window_start_utc", "class_ops_window_end_utc",
+            )},
+        })
+    return result
 
 
 def sync_ingest_runs(core, *, base_url: str, service_role_key: str) -> Dict[str, Any]:

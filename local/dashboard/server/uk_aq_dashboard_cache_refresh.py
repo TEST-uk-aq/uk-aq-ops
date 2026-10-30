@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timezone, timedelta
 import uk_aq_dashboard_cache as cache
 import uk_aq_dashboard_rolling_cache as rolling
+import uk_aq_dashboard_r2_billing as r2_billing
 from uk_aq_dashboard_direct_r2_patch import install
 from uk_aq_dashboard_history_generation import resolve_history_generation
 
@@ -88,6 +89,13 @@ def main():
             expires = cache.utcnow() + timedelta(seconds=cache.PRODUCT_SECONDS[product])
             if product == "storage_coverage":
                 expires = core._next_storage_coverage_refresh(datetime.now(timezone.utc)).replace(tzinfo=None)
+            if product in {"r2_metrics", "metric_context"}:
+                payload["r2_usage"] = r2_billing.guard_usage(payload.get("r2_usage"))
+                period_end = r2_billing.timestamp((payload.get("r2_usage") or {}).get("billing_period_end_utc"))
+                if period_end and period_end > datetime.now(timezone.utc):
+                    expires = min(expires, period_end.replace(tzinfo=None))
+                if product == "r2_metrics" and r2_billing.configuration_valid() and r2_billing.operations_error(payload.get("r2_usage")):
+                    expires = min(expires, cache.utcnow() + timedelta(seconds=60))
             payload["r2_history_read_version"] = resolution
             if product == "r2_metrics":
                 try:
@@ -134,6 +142,13 @@ def main():
                         next_due[name] = 0
                         pending_refresh.discard(name)
                     del active[name]; completed.add(name)
+                    if name == "r2_metrics" and success:
+                        # Metric context must consume the newly collected snapshot,
+                        # including when an older context build was already in flight.
+                        if "metric_context" in active:
+                            pending_refresh.add("metric_context")
+                        else:
+                            next_due["metric_context"] = 0
             for name in next_due:
                 marker = directory / f"refresh-{name}"
                 stamp = marker.stat().st_mtime_ns if marker.exists() else 0

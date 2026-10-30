@@ -2107,6 +2107,9 @@
       let storageCoverageMode = "month";
       let r2ConnectorCountsMode = "stacked";
       let latestDashboardData = null;
+      let r2MetricsRequestInFlight = false;
+      let r2RefreshPollTimer = null;
+      let r2PeriodTimer = null;
       let latestR2ConnectorCounts = null;
       let latestR2HistoryReadVersion = { label: "R2_?", warning: "R2 history read version has not been reported by the dashboard API yet.", valid: false };
       let dashboardLoadSequence = 0;
@@ -3039,6 +3042,8 @@
         startRefreshTimer();
         if (activeMode === "operations") {
           startOperationsDropboxPolling();
+          checkR2BillingRollover();
+          if (latestDashboardData?.r2_refresh_pending) void refreshR2MetricsOnly({ forceRefresh: false });
         }
         if (wasInactive) {
           if (activeMode === "ingest") {
@@ -3716,19 +3721,57 @@
         });
       }
 
-      async function refreshR2MetricsOnly() {
+      function replaceR2MetricsPanel() {
+        if (!latestDashboardData || activeMode !== "operations") return;
+        const data = latestDashboardData;
+        const panel = renderDbSizePanel(
+          data.db_size_metrics, data.db_size_metrics_error, data.schema_size_metrics,
+          data.schema_size_metrics_error, data.r2_domain_size_metrics, data.r2_domain_size_metrics_error,
+          data.r2_usage, data.r2_usage_error, data.r2_backup_window, data.r2_backup_window_error,
+        );
+        const container = getModeContainer("operations");
+        const previous = container?.querySelector('[data-panel="db-size"]');
+        if (previous) previous.replaceWith(panel);
+        else if (container) container.appendChild(panel);
+      }
+
+      function scheduleR2BillingRollover() {
+        clearTimeout(r2PeriodTimer);
+        const end = Date.parse(latestDashboardData?.r2_usage?.billing_period_end_utc || "");
+        if (activeMode !== "operations" || !Number.isFinite(end)) return;
+        const wait = end > Date.now() ? end - Date.now() + 10 : 60_000;
+        r2PeriodTimer = setTimeout(checkR2BillingRollover, Math.min(wait, 2147483647));
+      }
+
+      function checkR2BillingRollover() {
+        const end = Date.parse(latestDashboardData?.r2_usage?.billing_period_end_utc || "");
+        if (activeMode === "operations" && Number.isFinite(end) && Date.now() >= end) {
+          // Re-render first: a failed request must never leave old-period bars visible.
+          replaceR2MetricsPanel();
+          if (isPageActive()) void refreshR2MetricsOnly({ forceRefresh: false });
+        }
+        scheduleR2BillingRollover();
+      }
+
+      async function refreshR2MetricsOnly({ forceRefresh = true, pollDeadline = Date.now() + 120_000 } = {}) {
         if (activeMode !== "operations") {
           return;
         }
         if (!latestDashboardData) {
           return;
         }
+        if (r2MetricsRequestInFlight) return;
+        r2MetricsRequestInFlight = true;
+        clearTimeout(r2RefreshPollTimer);
+        const loadId = operationsLoadSequence;
         setError("");
         setStatus("Refreshing R2 metrics...");
         try {
           const params = new URLSearchParams();
-          params.set("force", "1");
-          params.set("t", String(Date.now()));
+          if (forceRefresh) {
+            params.set("force", "1");
+            params.set("t", String(Date.now()));
+          }
           const resp = await fetch(buildApiUrl("r2_metrics", params));
           const text = await resp.text();
           let payload = null;
@@ -3741,36 +3784,33 @@
             const message = buildResponseErrorMessage(resp, payload, text);
             throw new Error(message);
           }
+          if (activeMode !== "operations" || loadId !== operationsLoadSequence) return;
           latestDashboardData.r2_usage = payload ? payload.r2_usage : null;
           latestDashboardData.r2_usage_error = payload ? payload.r2_usage_error : null;
           latestDashboardData.r2_backup_window = payload ? payload.r2_backup_window : null;
           latestDashboardData.r2_backup_window_error = payload ? payload.r2_backup_window_error : null;
-          const nextPanel = renderDbSizePanel(
-            latestDashboardData.db_size_metrics,
-            latestDashboardData.db_size_metrics_error,
-            latestDashboardData.schema_size_metrics,
-            latestDashboardData.schema_size_metrics_error,
-            latestDashboardData.r2_domain_size_metrics,
-            latestDashboardData.r2_domain_size_metrics_error,
-            latestDashboardData.r2_usage,
-            latestDashboardData.r2_usage_error,
-            latestDashboardData.r2_backup_window,
-            latestDashboardData.r2_backup_window_error,
-          );
-          const operationsContainer = getModeContainer("operations");
-          const currentPanel = operationsContainer
-            ? operationsContainer.querySelector('[data-panel="db-size"]')
-            : null;
-          if (currentPanel) {
-            currentPanel.replaceWith(nextPanel);
-          } else if (operationsContainer) {
-            operationsContainer.appendChild(nextPanel);
+          latestDashboardData.r2_refresh_pending = Boolean(payload?.r2_refresh_pending);
+          latestDashboardData.r2_refresh_error = payload?.r2_refresh_error || null;
+          replaceR2MetricsPanel();
+          scheduleR2BillingRollover();
+          if (payload?.r2_refresh_error) {
+            setStatus("R2 collection failed; showing the previous snapshot with its original timestamp.");
+          } else if (payload?.r2_refresh_pending && !payload?.r2_usage_error) {
+            setStatus("R2 refresh pending; showing the previous storage snapshot and any valid current-period operations.");
+            if (Date.now() < pollDeadline) {
+              r2RefreshPollTimer = setTimeout(() => {
+                if (isPageActive()) void refreshR2MetricsOnly({ forceRefresh: false, pollDeadline });
+              }, 2000);
+            }
+          } else {
+            const sourceTime = payload?.r2_usage?.as_of_utc;
+            setStatus(payload?.r2_usage_error ? "R2 metrics refresh unavailable" : `R2 metrics collected ${formatDateTimeLocalWithTimezone(sourceTime)}`);
           }
-          const generatedAt = (payload && payload.generated_at) || new Date().toISOString();
-          setStatus(`R2 metrics refreshed ${formatDateTimeLocalWithTimezone(generatedAt)}`);
         } catch (err) {
           setError(err.message || String(err));
           setStatus("Error");
+        } finally {
+          r2MetricsRequestInFlight = false;
         }
       }
 
@@ -4139,7 +4179,19 @@
           backupWindowYears = backupWindowDays / 365.25;
         }
         const backupWindowLabel = `CLOUDFLARE R2 HISTORY WINDOW - ${backupWindowMin} -> ${backupWindowMax} - ${backupWindowDays !== null ? backupWindowDays : "n/a"} Days - ${backupWindowYears !== null ? backupWindowYears.toFixed(1) : "n/a"} Years`;
-        const r2LimitsResetLabel = "Limits are per calendar month";
+        const periodStart = Date.parse(r2UsageObject?.billing_period_start_utc || "");
+        const periodEnd = Date.parse(r2UsageObject?.billing_period_end_utc || "");
+        const queryStart = Date.parse(r2UsageObject?.class_ops_window_start_utc || "");
+        const queryCutoff = Date.parse(r2UsageObject?.class_ops_window_end_utc || "");
+        const periodCurrent = r2UsageObject?.billing_period_source === "cloudflare_r2_subscription_v1"
+          && Number.isFinite(periodStart) && periodStart <= Date.now() && Date.now() < periodEnd;
+        const operationsCurrent = periodCurrent && queryStart === periodStart
+          && queryCutoff >= periodStart && queryCutoff <= Date.now();
+        const utcText = value => new Date(value).toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
+        const r2BillingLabel = periodCurrent
+          ? `Operations billing period: ${utcText(periodStart)} → ${utcText(periodEnd)} (end exclusive)`
+          : "Operations billing period unavailable; authoritative Cloudflare subscription metadata is required.";
+        const r2OperationsError = r2UsageObject?.class_ops_error || (operationsCurrent ? "" : "Billing period expired, missing or invalid; refresh required");
         const r2Rows = [];
         let r2LastUpdate = "n/a";
         const addUsageRow = (title, summaryText, percentValue, subText, subRightText) => {
@@ -4201,30 +4253,29 @@
           const classAUsed = asNumber(r2UsageObject.class_a_used_requests);
           const classAFree = asNumber(r2UsageObject.class_a_free_tier_requests);
           const classAPercent = asNumber(r2UsageObject.class_a_percent_of_free_tier);
-          if (classAUsed !== null && classAFree !== null && classAPercent !== null) {
+          if (operationsCurrent && classAUsed !== null && classAFree !== null && classAPercent !== null) {
             addUsageRow(
               "R2 Class A free tier",
               `${formatCount(classAUsed)} / ${formatCount(classAFree)} (${Math.round(classAPercent)}%)`,
               classAPercent,
-              "Write/list-multipart operations",
+              "Write/list-multipart operations · billing period to date (analytics)",
             );
           } else {
-            addUnavailableRow("R2 Class A free tier", r2UsageObject.class_ops_error);
+            addUnavailableRow("R2 Class A free tier", r2OperationsError);
           }
 
           const classBUsed = asNumber(r2UsageObject.class_b_used_requests);
           const classBFree = asNumber(r2UsageObject.class_b_free_tier_requests);
           const classBPercent = asNumber(r2UsageObject.class_b_percent_of_free_tier);
-          if (classBUsed !== null && classBFree !== null && classBPercent !== null) {
+          if (operationsCurrent && classBUsed !== null && classBFree !== null && classBPercent !== null) {
             addUsageRow(
               "R2 Class B free tier",
               `${formatCount(classBUsed)} / ${formatCount(classBFree)} (${Math.round(classBPercent)}%)`,
               classBPercent,
-              "Read operations",
-              r2LimitsResetLabel,
+              "Read operations · billing period to date (analytics)",
             );
           } else {
-            addUnavailableRow("R2 Class B free tier", r2UsageObject.class_ops_error);
+            addUnavailableRow("R2 Class B free tier", r2OperationsError);
           }
         } else {
           addUnavailableRow("R2 usage", r2Error);
@@ -4233,7 +4284,11 @@
           <div class="r2-usage-wrap">
             <div class="r2-window-heading">${escapeHtml(backupWindowLabel)}</div>
             ${r2Rows.join("")}
+            <div class="r2-usage-sub">${escapeHtml(r2BillingLabel)}</div>
+            ${operationsCurrent ? `<div class="r2-usage-sub">Operations queried through: ${escapeHtml(utcText(queryCutoff))}. Analytics may lag.</div>` : ""}
             <div class="r2-usage-meta">
+              ${latestDashboardData?.r2_refresh_pending ? '<div class="r2-usage-sub">R2 refresh pending.</div>' : ""}
+              ${latestDashboardData?.r2_refresh_error ? '<div class="r2-usage-sub">Last R2 collection failed; previous storage snapshot retained.</div>' : ""}
               <div class="r2-usage-sub">R2 Metrics updated every hour. Last update: ${escapeHtml(r2LastUpdate)}</div>
               ${r2BackupWindowError ? `<div class="r2-usage-sub">Backup window source warning: ${escapeHtml(r2BackupWindowError)}</div>` : ""}
               <button class="settings-button r2-refresh-button" id="refresh-r2-metrics" type="button">Refresh R2 metrics</button>
@@ -6694,6 +6749,13 @@
             ),
           ];
           operationsContainer.replaceChildren(...nextPanels);
+          scheduleR2BillingRollover();
+          if (data.r2_refresh_pending) {
+            clearTimeout(r2RefreshPollTimer);
+            r2RefreshPollTimer = setTimeout(() => {
+              if (isPageActive()) void refreshR2MetricsOnly({ forceRefresh: false });
+            }, 2000);
+          }
           await refreshOperationsDropboxPanel();
           await loadDailyTaskRunsCard({ force: forceRefresh, parentLoadId: loadId });
           if (loadId !== operationsLoadSequence || activeMode !== "operations") {

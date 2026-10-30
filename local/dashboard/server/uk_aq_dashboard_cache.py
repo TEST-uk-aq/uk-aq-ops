@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import parse_qs
+import uk_aq_dashboard_r2_billing as r2_billing
 
 PRODUCT_SECONDS = {"dashboard": 300, "metric_context": 300, "storage_coverage": 21600,
                    "r2_metrics": 3600, "daily_task_runs": 300}
@@ -81,13 +82,16 @@ def request_dir():
     return Path.home() / "Library/Caches/uk-aq" / f"dashboard-{environment}"
 
 
-def request_refresh(product="dashboard"):
+def request_refresh(product="dashboard", minimum_age=0):
     try:
         if _WRITER or not enabled(): return
         if product not in PRODUCT_SECONDS: return
         directory = request_dir()
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        (directory / f"refresh-{product}").touch(mode=0o600)
+        marker = directory / f"refresh-{product}"
+        if minimum_age and marker.exists() and time.time() - marker.stat().st_mtime < minimum_age:
+            return
+        marker.touch(mode=0o600)
     except (OSError, CacheConfigurationError):
         pass
 
@@ -127,6 +131,19 @@ def read_product(product, version, role="reader"):
     if version != "none" and payload.get("r2_history_read_version", {}).get("version") != version:
         raise RuntimeError("Cached product descriptor does not match row generation")
     stale = row["expires_at"] <= utcnow() or bool(row["last_error_code"])
+    if product in {"r2_metrics", "metric_context"} and isinstance(payload.get("r2_usage"), dict):
+        usage = payload["r2_usage"]
+        if r2_billing.operations_error(usage):
+            stale = True
+            # Do not keep moving the acceptance time while a slow collection is
+            # already pending. Invalid static configuration requires correction.
+            if not _WRITER and r2_billing.configuration_valid():
+                marker = request_dir() / "refresh-r2_metrics"
+                source_time = r2_billing.timestamp(usage.get("as_of_utc"))
+                pending = marker.exists() and (source_time is None or source_time.timestamp() < marker.stat().st_mtime)
+                if not pending:
+                    request_refresh("r2_metrics", minimum_age=60)
+        payload["r2_usage"] = r2_billing.guard_usage(usage)
     meta = {"source": "local_mysql", "state": "stale" if stale else "fresh", "history_version": version,
             "source_generated_at": iso(row["source_generated_at"]), "refreshed_at": iso(row["refreshed_at"]),
             "expires_at": iso(row["expires_at"]), "last_error_code": row["last_error_code"]}
@@ -274,7 +291,7 @@ def _build_local_metric_context(core):
     version = core._resolve_r2_history_read_version()["version"]
     r2_row = read_product("r2_metrics", version, role="writer")
     r2_payload = r2_row[0] if r2_row else {}
-    r2_usage = rolling.read_latest_r2_usage(role="writer") or r2_payload.get("r2_usage")
+    r2_usage = r2_billing.guard_usage(rolling.read_latest_r2_usage(role="writer") or r2_payload.get("r2_usage"))
     payload = {
         "db_size_metrics": rolling.read_db_size_metrics(role="writer", lookback_days=30),
         "schema_size_metrics": rolling.read_schema_size_metrics(role="writer", lookback_days=30),
@@ -313,7 +330,8 @@ def build_product(core, product, base_url, service_role_key):
             result.get("upstream_refresh_errors", {}).pop("r2_domain_size_metrics_error", None)
         return result
     if product == "r2_metrics":
-        usage, usage_error = core._get_r2_usage_cached()
+        # A scheduled or manually signalled writer collection must reach Cloudflare.
+        usage, usage_error = core._get_r2_usage_cached(force_refresh=_WRITER)
         _, window, bucket, error = core._get_r2_history_days_cached(base_url=base_url, service_role_key=service_role_key)
         return {"r2_usage": usage, "r2_usage_error": usage_error, "r2_backup_window": window,
                 "r2_backup_window_error": error, "r2_history_days_bucket": bucket, "r2_history_days_error": error,
@@ -410,6 +428,8 @@ def serve_cached_request(handler, parsed):
     force_requested = flag("force", "0")
     if force_requested and parsed.path != "/api/storage_coverage":
         for product in products: request_refresh(product)
+        if "metric_context" in products:
+            request_refresh("r2_metrics")
     refresh_request_id = (query.get("refresh_request_id") or [None])[0]
     if parsed.path == "/api/storage_coverage" and refresh_request_id:
         try:
@@ -456,6 +476,14 @@ def serve_cached_request(handler, parsed):
             payload["r2_domain_size_metrics_warning"] = "Historical domain byte metrics have no generation identity; unavailable for v3. Account usage remains account-wide."
         if parsed.path == "/api/dashboard" and not flag("include_ingest_context"):
             payload["pollutants"] = []; payload["connectors_settings"] = []
+        if "r2_usage" in payload:
+            payload["r2_usage"] = r2_billing.guard_usage(payload["r2_usage"])
+            marker = request_dir() / "refresh-r2_metrics"
+            source_time = r2_billing.timestamp((payload.get("r2_usage") or {}).get("as_of_utc"))
+            payload["r2_refresh_pending"] = marker.exists() and (
+                source_time is None or source_time.timestamp() < marker.stat().st_mtime
+            )
+            payload["r2_refresh_error"] = (metadata.get("r2_metrics") or {}).get("last_error_code")
         payload["local_cache"] = metadata
         handler._send_cache_json(payload)
     except Exception:

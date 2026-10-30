@@ -1,0 +1,2543 @@
+import { assertHistoryPayload, historyResolution, type HistoryResolution } from "./history_generation";
+import { buildJsonResponse, errorEnvelope } from "./http";
+import type { WorkerEnv } from "./upstream";
+import { recordDashboardSupabaseResponse } from "./service_egress_metrics";
+
+type JsonObject = Record<string, unknown>;
+
+type DashboardPayload = {
+  project_ref: string | null;
+  obs_aqidb_project_ref: string | null;
+  generated_at: string;
+  dispatch_cursor: string | null;
+  buckets: string[];
+  db_size_metrics: unknown[];
+  schema_size_metrics: unknown[];
+  r2_domain_size_metrics: unknown[];
+  db_size_metrics_error: string | null;
+  schema_size_metrics_error: string | null;
+  r2_domain_size_metrics_error: string | null;
+  r2_usage: JsonObject | null;
+  r2_usage_error: string | null;
+  service_egress_metrics: unknown[];
+  service_egress_metrics_error: string | null;
+  r2_backup_window: JsonObject | null;
+  r2_backup_window_error: string | null;
+  r2_history_days_bucket: string | null;
+  r2_history_days_error: string | null;
+  r2_history_read_version: R2HistoryReadVersionResolution;
+  r2_history_read_version_effective: R2HistoryReadVersionResolution;
+  dropbox_backup_state_path: string | null;
+  dropbox_backup_state_error: string | null;
+  dropbox_backup_state_source: string | null;
+  dropbox_backup_state_attempted_paths: string[];
+  dropbox_backup_state_cache_key: string | null;
+  dropbox_backup_state_warning: string | null;
+  dropbox_backup_state_fallback_attempted: boolean;
+  dropbox_backup_observations_earliest_day: string | null;
+  dropbox_backup_observations_latest_day: string | null;
+  dropbox_backup_aqilevels_earliest_day: string | null;
+  dropbox_backup_aqilevels_latest_day: string | null;
+  storage_coverage_source: string;
+  storage_coverage_days: unknown[];
+  pollutants: unknown[];
+  dispatch_runs: unknown[];
+  dispatcher_settings: JsonObject;
+  connectors_settings: unknown[];
+};
+
+type PostgrestSchema = "uk_aq_core" | "uk_aq_public" | "uk_aq_ops";
+
+type R2DaySets = {
+  observations: Set<string>;
+  aqilevels: Set<string>;
+};
+
+type R2HistoryReadVersionResolution = HistoryResolution;
+
+type DropboxStatePathResolution = {
+  path: string;
+  attemptedPaths: string[];
+  source: string;
+  cacheKey: string;
+  warning: string | null;
+  fallbackAttempted: boolean;
+  readVersion: R2HistoryReadVersionResolution;
+};
+
+type DropboxMonthStateReference = {
+  year: string;
+  month: string;
+  stateKey: string;
+};
+
+const BUCKETS = ["0-3 Hours", "3-6 Hours", "6-24 Hours", "1 - 7 Days", "Older than 7 Days"] as const;
+const POLLUTANTS: Record<string, { label: string }> = {
+  pm25: { label: "PM2.5" },
+  pm10: { label: "PM10" },
+  no2: { label: "NO2" },
+};
+
+const DASHBOARD_TTL_MS = 20_000;
+const STORAGE_COVERAGE_TTL_MS = 5 * 60_000;
+const R2_USAGE_TTL_MS = 60 * 60_000;
+const R2_HISTORY_DAYS_TTL_MS = 5 * 60_000;
+const DROPBOX_MTIME_TTL_MS = 20_000;
+const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
+const DROPBOX_DOWNLOAD_URL = "https://content.dropboxapi.com/2/files/download";
+const DROPBOX_GET_METADATA_URL = "https://api.dropboxapi.com/2/files/get_metadata";
+const R2_BYTES_PER_GB = 1024 ** 3;
+const R2_CLASS_A_ACTION_TYPES = new Set([
+  "ListBuckets",
+  "PutBucket",
+  "ListObjects",
+  "PutObject",
+  "CopyObject",
+  "CompleteMultipartUpload",
+  "CreateMultipartUpload",
+  "LifecycleStorageTierTransition",
+  "ListMultipartUploads",
+  "UploadPart",
+  "UploadPartCopy",
+  "ListParts",
+  "PutBucketEncryption",
+  "PutBucketCors",
+  "PutBucketLifecycleConfiguration",
+]);
+const R2_CLASS_B_ACTION_TYPES = new Set([
+  "HeadBucket",
+  "HeadObject",
+  "GetObject",
+  "UsageSummary",
+  "GetBucketEncryption",
+  "GetBucketLocation",
+  "GetBucketCors",
+  "GetBucketLifecycleConfiguration",
+]);
+const R2_FREE_ACTION_TYPES = new Set([
+  "DeleteObject",
+  "DeleteObjects",
+  "DeleteBucket",
+  "AbortMultipartUpload",
+]);
+const DEFAULT_HIERARCHICAL_STATE_PREFIX =
+  "_ops/checkpoints/r2_history_backup_state_v2";
+const HIERARCHICAL_STATE_ROOT_KIND =
+  "uk_aq_r2_history_backup_state_v2_root";
+const HIERARCHICAL_MONTH_STATE_KIND =
+  "uk_aq_r2_history_backup_state_observations_month";
+
+const R2_OPS_GQL_QUERY = `
+query R2OpsMonth($accountTag: string!, $startDate: Time!, $endDate: Time!) {
+  viewer {
+    accounts(filter: { accountTag: $accountTag }) {
+      r2OperationsAdaptiveGroups(
+        limit: 10000
+        filter: {
+          datetime_geq: $startDate
+          datetime_leq: $endDate
+        }
+      ) {
+        sum {
+          requests
+        }
+        dimensions {
+          actionType
+        }
+      }
+    }
+  }
+}
+`;
+
+type CacheEntry<T> = {
+  expiresAt: number;
+  value: T;
+};
+
+const dashboardCache = new Map<string, CacheEntry<DashboardPayload>>();
+let storageCoverageCache: CacheEntry<{
+  generated_at: string;
+  storage_coverage_source: string;
+  storage_coverage_days: unknown[];
+  r2_backup_window: JsonObject | null;
+  r2_backup_window_error: string | null;
+  r2_history_days_bucket: string | null;
+  r2_history_days_error: string | null;
+  r2_history_read_version: R2HistoryReadVersionResolution;
+  r2_history_read_version_effective: R2HistoryReadVersionResolution;
+  dropbox_backup_state_path: string | null;
+  dropbox_backup_state_error: string | null;
+  dropbox_backup_state_source: string | null;
+  dropbox_backup_state_attempted_paths: string[];
+  dropbox_backup_state_cache_key: string | null;
+  dropbox_backup_state_warning: string | null;
+  dropbox_backup_state_fallback_attempted: boolean;
+  dropbox_backup_observations_earliest_day: string | null;
+  dropbox_backup_observations_latest_day: string | null;
+  dropbox_backup_aqilevels_earliest_day: string | null;
+  dropbox_backup_aqilevels_latest_day: string | null;
+}> | null = null;
+let r2UsageCache: CacheEntry<{ usage: JsonObject | null; error: string | null }> | null = null;
+let r2HistoryDaysCache: CacheEntry<{ daySets: R2DaySets | null; window: JsonObject | null; bucket: string | null; error: string | null; readVersion: R2HistoryReadVersionResolution }> | null = null;
+let r2HistoryDaysCacheVersionKey: string | null = null;
+let storageCoverageCacheVersionKey: string | null = null;
+let dropboxMtimeCache: CacheEntry<{ payload: JsonObject; error: string | null }> | null = null;
+
+function clearStorageCoverageCaches(): void {
+  storageCoverageCache = null;
+  storageCoverageCacheVersionKey = null;
+  r2HistoryDaysCache = null;
+  r2HistoryDaysCacheVersionKey = null;
+}
+
+function resolveR2HistoryReadVersion(env: WorkerEnv): R2HistoryReadVersionResolution {
+  return historyResolution(env);
+}
+
+function r2HistoryReadVersionCacheKey(env: WorkerEnv): string {
+  const resolved = resolveR2HistoryReadVersion(env);
+  return `${resolved.valid ? resolved.version : "invalid"}:${resolved.raw}`;
+}
+
+function addR2HistoryReadVersionParam(params: Record<string, string>, env: WorkerEnv): Record<string, string> {
+  const resolved = resolveR2HistoryReadVersion(env);
+  if (!resolved.valid || !resolved.version) {
+    throw new Error(resolved.warning || "Invalid R2 history read version");
+  }
+  return { ...params, read_version: resolved.version };
+}
+
+function readNumber(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return parsed;
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function asBoolFlag(value: string | null | undefined, defaultValue: boolean): boolean {
+  if (!value) {
+    return defaultValue;
+  }
+  const normalized = String(value).trim().toLowerCase();
+  if (!normalized) {
+    return defaultValue;
+  }
+  return !["0", "false", "no", "n", "off"].includes(normalized);
+}
+
+function asTruthy(value: unknown): boolean {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return ["1", "true", "yes", "y", "on"].includes(normalized);
+}
+
+function parseTimestamp(value: unknown): Date | null {
+  if (!value) {
+    return null;
+  }
+  const parsed = new Date(String(value));
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+  return parsed;
+}
+
+function toPostgrestTimestamp(value: Date): string {
+  return value.toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+function extractProjectRef(urlValue: string): string | null {
+  try {
+    const hostname = new URL(urlValue).hostname.toLowerCase();
+    const match = hostname.match(/^([a-z0-9-]+)\.supabase\.co$/);
+    return match ? match[1] : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
+function normalizeIsoDay(value: unknown): string | null {
+  if (!value) {
+    return null;
+  }
+  const raw = String(value).trim();
+  if (!raw) {
+    return null;
+  }
+  const maybeDay = raw.includes("T") ? raw.slice(0, 10) : raw;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(maybeDay)) {
+    return null;
+  }
+  return maybeDay;
+}
+
+function parseIsoDay(value: unknown): Date | null {
+  const normalized = normalizeIsoDay(value);
+  if (!normalized) {
+    return null;
+  }
+  const parsed = new Date(`${normalized}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+  return parsed;
+}
+
+function toIsoDay(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+function addUtcDays(date: Date, days: number): Date {
+  const out = new Date(date.getTime());
+  out.setUTCDate(out.getUTCDate() + days);
+  return out;
+}
+
+function defaultCoreSchema(env: WorkerEnv): PostgrestSchema {
+  return String(env.UK_AQ_CORE_SCHEMA || "uk_aq_core").trim() as PostgrestSchema;
+}
+
+function defaultPublicSchema(env: WorkerEnv): PostgrestSchema {
+  return String(env.UK_AQ_PUBLIC_SCHEMA || "uk_aq_public").trim() as PostgrestSchema;
+}
+
+function defaultOpsSchema(env: WorkerEnv): PostgrestSchema {
+  return String(env.UK_AQ_OPS_SCHEMA || "uk_aq_ops").trim() as PostgrestSchema;
+}
+
+function ingestRestBase(env: WorkerEnv): string {
+  const supabase = String(env.SUPABASE_URL || "").trim().replace(/\/+$/, "");
+  if (!supabase) {
+    throw new Error("SUPABASE_URL is required for direct dashboard mode.");
+  }
+  return `${supabase}/rest/v1`;
+}
+
+function obsRestBase(env: WorkerEnv): string {
+  const supabase = String(env.OBS_AQIDB_SUPABASE_URL || "").trim().replace(/\/+$/, "");
+  if (!supabase) {
+    throw new Error("OBS_AQIDB_SUPABASE_URL is required for this endpoint.");
+  }
+  return `${supabase}/rest/v1`;
+}
+
+function requireServiceKey(env: WorkerEnv): string {
+  const key = String(env.SB_SECRET_KEY || "").trim();
+  if (!key) {
+    throw new Error("SB_SECRET_KEY is required for direct dashboard mode.");
+  }
+  return key;
+}
+
+function requireObsServiceKey(env: WorkerEnv): string {
+  const key = String(env.OBS_AQIDB_SECRET_KEY || "").trim();
+  if (!key) {
+    throw new Error("OBS_AQIDB_SECRET_KEY is required for this endpoint.");
+  }
+  return key;
+}
+
+function postgrestHeaders(serviceRoleKey: string, schema: PostgrestSchema, write = false): Headers {
+  const headers = new Headers();
+  headers.set("apikey", serviceRoleKey);
+  headers.set("Authorization", `Bearer ${serviceRoleKey}`);
+  headers.set("Accept-Profile", schema);
+  if (write) {
+    headers.set("Content-Profile", schema);
+  }
+  return headers;
+}
+
+async function fetchJsonObject(
+  url: string,
+  init?: RequestInit,
+  errLabel?: string,
+  metricEnv?: WorkerEnv,
+): Promise<JsonObject> {
+  const startedAt = Date.now();
+  const response = await fetch(url, init);
+  const text = await response.text();
+  if (metricEnv) {
+    recordDashboardSupabaseResponse(metricEnv, url, response, text, Date.now() - startedAt);
+  }
+  let parsed: unknown = null;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch (_err) {
+    parsed = null;
+  }
+  if (!response.ok) {
+    const detail =
+      parsed && typeof parsed === "object" && parsed !== null
+        ? String((parsed as { message?: string; error?: string }).message || (parsed as { error?: string }).error || text || "")
+        : text || "";
+    throw new Error(`${errLabel || "Request failed"} (${response.status})${detail ? `: ${detail}` : ""}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${errLabel || "Request failed"} returned non-object JSON payload.`);
+  }
+  return parsed as JsonObject;
+}
+
+async function fetchJsonArray(
+  url: string,
+  init?: RequestInit,
+  errLabel?: string,
+  metricEnv?: WorkerEnv,
+  metricQueryName = "dashboard_read",
+): Promise<unknown[]> {
+  const startedAt = Date.now();
+  const response = await fetch(url, init);
+  const text = await response.text();
+  if (metricEnv) {
+    recordDashboardSupabaseResponse(metricEnv, url, response, text, Date.now() - startedAt, metricQueryName);
+  }
+  let parsed: unknown = null;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch (_err) {
+    parsed = null;
+  }
+  if (!response.ok) {
+    const detail =
+      parsed && typeof parsed === "object" && parsed !== null
+        ? String((parsed as { message?: string; error?: string }).message || (parsed as { error?: string }).error || text || "")
+        : text || "";
+    throw new Error(`${errLabel || "Request failed"} (${response.status})${detail ? `: ${detail}` : ""}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`${errLabel || "Request failed"} returned non-array JSON payload.`);
+  }
+  return parsed;
+}
+
+function buildUrl(base: string, path: string, params?: Record<string, string | undefined>): string {
+  const url = new URL(path, `${base}/`);
+  if (params) {
+    for (const [key, value] of Object.entries(params)) {
+      if (typeof value === "string" && value.length > 0) {
+        url.searchParams.set(key, value);
+      }
+    }
+  }
+  return url.toString();
+}
+
+function appendQueryParams(urlValue: string, params?: Record<string, string | undefined>): string {
+  const url = new URL(urlValue);
+  if (params) {
+    for (const [key, value] of Object.entries(params)) {
+      if (typeof value === "string" && value.length > 0) {
+        url.searchParams.set(key, value);
+      }
+    }
+  }
+  return url.toString();
+}
+
+function summarizeCloudflareGraphqlErrors(payload: JsonObject): string | null {
+  const rawErrors = payload.errors;
+  if (!Array.isArray(rawErrors) || !rawErrors.length) {
+    return null;
+  }
+  const messages: string[] = [];
+  const seen = new Set<string>();
+  for (const item of rawErrors) {
+    let message = "";
+    if (item && typeof item === "object" && !Array.isArray(item)) {
+      message = String((item as JsonObject).message || "").trim();
+      const path = (item as JsonObject).path;
+      if (message && Array.isArray(path) && path.length) {
+        message = `${message} (${path.map((part) => String(part)).join(".")})`;
+      }
+    } else {
+      message = String(item || "").trim();
+    }
+    if (!message || seen.has(message)) {
+      continue;
+    }
+    seen.add(message);
+    messages.push(message);
+    if (messages.length >= 3) {
+      break;
+    }
+  }
+  return messages.length ? messages.join("; ") : null;
+}
+
+function resolveUrlOrigin(urlValue: string): string {
+  try {
+    const parsed = new URL(urlValue);
+    if (!parsed.protocol || !parsed.host) {
+      return "";
+    }
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch (_err) {
+    return "";
+  }
+}
+
+function resolveR2HistoryDaysApiUrl(env: WorkerEnv): string {
+  const explicit = String(env.UK_AQ_R2_HISTORY_DAYS_API_URL || "").trim();
+  if (explicit) {
+    return explicit;
+  }
+  const dbSizeApi = String(env.UK_AQ_DB_SIZE_API_URL || "").trim();
+  if (!dbSizeApi) {
+    return "";
+  }
+  const origin = resolveUrlOrigin(dbSizeApi);
+  if (!origin) {
+    return "";
+  }
+  return `${origin}/v1/r2-history-days`;
+}
+
+function resolveR2HistoryCountsApiUrl(env: WorkerEnv): string {
+  const explicit = String(env.UK_AQ_R2_HISTORY_COUNTS_API_URL || "").trim();
+  if (explicit) {
+    return explicit;
+  }
+
+  const daysApi = String(env.UK_AQ_R2_HISTORY_DAYS_API_URL || "").trim();
+  if (daysApi) {
+    const origin = resolveUrlOrigin(daysApi);
+    if (origin) {
+      return `${origin}/v1/r2-history-counts`;
+    }
+  }
+
+  const dbSizeApi = String(env.UK_AQ_DB_SIZE_API_URL || "").trim();
+  if (!dbSizeApi) {
+    return "";
+  }
+  const origin = resolveUrlOrigin(dbSizeApi);
+  if (!origin) {
+    return "";
+  }
+  return `${origin}/v1/r2-history-counts`;
+}
+
+function resolveR2HistoryDaysApiToken(env: WorkerEnv): string {
+  return String(env.UK_AQ_R2_HISTORY_DAYS_API_TOKEN || env.UK_AQ_DB_SIZE_API_TOKEN || "").trim();
+}
+
+function resolveR2HistoryCountsApiToken(env: WorkerEnv): string {
+  return String(
+    env.UK_AQ_R2_HISTORY_COUNTS_API_TOKEN ||
+      env.UK_AQ_R2_HISTORY_DAYS_API_TOKEN ||
+      env.UK_AQ_DB_SIZE_API_TOKEN ||
+      "",
+  ).trim();
+}
+
+async function fetchAllRows(
+  restBase: string,
+  tableOrView: string,
+  headers: Headers,
+  params: Record<string, string>,
+  pageSize = 1000,
+  metricEnv?: WorkerEnv,
+  maxRows = Number.POSITIVE_INFINITY,
+): Promise<JsonObject[]> {
+  const rows: JsonObject[] = [];
+  let offset = 0;
+  while (true) {
+    const query = {
+      ...params,
+      limit: String(pageSize),
+      offset: String(offset),
+    };
+    const batch = await fetchJsonArray(
+      buildUrl(restBase, tableOrView, query),
+      { headers, method: "GET" },
+      `Failed to fetch ${tableOrView}`,
+      metricEnv,
+    );
+    const safeBatch = batch.filter((row): row is JsonObject => !!row && typeof row === "object" && !Array.isArray(row));
+    rows.push(...safeBatch);
+    if (rows.length >= maxRows) {
+      return rows.slice(0, maxRows);
+    }
+    if (safeBatch.length < pageSize) {
+      break;
+    }
+    offset += pageSize;
+  }
+  return rows;
+}
+
+function dashboardSummaryCount(value: unknown): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function buildPollutantsPayload(
+  summaryRows: JsonObject[],
+  connectorMap: Map<number, { connector_code: string; label: string }>,
+): JsonObject[] {
+  const connectorsByPollutant = new Map<string, JsonObject[]>();
+  for (const pollutantKey of Object.keys(POLLUTANTS)) {
+    connectorsByPollutant.set(pollutantKey, []);
+  }
+  for (const row of summaryRows) {
+    const pollutantKey = String(row.pollutant_code || "");
+    const connectors = connectorsByPollutant.get(pollutantKey);
+    const connectorId = Number(row.connector_id);
+    if (!connectors || !Number.isFinite(connectorId)) {
+      continue;
+    }
+    const connector = connectorMap.get(connectorId);
+    connectors.push({
+      connector_code: String(row.connector_code || connector?.connector_code || ""),
+      label: connector?.label || "",
+      stations_with_pollutant: dashboardSummaryCount(row.stations_with_pollutant),
+      active_stations_with_pollutant: dashboardSummaryCount(row.active_stations_with_pollutant),
+      buckets: {
+        "0-3 Hours": dashboardSummaryCount(row.bucket_0_3_hours),
+        "3-6 Hours": dashboardSummaryCount(row.bucket_3_6_hours),
+        "6-24 Hours": dashboardSummaryCount(row.bucket_6_24_hours),
+        "1 - 7 Days": dashboardSummaryCount(row.bucket_1_7_days),
+        "Older than 7 Days": dashboardSummaryCount(row.bucket_older_7_days),
+      },
+    });
+  }
+  return Object.entries(POLLUTANTS).map(([pollutantKey, config]) => ({
+    key: pollutantKey,
+    label: config.label,
+    connectors: (connectorsByPollutant.get(pollutantKey) || []).sort((a, b) =>
+      String(a.connector_code || "").localeCompare(String(b.connector_code || "")),
+    ),
+  }));
+}
+
+function cacheGet<T>(entry: CacheEntry<T> | null): T | null {
+  if (!entry) {
+    return null;
+  }
+  if (Date.now() > entry.expiresAt) {
+    return null;
+  }
+  return entry.value;
+}
+
+function parseHistoryDaySets(payload: JsonObject): R2DaySets {
+  const domains = payload.domains;
+  const sets: R2DaySets = { observations: new Set<string>(), aqilevels: new Set<string>() };
+  if (!domains || typeof domains !== "object" || Array.isArray(domains)) {
+    return sets;
+  }
+  for (const domainName of ["observations", "aqilevels"] as const) {
+    const domain = (domains as JsonObject)[domainName];
+    if (!domain || typeof domain !== "object" || Array.isArray(domain)) {
+      continue;
+    }
+    const days = (domain as JsonObject).days;
+    if (!Array.isArray(days)) {
+      continue;
+    }
+    for (const value of days) {
+      const day = normalizeIsoDay(value);
+      if (day) {
+        sets[domainName].add(day);
+      }
+    }
+  }
+  return sets;
+}
+
+function buildR2Window(daySets: R2DaySets, env: WorkerEnv): JsonObject {
+  const overlap: string[] = [];
+  for (const day of daySets.observations) {
+    if (historyResolution(env).version === "v3" || daySets.aqilevels.has(day)) {
+      overlap.push(day);
+    }
+  }
+  overlap.sort();
+  const observations = Array.from(daySets.observations).sort();
+  const aqilevels = Array.from(daySets.aqilevels).sort();
+  return {
+    min_day_utc: overlap.length ? overlap[0] : null,
+    max_day_utc: overlap.length ? overlap[overlap.length - 1] : null,
+    day_count: overlap.length,
+    observations_day_count: observations.length,
+    aqilevels_day_count: aqilevels.length,
+    count_basis: historyResolution(env).version === "v3" ? "explicit_observation_days" : "explicit_overlap_both_domains",
+  };
+}
+
+async function fetchR2HistoryDays(
+  env: WorkerEnv,
+  forceRefresh = false,
+): Promise<{ daySets: R2DaySets | null; window: JsonObject | null; bucket: string | null; error: string | null; readVersion: R2HistoryReadVersionResolution }> {
+  const versionCacheKey = r2HistoryReadVersionCacheKey(env);
+  if (!forceRefresh && r2HistoryDaysCacheVersionKey === versionCacheKey) {
+    const cached = cacheGet(r2HistoryDaysCache);
+    if (cached) {
+      return cached;
+    }
+  }
+
+  const apiUrl = resolveR2HistoryDaysApiUrl(env);
+  if (!apiUrl) {
+    const fallback = {
+      daySets: null,
+      window: null,
+      bucket: null,
+      error: "R2 history-days API not configured",
+      readVersion: resolveR2HistoryReadVersion(env),
+    };
+    r2HistoryDaysCacheVersionKey = versionCacheKey;
+    r2HistoryDaysCache = { value: fallback, expiresAt: Date.now() + R2_HISTORY_DAYS_TTL_MS };
+    return fallback;
+  }
+
+  const headers = new Headers();
+  headers.set("Accept", "application/json");
+  const token = resolveR2HistoryDaysApiToken(env);
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+  const maxDays = Math.max(1, Math.min(3660, Math.trunc(readNumber(env.UK_AQ_R2_HISTORY_DAYS_API_MAX_DAYS, 3660))));
+  try {
+    const payload = await fetchJsonObject(
+      appendQueryParams(apiUrl, addR2HistoryReadVersionParam({ max_days: String(maxDays) }, env)),
+      { method: "GET", headers },
+      "R2 history-days API",
+    );
+    assertHistoryPayload(payload, env);
+    const daySets = parseHistoryDaySets(payload);
+    const value = {
+      daySets,
+      window: buildR2Window(daySets, env),
+      bucket: String(payload.bucket || "").trim() || null,
+      error: null,
+      readVersion: resolveR2HistoryReadVersion(env),
+    };
+    r2HistoryDaysCacheVersionKey = versionCacheKey;
+    r2HistoryDaysCache = { value, expiresAt: Date.now() + R2_HISTORY_DAYS_TTL_MS };
+    return value;
+  } catch (err) {
+    const value = {
+      daySets: null,
+      window: null,
+      bucket: null,
+      error: err instanceof Error ? err.message : String(err),
+      readVersion: resolveR2HistoryReadVersion(env),
+    };
+    r2HistoryDaysCacheVersionKey = versionCacheKey;
+    r2HistoryDaysCache = { value, expiresAt: Date.now() + R2_HISTORY_DAYS_TTL_MS };
+    return value;
+  }
+}
+
+async function fetchR2BackupWindowFromSupabase(env: WorkerEnv): Promise<{ window: JsonObject | null; error: string | null }> {
+  try {
+    const restBase = ingestRestBase(env);
+    const key = requireServiceKey(env);
+    const rows = await fetchJsonArray(
+      buildUrl(restBase, `rpc/${String(env.UK_AQ_R2_HISTORY_WINDOW_RPC || "uk_aq_rpc_r2_history_window").trim() || "uk_aq_rpc_r2_history_window"}`),
+      {
+        method: "POST",
+        headers: postgrestHeaders(key, defaultPublicSchema(env), true),
+        body: JSON.stringify({}),
+      },
+      "R2 window RPC",
+      env,
+    );
+    const first = rows.find((row): row is JsonObject => !!row && typeof row === "object" && !Array.isArray(row));
+    if (!first) {
+      return {
+        window: {
+          min_day_utc: null,
+          max_day_utc: null,
+          day_count: null,
+          count_basis: "range_rpc_fallback",
+        },
+        error: null,
+      };
+    }
+    return {
+      window: {
+        min_day_utc: normalizeIsoDay(first.min_day_utc),
+        max_day_utc: normalizeIsoDay(first.max_day_utc),
+        day_count: null,
+        count_basis: "range_rpc_fallback",
+      },
+      error: null,
+    };
+  } catch (err) {
+    return { window: null, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+function extractR2UsagePoint(value: unknown): { used_bytes: number; object_count: number } | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const row = value as JsonObject;
+  const usedBytes = readNumber(row.used_bytes, Number.NaN);
+  const payloadBytes = readNumber(row.payloadSize, Number.NaN);
+  const metadataBytes = readNumber(row.metadataSize, Number.NaN);
+  const objectsLegacy = readNumber(row.object_count, Number.NaN);
+  const objectsModern = readNumber(row.objects, Number.NaN);
+
+  const bytes = Number.isFinite(usedBytes)
+    ? usedBytes
+    : Number.isFinite(payloadBytes)
+      ? payloadBytes + (Number.isFinite(metadataBytes) ? metadataBytes : 0)
+      : Number.NaN;
+  const objects = Number.isFinite(objectsLegacy) ? objectsLegacy : objectsModern;
+
+  if (!Number.isFinite(bytes) || !Number.isFinite(objects)) {
+    return null;
+  }
+  return { used_bytes: bytes, object_count: objects };
+}
+
+function clampPercent(value: number): number {
+  return Math.max(0, Math.min(200, value));
+}
+
+async function fetchR2OperationsMetrics(
+  accountId: string,
+  apiToken: string,
+  now: Date,
+): Promise<{ metrics: JsonObject | null; error: string | null }> {
+  const windowEnd = new Date(now.getTime());
+  const windowStart = new Date(Date.UTC(windowEnd.getUTCFullYear(), windowEnd.getUTCMonth(), 1, 0, 0, 0, 0));
+  const headers = new Headers();
+  headers.set("Authorization", `Bearer ${apiToken}`);
+  headers.set("Content-Type", "application/json");
+
+  let payload: JsonObject;
+  try {
+    payload = await fetchJsonObject(
+      "https://api.cloudflare.com/client/v4/graphql",
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          query: R2_OPS_GQL_QUERY,
+          variables: {
+            accountTag: accountId,
+            startDate: windowStart.toISOString(),
+            endDate: windowEnd.toISOString(),
+          },
+        }),
+      },
+      "Cloudflare R2 ops",
+    );
+  } catch (err) {
+    return { metrics: null, error: err instanceof Error ? err.message : String(err) };
+  }
+
+  const gqlError = summarizeCloudflareGraphqlErrors(payload);
+  if (gqlError) {
+    return { metrics: null, error: `R2 ops GraphQL returned errors: ${gqlError}` };
+  }
+
+  const data = payload.data;
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return { metrics: null, error: "R2 ops missing data object" };
+  }
+  const viewer = (data as JsonObject).viewer;
+  if (!viewer || typeof viewer !== "object" || Array.isArray(viewer)) {
+    return { metrics: null, error: "R2 ops missing viewer object" };
+  }
+  const accounts = (viewer as JsonObject).accounts;
+  if (!Array.isArray(accounts) || !accounts.length || !accounts[0] || typeof accounts[0] !== "object" || Array.isArray(accounts[0])) {
+    return { metrics: null, error: "R2 ops missing account data" };
+  }
+  const groups = (accounts[0] as JsonObject).r2OperationsAdaptiveGroups;
+  if (!Array.isArray(groups)) {
+    return { metrics: null, error: "R2 ops missing operations groups" };
+  }
+
+  let classARequests = 0;
+  let classBRequests = 0;
+  let unclassifiedRequests = 0;
+  const unclassifiedActionTypes: string[] = [];
+  const unclassifiedSeen = new Set<string>();
+
+  for (const group of groups) {
+    if (!group || typeof group !== "object" || Array.isArray(group)) {
+      continue;
+    }
+    const dimensions = (group as JsonObject).dimensions;
+    const totals = (group as JsonObject).sum;
+    if (!dimensions || typeof dimensions !== "object" || Array.isArray(dimensions) || !totals || typeof totals !== "object" || Array.isArray(totals)) {
+      continue;
+    }
+    const actionType = String((dimensions as JsonObject).actionType || "").trim();
+    if (!actionType) {
+      continue;
+    }
+    const requestsCount = readNumber((totals as JsonObject).requests, Number.NaN);
+    if (!Number.isFinite(requestsCount) || requestsCount < 0) {
+      continue;
+    }
+    if (R2_CLASS_A_ACTION_TYPES.has(actionType)) {
+      classARequests += Math.round(requestsCount);
+    } else if (R2_CLASS_B_ACTION_TYPES.has(actionType)) {
+      classBRequests += Math.round(requestsCount);
+    } else if (!R2_FREE_ACTION_TYPES.has(actionType) && !actionType.toLowerCase().startsWith("delete")) {
+      unclassifiedRequests += Math.round(requestsCount);
+      if (!unclassifiedSeen.has(actionType)) {
+        unclassifiedSeen.add(actionType);
+        unclassifiedActionTypes.push(actionType);
+      }
+    }
+  }
+
+  return {
+    metrics: {
+      class_a_requests: classARequests,
+      class_b_requests: classBRequests,
+      unclassified_requests: unclassifiedRequests,
+      unclassified_action_types: unclassifiedActionTypes.sort(),
+      window_start_utc: windowStart.toISOString(),
+      window_end_utc: windowEnd.toISOString(),
+    },
+    error: null,
+  };
+}
+
+async function fetchR2Usage(env: WorkerEnv, forceRefresh = false): Promise<{ usage: JsonObject | null; error: string | null }> {
+  if (!forceRefresh) {
+    const cached = cacheGet(r2UsageCache);
+    if (cached) {
+      return cached;
+    }
+  }
+
+  const accountId = String(env.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID || env.CLOUDFLARE_ACCOUNT_ID || "").trim();
+  const apiToken = String(env.UK_AQ_R2_CLOUDFLARE_API_TOKEN || env.CFLARE_API_READ_TOKEN || "").trim();
+  if (!accountId || !apiToken) {
+    const value = {
+      usage: null,
+      error: "Missing UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID/CLOUDFLARE_ACCOUNT_ID or UK_AQ_R2_CLOUDFLARE_API_TOKEN/CFLARE_API_READ_TOKEN",
+    };
+    r2UsageCache = { value, expiresAt: Date.now() + R2_USAGE_TTL_MS };
+    return value;
+  }
+
+  const headers = new Headers();
+  headers.set("Authorization", `Bearer ${apiToken}`);
+  headers.set("Content-Type", "application/json");
+  try {
+    const payload = await fetchJsonObject(
+      `https://api.cloudflare.com/client/v4/accounts/${accountId}/r2/metrics`,
+      { method: "GET", headers },
+      "Cloudflare R2 metrics",
+    );
+    const success = Boolean(payload.success);
+    if (!success) {
+      throw new Error("Cloudflare R2 metrics reported success=false");
+    }
+    const result = payload.result;
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      throw new Error("Cloudflare R2 metrics missing result payload");
+    }
+    const standard = (result as JsonObject).standard;
+    if (!standard || typeof standard !== "object" || Array.isArray(standard)) {
+      throw new Error("Cloudflare R2 metrics missing standard usage payload");
+    }
+    const published = extractR2UsagePoint((standard as JsonObject).published);
+    const uploaded = extractR2UsagePoint((standard as JsonObject).uploaded);
+    const selected = published || uploaded;
+    if (!selected) {
+      throw new Error("Cloudflare R2 metrics missing standard usage values");
+    }
+    const now = new Date();
+    const freeTierGb = 10;
+    const freeBytes = freeTierGb * R2_BYTES_PER_GB;
+    const classAFree = 1_000_000;
+    const classBFree = 10_000_000;
+    const opsMetrics = await fetchR2OperationsMetrics(accountId, apiToken, now);
+    const usage: JsonObject = {
+      standard_used_bytes: Math.max(0, Math.round(selected.used_bytes)),
+      standard_used_gb: Math.max(0, selected.used_bytes) / R2_BYTES_PER_GB,
+      standard_objects: Math.max(0, Math.round(selected.object_count)),
+      free_tier_gb: freeTierGb,
+      percent_of_free_tier: clampPercent((selected.used_bytes / freeBytes) * 100),
+      class_a_used_requests: null,
+      class_b_used_requests: null,
+      class_a_free_tier_requests: classAFree,
+      class_b_free_tier_requests: classBFree,
+      class_a_percent_of_free_tier: null,
+      class_b_percent_of_free_tier: null,
+      class_ops_unclassified_requests: null,
+      class_ops_unclassified_action_types: [],
+      class_ops_window_start_utc: null,
+      class_ops_window_end_utc: null,
+      class_ops_error: opsMetrics.error,
+      storage_source: "cloudflare_r2_account_metrics",
+      source: "cloudflare_r2_account_metrics",
+      as_of_utc: now.toISOString(),
+    };
+    if (opsMetrics.metrics) {
+      const classAUsed = Math.max(0, Math.round(readNumber(opsMetrics.metrics.class_a_requests, 0)));
+      const classBUsed = Math.max(0, Math.round(readNumber(opsMetrics.metrics.class_b_requests, 0)));
+      usage.class_a_used_requests = classAUsed;
+      usage.class_b_used_requests = classBUsed;
+      usage.class_a_percent_of_free_tier = clampPercent((classAUsed / classAFree) * 100);
+      usage.class_b_percent_of_free_tier = clampPercent((classBUsed / classBFree) * 100);
+      usage.class_ops_unclassified_requests = Math.max(0, Math.round(readNumber(opsMetrics.metrics.unclassified_requests, 0)));
+      usage.class_ops_unclassified_action_types = Array.isArray(opsMetrics.metrics.unclassified_action_types)
+        ? opsMetrics.metrics.unclassified_action_types
+        : [];
+      usage.class_ops_window_start_utc = String(opsMetrics.metrics.window_start_utc || "") || null;
+      usage.class_ops_window_end_utc = String(opsMetrics.metrics.window_end_utc || "") || null;
+    }
+    const value = { usage, error: null };
+    r2UsageCache = { value, expiresAt: Date.now() + R2_USAGE_TTL_MS };
+    return value;
+  } catch (err) {
+    const value = { usage: null, error: err instanceof Error ? err.message : String(err) };
+    r2UsageCache = { value, expiresAt: Date.now() + R2_USAGE_TTL_MS };
+    return value;
+  }
+}
+
+async function fetchDbMetrics(env: WorkerEnv): Promise<{
+  dbRows: unknown[];
+  schemaRows: unknown[];
+  r2DomainRows: unknown[];
+  dbError: string | null;
+  schemaError: string | null;
+  r2DomainError: string | null;
+}> {
+  const externalUrl = String(env.UK_AQ_DB_SIZE_API_URL || "").trim();
+  const lookbackDays = Math.max(1, Math.trunc(readNumber(env.UK_AQ_DB_SIZE_LOOKBACK_DAYS, 28)));
+  if (externalUrl) {
+    const headers = new Headers();
+    headers.set("Accept", "application/json");
+    const token = String(env.UK_AQ_DB_SIZE_API_TOKEN || "").trim();
+    if (token) {
+      headers.set("Authorization", `Bearer ${token}`);
+    }
+    try {
+      const payload = await fetchJsonObject(
+        appendQueryParams(externalUrl, addR2HistoryReadVersionParam({ lookback_days: String(lookbackDays) }, env)),
+        { method: "GET", headers },
+        "DB size API",
+      );
+      const dbRows = Array.isArray(payload.db_size_metrics) ? payload.db_size_metrics : [];
+      const schemaRows = Array.isArray(payload.schema_size_metrics) ? payload.schema_size_metrics : [];
+      const r2DomainRows = Array.isArray(payload.r2_domain_size_metrics) ? payload.r2_domain_size_metrics : [];
+      return {
+        dbRows,
+        schemaRows,
+        r2DomainRows,
+        dbError: typeof payload.db_size_metrics_error === "string" ? payload.db_size_metrics_error : null,
+        schemaError: typeof payload.schema_size_metrics_error === "string" ? payload.schema_size_metrics_error : null,
+        r2DomainError: typeof payload.r2_domain_size_metrics_error === "string" ? payload.r2_domain_size_metrics_error : null,
+      };
+    } catch (err) {
+      return {
+        dbRows: [],
+        schemaRows: [],
+        r2DomainRows: [],
+        dbError: err instanceof Error ? err.message : String(err),
+        schemaError: null,
+        r2DomainError: null,
+      };
+    }
+  }
+
+  try {
+    const restBase = ingestRestBase(env);
+    const key = requireServiceKey(env);
+    const publicSchema = defaultPublicSchema(env);
+    const headers = postgrestHeaders(key, publicSchema);
+    const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000).toISOString();
+    const ingestDbRows = await fetchAllRows(
+      restBase,
+      "uk_aq_db_size_metrics_hourly",
+      headers,
+      {
+        select: "bucket_hour,database_label,database_name,size_bytes,oldest_observed_at,recorded_at",
+        bucket_hour: `gte.${toPostgrestTimestamp(new Date(since))}`,
+        order: "bucket_hour.asc",
+      },
+      1000,
+      env,
+    );
+    const r2DomainRows = await fetchAllRows(
+      restBase,
+      "uk_aq_r2_domain_size_metrics_hourly",
+      headers,
+      {
+        select: "bucket_hour,domain_name,size_bytes,recorded_at",
+        bucket_hour: `gte.${toPostgrestTimestamp(new Date(since))}`,
+        order: "bucket_hour.asc",
+      },
+      1000,
+      env,
+    );
+    let obsDbRows: JsonObject[] = [];
+    let obsSchemaRows: JsonObject[] = [];
+    let obsError: string | null = null;
+    if (String(env.OBS_AQIDB_SUPABASE_URL || "").trim() && String(env.OBS_AQIDB_SECRET_KEY || "").trim()) {
+      const obsBase = obsRestBase(env);
+      const obsHeaders = postgrestHeaders(requireObsServiceKey(env), publicSchema);
+      obsDbRows = await fetchAllRows(
+        obsBase,
+        "uk_aq_db_size_metrics_hourly",
+        obsHeaders,
+        {
+          select: "bucket_hour,database_label,database_name,size_bytes,oldest_observed_at,recorded_at",
+          bucket_hour: `gte.${toPostgrestTimestamp(new Date(since))}`,
+          order: "bucket_hour.asc",
+        },
+        1000,
+        env,
+      );
+      obsSchemaRows = await fetchAllRows(
+        obsBase,
+        "uk_aq_schema_size_metrics_hourly",
+        obsHeaders,
+        {
+          select: "bucket_hour,database_label,schema_name,size_bytes,oldest_observed_at,recorded_at",
+          bucket_hour: `gte.${toPostgrestTimestamp(new Date(since))}`,
+          order: "bucket_hour.asc",
+        },
+        1000,
+        env,
+      );
+    } else {
+      obsError = "OBS_AQIDB_SUPABASE_URL/OBS_AQIDB_SECRET_KEY not configured.";
+    }
+    return {
+      dbRows: [...ingestDbRows, ...obsDbRows],
+      schemaRows: obsSchemaRows,
+      r2DomainRows,
+      dbError: null,
+      schemaError: obsError,
+      r2DomainError: null,
+    };
+  } catch (err) {
+    return {
+      dbRows: [],
+      schemaRows: [],
+      r2DomainRows: [],
+      dbError: err instanceof Error ? err.message : String(err),
+      schemaError: null,
+      r2DomainError: null,
+    };
+  }
+}
+
+function latestOldestDay(rows: unknown[], selector: (row: JsonObject) => boolean): string | null {
+  let latestSample: Date | null = null;
+  let latestDay: string | null = null;
+  for (const raw of rows) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      continue;
+    }
+    const row = raw as JsonObject;
+    if (!selector(row)) {
+      continue;
+    }
+    const sample = parseTimestamp(row.recorded_at) || parseTimestamp(row.bucket_hour);
+    if (!sample) {
+      continue;
+    }
+    if (!latestSample || sample.getTime() >= latestSample.getTime()) {
+      latestSample = sample;
+      latestDay = normalizeIsoDay(row.oldest_observed_at);
+    }
+  }
+  return latestDay;
+}
+
+function joinDropboxStatePath(env: WorkerEnv, stateRel: string): string {
+  const root = String(env.UK_AQ_DROPBOX_ROOT || "TEST").trim().replace(/^\/+|\/+$/g, "");
+  const historyDir = String(env.UK_AQ_R2_HISTORY_DROPBOX_DIR || "R2_history_backup").trim().replace(/^\/+|\/+$/g, "");
+  const normalizedStateRel = stateRel.trim().replace(/^\/+|\/+$/g, "");
+  const parts = [root, historyDir, normalizedStateRel].filter((part) => part.length > 0);
+  if (!parts.length) {
+    return "";
+  }
+  return `/${parts.join("/")}`;
+}
+
+function resolveDropboxStatePath(env: WorkerEnv): DropboxStatePathResolution {
+  const readVersion = resolveR2HistoryReadVersion(env);
+  if (!readVersion.valid || !readVersion.version) {
+    return {
+      path: "",
+      attemptedPaths: [],
+      source: "disabled_invalid_r2_history_read_version",
+      cacheKey: `dropbox:${r2HistoryReadVersionCacheKey(env)}:disabled`,
+      warning: readVersion.warning || "Invalid R2 history read version.",
+      fallbackAttempted: false,
+      readVersion,
+    };
+  }
+  const statePrefix = historyResolution(env).generation.backup_state_prefix;
+  if (!statePrefix) {
+    const warning = "Hierarchical Dropbox state prefix is empty.";
+    return {
+      path: "",
+      attemptedPaths: [],
+      source: "hierarchical_v2",
+      cacheKey: `dropbox:${r2HistoryReadVersionCacheKey(env)}:empty`,
+      warning,
+      fallbackAttempted: false,
+      readVersion,
+    };
+  }
+  const stateRel = `${statePrefix}/root.json`;
+  const path = joinDropboxStatePath(env, stateRel);
+  const attemptedPaths = path ? [`dropbox:${path}`] : [];
+  return {
+    path,
+    attemptedPaths,
+    source: "hierarchical_v2",
+    cacheKey: `dropbox:${r2HistoryReadVersionCacheKey(env)}:${path || "none"}`,
+    warning: null,
+    fallbackAttempted: false,
+    readVersion,
+  };
+}
+
+function storageCoverageCacheKey(env: WorkerEnv): string {
+  const dropboxStatePath = resolveDropboxStatePath(env);
+  return `storage_coverage:${r2HistoryReadVersionCacheKey(env)}:${dropboxStatePath.cacheKey}`;
+}
+
+function resolveDropboxHistoryPath(env: WorkerEnv): string {
+  const root = String(env.UK_AQ_DROPBOX_ROOT || "TEST").trim().replace(/^\/+|\/+$/g, "");
+  const historyDir = String(env.UK_AQ_R2_HISTORY_DROPBOX_DIR || "R2_history_backup").trim().replace(/^\/+|\/+$/g, "");
+  const parts = [root, historyDir].filter((part) => part.length > 0);
+  if (!parts.length) {
+    return "";
+  }
+  return `/${parts.join("/")}`;
+}
+
+async function fetchDropboxAccessToken(env: WorkerEnv): Promise<{ token: string | null; error: string | null }> {
+  const appKey = String(env.DROPBOX_APP_KEY || "").trim();
+  const appSecret = String(env.DROPBOX_APP_SECRET || "").trim();
+  const refreshToken = String(env.DROPBOX_REFRESH_TOKEN || "").trim();
+  if (!appKey && !appSecret && !refreshToken) {
+    return { token: null, error: null };
+  }
+  if (!appKey || !appSecret || !refreshToken) {
+    return { token: null, error: "Dropbox credentials incomplete (DROPBOX_APP_KEY/SECRET/REFRESH_TOKEN required)." };
+  }
+  const form = new URLSearchParams();
+  form.set("grant_type", "refresh_token");
+  form.set("refresh_token", refreshToken);
+  form.set("client_id", appKey);
+  form.set("client_secret", appSecret);
+  try {
+    const payload = await fetchJsonObject(
+      DROPBOX_TOKEN_URL,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: form.toString(),
+      },
+      "Dropbox token request",
+    );
+    const token = String(payload.access_token || "").trim();
+    if (!token) {
+      return { token: null, error: "Dropbox token response missing access_token." };
+    }
+    return { token, error: null };
+  } catch (err) {
+    return { token: null, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function fetchDropboxStateJson(env: WorkerEnv): Promise<{
+  days: R2DaySets;
+  path: string | null;
+  error: string | null;
+  source: string;
+  attemptedPaths: string[];
+  cacheKey: string;
+  warning: string | null;
+  fallbackAttempted: boolean;
+}> {
+  const resolvedPath = resolveDropboxStatePath(env);
+  const remotePath = resolvedPath.path;
+  const emptyDays = (): R2DaySets => ({
+    observations: new Set<string>(),
+    aqilevels: new Set<string>(),
+  });
+  if (!remotePath) {
+    return {
+      days: emptyDays(),
+      path: null,
+      error: null,
+      source: resolvedPath.source,
+      attemptedPaths: resolvedPath.attemptedPaths,
+      cacheKey: resolvedPath.cacheKey,
+      warning: resolvedPath.warning,
+      fallbackAttempted: resolvedPath.fallbackAttempted,
+    };
+  }
+  const { token, error: tokenError } = await fetchDropboxAccessToken(env);
+  if (tokenError) {
+    return {
+      days: emptyDays(),
+      path: `dropbox:${remotePath}`,
+      error: tokenError,
+      source: resolvedPath.source,
+      attemptedPaths: resolvedPath.attemptedPaths,
+      cacheKey: resolvedPath.cacheKey,
+      warning: resolvedPath.warning,
+      fallbackAttempted: resolvedPath.fallbackAttempted,
+    };
+  }
+  if (!token) {
+    return {
+      days: emptyDays(),
+      path: null,
+      error: null,
+      source: resolvedPath.source,
+      attemptedPaths: resolvedPath.attemptedPaths,
+      cacheKey: resolvedPath.cacheKey,
+      warning: resolvedPath.warning,
+      fallbackAttempted: resolvedPath.fallbackAttempted,
+    };
+  }
+  try {
+    const root = await fetchDropboxJson(token, remotePath);
+    if (root.observation_generation !== historyResolution(env).version) throw new Error("Dropbox checkpoint generation mismatch");
+    const references = parseHierarchicalStateMonthReferences(root);
+    if (references.some(ref => !ref.stateKey.startsWith(historyResolution(env).generation.backup_state_prefix + "/"))) throw new Error("Dropbox shard outside selected generation");
+    const days = emptyDays();
+    const shardErrors: string[] = [];
+    await mapWithConcurrency(references, 6, async (reference) => {
+      try {
+        const shardPath = joinDropboxStatePath(env, reference.stateKey);
+        const shard = await fetchDropboxJson(token, shardPath);
+        const shardDays = parseHierarchicalMonthStateDays(
+          shard,
+          reference.year,
+          reference.month,
+        );
+        for (const day of shardDays) days.observations.add(day);
+      } catch (error) {
+        shardErrors.push(
+          `${reference.stateKey}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    });
+    return {
+      days,
+      path: `dropbox:${remotePath}`,
+      error: shardErrors.length ? shardErrors.join("; ") : null,
+      source: resolvedPath.source,
+      attemptedPaths: resolvedPath.attemptedPaths,
+      cacheKey: resolvedPath.cacheKey,
+      warning: resolvedPath.warning,
+      fallbackAttempted: resolvedPath.fallbackAttempted,
+    };
+  } catch (err) {
+    return {
+      days: emptyDays(),
+      path: `dropbox:${remotePath}`,
+      error: err instanceof Error ? err.message : String(err),
+      source: resolvedPath.source,
+      attemptedPaths: resolvedPath.attemptedPaths,
+      cacheKey: resolvedPath.cacheKey,
+      warning: resolvedPath.warning,
+      fallbackAttempted: resolvedPath.fallbackAttempted,
+    };
+  }
+}
+
+async function fetchDropboxJson(
+  token: string,
+  remotePath: string,
+): Promise<JsonObject> {
+  const headers = new Headers();
+  headers.set("Authorization", `Bearer ${token}`);
+  headers.set("Dropbox-API-Arg", JSON.stringify({ path: remotePath }));
+  const response = await fetch(DROPBOX_DOWNLOAD_URL, {
+    method: "POST",
+    headers,
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(
+      `Dropbox checkpoint download failed (${response.status}): ${text}`,
+    );
+  }
+  const parsed = text ? JSON.parse(text) : null;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Dropbox checkpoint payload is not a JSON object.");
+  }
+  return parsed as JsonObject;
+}
+
+function normalizeHierarchicalStateKey(value: unknown): string {
+  const key = String(value || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\/+|\/+$/g, "");
+  if (!key || key === "." || key === ".." || key.startsWith("../") || key.includes("/../")) {
+    throw new Error(`Invalid hierarchical Dropbox state key: ${String(value || "")}`);
+  }
+  return key;
+}
+
+function parseHierarchicalStateMonthReferences(
+  root: JsonObject,
+): DropboxMonthStateReference[] {
+  if (
+    root.kind !== HIERARCHICAL_STATE_ROOT_KIND
+    || root.backup_version !== "v2"
+  ) {
+    throw new Error("Hierarchical Dropbox state root identity mismatch");
+  }
+  const observations = root.observations;
+  if (!observations || typeof observations !== "object" || Array.isArray(observations)) {
+    throw new Error("Hierarchical Dropbox state root has no observations object");
+  }
+  const years = (observations as JsonObject).years;
+  if (!Array.isArray(years)) {
+    throw new Error("Hierarchical Dropbox state root observations.years is not an array");
+  }
+  const references: DropboxMonthStateReference[] = [];
+  for (const rawYear of years) {
+    if (!rawYear || typeof rawYear !== "object" || Array.isArray(rawYear)) continue;
+    const year = String((rawYear as JsonObject).year || "").trim();
+    if (!/^\d{4}$/.test(year)) {
+      throw new Error(`Invalid hierarchical Dropbox state year: ${year}`);
+    }
+    const months = (rawYear as JsonObject).months;
+    if (!Array.isArray(months)) continue;
+    for (const rawMonth of months) {
+      if (!rawMonth || typeof rawMonth !== "object" || Array.isArray(rawMonth)) continue;
+      const month = String((rawMonth as JsonObject).month || "").trim().padStart(2, "0");
+      if (!/^(0[1-9]|1[0-2])$/.test(month)) {
+        throw new Error(`Invalid hierarchical Dropbox state month: ${month}`);
+      }
+      references.push({
+        year,
+        month,
+        stateKey: normalizeHierarchicalStateKey(
+          (rawMonth as JsonObject).state_shard_key,
+        ),
+      });
+    }
+  }
+  references.sort((left, right) =>
+    `${left.year}-${left.month}-${left.stateKey}`.localeCompare(
+      `${right.year}-${right.month}-${right.stateKey}`,
+    )
+  );
+  return references;
+}
+
+function parseHierarchicalMonthStateDays(
+  shard: JsonObject,
+  expectedYear: string,
+  expectedMonth: string,
+): Set<string> {
+  if (
+    shard.kind !== HIERARCHICAL_MONTH_STATE_KIND
+    || shard.backup_version !== "v2"
+    || shard.domain !== "observations"
+  ) {
+    throw new Error("Hierarchical Dropbox month state identity mismatch");
+  }
+  if (String(shard.year || "").trim() !== expectedYear) {
+    throw new Error("Hierarchical Dropbox month state year mismatch");
+  }
+  if (String(shard.month || "").trim().padStart(2, "0") !== expectedMonth) {
+    throw new Error("Hierarchical Dropbox month state month mismatch");
+  }
+  if (!Array.isArray(shard.days)) {
+    throw new Error("Hierarchical Dropbox month state days is not an array");
+  }
+  const days = new Set<string>();
+  for (const rawDay of shard.days) {
+    if (!rawDay || typeof rawDay !== "object" || Array.isArray(rawDay)) {
+      throw new Error("Hierarchical Dropbox month state contains an invalid day entry");
+    }
+    const day = normalizeIsoDay((rawDay as JsonObject).day_utc);
+    if (!day || !day.startsWith(`${expectedYear}-${expectedMonth}-`)) {
+      throw new Error("Hierarchical Dropbox month state contains an invalid day_utc");
+    }
+    days.add(day);
+  }
+  return days;
+}
+
+async function mapWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  let nextIndex = 0;
+  const runners = Array.from(
+    { length: Math.min(Math.max(1, concurrency), Math.max(1, items.length)) },
+    async () => {
+      while (true) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= items.length) return;
+        await worker(items[index]);
+      }
+    },
+  );
+  await Promise.all(runners);
+}
+
+function daySetBounds(days: Set<string>): { earliest: string | null; latest: string | null } {
+  const sorted = Array.from(days).filter((day) => normalizeIsoDay(day) === day).sort();
+  return {
+    earliest: sorted.length ? sorted[0] : null,
+    latest: sorted.length ? sorted[sorted.length - 1] : null,
+  };
+}
+
+function dropboxBackupDaysDiagnostics(days: R2DaySets): JsonObject {
+  const observations = daySetBounds(days.observations);
+  const aqilevels = daySetBounds(days.aqilevels);
+  return {
+    dropbox_backup_observations_earliest_day: observations.earliest,
+    dropbox_backup_observations_latest_day: observations.latest,
+    dropbox_backup_aqilevels_earliest_day: aqilevels.earliest,
+    dropbox_backup_aqilevels_latest_day: aqilevels.latest,
+  };
+}
+
+function filterDropboxBackupDaysForReadVersion(
+  dropboxDays: R2DaySets,
+  r2Days: R2DaySets | null,
+  readVersion: R2HistoryReadVersionResolution,
+): { days: R2DaySets; warning: string | null } {
+  if (!["v2", "v3"].includes(readVersion.version)) {
+    return { days: dropboxDays, warning: null };
+  }
+  if (!r2Days) {
+    return {
+      days: { observations: new Set<string>(), aqilevels: new Set<string>() },
+      warning: `Active R2 history version is ${readVersion.version} but explicit ${readVersion.version} history-days data is unavailable; ignoring Dropbox checkpoint day coverage because it is not verified.`,
+    };
+  }
+
+  const filtered: R2DaySets = { observations: new Set<string>(), aqilevels: new Set<string>() };
+  const warnings: string[] = [];
+  for (const domainName of ["observations", "aqilevels"] as const) {
+    const r2Set = r2Days[domainName];
+    const dropboxSet = dropboxDays[domainName];
+    const r2Bounds = daySetBounds(r2Set);
+    const dropboxBounds = daySetBounds(dropboxSet);
+    for (const day of dropboxSet) {
+      if (r2Set.has(day)) {
+        filtered[domainName].add(day);
+      }
+    }
+    if (r2Bounds.earliest && dropboxBounds.earliest && dropboxBounds.earliest < r2Bounds.earliest) {
+      warnings.push(
+        `Dropbox ${domainName} checkpoint claims ${dropboxBounds.earliest} before explicit ${readVersion.version} R2 history starts at ${r2Bounds.earliest}; earlier Dropbox days ignored.`,
+      );
+    }
+    const ignoredCount = dropboxSet.size - filtered[domainName].size;
+    if (ignoredCount > 0) {
+      warnings.push(`Ignored ${ignoredCount} unverified Dropbox ${domainName} day(s) for the ${readVersion.version} serving generation.`);
+    }
+  }
+  return { days: filtered, warning: warnings.length ? warnings.join(" ") : null };
+}
+
+function buildStorageCoverageRows(
+  dbRows: unknown[],
+  schemaRows: unknown[],
+  r2Days: R2DaySets | null,
+  dropboxDays: R2DaySets,
+): unknown[] {
+  const ingestOldest = latestOldestDay(
+    dbRows,
+    (row) => String(row.database_label || "").trim().toLowerCase() === "ingestdb",
+  );
+  const obsOldest = latestOldestDay(
+    dbRows,
+    (row) => String(row.database_label || "").trim().toLowerCase() === "obs_aqidb",
+  );
+  const aqiOldest = latestOldestDay(
+    schemaRows,
+    (row) => String(row.schema_name || "").trim().toLowerCase() === "uk_aq_aqilevels",
+  );
+  const dateCandidates: Date[] = [];
+  for (const value of [ingestOldest, obsOldest, aqiOldest]) {
+    const parsed = parseIsoDay(value);
+    if (parsed) {
+      dateCandidates.push(parsed);
+    }
+  }
+  for (const day of r2Days?.observations || []) {
+    const parsed = parseIsoDay(day);
+    if (parsed) {
+      dateCandidates.push(parsed);
+    }
+  }
+  for (const day of r2Days?.aqilevels || []) {
+    const parsed = parseIsoDay(day);
+    if (parsed) {
+      dateCandidates.push(parsed);
+    }
+  }
+  for (const day of dropboxDays.observations) {
+    const parsed = parseIsoDay(day);
+    if (parsed) {
+      dateCandidates.push(parsed);
+    }
+  }
+  for (const day of dropboxDays.aqilevels) {
+    const parsed = parseIsoDay(day);
+    if (parsed) {
+      dateCandidates.push(parsed);
+    }
+  }
+
+  const today = new Date();
+  const todayUtc = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
+  const defaultStart = addUtcDays(todayUtc, -90);
+  const minStart = dateCandidates.length
+    ? new Date(Math.min(...dateCandidates.map((item) => item.getTime())))
+    : defaultStart;
+  const start = minStart.getTime() < defaultStart.getTime() ? minStart : defaultStart;
+
+  const ingestStart = parseIsoDay(ingestOldest);
+  const obsStart = parseIsoDay(obsOldest);
+  const aqiStart = parseIsoDay(aqiOldest);
+  const rows: unknown[] = [];
+  for (let cursor = new Date(start.getTime()); cursor.getTime() <= todayUtc.getTime(); cursor = addUtcDays(cursor, 1)) {
+    const day = toIsoDay(cursor);
+    const r2Observs = Boolean(r2Days?.observations.has(day));
+    rows.push({
+      date: day,
+      ingest: Boolean(ingestStart && cursor.getTime() >= ingestStart.getTime()) && !r2Observs,
+      obs_aqi_observs: Boolean(obsStart && cursor.getTime() >= obsStart.getTime()),
+      obs_aqi_aqilevels: Boolean(aqiStart && cursor.getTime() >= aqiStart.getTime()),
+      r2_observs: r2Observs,
+      r2_aqilevels: Boolean(r2Days?.aqilevels.has(day)),
+      dropbox_observs: dropboxDays.observations.has(day),
+      dropbox_aqilevels: dropboxDays.aqilevels.has(day),
+      isToday: cursor.getTime() === todayUtc.getTime(),
+    });
+  }
+  return rows;
+}
+
+async function fetchServiceEgressMetrics(env: WorkerEnv): Promise<{ rows: unknown[]; error: string | null }> {
+  try {
+    const restBase = obsRestBase(env);
+    const key = requireObsServiceKey(env);
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const rows = await fetchAllRows(
+      restBase,
+      "uk_aq_service_egress_metrics_minute",
+      postgrestHeaders(key, defaultPublicSchema(env)),
+      {
+        select: "bucket_minute,env_name,project_ref,service_name,source_type,source_name,route_name,query_name,window_label,status,request_count,response_rows,response_bytes_est,upstream_bytes_est,duration_ms,error_count,notes",
+        bucket_minute: `gte.${toPostgrestTimestamp(since)}`,
+        env_name: `eq.${String(env.UKAQ_ENV_NAME || "TEST").trim() || "TEST"}`,
+        order: "bucket_minute.asc",
+      },
+      1000,
+      env,
+      10_000,
+    );
+    return {
+      rows,
+      error: rows.length >= 10_000
+        ? "Service egress minute view reached the 10000-row dashboard bound"
+        : null,
+    };
+  } catch (err) {
+    return { rows: [], error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function fetchDashboardBaseData(
+  env: WorkerEnv,
+  options: {
+    includeIngestContext: boolean;
+    includeMetricContext: boolean;
+    includeStorageCoverage: boolean;
+    dispatchCursor: Date | null;
+    forceRefresh: boolean;
+  },
+): Promise<DashboardPayload> {
+  const now = new Date();
+  const ingestBase = ingestRestBase(env);
+  const serviceKey = requireServiceKey(env);
+  const coreSchema = defaultCoreSchema(env);
+  const headersCore = postgrestHeaders(serviceKey, coreSchema);
+  const connectorsSettings: unknown[] = [];
+  const dispatchRuns: unknown[] = [];
+  const connectorMap = new Map<number, { connector_code: string; label: string }>();
+  const ingestSummaryRows: JsonObject[] = [];
+  let dispatcherSettings: JsonObject = {
+    id: 1,
+    dispatcher_parallel_ingest: false,
+    max_runs_per_dispatch_call: 1,
+    updated_at: null,
+  };
+  let r2_history_read_version = resolveR2HistoryReadVersion(env);
+  let r2_history_read_version_effective = resolveR2HistoryReadVersion(env);
+
+  if (options.includeIngestContext) {
+    const connectors = await fetchAllRows(
+      ingestBase,
+      "connectors",
+      headersCore,
+      {
+        select: "id,connector_code,label,display_name,last_run_start,last_run_end,poll_enabled,poll_interval_minutes,poll_window_hours,poll_timeseries_batch_size,scheduler_backend",
+        order: "connector_code.asc",
+      },
+      1000,
+      env,
+    );
+    for (const row of connectors) {
+      const idValue = Number(row.id);
+      if (Number.isFinite(idValue)) {
+        connectorMap.set(idValue, {
+          connector_code: String(row.connector_code || ""),
+          label: String(row.label || ""),
+        });
+      }
+      connectorsSettings.push({
+        id: row.id ?? null,
+        connector_code: row.connector_code ?? "",
+        label: row.label ?? "",
+        display_name: row.display_name ?? "",
+        poll_enabled: row.poll_enabled ?? null,
+        poll_interval_minutes: row.poll_interval_minutes ?? null,
+        poll_window_hours: row.poll_window_hours ?? null,
+        poll_timeseries_batch_size: row.poll_timeseries_batch_size ?? null,
+        scheduler_backend: row.scheduler_backend || "supabase_function",
+      });
+    }
+
+    const summaryRows = await fetchJsonArray(
+      buildUrl(ingestBase, "rpc/uk_aq_rpc_dashboard_ingest_summary_v1"),
+      {
+        method: "POST",
+        headers: postgrestHeaders(serviceKey, defaultPublicSchema(env), true),
+        body: JSON.stringify({ p_as_of: now.toISOString() }),
+      },
+      "Dashboard ingest summary RPC",
+      env,
+      "dashboard_ingest_summary",
+    );
+    for (const row of summaryRows) {
+      if (row && typeof row === "object" && !Array.isArray(row)) {
+        ingestSummaryRows.push(row as JsonObject);
+      }
+    }
+
+    const dispatchWindowMinutes = 240;
+    const overlapSeconds = 120;
+    const fetchLimit = 1000;
+    const createdSince = options.dispatchCursor
+      ? new Date(options.dispatchCursor.getTime() - overlapSeconds * 1000)
+      : new Date(now.getTime() - dispatchWindowMinutes * 60_000);
+    const ingestRunsRows = await fetchJsonArray(
+      buildUrl(ingestBase, "uk_aq_ingest_runs", {
+        select: "id,connector_id,connector_code,run_started_at,run_ended_at,run_status,run_message,last_observed_at,stations_updated,observations_upserted,timeseries_updated,series_polled,response_status,response_payload,created_at",
+        order: "created_at.desc.nullslast",
+        created_at: `gte.${toPostgrestTimestamp(createdSince)}`,
+        limit: String(fetchLimit),
+      }),
+      { method: "GET", headers: headersCore },
+      "ingest runs",
+      env,
+    );
+    const latestByConnector = new Map<number, JsonObject>();
+    const normalizedRuns: JsonObject[] = [];
+    for (const raw of ingestRunsRows) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        continue;
+      }
+      const row = raw as JsonObject;
+      const connectorId = Number(row.connector_id);
+      const runTs = parseTimestamp(row.run_ended_at) || parseTimestamp(row.run_started_at);
+      if (Number.isFinite(connectorId) && runTs) {
+        const current = latestByConnector.get(connectorId);
+        const currentTs = current ? parseTimestamp(current.run_ended_at) || parseTimestamp(current.run_started_at) : null;
+        if (!current || !currentTs || runTs.getTime() > currentTs.getTime()) {
+          latestByConnector.set(connectorId, row);
+        }
+      }
+      const connectorMeta = connectorMap.get(connectorId);
+      normalizedRuns.push({
+        ...row,
+        connector_label: connectorMeta?.label || row.connector_code || "",
+        run_timestamp: row.run_ended_at || row.run_started_at || null,
+        in_flight_minutes: null,
+        in_flight_over_threshold: false,
+      });
+    }
+
+    const inFlightWarnMinutes = 5;
+    const inFlightMaxAgeMinutes = 180;
+    const inFlightRows: JsonObject[] = [];
+    for (const raw of connectorsSettings) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+        continue;
+      }
+      const connector = raw as JsonObject;
+      const connectorId = Number(connector.id);
+      if (!Number.isFinite(connectorId)) {
+        continue;
+      }
+      const latestRun = latestByConnector.get(connectorId);
+      if (latestRun) {
+        const startedAt = parseTimestamp(latestRun.run_started_at);
+        const endedAt = parseTimestamp(latestRun.run_ended_at);
+        if (startedAt && !endedAt) {
+          const minutes = Math.max(0, Math.trunc((now.getTime() - startedAt.getTime()) / 60_000));
+          inFlightRows.push({
+            connector_id: connectorId,
+            connector_code: latestRun.connector_code || connector.connector_code || "",
+            connector_label: connector.label || latestRun.connector_code || "",
+            run_started_at: startedAt.toISOString(),
+            run_ended_at: null,
+            run_status: "running",
+            run_message: "in_flight",
+            last_observed_at: null,
+            stations_updated: null,
+            observations_upserted: null,
+            timeseries_updated: null,
+            series_polled: null,
+            run_timestamp: startedAt.toISOString(),
+            in_flight_minutes: minutes,
+            in_flight_over_threshold: minutes >= inFlightWarnMinutes,
+          });
+        }
+        continue;
+      }
+      const lastRunStart = parseTimestamp(connector.last_run_start);
+      const lastRunEnd = parseTimestamp(connector.last_run_end);
+      if (lastRunStart && !lastRunEnd) {
+        const minutes = Math.max(0, Math.trunc((now.getTime() - lastRunStart.getTime()) / 60_000));
+        if (minutes <= inFlightMaxAgeMinutes) {
+          inFlightRows.push({
+            connector_id: connectorId,
+            connector_code: connector.connector_code || "",
+            connector_label: connector.label || connector.connector_code || "",
+            run_started_at: lastRunStart.toISOString(),
+            run_ended_at: null,
+            run_status: "running",
+            run_message: "in_flight",
+            last_observed_at: null,
+            stations_updated: null,
+            observations_upserted: null,
+            timeseries_updated: null,
+            series_polled: null,
+            run_timestamp: lastRunStart.toISOString(),
+            in_flight_minutes: minutes,
+            in_flight_over_threshold: minutes >= inFlightWarnMinutes,
+          });
+        }
+      }
+    }
+    const mergedRuns = [...inFlightRows, ...normalizedRuns];
+    mergedRuns.sort((a, b) => {
+      const aTs = parseTimestamp(a.run_timestamp) || new Date(0);
+      const bTs = parseTimestamp(b.run_timestamp) || new Date(0);
+      return bTs.getTime() - aTs.getTime();
+    });
+    dispatchRuns.push(...mergedRuns);
+
+    const dispatcherRows = await fetchJsonArray(
+      buildUrl(ingestBase, "dispatcher_settings", {
+        select: "id,dispatcher_parallel_ingest,max_runs_per_dispatch_call,updated_at",
+        id: "eq.1",
+        limit: "1",
+      }),
+      { method: "GET", headers: headersCore },
+      "dispatcher settings",
+      env,
+    );
+    const row = dispatcherRows.find((item): item is JsonObject => !!item && typeof item === "object" && !Array.isArray(item));
+    if (row) {
+      dispatcherSettings = {
+        id: row.id ?? 1,
+        dispatcher_parallel_ingest: Boolean(row.dispatcher_parallel_ingest),
+        max_runs_per_dispatch_call: row.max_runs_per_dispatch_call || 1,
+        updated_at: row.updated_at || null,
+      };
+    }
+  }
+
+  const pollutantsPayload: unknown[] = [];
+  if (options.includeIngestContext) {
+    pollutantsPayload.push(...buildPollutantsPayload(ingestSummaryRows, connectorMap));
+  }
+
+  let db_size_metrics: unknown[] = [];
+  let schema_size_metrics: unknown[] = [];
+  let r2_domain_size_metrics: unknown[] = [];
+  let db_size_metrics_error: string | null = null;
+  let schema_size_metrics_error: string | null = null;
+  let r2_domain_size_metrics_error: string | null = null;
+  let r2_usage: JsonObject | null = null;
+  let r2_usage_error: string | null = null;
+  let service_egress_metrics: unknown[] = [];
+  let service_egress_metrics_error: string | null = null;
+  let r2_backup_window: JsonObject | null = null;
+  let r2_backup_window_error: string | null = null;
+  let r2_history_days_bucket: string | null = null;
+  let r2_history_days_error: string | null = null;
+  let dropbox_backup_state_path: string | null = null;
+  let dropbox_backup_state_error: string | null = null;
+  let dropbox_backup_state_source: string | null = null;
+  let dropbox_backup_state_attempted_paths: string[] = [];
+  let dropbox_backup_state_cache_key: string | null = null;
+  let dropbox_backup_state_warning: string | null = null;
+  let dropbox_backup_state_fallback_attempted = false;
+  let dropbox_backup_observations_earliest_day: string | null = null;
+  let dropbox_backup_observations_latest_day: string | null = null;
+  let dropbox_backup_aqilevels_earliest_day: string | null = null;
+  let dropbox_backup_aqilevels_latest_day: string | null = null;
+  let storage_coverage_days: unknown[] = [];
+
+  if (options.includeMetricContext || options.includeStorageCoverage) {
+    const [dbMetrics, r2Usage, r2History, egress, dropboxState] = await Promise.all([
+      fetchDbMetrics(env),
+      fetchR2Usage(env, options.forceRefresh),
+      fetchR2HistoryDays(env, options.forceRefresh),
+      fetchServiceEgressMetrics(env),
+      fetchDropboxStateJson(env),
+    ]);
+    db_size_metrics = dbMetrics.dbRows;
+    schema_size_metrics = dbMetrics.schemaRows;
+    r2_domain_size_metrics = dbMetrics.r2DomainRows;
+    db_size_metrics_error = dbMetrics.dbError;
+    schema_size_metrics_error = dbMetrics.schemaError;
+    r2_domain_size_metrics_error = dbMetrics.r2DomainError;
+    r2_usage = r2Usage.usage;
+    r2_usage_error = r2Usage.error;
+    service_egress_metrics = egress.rows;
+    service_egress_metrics_error = egress.error;
+    r2_history_days_bucket = r2History.bucket;
+    r2_history_days_error = r2History.error;
+    r2_backup_window = r2History.window;
+    // Update read version from fetched r2History
+    const readVersion = r2History.readVersion;
+    r2_history_read_version = readVersion;
+    r2_history_read_version_effective = readVersion;
+    dropbox_backup_state_path = dropboxState.path;
+    dropbox_backup_state_error = dropboxState.error;
+    dropbox_backup_state_source = dropboxState.source;
+    dropbox_backup_state_attempted_paths = dropboxState.attemptedPaths;
+    dropbox_backup_state_cache_key = dropboxState.cacheKey;
+    dropbox_backup_state_warning = dropboxState.warning;
+    dropbox_backup_state_fallback_attempted = dropboxState.fallbackAttempted;
+    const filteredDropbox = filterDropboxBackupDaysForReadVersion(
+      dropboxState.days,
+      r2History.daySets,
+      r2_history_read_version,
+    );
+    const dropboxDays = filteredDropbox.days;
+    const dropboxDiagnostics = dropboxBackupDaysDiagnostics(dropboxDays);
+    dropbox_backup_observations_earliest_day =
+      dropboxDiagnostics.dropbox_backup_observations_earliest_day as string | null;
+    dropbox_backup_observations_latest_day =
+      dropboxDiagnostics.dropbox_backup_observations_latest_day as string | null;
+    dropbox_backup_aqilevels_earliest_day =
+      dropboxDiagnostics.dropbox_backup_aqilevels_earliest_day as string | null;
+    dropbox_backup_aqilevels_latest_day =
+      dropboxDiagnostics.dropbox_backup_aqilevels_latest_day as string | null;
+    if (filteredDropbox.warning) {
+      dropbox_backup_state_warning = dropbox_backup_state_warning
+        ? `${dropbox_backup_state_warning} ${filteredDropbox.warning}`
+        : filteredDropbox.warning;
+    }
+    if (!r2_backup_window && !["v2", "v3"].includes(r2_history_read_version.version)) {
+      const fallbackWindow = await fetchR2BackupWindowFromSupabase(env);
+      r2_backup_window = fallbackWindow.window;
+      r2_backup_window_error = fallbackWindow.error;
+      if (r2_history_days_error) {
+        r2_backup_window_error = r2_backup_window_error
+          ? `${r2_history_days_error}; ${r2_backup_window_error}`
+          : r2_history_days_error;
+      }
+    } else if (!r2_backup_window && ["v2", "v3"].includes(r2_history_read_version.version)) {
+      r2_backup_window_error = r2_history_days_error ||
+        `R2 history-days API did not return a ${r2_history_read_version.version} window; version-blind Supabase window fallback disabled for the selected serving generation.`;
+    }
+    if (options.includeStorageCoverage) {
+      storage_coverage_days = buildStorageCoverageRows(
+        dbMetrics.dbRows,
+        dbMetrics.schemaRows,
+        r2History.daySets,
+        dropboxDays,
+      );
+    }
+  }
+
+  let dispatchCursorValue: string | null = null;
+  for (const row of dispatchRuns) {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      continue;
+    }
+    const createdAt = parseTimestamp((row as JsonObject).created_at);
+    if (!createdAt) {
+      continue;
+    }
+    const iso = createdAt.toISOString().replace(/\.\d{3}Z$/, "Z");
+    if (!dispatchCursorValue || iso > dispatchCursorValue) {
+      dispatchCursorValue = iso;
+    }
+  }
+
+  return {
+    project_ref: extractProjectRef(String(env.SUPABASE_URL || "")),
+    obs_aqidb_project_ref: extractProjectRef(String(env.OBS_AQIDB_SUPABASE_URL || "")),
+    generated_at: now.toISOString(),
+    dispatch_cursor: dispatchCursorValue,
+    buckets: [...BUCKETS],
+    db_size_metrics,
+    schema_size_metrics,
+    r2_domain_size_metrics,
+    db_size_metrics_error,
+    schema_size_metrics_error,
+    r2_domain_size_metrics_error,
+    r2_usage,
+    r2_usage_error,
+    service_egress_metrics,
+    service_egress_metrics_error,
+    r2_backup_window,
+    r2_backup_window_error,
+    r2_history_days_bucket,
+    r2_history_days_error,
+    dropbox_backup_state_path,
+    dropbox_backup_state_error,
+    dropbox_backup_state_source,
+    dropbox_backup_state_attempted_paths,
+    dropbox_backup_state_cache_key,
+    dropbox_backup_state_warning,
+    dropbox_backup_state_fallback_attempted,
+    dropbox_backup_observations_earliest_day,
+    dropbox_backup_observations_latest_day,
+    dropbox_backup_aqilevels_earliest_day,
+    dropbox_backup_aqilevels_latest_day,
+    storage_coverage_source: "live_per_day_presence",
+    storage_coverage_days,
+    r2_history_read_version,
+    r2_history_read_version_effective,
+    pollutants: pollutantsPayload,
+    dispatch_runs: dispatchRuns,
+    dispatcher_settings: dispatcherSettings,
+    connectors_settings: connectorsSettings,
+  };
+}
+
+function dashboardCacheKey(search: URLSearchParams, env: WorkerEnv): string {
+  const includeStorage = asBoolFlag(search.get("include_storage_coverage"), true) ? "1" : "0";
+  const includeMetric = asBoolFlag(search.get("include_metric_context"), true) ? "1" : "0";
+  const includeIngest = asBoolFlag(search.get("include_ingest_context"), true) ? "1" : "0";
+  const storageKey = includeStorage === "1" ? storageCoverageCacheKey(env) : "storage_coverage:disabled";
+  return `${r2HistoryReadVersionCacheKey(env)}|storage=${includeStorage}|metric=${includeMetric}|ingest=${includeIngest}|${storageKey}`;
+}
+
+export async function getDirectDashboardPayload(
+  env: WorkerEnv,
+  search: URLSearchParams,
+): Promise<DashboardPayload> {
+  const forceRefresh = asTruthy(search.get("force"));
+  const cacheKey = dashboardCacheKey(search, env);
+  if (!forceRefresh) {
+    const cached = dashboardCache.get(cacheKey);
+    if (cached && Date.now() <= cached.expiresAt) {
+      return cached.value;
+    }
+  }
+
+  const payload = await fetchDashboardBaseData(env, {
+    includeStorageCoverage: asBoolFlag(search.get("include_storage_coverage"), true),
+    includeMetricContext: asBoolFlag(search.get("include_metric_context"), true),
+    includeIngestContext: asBoolFlag(search.get("include_ingest_context"), true),
+    dispatchCursor: null,
+    forceRefresh,
+  });
+  if (historyResolution(env).version === "v3") {
+    payload.r2_domain_size_metrics = [];
+    payload.r2_domain_size_metrics_error = "Historical domain byte metrics have no generation identity; unavailable for v3";
+  }
+  dashboardCache.set(cacheKey, { value: payload, expiresAt: Date.now() + DASHBOARD_TTL_MS });
+  return payload;
+}
+
+export async function getDirectStorageCoveragePayload(
+  env: WorkerEnv,
+  search: URLSearchParams,
+): Promise<{
+  generated_at: string;
+  storage_coverage_source: string;
+  storage_coverage_days: unknown[];
+  r2_backup_window: JsonObject | null;
+  r2_backup_window_error: string | null;
+  r2_history_days_bucket: string | null;
+  r2_history_days_error: string | null;
+  r2_history_read_version: R2HistoryReadVersionResolution;
+  r2_history_read_version_effective: R2HistoryReadVersionResolution;
+  dropbox_backup_state_path: string | null;
+  dropbox_backup_state_error: string | null;
+  dropbox_backup_state_source: string | null;
+  dropbox_backup_state_attempted_paths: string[];
+  dropbox_backup_state_cache_key: string | null;
+  dropbox_backup_state_warning: string | null;
+  dropbox_backup_state_fallback_attempted: boolean;
+  dropbox_backup_observations_earliest_day: string | null;
+  dropbox_backup_observations_latest_day: string | null;
+  dropbox_backup_aqilevels_earliest_day: string | null;
+  dropbox_backup_aqilevels_latest_day: string | null;
+}> {
+  const forceRefresh = asTruthy(search.get("force"));
+  if (forceRefresh) {
+    clearStorageCoverageCaches();
+  }
+  const cacheKey = storageCoverageCacheKey(env);
+  if (!forceRefresh && storageCoverageCacheVersionKey === cacheKey) {
+    const cached = cacheGet(storageCoverageCache);
+    if (cached) {
+      return cached;
+    }
+  }
+  const payload = await fetchDashboardBaseData(env, {
+    includeStorageCoverage: true,
+    includeMetricContext: true,
+    includeIngestContext: false,
+    dispatchCursor: null,
+    forceRefresh,
+  });
+  const response = {
+    generated_at: nowIso(),
+    storage_coverage_source: payload.storage_coverage_source,
+    storage_coverage_days: Array.isArray(payload.storage_coverage_days) ? payload.storage_coverage_days : [],
+    r2_backup_window: payload.r2_backup_window || null,
+    r2_backup_window_error: payload.r2_backup_window_error || null,
+    r2_history_days_bucket: payload.r2_history_days_bucket || null,
+    r2_history_days_error: payload.r2_history_days_error || null,
+    r2_history_read_version: payload.r2_history_read_version || resolveR2HistoryReadVersion(env),
+    r2_history_read_version_effective: payload.r2_history_read_version_effective || payload.r2_history_read_version || resolveR2HistoryReadVersion(env),
+    dropbox_backup_state_path: payload.dropbox_backup_state_path || null,
+    dropbox_backup_state_error: payload.dropbox_backup_state_error || null,
+    dropbox_backup_state_source: payload.dropbox_backup_state_source || null,
+    dropbox_backup_state_attempted_paths: payload.dropbox_backup_state_attempted_paths || [],
+    dropbox_backup_state_cache_key: payload.dropbox_backup_state_cache_key || null,
+    dropbox_backup_state_warning: payload.dropbox_backup_state_warning || null,
+    dropbox_backup_state_fallback_attempted: payload.dropbox_backup_state_fallback_attempted || false,
+    dropbox_backup_observations_earliest_day: payload.dropbox_backup_observations_earliest_day || null,
+    dropbox_backup_observations_latest_day: payload.dropbox_backup_observations_latest_day || null,
+    dropbox_backup_aqilevels_earliest_day: payload.dropbox_backup_aqilevels_earliest_day || null,
+    dropbox_backup_aqilevels_latest_day: payload.dropbox_backup_aqilevels_latest_day || null,
+  };
+  storageCoverageCacheVersionKey = cacheKey;
+  storageCoverageCache = { value: response, expiresAt: Date.now() + STORAGE_COVERAGE_TTL_MS };
+  return response;
+}
+
+export async function getDirectR2MetricsPayload(
+  env: WorkerEnv,
+  search: URLSearchParams,
+): Promise<JsonObject> {
+  const forceRefresh = asTruthy(search.get("force"));
+  const [r2Usage, r2History] = await Promise.all([
+    fetchR2Usage(env, forceRefresh),
+    fetchR2HistoryDays(env, forceRefresh),
+  ]);
+  const fallbackWindow = ["v2", "v3"].includes(r2History.readVersion.version)
+    ? {
+      window: null,
+      error: `Version-blind Supabase window fallback disabled for the ${r2History.readVersion.version} serving generation.`,
+    }
+    : await fetchR2BackupWindowFromSupabase(env);
+  const window = r2History.window || fallbackWindow.window;
+  let windowError: string | null = null;
+  if (r2History.error && fallbackWindow.error) {
+    windowError = `${r2History.error}; ${fallbackWindow.error}`;
+  } else if (r2History.error) {
+    windowError = r2History.error;
+  } else if (!r2History.window && fallbackWindow.error) {
+    windowError = fallbackWindow.error;
+  }
+  return {
+    r2_usage: r2Usage.usage,
+    r2_usage_error: r2Usage.error,
+    r2_backup_window: window,
+    r2_backup_window_error: windowError,
+    r2_history_read_version: r2History.readVersion,
+    r2_history_days_bucket: r2History.bucket,
+    r2_history_days_error: r2History.error,
+    generated_at: nowIso(),
+  };
+}
+
+export async function getDirectR2ConnectorCountsPayload(
+  env: WorkerEnv,
+  search: URLSearchParams,
+): Promise<JsonObject> {
+  const apiUrl = resolveR2HistoryCountsApiUrl(env);
+  if (!apiUrl) {
+    throw new Error("R2 history-counts API not configured.");
+  }
+  const headers = new Headers();
+  headers.set("Accept", "application/json");
+  const token = resolveR2HistoryCountsApiToken(env);
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+  let params: Record<string, string> = {};
+  for (const key of ["from_day", "to_day", "grain", "connector_ids"] as const) {
+    const value = String(search.get(key) || "").trim();
+    if (value) {
+      params[key] = value;
+    }
+  }
+  params = addR2HistoryReadVersionParam(params, env);
+  const payload = await fetchJsonObject(appendQueryParams(apiUrl, params), { method: "GET", headers }, "R2 history-counts API");
+  assertHistoryPayload(payload, env);
+  return payload;
+}
+
+export async function getDirectDailyTaskRunsPayload(
+  env: WorkerEnv,
+  search: URLSearchParams,
+): Promise<JsonObject> {
+  const mode = String(search.get("mode") || "latest").trim().toLowerCase();
+  if (!["latest", "all"].includes(mode)) {
+    throw new Error("mode must be latest or all");
+  }
+  const day = normalizeIsoDay(search.get("day")) || toIsoDay(new Date());
+  const restBase = obsRestBase(env);
+  const key = requireObsServiceKey(env);
+  const rows = await fetchJsonArray(
+    buildUrl(restBase, "daily_task_runs_dashboard", {
+      select: "run_id,task_key,task_name,platform,source,scheduled_for_date,scheduled_time_utc,scheduled_at_utc,attempt,raw_status,started_at,finished_at,failed_at,updated_at,duration_seconds,summary,error_message,log_url,effective_status,scheduled_or_started_at,finished_or_failed_at,is_failed,is_overdue,is_not_started,task_day_rank",
+      scheduled_for_date: `eq.${day}`,
+      order: "updated_at.desc.nullslast,run_id.desc",
+      limit: "500",
+      ...(mode === "latest" ? { task_day_rank: "eq.1" } : {}),
+    }),
+    {
+      method: "GET",
+      headers: postgrestHeaders(key, defaultOpsSchema(env)),
+    },
+    "daily_task_runs_dashboard",
+    env,
+  );
+  return {
+    day,
+    mode,
+    rows,
+    generated_at: nowIso(),
+  };
+}
+
+export async function getDirectDropboxMtimePayload(
+  env: WorkerEnv,
+  search: URLSearchParams,
+): Promise<JsonObject> {
+  const forceRefresh = asTruthy(search.get("force"));
+  if (!forceRefresh) {
+    const cached = cacheGet(dropboxMtimeCache);
+    if (cached) {
+      return {
+        ...cached.payload,
+        error: cached.error,
+      };
+    }
+  }
+  const remotePath = resolveDropboxStatePath(env).path;
+  const resolvedHistoryPath = resolveDropboxHistoryPath(env);
+  const { token, error: tokenError } = await fetchDropboxAccessToken(env);
+  if (tokenError) {
+    const payload = {
+      generated_at: nowIso(),
+      resolved_history_path: resolvedHistoryPath || null,
+      latest_mtime_utc: null,
+      latest_entry_path: null,
+    };
+    dropboxMtimeCache = { value: { payload, error: tokenError }, expiresAt: Date.now() + DROPBOX_MTIME_TTL_MS };
+    return { ...payload, error: tokenError };
+  }
+  if (!token || !remotePath) {
+    const payload = {
+      generated_at: nowIso(),
+      resolved_history_path: resolvedHistoryPath || null,
+      latest_mtime_utc: null,
+      latest_entry_path: null,
+    };
+    dropboxMtimeCache = { value: { payload, error: null }, expiresAt: Date.now() + DROPBOX_MTIME_TTL_MS };
+    return { ...payload, error: null };
+  }
+  const headers = new Headers();
+  headers.set("Authorization", `Bearer ${token}`);
+  headers.set("Content-Type", "application/json");
+  try {
+    const payload = await fetchJsonObject(
+      DROPBOX_GET_METADATA_URL,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ path: remotePath }),
+      },
+      "Dropbox metadata",
+    );
+    const latestMtime = payload.server_modified ? String(payload.server_modified) : null;
+    const response: JsonObject = {
+      generated_at: nowIso(),
+      resolved_history_path: resolvedHistoryPath || null,
+      latest_mtime_utc: latestMtime,
+      latest_entry_path: `dropbox:${remotePath}`,
+    };
+    dropboxMtimeCache = { value: { payload: response, error: null }, expiresAt: Date.now() + DROPBOX_MTIME_TTL_MS };
+    return { ...response, error: null };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    const payload = {
+      generated_at: nowIso(),
+      resolved_history_path: resolvedHistoryPath || null,
+      latest_mtime_utc: null,
+      latest_entry_path: `dropbox:${remotePath}`,
+    };
+    dropboxMtimeCache = { value: { payload, error }, expiresAt: Date.now() + DROPBOX_MTIME_TTL_MS };
+    return { ...payload, error };
+  }
+}
+
+export async function getDirectConfigPayload(env: WorkerEnv): Promise<JsonObject> {
+  const base = String(env.SUPABASE_URL || "").trim().replace(/\/+$/, "");
+  const rpc = "uk_aq_station_snapshot";
+  let defaultObsLimit = "all";
+  if (!["all", "100", "1000", "5000", "10000"].includes(defaultObsLimit)) {
+    defaultObsLimit = "all";
+  }
+  return {
+    edge_url: base ? `${base}/rest/v1/rpc/${rpc}` : null,
+    default_station_id: String(env.CLEANAIRSURB_ST_ID || "").trim(),
+    snapshot_mode: "service_role_postgrest_rpc",
+    has_obs_aqidb: Boolean(String(env.OBS_AQIDB_SUPABASE_URL || "").trim() && String(env.OBS_AQIDB_SECRET_KEY || "").trim()),
+    default_obs_limit: defaultObsLimit,
+  };
+}
+
+function parseSnapshotObsLimit(rawValue: string): number | null {
+  const value = rawValue.trim().toLowerCase();
+  if (!value || value === "all") {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    throw new Error("obs_limit must be a positive integer or 'all'.");
+  }
+  return Math.trunc(parsed);
+}
+
+export async function getDirectSnapshotPayload(env: WorkerEnv, search: URLSearchParams): Promise<JsonObject> {
+  const restBase = ingestRestBase(env);
+  const key = requireServiceKey(env);
+  const stationIdRaw = String(search.get("station_id") || "").trim();
+  const stationRefRaw = String(search.get("station_ref") || "").trim();
+  const timeseriesIdRaw = String(search.get("timeseries_id") || "").trim();
+  const window = String(search.get("window") || "24h").trim() || "24h";
+  const obsLimitRaw = String(search.get("obs_limit") || "all").trim();
+
+  const stationId = stationIdRaw ? Number(stationIdRaw) : null;
+  const timeseriesId = timeseriesIdRaw ? Number(timeseriesIdRaw) : null;
+  if ((!stationId || !Number.isFinite(stationId)) && !stationRefRaw) {
+    throw new Error("station_id or station_ref is required.");
+  }
+  if (stationIdRaw && !Number.isFinite(stationId || Number.NaN)) {
+    throw new Error("station_id must be numeric.");
+  }
+  if (timeseriesIdRaw && !Number.isFinite(timeseriesId || Number.NaN)) {
+    throw new Error("timeseries_id must be numeric.");
+  }
+  const obsLimit = parseSnapshotObsLimit(obsLimitRaw);
+  const rpc = "uk_aq_station_snapshot";
+
+  const rows = await fetchJsonArray(
+    buildUrl(restBase, `rpc/${rpc}`),
+    {
+      method: "POST",
+      headers: (() => {
+        const headers = postgrestHeaders(key, defaultPublicSchema(env), true);
+        headers.set("Content-Type", "application/json");
+        return headers;
+      })(),
+      body: JSON.stringify({
+        p_station_id: Number.isFinite(stationId || Number.NaN) ? stationId : null,
+        p_station_ref: stationRefRaw || null,
+        p_timeseries_id: Number.isFinite(timeseriesId || Number.NaN) ? timeseriesId : null,
+        p_window: window,
+        p_obs_limit: obsLimit,
+      }),
+    },
+    "station snapshot RPC",
+    env,
+  );
+  const payload = rows[0];
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { error: "Station not found.", station: null };
+  }
+  const response = payload as JsonObject;
+  const observations = Array.isArray(response.observations) ? response.observations : [];
+  response.observations = observations;
+  response.observations_all = Array.isArray(response.observations_all) ? response.observations_all : [...observations];
+  response.obs_aqidb_observations = Array.isArray(response.obs_aqidb_observations) ? response.obs_aqidb_observations : [];
+  response.obs_aqidb_observations_all = Array.isArray(response.obs_aqidb_observations_all) ? response.obs_aqidb_observations_all : [];
+  response.obs_aqidb_timeseries_aqi_hourly = Array.isArray(response.obs_aqidb_timeseries_aqi_hourly) ? response.obs_aqidb_timeseries_aqi_hourly : [];
+  response.obs_aqidb_timeseries_aqi_daily = Array.isArray(response.obs_aqidb_timeseries_aqi_daily) ? response.obs_aqidb_timeseries_aqi_daily : [];
+  return response;
+}
+
+export async function updateDirectConnectors(env: WorkerEnv, request: Request): Promise<Response> {
+  const body = (await request.json().catch(() => ({}))) as JsonObject;
+  const updatesRaw = body.updates;
+  if (!Array.isArray(updatesRaw)) {
+    return errorEnvelope("BAD_REQUEST", "Invalid payload: updates[] is required.", 400);
+  }
+  const restBase = ingestRestBase(env);
+  const key = requireServiceKey(env);
+  const headers = postgrestHeaders(key, defaultCoreSchema(env), true);
+  headers.set("Content-Type", "application/json");
+  headers.set("Prefer", "return=minimal");
+  for (const item of updatesRaw) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      continue;
+    }
+    const row = item as JsonObject;
+    const idValue = Number(row.id);
+    if (!Number.isFinite(idValue)) {
+      continue;
+    }
+    const payload: JsonObject = {
+      poll_enabled: row.poll_enabled ?? null,
+      poll_interval_minutes: row.poll_interval_minutes ?? null,
+      poll_window_hours: row.poll_window_hours ?? null,
+      poll_timeseries_batch_size: row.poll_timeseries_batch_size ?? null,
+      scheduler_backend: row.scheduler_backend || "supabase_function",
+    };
+    const response = await fetch(
+      buildUrl(restBase, "connectors", { id: `eq.${Math.trunc(idValue)}` }),
+      {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify(payload),
+      },
+    );
+    if (!response.ok) {
+      const detail = await response.text();
+      return errorEnvelope(
+        "UPSTREAM_HTTP_ERROR",
+        `Failed to update connector ${Math.trunc(idValue)} (${response.status}): ${detail}`,
+        502,
+      );
+    }
+  }
+  dashboardCache.clear();
+  return buildJsonResponse({ status: "ok" }, 200, "no-store");
+}
+
+export async function updateDirectDispatcherSettings(env: WorkerEnv, request: Request): Promise<Response> {
+  const body = (await request.json().catch(() => ({}))) as JsonObject;
+  const parallel = Boolean(body.dispatcher_parallel_ingest);
+  let maxRuns = Number(body.max_runs_per_dispatch_call);
+  if (!Number.isFinite(maxRuns) || maxRuns < 1) {
+    maxRuns = 1;
+  }
+  const restBase = ingestRestBase(env);
+  const key = requireServiceKey(env);
+  const headers = postgrestHeaders(key, defaultCoreSchema(env), true);
+  headers.set("Content-Type", "application/json");
+  headers.set("Prefer", "return=minimal");
+  const response = await fetch(
+    buildUrl(restBase, "dispatcher_settings", { id: "eq.1" }),
+    {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({
+        dispatcher_parallel_ingest: parallel,
+        max_runs_per_dispatch_call: Math.trunc(maxRuns),
+        updated_at: nowIso(),
+      }),
+    },
+  );
+  if (!response.ok) {
+    const detail = await response.text();
+    return errorEnvelope("UPSTREAM_HTTP_ERROR", `Failed to update dispatcher settings (${response.status}): ${detail}`, 502);
+  }
+  dashboardCache.clear();
+  return buildJsonResponse({ status: "ok" }, 200, "no-store");
+}
+
+export async function handleDirectCompatRoute(
+  request: Request,
+  env: WorkerEnv,
+  pathname: string,
+): Promise<Response> {
+  const search = new URL(request.url).searchParams;
+  try {
+    if (pathname === "/api/dashboard") {
+      const payload = await getDirectDashboardPayload(env, search);
+      return buildJsonResponse(payload, 200, "no-store");
+    }
+    if (pathname === "/api/storage_coverage") {
+      const payload = await getDirectStorageCoveragePayload(env, search);
+      return buildJsonResponse(payload, 200, "no-store");
+    }
+    if (pathname === "/api/r2_metrics") {
+      const payload = await getDirectR2MetricsPayload(env, search);
+      return buildJsonResponse(payload, 200, "no-store");
+    }
+    if (pathname === "/api/r2_connector_counts") {
+      const payload = await getDirectR2ConnectorCountsPayload(env, search);
+      return buildJsonResponse(payload, 200, "no-store");
+    }
+    if (pathname === "/api/operations_dropbox_mtime") {
+      const payload = await getDirectDropboxMtimePayload(env, search);
+      return buildJsonResponse(payload, 200, "no-store");
+    }
+    if (pathname === "/api/daily_task_runs") {
+      const payload = await getDirectDailyTaskRunsPayload(env, search);
+      return buildJsonResponse(payload, 200, "no-store");
+    }
+    if (pathname === "/api/config") {
+      const payload = await getDirectConfigPayload(env);
+      return buildJsonResponse(payload, 200, "no-store");
+    }
+    if (pathname === "/api/snapshot") {
+      const payload = await getDirectSnapshotPayload(env, search);
+      const status = payload.station === null ? 404 : 200;
+      return buildJsonResponse(payload, status, "no-store");
+    }
+    if (pathname === "/api/connectors") {
+      return updateDirectConnectors(env, request);
+    }
+    if (pathname === "/api/dispatcher_settings") {
+      return updateDirectDispatcherSettings(env, request);
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return errorEnvelope("DIRECT_BACKEND_ERROR", message, 500);
+  }
+  return errorEnvelope("NOT_FOUND", "Route not found", 404);
+}
