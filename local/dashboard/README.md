@@ -15,6 +15,11 @@ local/scripts/run_dashboard.sh
 
 The frontend served by this backend is `dashboard/index.html`.
 
+R2 operation billing periods, subscription/Billing Read configuration, refresh,
+TEST acceptance and the separate system-doc handover are described in
+[`docs/R2_BILLING_PERIOD_REPORTING.md`](../../docs/R2_BILLING_PERIOD_REPORTING.md).
+The existing Standard storage display remains unchanged.
+
 Legacy note:
 
 - dashboard Cloud Run deploy workflow is retired and archived at:

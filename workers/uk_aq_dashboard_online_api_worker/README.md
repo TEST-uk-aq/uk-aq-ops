@@ -2,6 +2,15 @@
 
 Cloudflare Worker API for the hosted UK AQ ops dashboard.
 
+R2 Class A/B reporting requires `UK_AQ_R2_BILLING_SUBSCRIPTION_ID` and an
+account-scoped Billing Read credential (existing read token or optional
+`UK_AQ_R2_BILLING_API_TOKEN`). Exact timestamps come from verified subscription
+metadata, not a day-of-month setting. See
+[R2 billing-period reporting](../../docs/R2_BILLING_PERIOD_REPORTING.md) for the
+source cross-check, direct/upstream cache guards, configuration/deployment and
+TEST acceptance. Billing failures leave the existing Standard storage display
+available and operation counts explicitly unavailable.
+
 ## Purpose
 
 - Keep browser code static and secret-free.

@@ -158,6 +158,14 @@ Latest and All runs are therefore display modes over the same local rows. Latest
 
 ## R2 latency
 
+R2 Class A/B billing periods use verified Cloudflare subscription metadata.
+See [R2 billing-period reporting](../../docs/R2_BILLING_PERIOD_REPORTING.md) for
+configuration, provenance/rollover guards, the additive `r2_refresh_pending`
+response and the real TEST acceptance sequence. A writer R2 refresh bypasses
+its process cache and refreshes metric context after collection. Expired or
+unverified operation counts cannot be presented as current. Standard storage
+fields/bar, MySQL schema/retention and calendar-only Refresh are unchanged.
+
 Normal local R2 account-usage rendering is served from MySQL after a successful hourly background fetch, so a slow Cloudflare response no longer needs to delay the browser. `r2_usage_hourly` also preserves a recent local trend across dashboard/refresher restarts.
 
 Persisting R2 usage does not make the actual Cloudflare API request faster. It moves that latency out of normal page rendering. The storage calendar's explicit Refresh has separate generation-selected history/Dropbox/coverage behaviour and does not refresh R2 account usage or other dashboard products.

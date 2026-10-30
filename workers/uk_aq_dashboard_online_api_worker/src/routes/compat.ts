@@ -7,6 +7,7 @@ import {
 } from "../lib/r2_metrics_service";
 import { enrichStorageCoverageResponse } from "../lib/storage_coverage_http_enrichment";
 import { proxyToUpstream, shouldUseUpstream, type WorkerEnv } from "../lib/upstream";
+import { billingConfigurationKey, billingTimestamp, guardR2Usage, r2OperationsError } from "../lib/r2_billing_period";
 
 const GET_ROUTES = new Set([
   "/api/config",
@@ -86,6 +87,13 @@ export async function handleCompatRoute(
       if (serviceResponse) return withHistoryDiagnostics(serviceResponse, env);
     }
 
+    const hasR2Usage = pathname === "/api/dashboard" || pathname === "/api/r2_metrics";
+    if (useUpstream && hasR2Usage) {
+      const url = new URL(request.url);
+      url.searchParams.set("__r2_billing", billingConfigurationKey(env));
+      request = new Request(url, request);
+    }
+
     let response = !useUpstream
       ? await handleDirectCompatRoute(request, env, pathname)
       : await proxyToUpstream(request, env, pathname, {
@@ -95,6 +103,24 @@ export async function handleCompatRoute(
           ignoredCacheSearchParams: pathname === "/api/dashboard"
             ? ["t", "ts", "dispatch_cursor"]
             : undefined,
+          validateCachedResponse: hasR2Usage ? async cached => {
+            try {
+              const body = await cached.json() as Record<string, unknown>;
+              const usage = body.r2_usage as Record<string, unknown> | null;
+              if (!usage) return true;
+              if (usage.class_a_used_requests === null && usage.class_b_used_requests === null && usage.billing_period_error) return true;
+              return !r2OperationsError(usage, env);
+            } catch { return false; }
+          } : undefined,
+          responseCacheSeconds: hasR2Usage ? async fresh => {
+            try {
+              const body = await fresh.json() as Record<string, unknown>;
+              const usage = body.r2_usage as Record<string, unknown> | null;
+              if (usage && r2OperationsError(usage, env)) return 60;
+              const end = billingTimestamp(usage?.billing_period_end_utc);
+              return Number.isFinite(end) ? Math.max(0, Math.floor((end - Date.now()) / 1000)) : GET_ROUTE_CACHE_SECONDS[pathname];
+            } catch { return 0; }
+          } : undefined,
         });
 
     if (historyRoute && useUpstream && response.ok) {
@@ -131,6 +157,9 @@ export async function handleCompatRoute(
 async function withHistoryDiagnostics(response: Response, env: WorkerEnv): Promise<Response> {
   if (!response.ok) return response;
   const body = await response.clone().json() as Record<string, unknown>;
+  if (body.r2_usage && typeof body.r2_usage === "object" && !Array.isArray(body.r2_usage)) {
+    body.r2_usage = guardR2Usage(body.r2_usage as Record<string, unknown>, env);
+  }
   const resolution = historyResolution(env);
   body.r2_history_read_version = resolution;
   body.r2_history_read_version_effective = resolution;

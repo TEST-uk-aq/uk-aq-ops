@@ -28,6 +28,7 @@ warnings.filterwarnings(
     message=r"urllib3 v2 only supports OpenSSL 1\.1\.1\+.*",
 )
 import requests
+import uk_aq_dashboard_r2_billing as r2_billing
 
 POLLUTANTS = {
     "pm25": {"label": "PM2.5"},
@@ -202,14 +203,14 @@ R2_FREE_ACTION_TYPES = {
     "AbortMultipartUpload",
 }
 R2_OPS_GQL_QUERY = """
-query R2OpsMonth($accountTag: string!, $startDate: Time!, $endDate: Time!) {
+query R2OpsBillingPeriod($accountTag: string!, $startDate: Time!, $endDate: Time!) {
   viewer {
     accounts(filter: { accountTag: $accountTag }) {
       r2OperationsAdaptiveGroups(
         limit: 10000
         filter: {
           datetime_geq: $startDate
-          datetime_leq: $endDate
+          datetime_lt: $endDate
         }
       ) {
         sum {
@@ -281,8 +282,7 @@ def _invalidate_dashboard_cache(clear_storage_coverage: bool = False) -> None:
     from uk_aq_dashboard_cache import request_refresh
     request_refresh("dashboard")
     with CACHE_LOCK:
-        for cache_bucket in ("with_coverage", "without_coverage"):
-            bucket_state = CACHE_STATE.get(cache_bucket)
+        for bucket_state in CACHE_STATE.values():
             if isinstance(bucket_state, dict):
                 bucket_state["data"] = None
                 bucket_state["generated_at"] = None
@@ -706,8 +706,17 @@ def _fetch_r2_operations_metrics(
     api_token: str,
     now: datetime,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    window_end = now.astimezone(timezone.utc)
-    window_start = window_end.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    try:
+        period = r2_billing.fetch_period(account_id, api_token)
+    except ValueError as exc:
+        return None, str(exc)
+    window_end = datetime.now(timezone.utc)
+    window_start = r2_billing.timestamp(period["billing_period_start_utc"])
+    period_end = r2_billing.timestamp(period["billing_period_end_utc"])
+    if not window_start <= window_end < period_end:
+        return None, "R2 billing period changed before operations query; refresh required"
+    if window_end - window_start > timedelta(days=31):
+        return None, "R2 billing-period query exceeds Cloudflare's 31-day analytics range"
     try:
         resp = requests.post(
             "https://api.cloudflare.com/client/v4/graphql",
@@ -789,7 +798,10 @@ def _fetch_r2_operations_metrics(
                 unclassified_seen.add(action_type)
                 unclassified_action_types.append(action_type)
 
+    if r2_billing.period_error(period):
+        return None, "R2 billing period changed during operations query; refresh required"
     return {
+        **period,
         "class_a_requests": int(round(class_a_requests)),
         "class_b_requests": int(round(class_b_requests)),
         "free_requests": int(round(free_requests)),
@@ -3311,8 +3323,10 @@ def _fetch_r2_account_metrics(now: datetime) -> Tuple[Optional[Dict[str, Any]], 
     }
     if ops_metrics is None:
         payload["class_ops_error"] = ops_error
+        payload["billing_period_error"] = ops_error
         return payload, None
 
+    payload.update({key: value for key, value in ops_metrics.items() if key.startswith("billing_period_")})
     class_a_used_requests = int(ops_metrics.get("class_a_requests") or 0)
     class_b_used_requests = int(ops_metrics.get("class_b_requests") or 0)
     class_a_percent = _clamp_percent((class_a_used_requests / class_a_free_tier) * 100.0)
@@ -3337,23 +3351,30 @@ def _get_r2_usage_cached(
     force_refresh: bool = False,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     now = datetime.now(timezone.utc)
+    billing_key = r2_billing.configuration_key()
     with CACHE_LOCK:
         cached_usage = R2_CACHE_STATE.get("usage")
         cached_error = R2_CACHE_STATE.get("error")
         generated_at = R2_CACHE_STATE.get("generated_at")
         if (
             not force_refresh
+            and R2_CACHE_STATE.get("billing_key") == billing_key
             and isinstance(generated_at, datetime)
-            and (now - generated_at).total_seconds() < R2_CACHE_TTL_SECONDS
+            and (now - generated_at).total_seconds() < (
+                60 if r2_billing.configuration_valid() and r2_billing.period_error(cached_usage, now) else R2_CACHE_TTL_SECONDS
+            )
+            and not (isinstance(cached_usage, dict) and cached_usage.get("billing_period_end_utc")
+                     and r2_billing.period_error(cached_usage, now))
         ):
-            return cached_usage, cached_error
+            return r2_billing.guard_usage(cached_usage, now), cached_error
 
     usage, error = _fetch_r2_account_metrics(now)
     with CACHE_LOCK:
         R2_CACHE_STATE["usage"] = usage
         R2_CACHE_STATE["error"] = error
         R2_CACHE_STATE["generated_at"] = datetime.now(timezone.utc)
-    return usage, error
+        R2_CACHE_STATE["billing_key"] = billing_key
+    return r2_billing.guard_usage(usage), error
 
 
 def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
@@ -4407,7 +4428,7 @@ def _get_dashboard(
         if cached and isinstance(generated_at, datetime):
             age = (datetime.now(timezone.utc) - generated_at).total_seconds()
             if age < CACHE_TTL_SECONDS:
-                return cached
+                return dict(cached, r2_usage=r2_billing.guard_usage(cached.get("r2_usage"))) if include_metric_context else cached
     data = _build_dashboard(
         base_url,
         service_role_key,
@@ -4422,7 +4443,7 @@ def _get_dashboard(
         bucket_state = CACHE_STATE.setdefault(cache_bucket, {})
         bucket_state["data"] = data
         bucket_state["generated_at"] = datetime.now(timezone.utc)
-    return data
+    return dict(data, r2_usage=r2_billing.guard_usage(data.get("r2_usage"))) if include_metric_context else data
 
 
 def _build_storage_coverage_payload(
@@ -4719,6 +4740,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     dispatch_cursor = parsed_cursor
         if force_refresh:
             _invalidate_dashboard_cache(clear_storage_coverage=True)
+            if include_metric_context:
+                _get_r2_usage_cached(force_refresh=True)
         try:
             data = _get_dashboard(
                 self.server.base_url,

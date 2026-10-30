@@ -37,6 +37,8 @@ export type WorkerEnv = {
   UK_AQ_R2_HISTORY_WINDOW_RPC?: string;
   UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID?: string;
   UK_AQ_R2_CLOUDFLARE_API_TOKEN?: string;
+  UK_AQ_R2_BILLING_SUBSCRIPTION_ID?: string;
+  UK_AQ_R2_BILLING_API_TOKEN?: string;
   CLOUDFLARE_ACCOUNT_ID?: string;
   CFLARE_API_READ_TOKEN?: string;
   DROPBOX_APP_KEY?: string;
@@ -55,6 +57,8 @@ export type ProxyCacheOptions = {
   staleWhileRevalidateSeconds?: number;
   bypassCache?: boolean;
   ignoredCacheSearchParams?: string[];
+  validateCachedResponse?: (response: Response) => Promise<boolean>;
+  responseCacheSeconds?: (response: Response) => Promise<number>;
 };
 
 export class UpstreamError extends Error {
@@ -122,7 +126,7 @@ export async function proxyToUpstream(
   cacheOptions?: ProxyCacheOptions,
 ): Promise<Response> {
   const incomingUrl = new URL(request.url);
-  const upstreamUrl = buildUpstreamUrl(env, upstreamPathname, incomingUrl.search);
+  let upstreamUrl = buildUpstreamUrl(env, upstreamPathname, incomingUrl.search);
   const method = request.method.toUpperCase();
   const headers = new Headers();
   const incomingContentType = request.headers.get("content-type");
@@ -158,10 +162,15 @@ export async function proxyToUpstream(
 
   if (useEdgeCache && !bypassCache) {
     const cached = await defaultEdgeCache().match(cacheKey);
-    if (cached) {
+    if (cached && (!cacheOptions?.validateCachedResponse || await cacheOptions.validateCachedResponse(cached.clone()))) {
       const hit = withCorsAndCacheControl(cached, cacheControl);
       hit.headers.set("X-UKAQ-Worker-Cache", "HIT");
       return hit;
+    }
+    if (cached && cacheOptions?.validateCachedResponse) {
+      const freshUrl = new URL(upstreamUrl);
+      freshUrl.searchParams.set("force", "1");
+      upstreamUrl = freshUrl.toString();
     }
   }
 
@@ -181,10 +190,16 @@ export async function proxyToUpstream(
     return withCorsAndNoStore(upstreamResp);
   }
 
-  const missResponse = withCorsAndCacheControl(upstreamResp, cacheControl);
+  const responseTtl = cacheOptions?.responseCacheSeconds && upstreamResp.ok
+    ? Math.max(0, Math.min(cacheTtlSeconds, await cacheOptions.responseCacheSeconds(upstreamResp.clone())))
+    : cacheTtlSeconds;
+  const responseCacheControl = !bypassCache && responseTtl > 0
+    ? `public, max-age=${responseTtl}, s-maxage=${responseTtl}, stale-while-revalidate=${cacheOptions?.responseCacheSeconds ? 0 : staleWhileRevalidateSeconds}`
+    : "no-store";
+  const missResponse = withCorsAndCacheControl(upstreamResp, responseCacheControl);
   missResponse.headers.set("X-UKAQ-Worker-Cache", bypassCache ? "BYPASS" : "MISS");
 
-  if (!bypassCache && upstreamResp.ok) {
+  if (!bypassCache && upstreamResp.ok && responseTtl > 0) {
     await defaultEdgeCache().put(cacheKey, missResponse.clone());
   }
   return missResponse;

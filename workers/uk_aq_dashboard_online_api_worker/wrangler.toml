@@ -12,6 +12,8 @@ redact_query_string = true
 
 [vars]
 UKAQ_PROXY_ROUTE_PREFIX = "/api"
+# Set through the environment-specific deployment --var; empty disables operations only.
+UK_AQ_R2_BILLING_SUBSCRIPTION_ID = ""
 # DASHBOARD_UPSTREAM_BASE_URL = "https://example.internal"
 
 [[routes]]
