@@ -717,6 +717,9 @@ def read_r2_usage_history(role: str = "reader", lookback_days: int = 30) -> List
             "class_b_used_requests": row.get("class_b_used_requests"), "source_generated_at": _iso(row.get("source_generated_at")),
             **{key: payload.get(key) for key in (
                 "billing_period_start_utc", "billing_period_end_utc", "billing_period_source",
+                "billing_period_verified_at_utc", "billing_period_fresh_until_utc", "billing_period_status",
+                "billing_period_account_id", "billing_period_subscription_id", "billing_period_anchor_utc", "billing_period_subscription_start_utc",
+                "billing_period_end_source", "billing_period_end_subscription_ids", "billing_period_error",
                 "class_ops_window_start_utc", "class_ops_window_end_utc",
             )},
         })

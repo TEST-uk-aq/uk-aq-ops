@@ -1,115 +1,119 @@
 # R2 operations billing-period reporting
 
-Implementation guide for the shared dashboard, local Python backend and hosted API Worker. Authoritative prose remains in `TEST-uk-aq/uk-aq-system-docs`; the handover below identifies its required updates. This change does not establish deployment or account acceptance.
+Implementation guide for the shared dashboard, local Python backend and hosted API Worker. Authoritative prose remains in the separate system-docs repository; the handover below identifies the required updates. Deployment and operational acceptance are separate from this implementation.
 
-Required pre-change archives under `archive/2026-10-30/` preserve the original checked-out revision `ea7212e85a01e2dc65b73ed0204d3dca9af73066`. The implementation was subsequently rebased onto newer TEST `main`; those once-per-day archives were retained unchanged. Use the PR's parent revision for rollback to the immediately preceding current application.
+## Scope and pre-implementation contract check
 
-## Scope
+Class A/B analytics use an R2-specific Billable Usage v1 start and, only when adequately verified, an account monthly-cycle end. Standard storage size, object count, the existing 10 GB comparison, percentage and progress bar are preserved exactly. No GB-month, average-storage or cost calculation is introduced.
 
-Class A and Class B analytics use verified Cloudflare current-period timestamps. The existing Standard storage size, object count, 10 GB comparison, percentage and progress bar are unchanged. Storage remains available when billing metadata or operations are unavailable. There are no GB-month, average-storage, cost or additional storage metrics.
+The operator's actual account evidence establishes that Billable Usage v1 and its info endpoint work with an account-scoped Billing Read token. The R2 usage subscription is **not** retrievable through generic subscription detail (error 1295). The account subscription list works and returns different monthly IDs agreeing on the current boundaries. Usage v2 is Alpha, Restricted and returns error 1171. Neither subscription detail nor usage v2 is a resolver dependency.
 
-The operator has confirmed TEST's date range as the 18th–17th and LIVE's as the 30th–29th where those dates exist. Exact UTC timestamps and missing-date renewal behaviour have not been verified. These observations are acceptance evidence, not runtime recurrence rules. No environment dates are embedded in the implementation and no manual period schedule is supported.
+Before implementation, the published Cloudflare OpenAPI schemas and billing documentation were checked against that evidence:
 
-## Environment configuration
+- V1 `result` is an array of usage records. `BillingAccountId`, `SubscriptionId`, `ServiceFamilyName` and `BillingPeriodStart` support the required identity/start selection. The no-query route is described as current-period usage, but real responses can contain historical rows too.
+- Info `result` is an object with `covered` and `subscriptions`. Subscription items have `id`, `start_timestamp`, `billing_cycle_anchor_timestamp` and an optional cancellation `end_timestamp`. Info has no R2 family discriminator: its subscription ID must be joined to the R2 usage rows.
+- V1 deliberately has **no authoritative BillingPeriodEnd**. The schema explicitly warns against calendar arithmetic. Charge-period ends, subscription lifecycle ends and anchors are not renewal boundaries.
+- The account subscription list has no pagination parameters and is documented to list all account subscriptions. Its monthly frequency, usable state, ID and timezone-aware `current_period_start`/`current_period_end` can supply corroborating current-cycle boundaries. The IDs need not equal the R2 usage subscription ID.
+- Cloudflare documents an account-wide monthly billing cycle (annual subscriptions have another cycle), but also documents replacement usage subscriptions with separate cycles. Therefore account scope or an arbitrary monthly row alone is insufficient: the complete usable monthly set must agree and match the R2-specific start.
 
-Existing configuration is reused:
-
-- Account: `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID`, otherwise the existing same-environment `CLOUDFLARE_ACCOUNT_ID` setting.
-- Analytics token: `UK_AQ_R2_CLOUDFLARE_API_TOKEN`, otherwise the existing same-environment `CFLARE_API_READ_TOKEN`.
-- New `UK_AQ_R2_BILLING_SUBSCRIPTION_ID`: the exact R2 subscription identifier, confirmed by the operator and verified at runtime. It must match `[A-Za-z0-9_-]{1,32}` without whitespace. The account must be a 32-character hexadecimal account ID.
-- Optional new `UK_AQ_R2_BILLING_API_TOKEN`: a dedicated token restricted to that same account with Account → Billing → Read. Omit this setting entirely to reuse the analytics token, which must then also have Billing Read. An explicitly present empty dedicated token is invalid. A dedicated token that fails is never retried using another credential.
-
-Do not grant Billing Write or substitute a deployment token. GraphQL still requires Account Analytics Read. Neither the subscription ID nor a token value is invented by this change.
-
-Local: set the chosen values in the Ops checkout's existing `.env`, loaded by `local/scripts/run_dashboard.sh` for both HTTP and `--cache-refresh` processes. Do not put the billing token into browser `UKAQ_*` configuration, a committed file or MySQL reader/writer credential files.
-
-Hosted: use a GitHub repository variable for `UK_AQ_R2_BILLING_SUBSCRIPTION_ID` and, only if required, a GitHub secret for `UK_AQ_R2_BILLING_API_TOKEN`. Existing environment-sync target mappings are extended accordingly. Align the operator's ignored `env-vars-master.csv` with those names and classifications; that catalogue is absent from the cloud checkout and has not been fabricated here. The existing synchroniser can then use the updated target CSV. Do not execute it merely to review this PR.
-
-The deployment workflow passes the ID explicitly through `wrangler deploy --var`, including an empty value, so removing its repository variable cannot silently retain a previous ID. The optional token follows the existing nonempty Worker-secret upload mechanism. That mechanism does not delete an already installed secret when its GitHub value is removed: an operator switching back to the existing read token must separately arrange removal of the dedicated Worker secret. No such setting changes are performed by this implementation.
-
-Manual Worker deployments must likewise supply the verified ID through the deployment's environment-specific configuration/`--var`; the committed Wrangler default is empty. This has no calendar-month default. The same code and setting names apply to separately authorised LIVE adoption. Never reuse another environment's values.
-
-## Runtime verification
-
-For the configured account, the resolver reads:
-
-1. `GET /client/v4/accounts/{account_id}/subscriptions/{subscription_id}`.
-2. `GET /client/v4/accounts/{account_id}/billable-usage` with no date parameters (current billing period).
-
-It requires the exact subscription ID, monthly frequency, a usable subscription state (`Paid`, `Provisioned`, `Trial` or `AwaitingPayment`), and timezone-aware `current_period_start`/`current_period_end` containing now. It then requires current Billable Usage rows with matching `BillingAccountId`, `SubscriptionId`, `ServiceFamilyName=R2` and `BillingPeriodStart` equal to the subscription start.
-
-This cross-check prevents an unrelated monthly subscription from silently selecting R2's period. If R2 is not exposed by the generic subscriptions API, access is denied, required fields are absent or billing data has not caught up after renewal, operations explicitly report unavailable. Operator acceptance must prove this API contract for the actual TEST account. No unavailable metadata is reconstructed from the confirmed day numbers, charge-period end, anchor, subscription lifecycle end or a fixed interval.
-
-Read-only operator verification before acceptance should inspect those exact returned fields, without copying credentials or the whole billing response into logs. Existing token access, the actual subscription ID, exact timestamps and R2 support in the endpoint remain unverified in the implementation environment, which has no Cloudflare credentials or permitted `api.cloudflare.com` network access.
+This is structurally viable with the existing account, subscription and token settings. No new setting or wider permission is required. Actual account field values, usable states and runtime convergence remain post-deployment acceptance checks; this environment has no Cloudflare credentials or permitted Cloudflare API access.
 
 Official references:
 
-- [Subscription GET and Billing Read permission](https://developers.cloudflare.com/api/resources/accounts/subresources/subscriptions/methods/get_by_identifier/).
-- [Current Billable Usage v1](https://developers.cloudflare.com/api/resources/billing/subresources/usage/methods/get_account_usage_v1/). Its billing start is useful for verification; it has no billing-period-end counterpart.
+- [Billable Usage v1](https://developers.cloudflare.com/api/resources/billing/subresources/usage/methods/get_account_usage_v1/) and [published schemas](https://github.com/cloudflare/api-schemas/blob/main/openapi.yaml), especially `billable-usage-api_usage_record` and `billable-usage-api_usage_info_response`.
+- [Account subscription list](https://developers.cloudflare.com/api/resources/accounts/subresources/subscriptions/); `current_period_end` is the end of the current period and when next billing is due.
+- [Account monthly and annual billing cycles](https://developers.cloudflare.com/billing/understand/how-billing-works/#billing-cycles).
+- [Billable usage subscription replacement and separate cycles](https://developers.cloudflare.com/billing/manage/billable-usage/#switch-between-subscriptions).
 - [Billing permissions](https://developers.cloudflare.com/billing/understand/billing-permissions/).
 - [R2 analytics datasets and query limits](https://developers.cloudflare.com/r2/platform/metrics-analytics/).
 
-## API and caching
+## Environment configuration
 
-Existing routes and operation fields are preserved. Successful `r2_usage` responses additionally carry:
+Reuse the existing settings, all from the intended environment:
+
+- Account: `UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID`, otherwise the existing same-environment `CLOUDFLARE_ACCOUNT_ID`. A 32-character hexadecimal ID is required.
+- Analytics credential: `UK_AQ_R2_CLOUDFLARE_API_TOKEN`, otherwise the existing same-environment `CFLARE_API_READ_TOKEN`, with Account Analytics Read.
+- `UK_AQ_R2_BILLING_SUBSCRIPTION_ID`: the **R2 usage** subscription ID, matched between R2 v1 rows and info, not one of the unrelated IDs in the generic account subscription list. Format remains `[A-Za-z0-9_-]{1,32}` without whitespace.
+- `UK_AQ_R2_BILLING_API_TOKEN`: optional dedicated Account Billing Read credential scoped to the same account. The operator's working dedicated token fits this existing setting. If omitted entirely, reuse the analytics credential, which must then also have Billing Read. An explicitly empty dedicated credential is invalid; a failing dedicated credential is never retried with another credential.
+
+No Billing Write, deployment token, manual start/end, day-of-month, alternative account or v2 permission is needed. The selected account never changes in response to an API failure.
+
+Local values belong in the Ops checkout's existing `.env`, loaded by `local/scripts/run_dashboard.sh` for both HTTP and cache-refresher processes. Do not put secrets in browser `UKAQ_*` settings or MySQL credential files.
+
+Hosted values use the existing GitHub variable for the subscription ID and optional GitHub secret for the billing token, with the existing `config/uk_aq_github_env_targets.csv` mappings and Worker workflow. No mappings, Wrangler variable declarations or deployment workflow changes are needed by this correction. The ignored operator `env-vars-master.csv` is absent from this cloud checkout: retain/align the existing two entries locally, without creating another catalogue.
+
+The existing workflow passes the ID explicitly via `--var`, including empty values. Manual deployments must also supply it; the committed default is empty. The existing nonempty-secret mechanism does not delete an installed Worker secret when its GitHub value is removed. Switching back to the analytics token therefore requires deliberate removal of the dedicated Worker secret through the separately authorised configuration process.
+
+## Resolver and failure semantics
+
+The resolver performs only these account-scoped GETs, using the selected billing credential:
+
+1. `billable-usage/info`: require `covered=true`, exactly one entry for the configured R2 usage ID, valid timezone-aware lifecycle/anchor timestamps no later than now, and no cancellation end.
+2. `billable-usage`, without date parameters: filter by exact account, configured subscription and R2 family. Select the **latest valid nonfuture start** no earlier than the subscription lifecycle start or anchor. Historical starts in the same response are expected and do not cause an all-rows-equal check.
+3. `subscriptions`: accept an end only if at least one usable monthly row exists, all usable monthly rows have distinct valid IDs and the exact R2 start, and all agree on a single valid end containing now. Valid usable states remain `Paid`, `Provisioned`, `Trial`, `AwaitingPayment`. Known retired states and recognised nonmonthly frequencies (`weekly`, `quarterly`, `yearly`, `not-applicable`) are excluded; `not-applicable` entries need no current-period timestamps and do not contribute boundary provenance. Unknown/malformed eligible rows, conflicting starts/ends, duplicates, empty results and access failures prevent end verification. The period cannot exceed the analytics 31-day bound.
+
+The generic account subscriptions corroborate the documented monthly account cycle; they do not establish R2 subscription ownership. Their IDs are recorded separately. No list order, rate-plan name, ID equivalence, environment date or calendar recurrence is assumed.
+
+When the end cannot be verified, return **start-only reporting**: preserve the R2 start, anchor, lifecycle and identity provenance, set end/source to null and IDs to an empty array, and report `start_only` with an explicit error. A fresh response containing an old start is not proof of renewal. Consequently current Class A/B values, percentages and query windows remain null and no operations query runs in this mode. Storage remains available. No zero figures are fabricated.
+
+Start-only metadata is fresh for at most five minutes; fully verified metadata is fresh for at most one hour, capped at the returned end. Both have a conservative maximum reported-start age of 31 days. These are reporting safety limits, **not calculated billing ends**. Expiry reports `stale`, hides current operation figures and requires fresh upstream verification. Failed renewal never extends an old current interval. An unavailable/missing source remains explicitly unavailable.
+
+## API and caches
+
+Existing routes and operation fields are preserved. R2 JSON carries:
 
 ```text
+billing_period_source = cloudflare_r2_billable_usage_v1
 billing_period_start_utc
-billing_period_end_utc
+billing_period_end_utc                         # nullable
 billing_period_verified_at_utc
-billing_period_source = cloudflare_r2_subscription_v1
+billing_period_fresh_until_utc                 # freshness deadline, not a billing end
 billing_period_account_id
-billing_period_subscription_id
+billing_period_subscription_id                 # R2 usage ID
+billing_period_anchor_utc
+billing_period_subscription_start_utc
+billing_period_end_source = cloudflare_account_monthly_subscriptions_v1  # nullable
+billing_period_end_subscription_ids             # distinct generic monthly IDs
+billing_period_status = verified | start_only | stale | unavailable
 billing_period_error
 ```
 
-Account/subscription identifiers are nonsecret provenance used to reject mismatched caches. No token or raw billing records are returned. `class_ops_window_start_utc` and `class_ops_window_end_utc` still describe the analytics query, not the next renewal. Queries use `[period start, query cutoff)` in UTC and reject ranges over Cloudflare's 31-day analytics maximum. Slow fetches are checked again before being presented as current.
+Unavailable metadata has an explicit error/status and may lack the other provenance fields. No raw billing records or credentials are returned. `class_ops_window_start_utc` and `class_ops_window_end_utc` describe the analytics query `[R2 start, query cutoff)`, distinct from the exclusive billing end. The existing 31-day analytics maximum and post-query validity check remain.
 
-Process responses, MySQL `r2_metrics`/`metric_context`, latest rolling snapshots and proxy responses validate provenance and period. Legacy calendar-month JSON cannot become current by having a coincidentally matching start date. Invalid or expired operations are nulled with an explicit error; storage fields are retained. Same-period historical snapshots are cumulative, never summed into a total. Rolling history includes period metadata when available; legacy history remains without a verified period.
+Python and TypeScript guards reject legacy source markers, wrong account/subscription, missing provenance, expired freshness and expired/unverified ends. They null only operations and preserve storage. Process caches, MySQL current products/latest snapshots, composed metric context, upstream proxy caches and browser rendering enforce this boundary. Successful cache TTLs are capped by freshness, including renewal; invalid responses are retried on a bounded one-minute cadence when configuration is valid. A stale/error response may be retained for one minute while its operation values remain null. This prevents reader traffic from repeatedly calling billing APIs.
 
-Successful current products/process caches expire no later than period end. The R2 writer is scheduled at that boundary and retries unavailable metadata on a bounded cadence when static configuration is valid. Invalid static configuration does not generate repeated reader-triggered cloud collections. A successful new R2 collection triggers a new metric-context build, including after an older build was already in flight. No schema migration, new tables, retention change or cache-history deletion is required.
+The writer remains hourly in normal verified operation, is due no later than freshness/renewal, and retries start-only/unavailable metadata every minute. Rolling history retains the new provenance alongside its existing cumulative snapshot values. Snapshots are never summed, legacy rows are never relabelled, JSON schema/tables and 30-day retention are unchanged. No history deletion or migration is needed.
 
-Hosted direct mode remains independent of MySQL. Upstream mode keys its cache by configured billing identity, validates hits and caps cache TTLs at period end; an invalid hit requests a fresh upstream response. Response guards also remove legacy/expired operation counts supplied by an older upstream. Browser responses remain `no-store` through the existing history diagnostics path.
+The browser shows the verified UTC pair and exclusive end or the reported start with an explicit end/renewal-unavailable or stale label. It hides expired bars before reading replacements, including after tab resume, and polls start-only/unavailable states each minute while active. Hosted mode remains independent of local MySQL. Analytics may lag and are not authoritative invoices.
 
-The browser shows the full UTC boundary pair with an exclusive end and separately displays the analytics query cutoff. It labels the operation counts as analytics, not an authoritative invoice or cost. At rollover, or on resuming an expired tab, old bars are hidden before requesting replacement data; retry failures do not restore those bars. It never calculates the next period.
+## Existing Refresh and calendar behaviour
 
-## Refresh
+Explicit R2 and metric-bearing main Refresh retain the existing force/bypass path. With local MySQL, readers signal the same writer marker, return promptly with `r2_refresh_pending`, and follow pending work with short reads for up to two minutes. Each writer collection bypasses its process cache. Successful R2 collection schedules metric-context rebuilding, including when an older build is in flight. Without MySQL, force Refresh directly bypasses the process cache.
 
-The existing R2 `force=1` route remains supported. Without MySQL, explicit R2 and metric-bearing dashboard Refresh bypass the process R2 cache. With MySQL, the HTTP reader signals the existing environment-local writer marker and returns promptly with additive `r2_refresh_pending` state. Every writer R2 collection bypasses its in-memory usage cache and performs new metadata/metrics requests. A metric-bearing main Refresh also signals that R2 dependency.
+Storage-calendar Refresh, history-generation selection, direct R2 day-presence checks, calendar cadence, failure preservation and unrelated dashboard functionality are unchanged.
 
-The browser follows a pending R2 refresh with short ordinary reads for up to two minutes, without repeatedly signalling new refreshes. It displays pending and the original source timestamp until a post-request collection exists. A still-pending collection may be checked again manually or on a subsequent load. Background fetch time remains dependent on Cloudflare. The storage-calendar Refresh handshake, generation selection, direct R2 presence checks and calendar cadence are unchanged.
+## TEST activation and acceptance
 
-## TEST rollout and acceptance
+This PR does not merge, deploy, change settings, call collectors or access databases. Pre-deployment checks are Python/JavaScript syntax, Worker types and existing configuration/schema viability only. No speculative tests are added.
 
-Before deployment, perform syntax/type/configuration parsing only. This implementation adds no test suite. Do not execute the collector or databases as a pre-deployment structural check.
+After review and separately authorised TEST deployment:
 
-After review and separately authorised TEST activation:
+1. Set the existing same-account subscription ID and working dedicated Billing Read token using the mechanisms above. Do not replace the R2 ID with a generic monthly ID. Use the normal dashboard API Worker and Pages workflows and restart **both** local HTTP and cache-refresher processes using the existing commands in `local/dashboard/README.cache.md`.
+2. Inspect only the bounded GETs above, without logging credentials or entire billing responses. Confirm exact account/R2 identity, info coverage/lifecycle/anchor, latest R2 start, usable monthly states and agreeing start/end. Verify that historical R2 rows do not block current selection and that subscription detail/v2 are never called.
+3. Compare `/api/r2_metrics` and metric-bearing `/api/dashboard` locally and hosted against those actual UTC boundaries. Check end provenance lists the contributing generic IDs separately from the R2 ID. Compare Class A/B with analytics queried over that interval; preserve Standard storage size/objects/10 GB/bar exactly.
+4. Click R2 and main Refresh. Confirm real new collections, advancing source timestamps, pending-to-complete state and metric-context convergence. Warm local reads remain MySQL-backed; hosted operation requires no Mac/MySQL availability.
+5. With separately authorised controlled configuration/API failure conditions, verify missing/invalid ID, wrong account/subscription, denied billing access, unavailable subscriptions and disagreeing monthly periods. Valid R2 metadata plus an unverifiable end must show the reported start and null current operations; failed/stale verification must never restore old A/B counts. Restore configuration afterwards.
+6. Observe a real renewal and an open/resumed tab: expiry hides old bars first; the writer polls; updated account boundaries with delayed R2 rows produce start-only/unavailable operations; matching new R2 metadata then restores current figures. Check process, MySQL, proxy and composed responses all converge. Do not fabricate a short billing period to simulate renewal.
+7. Confirm calendar-only Refresh remains independent, failed collections preserve storage/history, retention remains 30 days, and no credentials appear in browser assets/responses.
 
-1. Verify the TEST R2 subscription and Billing Read access using the bounded reads above. Compare returned exact UTC dates with the operator-confirmed 18th–17th range. If the endpoint cannot establish them, retain explicit unavailable operations and report the missing metadata/access; do not set a midnight or recurrence assumption.
-2. Set the existing configuration mechanisms, then use the normal dashboard API Worker and Pages deployment workflows. This PR does not merge, deploy, run workflows or modify Cloudflare settings. No provider/history deployment or MySQL migration is introduced.
-3. Restart **both** local TEST processes after the code/configuration is installed:
+Rollback restores matching frontend/backend revisions and restarts both local processes, retaining JSON history. Reverting only this correction restores PR #147's unsupported resolver and is expected to make operations unavailable again. Use this PR's parent revision for exact rollback; once-per-day archives are reference snapshots, not necessarily that immediate parent. Existing daily archives are retained unchanged; newly archived resolver modules preserve their exact pre-correction contents.
 
-   ```bash
-   launchctl kickstart -k "gui/$(id -u)/co.uk.chronicillnesschannel.aq.dashboard-cache.test"
-   launchctl kickstart -k "gui/$(id -u)/co.uk.chronicillnesschannel.aq.dashboard.test"
-   ```
+## Separate Chat-mode system-doc handover
 
-4. In real TEST operation, compare `/api/dashboard` metric context and `/api/r2_metrics` on local and hosted: same verified period, distinct query cutoff, sensible A/B counts for that interval, unchanged storage display and generation diagnostics. Analytics and billing data can lag and are not guaranteed to be invoice-equivalent.
-5. Click R2 Refresh and the main dashboard Refresh. Observe a real new Cloudflare collection, advancing R2 `as_of_utc`, pending then completed state, and convergence of metric context. Confirm warm local reads remain MySQL-backed and fast and hosted needs no Mac/MySQL availability.
-6. Through controlled TEST configuration changes when authorised, check missing/invalid ID, unrelated subscription, insufficient Billing Read and metadata failure. Expect explicit unavailable A/B, preserved storage and no calendar-month fallback or environment crossover.
-7. Observe a genuine renewal: old operation bars disappear, writer collection is due at the returned boundary, new verified metadata replaces them, and neither MySQL nor proxy caches resurrect the old interval. Delayed billing records may temporarily leave operations unavailable. For later authorised LIVE adoption, obtain the actual February and March boundaries; no behaviour for absent 30th/31st dates is inferred here.
-8. Confirm calendar-only Refresh still refreshes only its coverage product, existing 30-day retention and failed-collection history preservation remain, and browser assets contain no credentials.
+Authoritative system_docs are not edited. ChatGPT in Chat mode should update:
 
-Rollback restores matching frontend/backend revisions and restarts both local processes; existing JSON history is retained and needs no destructive migration. A rollback to calendar-month code must also restore its matching UI, not keep new billing-period labels against old metrics.
-
-## Separate Chat-mode system-document handover
-
-Do not copy this guide into authoritative docs without recording implementation/deployment status. ChatGPT in Chat mode should update these precise contracts:
-
-- `system_docs/dashboards/data_sources.md`: explicit subscription timestamps and R2 Billable Usage identity cross-check; analytics interval versus billing end; operation unavailable semantics. Record that the current Standard storage volume, objects and existing 10 GB comparison/bar are intentionally preserved, with no new billing-period storage metric.
-- `system_docs/dashboards/local_mysql_cache.md`: R2 provenance/expiry guards in current products and rolling snapshots, boundary scheduling, unavailable retries, forced writer collection, pending reader responses, post-R2 metric-context refresh, unchanged JSON schema/30-day retention and independent calendar Refresh.
-- `system_docs/dashboards/hosted_dashboard.md`: identical Python/TypeScript period semantics, direct process cache and upstream edge validation, partial failure preserving storage, continued exclusion of MySQL from hosted.
-- `system_docs/dashboards/operations.md`: new subscription ID and optional Billing Read secret, existing token reuse, target/catalogue mapping, explicit deployment variable, account verification, both local process restarts and rollback. Link from `local_dashboard.md` if needed rather than duplicating the rules.
-- `system_docs/dashboards/validation.md`: minimal syntax/type/config checks and evidence from actual TEST collection, force refresh, invalid configuration and rollover. Exact timestamps and February behaviour remain unresolved until authoritative account evidence exists.
-
-No authoritative system-doc file is edited by this implementation. No LIVE code/configuration, database schema or cloud resource is changed.
+- `system_docs/dashboards/data_sources.md`: R2 v1 identity/latest-start selection, info lifecycle/anchor cross-check, conditionally corroborated account monthly end, start-only/unavailable/stale semantics, query cutoff versus renewal; preserve all Standard storage metrics.
+- `system_docs/dashboards/local_mysql_cache.md`: freshness-capped products, latest/history provenance, renewal polling, null stale operations, existing Refresh/pending/metric-context handling and unchanged tables/retention/calendar behaviour.
+- `system_docs/dashboards/hosted_dashboard.md`: identical resolver/guards, direct/upstream expiry, partial failure preserving storage, no MySQL dependency.
+- `system_docs/dashboards/operations.md`: reuse existing R2 ID/dedicated Billing Read settings and mappings, distinguish usage and generic IDs, three bounded GETs, both local restarts, coordinated rollback.
+- `system_docs/dashboards/validation.md`: actual TEST identity, mixed historical/current rows, agreeing/mismatching monthly boundaries, start-only/stale handling, Refresh and genuine rollover acceptance. Record acceptance evidence only after deployment.

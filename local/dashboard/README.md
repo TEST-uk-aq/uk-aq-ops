@@ -15,7 +15,8 @@ local/scripts/run_dashboard.sh
 
 The frontend served by this backend is `dashboard/index.html`.
 
-R2 operation billing periods, subscription/Billing Read configuration, refresh,
+R2 Billable Usage v1 starts, verified account monthly ends, start-only reporting,
+existing subscription/Billing Read configuration, refresh,
 TEST acceptance and the separate system-doc handover are described in
 [`docs/R2_BILLING_PERIOD_REPORTING.md`](../../docs/R2_BILLING_PERIOD_REPORTING.md).
 The existing Standard storage display remains unchanged.

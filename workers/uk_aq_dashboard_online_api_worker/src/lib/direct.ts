@@ -875,6 +875,8 @@ async function fetchR2OperationsMetrics(
   let period: JsonObject;
   try { period = await fetchR2BillingPeriod(env, accountId, apiToken); }
   catch (error) { return { metrics: null, error: (error as Error).message }; }
+  const periodProblem = billingPeriodError(period, env);
+  if (periodProblem) return { metrics: period, error: periodProblem }; // Keep start-only provenance, withhold operations.
   const windowEnd = new Date();
   const windowStart = new Date(billingTimestamp(period.billing_period_start_utc));
   if (!(windowStart.getTime() <= windowEnd.getTime() && windowEnd.getTime() < billingTimestamp(period.billing_period_end_utc))) {
@@ -988,8 +990,7 @@ async function fetchR2Usage(env: WorkerEnv, forceRefresh = false): Promise<{ usa
   const billingKey = billingConfigurationKey(env);
   if (!forceRefresh) {
     const cached = cacheGet(r2UsageCache);
-    if (cached && r2UsageBillingKey === billingKey
-      && !(cached.usage?.billing_period_end_utc && billingPeriodError(cached.usage, env))) {
+    if (cached && r2UsageBillingKey === billingKey) {
       return { ...cached, usage: guardR2Usage(cached.usage, env) };
     }
   }
@@ -1057,6 +1058,7 @@ async function fetchR2Usage(env: WorkerEnv, forceRefresh = false): Promise<{ usa
       class_ops_window_end_utc: null,
       class_ops_error: opsMetrics.error,
       billing_period_error: opsMetrics.error,
+      billing_period_status: "unavailable",
       storage_source: "cloudflare_r2_account_metrics",
       source: "cloudflare_r2_account_metrics",
       as_of_utc: now.toISOString(),
@@ -1065,6 +1067,8 @@ async function fetchR2Usage(env: WorkerEnv, forceRefresh = false): Promise<{ usa
       for (const [key, value] of Object.entries(opsMetrics.metrics)) {
         if (key.startsWith("billing_period_")) usage[key] = value;
       }
+    }
+    if (opsMetrics.metrics && !opsMetrics.error) {
       const classAUsed = Math.max(0, Math.round(readNumber(opsMetrics.metrics.class_a_requests, 0)));
       const classBUsed = Math.max(0, Math.round(readNumber(opsMetrics.metrics.class_b_requests, 0)));
       usage.class_a_used_requests = classAUsed;
@@ -1079,9 +1083,9 @@ async function fetchR2Usage(env: WorkerEnv, forceRefresh = false): Promise<{ usa
       usage.class_ops_window_end_utc = String(opsMetrics.metrics.window_end_utc || "") || null;
     }
     const value = { usage: guardR2Usage(usage, env), error: null };
-    const end = billingTimestamp(usage.billing_period_end_utc);
+    const freshUntil = billingTimestamp(usage.billing_period_fresh_until_utc);
     const ttl = billingConfigurationValid(env) && billingPeriodError(usage, env) ? 60_000 : R2_USAGE_TTL_MS;
-    r2UsageCache = { value, expiresAt: Math.min(Date.now() + ttl, Number.isFinite(end) ? end : Infinity) };
+    r2UsageCache = { value, expiresAt: Math.min(Date.now() + ttl, freshUntil > Date.now() ? freshUntil : Infinity) };
     r2UsageBillingKey = billingKey;
     return value;
   } catch (err) {
@@ -2164,8 +2168,8 @@ export async function getDirectDashboardPayload(
     payload.r2_domain_size_metrics = [];
     payload.r2_domain_size_metrics_error = "Historical domain byte metrics have no generation identity; unavailable for v3";
   }
-  const periodEnd = billingTimestamp(payload.r2_usage?.billing_period_end_utc);
-  dashboardCache.set(cacheKey, { value: payload, expiresAt: Math.min(Date.now() + DASHBOARD_TTL_MS, Number.isFinite(periodEnd) ? periodEnd : Infinity) });
+  const freshUntil = billingTimestamp(payload.r2_usage?.billing_period_fresh_until_utc);
+  dashboardCache.set(cacheKey, { value: payload, expiresAt: Math.min(Date.now() + DASHBOARD_TTL_MS, Number.isFinite(freshUntil) ? freshUntil : Infinity) });
   payload.r2_usage = guardR2Usage(payload.r2_usage, env);
   return payload;
 }

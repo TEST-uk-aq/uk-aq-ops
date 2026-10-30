@@ -117,8 +117,8 @@ export async function handleCompatRoute(
               const body = await fresh.json() as Record<string, unknown>;
               const usage = body.r2_usage as Record<string, unknown> | null;
               if (usage && r2OperationsError(usage, env)) return 60;
-              const end = billingTimestamp(usage?.billing_period_end_utc);
-              return Number.isFinite(end) ? Math.max(0, Math.floor((end - Date.now()) / 1000)) : GET_ROUTE_CACHE_SECONDS[pathname];
+              const freshUntil = billingTimestamp(usage?.billing_period_fresh_until_utc);
+              return Number.isFinite(freshUntil) ? Math.max(0, Math.floor((freshUntil - Date.now()) / 1000)) : GET_ROUTE_CACHE_SECONDS[pathname];
             } catch { return 0; }
           } : undefined,
         });
