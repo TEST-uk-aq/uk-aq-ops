@@ -3737,15 +3737,18 @@
 
       function scheduleR2BillingRollover() {
         clearTimeout(r2PeriodTimer);
-        const end = Date.parse(latestDashboardData?.r2_usage?.billing_period_end_utc || "");
-        if (activeMode !== "operations" || !Number.isFinite(end)) return;
-        const wait = end > Date.now() ? end - Date.now() + 10 : 60_000;
+        const deadline = Date.parse(latestDashboardData?.r2_usage?.billing_period_fresh_until_utc || "");
+        if (activeMode !== "operations") return;
+        const usage = latestDashboardData?.r2_usage;
+        const retry = usage?.billing_period_status !== "verified" || usage?.billing_period_error;
+        const wait = retry || !Number.isFinite(deadline) ? 60_000 : deadline > Date.now() ? deadline - Date.now() + 10 : 60_000;
         r2PeriodTimer = setTimeout(checkR2BillingRollover, Math.min(wait, 2147483647));
       }
 
       function checkR2BillingRollover() {
-        const end = Date.parse(latestDashboardData?.r2_usage?.billing_period_end_utc || "");
-        if (activeMode === "operations" && Number.isFinite(end) && Date.now() >= end) {
+        const deadline = Date.parse(latestDashboardData?.r2_usage?.billing_period_fresh_until_utc || "");
+        if (activeMode === "operations" && (!Number.isFinite(deadline) || Date.now() >= deadline
+          || latestDashboardData?.r2_usage?.billing_period_status !== "verified")) {
           // Re-render first: a failed request must never leave old-period bars visible.
           replaceR2MetricsPanel();
           if (isPageActive()) void refreshR2MetricsOnly({ forceRefresh: false });
@@ -4183,14 +4186,23 @@
         const periodEnd = Date.parse(r2UsageObject?.billing_period_end_utc || "");
         const queryStart = Date.parse(r2UsageObject?.class_ops_window_start_utc || "");
         const queryCutoff = Date.parse(r2UsageObject?.class_ops_window_end_utc || "");
-        const periodCurrent = r2UsageObject?.billing_period_source === "cloudflare_r2_subscription_v1"
-          && Number.isFinite(periodStart) && periodStart <= Date.now() && Date.now() < periodEnd;
+        const verifiedAt = Date.parse(r2UsageObject?.billing_period_verified_at_utc || "");
+        const freshUntil = Date.parse(r2UsageObject?.billing_period_fresh_until_utc || "");
+        const metadataFresh = r2UsageObject?.billing_period_source === "cloudflare_r2_billable_usage_v1"
+          && Number.isFinite(periodStart) && periodStart <= verifiedAt && verifiedAt <= Date.now()
+          && verifiedAt < freshUntil && freshUntil <= verifiedAt + 3600_000 && Date.now() < freshUntil;
+        const periodCurrent = metadataFresh && r2UsageObject?.billing_period_status === "verified"
+          && r2UsageObject?.billing_period_end_source === "cloudflare_account_monthly_subscriptions_v1"
+          && Array.isArray(r2UsageObject?.billing_period_end_subscription_ids)
+          && r2UsageObject.billing_period_end_subscription_ids.length > 0 && Date.now() < periodEnd;
         const operationsCurrent = periodCurrent && queryStart === periodStart
           && queryCutoff >= periodStart && queryCutoff <= Date.now();
         const utcText = value => new Date(value).toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
         const r2BillingLabel = periodCurrent
           ? `Operations billing period: ${utcText(periodStart)} → ${utcText(periodEnd)} (end exclusive)`
-          : "Operations billing period unavailable; authoritative Cloudflare subscription metadata is required.";
+          : Number.isFinite(periodStart)
+            ? `R2 reported billing start: ${utcText(periodStart)} · ${metadataFresh ? "end/renewal unavailable" : "metadata stale or unverified"}; current operations unavailable.`
+            : "Operations billing period unavailable; verified R2 Billable Usage metadata is required.";
         const r2OperationsError = r2UsageObject?.class_ops_error || (operationsCurrent ? "" : "Billing period expired, missing or invalid; refresh required");
         const r2Rows = [];
         let r2LastUpdate = "n/a";
@@ -4289,7 +4301,7 @@
             <div class="r2-usage-meta">
               ${latestDashboardData?.r2_refresh_pending ? '<div class="r2-usage-sub">R2 refresh pending.</div>' : ""}
               ${latestDashboardData?.r2_refresh_error ? '<div class="r2-usage-sub">Last R2 collection failed; previous storage snapshot retained.</div>' : ""}
-              <div class="r2-usage-sub">R2 Metrics updated every hour. Last update: ${escapeHtml(r2LastUpdate)}</div>
+              <div class="r2-usage-sub">R2 metrics: hourly when verified; renewal retries every minute. Last update: ${escapeHtml(r2LastUpdate)}</div>
               ${r2BackupWindowError ? `<div class="r2-usage-sub">Backup window source warning: ${escapeHtml(r2BackupWindowError)}</div>` : ""}
               <button class="settings-button r2-refresh-button" id="refresh-r2-metrics" type="button">Refresh R2 metrics</button>
             </div>

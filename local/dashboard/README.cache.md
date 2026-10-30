@@ -158,7 +158,9 @@ Latest and All runs are therefore display modes over the same local rows. Latest
 
 ## R2 latency
 
-R2 Class A/B billing periods use verified Cloudflare subscription metadata.
+R2 Class A/B billing periods use the latest verified R2 Billable Usage v1 start
+and a matching, unambiguous account monthly-cycle end. Without a verified end,
+start-only metadata is shown and current operations are unavailable.
 See [R2 billing-period reporting](../../docs/R2_BILLING_PERIOD_REPORTING.md) for
 configuration, provenance/rollover guards, the additive `r2_refresh_pending`
 response and the real TEST acceptance sequence. A writer R2 refresh bypasses

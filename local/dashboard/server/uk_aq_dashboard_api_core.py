@@ -710,6 +710,9 @@ def _fetch_r2_operations_metrics(
         period = r2_billing.fetch_period(account_id, api_token)
     except ValueError as exc:
         return None, str(exc)
+    period_problem = r2_billing.period_error(period)
+    if period_problem:
+        return period, period_problem  # Preserve start-only provenance; never query old-period operations.
     window_end = datetime.now(timezone.utc)
     window_start = r2_billing.timestamp(period["billing_period_start_utc"])
     period_end = r2_billing.timestamp(period["billing_period_end_utc"])
@@ -3316,6 +3319,7 @@ def _fetch_r2_account_metrics(now: datetime) -> Tuple[Optional[Dict[str, Any]], 
         "class_ops_window_start_utc": None,
         "class_ops_window_end_utc": None,
         "class_ops_error": None,
+        "billing_period_status": "unavailable",
         "storage_source": storage_source,
         "storage_fallback_error": storage_fetch_warning,
         "source": "cloudflare_r2_account_metrics",
@@ -3327,6 +3331,9 @@ def _fetch_r2_account_metrics(now: datetime) -> Tuple[Optional[Dict[str, Any]], 
         return payload, None
 
     payload.update({key: value for key, value in ops_metrics.items() if key.startswith("billing_period_")})
+    if ops_error:
+        payload["class_ops_error"] = ops_error
+        return payload, None
     class_a_used_requests = int(ops_metrics.get("class_a_requests") or 0)
     class_b_used_requests = int(ops_metrics.get("class_b_requests") or 0)
     class_a_percent = _clamp_percent((class_a_used_requests / class_a_free_tier) * 100.0)
@@ -3363,8 +3370,6 @@ def _get_r2_usage_cached(
             and (now - generated_at).total_seconds() < (
                 60 if r2_billing.configuration_valid() and r2_billing.period_error(cached_usage, now) else R2_CACHE_TTL_SECONDS
             )
-            and not (isinstance(cached_usage, dict) and cached_usage.get("billing_period_end_utc")
-                     and r2_billing.period_error(cached_usage, now))
         ):
             return r2_billing.guard_usage(cached_usage, now), cached_error
 
