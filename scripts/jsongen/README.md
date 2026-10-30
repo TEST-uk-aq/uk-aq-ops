@@ -1,5 +1,14 @@
 # Managed JSONgen foundations and pending Prune source
 
+The [Stage 3D Phase 1 registration diagnostic](prune-registration-handover.md)
+adds `reconcile-cli.mjs --execute-read-only --prune-registration` for one bounded
+AURN outbox discovery page. It independently authenticates discovered originals,
+checks exact complete retained/registered groups (including zero-selected and
+legacy events), and writes a separate private diagnostic v1 plus exact local
+control companion. Existing reconciliation reports 1–4 remain unchanged. This
+is code only; use the handover's separately authorised read-only TEST procedure.
+All-writer coverage/freshness remain unknown and managed selection stays disabled.
+
 The [23 October Stage 2 implementation and operator handover](prune-stage2-handover.md)
 describes descriptor v1, selected receipt v3, atomic control v2 migration, and
 reconciliation v4. This is code only. The existing `--execute-retain` interface
