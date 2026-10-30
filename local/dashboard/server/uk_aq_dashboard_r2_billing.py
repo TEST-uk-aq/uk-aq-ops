@@ -184,7 +184,7 @@ def fetch_period(account: str, analytics_token: str) -> Dict[str, Any]:
         for row in account_rows:
             if not isinstance(row, dict):
                 raise ValueError(end_error)
-            if str(row.get("frequency")) in {"weekly", "quarterly", "yearly"} or str(row.get("state")) in _RETIRED_STATES:
+            if str(row.get("frequency")) in {"weekly", "quarterly", "yearly", "not-applicable"} or str(row.get("state")) in _RETIRED_STATES:
                 continue
             # Do not pick the first match or ignore a conflicting usable monthly row.
             row_start = timestamp(row.get("current_period_start"))

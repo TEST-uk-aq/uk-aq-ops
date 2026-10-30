@@ -158,7 +158,7 @@ export async function fetchR2BillingPeriod(env: WorkerEnv, account: string, anal
     const periods: { id: string; end: number }[] = [];
     for (const row of accountRows as JsonObject[]) {
       if (!row || typeof row !== "object") throw new Error(endError);
-      if (["weekly", "quarterly", "yearly"].includes(String(row.frequency)) || RETIRED_STATES.has(String(row.state))) continue;
+      if (["weekly", "quarterly", "yearly", "not-applicable"].includes(String(row.frequency)) || RETIRED_STATES.has(String(row.state))) continue;
       const rowStart = billingTimestamp(row.current_period_start);
       const rowEnd = billingTimestamp(row.current_period_end);
       if (row.frequency !== "monthly" || !USABLE_STATES.has(String(row.state))
