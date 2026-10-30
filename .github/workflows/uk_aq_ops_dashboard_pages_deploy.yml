@@ -58,7 +58,7 @@ jobs:
               exit 1
               ;;
           esac
-          if [ -z "${UK_AQ_OPS_DASHBOARD_PAGES_PROJECT}" ]; then
+          if [[ -z "${UK_AQ_OPS_DASHBOARD_PAGES_PROJECT//[[:space:]]/}" ]]; then
             echo "Missing variable UK_AQ_OPS_DASHBOARD_PAGES_PROJECT."
             exit 1
           fi
