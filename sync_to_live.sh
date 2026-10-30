@@ -514,6 +514,9 @@ sync_repo() {
   local rsync_args=(
     -av
     --checksum
+    # Retain byte-based comparison but do not update identical files merely
+    # because their filesystem modification times differ between checkouts.
+    --no-times
     --delete-delay
     --itemize-changes
     --human-readable
@@ -572,6 +575,15 @@ sync_repo() {
       )
       ;;
     website)
+      rsync_args+=(
+        # This is environment-owned editorial configuration. Leave the beta
+        # copy untouched, including when --delete-delay is enabled.
+        --exclude='/site-notice.toml'
+
+        # Development-only content must not become publicly accessible on beta.
+        --exclude='/compressed-chart-history-test/'
+        --exclude='/dark-preview/'
+      )
       # Feature directories and their dedicated icon assets are promoted only
       # when the corresponding COPY_* switch at the top of this script is true.
       # Normal rsync exclusions protect any existing beta copies from deletion.
