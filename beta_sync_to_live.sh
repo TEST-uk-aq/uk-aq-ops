@@ -34,6 +34,8 @@ Options:
   -h, --help            Show this help.
 
 GitHub workflows and the beta notice are included like normal website files.
+Archive/ and archive/ directories are wholly excluded at any depth: no copies,
+updates or deletions in the public LIVE destination.
 The public LIVE CNAME and favicon files are preserved.
 All active public HTML pages have noindex/nofollow robots meta directives
 removed from the public LIVE destination after sync. Archived HTML is preserved.
@@ -117,6 +119,11 @@ rsync_args=(
   --exclude='.pages-site/'
   --exclude='logs/'
 
+  # Exclude whole Archive/ and archive/ trees at every depth. Without
+  # --delete-excluded, this also protects existing destination archives from
+  # the --delete-delay operation. Never copy or delete archived files.
+  --exclude='[Aa]rchive/'
+
   # Public LIVE owns these values/files.
   --exclude='CNAME'
   --exclude='favicon.ico'
@@ -143,6 +150,7 @@ echo "              ukaq.co.uk (UK-AQ/uk-aq.github.io)"
 echo " GitHub workflows: INCLUDED"
 echo " Beta notice: INCLUDED"
 echo " Preserved LIVE-owned files: CNAME, favicon.ico, favicon.png"
+echo " Archive directories: EXCLUDED from transfer and deletion (all depths)"
 echo " Public LIVE robots transform: remove noindex/nofollow from active HTML (Archive preserved)"
 echo
 
