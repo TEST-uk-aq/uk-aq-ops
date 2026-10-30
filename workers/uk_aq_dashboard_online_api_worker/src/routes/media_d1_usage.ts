@@ -69,7 +69,7 @@ async function digest(value: string): Promise<string> {
 async function graphql(config: Config, query: string, variables: Json): Promise<Json> {
   let response: Response;
   try {
-    response = await fetch('https://api.cloudflare.com/client/v4/graphql', { method: 'POST', redirect: 'error',
+    response = await fetch('https://api.cloudflare.com/client/v4/graphql', { method: 'POST', redirect: 'manual',
       headers: { Authorization: `Bearer ${config.token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ query, variables: { account: config.account, ...variables } }),
       signal: AbortSignal.timeout(12000) });
