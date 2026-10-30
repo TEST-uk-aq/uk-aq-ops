@@ -340,6 +340,21 @@ mark_failure() {
   FAILED_REPOS+=("${label}")
 }
 
+# With --no-times, rsync may still itemise unchanged files as ".f..T....".
+# Those records report only an unpreserved modification time, not a content
+# transfer. Keep rsync's checksum comparison and suppress only those lines.
+# All content, permission, ownership, deletion and error diagnostics remain.
+filter_rsync_timestamp_only_lines() {
+  local line item
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    item="${line%% *}"
+    case "${item}" in
+      .[fdLDS]..T....|.[fdLDS]..T......) continue ;;
+    esac
+    printf '%s\n' "${line}"
+  done
+}
+
 website_was_selected() {
   local repo
   for repo in "${SELECTED_REPOS[@]}"; do
@@ -617,7 +632,9 @@ sync_repo() {
     rsync_args+=(--dry-run)
   fi
 
-  if rsync "${rsync_args[@]}" "${src}/" "${dst}/"; then
+  # pipefail keeps rsync failures fatal even though we filter display-only
+  # timestamp records from stdout. stderr remains untouched.
+  if rsync "${rsync_args[@]}" "${src}/" "${dst}/" | filter_rsync_timestamp_only_lines; then
     # Media LIVE retains its operational docs; excluding docs from rsync
     # must not result in a separate destructive docs cleanup.
     if [[ "${label}" != "media" ]]; then
