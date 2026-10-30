@@ -17,8 +17,8 @@ DST="${LIVE_BASE}/LIVE-uk-aq.github.io"
 
 APPLY=0
 
-PUBLIC_BLOG_REL="blog/index.html"
-PUBLIC_BLOG_ROBOTS_META='<meta name="robots" content="noindex, nofollow">'
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROBOTS_HELPER="${SCRIPT_DIR}/scripts/strip_public_robots_meta.py"
 
 usage() {
   cat <<'USAGE'
@@ -35,8 +35,9 @@ Options:
 
 GitHub workflows and the beta notice are included like normal website files.
 The public LIVE CNAME and favicon files are preserved.
-When Blog is present, its beta-only noindex/nofollow robots meta line is removed
-from the public LIVE destination after sync.
+All active public HTML pages have noindex/nofollow robots meta directives
+removed from the public LIVE destination after sync. Archived HTML is preserved.
+The dry run reports these changes without modifying any files.
 USAGE
 }
 
@@ -97,52 +98,6 @@ if [[ "${DST_CNAME}" != "ukaq.co.uk" ]]; then
   exit 1
 fi
 
-remove_public_blog_noindex() {
-  local source_blog="${SRC}/${PUBLIC_BLOG_REL}"
-  local destination_blog="${DST}/${PUBLIC_BLOG_REL}"
-
-  if [[ ! -f "${source_blog}" ]]; then
-    return 0
-  fi
-
-  if ! grep -Fq "${PUBLIC_BLOG_ROBOTS_META}" "${source_blog}"; then
-    return 0
-  fi
-
-  if [[ "${APPLY}" -eq 0 ]]; then
-    echo " Public LIVE Blog transform: would remove noindex/nofollow robots meta from ${PUBLIC_BLOG_REL}"
-    return 0
-  fi
-
-  if [[ ! -f "${destination_blog}" ]]; then
-    echo "ERROR: expected public LIVE Blog file after sync: ${destination_blog}" >&2
-    exit 1
-  fi
-
-  if grep -Fq "${PUBLIC_BLOG_ROBOTS_META}" "${destination_blog}"; then
-    python3 - "${destination_blog}" "${PUBLIC_BLOG_ROBOTS_META}" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-marker = sys.argv[2]
-text = path.read_text(encoding="utf-8")
-lines = text.splitlines(keepends=True)
-path.write_text(
-    "".join(line for line in lines if marker not in line),
-    encoding="utf-8",
-)
-PY
-  fi
-
-  if grep -Fq "${PUBLIC_BLOG_ROBOTS_META}" "${destination_blog}"; then
-    echo "ERROR: public LIVE Blog robots transform failed: ${destination_blog}" >&2
-    exit 1
-  fi
-
-  echo " Public LIVE Blog transform: removed beta-only noindex/nofollow robots meta"
-}
-
 rsync_args=(
   -av
   --checksum
@@ -188,8 +143,18 @@ echo "              ukaq.co.uk (UK-AQ/uk-aq.github.io)"
 echo " GitHub workflows: INCLUDED"
 echo " Beta notice: INCLUDED"
 echo " Preserved LIVE-owned files: CNAME, favicon.ico, favicon.png"
-echo " Public LIVE Blog transform: remove beta-only noindex/nofollow robots meta"
+echo " Public LIVE robots transform: remove noindex/nofollow from active HTML (Archive preserved)"
 echo
+
+if [[ ! -f "${ROBOTS_HELPER}" ]]; then
+  echo "ERROR: required robots transform helper is missing: ${ROBOTS_HELPER}" >&2
+  exit 1
+fi
+
+echo " Previewing public HTML indexing changes:"
+# Validate and preview the complete source before any destination modification.
+# The preflight leaves both website checkouts unchanged.
+python3 "${ROBOTS_HELPER}" "${SRC}"
 
 if ! rsync "${rsync_args[@]}" "${SRC}/" "${DST}/"; then
   echo
@@ -200,7 +165,11 @@ if ! rsync "${rsync_args[@]}" "${SRC}/" "${DST}/"; then
   exit 1
 fi
 
-remove_public_blog_noindex
+if [[ "${APPLY}" -eq 1 ]]; then
+  # The source was inspected before rsync. Write only the resulting active HTML
+  # in the public destination, leaving beta and Archive untouched.
+  python3 "${ROBOTS_HELPER}" "${DST}" --apply
+fi
 
 echo
 echo "==================================================================="
