@@ -4,6 +4,12 @@ import { readColumn } from "hyparquet/src/column.js";
 import { DEFAULT_PARSERS } from "hyparquet/src/convert.js";
 import { flatten } from "hyparquet/src/utils.js";
 import { compressors } from "hyparquet-compressors";
+import { encodeObservationHistoryIndexV3Json } from "./uk_aq_observation_history_index_v3_json.mjs";
+import {
+  EXACT_LEAF_FORMATS_V3, exactLeafFormatV3, assertExactRecordFieldsV2,
+  assertExactFieldsV3, assertExactLeafKeyV3, exactLeafRevisionBytesV3,
+  validateExactCanonicalSourceV2,
+} from "./uk_aq_observation_history_exact_leaf_format_v3.mjs";
 
 import {
   coalesceObservationHistoryV3ByteRanges,
@@ -37,6 +43,9 @@ const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const COLUMN_NAMES = Object.freeze(["observed_at_utc", "value"]);
 const CURSOR_KIND = "uk_aq_observation_history_exact_leaf_physical_cursor";
 const CURSOR_SCHEMA_VERSION = 3;
+const EXACT_ONLY_CURSOR_SCHEMA_VERSION = 4;
+const EXACT_ONLY_CURSOR_LIFETIME_MS = 300_000;
+const REQUEST_SELECTOR_IDENTITY = Symbol("request-local exact selector identity");
 const PAGINATION_PARTIAL_REASON = "physical_pagination_incomplete";
 const SUPPORTED_DECODE_PROFILE_ID = "hyparquet-direct-column-v1";
 const SUPPORTED_DECODE_PROFILE = Object.freeze({
@@ -113,7 +122,12 @@ function iso(value, label) {
 
 function parseJson(body, label) {
   try {
-    return JSON.parse(new TextDecoder().decode(body));
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(body);
+    const payload = JSON.parse(text);
+    if (payload?.schema_version === 2 && text !== encodeObservationHistoryIndexV3Json(payload)) {
+      throw new Error("schema-2 index bytes are not canonical (or contain duplicate fields)");
+    }
+    return payload;
   } catch (error) {
     throw new Error(`${label} is not valid JSON`, { cause: error });
   }
@@ -169,6 +183,7 @@ function normalizeIndex(index) {
     manifestKind: required(index.manifestKind, "index.manifestKind"),
     leafKind: required(index.leafKind, "index.leafKind"),
     additionalCommonFields: Object.freeze({ ...additionalCommonFields }),
+    supportedExactSchemas: Object.freeze([...(index.supportedExactSchemas || [1])]),
   });
   if (
     normalized.historyVersion !== "v2" ||
@@ -176,6 +191,11 @@ function normalizeIndex(index) {
     normalized.alignedRowCap !== MAX_PHYSICAL_SEGMENT_ROWS ||
     normalized.decodeProfileId !== SUPPORTED_DECODE_PROFILE_ID
   ) throw new Error("unsupported exact-leaf logical/layout identity");
+  if (!normalized.supportedExactSchemas.length ||
+      normalized.supportedExactSchemas.some((schema) => ![1, 2].includes(schema)) ||
+      new Set(normalized.supportedExactSchemas).size !== normalized.supportedExactSchemas.length) {
+    throw new Error("unsupported exact-index schema admission");
+  }
   if (normalized.root === getObservationHistoryGeneration("v3").observations_timeseries_index_prefix &&
       (normalized.alignedDataRoot !== getObservationHistoryGeneration("v3").observations_prefix || normalized.indexGeneration !== "v3")) {
     throw new Error("Canonical exact v3 index must reference history/v3 observations");
@@ -241,27 +261,27 @@ function assertCommonIndex(
   expectedPhysicalIdentity = null,
 ) {
   const physicalIdentity = normalizeScopePhysicalIdentity(payload, index, kind);
+  const record = kind === index.manifestKind ? "manifest" : "leaf";
+  const format = exactLeafFormatV3(payload, record);
   if (
-    payload?.schema_version !== 1 ||
-    payload?.kind !== kind ||
+    !index.supportedExactSchemas.includes(format.schema_version) ||
+    (format.schema_version === 1 && payload?.kind !== kind) ||
     payload?.index_generation !== index.indexGeneration ||
     payload?.history_version !== index.historyVersion ||
     payload?.domain !== "observations" ||
     payload?.day_utc !== expected.dayUtc ||
     payload?.connector_id !== expected.connectorId ||
     payload?.pollutant_code !== expected.pollutantCode ||
-    Object.entries(index.additionalCommonFields).some(([field, value]) => payload?.[field] !== value)
+    Object.entries(index.additionalCommonFields).some(([field, value]) =>
+      !(format.schema_version === 2 && field === "exact_leaf_index_version") && payload?.[field] !== value)
   ) throw new Error(`unsupported or contradictory ${kind}`);
+  if (format.schema_version === 2) assertExactRecordFieldsV2(payload, record);
   if (
     expectedPhysicalIdentity &&
     Object.entries(expectedPhysicalIdentity).some(([field, value]) =>
       physicalIdentity[field] !== value)
   ) throw new Error(`${kind} physical identity contradicts its scoped manifest`);
   return physicalIdentity;
-}
-
-function expectedLeafKey(root, scope, timeseriesId) {
-  return `${root}/${scope}/timeseries_id=${String(timeseriesId).padStart(9, "0")}.json`;
 }
 
 function validateIdentity(raw, label) {
@@ -386,6 +406,7 @@ function validateManifest(payload, expected, key, scope, index) {
     Array.isArray(payload.leaves_by_timeseries_id)
   ) throw new Error("exact-leaf scoped manifest key or lookup is contradictory");
   const profile = validateProfile(payload.decode_profile, physicalIdentity);
+  const format = exactLeafFormatV3(payload);
   const lookupKeys = Object.keys(payload.leaves_by_timeseries_id);
   if (
     positiveInteger(payload.coverage?.timeseries_count, "coverage.timeseries_count") !== lookupKeys.length ||
@@ -398,30 +419,53 @@ function validateManifest(payload, expected, key, scope, index) {
   const coverageMin = iso(payload.coverage?.min_observed_at_utc, "coverage.min_observed_at_utc");
   const coverageMax = iso(payload.coverage?.max_observed_at_utc, "coverage.max_observed_at_utc");
   if (coverageMin > coverageMax) throw new Error("exact-leaf scoped manifest coverage bounds are contradictory");
-  const sourceManifest = validateIdentity(payload.source_aligned_scoped_manifest, "source_aligned_scoped_manifest");
-  if (sourceManifest.key !== `${index.alignedIndexRoot}/${scope}/manifest.json`) {
-    throw new Error("exact-leaf source aligned scoped-manifest key is contradictory");
+  if (format.schema_version === 1) {
+    const sourceManifest = validateIdentity(payload.source_aligned_scoped_manifest, "source_aligned_scoped_manifest");
+    if (sourceManifest.key !== `${index.alignedIndexRoot}/${scope}/manifest.json`) {
+      throw new Error("exact-leaf source aligned scoped-manifest key is contradictory");
+    }
+  } else {
+    if (encodeObservationHistoryIndexV3Json(profile) !==
+        encodeObservationHistoryIndexV3Json(decodeProfileForPhysicalIdentity(physicalIdentity))) {
+      throw new Error("schema-2 decode profile has unsupported fields");
+    }
+    assertExactFieldsV3(payload.coverage, ["row_count", "timeseries_count", "physical_file_count",
+      "physical_leaf_count", "min_observed_at_utc", "max_observed_at_utc"], "exact coverage");
+    if (payload.coverage.physical_leaf_count !== lookupKeys.length ||
+        !Number.isSafeInteger(payload.coverage.physical_file_count) || payload.coverage.physical_file_count <= 0 ||
+        payload.coverage.physical_file_count > payload.coverage.row_count ||
+        coverageMin < `${expected.dayUtc}T00:00:00.000Z` ||
+        coverageMax >= new Date(Date.parse(`${expected.dayUtc}T00:00:00.000Z`) + DAY_MS).toISOString()) {
+      throw new Error("schema-2 exact coverage is contradictory");
+    }
+    validateExactCanonicalSourceV2(payload.canonical_source_manifest, payload, index.alignedDataRoot, scope);
+    for (const [id, tuple] of Object.entries(payload.leaves_by_timeseries_id)) {
+      if (!Array.isArray(tuple) || tuple.length !== 3 || !Number.isSafeInteger(tuple[1]) || tuple[1] <= 0 || tuple[1] > MAX_INDEX_BYTES) {
+        throw new Error("schema-2 leaf descriptor is contradictory");
+      }
+      const identity = validateIdentity({ key: tuple[0], byte_size: tuple[1], sha256: tuple[2] }, "exact member");
+      assertExactLeafKeyV3(identity.key, index.root, scope, Number(id), format);
+    }
   }
   const raw = payload.leaves_by_timeseries_id[String(expected.timeseriesId)];
-  if (raw === undefined) return { profile, physicalIdentity, descriptor: null };
+  if (raw === undefined) return { profile, physicalIdentity, format, descriptor: null };
   if (!Array.isArray(raw) || raw.length !== 3) throw new Error("exact-leaf descriptor tuple is contradictory");
   const descriptor = validateIdentity(
     { key: raw[0], byte_size: raw[1], sha256: raw[2] },
     "selected exact-leaf descriptor",
   );
-  if (descriptor.key !== expectedLeafKey(index.root, scope, expected.timeseriesId)) {
-    throw new Error("exact-leaf descriptor key is contradictory");
-  }
-  return { profile, physicalIdentity, descriptor };
+  assertExactLeafKeyV3(descriptor.key, index.root, scope, expected.timeseriesId, format);
+  return { profile, physicalIdentity, format, descriptor };
 }
 
-function validateLeaf(
+async function validateLeaf(
   payload,
   expected,
   descriptor,
   profile,
   physicalIdentity,
   index,
+  expectedFormat = EXACT_LEAF_FORMATS_V3[0],
 ) {
   assertCommonIndex(
     payload,
@@ -430,6 +474,14 @@ function validateLeaf(
     index,
     physicalIdentity,
   );
+  const format = exactLeafFormatV3(payload, "leaf");
+  if (format.schema_version !== expectedFormat.schema_version) throw new Error("leaf format contradicts selected scope");
+  if (format.schema_version === 2) {
+    const revision = assertExactLeafKeyV3(descriptor.key, index.root, scopePath(expected), expected.timeseriesId, format);
+    if (await sha256ObservationHistoryV3Bytes(exactLeafRevisionBytesV3(payload)) !== revision) {
+      throw new Error("immutable exact leaf revision contradicts semantic payload");
+    }
+  }
   if (
     payload.key !== descriptor.key ||
     payload.timeseries_id !== expected.timeseriesId ||
@@ -448,21 +500,28 @@ function validateLeaf(
   if (leafMin > leafMax || leafMin < dayStart || leafMax >= dayEnd) {
     throw new Error("exact physical leaf bounds are contradictory to its UTC-day scope");
   }
-  const sourceChild = validateIdentity(payload.source_aligned_child, "source_aligned_child");
-  const alignedScopeRoot = `${index.alignedIndexRoot}/${scopePath(expected)}`;
-  if (
-    !sourceChild.key.startsWith(`${alignedScopeRoot}/range=`) ||
-    !/\/range=\d+-\d+\.json$/.test(sourceChild.key)
-  ) throw new Error("exact physical leaf source aligned child is contradictory");
+  if (format.schema_version === 1) {
+    const sourceChild = validateIdentity(payload.source_aligned_child, "source_aligned_child");
+    const alignedScopeRoot = `${index.alignedIndexRoot}/${scopePath(expected)}`;
+    if (!sourceChild.key.startsWith(`${alignedScopeRoot}/range=`) ||
+        !/\/range=\d+-\d+\.json$/.test(sourceChild.key)) {
+      throw new Error("exact physical leaf source aligned child is contradictory");
+    }
+  }
 
   const files = new Map(payload.files.map((raw) => {
     const file = validateFile(raw, expected, index);
+    if (format.schema_version === 2 && (!file.key.startsWith(`${index.alignedDataRoot}/${scopePath(expected)}/`) ||
+        file.key.split("/").some((part) => !part || part === "." || part === ".."))) {
+      throw new Error("exact-only file is outside its selected canonical scope");
+    }
     return [file.key, file];
   }));
   if (files.size !== payload.files.length) throw new Error("duplicate exact-leaf file descriptor");
 
   let totalRows = 0;
   let previousMax = null;
+  let previousPhysical = null;
   const coordinates = new Set();
   const usedFileKeys = new Set();
   const segments = payload.segments.map((raw, segmentIndex) => {
@@ -483,6 +542,20 @@ function validateLeaf(
     const coordinate = `${file.key}#${rowGroupOrdinal}#${raw.row_start}`;
     if (coordinates.has(coordinate)) throw new Error(`duplicate exact-leaf segment coordinate: ${coordinate}`);
     coordinates.add(coordinate);
+    if (format.schema_version === 2) {
+      const groupKey = `${file.key}#${rowGroupOrdinal}`;
+      if (coordinates.has(groupKey) || raw.timeseries_id !== expected.timeseriesId ||
+          !Number.isSafeInteger(raw.row_start) || raw.row_start < 0 || raw.row_start + rowCount > file.row_count) {
+        throw new Error("schema-2 physical row-group coverage is contradictory");
+      }
+      coordinates.add(groupKey);
+      if (previousPhysical && (file.key < previousPhysical.file_key ||
+          (file.key === previousPhysical.file_key && (raw.row_group_ordinal <= previousPhysical.row_group_ordinal ||
+            raw.row_start < previousPhysical.row_start + previousPhysical.row_count)))) {
+        throw new Error("schema-2 physical segment order regresses");
+      }
+      previousPhysical = raw;
+    }
     const min = iso(raw.min_observed_at_utc, `segments[${segmentIndex}].min_observed_at_utc`);
     const max = iso(raw.max_observed_at_utc, `segments[${segmentIndex}].max_observed_at_utc`);
     if (
@@ -636,17 +709,21 @@ function validateCursorPhysicalIdentity(raw, index, label) {
   return identity;
 }
 
-function encodeNextCursor(request, index, discovery, segment, pageNumber, scopeSegmentNumber) {
-  return base64UrlEncode({
-    schema_version: CURSOR_SCHEMA_VERSION,
+function encodeNextCursor(request, index, discovery, segment, pageNumber, scopeSegmentNumber, lifetime) {
+  const exactOnly = discovery.scopes.some((scope) => scope.exact_format?.schema_version === 2);
+  const cursor = base64UrlEncode({
+    schema_version: exactOnly ? EXACT_ONLY_CURSOR_SCHEMA_VERSION : CURSOR_SCHEMA_VERSION,
     kind: CURSOR_KIND,
     request: cursorRequestIdentity(request, index),
     discovery,
     next: cursorSegmentIdentity(segment, pageNumber, scopeSegmentNumber),
+    ...(exactOnly ? lifetime : {}),
   });
+  if (cursor.length > MAX_CURSOR_LENGTH) throw new Error("physical cursor exceeds bounded size");
+  return cursor;
 }
 
-function validateCursorLeafDescriptor(raw, request, index, dayUtc, label) {
+function validateCursorLeafDescriptor(raw, request, index, dayUtc, label, format = EXACT_LEAF_FORMATS_V3[0]) {
   exactKeys(raw, ["key", "byte_size", "sha256"], label);
   const descriptor = validateIdentity(raw, label);
   const scope = scopePath({
@@ -654,9 +731,7 @@ function validateCursorLeafDescriptor(raw, request, index, dayUtc, label) {
     connectorId: request.connectorId,
     pollutantCode: request.pollutantCode,
   });
-  if (descriptor.key !== expectedLeafKey(index.root, scope, request.timeseriesId)) {
-    throw codedError("physical_cursor_invalid", `${label} is outside its deterministic exact-leaf scope`);
-  }
+  assertExactLeafKeyV3(descriptor.key, index.root, scope, request.timeseriesId, format);
   return descriptor;
 }
 
@@ -719,7 +794,7 @@ function sameFields(left, right) {
   });
 }
 
-function validateCursorDiscovery(raw, request, index, startMs, endMs) {
+function validateCursorDiscovery(raw, request, index, startMs, endMs, cursorVersion) {
   exactKeys(raw, [
     "coverage_complete",
     "coverage_partial_reasons",
@@ -742,12 +817,33 @@ function validateCursorDiscovery(raw, request, index, startMs, endMs) {
       "leaf_descriptor",
       "intersecting_segment_count",
       "first_intersecting_segment",
+      ...(cursorVersion === 4 ? ["exact_format", "selector_descriptor"] : []),
     ], label);
     const dayUtc = required(scope.day_utc, `${label}.day_utc`);
     if (dayUtc !== days[scopeIndex]) {
       throw codedError("physical_cursor_invalid", `${label}.day_utc is contradictory`);
     }
     const state = required(scope.state, `${label}.state`);
+    let format = EXACT_LEAF_FORMATS_V3[0];
+    let selector = null;
+    if (cursorVersion === 4) {
+      format = scope.exact_format === null ? null : EXACT_LEAF_FORMATS_V3.find((candidate) =>
+        JSON.stringify(candidate) === JSON.stringify(scope.exact_format));
+      if (scope.exact_format !== null && (!format || !index.supportedExactSchemas.includes(format.schema_version))) {
+        throw codedError("physical_cursor_invalid", "unsupported cursor scope exact format");
+      }
+      if (scope.selector_descriptor !== null) {
+        exactKeys(scope.selector_descriptor, ["key", "byte_size", "sha256"], "cursor selector");
+        selector = validateIdentity(scope.selector_descriptor, "cursor selector");
+        if (selector.key !== `${index.root}/${scopePath({ ...request, dayUtc })}/manifest.json`) {
+          throw codedError("physical_cursor_invalid", "cursor selector is outside its deterministic scope");
+        }
+      }
+      if ((state === "missing_scope") !== (format === null && selector === null) ||
+          (state !== "missing_scope" && (!format || !selector))) {
+        throw codedError("physical_cursor_invalid", "cursor scope format/selector is contradictory");
+      }
+    }
     if (!["validated_leaf", "authoritative_absence", "missing_scope", "missing_leaf"].includes(state)) {
       throw codedError("physical_cursor_invalid", `${label}.state is invalid`);
     }
@@ -765,7 +861,7 @@ function validateCursorDiscovery(raw, request, index, startMs, endMs) {
       );
     const descriptor = scope.leaf_descriptor === null
       ? null
-      : validateCursorLeafDescriptor(scope.leaf_descriptor, request, index, dayUtc, `${label}.leaf_descriptor`);
+      : validateCursorLeafDescriptor(scope.leaf_descriptor, request, index, dayUtc, `${label}.leaf_descriptor`, format);
     const first = scope.first_intersecting_segment === null
       ? null
       : validateCursorCoordinate(scope.first_intersecting_segment, request, index, dayUtc, `${label}.first_intersecting_segment`);
@@ -786,6 +882,7 @@ function validateCursorDiscovery(raw, request, index, startMs, endMs) {
       leaf_descriptor: descriptor,
       intersecting_segment_count: count,
       first_intersecting_segment: first,
+      ...(cursorVersion === 4 ? { exact_format: format, selector_descriptor: selector } : {}),
     });
   });
   const derivedReasons = [...new Set(scopes.flatMap((scope) => {
@@ -812,8 +909,10 @@ function validateCursorDiscovery(raw, request, index, startMs, endMs) {
 function decodeAndValidateCursorRequest(physicalCursor, request, index, startMs, endMs) {
   if (physicalCursor === null || physicalCursor === undefined || physicalCursor === "") return null;
   const payload = base64UrlDecode(physicalCursor);
-  exactKeys(payload, ["schema_version", "kind", "request", "discovery", "next"], "physical cursor");
-  if (payload.schema_version !== CURSOR_SCHEMA_VERSION || payload.kind !== CURSOR_KIND) {
+  const version = payload.schema_version;
+  exactKeys(payload, ["schema_version", "kind", "request", "discovery", "next",
+    ...(version === 4 ? ["issued_at_utc", "expires_at_utc"] : [])], "physical cursor");
+  if (![CURSOR_SCHEMA_VERSION, EXACT_ONLY_CURSOR_SCHEMA_VERSION].includes(version) || payload.kind !== CURSOR_KIND) {
     throw codedError("physical_cursor_invalid", "physical cursor version or kind is invalid");
   }
   const expectedRequest = cursorRequestIdentity(request, index);
@@ -823,7 +922,17 @@ function decodeAndValidateCursorRequest(physicalCursor, request, index, startMs,
       throw codedError("physical_cursor_invalid", `physical cursor request field ${field} is contradictory`);
     }
   }
-  const discovery = validateCursorDiscovery(payload.discovery, request, index, startMs, endMs);
+  if (version === 4) {
+    const issued = Date.parse(iso(payload.issued_at_utc, "cursor issuance"));
+    const expires = Date.parse(iso(payload.expires_at_utc, "cursor expiry"));
+    if (expires - issued !== EXACT_ONLY_CURSOR_LIFETIME_MS || issued > Date.now() || expires <= Date.now()) {
+      throw codedError("physical_cursor_invalid", "physical cursor is expired or has invalid lifetime");
+    }
+  }
+  const discovery = validateCursorDiscovery(payload.discovery, request, index, startMs, endMs, version);
+  if (version === 4 && !discovery.scopes.some((scope) => scope.exact_format?.schema_version === 2)) {
+    throw codedError("physical_cursor_invalid", "cursor 4 requires selected schema-2 authority");
+  }
   exactKeys(payload.next, [
     "page_number",
     "scope_segment_number",
@@ -860,7 +969,7 @@ function decodeAndValidateCursorRequest(physicalCursor, request, index, startMs,
     key: payload.next.leaf_key,
     byte_size: payload.next.leaf_byte_size,
     sha256: payload.next.leaf_sha256,
-  }, request, index, dayUtc, "physical cursor next leaf descriptor");
+  }, request, index, dayUtc, "physical cursor next leaf descriptor", scope.exact_format || EXACT_LEAF_FORMATS_V3[0]);
   if (!sameFields(nextDescriptor, scope.leaf_descriptor)) {
     throw codedError("physical_cursor_invalid", "physical cursor next leaf descriptor contradicts discovery");
   }
@@ -895,7 +1004,7 @@ function decodeAndValidateCursorRequest(physicalCursor, request, index, startMs,
     throw codedError("physical_cursor_invalid", "physical cursor page number contradicts bounded discovery");
   }
   return Object.freeze({
-    schema_version: CURSOR_SCHEMA_VERSION,
+    schema_version: version,
     kind: CURSOR_KIND,
     request: payload.request,
     discovery,
@@ -910,6 +1019,7 @@ function decodeAndValidateCursorRequest(physicalCursor, request, index, startMs,
       ...nextCoordinate,
     }),
     scope_index: scopeIndex,
+    ...(version === 4 ? { issued_at_utc: payload.issued_at_utc, expires_at_utc: payload.expires_at_utc } : {}),
   });
 }
 
@@ -958,8 +1068,13 @@ async function readIndex(source, key, diagnostics, { leaf = false, manifest = fa
   if (diagnostics.index_objects_read >= MAX_INDEX_OBJECTS) {
     throw new Error("exact-leaf index object-count budget exceeded");
   }
-  const object = await source.getIndexObject({ key, maxBytes: MAX_INDEX_BYTES, diagnostics });
+  const remaining = MAX_INDEX_BYTES - diagnostics.index_bytes_read;
+  if (remaining <= 0) throw new Error("exact-leaf index byte budget exceeded");
+  const object = await source.getIndexObject({ key, maxBytes: remaining, diagnostics });
   if (!object) return null;
+  if (exactBody(object.body).byteLength !== object.byte_size || object.byte_size > remaining) {
+    throw new Error("exact-leaf index byte budget or body size mismatch");
+  }
   diagnostics.index_objects_read += 1;
   diagnostics.index_bytes_read += object.byte_size;
   if (manifest) diagnostics.scoped_manifests_read += 1;
@@ -1067,13 +1182,14 @@ export async function readObservationHistoryExactLeafDailyMetadataV3({
       manifest.descriptor,
       "exact physical leaf",
     );
-    const segments = validateLeaf(
+    const segments = await validateLeaf(
       parseJson(leafBody, manifest.descriptor.key),
       expected,
       manifest.descriptor,
       manifest.profile,
       manifest.physicalIdentity,
       normalizedIndex,
+      manifest.format,
     );
     rows.push(Object.freeze({
       day_utc: dayUtc,
@@ -1122,6 +1238,7 @@ function leafDescriptorSnapshot(descriptor) {
 }
 
 function createDiscoverySnapshot(scopes) {
+  const exactOnly = scopes.some((scope) => scope.exact_format?.schema_version === 2);
   const coveragePartialReasons = [...new Set(scopes.flatMap((scope) => {
     if (scope.state === "missing_scope") return ["required_physical_leaf_scope_missing"];
     if (scope.state === "missing_leaf") return ["required_physical_timeseries_leaf_missing"];
@@ -1136,6 +1253,7 @@ function createDiscoverySnapshot(scopes) {
     first_intersecting_segment: scope.intersecting_segments.length
       ? segmentCoordinateIdentity(scope.intersecting_segments[0])
       : null,
+    ...(exactOnly ? { exact_format: scope.exact_format, selector_descriptor: scope.selector_descriptor } : {}),
   }));
   return Object.freeze({
     coverage_complete: coveragePartialReasons.length === 0,
@@ -1194,6 +1312,45 @@ function compareCursorSelectedSegment(cursor, segment) {
   }
 }
 
+async function selectorIdentity(object, key) {
+  if (object[REQUEST_SELECTOR_IDENTITY]) return object[REQUEST_SELECTOR_IDENTITY];
+  return Object.freeze({ key, byte_size: object.byte_size,
+    sha256: await sha256ObservationHistoryV3Bytes(exactBody(object.body)) });
+}
+
+// Request-local selection for cache identity. The reader reuses these same bytes:
+// a cold miss does not add network reads or bypass its four-object/8 MiB budget.
+export async function prepareObservationHistoryExactLeafRequestV3(options) {
+  const { source } = options;
+  const index = normalizeIndex(options.index);
+  const request = { timeseriesId: positiveInteger(options.timeseriesId, "timeseriesId"),
+    connectorId: positiveInteger(options.connectorId, "connectorId"),
+    pollutantCode: required(options.pollutantCode, "pollutantCode"),
+    startIso: iso(options.startUtc, "startUtc"), endIso: iso(options.endUtc, "endUtc") };
+  const start = Date.parse(request.startIso), end = Date.parse(request.endIso);
+  if (end <= start || end - start > MAX_LOGICAL_REQUEST_MS) throw new Error("invalid bounded exact request");
+  const prefetched = new Map();
+  const selectors = [];
+  const diagnostics = diagnosticsTemplate();
+  for (const dayUtc of dayList(start, end)) {
+    const scope = scopePath({ ...request, dayUtc });
+    const key = `${index.root}/${scope}/manifest.json`;
+    const object = await readIndex(source, key, diagnostics, { manifest: true });
+    if (!object) { prefetched.set(key, null); selectors.push({ key, state: "missing_scope" }); continue; }
+    const manifest = validateManifest(parseJson(object.body, key), { ...request, dayUtc }, key, scope, index);
+    const identity = await selectorIdentity(object, key);
+    prefetched.set(key, Object.freeze({ ...object, [REQUEST_SELECTOR_IDENTITY]: identity }));
+    selectors.push({ ...identity, exact_format: manifest.format });
+  }
+  return Object.freeze({
+    source: Object.freeze({
+      getIndexObject: async (args) => prefetched.has(args.key) ? prefetched.get(args.key) : source.getIndexObject(args),
+      openParquetFile: (args) => source.openParquetFile(args),
+    }),
+    cache_identity: await sha256ObservationHistoryV3Bytes(new TextEncoder().encode(JSON.stringify(selectors))),
+  });
+}
+
 export async function readObservationHistoryExactLeafPageV3({
   source,
   timeseriesId,
@@ -1249,6 +1406,9 @@ export async function readObservationHistoryExactLeafPageV3({
     let pageNumber = 1;
     let scopeSegmentNumber = 1;
     let nextScopeSegmentNumber = null;
+    const issuedAt = decodedCursor?.issued_at_utc || new Date().toISOString();
+    const lifetime = { issued_at_utc: issuedAt,
+      expires_at_utc: decodedCursor?.expires_at_utc || new Date(Date.parse(issuedAt) + EXACT_ONLY_CURSOR_LIFETIME_MS).toISOString() };
 
     if (!decodedCursor) {
       diagnostics.physical_page_path = "initial_discovery";
@@ -1266,6 +1426,8 @@ export async function readObservationHistoryExactLeafPageV3({
             day_utc: dayUtc,
             state: "missing_scope",
             physical_identity: null,
+            exact_format: null,
+            selector_descriptor: null,
             leaf_descriptor: null,
             intersecting_segments: [],
           });
@@ -1278,11 +1440,14 @@ export async function readObservationHistoryExactLeafPageV3({
           scope,
           normalizedIndex,
         );
+        const selector = await selectorIdentity(manifestObject, manifestKey);
         if (!manifest.descriptor) {
           scopeRecords.push({
             day_utc: dayUtc,
             state: "authoritative_absence",
             physical_identity: manifest.physicalIdentity,
+            exact_format: manifest.format,
+            selector_descriptor: selector,
             leaf_descriptor: null,
             intersecting_segments: [],
           });
@@ -1294,19 +1459,22 @@ export async function readObservationHistoryExactLeafPageV3({
             day_utc: dayUtc,
             state: "missing_leaf",
             physical_identity: manifest.physicalIdentity,
+            exact_format: manifest.format,
+            selector_descriptor: selector,
             leaf_descriptor: manifest.descriptor,
             intersecting_segments: [],
           });
           continue;
         }
         const leafBody = await assertBodyIdentity(leafObject, manifest.descriptor, "exact physical leaf");
-        const segments = validateLeaf(
+        const segments = await validateLeaf(
           parseJson(leafBody, manifest.descriptor.key),
           expected,
           manifest.descriptor,
           manifest.profile,
           manifest.physicalIdentity,
           normalizedIndex,
+          manifest.format,
         );
         const scopedSegments = segments
           .filter((segment) => segmentIntersects(segment, startMs, endMs))
@@ -1316,6 +1484,8 @@ export async function readObservationHistoryExactLeafPageV3({
           day_utc: dayUtc,
           state: "validated_leaf",
           physical_identity: manifest.physicalIdentity,
+          exact_format: manifest.format,
+          selector_descriptor: selector,
           leaf_descriptor: manifest.descriptor,
           intersecting_segments: scopedSegments,
         });
@@ -1329,6 +1499,29 @@ export async function readObservationHistoryExactLeafPageV3({
       nextScopeSegmentNumber = nextSegment?.scope_segment_number || null;
     } else {
       discovery = decodedCursor.discovery;
+      if (decodedCursor.schema_version === 4) {
+        // Validate exact selector identities, without rediscovering/sorting the
+        // remaining logical range. At most two selectors plus one leaf.
+        for (const selected of discovery.scopes) {
+          const expected = { ...request, dayUtc: selected.day_utc };
+          const scope = scopePath(expected);
+          const key = `${normalizedIndex.root}/${scope}/manifest.json`;
+          const object = await readIndex(source, key, diagnostics, { manifest: true });
+          if (selected.state === "missing_scope" && !object) continue;
+          if (!object || !selected.selector_descriptor) throw codedError("physical_cursor_invalid", "cursor selector presence changed");
+          try {
+            await assertBodyIdentity(object, selected.selector_descriptor, "cursor scoped selector");
+            const manifest = validateManifest(parseJson(object.body, key), expected, key, scope, normalizedIndex);
+            if (manifest.format !== selected.exact_format ||
+                !sameFields(manifest.physicalIdentity, selected.physical_identity) ||
+                JSON.stringify(manifest.descriptor) !== JSON.stringify(selected.leaf_descriptor)) {
+              throw new Error("cursor selected format, physical identity or membership changed");
+            }
+          } catch (error) {
+            throw codedError("physical_cursor_invalid", error instanceof Error ? error.message : String(error));
+          }
+        }
+      }
       pageNumber = decodedCursor.next.page_number;
       scopeSegmentNumber = decodedCursor.next.scope_segment_number;
       const currentScope = discovery.scopes[decodedCursor.scope_index];
@@ -1350,13 +1543,14 @@ export async function readObservationHistoryExactLeafPageV3({
           `physical cursor pinned leaf identity is stale: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
-      const segments = validateLeaf(
+      const segments = await validateLeaf(
         parseJson(leafBody, descriptor.key),
         expected,
         descriptor,
         decodeProfileForPhysicalIdentity(currentScope.physical_identity),
         currentScope.physical_identity,
         normalizedIndex,
+        currentScope.exact_format || EXACT_LEAF_FORMATS_V3[0],
       );
       const scopedSegments = segments
         .filter((segment) => segmentIntersects(segment, startMs, endMs))
@@ -1495,6 +1689,7 @@ export async function readObservationHistoryExactLeafPageV3({
           nextSegment,
           pageNumber + 1,
           nextScopeSegmentNumber,
+          lifetime,
         );
     const coverageReasons = [...discovery.coverage_partial_reasons];
     const partialReasons = [...coverageReasons, ...(paginationComplete ? [] : [PAGINATION_PARTIAL_REASON])];
@@ -1549,6 +1744,7 @@ export const OBSERVATION_HISTORY_EXACT_LEAF_LIMITS = Object.freeze({
   max_physical_segments_per_invocation: 1,
   max_physical_segment_rows: MAX_PHYSICAL_SEGMENT_ROWS,
   physical_cursor_schema_version: CURSOR_SCHEMA_VERSION,
+  exact_only_physical_cursor_schema_version: EXACT_ONLY_CURSOR_SCHEMA_VERSION,
   max_physical_cursor_characters: MAX_CURSOR_LENGTH,
 });
 
