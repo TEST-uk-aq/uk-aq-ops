@@ -32,7 +32,6 @@ import {
 const ACCEPTED_SNAPSHOT_MAX_ROWS = 250_000;
 const ACCEPTED_SNAPSHOT_MAX_BYTES = 268_435_456;
 const CONTROLLED_MAX_CANDIDATES = 1;
-const CONTROLLED_STAGING_RETENTION_DAYS = 365_000;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const GIT_SHA_PATTERN = /^[0-9a-f]{40}$/;
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
@@ -449,7 +448,6 @@ export function buildControlledPhaseBConfig(phaseB) {
   return {
     ...phaseB,
     max_candidates_per_run: CONTROLLED_MAX_CANDIDATES,
-    staging_retention_days: CONTROLLED_STAGING_RETENTION_DAYS,
     prune_check_dropbox: {
       ...(phaseB.prune_check_dropbox || {}),
       enabled: false,
@@ -515,9 +513,6 @@ function assertApplySummary({ summary, expected, events }) {
   }
   if (Array.isArray(summary?.aggregate_day_failures) && summary.aggregate_day_failures.length > 0) {
     fail("Phase B reported aggregate-day failures");
-  }
-  if (Number(summary?.staging_cleanup?.deleted_count || 0) !== 0) {
-    fail(`Controlled acceptance unexpectedly deleted ${summary.staging_cleanup.deleted_count} staging object(s)`);
   }
   if (Number(summary?.prune_check_dropbox_exports || 0) !== 0 || Number(summary?.prune_check_dropbox_failures || 0) !== 0) {
     fail("Controlled acceptance unexpectedly used the optional Phase B Dropbox comparison surface");
@@ -751,7 +746,6 @@ export async function executeControlledPhaseBAcceptance(options, {
         max_candidates_per_run: phaseB.max_candidates_per_run,
         snapshot_max_rows: phaseB.phase_b_observation_snapshot_max_rows,
         snapshot_max_bytes: phaseB.phase_b_observation_snapshot_max_bytes,
-        staging_retention_days: phaseB.staging_retention_days,
         prune_check_dropbox_enabled: phaseB.prune_check_dropbox.enabled,
       },
       plan,
@@ -807,7 +801,6 @@ export async function executeControlledPhaseBAcceptance(options, {
       max_candidates_per_run: phaseB.max_candidates_per_run,
       snapshot_max_rows: phaseB.phase_b_observation_snapshot_max_rows,
       snapshot_max_bytes: phaseB.phase_b_observation_snapshot_max_bytes,
-      staging_retention_days: phaseB.staging_retention_days,
       prune_check_dropbox_enabled: phaseB.prune_check_dropbox.enabled,
     },
     plan,

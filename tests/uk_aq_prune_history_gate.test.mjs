@@ -11,6 +11,7 @@ import {
   isAcceptedPruneHistoryDayManifestKey,
   markCandidateAndConnectorGateCompleteForTest,
   populateBackupCandidatesForTest,
+  resolvePhaseBRuntimeConfig,
   runCandidateAqilevelsStageForTest,
   runPhaseBBackup,
   runBudgetedPhaseBStageForTest,
@@ -65,6 +66,13 @@ test("connector-day pairs accept canonical text and UTC-midnight Date values onl
   assert.throws(() => normalizeConnectorDayPair("2026-07-23", "two"), /Invalid.*connector_id/);
 });
 
+test("Phase B runtime config has no staging maintenance fields", () => {
+  const runtime = resolvePhaseBRuntimeConfig({
+    UK_AQ_R2_HISTORY_VERSION: "v2",
+  });
+  assert.equal(Object.keys(runtime).some((key) => key.startsWith("staging_")), false);
+});
+
 test("prune history day manifest gate accepts v1 observation day manifests", () => {
   assert.equal(
     isAcceptedPruneHistoryDayManifestKey("history/v1/observations/day_utc=2026-06-12/manifest.json"),
@@ -90,7 +98,7 @@ test("prune history day manifest gate rejects non-day and malformed paths", () =
   assert.equal(isAcceptedPruneHistoryDayManifestKey("history/v2/observations/manifest.json"), false);
   assert.equal(isAcceptedPruneHistoryDayManifestKey("history/v2/observations/day_utc=2026-6-12/manifest.json"), false);
   assert.equal(isAcceptedPruneHistoryDayManifestKey("history/v2/observations/day_utc=2026-06-12/not-manifest.json"), false);
-  assert.equal(isAcceptedPruneHistoryDayManifestKey("history/v3/observations/day_utc=2026-06-12/manifest.json"), false);
+  assert.equal(isAcceptedPruneHistoryDayManifestKey("history/v3/observations/day_utc=2026-06-12/manifest.json"), true);
 });
 
 test("prune history day manifest gate rejects connector and pollutant manifests", () => {
@@ -1726,7 +1734,6 @@ function phaseBConfig() {
     },
     history_write_version: "v2",
     writer_git_sha: "4".repeat(40),
-    staging_prefix_base: "history/v2/_ops/observations/staging",
     committed_prefix: "history/v2/observations",
     committed_prefix_v1: "history/v1/observations",
     committed_prefix_v2: "history/v2/observations",
@@ -1767,6 +1774,7 @@ test("persisted historical block remains visible on rediscovery without a pendin
       };
       let pendingFetches = 0;
       let writerClaims = 0;
+      const r2Calls = { listedPrefixes: [], putKeys: [], headKeys: [] };
       const client = {
         async connect() {}, async end() {},
         async query(sql) {
@@ -1790,9 +1798,26 @@ test("persisted historical block remains visible on rediscovery without a pendin
         ...phaseBConfig(), history_write_version: generation,
         committed_prefix: `history/${generation}/observations`,
         runs_prefix: `history/${generation}/_ops/observations/runs`,
+        r2: {
+          endpoint: "https://r2.invalid", bucket: "test-bucket", region: "auto",
+          access_key_id: "test-access", secret_access_key: "test-secret",
+          adapter: {
+            async listAllObjects({ prefix }) {
+              r2Calls.listedPrefixes.push(prefix);
+              return [];
+            },
+            async putObject({ key }) {
+              r2Calls.putKeys.push(key);
+            },
+            async headObject({ key }) {
+              r2Calls.headKeys.push(key);
+              return { exists: true };
+            },
+          },
+        },
       };
       const summary = await runPhaseBBackup({
-        dryRun: true, phaseB, ingestRetentionDays: 5, logStructured: () => {},
+        dryRun: false, phaseB, ingestRetentionDays: 5, logStructured: () => {},
         runId: `rediscovery-${generation}`, nowUtc: "2026-07-27T12:00:00.000Z",
         createPgClient: () => client,
       });
@@ -1802,6 +1827,10 @@ test("persisted historical block remains visible on rediscovery without a pendin
       assert.equal(summary.pending_candidates, 0);
       assert.equal(pendingFetches, 1);
       assert.equal(writerClaims, 0);
+      assert.equal(Object.hasOwn(summary, "staging_cleanup"), false);
+      assert.equal(r2Calls.listedPrefixes.some((prefix) => /_ops\/observations\/staging/.test(prefix)), false);
+      assert.ok(r2Calls.putKeys.includes(`${phaseB.runs_prefix}/run_id=rediscovery-${generation}/run_manifest.json`));
+      assert.ok(r2Calls.headKeys.includes(`${phaseB.runs_prefix}/run_id=rediscovery-${generation}/run_manifest.json`));
     }
   }
 });

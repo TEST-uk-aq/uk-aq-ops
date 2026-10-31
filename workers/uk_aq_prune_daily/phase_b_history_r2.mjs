@@ -32,7 +32,6 @@ import { compressors } from "hyparquet-compressors";
 import {
   hasRequiredR2Config,
   normalizePrefix,
-  r2DeleteObjects,
   r2GetObject,
   r2HeadObject,
   r2ListAllObjects,
@@ -192,8 +191,6 @@ const PHASE_B_V3_CANDIDATE_START_MIN_MS =
   PHASE_B_STAGE_MIN_MS.candidate_start
   - PHASE_B_STAGE_MIN_MS.observation_run_finalization
   + PHASE_B_V3_RUN_FINALIZATION_RESERVE_MS;
-const DEFAULT_STAGING_RETENTION_DAYS = 7;
-const DEFAULT_STAGING_PREFIX = "history/v1/_ops/observations/staging";
 const DEFAULT_RUNS_PREFIX_V2 = "history/v2/_ops/observations/runs";
 const DEFAULT_INGESTDB_RETENTION_DAYS = 5;
 const DEFAULT_OBSAQIDB_OBSERVS_RETENTION_DAYS = 14;
@@ -6860,59 +6857,6 @@ async function finalizeDayGateIfReady({ client, runtime, dayUtc }) {
   });
 }
 
-async function cleanupStaging({ runtime, logStructured }) {
-  const thresholdMs = (Date.now() - (runtime.staging_retention_days * DAY_MS));
-  const entries = await r2ListAllObjects({
-    r2: runtime.r2,
-    prefix: `${runtime.staging_prefix_base}/`,
-    max_keys: 1000,
-  });
-
-  const staleKeys = entries
-    .filter((entry) => {
-      if (!entry.last_modified) {
-        return false;
-      }
-      const lastModifiedMs = Date.parse(entry.last_modified);
-      if (Number.isNaN(lastModifiedMs)) {
-        return false;
-      }
-      return lastModifiedMs < thresholdMs;
-    })
-    .map((entry) => entry.key);
-
-  if (!staleKeys.length) {
-    return {
-      scanned_count: entries.length,
-      deleted_count: 0,
-      error_count: 0,
-    };
-  }
-
-  let deletedCount = 0;
-  let errorCount = 0;
-  for (let i = 0; i < staleKeys.length; i += 1000) {
-    const batch = staleKeys.slice(i, i + 1000);
-    const result = await r2DeleteObjects({ r2: runtime.r2, keys: batch });
-    deletedCount += result.deleted_count;
-    errorCount += result.errors.length;
-    if (result.errors.length > 0) {
-      logStructured("WARNING", "phase_b_history_staging_cleanup_batch_errors", {
-        run_id: runtime.run_id,
-        batch_size: batch.length,
-        error_count: result.errors.length,
-        errors_sample: result.errors.slice(0, 10),
-      });
-    }
-  }
-
-  return {
-    scanned_count: entries.length,
-    deleted_count: deletedCount,
-    error_count: errorCount,
-  };
-}
-
 async function writeRunManifest({ runtime, runSummary }) {
   const key = buildRunManifestKey(runtime.runs_prefix, runtime.run_id);
   const payloadWithoutHash = {
@@ -6980,9 +6924,6 @@ function resolveR2Bucket(env) {
 }
 
 export function resolvePhaseBRuntimeConfig(env = process.env) {
-  const stagingBasePrefix = normalizePrefix(
-    env.UK_AQ_R2_HISTORY_STAGING_PREFIX || DEFAULT_STAGING_PREFIX,
-  );
   const writePrefixes = resolvePhaseBHistoryWritePrefixes(env);
   const committedPrefixV2 = writePrefixes.observations_prefix_v2;
   const activeCommittedPrefix = writePrefixes.observations_prefix;
@@ -7139,13 +7080,6 @@ export function resolvePhaseBRuntimeConfig(env = process.env) {
       0,
       3_600,
     ),
-    staging_retention_days: parsePositiveInt(
-      env.UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS,
-      DEFAULT_STAGING_RETENTION_DAYS,
-      1,
-      90,
-    ),
-    staging_prefix_base: stagingBasePrefix,
     committed_prefix: activeCommittedPrefix,
     aqilevels_prefix: aqilevelsPrefix,
     history_write_version: historyWriteVersion,
@@ -7219,7 +7153,6 @@ export async function runPhaseBBackup({
     ...phaseB,
     run_id: runId,
     now_utc: nowUtc,
-    staging_prefix: `${phaseB.staging_prefix_base}/run_id=${runId}`,
     logStructured,
     run_budget: createPhaseBRunBudgetForTest({
       nowMs,
@@ -7770,11 +7703,6 @@ export async function runPhaseBBackup({
   summary.blocked_preview = dayStates.filter((state) => state.history_done !== true).slice(0, 25);
   summary.aggregate_day_failures = summary.aggregate_day_failures.slice(0, 25);
   summary.failures = summary.failures.slice(0, 25);
-
-  const cleanupSummary = summary.status === "stopped_budget"
-    ? { skipped: true, reason: "reserved_for_final_reporting" }
-    : await cleanupStaging({ runtime, logStructured });
-  summary.staging_cleanup = cleanupSummary;
 
   if (summary.status === "stopped_budget") {
     summary.run_manifest_key = null;

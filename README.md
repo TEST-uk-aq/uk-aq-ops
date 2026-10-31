@@ -127,14 +127,14 @@ Primary controls:
 - `UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_ENABLED` (default `false`; optional prune-vs-adopted comparison export to Dropbox for adopted connectors)
 - `UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_REQUIRED` (default `false`; when `true`, adoption fails if comparison upload fails)
 - `UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_DIR` (default `prune_r2_check`)
-- `UK_AQ_R2_HISTORY_STAGING_RETENTION_DAYS` (default `7`)
-- `UK_AQ_R2_HISTORY_STAGING_PREFIX` (default `history/v1/_ops/observations/staging`)
 - `UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX` (default `history/v1/observations`)
 - `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX` (default `history/v1/aqilevels/hourly`)
 - `UK_AQ_R2_HISTORY_RUNS_PREFIX` (default `history/v1/_ops/observations/runs`)
 - `UK_AQ_DEPLOY_ENV` (`dev|stage|prod`, default `dev`)
 - The active GitHub Actions path uses a 30-minute worker guard and a 40-minute job timeout; see [`system_docs/r2_history/prune_daily_runtime_budget.md`](system_docs/r2_history/prune_daily_runtime_budget.md).
 - Observation deletion requires source-identity contract v1 evidence on both the completed candidate and Prune-owned connector-day gate. Prune recomputes the exact canonical connector-day identity and deletes selected buckets in the same direct-PostgreSQL `REPEATABLE READ` transaction; legacy null evidence and mismatches fail closed.
+
+`ops_vars.txt` is a historical informational export captured on 5 July 2026, not a current settings snapshot. Its two retired observation-staging entries were removed; the remaining values have not been refreshed from GitHub.
 
 ### 2) Observs Outbox Flush (`workers/uk_aq_observs_outbox_flush_service/server.mjs`)
 

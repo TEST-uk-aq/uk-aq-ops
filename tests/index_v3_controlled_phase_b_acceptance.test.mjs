@@ -15,6 +15,7 @@ function baseEnv() {
   return {
     UK_AQ_ENV_NAME: "TEST",
     UK_AQ_R2_HISTORY_INTEGRITY_VERSION: "v2",
+    UK_AQ_R2_HISTORY_VERSION: "v3",
     GITHUB_SHA: GIT_SHA,
     INGESTDB_RETENTION_DAYS: "5",
   };
@@ -22,7 +23,9 @@ function baseEnv() {
 
 function basePhaseB() {
   return {
-    history_write_version: "v2",
+    history_write_version: "v3",
+    committed_prefix: "history/v3/observations",
+    runs_prefix: "history/v3/_ops/observations/runs",
     observation_history_index_version: "v3",
     supabase_db_url: "postgres://example.invalid/test",
     observs_source: {
@@ -39,7 +42,6 @@ function basePhaseB() {
     phase_b_observation_snapshot_max_rows: 250000,
     phase_b_observation_snapshot_max_bytes: 268435456,
     observations_pollutant_codes: [],
-    staging_retention_days: 7,
     prune_check_dropbox: {
       enabled: true,
       required: true,
@@ -124,7 +126,7 @@ test("controlled config hard-limits one candidate and disables optional Dropbox 
   assert.equal(controlled.phase_b_observation_snapshot_max_bytes, 268435456);
   assert.equal(controlled.prune_check_dropbox.enabled, false);
   assert.equal(controlled.prune_check_dropbox.required, false);
-  assert.equal(controlled.staging_retention_days, 365000);
+  assert.equal(Object.keys(controlled).some((key) => key.includes("staging")), false);
 });
 
 test("strict dry-run never invokes the Phase B writer", async () => {
@@ -193,7 +195,6 @@ test("apply uses one-candidate Phase B only and accepts retained source evidence
         failed_candidates: 0,
         failures: [],
         aggregate_day_failures: [],
-        staging_cleanup: { deleted_count: 0 },
         prune_check_dropbox_exports: 0,
         prune_check_dropbox_failures: 0,
       };

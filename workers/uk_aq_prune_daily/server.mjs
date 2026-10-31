@@ -1699,12 +1699,6 @@ export function buildRunConfig(url) {
     1,
     50_000,
   );
-  phaseB.staging_retention_days = parsePositiveInt(
-    params.get("historyStagingRetentionDays") ?? phaseB.staging_retention_days,
-    phaseB.staging_retention_days,
-    1,
-    90,
-  );
   const historyDbUrlOverride = (params.get("historyDbUrl") || "").trim();
   if (historyDbUrlOverride) {
     phaseB.supabase_db_url = historyDbUrlOverride;
