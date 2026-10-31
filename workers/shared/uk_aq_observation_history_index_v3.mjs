@@ -1,6 +1,8 @@
 // @ts-nocheck -- shared deterministic builder is consumed by Node and Deno callers.
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
+import { encodeObservationHistoryIndexV3Json } from "./uk_aq_observation_history_index_v3_json.mjs";
+export { encodeObservationHistoryIndexV3Json };
 
 import {
   validateObservationContentHashMetadata,
@@ -146,25 +148,6 @@ class PublicationPositionMinHeap {
     }
     return minimum;
   }
-}
-
-function canonicalizeJsonValue(value) {
-  if (Array.isArray(value)) {
-    return value.map(canonicalizeJsonValue);
-  }
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.keys(value)
-        .filter((key) => value[key] !== undefined)
-        .sort(bytewiseCompare)
-        .map((key) => [key, canonicalizeJsonValue(value[key])]),
-    );
-  }
-  return value;
-}
-
-export function encodeObservationHistoryIndexV3Json(payload) {
-  return `${JSON.stringify(canonicalizeJsonValue(payload), null, 2)}\n`;
 }
 
 // Match canonicalizeJsonValue() followed by JSON.stringify(..., null, 2)

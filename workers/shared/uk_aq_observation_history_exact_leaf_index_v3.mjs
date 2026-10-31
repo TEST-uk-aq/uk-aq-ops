@@ -18,6 +18,10 @@ import {
   OBSERVATION_HISTORY_WRITER_VERSION_V3,
 } from "./uk_aq_observation_history_schema.mjs";
 import { sha256Hex } from "./r2_sigv4.mjs";
+import { getObservationHistoryGeneration } from "./uk_aq_observation_history_generation.mjs";
+import { EXACT_LEAF_FORMATS_V3, exactLeafFormatV3, assertExactRecordFieldsV2,
+  assertExactLeafKeyV3, exactLeafRevisionBytesV3, validateExactCanonicalSourceV2,
+} from "./uk_aq_observation_history_exact_leaf_format_v3.mjs";
 
 export {
   buildObservationHistoryIndexV3PublicationPlan,
@@ -552,12 +556,101 @@ function artifactBodyIsExact(raw, expectedKind, expectedStage) {
   return raw;
 }
 
-export function validateObservationHistoryExactLeafArtifactV3({ artifact: raw }) {
+function validateExactOnlyCommon(payload, indexRoot) {
+  const scope = normalizeScope(payload);
+  if (payload.index_generation !== "v3" || payload.history_version !== "v2" || payload.domain !== "observations" ||
+      ![3, 4].includes(payload.history_schema_version) ||
+      payload.writer_version !== `parquet-wasm-zstd-v${payload.history_schema_version}` ||
+      payload.physical_layout_version !== OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION ||
+      payload.aligned_row_cap !== OBSERVATION_HISTORY_ALIGNED_ROW_CAP ||
+      payload.day_utc !== scope.day_utc || payload.connector_id !== scope.connector_id ||
+      payload.pollutant_code !== scope.pollutant_code) throw new Error("unsupported exact-only physical/scope identity");
+  return scopePath(scope);
+}
+
+function validateExactOnlyLeaf(payload, indexRoot) {
+  const format = exactLeafFormatV3(payload, "leaf");
+  assertExactRecordFieldsV2(payload, "leaf");
+  const scope = validateExactOnlyCommon(payload, indexRoot);
+  const revision = assertExactLeafKeyV3(payload.key, indexRoot, scope, payload.timeseries_id, format);
+  if (sha256Hex(exactLeafRevisionBytesV3(payload)) !== revision) throw new Error("exact-only leaf revision mismatch");
+  if (!Array.isArray(payload.files) || !Array.isArray(payload.segments) || !payload.segments.length) {
+    throw new Error("exact-only leaf requires complete files/segments");
+  }
+  const files = new Map(payload.files.map((raw) => {
+    const file = fileDescriptor(raw);
+    if (!file.key.startsWith(`${getObservationHistoryGeneration("v3").observations_prefix}/${scope}/`) ||
+        !file.key.endsWith(".parquet")) throw new Error("exact-only file is outside canonical scope");
+    return [file.key, file];
+  }));
+  if (files.size !== payload.files.length) throw new Error("duplicate exact-only file");
+  const groups = new Set(), used = new Set();
+  let rows = 0, previous = null;
+  for (const segment of payload.segments) {
+    const file = files.get(segment.file_key);
+    const min = canonicalIso(segment.min_observed_at_utc, "segment minimum");
+    const max = canonicalIso(segment.max_observed_at_utc, "segment maximum");
+    const dayStart = `${payload.day_utc}T00:00:00.000Z`;
+    if (!file || segment.timeseries_id !== payload.timeseries_id || segment.row_count > 1024 ||
+        segment.row_group_row_start !== 0 || segment.row_group_ordinal >= file.row_group_count ||
+        segment.row_start + segment.row_count > file.row_count || min > max || min < dayStart ||
+        max >= new Date(Date.parse(dayStart) + 86400000).toISOString() || (previous !== null && min < previous)) {
+      throw new Error("contradictory exact-only segment");
+    }
+    integer(segment.row_group_ordinal, "row group", { zero: true });
+    integer(segment.row_start, "row start", { zero: true });
+    const group = `${file.key}#${segment.row_group_ordinal}`;
+    if (groups.has(group)) throw new Error("duplicate exact-only row group");
+    groups.add(group); used.add(file.key);
+    rows += integer(segment.row_count, "segment rows"); previous = max;
+    for (const name of ["observed_at_utc", "value"]) validateRange(segment.column_ranges?.[name], file, segment.row_count, name);
+  }
+  if (rows !== payload.row_count || used.size !== files.size ||
+      payload.segments[0].min_observed_at_utc !== payload.min_observed_at_utc ||
+      payload.segments.at(-1).max_observed_at_utc !== payload.max_observed_at_utc) {
+    throw new Error("exact-only leaf coverage mismatch");
+  }
+}
+
+function validateExactOnlyDependencies(value, expected) {
+  if (!Array.isArray(value.dependencies) || !Array.isArray(value.publication_prerequisites)) {
+    throw new Error("exact-only artifact requires explicit dependency arrays");
+  }
+  const normalized = value.dependencies.map((entry) => identity(entry, "exact dependency", entry.kind))
+    .sort((a, b) => bytewiseCompare(a.key, b.key));
+  const wanted = expected.map((entry) => identity(entry, "expected dependency", entry.kind))
+    .sort((a, b) => bytewiseCompare(a.key, b.key));
+  if (encodeObservationHistoryIndexV3Json(normalized) !== encodeObservationHistoryIndexV3Json(wanted)) {
+    throw new Error("exact-only dependencies contradict semantic file/source/leaf identities");
+  }
+  const scope = scopePath(value.payload);
+  const sourceKey = `${getObservationHistoryGeneration("v3").observations_prefix}/${scope}/manifest.json`;
+  if (value.publication_prerequisites.length > 1 ||
+      (value.payload.kind === EXACT_LEAF_FORMATS_V3[1].leaf_kind && value.publication_prerequisites.length !== 1)) {
+    throw new Error("exact-only leaf requires its canonical publication prerequisite");
+  }
+  for (const entry of value.publication_prerequisites) {
+    identity(entry, "exact prerequisite");
+    if (entry.kind !== "canonical_manifest" || entry.key !== sourceKey) {
+      throw new Error("unsupported exact-only publication prerequisite");
+    }
+  }
+}
+
+export function validateObservationHistoryExactLeafArtifactV3({ artifact: raw,
+  indexRoot = DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT }) {
   const value = artifactBodyIsExact(
     raw,
     "observation_history_index_v3_exact_leaf",
     "child_shard",
   );
+  const format = exactLeafFormatV3(value.payload, "leaf");
+  if (format.schema_version === 2) {
+    if (value.key !== value.payload.key) throw new Error("exact-only artifact key mismatch");
+    validateExactOnlyLeaf(value.payload, normalizePrefix(indexRoot, "indexRoot"));
+    validateExactOnlyDependencies(value, value.payload.files.map((file) => ({ ...file, kind: "canonical_parquet" })));
+    return Object.freeze({ artifact: value });
+  }
   if (
     value.payload?.kind !== OBSERVATION_HISTORY_EXACT_LEAF_KIND_V3 ||
     value.payload?.physical_layout_version !== OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION ||
@@ -571,19 +664,43 @@ export function validateObservationHistoryExactLeafArtifactV3({ artifact: raw })
 export function validateObservationHistoryExactLeafScopedManifestArtifactV3({
   artifact: raw,
   exactLeaves,
+  indexRoot = DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT,
 }) {
   const value = artifactBodyIsExact(
     raw,
     "observation_history_index_v3_exact_leaf_scoped_manifest",
     "scoped_manifest",
   );
+  const format = exactLeafFormatV3(value.payload);
+  const root = normalizePrefix(indexRoot, "indexRoot");
+  if (format.schema_version === 2) {
+    assertExactRecordFieldsV2(value.payload, "manifest");
+    const scope = validateExactOnlyCommon(value.payload, root);
+    if (value.key !== `${root}/${scope}/manifest.json` || value.payload.key !== value.key) {
+      throw new Error("exact-only selector key mismatch");
+    }
+    validateExactCanonicalSourceV2(value.payload.canonical_source_manifest, value.payload,
+      getObservationHistoryGeneration("v3").observations_prefix, scope);
+    validateExactOnlyDependencies(value, [
+      { ...value.payload.canonical_source_manifest, kind: "canonical_manifest" },
+      ...Object.values(value.payload.leaves_by_timeseries_id || {}).map((tuple) => ({
+        key: tuple?.[0], byte_size: tuple?.[1], sha256: tuple?.[2], kind: "child_shard" })),
+    ]);
+    const expectedProfile = { ...OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE,
+      root_schema_element: { ...OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE.root_schema_element,
+        num_children: value.payload.history_schema_version === 4 ? 6 : 7 } };
+    if (encodeObservationHistoryIndexV3Json(value.payload.decode_profile) !== encodeObservationHistoryIndexV3Json(expectedProfile) ||
+        JSON.stringify(value.payload.leaf_descriptor_fields) !== JSON.stringify(["key", "byte_size", "sha256"])) {
+      throw new Error("exact-only decode profile or descriptor fields mismatch");
+    }
+  }
   if (
-    value.payload?.kind !== OBSERVATION_HISTORY_EXACT_LEAF_MANIFEST_KIND_V3 ||
+    format.schema_version === 1 && (value.payload?.kind !== OBSERVATION_HISTORY_EXACT_LEAF_MANIFEST_KIND_V3 ||
     encodeObservationHistoryIndexV3Json(value.payload?.decode_profile) !==
-      encodeObservationHistoryIndexV3Json(OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE)
+      encodeObservationHistoryIndexV3Json(OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE))
   ) throw new Error(`exact-leaf scoped payload is contradictory: ${value.key}`);
   const leaves = (Array.isArray(exactLeaves) ? exactLeaves : []).map((leaf) =>
-    validateObservationHistoryExactLeafArtifactV3({ artifact: leaf }).artifact
+    validateObservationHistoryExactLeafArtifactV3({ artifact: leaf, indexRoot: root }).artifact
   );
   const expected = Object.fromEntries(leaves
     .sort((left, right) => left.payload.timeseries_id - right.payload.timeseries_id)
@@ -595,11 +712,49 @@ export function validateObservationHistoryExactLeafScopedManifestArtifactV3({
     encodeObservationHistoryIndexV3Json(value.payload.leaves_by_timeseries_id) !==
       encodeObservationHistoryIndexV3Json(expected)
   ) throw new Error(`exact-leaf scoped membership is incomplete: ${value.key}`);
+  if (format.schema_version === 2) {
+    const p = value.payload, c = p.coverage;
+    const files = new Map(), groups = new Set(), segmentsByFile = new Map();
+    for (const leaf of leaves) {
+      if (leaf.payload.schema_version !== 2 || ["day_utc", "connector_id", "pollutant_code", "history_schema_version", "writer_version"]
+        .some((field) => leaf.payload[field] !== p[field])) throw new Error("mixed scoped exact authority");
+      for (const file of leaf.payload.files) {
+        const prior = files.get(file.key);
+        if (prior && encodeObservationHistoryIndexV3Json(prior) !== encodeObservationHistoryIndexV3Json(file)) throw new Error("contradictory shared file");
+        files.set(file.key, file);
+      }
+      for (const s of leaf.payload.segments) {
+        const key = `${s.file_key}#${s.row_group_ordinal}`;
+        if (groups.has(key)) throw new Error("shared exact row group");
+        groups.add(key);
+        const segments = segmentsByFile.get(s.file_key) || [];
+        segments.push(s); segmentsByFile.set(s.file_key, segments);
+      }
+    }
+    if (!leaves.length || leaves.length !== new Set(leaves.map((l) => l.payload.timeseries_id)).size ||
+        c.timeseries_count !== leaves.length || c.physical_leaf_count !== leaves.length ||
+        c.physical_file_count !== files.size || c.row_count !== leaves.reduce((n, l) => n + l.payload.row_count, 0) ||
+        c.min_observed_at_utc !== leaves.map((l) => l.payload.min_observed_at_utc).sort()[0] ||
+        c.max_observed_at_utc !== leaves.map((l) => l.payload.max_observed_at_utc).sort().at(-1)) {
+      throw new Error("exact-only complete scope coverage mismatch");
+    }
+    for (const file of files.values()) {
+      const segments = segmentsByFile.get(file.key).sort((a, b) => a.row_start - b.row_start);
+      let position = 0;
+      if (segments.length !== file.row_group_count) throw new Error("incomplete exact-only file groups");
+      for (const [ordinal, segment] of segments.entries()) {
+        if (segment.row_start !== position || segment.row_group_ordinal !== ordinal) throw new Error("incomplete exact-only file rows");
+        position += segment.row_count;
+      }
+      if (position !== file.row_count) throw new Error("incomplete exact-only file count");
+    }
+  }
   return Object.freeze({ artifact: value });
 }
 
 export function scopedRootDescriptor(scopedManifest) {
   const payload = scopedManifest.payload;
+  const format = exactLeafFormatV3(payload);
   return Object.freeze({
     day_utc: payload.day_utc,
     connector_id: payload.connector_id,
@@ -614,10 +769,13 @@ export function scopedRootDescriptor(scopedManifest) {
     physical_file_count: payload.coverage.physical_file_count,
     min_observed_at_utc: payload.coverage.min_observed_at_utc,
     max_observed_at_utc: payload.coverage.max_observed_at_utc,
+    ...(format.schema_version === 2 ? { exact_index_schema_version: 2,
+      exact_index_kind: format.manifest_kind, exact_leaf_index_version: format.exact_leaf_index_version } : {}),
   });
 }
 
 function latestPayload(roots, indexRoot, latestKey) {
+  const exactOnly = roots.some((root) => root.exact_index_schema_version === 2);
   const byDay = new Map();
   for (const root of roots) {
     const list = byDay.get(root.day_utc) || [];
@@ -647,7 +805,9 @@ function latestPayload(roots, indexRoot, latestKey) {
     writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
     physical_layout_version: OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION,
     aligned_row_cap: OBSERVATION_HISTORY_ALIGNED_ROW_CAP,
-    exact_leaf_index_version: OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION,
+    ...(exactOnly ? { exact_index_formats: EXACT_LEAF_FORMATS_V3.filter((format) =>
+      roots.some((root) => (root.exact_index_schema_version || 1) === format.schema_version)) }
+      : { exact_leaf_index_version: OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION }),
     index_root: indexRoot,
     min_day_utc: days[0],
     max_day_utc: days.at(-1),
@@ -667,6 +827,9 @@ function latestPayload(roots, indexRoot, latestKey) {
         `${indexRoot}/day_utc={day_utc}/connector_id={connector_id}` +
         "/pollutant_code={pollutant_code}/timeseries_id={timeseries_id_9}.json",
       aligned_source_index_root: `${indexRoot}/_aligned`,
+      ...(exactOnly ? { exact_only_leaf_key_template:
+        `${indexRoot}/day_utc={day_utc}/connector_id={connector_id}/pollutant_code={pollutant_code}` +
+        "/_exact_v2/timeseries_id={timeseries_id_9}/revision={revision_sha256}.json" } : {}),
       latest_key: latestKey,
     },
     day_summaries: daySummaries,
@@ -728,6 +891,11 @@ function canonicalIso(value, label) {
 
 function normalizedRegistryRoot(raw, indexRoot, label) {
   const scope = normalizeScope(raw);
+  const explicitFormat = ["exact_index_schema_version", "exact_index_kind", "exact_leaf_index_version"]
+    .some((field) => Object.hasOwn(raw, field));
+  const format = explicitFormat ? exactLeafFormatV3({ schema_version: raw.exact_index_schema_version,
+    kind: raw.exact_index_kind, exact_leaf_index_version: raw.exact_leaf_index_version }) : EXACT_LEAF_FORMATS_V3[0];
+  if (explicitFormat && format.schema_version !== 2) throw new Error("legacy latest root must retain its original representation");
   const result = Object.freeze({
     ...scope,
     key: normalizeKey(raw?.key, `${label}.key`),
@@ -746,6 +914,8 @@ function normalizedRegistryRoot(raw, indexRoot, label) {
       raw?.max_observed_at_utc,
       `${label}.max_observed_at_utc`,
     ),
+    ...(format.schema_version === 2 ? { exact_index_schema_version: 2,
+      exact_index_kind: format.manifest_kind, exact_leaf_index_version: format.exact_leaf_index_version } : {}),
   });
   if (
     result.key !== scopedManifestKey(indexRoot, scope) ||

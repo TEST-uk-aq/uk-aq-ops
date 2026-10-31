@@ -8,6 +8,7 @@ import {
   ObservationHistoryExactLeafReadError,
   readObservationHistoryExactLeafDailyMetadataV3,
   readObservationHistoryExactLeafPageV3,
+  prepareObservationHistoryExactLeafRequestV3,
 } from "../shared/uk_aq_observation_history_exact_leaf_reader_v3.mjs";
 import {
   OBSERVATION_VERIFICATION_PER_OBSERVATION_MODEL,
@@ -24,7 +25,7 @@ const ALIGNED_ROW_CAP = 1024;
 const V3 = getObservationHistoryGeneration("v3");
 const ALIGNED_INDEX_PREFIX = `${V3.observations_timeseries_index_prefix}/_aligned`;
 const ALIGNED_DATA_PREFIX = V3.observations_prefix;
-const RESPONSE_CACHE_GENERATION = "side-by-side-v3-exact-leaf-5";
+const RESPONSE_CACHE_GENERATION = "side-by-side-v3-exact-leaf-6";
 const TIMESERIES_BINDING_CACHE_GENERATION = "3";
 const DEFAULT_MUTABLE_CACHE_SECONDS = 300;
 const DEFAULT_IMMUTABLE_CACHE_SECONDS = 86400;
@@ -143,6 +144,7 @@ export function observationHistoryV3ReaderIndex(indexRoot) {
     manifestKind: "observation_timeseries_physical_leaf_scoped_manifest",
     leafKind: "observation_timeseries_physical_leaf",
     additionalCommonFields: Object.freeze({ exact_leaf_index_version: "exact-timeseries-leaf-v1" }),
+    supportedExactSchemas: Object.freeze([1, 2]),
   });
 }
 
@@ -530,7 +532,7 @@ function cachePolicy(endIso) {
   return { scope: immutable ? "immutable" : "recent", seconds: immutable ? DEFAULT_IMMUTABLE_CACHE_SECONDS : DEFAULT_MUTABLE_CACHE_SECONDS };
 }
 
-function cacheKey(requestUrl, generation, verificationIdentity = null, env = {}, verificationMode = null) {
+function cacheKey(requestUrl, generation, verificationIdentity = null, env = {}, verificationMode = null, exactSelectionIdentity = null) {
   const url = historyCacheKeyUrl(requestUrl, env);
   url.searchParams.set("__ukaq_observs_history_read_v", generation);
   url.searchParams.set("__ukaq_observs_history_cache_gen", generation === INDEX_GENERATION ? RESPONSE_CACHE_GENERATION : TIMESERIES_BINDING_CACHE_GENERATION);
@@ -539,6 +541,8 @@ function cacheKey(requestUrl, generation, verificationIdentity = null, env = {},
       throw new Error("Missing or invalid v3 observation cache verification mode.");
     }
     url.searchParams.set("__ukaq_verification_mode", verificationMode);
+    if (!exactSelectionIdentity) throw new Error("Missing selected exact-index cache identity.");
+    url.searchParams.set("__ukaq_exact_selection", exactSelectionIdentity);
   }
   if (verificationIdentity) {
     url.searchParams.set("__ukaq_verification_identity", verificationIdentity);
@@ -626,10 +630,11 @@ async function handleObservations(
   env,
   diagnosticContext,
   verificationAuthority,
+  prepared = null,
 ) {
   const indexRoot = assertGenerationConfiguration(env);
   const result = await readObservationHistoryExactLeafPageV3({
-    source: createR2ObservationHistoryV3Source({ bucket: env.UK_AQ_HISTORY_BUCKET }),
+    source: prepared?.source || createR2ObservationHistoryV3Source({ bucket: env.UK_AQ_HISTORY_BUCKET }),
     timeseriesId: params.timeseriesId,
     connectorId: params.connectorId,
     pollutantCode: params.pollutantCode,
@@ -714,7 +719,7 @@ async function handleObservations(
   };
   return jsonResponse(payload, {
     cacheSeconds: policy.seconds,
-    noStore: !complete || Boolean(diagnosticContext),
+    noStore: !complete || Boolean(diagnosticContext) || Boolean(params.physicalCursor),
     extraHeaders: diagnosticHeaders(diagnosticContext),
   });
 }
@@ -754,8 +759,8 @@ export default {
       if (!params.ok) return jsonResponse({ ok: false, ...(params.error_code ? { error_code: params.error_code } : {}), error: params.error }, { status: params.status, noStore: true });
       const overlayEnabled = verificationOverlayEnabled(env);
       context = diagnosticRequestContext(request, params, overlayEnabled);
-      if (context) {
-        if (context.mode === EXACT_HISTORY_WORKLOAD_DIAGNOSTIC_MODE) {
+      if (context || params.physicalCursor) {
+        if (context?.mode === EXACT_HISTORY_WORKLOAD_DIAGNOSTIC_MODE) {
           console.info(JSON.stringify({
             event: "observation_history_v3_physical_leaf_workload_diagnostic_start",
             diagnostic_request_id: context.request_id,
@@ -788,6 +793,12 @@ export default {
       }
       // Keep concentration-only reads independent of verification discovery and
       // isolate cached content from older or newly re-enabled status-bearing reads.
+      const prepared = await prepareObservationHistoryExactLeafRequestV3({
+        source: createR2ObservationHistoryV3Source({ bucket: env.UK_AQ_HISTORY_BUCKET }),
+        timeseriesId: params.timeseriesId, connectorId: params.connectorId, pollutantCode: params.pollutantCode,
+        startUtc: params.startIso, endUtc: params.endIso,
+        index: observationHistoryV3ReaderIndex(V3.observations_timeseries_index_prefix),
+      });
       const verificationDiscovery = overlayEnabled
         ? await loadObservationVerificationDiscovery({
             bucket: env.UK_AQ_HISTORY_BUCKET,
@@ -806,6 +817,7 @@ export default {
         verificationManifestIdentity?.sha256 || null,
         env,
         overlayEnabled ? "enabled" : "disabled",
+        prepared.cache_identity,
       );
       const cached = await caches.default.match(key);
       if (cached && (!historyCacheEnabled(env) || authenticatedHistoryTags(cached.headers, env))) return withCacheHeaders(cached, "HIT", RESPONSE_CACHE_GENERATION);
@@ -822,6 +834,7 @@ export default {
         env,
         null,
         verificationAuthority,
+        prepared,
       );
       const payload = await response.clone().json().catch(() => null);
       if (response.ok) {
