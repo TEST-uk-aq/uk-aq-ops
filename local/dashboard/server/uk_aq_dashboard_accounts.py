@@ -25,7 +25,7 @@ _SUBSCRIPTION_FIELDS = (
     "consent_text_version", "mode_since_at", "confirmation_last_sent_at", "confirmed",
 )
 _DELIVERY_FIELDS = (
-    "id", "subscription_id", "delivery_mode", "state", "created_at", "sent_at",
+    "id", "subscription_id", "delivery_mode", "state", "display_state", "created_at", "sent_at",
     "failed_at", "attempt_count", "selected_transport", "attempt_transport",
     "retry_hold", "error_class",
 )
@@ -260,6 +260,14 @@ def _read_subscriptions(handler: Any, parsed: Any, headers_builder: Callable[...
     }
 
 
+def _valid_delivery_display(row: dict[str, Any]) -> bool:
+    # Never relabel a real cancellation; the Media source proves an empty Daily window.
+    return row["display_state"] == row["state"] or (
+        row["delivery_mode"] == "daily" and row["state"] == "cancelled"
+        and row["display_state"] == "no_articles"
+    )
+
+
 def _read_email_delivery(parsed: Any) -> dict[str, Any]:
     raw_query = _query(parsed.query, {"subscription_id", "limit", "offset", "days"})
     query = {
@@ -288,18 +296,20 @@ def _read_email_delivery(parsed: Any) -> dict[str, Any]:
         or type(payload.get("window_days")) is not int or payload["window_days"] != query["days"]
     ):
         _invalid_source()
-    safe_summary = [_safe_record(row, ("delivery_mode", "state", "count")) for row in summary]
+    safe_summary = [_safe_record(row, ("delivery_mode", "state", "display_state", "count")) for row in summary]
     safe_deliveries = [_safe_record(row, _DELIVERY_FIELDS) for row in deliveries]
     safe_outbox = [_safe_record(row, _OUTBOX_FIELDS) for row in outbox]
     if any(
         type(row["count"]) is not int or row["count"] < 0
         or row["delivery_mode"] not in _DELIVERY_MODE or row["state"] not in _DELIVERY_STATE | {"held"}
+        or not _valid_delivery_display(row)
         for row in safe_summary
     ):
         _invalid_source()
     for row in safe_deliveries:
         if (
             row["delivery_mode"] not in _DELIVERY_MODE or row["state"] not in _DELIVERY_STATE
+            or not _valid_delivery_display(row)
             or row["selected_transport"] not in _TRANSPORT or row["attempt_transport"] not in _TRANSPORT
             or row["error_class"] not in _ERROR_CLASS or not isinstance(row["retry_hold"], bool)
             or type(row["attempt_count"]) is not int or row["attempt_count"] < 0
