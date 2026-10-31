@@ -9,12 +9,17 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SUBSCRIPTION_FIELDS = ['id', 'email', 'status', 'delivery_mode', 'daily_time_local', 'timezone',
   'confirmed_at', 'created_at', 'updated_at', 'unsubscribed_at', 'blocked_at', 'block_reason', 'consent_text_version',
   'mode_since_at', 'confirmation_last_sent_at', 'confirmed'] as const;
-const DELIVERY_FIELDS = ['id', 'subscription_id', 'delivery_mode', 'state', 'created_at', 'sent_at',
+const DELIVERY_FIELDS = ['id', 'subscription_id', 'delivery_mode', 'state', 'display_state', 'created_at', 'sent_at',
   'failed_at', 'attempt_count', 'selected_transport', 'attempt_transport', 'retry_hold', 'error_class'] as const;
 const OUTBOX_FIELDS = ['id', 'work_type', 'state', 'created_at', 'queued_at', 'attempt_count', 'error_class'] as const;
 const STATUSES = ['pending', 'active', 'unsubscribed', 'blocked'];
 const MODES = ['confirmation', 'immediate', 'daily'];
 const STATES = ['pending', 'sending', 'accepted', 'temporary_failure', 'permanent_failure', 'unknown', 'cancelled'];
+// Presentation-only classification. The authoritative D1 'state' is unchanged.
+function validDisplayState(row: Json): boolean {
+  return row.display_state === row.state || (row.delivery_mode === 'daily' &&
+    row.state === 'cancelled' && row.display_state === 'no_articles');
+}
 const TRANSPORTS = [null, 'cloudflare_xoauth2', 'pro_app_password'];
 const ERRORS = [null, 'digest_size_requires_operator', 'stale_smtp_claim', 'stale_pre_submission_claim',
   'temporary_failure', 'permanent_failure', 'unknown', 'subscription_service_unavailable', 'work_retry_required', 'unavailable'];
@@ -195,15 +200,17 @@ async function delivery(url: URL, env: WorkerEnv): Promise<Response> {
   if (result.available !== true || result.window_days !== days || !Array.isArray(result.summary) || result.summary.length > 24) {
     throw new Error('Invalid delivery read');
   }
-  const summary = result.summary.map(row => project(row, ['delivery_mode', 'state', 'count']));
+  const summary = result.summary.map(row => project(row, ['delivery_mode', 'state', 'display_state', 'count']));
   const deliveries = rows(result.deliveries, paging.limit, DELIVERY_FIELDS);
   const outbox = rows(result.outbox, paging.limit, OUTBOX_FIELDS);
   for (const row of summary) {
     if (!MODES.includes(String(row.delivery_mode)) || ![...STATES, 'held'].includes(String(row.state)) ||
+        !validDisplayState(row) ||
         typeof row.count !== 'number' || !Number.isSafeInteger(row.count) || row.count < 0) throw new Error('Invalid summary');
   }
   for (const row of deliveries) {
     if (!MODES.includes(String(row.delivery_mode)) || !STATES.includes(String(row.state)) ||
+        !validDisplayState(row) ||
         !TRANSPORTS.includes(row.selected_transport as string | null) || !TRANSPORTS.includes(row.attempt_transport as string | null) ||
         !ERRORS.includes(row.error_class as string | null) || typeof row.retry_hold !== 'boolean' ||
         typeof row.attempt_count !== 'number' || row.attempt_count < 0 || typeof row.subscription_id !== 'string' ||
