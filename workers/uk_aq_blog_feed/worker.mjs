@@ -96,14 +96,21 @@ async function refreshFeed(env) {
 
     const rendered = await readBrowserRunRenderedContent(response);
     const rssSource = extractRssSource(rendered);
-    const candidate = normaliseRss(rssSource);
+    const diagnostics = {};
+    const candidate = normaliseRss(rssSource, diagnostics);
     validateNormalisedFeed(candidate);
 
     const payload = JSON.stringify(candidate);
     await env.BLOG_FEED_KV.put(KV_KEY, payload);
 
     return jsonResponse(
-      { ok: true, contract_version: candidate.contract_version, post_count: candidate.posts.length },
+      {
+        ok: true,
+        contract_version: candidate.contract_version,
+        post_count: candidate.posts.length,
+        source_last_build_date: diagnostics.lastBuildDate,
+        newest_post_description_chars: candidate.posts[0].description.length,
+      },
       200,
       { "cache-control": "no-store" },
     );
@@ -267,12 +274,21 @@ function describeRenderedSource(rendered) {
   return flags.join(",");
 }
 
-function normaliseRss(rssSource) {
+function normaliseRss(rssSource, diagnostics = null) {
   const root = parseXmlDocument(rssSource);
   if (root.name !== "rss") throw new Error("Feed root is not rss");
 
   const channel = childElements(root, "channel")[0];
   if (!channel) throw new Error("RSS channel is missing");
+
+  // Diagnostic only: the RSS publication date is not part of the normalised feed.
+  if (diagnostics) {
+    const rawDate = childText(channel, "lastBuildDate").trim();
+    const timestamp = rawDate ? Date.parse(rawDate) : NaN;
+    diagnostics.lastBuildDate = Number.isFinite(timestamp)
+      ? new Date(timestamp).toISOString()
+      : null;
+  }
 
   normalisePlainText(childText(channel, "title"), LIMITS.titleLength, "channel title");
   const channelLink = childText(channel, "link").trim();
