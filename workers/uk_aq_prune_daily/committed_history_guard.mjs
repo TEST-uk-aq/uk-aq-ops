@@ -15,6 +15,8 @@ import {
 } from "../shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import { encodeObservationHistoryIndexV3Json } from "../shared/uk_aq_observation_history_index_v3.mjs";
 import { r2GetObject, sha256Hex } from "../shared/r2_sigv4.mjs";
+import { exactLeafFormatV3 } from "../shared/uk_aq_observation_history_exact_leaf_format_v3.mjs";
+import { verifySelectedExactOnlyConsumerScopeV3 } from "../shared/uk_aq_observation_history_exact_only_consumer_v3.mjs";
 
 function isNotFound(error) {
   const status = error?.status ?? error?.statusCode ?? error?.response?.status;
@@ -113,10 +115,21 @@ async function pinnedIndexJson(getObject, r2, reference, expectedKey) {
   return payload;
 }
 
-async function verifyCommittedIndexBinding(getObject, r2, root, pollutant, pollutantBody) {
+async function verifyCommittedIndexBinding(getObject, r2, root, pollutant, pollutantBody, { headObject, assertOperationHeld }) {
   const indexRoot = DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT;
   const scope = `day_utc=${root.day_utc}/connector_id=${root.connector_id}/pollutant_code=${root.pollutant_code}`;
   const scoped = await pinnedIndexJson(getObject, r2, root, `${indexRoot}/${scope}/manifest.json`);
+  const format = exactLeafFormatV3(scoped);
+  if (format.schema_version === 2) {
+    await verifySelectedExactOnlyConsumerScopeV3({
+      scope: { day_utc: root.day_utc, connector_id: root.connector_id, pollutant_code: root.pollutant_code },
+      selector: root, canonical: { key: pollutant.manifest_key, byte_size: pollutantBody.length, sha256: sha256Hex(pollutantBody) },
+      getObject: async ({ key }) => await getObject({ r2, key }),
+      headObject: headObject ? async ({ key }) => await headObject({ r2, key, accept_encoding_identity: true }) : null,
+      assertOperationHeld,
+    });
+    return;
+  }
   if (scoped.kind !== "observation_timeseries_physical_leaf_scoped_manifest" ||
       scoped.index_generation !== "v3" || scoped.history_version !== "v2" ||
       scoped.day_utc !== root.day_utc || scoped.connector_id !== root.connector_id ||
@@ -157,7 +170,7 @@ export class PruneCommittedHistoryGuardError extends Error {
 // are committed authority; loose same-key objects can be interrupted artefacts.
 async function inspectPruneFrozenConnectorSnapshot({
   r2, observationsPrefix, dayUtc, connectorId, rows, getObject = r2GetObject,
-  onOriginalAuthority = null,
+  onOriginalAuthority = null, headObject = null, assertOperationHeld = null,
 }) {
   const prefix = observationsPrefix;
   const rootKey = buildR2HistoryV2ObservationsRootManifestKey(prefix);
@@ -242,7 +255,7 @@ async function inspectPruneFrozenConnectorSnapshot({
       validateCanonicalHistoryV2Manifest(pollutant, { history_version: "v2", domain: "observations", manifest_kind: "pollutant", day_utc: dayUtc, connector_id: connectorId, pollutant_code: code, manifest_key: childKey });
       if (pollutant.manifest_hash !== child.manifest_hash) throw new Error(`original complete publication identity cannot be proved after same-key child advance: ${childKey}`);
       validateObservationContentHashMetadata(pollutant, { rowCount: pollutant.row_count });
-      await verifyCommittedIndexBinding(getObject, r2, indexRoot, pollutant, pollutantBody);
+      await verifyCommittedIndexBinding(getObject, r2, indexRoot, pollutant, pollutantBody, { headObject, assertOperationHeld });
       if (!partition) {
         sourceDifferences.push(`frozen source omits committed pollutant=${code}`);
       } else if (pollutant.observation_content_hash_contract_version !== 1 ||

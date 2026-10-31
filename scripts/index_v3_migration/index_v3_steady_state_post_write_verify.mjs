@@ -13,6 +13,7 @@ import { readBoundedBaseline } from "./bounded_verify_baseline.mjs";
 import {
   DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY,
   encodeObservationHistoryIndexV3Json,
+  validateObservationHistoryExactLeafIndexV3LatestRegistry,
 } from "../../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import {
   OBSERVATION_HISTORY_COLUMNS_V3,
@@ -47,9 +48,13 @@ import {
 import { getObservationHistoryGeneration, assertObservationHistoryGenerationKey } from "../../workers/shared/uk_aq_observation_history_generation.mjs";
 import { CONTROLLED_PHASE_B_SOURCE_TABLES } from "./index_v3_controlled_phase_b_source_freeze.mjs";
 
+import { exactLeafFormatV3 } from "../../workers/shared/uk_aq_observation_history_exact_leaf_format_v3.mjs";
+import { verifySelectedExactOnlyConsumerScopeV3 } from "../../workers/shared/uk_aq_observation_history_exact_only_consumer_v3.mjs";
+import { withObservationsGlobalOperationLock } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
+
 const GENERATION = getObservationHistoryGeneration("v3");
 
-export const STEADY_STATE_POST_WRITE_VERIFIER_VERSION = 2;
+export const STEADY_STATE_POST_WRITE_VERIFIER_VERSION = 3;
 export const STEADY_STATE_BASELINE_KIND =
   "authenticated_completed_migration_recovery_journal";
 export const FINAL_SUCCESS = Object.freeze([
@@ -589,7 +594,7 @@ function assertExactLeafWriterLimits(leaf, label) {
   requireEqual(rows, Number(leaf.row_count), `${label} leaf row coverage`);
 }
 
-export async function verifyCanonicalHierarchy({ getObject, headObject, accepted, candidateManifestKey }) {
+export async function verifyCanonicalHierarchy({ getObject, headObject, accepted, candidateManifestKey, assertOperationHeld = null }) {
   const connectorObject = await getIdentity(getObject, candidateManifestKey);
   const connector = JSON.parse(connectorObject.body.toString("utf8"));
   validateCanonicalHistoryV2Manifest(connector, {
@@ -637,11 +642,20 @@ export async function verifyCanonicalHierarchy({ getObject, headObject, accepted
       };
       assertObservationHistoryGenerationKey(GENERATION, file.key);
       const head = await headObject({ key: file.key });
-      const classification = classifyDependencyIdentity({
-        exists: head?.exists !== false,
-        byte_size: head?.bytes,
-        sha256: head?.sha256,
-      }, descriptor);
+      let current = { exists: head?.exists !== false, byte_size: head?.bytes, sha256: head?.sha256 };
+      if (head?.sha256 == null) {
+        const indexKey = `${GENERATION.observations_timeseries_index_prefix}/day_utc=${accepted.day_utc}/connector_id=${accepted.connector_id}/pollutant_code=${ref.pollutant_code}/manifest.json`;
+        const selected = JSON.parse((await getIdentity(getObject, indexKey)).body.toString("utf8"));
+        if (exactLeafFormatV3(selected).schema_version === 2) {
+          if (typeof assertOperationHeld !== "function") fail("schema-2 full-GET verification requires held observations operation");
+          if (await assertOperationHeld() === false) fail("observations operation is not held");
+          if (head?.exists === false || (head?.bytes != null && head.bytes !== descriptor.byte_size)) fail("contradictory canonical HEAD identity");
+          const actual = await getIdentity(getObject, file.key);
+          if (await assertOperationHeld() === false) fail("observations operation is not held");
+          current = { exists: true, byte_size: actual.byte_size, sha256: actual.sha256 };
+        }
+      }
+      const classification = classifyDependencyIdentity(current, descriptor);
       if (classification.classification !== "EXACT") fail(`canonical Parquet identity failed: ${file.key}`);
       if (Number(file.row_count) > ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3.max_file_rows || Number(file.bytes) > ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3.max_file_bytes) {
         fail(`canonical Parquet file exceeds accepted hard limits: ${file.key}`);
@@ -653,6 +667,7 @@ export async function verifyCanonicalHierarchy({ getObject, headObject, accepted
       pollutant_code: ref.pollutant_code,
       manifest_key: ref.manifest_key,
       manifest_hash: object.sha256,
+      manifest_byte_size: object.byte_size,
       row_count: Number(manifest.row_count),
       file_count: files.length,
       files: files.map((file) => ({
@@ -712,72 +727,15 @@ function exactLatestPayload(body) {
   } catch {
     fail("v3 latest-global object is invalid JSON");
   }
-  if (
-    payload?.schema_version !== 3 ||
-    payload?.kind !== "observation_timeseries_latest_global" ||
-    payload?.index_generation !== "v3" ||
-    payload?.history_version !== "v2" ||
-    payload?.domain !== "observations" ||
-    payload?.history_schema_version !== OBSERVATION_HISTORY_SCHEMA_VERSION_V3 ||
-    payload?.writer_version !== OBSERVATION_HISTORY_WRITER_VERSION_V3 ||
-    payload?.physical_layout_version !== OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION ||
-    payload?.aligned_row_cap !== OBSERVATION_HISTORY_ALIGNED_ROW_CAP ||
-    payload?.exact_leaf_index_version !== OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION ||
-    !Array.isArray(payload.day_summaries) ||
-    body.toString("utf8") !== encodeObservationHistoryIndexV3Json(payload)
-  ) {
-    fail("v3 latest-global object is non-canonical or contradictory");
-  }
-  const days = payload.day_summaries.map((entry) => String(entry?.day_utc || ""));
-  if (
-    days.length === 0 ||
-    days.some((day, index) => exactDay(day, "v3 latest day") !== day || (index > 0 && days[index - 1] >= day)) ||
-    JSON.stringify(payload.days) !== JSON.stringify(days) ||
-    payload.min_day_utc !== days[0] ||
-    payload.max_day_utc !== days.at(-1) ||
-    Number(payload.day_count) !== days.length
-  ) {
-    fail("v3 latest-global day hierarchy is contradictory");
-  }
-  let scopedRootCount = 0;
-  let childShardCount = 0;
-  let physicalFileReferenceCount = 0;
-  let totalRows = 0;
-  for (const summary of payload.day_summaries) {
-    const roots = Array.isArray(summary.scoped_roots) ? summary.scoped_roots : [];
-    const connectorIds = [...new Set(roots.map((entry) => Number(entry.connector_id)))].sort((a, b) => a - b);
-    const pollutantCodes = [...new Set(roots.map((entry) => String(entry.pollutant_code)))].sort();
-    const rowCount = roots.reduce((sum, entry) => sum + Number(entry.row_count), 0);
-    if (
-      roots.length === 0 ||
-      Number(summary.scoped_root_count) !== roots.length ||
-      Number(summary.row_count) !== rowCount ||
-      JSON.stringify(summary.connector_ids) !== JSON.stringify(connectorIds) ||
-      JSON.stringify(summary.pollutant_codes) !== JSON.stringify(pollutantCodes)
-    ) {
-      fail(`v3 latest-global affected-day summary is contradictory: ${summary.day_utc}`);
-    }
-    scopedRootCount += roots.length;
-    childShardCount += roots.reduce((sum, entry) => sum + Number(entry.child_shard_count), 0);
-    physicalFileReferenceCount += roots.reduce((sum, entry) => sum + Number(entry.physical_file_count), 0);
-    totalRows += rowCount;
-  }
-  if (
-    Number(payload.scoped_root_count) !== scopedRootCount ||
-    Number(payload.child_shard_count) !== childShardCount ||
-    Number(payload.physical_file_reference_count) !== physicalFileReferenceCount ||
-    Number(payload.total_rows) !== totalRows ||
-    Number(payload.physical_leaf_count) !== childShardCount ||
-    payload.key_layout?.latest_key !== DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY ||
-    payload.key_layout?.aligned_source_index_root !==
-      "history/_index_v3/observations_timeseries/_aligned"
-  ) {
-    fail("v3 latest-global aggregate counters or key layout are contradictory");
-  }
+  validateObservationHistoryExactLeafIndexV3LatestRegistry({ artifact: {
+    key: DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_LATEST_KEY,
+    kind: "observation_history_index_v3_latest_global", publication_stage: "latest_global",
+    payload, body: body.toString("utf8"), byte_size: body.length, sha256: sha256(body),
+  } });
   return payload;
 }
 
-async function verifyV3Authority({ getObject, headObject, accepted, canonical, environment }) {
+export async function verifyV3Authority({ getObject, headObject, accepted, canonical, environment, assertOperationHeld = null }) {
   const entries = [];
   const latest = await getIdentity(
     getObject,
@@ -796,6 +754,31 @@ async function verifyV3Authority({ getObject, headObject, accepted, canonical, e
     const scopedObject = await reconcileJsonDependency(getObject, root, "scoped_manifest", entries);
     if (!scopedObject) continue;
     const scoped = JSON.parse(scopedObject.body.toString("utf8"));
+    const format = exactLeafFormatV3(scoped);
+    if (format.schema_version === 2) {
+      const pollutant = canonical.pollutants.find((p) => p.pollutant_code === root.pollutant_code);
+      if (!pollutant) fail("schema-2 scope lacks independent canonical authority");
+      const { proof, identity_recheck } = await verifySelectedExactOnlyConsumerScopeV3({
+        scope: { day_utc: accepted.day_utc, connector_id: accepted.connector_id, pollutant_code: root.pollutant_code },
+        selector: root, getObject, headObject, assertOperationHeld,
+        canonical: { key: pollutant.manifest_key, byte_size: pollutant.manifest_byte_size,
+          sha256: pollutant.manifest_hash },
+      });
+      requireEqual(proof.row_count, pollutant.row_count, "schema-2 canonical rows");
+      const expectedFiles = pollutant.files.map(f => [f.key, f.byte_size, f.sha256, f.row_count]).sort();
+      const actualFiles = proof.files.map(f => [f.key, f.byte_size, f.sha256, f.row_count]).sort();
+      requireEqual(JSON.stringify(actualFiles), JSON.stringify(expectedFiles), "schema-2 canonical complete file set");
+      for (const item of [...proof.canonical_chain, ...proof.leaves, ...proof.files]) entries.push({
+        kind: "direct_canonical_physical", ...item, classification: "EXACT", reason: null,
+        verifier_version: proof.verifier_version, identity_recheck,
+      });
+      const timeseriesId = Number(Object.keys(scoped.leaves_by_timeseries_id).sort((a,b) => Number(a)-Number(b))[0]);
+      if (!selectedProbe || root.pollutant_code === "no2") selectedProbe = {
+        day_utc: accepted.day_utc, connector_id: accepted.connector_id, pollutant: root.pollutant_code,
+        timeseries_id: timeseriesId, scoped_manifest_key: root.key,
+      };
+      continue;
+    }
     if (
       scoped.kind !== "observation_timeseries_physical_leaf_scoped_manifest" ||
       scoped.index_generation !== "v3" || scoped.history_version !== "v2" ||
@@ -1237,6 +1220,11 @@ function diagnosticStage(stage) {
 export async function executeSteadyStatePostWriteVerifier(options, adaptersInput) {
   diagnosticStage("start");
   const adapters = assertReadOnlyAdapters(adaptersInput);
+  if (typeof adapters.withObservationOperation === "function" && !adapters.assertOperationHeld) {
+    return await adapters.withObservationOperation(async (assertOperationHeld) =>
+      await executeSteadyStatePostWriteVerifier(options, { ...adapters,
+        withObservationOperation: undefined, assertOperationHeld }));
+  }
   const acceptanceBytes = fs.readFileSync(options.acceptanceReport);
   requireEqual(sha256(acceptanceBytes), options.expectedAcceptanceReportSha256, "acceptance report SHA-256");
   const acceptanceReport = JSON.parse(acceptanceBytes.toString("utf8"));
@@ -1274,6 +1262,7 @@ export async function executeSteadyStatePostWriteVerifier(options, adaptersInput
     headObject: adapters.headObject,
     accepted,
     candidateManifestKey: independent.candidate.manifest_key,
+    assertOperationHeld: adapters.assertOperationHeld,
   });
   const controlR2Binding = bindIndependentControlStateToCanonical(independent, canonical);
   diagnosticStage("canonical-R2-complete; v3-index-start");
@@ -1283,6 +1272,7 @@ export async function executeSteadyStatePostWriteVerifier(options, adaptersInput
     accepted,
     canonical,
     environment: options.environment,
+    assertOperationHeld: adapters.assertOperationHeld,
   });
   diagnosticStage("v3-index-complete; migration-evidence-start");
   const planReport = options.planReport
@@ -1468,6 +1458,10 @@ async function main() {
     await client.connect();
     report = await withReadOnlyPgTransaction(client, async () =>
       await executeSteadyStatePostWriteVerifier(options, {
+        withObservationOperation: async (operation) => await withObservationsGlobalOperationLock({
+          client, owner: "index_v3_steady_state_post_write_verify", runId: options.expectedRunId,
+          diagnosticEnvironment: options.environment,
+        }, async (_identity, lease) => await operation(lease.assertHeld)),
         query: async ({ sql, params }) => await client.query(assertReadOnlySql(sql), params),
         getObject: async ({ key }) => await r2GetObject({ r2, key }),
         headObject: async ({ key }) => await r2HeadObject({ r2, key }),

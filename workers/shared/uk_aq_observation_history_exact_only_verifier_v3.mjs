@@ -21,7 +21,7 @@ import { validateR2HistoryV2ObservationsAggregateManifest,
   buildR2HistoryV2ObservationsMonthManifestKey,
 } from "./uk_aq_r2_observations_manifest_hierarchy.mjs";
 
-export const EXACT_ONLY_DIRECT_VERIFIER_V3 = "exact-only-canonical-physical-v1";
+export const EXACT_ONLY_DIRECT_VERIFIER_V3 = "exact-only-canonical-physical-v2";
 const generation = getObservationHistoryGeneration("v3");
 const SHA = /^[0-9a-f]{64}$/;
 const physicalProofs = new WeakMap();
@@ -85,7 +85,12 @@ function context({ getObject, headObject = null, assertOperationHeld }) {
         typeof object.etag !== "string" || !object.etag) throw new Error(`direct verification missing body/current identity: ${key}`);
     const body = Buffer.from(object.body);
     const pin = { key, byte_size: body.length, sha256: sha256Hex(body), etag: object.etag };
-    if (parquet && (object.sha256 !== pin.sha256 || (object.byte_size ?? object.bytes) !== pin.byte_size)) {
+    // Native authenticated S3 GET supplies the complete body and length, but
+    // does not expose a stored checksum. Compute its SHA here; canonical file
+    // reconciliation below still requires exact SHA equality. If supplied,
+    // stored checksum metadata must independently agree, never be invented.
+    if (parquet && ((object.sha256 != null && object.sha256 !== pin.sha256) ||
+        (object.byte_size ?? object.bytes) !== pin.byte_size)) {
       throw new Error(`direct verification stored file SHA/size mismatch: ${key}`);
     }
     const prior = pins.get(key);
@@ -350,6 +355,7 @@ export async function verifyObservationHistoryExactOnlyScopeV3({
     files: Object.freeze(metadata.files.map((f) => Object.freeze({ ...descriptor(f), etag: ctx.pins.get(f.key).etag }))),
     row_count: metadata.row_count, canonical_hierarchy_complete: true, stored_selection_verified: hierarchy === null,
     finalisation_complete: false, source_to_final_verified: false,
+    file_identity_proof: "authenticated_complete_body_sha256",
   });
   physicalProofs.set(report, { ctx, hierarchy: selected, source: source.descriptor, metadata, indexRoot });
   return report;

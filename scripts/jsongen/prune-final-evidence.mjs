@@ -6,6 +6,20 @@ import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
 import { preparePruneOriginalAuthorityExtension } from './prune-original-metadata.mjs';
 import { compactPruneMetadataEvidence } from './prune-metadata-codec.mjs';
 import { encodePruneEvidenceBundle } from './prune-evidence-bundle.mjs';
+import { exactLeafFormatV3 } from '../../workers/shared/uk_aq_observation_history_exact_leaf_format_v3.mjs';
+import { rejectExactOnlyOriginalHandoverV3 } from '../../workers/shared/uk_aq_observation_history_exact_only_consumer_v3.mjs';
+
+// This boundary owns only the existing original envelope. Merely retaining
+// schema-2 JSON bytes cannot attest an independently completed direct proof.
+export function assertPruneOriginalExactEvidenceV3(objects = []) {
+  for (const object of objects) {
+    if (!object.roles?.includes('exact_v3_index')) continue;
+    const payload = JSON.parse(Buffer.from(object.bytes_base64, 'base64').toString('utf8'));
+    if (!String(payload.kind || '').startsWith('observation_timeseries_physical_leaf')) continue;
+    const format = exactLeafFormatV3(payload, Object.hasOwn(payload, 'timeseries_id') ? 'leaf' : 'manifest');
+    if (format.schema_version === 2) rejectExactOnlyOriginalHandoverV3();
+  }
+}
 
 const same = (a, b) => canonicalJson(a).equals(canonicalJson(b));
 const reference = value => value && typeof value.key === 'string'
@@ -18,6 +32,7 @@ const references = values => (Array.isArray(values) ? values : [])
 export function preparePruneOriginalFinalEvidence({ pending, connector, finalization,
   runId, dayUtc, connectorId, writerGitSha, sourceIdentity, originalMetadataSnapshot = null,
   originalAuthorityCapture = null, evidenceMode = 'inline' }) {
+  assertPruneOriginalExactEvidenceV3(originalMetadataSnapshot?.objects);
   if (pending?.state !== 'put_acknowledged_unverified'
     || pending.pending_evidence?.writer?.invocation_id !== runId
     || pending.pending_evidence?.connector_id !== connectorId
