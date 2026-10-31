@@ -199,7 +199,7 @@ Each manifest entry needs full exact key, category, byte length, last-modified, 
 
 ### Accounting
 
-MiB = bytes / 1,048,576; GiB = bytes / 1,073,741,824; decimal MB = bytes / 1,000,000,000. Parent estimates and their child categories must not be double-counted.
+MiB = bytes / 1,048,576; GiB = bytes / 1,073,741,824; decimal MB = bytes / 1,000,000. Parent estimates and their child categories must not be double-counted.
 
 | Quantity | Current result |
 |---|---|
