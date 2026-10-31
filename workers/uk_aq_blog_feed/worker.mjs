@@ -215,7 +215,9 @@ async function readBoundedText(response, maximumBytes, label) {
 function extractRssSource(rendered) {
   const marker = /<([a-z][\w:-]*)\b[^>]*\bid\s*=\s*(["'])webkit-xml-viewer-source-xml\2[^>]*>/i.exec(rendered);
   if (!marker) {
-    throw new Error("Chromium XML viewer source marker was not found");
+    throw new Error(
+      `Chromium XML viewer source marker was not found (${describeRenderedSource(rendered)})`,
+    );
   }
 
   const sourceRegion = rendered.slice(marker.index + marker[0].length);
@@ -232,6 +234,26 @@ function extractRssSource(rendered) {
   }
   const escaped = sourceRegion.slice(escapedRssStart, escapedRssEnd + "&lt;/rss&gt;".length);
   return decodeHtmlSource(escaped);
+}
+
+// Report only fixed classifications and sizes, never rendered RSS/HTML, URLs or headers.
+function describeRenderedSource(rendered) {
+  const beginning = rendered.trimStart().slice(0, 256);
+  const kind = /^<\?xml\b/i.test(beginning) || /^<rss(?:\s|>)/i.test(beginning)
+    ? "xml"
+    : /^<!doctype\s+html\b/i.test(beginning) || /^<html\b/i.test(beginning)
+      ? "html"
+      : "other";
+  const flags = [
+    "kind=" + kind,
+    "chars=" + rendered.length,
+    "raw_rss=" + Number(/<rss(?:\s|>)/i.test(rendered)),
+    "escaped_rss=" + Number(/&lt;rss(?:\s|&gt;)/i.test(rendered)),
+    "html_markup=" + Number(/<!doctype\s+html\b|<html\b/i.test(rendered)),
+    "xml_viewer_hint=" + Number(/(?:webkit-)?xml-viewer/i.test(rendered)),
+    "challenge_hint=" + Number(/cf-chl|challenge-platform|just a moment|checking your browser|too many requests|captcha/i.test(rendered)),
+  ];
+  return flags.join(",");
 }
 
 function normaliseRss(rssSource) {
