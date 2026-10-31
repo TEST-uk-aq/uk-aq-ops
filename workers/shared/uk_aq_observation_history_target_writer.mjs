@@ -10,6 +10,12 @@ import {
   readOffsetIndex,
 } from "hyparquet";
 import * as parquetWasm from "parquet-wasm/esm";
+import { readColumn } from "hyparquet/src/column.js";
+import { deserializeTCompactProtocol } from "hyparquet/src/thrift.js";
+import { PageTypes } from "hyparquet/src/constants.js";
+import { DEFAULT_PARSERS } from "hyparquet/src/convert.js";
+import { compressors } from "hyparquet-compressors";
+import { encodeObservationHistoryIndexV3Json } from "./uk_aq_observation_history_index_v3_json.mjs";
 
 import {
   computeEmptyObservationContentHash,
@@ -1079,3 +1085,121 @@ export function buildCanonicalObservationTimeseriesAlignedFiles(rows, {
 // layout-specific name. It produces only timeseries-aligned-v2 output.
 export const buildCanonicalObservationTimeseriesBoundedFiles =
   buildCanonicalObservationTimeseriesAlignedFiles;
+
+// Actual inspector capability, deliberately narrower than mixed-format reading.
+// No caller-supplied decoded rows or emitter metadata enter this interface.
+export const OBSERVATION_HISTORY_OFFLINE_INSPECTOR_V3 = Object.freeze({
+  version: "canonical-aligned-offline-v1",
+  physical_schemas: Object.freeze([3]),
+  observation_content_hash_versions: Object.freeze([1]),
+  writer_version: OBSERVATION_HISTORY_WRITER_VERSION_V3,
+  decode_profile: OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE_ID,
+});
+
+export function inspectPinnedCanonicalObservationFilesV3(files, options) {
+  if (options?.historySchemaVersion !== 3 ||
+      options?.writerVersion !== OBSERVATION_HISTORY_WRITER_VERSION_V3) {
+    throw new Error("offline exact inspector does not support this physical schema/writer (schema 4 is unsupported)");
+  }
+  const limits = validateLimits(options.limits);
+  ensureParquetWasmInitialized();
+  const decodedFiles = files.map((file) => {
+    const body = Buffer.from(file.body);
+    if (!body.length || body.length > limits.max_file_bytes) throw new Error("offline inspector file byte bound");
+    const footer = parquetMetadata(exactArrayBuffer(body), { geoparquet: false });
+    if (footer.created_by !== PARQUET_CREATED_BY || Number(footer.num_rows) > limits.max_file_rows ||
+        (footer.row_groups || []).length > limits.max_row_groups_per_file) {
+      throw new Error("offline inspector unsupported writer or file limits");
+    }
+    const schema = [
+      { name: "arrow_schema", num_children: 7 },
+      ...["connector_id", "station_id", "timeseries_id"].map((name) => ({ type: "INT32", repetition_type: "OPTIONAL", name })),
+      { type: "BYTE_ARRAY", repetition_type: "OPTIONAL", name: "pollutant_code", converted_type: "UTF8", logical_type: { type: "STRING" } },
+      OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE.columns.observed_at_utc.schema_element,
+      OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE.columns.value.schema_element,
+      { type: "BYTE_ARRAY", repetition_type: "OPTIONAL", name: "verification_status", converted_type: "UTF8", logical_type: { type: "STRING" } },
+    ];
+    if (encodeObservationHistoryIndexV3Json(footer.schema) !== encodeObservationHistoryIndexV3Json(schema)) {
+      throw new Error("offline inspector unsupported full physical schema");
+    }
+    const dataEnd = body.length - footer.metadata_length - 8;
+    const chunks = [];
+    for (const group of footer.row_groups || []) for (const column of group.columns || []) {
+      const range = validateProjectedColumnChunkRange(column, "offline full column", body.length);
+      if (range.start < 4 || range.end > dataEnd || range.num_values !== Number(group.num_rows)) {
+        throw new Error("offline column chunk exceeds physical data region");
+      }
+      chunks.push(range);
+    }
+    chunks.sort((a, b) => a.start - b.start);
+    if (chunks.some((range, i) => i > 0 && range.start < chunks[i - 1].end)) throw new Error("offline overlapping physical column chunks");
+    const wasmTable = parquetWasm.readParquet(body);
+    // intoIPCStream consumes the wasm table; freeing it again is invalid.
+    const table = arrow.tableFromIPC(wasmTable.intoIPCStream());
+    const columns = table.schema.fields.map((f) => f.name);
+    if (JSON.stringify(columns) !== JSON.stringify(OBSERVATION_HISTORY_COLUMNS_V3)) {
+      throw new Error("offline inspector unsupported physical columns");
+    }
+    const vectors = Object.fromEntries(columns.map((name) => [name, table.getChild(name)]));
+    const rows = Array.from({ length: table.numRows }, (_, i) => {
+      const row = Object.fromEntries(columns.map((name) => [name, vectors[name].get(i)]));
+      for (const name of ["connector_id", "timeseries_id", "pollutant_code", "observed_at_utc", "value"]) {
+        if (row[name] === null || row[name] === undefined) throw new Error("offline inspector null required value");
+      }
+      row.observed_at_utc = new Date(Number(row.observed_at_utc)).toISOString();
+      return row;
+    });
+    return { key: file.key, body, rows };
+  });
+  const result = inspectCanonicalObservationTimeseriesAlignedFiles(decodedFiles, options);
+  for (const [ordinal, file] of decodedFiles.entries()) {
+    const metadata = parquetMetadata(exactArrayBuffer(file.body), { geoparquet: false });
+    for (const segment of result.metadata.files[ordinal].row_groups) {
+      const group = metadata.row_groups[segment.row_group_ordinal];
+      for (const name of REQUIRED_RANGED_READER_COLUMNS) {
+        const profile = OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE.columns[name];
+        const schema = parquetSchema(metadata).children.find((c) => c.element.name === name);
+        const chunk = columnChunk(group, name).meta_data;
+        if (encodeObservationHistoryIndexV3Json(schema.element) !== encodeObservationHistoryIndexV3Json(profile.schema_element) ||
+            chunk.type !== profile.physical_type || chunk.codec !== profile.codec) {
+          throw new Error("offline inspector projected decode profile mismatch");
+        }
+        const range = segment.segments[0].column_ranges[name];
+        const bytes = exactArrayBuffer(file.body.subarray(range.start, range.end));
+        // Verify actual page/dictionary headers and their full compressed bounds.
+        const pages = { view: new DataView(bytes), offset: 0 };
+        let values = 0, dictionaries = 0;
+        while (pages.offset < bytes.byteLength) {
+          const offset = range.start + pages.offset;
+          const header = deserializeTCompactProtocol(pages);
+          const pageType = PageTypes[header.field_1];
+          if (pageType === "DICTIONARY_PAGE") {
+            if (++dictionaries !== 1 || offset !== range.dictionary_page_offset) throw new Error("offline dictionary boundary mismatch");
+          } else if (["DATA_PAGE", "DATA_PAGE_V2"].includes(pageType)) {
+            if (values === 0 && offset !== range.data_page_offset) throw new Error("offline data-page boundary mismatch");
+            values += Number((header.field_5 || header.field_8)?.field_1);
+          } else throw new Error("offline unsupported column page");
+          const size = Number(header.field_3);
+          if (!Number.isSafeInteger(size) || size < 0 || pages.offset + size > bytes.byteLength) throw new Error("offline page exceeds chunk");
+          pages.offset += size;
+        }
+        if (values !== segment.row_count || dictionaries !== (range.dictionary_page_offset === null ? 0 : 1)) {
+          throw new Error("offline page counts contradict group");
+        }
+        const leaf = { element: profile.schema_element, children: [], path: [name] };
+        const root = { element: OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE.root_schema_element, children: [leaf], path: [] };
+        const reader = { view: new DataView(bytes), offset: 0 };
+        const decoded = readColumn(reader, { groupStart: 0, selectStart: 0, selectEnd: segment.row_count }, {
+          pathInSchema: [name], type: profile.physical_type, element: profile.schema_element,
+          schemaPath: [root, leaf], codec: profile.codec, parsers: DEFAULT_PARSERS, compressors, utf8: true,
+        });
+        const actual = decoded.data.flatMap((chunk) => Array.from(chunk));
+        if (decoded.skipped !== 0 || actual.length !== segment.row_count || reader.offset !== bytes.byteLength ||
+            actual.some((value, i) => (name === "observed_at_utc" ? new Date(value).toISOString() : value) !== file.rows[segment.row_start + i][name])) {
+          throw new Error("offline projected decode differs from complete stored-value decode");
+        }
+      }
+    }
+  }
+  return result;
+}
