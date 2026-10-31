@@ -2,7 +2,7 @@
 import { sha256Hex } from './r2_sigv4.mjs';
 import { exactLeafFormatV3 } from './uk_aq_observation_history_exact_leaf_format_v3.mjs';
 import { scopedRootDescriptor, encodeObservationHistoryIndexV3Json } from './uk_aq_observation_history_exact_leaf_index_v3.mjs';
-import { verifyObservationHistoryExactOnlyScopeV3 } from './uk_aq_observation_history_exact_only_verifier_v3.mjs';
+import { verifyObservationHistoryExactOnlyScopeV3, verifyObservationHistoryExactOnlyMetadataV3 } from './uk_aq_observation_history_exact_only_verifier_v3.mjs';
 
 export function rejectExactOnlyOriginalHandoverV3() {
   throw Object.assign(new Error('Schema-2 direct proof has no accepted durable original-evidence/receipt representation; retain source and require a versioned contract decision'), {
@@ -13,12 +13,19 @@ export function rejectExactOnlyOriginalHandoverV3() {
 const same = (a, b) => encodeObservationHistoryIndexV3Json(a) === encodeObservationHistoryIndexV3Json(b);
 const id = o => ({ key: o.key, byte_size: o.byte_size, sha256: o.sha256 });
 
+// Only for rejecting prior committed history. This is not physical proof and
+// is intentionally not accepted by publication, original evidence or deletion.
+export async function verifySelectedExactOnlyRejectionMetadataV3({ scope, selector, canonical, getObject, assertOperationHeld }) {
+  const result = await verifyObservationHistoryExactOnlyMetadataV3({ scope, getObject, assertOperationHeld });
+  if (!same(result.selector, id(selector)) || !same(id(result.canonical_source_manifest), canonical)) throw new Error('committed schema-2 metadata identity changed');
+}
+
 // The native R2 adapter requests checksum mode on HEAD, but availability is a
 // per-object response fact. Probe before creating the proof: unsupported/missing
 // checksum capability selects authenticated full GETs, not ETag-only evidence.
 // Once checksum HEAD is admitted, later uncertainty fails closed in the verifier.
 export async function verifySelectedExactOnlyConsumerScopeV3({
-  scope, selector, canonical, getObject, headObject = null, assertOperationHeld,
+  scope, selector, canonical, getObject, headObject = null, assertOperationHeld, scopedObject = null,
 }) {
   if (typeof assertOperationHeld !== 'function') throw new Error('schema-2 consumer requires the original held observations operation');
   let lost = false;
@@ -28,9 +35,10 @@ export async function verifySelectedExactOnlyConsumerScopeV3({
     catch (error) { lost = true; throw error; }
   };
   const read = async key => { await held(); const object = await getObject({ key }); await held(); return object; };
-  const object = await read(selector.key);
+  await held();
+  const object = scopedObject || await read(selector.key);
   const body = Buffer.from(object?.body ?? '');
-  if (body.length !== selector.byte_size || sha256Hex(body) !== selector.sha256) throw new Error('selected schema-2 selector identity changed');
+  if (object?.key !== selector.key || body.length !== selector.byte_size || sha256Hex(body) !== selector.sha256) throw new Error('selected schema-2 selector identity changed');
   const payload = JSON.parse(body.toString('utf8'));
   if (exactLeafFormatV3(payload).schema_version !== 2) throw new Error('selected exact format changed');
   if (!same(scopedRootDescriptor({ ...id(selector), payload }), selector)) throw new Error('selected exact format/coverage registry mismatch');
@@ -43,11 +51,12 @@ export async function verifySelectedExactOnlyConsumerScopeV3({
   for (const file of typeof headObject === 'function' ? pollutant.files : []) {
     await held(); const head = await headObject({ key: file.key }); await held();
     if (!head || head.exists === false || head.key !== file.key) throw new Error('canonical file HEAD identity/absence contradiction');
-    const size = head.byte_size ?? head.bytes;
-    if (size != null && size !== file.bytes) throw new Error('canonical file HEAD size contradiction');
-    if (head.byte_size != null && head.bytes != null && head.byte_size !== head.bytes) throw new Error('canonical file HEAD size aliases disagree');
+    const lengths = [head.byte_size, head.bytes].filter(n => Number.isSafeInteger(n) && n >= 0);
+    if (lengths.some(n => n !== file.bytes)) throw new Error('canonical file HEAD size contradiction');
     if (head.sha256 != null && (!/^[0-9a-f]{64}$/.test(head.sha256) || head.sha256 !== file.etag_or_hash)) throw new Error('canonical file HEAD checksum contradiction');
-    if (head.sha256 == null || !Number.isSafeInteger(size) || typeof head.etag !== 'string' || !head.etag || head.exists !== true) capable = false;
+    if (head.sha256 == null || !lengths.length ||
+        (head.byte_size !== undefined && head.bytes !== undefined && head.byte_size !== head.bytes) ||
+        typeof head.etag !== 'string' || !head.etag || head.exists !== true) capable = false;
   }
   const proof = await verifyObservationHistoryExactOnlyScopeV3({ scope,
     getObject: async ({ key }) => await read(key),

@@ -307,6 +307,69 @@ function reconcile(hierarchy, source, metadata, indexRoot) {
   }
 }
 
+async function readStoredExactOnlyHierarchy(ctx, scope, source, indexRoot) {
+  const key = `${indexRoot}/${scopePath(scope)}/manifest.json`;
+  const parent = await ctx.read(key);
+  const payload = JSON.parse(parent.body.toString("utf8"));
+  if (payload.schema_version !== 2) throw new Error("unsupported selected exact format for direct verifier");
+  const leaves = [];
+  for (const tuple of Object.values(payload.leaves_by_timeseries_id || {})) {
+    const object = await ctx.read(tuple[0]);
+    equal([object.key, object.byte_size, object.sha256], tuple, "stored immutable leaf");
+    const leaf = JSON.parse(object.body.toString("utf8"));
+    leaves.push({ ...identity(object), body: object.body.toString("utf8"), payload: leaf,
+      kind: "observation_history_index_v3_exact_leaf", publication_stage: "child_shard",
+      dependencies: leaf.files.map((f) => ({ ...identity(f), kind: "canonical_parquet" })),
+      publication_prerequisites: [{ ...identity(source.descriptor), kind: "canonical_manifest" }],
+    });
+  }
+  return { exact_leaves: leaves, scoped_manifest: {
+    ...identity(parent), body: parent.body.toString("utf8"), payload,
+    kind: "observation_history_index_v3_exact_leaf_scoped_manifest", publication_stage: "scoped_manifest",
+    dependencies: [{ ...identity(source.descriptor), kind: "canonical_manifest" },
+      ...leaves.map((l) => ({ ...identity(l), kind: "child_shard" }))], publication_prerequisites: [],
+  } };
+}
+
+// Rejection-only metadata authentication. The prior-authority admission
+// contract needs no historical Parquet rows. This deliberately mints no physical
+// proof handle and cannot establish publication or source-deletion eligibility.
+export async function verifyObservationHistoryExactOnlyMetadataV3({ scope, getObject, assertOperationHeld,
+  indexRoot = generation.observations_timeseries_index_prefix }) {
+  if (indexRoot !== generation.observations_timeseries_index_prefix) throw new Error("unsupported selected v3 index root");
+  const ctx = context({ getObject, assertOperationHeld });
+  const source = await canonicalSource(ctx, scope);
+  if (source.descriptor.observation_content_hash_version !== 1) throw new Error("unsupported rejection metadata hash version");
+  const selected = await readStoredExactOnlyHierarchy(ctx, scope, source, indexRoot);
+  validateObservationHistoryExactLeafScopedManifestArtifactV3({ artifact: selected.scoped_manifest,
+    exactLeaves: selected.exact_leaves, indexRoot });
+  const parent = selected.scoped_manifest.payload, canonical = source.payload;
+  equal(parent.canonical_source_manifest, source.descriptor, "canonical metadata binding");
+  for (const field of ["history_schema_version", "writer_version"]) equal(parent[field], canonical[field], field);
+  equal(parent.coverage.min_observed_at_utc, canonical.min_observed_at_utc, "canonical metadata minimum");
+  equal(parent.coverage.max_observed_at_utc, canonical.max_observed_at_utc, "canonical metadata maximum");
+  const counts = {}, files = new Map(), fileCounts = new Map();
+  for (const leaf of selected.exact_leaves) {
+    counts[leaf.payload.timeseries_id] = leaf.payload.row_count;
+    for (const file of leaf.payload.files) {
+      if (file.byte_size > limits.max_file_bytes || file.row_count > limits.max_file_rows || file.row_group_count > limits.max_row_groups_per_file) throw new Error("rejection metadata exceeds accepted file limits");
+      files.set(file.key, [file.key, file.byte_size, file.sha256, file.row_count]);
+    }
+    for (const segment of leaf.payload.segments) {
+      const perFile = fileCounts.get(segment.file_key) || {};
+      perFile[segment.timeseries_id] = (perFile[segment.timeseries_id] || 0) + segment.row_count;
+      fileCounts.set(segment.file_key, perFile);
+    }
+  }
+  equal(counts, canonical.timeseries_row_counts, "complete canonical metadata series");
+  equal([...files.values()].sort(), canonical.files.map(f => [f.key, f.bytes, f.etag_or_hash, f.row_count]).sort(), "complete canonical metadata files");
+  for (const file of canonical.files) equal(fileCounts.get(file.key), file.timeseries_row_counts, "canonical per-file metadata series");
+  await ctx.recheck();
+  return Object.freeze({ selector: Object.freeze(identity(selected.scoped_manifest)),
+    canonical_source_manifest: Object.freeze(source.descriptor),
+    physical_verification_performed: false });
+}
+
 // Reusable read-only entry point for Prune and independent post-write adapters.
 // Passing a hierarchy is preparation-only; omitting it verifies exact stored
 // selector/leaf bytes. Neither mode creates durable original evidence.
@@ -318,30 +381,7 @@ export async function verifyObservationHistoryExactOnlyScopeV3({
   const ctx = context({ getObject, headObject, assertOperationHeld });
   const source = await canonicalSource(ctx, scope, expectedRoot);
   const metadata = await physicalMetadata(ctx, source.payload, scope);
-  let selected = hierarchy;
-  if (!selected) {
-    const key = `${indexRoot}/${scopePath(scope)}/manifest.json`;
-    const parent = await ctx.read(key);
-    const payload = JSON.parse(parent.body.toString("utf8"));
-    if (payload.schema_version !== 2) throw new Error("unsupported selected exact format for direct verifier");
-    const leaves = [];
-    for (const tuple of Object.values(payload.leaves_by_timeseries_id || {})) {
-      const object = await ctx.read(tuple[0]);
-      equal([object.key, object.byte_size, object.sha256], tuple, "stored immutable leaf");
-      const leaf = JSON.parse(object.body.toString("utf8"));
-      leaves.push({ ...identity(object), body: object.body.toString("utf8"), payload: leaf,
-        kind: "observation_history_index_v3_exact_leaf", publication_stage: "child_shard",
-        dependencies: leaf.files.map((f) => ({ ...identity(f), kind: "canonical_parquet" })),
-        publication_prerequisites: [{ ...identity(source.descriptor), kind: "canonical_manifest" }],
-      });
-    }
-    selected = { exact_leaves: leaves, scoped_manifest: {
-      ...identity(parent), body: parent.body.toString("utf8"), payload,
-      kind: "observation_history_index_v3_exact_leaf_scoped_manifest", publication_stage: "scoped_manifest",
-      dependencies: [{ ...identity(source.descriptor), kind: "canonical_manifest" },
-        ...leaves.map((l) => ({ ...identity(l), kind: "child_shard" }))], publication_prerequisites: [],
-    } };
-  }
+  const selected = hierarchy || await readStoredExactOnlyHierarchy(ctx, scope, source, indexRoot);
   reconcile(selected, source.descriptor, metadata, indexRoot);
   for (const leaf of selected.exact_leaves) for (const file of leaf.payload.files) {
     if (file.etag) equal(file.etag, ctx.pins.get(file.key).etag, "current leaf ETag");

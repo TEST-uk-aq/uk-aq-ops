@@ -616,13 +616,13 @@ test("missing or contradictory index_v3 authority blocks before publication", as
 });
 
 
-test('schema-2 committed history and post-write proof use actual files, retain source and reject original receipt handover', async () => {
+test('schema-2 committed history uses rejection metadata; post-write retains actual file proof and receipt denial', async () => {
   const { buildObservationHistoryV3SteadyStatePartition } = await import('../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs');
   const { buildObservationHistoryExactLeafIndexV3ScopedHierarchy, buildObservationHistoryExactLeafIndexV3Latest } = await import('../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs');
   const { ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3 } = await import('../workers/shared/uk_aq_observation_history_writer_limits_v3.mjs');
   const { verifyCanonicalHierarchy, verifyV3Authority } = await import('../scripts/index_v3_migration/index_v3_steady_state_post_write_verify.mjs');
   const { assertPruneOriginalExactEvidenceV3 } = await import('../scripts/jsongen/prune-final-evidence.mjs');
-  const source = [row('no2', 101)];
+  const source = Array.from({ length: 1026 }, (_, i) => ({ ...row('no2', i < 1025 ? 101 : 201), observed_at_utc: new Date(Date.parse(time) + Math.min(i, 1024) * 60000).toISOString() }));
   const prepared = buildObservationHistoryV3SteadyStatePartition({ source: 'prune_daily', rows: source,
     targetWriterGitSha: 'a'.repeat(40), writerLimits: ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3 });
   const prior = history(source, connectorId, prepared.canonical_pollutant_manifest.payload.files);
@@ -632,14 +632,16 @@ test('schema-2 committed history and post-write proof use actual files, retain s
   const canonicalBody = (await getObjectFrom(prior.objects)({ key: canonicalKey })).body;
   const hierarchy = buildObservationHistoryExactLeafIndexV3ScopedHierarchy({ metadata: prepared.target_metadata,
     exactSchemaVersion: 2, canonicalManifest: { key: canonicalKey, byte_size: canonicalBody.length,
-      sha256: sha256Hex(canonicalBody), manifest_hash: canonical.manifest_hash, row_count: 1,
+      sha256: sha256Hex(canonicalBody), manifest_hash: canonical.manifest_hash, row_count: source.length,
       observation_content_hash: canonical.observation_content_hash, observation_content_hash_version: 1 } });
   for (const entry of hierarchy.publication_objects) prior.objects.set(entry.key, Buffer.from(entry.body));
   const latest = buildObservationHistoryExactLeafIndexV3Latest({ scopedHierarchies: [hierarchy] });
   prior.objects.set(latest.key, Buffer.from(latest.body));
-  let fileReads = 0, alignedReads = 0, held = true;
+  let fileReads = 0, alignedReads = 0, held = true, selectorReads = 0;
+  assert.equal(prepared.file_intents.length, 2);
   const getObject = async ({ key }) => {
     if (key.endsWith('.parquet')) fileReads++;
+    if (key === hierarchy.scoped_manifest.key) selectorReads++;
     if (key.includes('/_aligned/')) alignedReads++;
     const result = await getObjectFrom(prior.objects)({ key });
     // Native S3 GET shape: no manufactured stored checksum.
@@ -648,23 +650,65 @@ test('schema-2 committed history and post-write proof use actual files, retain s
   const headObject = async ({ key }) => { const b = prior.objects.get(key);return { key, exists: true, bytes: b.length, etag: sha256Hex(b) }; };
   const assertOperationHeld = () => { if (!held) throw new Error('original lock lost'); };
   const args = { r2: {}, observationsPrefix: prefix, dayUtc, connectorId, rows: source, getObject, headObject, assertOperationHeld };
-  await assert.rejects(admitPruneFrozenConnectorSnapshot(args), error => error.isolatable === true && /verified already-committed identical history/.test(error.reason));
-  assert.ok(fileReads > 0);assert.equal(alignedReads, 0);
-  await assert.rejects(admitPruneFrozenConnectorSnapshot({ ...args, rows: [row('no2', 101, 13)] }), /frozen observations differ/);
-  const accepted = { day_utc: dayUtc, connector_id: connectorId, pollutant_codes: ['no2'], source_row_count: 1 };
+  await assert.rejects(admitPruneFrozenConnectorSnapshot(args), error => error.isolatable === true && /authenticated already-committed metadata/.test(error.reason));
+  assert.equal(fileReads, 0);assert.equal(alignedReads, 0);
+  await assert.rejects(admitPruneFrozenConnectorSnapshot({ ...args, rows: source.map((r, i) => i ? r : { ...r, value: 13 }) }), /frozen observations differ/);
+  assert.equal(fileReads, 0);
+  const accepted = { day_utc: dayUtc, connector_id: connectorId, pollutant_codes: ['no2'], source_row_count: source.length };
+  selectorReads = 0;
   const current = await verifyCanonicalHierarchy({ getObject, headObject, accepted, candidateManifestKey: prior.connectorKey, assertOperationHeld });
+  assert.equal(selectorReads, 1);
   const verified = await verifyV3Authority({ getObject, headObject, accepted, canonical: current, environment: 'TEST', assertOperationHeld });
   assert.equal(verified.reconciliation.counts.FAIL, 0);
   assert.equal(verified.selected_probe.timeseries_id, 101);assert.equal(alignedReads, 0);
+  assert.equal(selectorReads, 3); // initial selection, independent read and closing recheck
+  // Reusing a snapshot after its one canonical->index handoff is forbidden.
+  await assert.rejects(verifyV3Authority({ getObject, headObject, accepted, canonical: current, environment: 'TEST', assertOperationHeld }), /another or ended operation/);
+  const lost = await verifyCanonicalHierarchy({ getObject, headObject, accepted,
+    candidateManifestKey: prior.connectorKey, assertOperationHeld });
+  held = false;
+  await assert.rejects(verifyV3Authority({ getObject, headObject, accepted, canonical: lost,
+    environment: 'TEST', assertOperationHeld }), /original lock lost/);
+  held = true;
+  await assert.rejects(verifyV3Authority({ getObject, headObject, accepted, canonical: lost,
+    environment: 'TEST', assertOperationHeld }), /another or ended operation/);
   const { verifySelectedExactOnlyConsumerScopeV3 } = await import('../workers/shared/uk_aq_observation_history_exact_only_consumer_v3.mjs');
   const selector = latest.payload.day_summaries[0].scoped_roots[0];
   const capableHead = async ({key}) => ({ ...await headObject({key}), sha256: sha256Hex(prior.objects.get(key)) });
   const direct = await verifySelectedExactOnlyConsumerScopeV3({ scope: prepared.scope, selector,
     getObject, headObject: capableHead, assertOperationHeld });
   assert.equal(direct.identity_recheck, 'checksum_sha256_size_etag_head');
+  const incompleteAlias = await verifySelectedExactOnlyConsumerScopeV3({ scope: prepared.scope, selector,
+    getObject, headObject: async args => ({ ...await capableHead(args), byte_size: null }), assertOperationHeld });
+  assert.equal(incompleteAlias.identity_recheck, 'authenticated_complete_get_sha256');
+  const incompleteLength = async args => ({ ...await capableHead(args), bytes: null });
+  const incomplete = await verifyCanonicalHierarchy({ getObject, headObject: incompleteLength, accepted,
+    candidateManifestKey: prior.connectorKey, assertOperationHeld });
+  await verifyV3Authority({ getObject, headObject: incompleteLength, accepted, canonical: incomplete,
+    environment: 'TEST', assertOperationHeld });
+  for (const overrides of [{ sha256: 'f'.repeat(64), bytes: null }, { sha256: null, bytes: 1 }]) {
+    const before = fileReads;
+    await assert.rejects(verifyCanonicalHierarchy({ getObject,
+      headObject: async args => ({ ...await capableHead(args), ...overrides }), accepted,
+      candidateManifestKey: prior.connectorKey, assertOperationHeld }), /contradictory canonical HEAD/);
+    assert.equal(fileReads, before);
+  }
+  const savedLeaf = prior.objects.get(hierarchy.exact_leaves[0].key);
+  prior.objects.delete(hierarchy.exact_leaves[0].key);
+  await assert.rejects(admitPruneFrozenConnectorSnapshot(args), /missing|404/);
+  prior.objects.set(hierarchy.exact_leaves[0].key, savedLeaf);
+  const changed = await verifyCanonicalHierarchy({ getObject, headObject, accepted,
+    candidateManifestKey: prior.connectorKey, assertOperationHeld });
+  const advancedLatest = JSON.parse(Buffer.from(latest.body).toString('utf8'));
+  advancedLatest.day_summaries[0].scoped_roots[0].sha256 = 'f'.repeat(64);
+  prior.objects.set(latest.key, Buffer.from(encodeObservationHistoryIndexV3Json(advancedLatest)));
+  await assert.rejects(verifyV3Authority({ getObject, headObject, accepted, canonical: changed,
+    environment: 'TEST', assertOperationHeld }), /selected scope identity changed/);
+  prior.objects.set(latest.key, Buffer.from(latest.body));
+
   await assert.rejects(verifySelectedExactOnlyConsumerScopeV3({ scope: prepared.scope, selector,
     getObject, headObject: async args => ({ ...await capableHead(args), sha256: 'f'.repeat(64) }), assertOperationHeld }), /HEAD checksum contradiction/);
-  await assert.rejects(verifyV3Authority({ getObject, headObject, accepted, canonical: current, environment: 'TEST' }), /original held observations operation/);
+  await assert.rejects(verifyV3Authority({ getObject, headObject, accepted, canonical: { ...current, pollutants: current.pollutants.map(p => ({ ...p })) }, environment: 'TEST' }), /original held observations operation/);
   const evidenceObject = payload => ({ roles: ['exact_v3_index'], bytes_base64: Buffer.from(encodeObservationHistoryIndexV3Json(payload)).toString('base64') });
   assertPruneOriginalExactEvidenceV3([evidenceObject(prepared.v3_hierarchy.scoped_manifest.payload)]);
   assert.throws(() => assertPruneOriginalExactEvidenceV3([evidenceObject(hierarchy.scoped_manifest.payload)]), { code: 'PRUNE_EXACT_ONLY_DURABLE_HANDOVER_UNSUPPORTED' });

@@ -594,6 +594,10 @@ function assertExactLeafWriterLimits(leaf, label) {
   requireEqual(rows, Number(leaf.row_count), `${label} leaf row coverage`);
 }
 
+// Non-serialised selector snapshot, owned by this one canonical->index check.
+// No Parquet bytes, global lookup cache or cross-invocation evidence is retained.
+const SELECTED_SCOPE = Symbol("operation-local selected scope");
+
 export async function verifyCanonicalHierarchy({ getObject, headObject, accepted, candidateManifestKey, assertOperationHeld = null }) {
   const connectorObject = await getIdentity(getObject, candidateManifestKey);
   const connector = JSON.parse(connectorObject.body.toString("utf8"));
@@ -632,6 +636,7 @@ export async function verifyCanonicalHierarchy({ getObject, headObject, accepted
     requireEqual(manifest.source_row_count, ref.source_row_count, `pollutant child row count ${ref.pollutant_code}`);
     const files = Array.isArray(manifest.files) ? manifest.files : [];
     if (!files.length) fail(`pollutant manifest has no Parquet files: ${ref.pollutant_code}`);
+    let selection = null;
     for (const file of files) {
       if (parquetKeys.has(file.key)) fail(`duplicate Parquet authority: ${file.key}`);
       parquetKeys.add(file.key);
@@ -642,14 +647,25 @@ export async function verifyCanonicalHierarchy({ getObject, headObject, accepted
       };
       assertObservationHistoryGenerationKey(GENERATION, file.key);
       const head = await headObject({ key: file.key });
-      let current = { exists: head?.exists !== false, byte_size: head?.bytes, sha256: head?.sha256 };
-      if (head?.sha256 == null) {
-        const indexKey = `${GENERATION.observations_timeseries_index_prefix}/day_utc=${accepted.day_utc}/connector_id=${accepted.connector_id}/pollutant_code=${ref.pollutant_code}/manifest.json`;
-        const selected = JSON.parse((await getIdentity(getObject, indexKey)).body.toString("utf8"));
-        if (exactLeafFormatV3(selected).schema_version === 2) {
+      const lengths = [head?.byte_size, head?.bytes].filter(n => Number.isSafeInteger(n) && n >= 0);
+      // A positive contradiction is fatal even if another required field is
+      // missing. GET may fill absent metadata, never override conflicting HEAD.
+      if (head?.exists === false || (head?.key != null && head.key !== file.key) ||
+          lengths.some(n => n !== descriptor.byte_size) ||
+          (head?.sha256 != null && head.sha256 !== descriptor.sha256)) fail(`contradictory canonical HEAD identity: ${file.key}`);
+      let current = { exists: true, byte_size: lengths[0], sha256: head?.sha256 };
+      if (head?.sha256 == null || !lengths.length) {
+        if (!selection) {
+          const indexKey = `${GENERATION.observations_timeseries_index_prefix}/day_utc=${accepted.day_utc}/connector_id=${accepted.connector_id}/pollutant_code=${ref.pollutant_code}/manifest.json`;
+          const selected = await getIdentity(getObject, indexKey);
+          const payload = JSON.parse(selected.body.toString("utf8"));
+          const format = exactLeafFormatV3(payload);
+          if (selected.body.toString("utf8") !== encodeObservationHistoryIndexV3Json(payload)) fail("selected exact scope is not canonical JSON");
+          selection = { object: selected, format, assertOperationHeld, active: true };
+        }
+        if (selection.format.schema_version === 2) {
           if (typeof assertOperationHeld !== "function") fail("schema-2 full-GET verification requires held observations operation");
           if (await assertOperationHeld() === false) fail("observations operation is not held");
-          if (head?.exists === false || (head?.bytes != null && head.bytes !== descriptor.byte_size)) fail("contradictory canonical HEAD identity");
           const actual = await getIdentity(getObject, file.key);
           if (await assertOperationHeld() === false) fail("observations operation is not held");
           current = { exists: true, byte_size: actual.byte_size, sha256: actual.sha256 };
@@ -663,7 +679,7 @@ export async function verifyCanonicalHierarchy({ getObject, headObject, accepted
       parquetRows += Number(file.row_count);
       parquetBytes += Number(file.bytes);
     }
-    pollutants.push({
+    const pollutant = {
       pollutant_code: ref.pollutant_code,
       manifest_key: ref.manifest_key,
       manifest_hash: object.sha256,
@@ -676,7 +692,9 @@ export async function verifyCanonicalHierarchy({ getObject, headObject, accepted
         sha256: String(file.etag_or_hash),
         row_count: Number(file.row_count),
       })),
-    });
+    };
+    if (selection?.format.schema_version === 2) Object.defineProperty(pollutant, SELECTED_SCOPE, { value: selection });
+    pollutants.push(pollutant);
   }
   requireEqual(parquetRows, accepted.source_row_count, "canonical child Parquet row total");
 
@@ -751,16 +769,25 @@ export async function verifyV3Authority({ getObject, headObject, accepted, canon
 
   let selectedProbe = null;
   for (const root of roots) {
-    const scopedObject = await reconcileJsonDependency(getObject, root, "scoped_manifest", entries);
+    const pollutant = canonical.pollutants.find((p) => p.pollutant_code === root.pollutant_code);
+    const selection = pollutant?.[SELECTED_SCOPE];
+    let readScope = getObject;
+    if (selection) {
+      if (!selection.active || selection.assertOperationHeld !== assertOperationHeld) fail("selected scope belongs to another or ended operation");
+      selection.active = false; // consume once; errors cannot revive this snapshot
+      if (await assertOperationHeld() === false) fail("observations operation is not held");
+      if (selection.object.key !== root.key || selection.object.sha256 !== root.sha256 || selection.object.byte_size !== root.byte_size) fail("selected scope identity changed between canonical and index checks");
+      readScope = async () => selection.object;
+    }
+    const scopedObject = await reconcileJsonDependency(readScope, root, "scoped_manifest", entries);
     if (!scopedObject) continue;
     const scoped = JSON.parse(scopedObject.body.toString("utf8"));
     const format = exactLeafFormatV3(scoped);
     if (format.schema_version === 2) {
-      const pollutant = canonical.pollutants.find((p) => p.pollutant_code === root.pollutant_code);
       if (!pollutant) fail("schema-2 scope lacks independent canonical authority");
       const { proof, identity_recheck } = await verifySelectedExactOnlyConsumerScopeV3({
         scope: { day_utc: accepted.day_utc, connector_id: accepted.connector_id, pollutant_code: root.pollutant_code },
-        selector: root, getObject, headObject, assertOperationHeld,
+        selector: root, getObject, headObject, assertOperationHeld, scopedObject,
         canonical: { key: pollutant.manifest_key, byte_size: pollutant.manifest_byte_size,
           sha256: pollutant.manifest_hash },
       });
@@ -1221,9 +1248,17 @@ export async function executeSteadyStatePostWriteVerifier(options, adaptersInput
   diagnosticStage("start");
   const adapters = assertReadOnlyAdapters(adaptersInput);
   if (typeof adapters.withObservationOperation === "function" && !adapters.assertOperationHeld) {
-    return await adapters.withObservationOperation(async (assertOperationHeld) =>
-      await executeSteadyStatePostWriteVerifier(options, { ...adapters,
-        withObservationOperation: undefined, assertOperationHeld }));
+    return await adapters.withObservationOperation(async (assertOperationHeld) => {
+      let active = true;
+      const held = async () => {
+        if (!active) fail("post-write operation lifetime ended");
+        return await assertOperationHeld();
+      };
+      try {
+        return await executeSteadyStatePostWriteVerifier(options, { ...adapters,
+          withObservationOperation: undefined, assertOperationHeld: held });
+      } finally { active = false; }
+    });
   }
   const acceptanceBytes = fs.readFileSync(options.acceptanceReport);
   requireEqual(sha256(acceptanceBytes), options.expectedAcceptanceReportSha256, "acceptance report SHA-256");

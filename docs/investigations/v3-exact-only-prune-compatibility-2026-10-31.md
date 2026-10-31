@@ -16,7 +16,7 @@ handover boundary, rather than manufacturing a new receipt authority.
 | --- | --- |
 | `workers/shared/uk_aq_observation_history_exact_only_consumer_v3.mjs` | New shared adapter for an already selected schema-2 scope. Pins exact selector/registry and canonical body identities, establishes actual checksum-HEAD capability, invokes the existing complete canonical/physical verifier and compares its final identities. Provides the explicit unsupported durable-handover error. No catalogue, receipt or writer state is persisted. |
 | `workers/shared/uk_aq_observation_history_exact_only_verifier_v3.mjs` | Advances the internal direct verifier identity to `exact-only-canonical-physical-v2`. Accepts the real authenticated native GET shape without fabricating stored checksum metadata: always computes full-body SHA; declared size and any supplied checksum must agree; canonical file reconciliation still checks that exact computed SHA. The existing HEAD recheck remains strict. |
-| `workers/uk_aq_prune_daily/committed_history_guard.mjs` | Explicit schema/kind/version dispatch. Schema 1 retains its aligned canonical binding. Schema 2 invokes complete root-to-DCP/actual-file verification, then retains the original full frozen-source comparison and the unconditional block on replacing already committed history, including identical duplicates. No already-committed scope becomes first-publication or deletion authority. |
+| `workers/uk_aq_prune_daily/committed_history_guard.mjs` | Explicit schema/kind/version dispatch. Schema 1 retains its aligned canonical binding. Schema 2 authenticates complete root-to-DCP and exact-index metadata without reading Parquet, then retains the original full frozen-source comparison and the unconditional block on replacing already committed history, including identical duplicates. No already-committed scope becomes first-publication or deletion authority. |
 | `workers/uk_aq_prune_daily/phase_b_history_r2.mjs` | Supplies the existing supervisor/run-local-cache lifetime assertion and native HEAD adapter to committed-history admission. At connector verification, explicitly rejects schema 2 before returning gate evidence because the completed direct original handover is not accepted and the completed root does not yet exist at this seam. All normal schema-1 writes/finalisation/READY handling remain. |
 | `scripts/jsongen/prune-final-evidence.mjs` | Only the Prune-owned original-envelope preparation interface changes: inspect retained exact-index metadata with explicit dispatch; schema 2 raises `PRUNE_EXACT_ONLY_DURABLE_HANDOVER_UNSUPPORTED` / `exact_only_durable_handover_unsupported`. It does not silently serialize a new direct-proof claim into old evidence. No JSONgen Parquet pass, receipt/digest or consumer authority change. |
 | `scripts/index_v3_migration/index_v3_steady_state_post_write_verify.mjs` | Shared format-aware compact-latest validation, retained schema-1 aligned checks, complete direct schema-2 verification and exact selected/canonical file reconciliation. Independent report verifier version advances from 2 to 3. CLI reuses the existing global observations-operation lock around the existing read-only operation, with the original session-loss assertion. Embedded schema-2 calls without a held-operation assertion fail closed. |
@@ -24,12 +24,13 @@ handover boundary, rather than manufacturing a new receipt authority.
 
 Exact pre-change snapshots for the four newly modified existing consumer files
 are under `archive/2026-10-31/`, preserving relative paths. The direct verifier's
-existing daily snapshot from PR #157 is reused unchanged. Archives are not
+existing daily snapshot from PR #157 is reused unchanged. The follow-up also
+archives the newly modified shared consumer adapter once on the same date. Archives are not
 imported or executed. Authoritative `system_docs/` is unchanged.
 
 ## Independent proof, source identity and lock lifetime
 
-Schema 2 takes no aligned parent/shard dependencies. It authenticates the entire
+Schema-2 independent post-write proof takes no aligned parent/shard dependencies. It authenticates the entire
 current canonical root/year/month/day/connector/pollutant chain and the specific
 selected selector/leaf set using PR #157's verifier. Every canonical member,
 file/group/row position, count, bound and projected range is reconciled against
@@ -37,10 +38,11 @@ actual full-file lossless decoding and physical inspection. The wrapper compares
 the result to the **original** discovered selector identity and previously pinned
 canonical body; later same-key advancement does not become replacement authority.
 
-Prune committed-history admission retains the complete frozen pollutant set and
-canonical observation-content-hash/count/status comparison. A successfully
-verified identical prior publication is still blocked with retained IngestDB rows
-and the original duplicate-history diagnostic. Changed values with unchanged row
+Prune committed-history admission authenticates the complete canonical and exact
+metadata and retains the complete frozen pollutant set and canonical
+observation-content-hash/count/status comparison. An authenticated identical
+prior publication is still blocked with retained IngestDB rows; its diagnostic
+explicitly states that no physical inspection or deletion authority is asserted. Changed values with unchanged row
 counts remain blocked. First publication still follows the existing absence
 route, shared writer, complete snapshot, source-to-final verification, required
 final hierarchy and batch validation, protected candidate/gate transaction and
@@ -73,20 +75,79 @@ checksum. Requesting the header does **not** prove every object/provider returns
 it. Before admitting HEAD rechecks, the consumer probes the actual required file
 responses. Exact key/existence, supported SHA, byte size and current ETag must be
 available; checksum and declared-size contradictions fail immediately. A missing
-checksum/capability chooses full authenticated GET/hash rechecks **before** the
+checksum or usable length/capability chooses full authenticated GET/hash rechecks **before** the
 proof context is created. Once checksum HEAD is admitted, later uncertainty or
 contradiction retains PR #157's permanent proof invalidation and no-fallback
 rule. ETag alone is never SHA evidence.
 
 The canonical pre-pass in the independent post-write verifier retains schema-1's
 stored-HEAD checks. Only a selected schema-2 scope under held exclusion can use
-full GET/hash when checksum metadata is absent. The subsequent direct verifier
+full GET/hash when checksum or usable byte-length metadata is absent. Any
+positively contradictory checksum or usable size fails before GET; GET never
+overrides that contradiction. The subsequent direct verifier
 still performs its own independent physical inspection. All such work is per
 complete DCP/file pass, not per exact leaf. Checksumless providers can therefore
 incur an additional canonical full-GET pass plus the direct verifier's full GET
 identity recheck; there is no new permanent physical cache or configurable
 bypass. Real deployed checksum availability, CPU, bytes and latency have not been
 queried or accepted in this code-only task.
+
+## PR #158 simplification follow-up
+
+The admission contract in
+`prune_daily_complete_snapshot_child_set_contract.md` explicitly says prior
+history admission needs metadata, not historical Parquet rows. The new rejection
+helper reuses the direct verifier's canonical reader and stored-leaf loader. It
+validates exact selector/leaf bytes, complete canonical membership, file/series
+counts, coverage and canonical binding, then rereads its pinned **JSON** identities.
+It does not inspect Parquet, register a physical proof handle, or grant original,
+publication or deletion authority. Missing/contradictory metadata and every prior
+committed scope remain blocked; first-publication and schema-1 paths retain their
+existing checks.
+
+The post-write canonical pre-pass resolves an incompletely described schema-2
+scope once per DCP rather than once per file. Its authenticated selector snapshot
+is nonserialised, one-use and bound to the original operation callback. The next
+stage checks it against freshly read compact-latest identity; observed lock loss
+consumes it permanently, and normal operation exit invalidates the callback. The
+consumer rehashes that selector rather than fetching an identical prefix copy.
+The core verifier still freshly authenticates the complete hierarchy, inspects
+actual Parquet and performs its closing identity recheck. There is no durable
+cache, retained Parquet body cache, new configuration or proof format.
+
+Request model per selected DCP, with F canonical files and B total Parquet bytes:
+
+| Path | Before this follow-up | After this follow-up |
+| --- | --- | --- |
+| Committed-history rejection, no checksum HEAD | 2F complete-file GETs / 2B bytes (inspection plus closing identity) | 0 Parquet GETs / 0 Parquet bytes; authenticated JSON remains |
+| Committed-history rejection, checksum-capable HEAD | F complete-file GETs / B bytes plus HEAD rechecks | 0 Parquet GETs / 0 Parquet bytes |
+| Complete post-write proof, every HEAD missing checksum | F+4 scoped-selector GETs | 3 scoped-selector GETs (one selection, independent read, closing read) |
+| Complete post-write proof, complete checksum HEAD | 4 scoped-selector GETs | 3 scoped-selector GETs |
+| Complete post-write proof, no checksum HEAD | 3F complete-file GETs / 3B bytes | 3F complete-file GETs / 3B bytes |
+
+These are code-path counts, not measured R2 performance. For K files with missing
+HEAD metadata, the selector count changes from K+4 to 3 when K>0. Leaf JSON reads
+remain proportional to the selected leaf set; full-file passes do not multiply
+by leaf count. Checksum-without-length now correctly falls back to authenticated
+GET instead of failing on incomplete identity. Known checksum/size contradictions
+still fail before downloading Parquet.
+
+The retained three full-file passes without checksum HEAD establish canonical
+SHA/size, independent actual physical layout, and closing current identity. The
+canonical pre-pass discards bodies and yields no physical-layout proof; its SHA
+alone cannot replace inspection. This follow-up avoids a new body cache or a
+larger verifier rewrite, so that remaining cost is explicit. No ETag-only
+shortcut or additional complete-file pass was introduced.
+
+Follow-up validation: the six existing selected committed-history checks and all
+17 existing independent post-write checks passed (23 total, no failures/skips).
+The directly relevant schema-2 case now uses two small files to detect repeated
+scope lookup and checks incomplete length, contradiction-before-GET, selector
+advance, one-use handoff, lock loss/revival rejection, zero-Parquet prior-history
+rejection, and continued original-receipt denial. Syntax/import, hard-disabled
+publication, archive identity and diff checks passed. Focused independent review
+found no important defect. Earlier baseline limitations below remain unchanged;
+no broad or large-fixture run was repeated.
 
 ## Precise durable original-evidence contract gap
 
@@ -172,8 +233,9 @@ schema-2 publication remains inactive.
 
 Record a TEST code-only consumer compatibility milestone, not schema-2 readiness.
 Document direct verifier v2 and post-write report verifier v3, native GET SHA
-proof and observed-response HEAD admission, read-only schema-2 Prune/post-write
-support, and the explicit original-handover/gate rejection. Resolve the typed
+proof and observed-response HEAD admission, metadata-only committed-history
+rejection (never physical/deletion proof), independent physical post-write
+support, operation-local one-use selector reuse, and the explicit original-handover/gate rejection. Resolve the typed
 completed-direct-proof original extension/version/encoding/finalisation boundary
 before its next implementation; preserve historical receipt/digest meanings.
 Keep publication hard-disabled and all remaining consumer/reconstruction and
