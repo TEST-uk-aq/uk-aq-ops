@@ -20,7 +20,7 @@ import {
 import { sha256Hex } from "./r2_sigv4.mjs";
 import { getObservationHistoryGeneration } from "./uk_aq_observation_history_generation.mjs";
 import { EXACT_LEAF_FORMATS_V3, exactLeafFormatV3, assertExactRecordFieldsV2,
-  assertExactLeafKeyV3, exactLeafRevisionBytesV3, validateExactCanonicalSourceV2,
+  assertExactLeafKeyV3, exactLeafKeyV3, exactLeafRevisionBytesV3, validateExactCanonicalSourceV2,
 } from "./uk_aq_observation_history_exact_leaf_format_v3.mjs";
 
 export {
@@ -495,8 +495,13 @@ export function buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
   metadata,
   canonicalManifest,
   indexRoot = DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT,
+  exactSchemaVersion = 1,
 }) {
+  if (![1, 2].includes(exactSchemaVersion)) throw new Error("unsupported exact build schema");
   const normalized = normalizedTarget(metadata);
+  if (exactSchemaVersion === 2) {
+    return buildExactOnlyHierarchy({ normalized, canonicalManifest, indexRoot });
+  }
   const source = canonicalManifestDescriptor(canonicalManifest, normalized);
   const root = normalizePrefix(indexRoot, "indexRoot");
   const starts = [...new Set([...normalized.timeseries.keys()].map(rangeStart))]
@@ -541,6 +546,64 @@ export function buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
     scoped_manifest: scopedManifest,
     publication_objects: Object.freeze(publicationObjects),
   });
+}
+
+// Construction is not independent proof or publication admission. Operational
+// callers retain schema 1; the shared finaliser rejects schema-2 publication.
+function buildExactOnlyHierarchy({ normalized, canonicalManifest, indexRoot }) {
+  const root = normalizePrefix(indexRoot, "indexRoot");
+  const source = {
+    ...canonicalManifestDescriptor(canonicalManifest, normalized),
+    observation_content_hash_version: canonicalManifest.observation_content_hash_version,
+  };
+  const format = EXACT_LEAF_FORMATS_V3[1];
+  const common = (kind) => ({
+    ...commonPayload(kind, normalized.scope),
+    schema_version: format.schema_version,
+    exact_leaf_index_version: format.exact_leaf_index_version,
+  });
+  const leaves = [...normalized.timeseries.keys()].sort((a, b) => a - b).map((id) => {
+    const entry = timeseriesEntry(id, normalized.timeseries.get(id));
+    const keys = new Set(entry.segments.map((s) => s.file_key));
+    const files = [...normalized.files.values()].filter((f) => keys.has(f.key))
+      .sort((a, b) => bytewiseCompare(a.key, b.key));
+    const semantic = {
+      ...common(format.leaf_kind), timeseries_id: id, row_count: entry.row_count,
+      min_observed_at_utc: entry.min_observed_at_utc,
+      max_observed_at_utc: entry.max_observed_at_utc,
+      files, segments: entry.segments,
+    };
+    const key = exactLeafKeyV3(root, scopePath(normalized.scope), id, format,
+      sha256Hex(exactLeafRevisionBytesV3(semantic)));
+    return artifact({ kind: "observation_history_index_v3_exact_leaf", key,
+      payload: { ...semantic, key }, stage: "child_shard",
+      dependencies: files.map((f) => identity(f, "leaf file", "canonical_parquet")),
+      prerequisites: [identity(source, "canonical manifest", "canonical_manifest")],
+    });
+  });
+  const key = scopedManifestKey(root, normalized.scope);
+  const scopedManifest = artifact({
+    kind: "observation_history_index_v3_exact_leaf_scoped_manifest", key,
+    payload: {
+      ...common(format.manifest_kind), key, canonical_source_manifest: source,
+      decode_profile: OBSERVATION_HISTORY_EXACT_LEAF_DECODE_PROFILE,
+      coverage: { row_count: normalized.row_count, timeseries_count: leaves.length,
+        physical_file_count: normalized.files.size, physical_leaf_count: leaves.length,
+        min_observed_at_utc: leaves.map((l) => l.payload.min_observed_at_utc).sort()[0],
+        max_observed_at_utc: leaves.map((l) => l.payload.max_observed_at_utc).sort().at(-1) },
+      leaf_descriptor_fields: ["key", "byte_size", "sha256"],
+      leaves_by_timeseries_id: Object.fromEntries(leaves.map((l) =>
+        [String(l.payload.timeseries_id), [l.key, l.byte_size, l.sha256]])),
+    }, stage: "scoped_manifest",
+    dependencies: [identity(source, "canonical manifest", "canonical_manifest"),
+      ...leaves.map((l) => identity(l, "leaf", "child_shard"))],
+  });
+  validateObservationHistoryExactLeafScopedManifestArtifactV3({
+    artifact: scopedManifest, exactLeaves: leaves, indexRoot: root,
+  });
+  return Object.freeze({ exact_leaves: Object.freeze(leaves),
+    child_shards: Object.freeze(leaves), scoped_manifest: scopedManifest,
+    publication_objects: Object.freeze([...leaves, scopedManifest]) });
 }
 
 function artifactBodyIsExact(raw, expectedKind, expectedStage) {
