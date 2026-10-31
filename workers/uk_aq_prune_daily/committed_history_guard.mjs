@@ -15,6 +15,8 @@ import {
 } from "../shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import { encodeObservationHistoryIndexV3Json } from "../shared/uk_aq_observation_history_index_v3.mjs";
 import { r2GetObject, sha256Hex } from "../shared/r2_sigv4.mjs";
+import { exactLeafFormatV3 } from "../shared/uk_aq_observation_history_exact_leaf_format_v3.mjs";
+import { verifySelectedExactOnlyRejectionMetadataV3 } from "../shared/uk_aq_observation_history_exact_only_consumer_v3.mjs";
 
 function isNotFound(error) {
   const status = error?.status ?? error?.statusCode ?? error?.response?.status;
@@ -113,10 +115,20 @@ async function pinnedIndexJson(getObject, r2, reference, expectedKey) {
   return payload;
 }
 
-async function verifyCommittedIndexBinding(getObject, r2, root, pollutant, pollutantBody) {
+async function verifyCommittedIndexBinding(getObject, r2, root, pollutant, pollutantBody, { assertOperationHeld }) {
   const indexRoot = DEFAULT_OBSERVATION_HISTORY_EXACT_LEAF_INDEX_V3_ROOT;
   const scope = `day_utc=${root.day_utc}/connector_id=${root.connector_id}/pollutant_code=${root.pollutant_code}`;
   const scoped = await pinnedIndexJson(getObject, r2, root, `${indexRoot}/${scope}/manifest.json`);
+  const format = exactLeafFormatV3(scoped);
+  if (format.schema_version === 2) {
+    await verifySelectedExactOnlyRejectionMetadataV3({
+      scope: { day_utc: root.day_utc, connector_id: root.connector_id, pollutant_code: root.pollutant_code },
+      selector: root, canonical: { key: pollutant.manifest_key, byte_size: pollutantBody.length, sha256: sha256Hex(pollutantBody) },
+      getObject: async ({ key }) => await getObject({ r2, key }),
+      assertOperationHeld,
+    });
+    return 2;
+  }
   if (scoped.kind !== "observation_timeseries_physical_leaf_scoped_manifest" ||
       scoped.index_generation !== "v3" || scoped.history_version !== "v2" ||
       scoped.day_utc !== root.day_utc || scoped.connector_id !== root.connector_id ||
@@ -157,7 +169,7 @@ export class PruneCommittedHistoryGuardError extends Error {
 // are committed authority; loose same-key objects can be interrupted artefacts.
 async function inspectPruneFrozenConnectorSnapshot({
   r2, observationsPrefix, dayUtc, connectorId, rows, getObject = r2GetObject,
-  onOriginalAuthority = null,
+  onOriginalAuthority = null, headObject = null, assertOperationHeld = null,
 }) {
   const prefix = observationsPrefix;
   const rootKey = buildR2HistoryV2ObservationsRootManifestKey(prefix);
@@ -215,7 +227,7 @@ async function inspectPruneFrozenConnectorSnapshot({
   if (connectorRef.manifest_key !== connectorKey) throw new Error(`Committed observation connector key disagrees: ${dayKey}`);
   const authority = `${connectorKey}#${connectorRef.manifest_hash}`;
   if (!indexRoots.length) throw new Error("Committed connector has no final index_v3 scope; original unfinished attempt identity is unavailable");
-  let connector;
+  let connector, metadataOnly = false;
   try {
     connector = await manifest(getObject, r2, connectorKey, { manifest_kind: "connector", day_utc: dayUtc, connector_id: connectorId }, connectorRef.manifest_hash);
     const children = matchingReferences(connector, "pollutant_manifests", "child_manifests", "pollutant_code", connectorKey);
@@ -242,7 +254,8 @@ async function inspectPruneFrozenConnectorSnapshot({
       validateCanonicalHistoryV2Manifest(pollutant, { history_version: "v2", domain: "observations", manifest_kind: "pollutant", day_utc: dayUtc, connector_id: connectorId, pollutant_code: code, manifest_key: childKey });
       if (pollutant.manifest_hash !== child.manifest_hash) throw new Error(`original complete publication identity cannot be proved after same-key child advance: ${childKey}`);
       validateObservationContentHashMetadata(pollutant, { rowCount: pollutant.row_count });
-      await verifyCommittedIndexBinding(getObject, r2, indexRoot, pollutant, pollutantBody);
+      const format = await verifyCommittedIndexBinding(getObject, r2, indexRoot, pollutant, pollutantBody, { assertOperationHeld });
+      if (format === 2) metadataOnly = true;
       if (!partition) {
         sourceDifferences.push(`frozen source omits committed pollutant=${code}`);
       } else if (pollutant.observation_content_hash_contract_version !== 1 ||
@@ -264,7 +277,9 @@ async function inspectPruneFrozenConnectorSnapshot({
   }
   throw new PruneCommittedHistoryGuardError({
     dayUtc, connectorId, previousAuthority: authority,
-    reason: "verified already-committed identical history; original Prune attempt and complete source identity cannot be proved from canonical content alone",
+    reason: metadataOnly
+      ? "authenticated already-committed metadata and matching frozen source; no physical inspection or original Prune deletion authority is asserted"
+      : "verified already-committed identical history; original Prune attempt and complete source identity cannot be proved from canonical content alone",
     nextAction: "review_original_publication_evidence_or_duplicate_historical_rows",
     isolatable: true,
   });

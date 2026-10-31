@@ -6,6 +6,8 @@ import {
   createPruneDailyObservationHistoryV3RunLocalEvidenceCache,
 } from "../shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
 import { admitPruneFrozenConnectorSnapshot, PruneCommittedHistoryGuardError } from "./committed_history_guard.mjs";
+import { exactLeafFormatV3 } from "../shared/uk_aq_observation_history_exact_leaf_format_v3.mjs";
+import { rejectExactOnlyOriginalHandoverV3 } from "../shared/uk_aq_observation_history_exact_only_consumer_v3.mjs";
 import { FIRST_DELETE_READY, FIRST_DELETE_CONSUMED, FIRST_DELETE_UNPROVEN } from "./deletion_attempt_state.mjs";
 import { getObservationHistoryGeneration, resolveObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes, assertObservationHistoryGenerationKey } from "../shared/uk_aq_observation_history_generation.mjs";
 import fs from "node:fs";
@@ -4198,6 +4200,13 @@ async function writeFrozenCandidateObservationsToV2({
         dayUtc: candidate.day_utc,
         connectorId: candidate.connector_id,
         rows,
+        headObject: r2HeadObject,
+        assertOperationHeld: () => {
+          // The existing outer supervisor owns this original session and kills
+          // its child on loss. The run-local cache binds its lifetime and nonce.
+          const current = observationsGlobalOperationLockContext({ expectedOwner: 'prune_daily', expectedRunId: runtime.run_id });
+          if (!runtime.v3_run_local_evidence_cache?.matches(current)) throw new Error('original supervised Prune operation unavailable');
+        },
         ...(jsongenOriginalAuthority ? {
           getObject: async args => {
             const object = await readAdmissionObject(args);
@@ -5582,6 +5591,10 @@ export async function verifyObservationConnectorHistory({
       if (object.body.byteLength !== evidence.byte_size || sha256Hex(object.body) !== evidence.sha256) {
         throw new Error(`V3 scoped publication identity changed: ${evidence.key}`);
       }
+      // Connector verification precedes completed-root finalisation. Current
+      // receipt authority cannot retain schema-2 direct-verifier completion;
+      // do not mint READY evidence from a connector-stage or copied report.
+      if (exactLeafFormatV3(JSON.parse(object.body.toString('utf8'))).schema_version === 2) rejectExactOnlyOriginalHandoverV3();
     }
     return {
       observation_index_generation: "v3", connector_manifest: connectorManifest,
