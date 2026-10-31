@@ -124,15 +124,14 @@ jobs:
             echo "Missing GitHub variable UK_AQ_DROPBOX_ROOT."
             exit 1
           fi
-		if [[ ! "${UK_AQ_R2_BILLING_SUBSCRIPTION_ID}" =~ ^[A-Za-z0-9_-]{1,32}$ ]]; then
-		  echo "::error::Missing or invalid UK_AQ_R2_BILLING_SUBSCRIPTION_ID."
-		  exit 1
-		fi
-
-		if [ -z "${UK_AQ_R2_BILLING_API_TOKEN}" ]; then
-		  echo "::error::Missing required secret UK_AQ_R2_BILLING_API_TOKEN."
-		  exit 1
-		fi
+          if [[ ! "${UK_AQ_R2_BILLING_SUBSCRIPTION_ID}" =~ ^[A-Za-z0-9_-]{1,32}$ ]]; then
+            echo "::error::Missing or invalid UK_AQ_R2_BILLING_SUBSCRIPTION_ID."
+            exit 1
+          fi
+          if [ -z "${UK_AQ_R2_BILLING_API_TOKEN}" ]; then
+            echo "::error::Missing required secret UK_AQ_R2_BILLING_API_TOKEN."
+            exit 1
+          fi
           if [ -z "${DASHBOARD_UPSTREAM_BASE_URL}" ] && { [ -z "${SUPABASE_URL}" ] || [ -z "${SB_SECRET_KEY}" ]; }; then
             echo "Direct mode requires SUPABASE_URL + SB_SECRET_KEY when DASHBOARD_UPSTREAM_BASE_URL is not set."
             exit 1
