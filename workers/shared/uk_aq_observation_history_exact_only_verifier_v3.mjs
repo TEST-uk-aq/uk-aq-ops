@@ -62,14 +62,16 @@ export function exactCanonicalHashVersionV3(manifest) {
   return version;
 }
 
-function context({ getObject, assertOperationHeld }) {
+function context({ getObject, headObject = null, assertOperationHeld }) {
   if (typeof getObject !== "function" || typeof assertOperationHeld !== "function") {
     throw new Error("direct verification requires authenticated GET and held observations-operation exclusion");
   }
+  if (headObject !== null && typeof headObject !== "function") throw new Error("invalid direct-verifier HEAD adapter");
   const pins = new Map(), parquetKeys = new Set();
-  let lost = false;
+  let lost = false, invalidated = false;
   const held = async () => {
     if (lost) throw new Error("direct verification operation exclusion was lost");
+    if (invalidated) throw new Error("direct verification proof was invalidated; fresh verification required");
     try {
       if (await assertOperationHeld() === false) throw new Error("observations-operation exclusion is not held");
     } catch (error) { lost = true; throw error; }
@@ -93,8 +95,36 @@ function context({ getObject, assertOperationHeld }) {
     return { ...pin, body };
   }
   async function recheck() {
-    for (const pin of [...pins.values()]) await read(pin.key, { parquet: parquetKeys.has(pin.key) });
-    await held();
+    try {
+      for (const pin of [...pins.values()]) {
+        if (parquetKeys.has(pin.key) && headObject) {
+          // The independent full-body SHA and inspection already exist in this
+          // held operation. Require the authenticated stored checksum as well as
+          // size AND unchanged ETag; an ETag alone is never SHA-256 evidence.
+          await held();
+          const object = await headObject({ key: pin.key });
+          await held();
+          if (!object || object.exists !== true || object.key !== pin.key ||
+              !SHA.test(object.sha256) || !Number.isSafeInteger(object.byte_size ?? object.bytes) ||
+              (object.byte_size !== undefined && object.bytes !== undefined && object.byte_size !== object.bytes) ||
+              typeof object.etag !== "string" || !object.etag) {
+            throw new Error(`direct verification current file SHA/size/ETag unavailable: ${pin.key}`);
+          }
+          equal({ key: object.key, byte_size: object.byte_size ?? object.bytes,
+            sha256: object.sha256, etag: object.etag }, pin, `changed pinned object ${pin.key}`);
+        } else {
+          // No checksum-capable HEAD adapter: retain exact body verification at
+          // this boundary. Never fall back from contradictory HEAD evidence.
+          await read(pin.key, { parquet: parquetKeys.has(pin.key) });
+        }
+      }
+      await held();
+    } catch (error) {
+      // A changed or uncertain identity cannot become reusable by restoring
+      // metadata or retrying this handle. Start independent verification anew.
+      invalidated = true;
+      throw error;
+    }
   }
   return { read, held, pins, recheck };
 }
@@ -276,11 +306,11 @@ function reconcile(hierarchy, source, metadata, indexRoot) {
 // Passing a hierarchy is preparation-only; omitting it verifies exact stored
 // selector/leaf bytes. Neither mode creates durable original evidence.
 export async function verifyObservationHistoryExactOnlyScopeV3({
-  scope, getObject, assertOperationHeld, hierarchy = null,
+  scope, getObject, headObject = null, assertOperationHeld, hierarchy = null,
   indexRoot = generation.observations_timeseries_index_prefix, expectedRoot = null,
 }) {
   if (indexRoot !== generation.observations_timeseries_index_prefix) throw new Error("unsupported selected v3 index root");
-  const ctx = context({ getObject, assertOperationHeld });
+  const ctx = context({ getObject, headObject, assertOperationHeld });
   const source = await canonicalSource(ctx, scope, expectedRoot);
   const metadata = await physicalMetadata(ctx, source.payload, scope);
   let selected = hierarchy;
@@ -325,7 +355,19 @@ export async function verifyObservationHistoryExactOnlyScopeV3({
   return report;
 }
 
+// Only operation liveness, not current object identity or physical inspection.
+// This cheap guard is safe between scope-level identity/acceptance boundaries;
+// it cannot refresh a proof or survive loss of its original lock session.
+export async function assertObservationHistoryExactOnlyProofOperationV3(report) {
+  const proof = physicalProofs.get(report);
+  if (!proof) throw new Error("missing operation-local direct verification proof");
+  await proof.ctx.held();
+}
+
 // Opaque operation-local proof: serialised/copied reports cannot admit a write.
+// Recheck current identities and complete prepared artifact consistency. This
+// reuses inspection evidence, not a new full physical inspection; the latter
+// remains mandatory in verifyObservationHistoryExactOnlyScopeV3().
 export async function recheckObservationHistoryExactOnlyProofV3(report) {
   const proof = physicalProofs.get(report);
   if (!proof) throw new Error("missing operation-local direct verification proof");
@@ -339,8 +381,8 @@ export async function recheckObservationHistoryExactOnlyProofV3(report) {
 // Shared producer entry for future writer adapters. Files and the canonical
 // pollutant child must already be durably written. No completed root is required
 // yet; it is mandatory at final acceptance. Always inspect actual pinned files.
-export async function prepareObservationHistoryExactOnlyScopeV3({ scope, getObject, assertOperationHeld }) {
-  const ctx = context({ getObject, assertOperationHeld });
+export async function prepareObservationHistoryExactOnlyScopeV3({ scope, getObject, headObject = null, assertOperationHeld }) {
+  const ctx = context({ getObject, headObject, assertOperationHeld });
   const key = `${generation.observations_prefix}/${scopePath(scope)}/manifest.json`;
   const object = await ctx.read(key);
   const canonical = JSON.parse(object.body.toString("utf8"));

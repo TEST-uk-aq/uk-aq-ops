@@ -13,6 +13,7 @@ import {
   scopedRootDescriptor,
 } from "./uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import {
+  assertObservationHistoryExactOnlyProofOperationV3,
   recheckObservationHistoryExactOnlyProofV3,
   verifyObservationHistoryExactOnlyScopeV3,
 } from "./uk_aq_observation_history_exact_only_verifier_v3.mjs";
@@ -44,13 +45,14 @@ function storedArtifact(object, kind, stage) {
 // mode, progress ledger or receipt. Lock assertion must remain bound to the same
 // observations-operation session for the lifetime of the returned closure.
 export async function prepareObservationHistoryExactOnlyPublicationV3({
-  preparedScopes, getObject, assertOperationHeld,
+  preparedScopes, getObject, headObject = null, assertOperationHeld,
   finalizeCanonicalHierarchy, finalizeRun,
 }) {
   if (!Array.isArray(preparedScopes) || !preparedScopes.length ||
       [getObject, assertOperationHeld, finalizeCanonicalHierarchy, finalizeRun].some((fn) => typeof fn !== "function")) {
     throw new Error("schema-2 preparation requires verified scopes, held operation and existing finalisation adapters");
   }
+  if (headObject !== null && typeof headObject !== "function") throw new Error("invalid schema-2 publication HEAD adapter");
   let lost = false;
   const held = async () => {
     if (lost) throw new Error("schema-2 operation exclusion previously lost");
@@ -74,7 +76,7 @@ export async function prepareObservationHistoryExactOnlyPublicationV3({
       const format = exactLeafFormatV3(JSON.parse(Buffer.from(originalObject.body).toString("utf8")));
       if (format.schema_version === 2) throw new Error("schema-2 selector already selected: explicit authenticated recovery required");
     }
-    selectors.set(parent.key, { original, expected: id(parent), selected: false, parent });
+    selectors.set(parent.key, { original, expected: id(parent), selected: false, parent, proof: prepared.proof });
     for (const leaf of hierarchy.exact_leaves) {
       const object = await get(leaf.key), pin = snapshot(object, leaf.key);
       if (pin.exists) same(id(pin), id(leaf), "immutable revision conflict");
@@ -112,15 +114,20 @@ export async function prepareObservationHistoryExactOnlyPublicationV3({
   const lifecycle = Object.freeze({
     async beforePublish(entry, policy) {
       await held();
-      for (const proof of proofs) await recheckObservationHistoryExactOnlyProofV3(proof);
+      // Immutable leaves do not mutate canonical files. Keep the original
+      // operation proof live per entry; check current source/file identities
+      // once at selector admission, rather than refetching all files per leaf.
+      for (const proof of proofs) await assertObservationHistoryExactOnlyProofOperationV3(proof);
       if (policy?.role === "selector") {
         const guard = selectors.get(entry.key);
         if (!guard) throw new Error("unregistered schema-2 selector");
+        await recheckObservationHistoryExactOnlyProofV3(guard.proof);
         const current = snapshot(await get(entry.key), entry.key);
         same(current, guard.original, "original selector identity guard");
         same(id(entry), guard.expected, "prepared selector identity");
       }
       if (entry.publication_stage === "latest_global") {
+        for (const proof of proofs) await recheckObservationHistoryExactOnlyProofV3(proof);
         same(snapshot(await get(latestKey), latestKey), originalLatest, "original compact latest identity guard");
       }
       // Held exclusion + identity recheck, not a GET/PUT compare-and-swap claim.
@@ -147,7 +154,7 @@ export async function prepareObservationHistoryExactOnlyPublicationV3({
         const p = hierarchy.scoped_manifest.payload;
         const report = await verifyObservationHistoryExactOnlyScopeV3({
           scope: { day_utc: p.day_utc, connector_id: p.connector_id, pollutant_code: p.pollutant_code },
-          getObject, assertOperationHeld: held,
+          getObject, headObject, assertOperationHeld: held,
         });
         same(report.selector, id(hierarchy.scoped_manifest), "accepted current selector");
         same(report.leaves, hierarchy.exact_leaves.map(id), "accepted immutable leaves");
