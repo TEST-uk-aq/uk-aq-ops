@@ -3,6 +3,29 @@ import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { encodeObservationHistoryIndexV3Json } from "./uk_aq_observation_history_index_v3_json.mjs";
 export { encodeObservationHistoryIndexV3Json };
+import { exactLeafFormatV3 } from "./uk_aq_observation_history_exact_leaf_format_v3.mjs";
+
+// Deliberately no environment switch or caller override. Compatible consumers,
+// original evidence and reconstruction require separate acceptance first.
+export const OBSERVATION_HISTORY_EXACT_ONLY_PUBLICATION_ACTIVE_V3 = false;
+
+function exactOnlyPublicationPolicy(object) {
+  const body = object.body;
+  // Parquet begins PAR1; do not decode/copy full binary files for format dispatch.
+  if (typeof body === "string" ? !body.trimStart().startsWith("{") : body?.[0] !== 0x7b) return null;
+  let payload;
+  try { payload = JSON.parse(typeof body === "string" ? body : body.toString("utf8")); }
+  catch { return null; }
+  const exactKind = String(payload.kind || "").startsWith("observation_timeseries_physical_leaf");
+  if (!exactKind) return null;
+  if (!["child_shard", "scoped_manifest"].includes(object.publication_stage)) throw new Error("exact payload has wrong publication stage");
+  const record = object.publication_stage === "child_shard" ? "leaf" : "manifest";
+  const format = exactLeafFormatV3(payload, record);
+  if (format.schema_version === 1) return null;
+  if (payload.key !== object.key) throw new Error("schema-2 publication key mismatch");
+  return { schema_version: 2, role: record === "leaf" ? "immutable_leaf" : "selector",
+    selector_key: `${DEFAULT_OBSERVATION_HISTORY_INDEX_V3_ROOT}/day_utc=${payload.day_utc}/connector_id=${payload.connector_id}/pollutant_code=${payload.pollutant_code}/manifest.json` };
+}
 
 import {
   validateObservationContentHashMetadata,
@@ -2386,6 +2409,7 @@ function normalizePublicationObject(raw) {
     raw.publication_prerequisites,
     "prerequisite",
   );
+  const exactPolicy = exactOnlyPublicationPolicy({ ...raw, body });
   const dependencyKeys = new Set(dependencies.map((entry) => entry.key));
   for (const prerequisite of publicationPrerequisites) {
     if (dependencyKeys.has(prerequisite.key)) {
@@ -2403,6 +2427,7 @@ function normalizePublicationObject(raw) {
     publication_stage: stage,
     dependencies,
     publication_prerequisites: publicationPrerequisites,
+    ...(exactPolicy ? { exact_only_policy: exactPolicy } : {}),
   };
 }
 
@@ -2433,6 +2458,7 @@ function scheduleSha256(plan) {
       byte_size: entry.byte_size,
       sha256: entry.sha256,
       publication_stage: entry.publication_stage,
+      ...(entry.exact_only_policy ? { exact_only_policy: entry.exact_only_policy } : {}),
       dependencies: entry.dependencies,
       publication_prerequisites: entry.publication_prerequisites,
       changed_dependencies: entry.changed_dependencies,
@@ -2591,6 +2617,7 @@ export function buildObservationHistoryIndexV3PublicationPlan({
       sha256: object.sha256,
       content_type: object.content_type,
       publication_stage: object.publication_stage,
+      ...(object.exact_only_policy ? { exact_only_policy: object.exact_only_policy } : {}),
       dependencies: object.dependencies,
       publication_prerequisites: object.publication_prerequisites,
       changed_dependencies: changedDependencies,
@@ -2636,6 +2663,10 @@ function validatePublicationPlan(plan) {
     throw new Error("Observation-history v3 publication schedule identity mismatch");
   }
   for (const [index, entry] of plan.entries.entries()) {
+    const body = Buffer.from(entry.body);
+    if (body.length !== entry.byte_size || sha256Hex(body) !== entry.sha256) {
+      throw new Error(`Observation-history v3 publication body identity mismatch: ${entry.key}`);
+    }
     if (
       entry.position !== index + 1 ||
       !Array.isArray(entry.dependencies) ||
@@ -2691,8 +2722,29 @@ export async function finalizeObservationHistoryIndexV3Publication({
   publicationConcurrency =
     DEFAULT_OBSERVATION_HISTORY_INDEX_V3_PUBLICATION_CONCURRENCY,
   onProgress = null,
+  exactOnlyLifecycle = null,
 }) {
   validatePublicationPlan(plan);
+  // Re-derive policy from exact bytes: stripping optional plan metadata cannot
+  // bypass inactive production or immutable revision semantics.
+  const policies = plan.entries.map(exactOnlyPublicationPolicy);
+  const exactOnly = policies.some(Boolean) || plan.entries.some((entry) => entry.exact_only_policy);
+  if (exactOnly && !OBSERVATION_HISTORY_EXACT_ONLY_PUBLICATION_ACTIVE_V3) {
+    throw new Error("schema-2 publication inactive: consumer/original-evidence/reconstruction acceptance is outstanding");
+  }
+  if (exactOnly) {
+    for (const [index, entry] of plan.entries.entries()) {
+      const body = Buffer.from(entry.body);
+      if (body.length !== entry.byte_size || sha256Hex(body) !== entry.sha256 ||
+          JSON.stringify(entry.exact_only_policy ?? null) !== JSON.stringify(policies[index])) {
+        throw new Error("schema-2 exact publication plan identity/policy mismatch");
+      }
+    }
+  }
+  if (exactOnly && (!exactOnlyLifecycle ||
+      ["beforePublish", "acceptCurrentRoot", "finalizeRun"].some((name) => typeof exactOnlyLifecycle[name] !== "function"))) {
+    throw new Error("schema-2 publication requires complete direct verification and finalisation lifecycle");
+  }
   if (
     typeof putIfChanged !== "function" ||
     typeof getObject !== "function" ||
@@ -2786,27 +2838,52 @@ export async function finalizeObservationHistoryIndexV3Publication({
   };
 
   const publishEntry = async (entry) => {
-    const putResult = await putIfChanged({
-      key: entry.key,
-      body: Buffer.from(entry.body),
-      byte_size: entry.byte_size,
-      sha256: entry.sha256,
-      content_type: entry.content_type,
-      publication_stage: entry.publication_stage,
-    });
+    const policy = exactOnlyPublicationPolicy(entry);
+    if (exactOnly) await exactOnlyLifecycle.beforePublish(entry, policy);
+    if (exactOnly && entry.publication_stage === "latest_global") await exactOnlyLifecycle.acceptCurrentRoot();
+    const existingRevision = policy?.role === "immutable_leaf" ? await getObject({ key: entry.key }) : null;
+    if (policy?.role === "immutable_leaf" && (!existingRevision || existingRevision.exists !== false)) {
+      const body = Buffer.from(existingRevision?.body ?? "");
+      if (!existingRevision?.etag || body.byteLength !== entry.byte_size || sha256Hex(body) !== entry.sha256) {
+        throw new Error(`immutable schema-2 revision conflict or uncertain identity: ${entry.key}`);
+      }
+    }
+    let putResult;
+    try {
+      putResult = existingRevision && existingRevision.exists !== false
+        ? { ok: true, status: "skipped_unchanged" }
+        : await putIfChanged({
+          key: entry.key,
+          body: Buffer.from(entry.body),
+          byte_size: entry.byte_size,
+          sha256: entry.sha256,
+          content_type: entry.content_type,
+          publication_stage: entry.publication_stage,
+        });
+    } catch (error) {
+      if (!policy) throw error;
+      // Unknown write result: reconcile exact current bytes, never retry a PUT
+      // on existence alone and never restore an old selector.
+      const fetched = await getObject({ key: entry.key });
+      const body = Buffer.from(fetched?.body ?? "");
+      if (fetched?.key !== entry.key || !fetched?.etag || !body.equals(Buffer.from(entry.body))) throw error;
+      putResult = { ok: true, status: "recovered" };
+    }
     if (!putResult || putResult.ok === false) {
       throw new Error(`V3 publication PUT failed: ${entry.key}`);
     }
     // A lower post-PUT GET may supply this exact proof. ETag-only unchanged
     // evidence has no post_put_get_verified flag and still requires a GET here.
-    if (!(putResult.verified === true && putResult.post_put_get_verified === true &&
+    if (exactOnly || !(putResult.verified === true && putResult.post_put_get_verified === true &&
         putResult.key === entry.key && putResult.byte_size === entry.byte_size && putResult.sha256 === entry.sha256)) {
       const fetched = await getObject({ key: entry.key });
       const fetchedBody = Buffer.from(fetched?.body ?? "");
-      if (fetchedBody.byteLength !== entry.byte_size || sha256Hex(fetchedBody) !== entry.sha256) {
+      if (fetchedBody.byteLength !== entry.byte_size || sha256Hex(fetchedBody) !== entry.sha256 ||
+          (exactOnly && (fetched?.key !== entry.key || !fetched?.etag || !fetchedBody.equals(Buffer.from(entry.body))))) {
         throw new Error(`V3 post-PUT GET verification failed: ${entry.key}`);
       }
     }
+    if (exactOnly) await exactOnlyLifecycle.afterReadback?.(entry);
     const durableResult = await recordDurableEvidence({
       key: entry.key,
       byte_size: entry.byte_size,
@@ -2893,6 +2970,8 @@ export async function finalizeObservationHistoryIndexV3Publication({
     throw (budgetFailure || failures[0]).reason;
   }
 
+  // A selected selector with incomplete latest/run state is not final success.
+  if (exactOnly) await exactOnlyLifecycle.finalizeRun();
   const finalDiagnostics = diagnostics("succeeded");
   reportProgress("succeeded");
   const evidence = evidenceByPosition.filter(Boolean);
