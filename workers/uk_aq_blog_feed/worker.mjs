@@ -214,25 +214,36 @@ async function readBoundedText(response, maximumBytes, label) {
 
 function extractRssSource(rendered) {
   const marker = /<([a-z][\w:-]*)\b[^>]*\bid\s*=\s*(["'])webkit-xml-viewer-source-xml\2[^>]*>/i.exec(rendered);
-  if (!marker) {
-    throw new Error(
-      `Chromium XML viewer source marker was not found (${describeRenderedSource(rendered)})`,
-    );
+  const sourceRegion = marker ? rendered.slice(marker.index + marker[0].length) : rendered;
+  if (marker) {
+    const rawRssStart = sourceRegion.search(/<rss\b/i);
+    if (rawRssStart >= 0) return sourceRegion.slice(rawRssStart);
   }
-
-  const sourceRegion = rendered.slice(marker.index + marker[0].length);
-  const rawRssStart = sourceRegion.search(/<rss\b/i);
-  if (rawRssStart >= 0) return sourceRegion.slice(rawRssStart);
 
   const escapedRssStart = sourceRegion.search(/&lt;rss\b/i);
   if (escapedRssStart < 0) {
-    throw new Error("Chromium XML viewer did not contain an RSS document");
+    throw new Error(`Browser Run did not contain an escaped RSS document (${describeRenderedSource(rendered)})`);
   }
   const escapedRssEnd = sourceRegion.toLowerCase().indexOf("&lt;/rss&gt;", escapedRssStart);
   if (escapedRssEnd < 0) {
-    throw new Error("Chromium XML viewer contained an incomplete escaped RSS document");
+    throw new Error("Browser Run contained an incomplete escaped RSS document");
   }
   const escaped = sourceRegion.slice(escapedRssStart, escapedRssEnd + "&lt;/rss&gt;".length);
+  if (!marker) {
+    const surroundingHtml = sourceRegion.slice(0, escapedRssStart)
+      + sourceRegion.slice(escapedRssEnd + "&lt;/rss&gt;".length);
+    // Accept one contiguous escaped document, without HTML interleaved in its source.
+    // Check challenge hints only outside it so article text cannot trigger rejection.
+    if (
+      escaped.includes("<")
+      || /&lt;rss\b/i.test(escaped.slice(1))
+      || /&lt;\/?rss\b/i.test(surroundingHtml)
+      || /cf-chl|challenge-platform|just a moment|checking your browser|too many requests|captcha/i.test(surroundingHtml)
+    ) {
+      throw new Error(`Browser Run contained an unsafe escaped RSS document (${describeRenderedSource(rendered)})`);
+    }
+  }
+  // Remove exactly the HTML escaping layer; XML entities are handled by the parser.
   return decodeHtmlSource(escaped);
 }
 
