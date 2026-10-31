@@ -83,10 +83,20 @@ async function refreshFeed(env) {
       throw new Error("Blog feed KV binding is unavailable");
     }
 
-    const response = await env.BROWSER.quickAction("content", {
-      url: FEED_URL,
-      gotoOptions: { waitUntil: "domcontentloaded", timeout: 30_000 },
-    });
+    // Vary the navigation URL per refresh while retaining the canonical RSS source.
+    const feedUrl = new URL(FEED_URL);
+    feedUrl.searchParams.set("_uk_aq_refresh", crypto.randomUUID());
+
+    let response;
+    try {
+      response = await env.BROWSER.quickAction("content", {
+        url: feedUrl.href,
+        gotoOptions: { waitUntil: "domcontentloaded", timeout: 30_000 },
+      });
+    } catch {
+      // Browser Run exceptions may include the full navigation URL.
+      throw new Error("Browser Run content action failed");
+    }
     if (!response || typeof response.text !== "function") {
       throw new Error("Browser Run returned an unexpected response");
     }
