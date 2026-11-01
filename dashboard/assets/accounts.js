@@ -57,8 +57,21 @@
     return `<p class="accounts-message${error ? " accounts-message--error" : ""}" role="${error ? "alert" : "status"}">${esc(text)}</p>`;
   }
 
+  function requestErrorNotice(error, prefix = "") {
+    const message = error instanceof TypeError || error instanceof SyntaxError ? errorText()
+      : (error?.message || errorText());
+    if (error?.httpStatus !== 401) return notice(prefix + message, true);
+    // A full document navigation allows Cloudflare Access to renew an expired
+    // session. Offer explicit logout separately for a stale but accepted cookie.
+    return `<div class="accounts-message accounts-message--error" role="alert">
+      <p>${esc(prefix + message)}</p>
+      <div class="accounts-actions"><a class="accounts-button accounts-button--primary" href="/accounts">Sign in again</a></div>
+      <p class="accounts-subtext">If signing in again does not help, <a href="/cdn-cgi/access/logout">reset your Cloudflare Access session</a>, then reopen this dashboard. Resetting also signs you out of other Access-protected pages.</p>
+    </div>`;
+  }
+
   function errorText(status) {
-    if (status === 401) return "Administrative sign-in is required. Sign in and refresh this page.";
+    if (status === 401) return "Cloudflare Access could not verify your administrative session.";
     if (status === 403) return "Your identity is not authorised to view this private data.";
     if (status === 503) return "This private service is unavailable or has not been configured.";
     if (status === 409) return "The subscription changed or this action is unavailable. Refresh its details before trying again.";
@@ -92,7 +105,7 @@
     const query = params ? `?${params.toString()}` : "";
     const response = await fetch(`/api/accounts/${path}${query}`, {
       method: mutation ? "POST" : "GET", credentials: "same-origin", cache: "no-store", redirect: "error",
-      headers: { Accept: "application/json", ...(mutation ? {
+      headers: { Accept: "application/json", "X-Requested-With": "XMLHttpRequest", ...(mutation ? {
         "Content-Type": "application/json", "X-UKAQ-Accounts-Action": "1",
       } : {}) }, signal: controller.signal,
       ...(mutation ? { body: JSON.stringify(mutation) } : {}),
@@ -102,7 +115,9 @@
     }
     if (!response.ok) {
       // Fixed messages prevent an upstream response or URL from leaking private data into errors.
-      throw new Error(errorText(response.status));
+      const failure = new Error(errorText(response.status));
+      failure.httpStatus = response.status;
+      throw failure;
     }
     return response.json();
   }
@@ -162,7 +177,7 @@
       session.items = payload.items;
       target.innerHTML = `<div class="accounts-counts" aria-label="All subscriptions by status">${STATUSES.map(status => `<div><span>${label(status)}</span><strong>${count(payload.counts[status])}</strong></div>`).join("")}</div><p class="accounts-subtext">All subscriptions: source-reported totals by status, independent of the list filters.</p>${payload.items.length ? `<div class="accounts-table-scroll" tabindex="0" role="region" aria-label="Subscription results"><table class="accounts-table accounts-table--subscriptions"><thead><tr><th scope="col">Email / subscription UUID</th><th scope="col">Family</th><th scope="col">Status</th><th scope="col">Delivery</th><th scope="col">Confirmation</th><th scope="col">Created</th><th scope="col">Updated</th><th scope="col">Detail</th></tr></thead><tbody>${payload.items.map(subscription => `<tr><td><span class="accounts-email">${esc(subscription.email)}</span><span class="accounts-id">${esc(subscription.id)}</span></td><td>AQ in the News</td><td>${badge(subscription.status)}</td><td>${preferencesRetained(subscription) ? esc(label(subscription.delivery_mode)) : "Not retained"}${preferencesRetained(subscription) && subscription.delivery_mode === "daily" ? `<span class="accounts-subtext accounts-cell-note">${esc(dailyTime(subscription))}</span>` : ""}</td><td>${!preferencesRetained(subscription) ? "Not retained" : subscription.confirmed === true ? "Confirmed" : "Unconfirmed"}<span class="accounts-subtext accounts-cell-note">${timestamp(subscription.confirmed_at)}</span></td><td class="accounts-date">${timestamp(subscription.created_at)}</td><td class="accounts-date">${timestamp(subscription.updated_at)}</td><td>${UUID.test(subscription.id) ? `<button type="button" class="accounts-button" data-detail="${esc(subscription.id)}">View details</button>` : "Unavailable"}</td></tr>`).join("")}</tbody></table></div>` : notice("No subscriptions match these filters.")}${pager("subscriptions", pagination.offset, pagination.limit, payload.items.length, pagination.has_more)}`;
     } catch (error) {
-      if (current(session, "list", controller)) target.innerHTML = notice(error instanceof TypeError || error instanceof SyntaxError ? errorText() : error.message, true);
+      if (current(session, "list", controller)) target.innerHTML = requestErrorNotice(error);
     }
   }
 
@@ -193,7 +208,7 @@
         ["Consent recorded", "consent_recorded_at"]];
       target.innerHTML = `<div class="accounts-heading"><h3>Subscription detail</h3><button type="button" class="accounts-button" data-close-detail>Close detail</button></div><p class="accounts-email">${esc(subscription.email)}</p><p class="accounts-id">${esc(subscription.id)}</p><dl class="accounts-detail-grid">${detailField("Family", "AQ in the News")}${detailField("Status", label(subscription.status))}${detailField("Confirmation", !preferencesRetained(subscription) ? "Not retained" : subscription.confirmed === true ? "Confirmed" : "Unconfirmed")}${detailField("Delivery mode", preferencesRetained(subscription) ? label(subscription.delivery_mode) : "Not retained")}${preferencesRetained(subscription) && subscription.delivery_mode === "daily" ? detailField("Daily wall time", dailyTime(subscription)) : ""}${detailField("Timezone", subscription.timezone || "Not recorded")}${detailField("Consent text version", subscription.consent_text_version || "Not retained")}${dates.filter(([, key]) => ["created_at", "updated_at", "confirmed_at"].includes(key) || Object.hasOwn(subscription, key)).map(([text, key]) => detailField(`${text} (UK)`, timestamp(subscription[key]))).join("")}${Object.hasOwn(subscription, "confirmation_send_count") ? detailField("Confirmation send count", count(subscription.confirmation_send_count)) : ""}${subscription.block_reason ? detailField("Block reason", subscription.block_reason) : ""}</dl><button type="button" class="accounts-button" data-history="${esc(id)}">View email delivery history</button>${subscriberControls(subscription)}`;
     } catch (error) {
-      if (current(session, "detail", controller)) target.innerHTML = notice(error instanceof TypeError || error instanceof SyntaxError ? errorText() : error.message, true);
+      if (current(session, "detail", controller)) target.innerHTML = requestErrorNotice(error);
     }
   }
 
@@ -249,8 +264,9 @@
         session.root.querySelector("[data-subscription-results]").insertAdjacentHTML("afterbegin", notice("Subscription deleted. Historical email delivery records are preserved."));
       }
     } catch (error) {
-      if (current(session, "mutation", controller)) target.innerHTML = notice(
-        `${error instanceof TypeError || error instanceof SyntaxError ? "The action result could not be confirmed." : error.message} Refresh before retrying.`, true);
+      if (current(session, "mutation", controller)) target.innerHTML = error?.httpStatus === 401
+        ? requestErrorNotice(error, "Subscriber action could not be confirmed. ")
+        : notice(`${error instanceof TypeError || error instanceof SyntaxError ? "The action result could not be confirmed." : error.message} Refresh before retrying.`, true);
     } finally {
       session.mutating = false;
       controls.forEach(control => { control.disabled = control.dataset.wasDisabled === "true"; delete control.dataset.wasDisabled; });
@@ -284,7 +300,7 @@
       const pagination = readPagination(payload, 25, session.deliveryOffset);
       target.innerHTML = `<h4>Source-reported summary</h4>${payload.summary.length ? `<div class="accounts-table-scroll" tabindex="0" role="region" aria-label="Delivery summary"><table class="accounts-table accounts-table--summary"><thead><tr><th scope="col">Mode / work type</th><th scope="col">State</th><th scope="col">Count</th></tr></thead><tbody>${payload.summary.map(item => `<tr><td>${esc(label(item.delivery_mode))}</td><td>${badge(item.display_state)}</td><td>${count(item.count)}</td></tr>`).join("")}</tbody></table></div>` : notice("No delivery summary was returned for this time window.")}${deliveryTable(payload.deliveries)}${outboxTable(payload.outbox)}${pager("delivery", pagination.offset, pagination.limit, Math.max(payload.deliveries.length, payload.outbox.length), pagination.has_more)}`;
     } catch (error) {
-      if (current(session, "delivery", controller)) target.innerHTML = notice(`Email Delivery unavailable. ${error instanceof TypeError || error instanceof SyntaxError ? errorText() : error.message}`, true);
+      if (current(session, "delivery", controller)) target.innerHTML = requestErrorNotice(error, "Email Delivery unavailable. ");
     }
   }
 
