@@ -155,7 +155,11 @@ export function createDropboxReader({ cacheDir, limits, checkpointKey = CHECKPOI
             }
             if (failure?.retryable && diagnosticFailure) failure = diagnosticFailure;
             diagnostic = Buffer.alloc(0);
-            if (failure) { chunks.length = 0; resolve({ failure }); }
+            if (failure) {
+              chunks.length = 0;
+              resolve({ failure, invocationFatal: ['authentication_or_permission', 'invalid_configuration',
+                'resource_limit', 'interrupted', 'syntax_or_usage'].includes(diagnosticFailure?.category) });
+            }
             else resolve({ body: Buffer.concat(chunks) });
           });
         });
@@ -172,7 +176,12 @@ export function createDropboxReader({ cacheDir, limits, checkpointKey = CHECKPOI
           if (attempt === 3) {
             exhaustedObjects.add(key); metrics.transport_retry_objects_exhausted = exhaustedObjects.size;
           }
-          throw new Error(`Dropbox read failed (${category}; attempts ${attempt}/3): ${key}`);
+          const error = new Error(`Dropbox read failed (${category}; attempts ${attempt}/3): ${key}`);
+          // An oversized object is scoped; exhausting the shared byte budget
+          // must escape scope-continuation handlers before any further work.
+          error.invocationFatal = result.invocationFatal
+            || (category === 'byte_limit' && metrics.source_bytes_read >= limits.sourceBytes);
+          throw error;
         }
         readBudget();
         const delay = RETRY_DELAYS_MS[attempt - 1] + Math.floor(Math.random() * 201);

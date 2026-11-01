@@ -11,6 +11,105 @@ precomputed-AQI, canonical observation hierarchy/schema/generation, verification
 station-history AQI and Dropbox checkpoint/pack routes. No authoritative docs or
 plans were edited. This README describes implementation, not a replacement contract.
 
+## Stage 1: inclusive UTC month-range selection
+
+The selected-series manual generator now accepts `--months YYYY-MM:YYYY-MM`,
+inclusive, or a single `--months YYYY-MM`. Use this **instead of** every legacy
+period flag (`--month-utc`, `--start-utc`, `--end-utc`, `--partial-month-utc`,
+`--completed-before-utc`); combining them is rejected. Existing manual modes keep
+their original admission and date semantics. Stage 1 requires explicit bounded
+`--timeseries-ids`, alongside the existing connector/pollutant selection,
+checkpoint byte/root pins, verification modes, configured Dropbox/R2/lock access
+and a new private output directory. The new mode supports selected physical
+PM2.5, PM10 and NO2 series; it does not inherit the old single-PM2.5-month limit.
+
+For example, replace the period flags in an independently reviewed command with:
+
+```sh
+--months 2026-08:2026-11 --timeseries-ids 212,324
+```
+
+This fragment is illustrative, not run authorisation or a claim that these series
+and dates are complete in any selected backup. All other required flags and
+existing operator configuration still apply. Do not run a historical bootstrap
+as part of code review. Implementation followed the 1 November 2026 month-range
+and initial-bootstrap contracts at system-docs `main`
+`d799c1daf5da84187c012c474694132a53e26aed`; authoritative documentation was read only.
+
+The invocation captures the current **UTC** month once. Every earlier selected
+month requests its entire calendar interval, including a historical last month.
+Invalid, reversed, future or conflicting selections fail before source work.
+The existing `--max-days` budget reserves the whole selected calendar envelope,
+including all possible days of an included open month; defaults/hard maxima and
+other invocation budgets remain unchanged. No fixed 90-day truncation is used.
+
+After authenticating the explicitly pinned completed Dropbox v3 backup, the
+planner walks the current month's days from day 1, stopping at the first day
+without positive completion evidence. A reporting day requires authenticated
+manifest membership and checkpoint `copied_at` at or after that timestamp-day's
+end, no later than invocation time. Missing observations, parent omission and
+elapsed wall time alone cannot establish day completion. The current UTC day
+is never included. With the existing conservative terminal rule, a cutoff also
+requires positive completion of its following timestamp-day, from the same
+checkpoint. This can leave the last otherwise completed reporting day unselected
+until terminal evidence exists. No new partial-day/exact-midnight proof is added.
+
+The resulting exclusive UTC cutoff is fixed **before** initial R2 comparison.
+It is never shortened to conceal a source/current hash mismatch. When no day
+qualifies, the current-month scope is incomplete, with no fabricated empty pair;
+eligible earlier months continue. On a month's first UTC day there are zero
+completed reporting days. An ended month always requires full coverage on a
+later invocation. A closed month's next-month terminal dependency may also be
+pending independently of its sound raw-month hash.
+
+Admitted periods feed the existing Dropbox reconstruction, PM predecessor,
+terminal-midnight, shared AQI, SHA-256/gzip and private output pipeline. Raw rows
+remain `[S,E)` and AQI endpoints remain `S < n <= E`. Both scoped R2 comparisons
+retain the brief shared lock; Dropbox reads, decoding and original-byte rechecks
+remain outside it. R2 supplies bounded authenticated comparison metadata only.
+There is no R2 observation/index discovery, Parquet fallback, new checkpoint
+selection, publication, selector or website integration.
+
+Stage 1 processes each selected physical series/month independently, reusing
+the authenticated Dropbox disk cache. Shared source files can be **decoded again
+for each selected series** and count against the same global decoded-row/time
+limits. In month-range mode the selected-row memory limit applies to that
+series/month including dependencies. This is deliberately bounded selected-series
+processing. **Stage 2 remains deferred:** all-AURN authenticated physical-series
+inventory, shared high-throughput Parquet decoding and bulk resource partitioning.
+
+`report.json.month_plan` and the private candidate manifest record the requested
+range, captured UTC time, full calendar boundaries, resolved partial cutoff,
+selected/completed days, terminal evidence, source proofs and per-month results.
+Initial/final currentness and successful/incomplete scopes identify affected
+months/days, connector/pollutant/physical series where known, failure phase,
+safe reason, authenticated original/current hashes and independent raw/AQI
+completeness. A failed initial gate avoids source decoding; its raw-currentness
+match is reported separately from raw output, which has not been generated.
+
+Source-month planning failures, selected binding failures, currentness mismatches
+and source/readback defects fail dependent scopes while independent work continues.
+A shared defective Parquet or binding range fails every selected series relying
+on it. Source revalidation and final-currentness failures preserve staged products
+as incomplete diagnostics; a terminal/PM-only defect can leave raw output complete.
+Scientific missing/insufficient-sample AQI outcomes keep the existing meanings.
+Checkpoint/trust-root failure, lost lock, essential configuration/authentication
+failure or exhausted global resource budget stops the invocation. Any incomplete
+requested scope makes the invocation exit nonzero and omit global `COMPLETE.json`;
+unaffected final-authenticated pairs remain separately reported for later review
+and fresh revalidation, with no automatic resume or promotion.
+
+Only syntax/import/help and diff checks were used for development. Separately
+authorised real TEST operations must validate month rollover, positive day and
+terminal admission, per-scope continuation, original/current hashes, raw/AQI
+boundaries and fidelity, product/report hashes and resource costs. No persistent
+configuration, database schema, schedule or deployment changes are required.
+Rollback is to stop using this CLI mode/revert the implementation; dated original
+code is preserved under `archive/2026-11-01/scripts/jsongen/bootstrap/` and is never
+executed. No contract amendment was needed. ChatGPT should update implementation
+status in the two routed bootstrap contracts and Station Charts README after code
+review, keeping operational acceptance and Stage 2 explicitly deferred.
+
 ## Authority boundary and assumptions
 
 This is a reconstruction of an explicitly selected completed backup. It is not
@@ -276,8 +375,9 @@ UK_AQ_ENV_NAME=TEST node --max-old-space-size=4096 \
 Whole UTC days are accepted. Full-month mode derives boundaries from the explicit
 `YYYY-MM`, accounts for every selected UTC day separately from natural missing
 measurements, and records preceding PM context days. Ranges split at month
-boundaries and process one connector/pollutant/month in memory. Each Parquet is decoded once for all selected
-physical series. SHA-pinned local disk cache avoids repeat Dropbox downloads for
+boundaries and process one connector/pollutant/month in memory. Legacy ranges
+decode each Parquet once for their selected physical series. Stage 1 `--months`
+uses one selected series per unit as described above. SHA-pinned local disk cache avoids repeat Dropbox downloads for
 adjacent-month context/multiple series. Total source-byte budget bounds cache disk;
 controlled completion/failure removes it. One binding range is cached in memory.
 

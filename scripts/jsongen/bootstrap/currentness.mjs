@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { requireValid as check } from '../schema.mjs';
 import { GENERATION } from './dropbox-reader.mjs';
+import { rethrowInvocationFault } from './failures.mjs';
 import { withHistoryWriterClient, withObservationsGlobalOperationLock } from '../../../workers/shared/uk_aq_r2_history_writer.mjs';
 import { hasRequiredR2Config, r2GetObjectBounded, sha256Hex } from '../../../workers/shared/r2_sigv4.mjs';
 import { resolveR2HistoryIndexConfig } from '../../../workers/shared/uk_aq_r2_history_index.mjs';
@@ -235,6 +236,7 @@ export async function readCurrentObservationScopes(scopes, {
               year: contextMonth.year.reference, month: contextMonth.reference });
           } catch (error) {
             assertHeld();
+            rethrowInvocationFault(error);
             results.push({ day_utc: contextDay, matches: false,
               proof_state: 'not_established', error: error.message });
           }
@@ -251,6 +253,7 @@ export async function readCurrentObservationScopes(scopes, {
     } catch (error) {
       // A lost lock is invocation-wide: never downgrade it to one failed month.
       assertHeld();
+      rethrowInvocationFault(error);
       results.push({ month_utc: scope.month_utc,
         currentness: { mode: scope.mode, matches: false, state: 'not_established' },
         context_days: [], terminal_days: [], matches: false, proof_state: 'not_established', error: error.message });
