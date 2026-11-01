@@ -14,9 +14,11 @@ import { AQI_ALGORITHM_VERSION, DAQI_PM_ROLLING24H_WINDOW_HOURS,
 import { createDropboxReader, resolveDropboxSource, CHECKPOINT_KEY } from './dropbox-reader.mjs';
 import { openBackupSource } from './source.mjs';
 import { authenticatedTerminalSourceDay, readCurrentObservationScopes, withBootstrapObservationLock } from './currentness.mjs';
+import { selectMonths, resolveMonths } from './months.mjs';
+import { failureReason, rethrowInvocationFault } from './failures.mjs';
 
 const DAY = 86_400_000, MIB = 1024 ** 2;
-const scopeKey = scope => `${scope.connector_id}/${scope.pollutant_code}/${scope.month_utc}`;
+const scopeKey = scope => `${scope.connector_id}/${scope.pollutant_code}/${scope.month_utc}/${scope.timeseries_id ?? '*'}`;
 export const HELP = `Manual, local-only TEST Dropbox historical JSONgen bootstrap.
 No execution occurs on import. No R2/database/Dropbox writes or publication.
 Required:
@@ -24,6 +26,11 @@ Required:
   --checkpoint-path ${CHECKPOINT_KEY}
   --checkpoint-sha256 <SHA-256 of exact selected completed root.json bytes>
   --observations-root-sha256 <checkpoint processed observations root>
+  --months <YYYY-MM:YYYY-MM or YYYY-MM> (inclusive UTC calendar months, Stage 1)
+     Requires --timeseries-ids. Historical months are full; the current month
+     resolves its completed prefix and terminal source from the pinned backup.
+     No admitted current-month days means an incomplete scope; earlier months continue.
+  or one of the separate manual compatibility period modes:
   --month-utc <closed calendar month YYYY-MM> (complete-month mode)
   or --start-utc <UTC month start> --partial-month-utc <YYYY-MM>
      --completed-before-utc <UTC midnight exclusive cutoff>
@@ -35,7 +42,8 @@ Required:
 Optional: --timeseries-ids <comma-separated physical IDs>
 Bounds (default; hard maximum):
   --max-days 124 (366), --max-series 256 (4096, across invocation)
-  --max-selected-rows 250000 (1000000, per connector/pollutant/month incl context)
+  --max-selected-rows 250000 (1000000, per month unit incl dependencies;
+     --months units select one physical series)
   --max-file-rows 131072 (1000000), --max-decoded-rows 10000000 (100000000)
   --max-source-mib 1024 (16384, includes metadata rechecks)
   --max-object-mib 16 (64), --max-metadata-mib 16 (32)
@@ -51,9 +59,9 @@ function csv(value, validate, label) {
   check(entries.length > 0 && entries.every(validate) && new Set(entries).size === entries.length, `invalid ${label}`);
   return entries;
 }
-export function parseOptions(argv) {
+export function parseOptions(argv, nowUtc = new Date().toISOString()) {
   const names = ['source', 'checkpoint-path', 'checkpoint-sha256', 'observations-root-sha256',
-    'month-utc', 'start-utc', 'end-utc', 'partial-month-utc', 'completed-before-utc',
+    'months', 'month-utc', 'start-utc', 'end-utc', 'partial-month-utc', 'completed-before-utc',
     'connector-ids', 'timeseries-ids', 'pollutants', 'verification-modes', 'output-dir',
     'max-days', 'max-series', 'max-selected-rows', 'max-file-rows', 'max-decoded-rows', 'max-source-mib',
     'max-object-mib', 'max-metadata-mib', 'max-output-mib', 'max-objects', 'max-read-commands', 'max-wall-seconds'];
@@ -97,8 +105,15 @@ export function parseOptions(argv) {
     check(Number.isFinite(date.getTime()) && date.toISOString() === raw.replace(/(?:\.000)?Z$/, '.000Z'), 'invalid UTC date');
     return date.toISOString();
   }
-  let start, end, selectedMonth = null, partialMonth = null, periodMode = 'legacy_range';
-  if (supplied['month-utc'] !== undefined) {
+  let start, end, selectedMonth = null, partialMonth = null, periodMode = 'legacy_range', monthSelection = null;
+  if (supplied.months !== undefined) {
+    check(['month-utc', 'start-utc', 'end-utc', 'partial-month-utc', 'completed-before-utc']
+      .every(name => supplied[name] === undefined), '--months cannot be combined with other period options');
+    check(timeseries?.length > 0, 'Stage 1 --months requires explicitly selected physical --timeseries-ids');
+    monthSelection = selectMonths(supplied.months, nowUtc, limits.days);
+    ({ start, end } = monthSelection);
+    periodMode = 'month_range';
+  } else if (supplied['month-utc'] !== undefined) {
     check(supplied['start-utc'] === undefined && supplied['end-utc'] === undefined
       && supplied['partial-month-utc'] === undefined && supplied['completed-before-utc'] === undefined,
     '--month-utc cannot be combined with other period options');
@@ -142,7 +157,7 @@ export function parseOptions(argv) {
   return { source: 'dropbox-backup', checkpointPath: CHECKPOINT_KEY, checkpointSha256: supplied['checkpoint-sha256'],
     observationsRoot: supplied['observations-root-sha256'], start, end, connectors, timeseries, pollutants,
     verificationModes, limits, output: path.resolve(supplied['output-dir']), selectedMonth,
-    partialMonth, periodMode };
+    partialMonth, periodMode, monthSelection };
 }
 
 export function monthsBetween(start, end) {
@@ -179,15 +194,23 @@ export async function buildCurrentnessScopes(source, periods, pollutants) {
   });
   const sourceMonths = new Map();
   for (const [monthUtc, selectedDays] of daysByMonth) {
-    sourceMonths.set(monthUtc, await source.observationMonthSnapshot(monthUtc, [...selectedDays]));
+    try {
+      sourceMonths.set(monthUtc, await source.observationMonthSnapshot(monthUtc, [...selectedDays]));
+    } catch (error) {
+      rethrowInvocationFault(error);
+      sourceMonths.set(monthUtc, { month_utc: monthUtc, selected_days: [],
+        source_failure: { reason: failureReason(error), message: error.message } });
+    }
   }
   const scopes = requested.map(period => {
     const month = sourceMonths.get(period.month_utc);
     return { month_utc: period.month_utc, mode: period.mode,
+      source_failure: month.source_failure || null,
       source_month_hash: month.processed_source_month_hash,
       selected_days: period.selected_days,
       source_days: period.mode === 'partial_completed_days'
-        ? period.selected_days.map(dayUtc => month.selected_days.find(day => day.day_utc === dayUtc)) : [],
+        ? period.selected_days.map(dayUtc => month.selected_days.find(day => day.day_utc === dayUtc) || { day_utc: dayUtc,
+          state: 'not_established', manifest_hash: null, manifest_key: null, copied_at: null }) : [],
       context_days: period.context_days,
       source_context_days: period.context_days.map(dayUtc => sourceMonths.get(dayUtc.slice(0, 7))
         .selected_days.find(day => day.day_utc === dayUtc)),
@@ -295,7 +318,10 @@ export async function runBootstrap(options) {
   const report = { schema_version: 1, kind: 'uk_aq_jsongen_dropbox_bootstrap_report', environment: 'TEST',
     started_at_utc: new Date().toISOString(),
     state: 'running', invocation_id: newPubID(), source: sourceRoot,
-    requested_period: { start_utc: options.start, end_exclusive_utc: options.end }, completed_periods: [],
+    requested_period: { start_utc: options.start, end_exclusive_utc: options.end,
+      ...(options.monthSelection ? { months: options.monthSelection.requested,
+        end_semantics: 'selected_calendar_envelope; current-month cutoff resolved separately' } : {}) }, completed_periods: [],
+    month_plan: null,
     selection: { connector_ids: options.connectors, timeseries_ids: options.timeseries, pollutants: options.pollutants },
     source_checkpoint: { key: options.checkpointPath, sha256: options.checkpointSha256,
       processed_observations_root_hash: options.observationsRoot },
@@ -329,7 +355,35 @@ export async function runBootstrap(options) {
   const periodCurrentness = new Map();
   const stagedCandidates = [];
   const failedScopes = new Map();
-  const periods = monthsBetween(options.start, options.end);
+  let periods = options.monthSelection ? [] : monthsBetween(options.start, options.end);
+  const bindingFailures = new Map();
+  function recordFailure(scope, stage, reason, details = {}) {
+    report.incomplete_scopes.push({ ...scope, stage, reason,
+      raw_observation_candidate_complete: false, derived_aqi_candidate_complete: false, ...details });
+    report.errors.push({ scope, stage, reason, ...details });
+  }
+  function recordCurrentnessFailures(scope, canonical, stage, needsPmContext, rawComplete = false) {
+    const result = classifyPeriodCurrentness(sourceScopeProof.scopes.find(item => item.month_utc === scope.month_utc),
+      canonical, needsPmContext);
+    const evidence = [];
+    if (!result.month_matches) {
+      if (canonical.currentness.days) evidence.push(...canonical.currentness.days.filter(day => !day.matches));
+      else evidence.push({ matches: false, source_content_hash: canonical.currentness.source_content_hash || null,
+        canonical_content_hash: canonical.currentness.canonical_content_hash || null });
+    }
+    if (needsPmContext) evidence.push(...(canonical.context_days || []).filter(day => !day.matches));
+    evidence.push(...(canonical.terminal_days || []).filter(day => !day.matches));
+    if (!result.matches && !evidence.length) evidence.push({});
+    for (const failed of evidence) {
+      const authorityEstablished = failed.proof_state ? failed.proof_state === 'established'
+        : canonical.currentness.source_authority_established && canonical.currentness.canonical_authority_established;
+      const sourceHash = failed.source_manifest_hash ?? failed.source_content_hash ?? null;
+      const canonicalHash = failed.canonical_manifest_hash ?? failed.canonical_content_hash ?? null;
+      recordFailure(scope, stage, authorityEstablished && sourceHash !== canonicalHash ? 'hash_mismatch' : 'authority_not_established',
+        { ...failed, raw_currentness_matches: result.month_matches,
+          raw_observation_candidate_complete: rawComplete, currentness: canonical });
+    }
+  }
   const progress = setInterval(() => process.stderr.write(JSON.stringify({ state: report.state,
     scope: active, source_files: reader.inventory.size, source_bytes: reader.metrics.source_bytes_read,
     decoded_rows: stats.rows_decoded, candidates: report.candidates.length }) + '\n'), 15000);
@@ -362,21 +416,46 @@ export async function runBootstrap(options) {
       report.json_gzip_write_cpu_ms += (used.user + used.system) / 1000;
     }
   }
+  // Retain original authenticated metadata even when no current-month day is
+  // admissible. These are the pinned source bytes, never a newer checkpoint.
+  const retainedMetadata = new Set();
+  async function retainMetadata() {
+    for (const ref of reader.metadata.values()) {
+      if (retainedMetadata.has(ref.sha256)) continue;
+      await write(`evidence/source/${ref.sha256}.json`, await fs.readFile(path.join(cacheDir, ref.sha256)));
+      retainedMetadata.add(ref.sha256);
+    }
+  }
   try {
     const initialStarted = performance.now();
     // Authenticate the immutable selected Dropbox generation and prepare all
     // selected month/day/PM proofs before acquiring the canonical writer lock.
     const opened = await openBackupSource(reader, options);
+    source = opened;
+    report.source_checkpoint = source.checkpoint;
+    if (options.monthSelection) {
+      const resolved = await resolveMonths(opened, options.monthSelection);
+      report.month_plan = resolved;
+      periods = resolved.periods;
+      for (const plan of resolved.plans.filter(plan => plan.state === 'incomplete')) {
+        recordFailure({ month_utc: plan.month_utc, timeseries_ids: options.timeseries,
+          connector_ids: options.connectors, pollutants: options.pollutants }, 'source_planning', plan.reason,
+        { day_utc: plan.first_uncompleted_day_utc || null, source_evidence: plan.source_month_evidence || null });
+      }
+      if (!periods.length) { await retainMetadata(); report.state = 'incomplete'; return report; }
+    }
     const sourceProof = await buildCurrentnessScopes(opened, periods, options.pollutants);
+    sourceScopeProof = sourceProof;
+    if (report.month_plan) for (const plan of report.month_plan.plans) {
+      const proof = sourceProof.scopes.find(scope => scope.month_utc === plan.month_utc);
+      if (proof) plan.source_scope = proof;
+    }
     const initial = await withBootstrapObservationLock(async lock => {
       const canonical = await readCurrentObservationScopes(sourceProof.scopes, {
-        env: process.env, signal: lock.signal, assertHeld: lock.assertHeld,
+        env: process.env, signal: lock.signal, assertHeld: () => { lock.assertHeld(); reader.deadline(); },
       });
       return canonical;
     }, { env: process.env, runId: report.invocation_id, diagnostics: report.operation_lock.initial });
-    source = opened;
-    sourceScopeProof = sourceProof;
-    report.source_checkpoint = source.checkpoint;
     const initialScopes = sourceProof.scopes.map((scope, index) => ({ ...scope,
       canonical: initial.scopes[index],
       result: classifyPeriodCurrentness(scope, initial.scopes[index]),
@@ -403,29 +482,38 @@ export async function runBootstrap(options) {
     report.canonical_r2_reads += initial.reads.length;
     for (const scope of initialScopes) periodCurrentness.set(scope.month_utc, scope);
     if (source.checkpoint.sha256 !== options.checkpointSha256) throw new Error('selected Dropbox checkpoint byte pin mismatch');
-    // Preserve exact metadata bytes once, independent of volatile measurements.
-    const retainedMetadata = new Set();
-    async function retainMetadata() {
-      for (const ref of reader.metadata.values()) {
-        if (retainedMetadata.has(ref.sha256)) continue;
-        await write(`evidence/source/${ref.sha256}.json`, await fs.readFile(path.join(cacheDir, ref.sha256)));
-        retainedMetadata.add(ref.sha256);
+    if (options.timeseries) for (const id of options.timeseries) {
+      try {
+        const binding = await source.binding(id);
+        check(options.connectors.includes(binding.connector_id) && options.pollutants.includes(binding.pollutant_code),
+          'explicit timeseries is outside connector/pollutant selection');
+      } catch (error) {
+        rethrowInvocationFault(error);
+        bindingFailures.set(id, error);
+        const binding = source.bindings.get(id);
+        for (const month of periods) recordFailure({ month_utc: month.month_utc, timeseries_id: id,
+          connector_id: binding?.connector_id || null, pollutant_code: binding?.pollutant_code || null },
+        'binding_or_verification_authority', failureReason(error), { message: error.message });
       }
     }
-    if (options.timeseries) for (const id of options.timeseries) {
-      const binding = await source.binding(id);
-      check(options.connectors.includes(binding.connector_id) && options.pollutants.includes(binding.pollutant_code),
-        'explicit timeseries is outside connector/pollutant selection');
+    function* workUnits() {
+      for (const month of periods) for (const connectorId of options.connectors) for (const pollutant of options.pollutants) {
+        const selectedForUnit = options.monthSelection ? options.timeseries.filter(id => {
+          const binding = source.bindings.get(id);
+          return !bindingFailures.has(id) && binding?.connector_id === connectorId && binding.pollutant_code === pollutant;
+        }) : [null];
+        for (const selectedId of selectedForUnit) yield { month, connectorId, pollutant, selectedId };
+      }
     }
-    for (const month of periods) {
-      for (const connectorId of options.connectors) for (const pollutant of options.pollutants) {
-        active = { connector_id: connectorId, pollutant_code: pollutant, month_utc: month.month_utc };
-        try {
+    for (const { month, connectorId, pollutant, selectedId } of workUnits()) {
+      active = { connector_id: connectorId, pollutant_code: pollutant, month_utc: month.month_utc,
+        ...(selectedId === null ? {} : { timeseries_id: selectedId }) };
+      try {
         const monthCurrentness = periodCurrentness.get(month.month_utc);
         const needsPmContext = pollutant === 'pm25' || pollutant === 'pm10';
-        if (!monthCurrentness?.result.month_matches) {
-          report.incomplete_scopes.push({ ...active, timeseries_ids: options.timeseries,
-            reason: 'initial_month_currentness_mismatch', currentness: monthCurrentness?.canonical || null });
+        const admission = classifyPeriodCurrentness(monthCurrentness, monthCurrentness.canonical, needsPmContext);
+        if (!admission.month_matches || (options.monthSelection && !admission.matches)) {
+          recordCurrentnessFailures(active, monthCurrentness.canonical, 'initial_currentness', needsPmContext);
           continue;
         }
         const contextStart = needsPmContext
@@ -441,7 +529,8 @@ export async function runBootstrap(options) {
           source_authority_established: terminalSourceEstablished,
           state: terminalSourceEstablished ? 'authenticated_source_day' : 'pending_terminal_source_authority',
           limitation: 'no partial_timestamp_day_or_exact_midnight_authority_implemented' };
-        const groups = new Map(), days = [], files = [], selectedIds = options.timeseries ? new Set(options.timeseries) : null;
+        const groups = new Map(), days = [], files = [], selectedIds = selectedId !== null
+          ? new Set([selectedId]) : options.timeseries ? new Set(options.timeseries.filter(id => !bindingFailures.has(id))) : null;
         let selectedRows = 0;
         const group = async id => {
           if (!groups.has(id)) {
@@ -450,7 +539,7 @@ export async function runBootstrap(options) {
           }
           return groups.get(id);
         };
-        if (options.timeseries) for (const id of options.timeseries) {
+        if (selectedIds) for (const id of selectedIds) {
           const b = source.bindings.get(id);
           if (b.connector_id === connectorId && b.pollutant_code === pollutant) await group(id);
         }
@@ -458,6 +547,7 @@ export async function runBootstrap(options) {
         const sourceDays = daysBetween(contextStart, month.requested_end_exclusive_utc);
         if (terminalSourceEstablished) sourceDays.push(terminalDay);
         for (const day of sourceDays) {
+          active.day_utc = day;
           reader.deadline();
           const dependencyRole = day === terminalDay ? 'aqi_terminal_endpoint'
             : day < month.requested_start_utc.slice(0, 10) ? 'pm_rolling_context' : 'raw_observations';
@@ -501,6 +591,7 @@ export async function runBootstrap(options) {
           days.push({ day_utc: day, state: 'exported', source_state: 'authenticated_membership',
             dependency_role: dependencyRole, row_count: selectedRows - before });
         }
+        delete active.day_utc;
         if (!terminalSourceEstablished) days.push({ day_utc: terminalDay,
           dependency_role: 'aqi_terminal_endpoint', state: 'pending_terminal_source_authority',
           source_state: 'not_established', row_count: 0 });
@@ -573,6 +664,7 @@ export async function runBootstrap(options) {
               state: 'complete', generation: 'v3', bucket: 'dropbox_backup_not_r2', evidence: sourceEvidence };
             calculated = await calculateMonthAqi(result, month, { pollutant, timeseriesId, contextStart });
           } catch (error) {
+            rethrowInvocationFault(error);
             // Preserve authenticated raw rows, including conflicting duplicates
             // or nullable stations; the shared AQI path must reject unsafe input.
             calculated = { rejection_reason: error.message, aqi: { rows: [], response_complete: false, has_gap: true, gap_ranges: [],
@@ -646,12 +738,12 @@ export async function runBootstrap(options) {
           pm_context_day_accounting: days.filter(d => d.day_utc < month.requested_start_utc.slice(0,10)),
           terminal_dependency: terminalDependency,
           physical_series_count: groups.size, candidate_count: groups.size });
-        } catch (error) {
-          const key = scopeKey(active);
-          failedScopes.set(key, error.message);
-          report.errors.push({ scope: active, message: error.message });
-          report.incomplete_scopes.push({ ...active, reason: 'source_scope_generation_failed', message: error.message });
-        }
+      } catch (error) {
+        rethrowInvocationFault(error);
+        const key = scopeKey(active);
+        failedScopes.set(key, error.message);
+        recordFailure(active, 'source_read', failureReason(error), { message: error.message,
+          currentness: periodCurrentness.get(month.month_utc)?.canonical || null });
       }
     }
     check(stagedCandidates.length > 0 || report.incomplete_scopes.length > 0,
@@ -696,11 +788,11 @@ export async function runBootstrap(options) {
     for (const [key, consumers] of cachedConsumers) {
       if (key === CHECKPOINT_KEY) continue;
       try { await reader.verifyCachedObjects([key]); }
-      catch (error) { failSourceConsumers(key, error, consumers); }
+      catch (error) { rethrowInvocationFault(error); failSourceConsumers(key, error, consumers); }
     }
     for (const [key, consumers] of networkConsumers) {
       try { await reader.checkSelectedStability([key]); }
-      catch (error) { failSourceConsumers(key, error, consumers); }
+      catch (error) { rethrowInvocationFault(error); failSourceConsumers(key, error, consumers); }
     }
     report.source_stability.original_checkpoint_cached_proof = 'verified';
     const checkpointKeyStillPinned = reader.inventory.get(CHECKPOINT_KEY)?.sha256 === options.checkpointSha256;
@@ -711,6 +803,7 @@ export async function runBootstrap(options) {
         ? { state: 'unchanged', ...currentCheckpoint }
         : { state: 'changed_not_adopted_scope_results_decide', ...currentCheckpoint };
     } catch (error) {
+      rethrowInvocationFault(error);
       report.source_stability.current_checkpoint = { state: 'not_established', reason: error.message };
     }
     report.source_stability.final_checkpoint_reread_at_utc = new Date().toISOString();
@@ -728,7 +821,7 @@ export async function runBootstrap(options) {
     // selected month/day comparisons. No Dropbox network or source-byte work.
     const final = await withBootstrapObservationLock(async lock => {
       const canonical = await readCurrentObservationScopes(sourceScopeProof.scopes, {
-        env: process.env, signal: lock.signal, assertHeld: lock.assertHeld,
+        env: process.env, signal: lock.signal, assertHeld: () => { lock.assertHeld(); reader.deadline(); },
       });
       return { canonical };
     }, { env: process.env, runId: report.invocation_id, diagnostics: report.operation_lock.final });
@@ -776,13 +869,23 @@ export async function runBootstrap(options) {
         && (!needsPmContext || startResult.context_matches === true) && startResult.terminal_matches === true;
       const sourceFailure = sourceFailures.get(staged) || [];
       const rawSourceFailure = rawSourceFailures.get(staged) || [];
-      const generationFailure = failedScopes.get(scopeKey(staged)) || null;
+      const generationFailure = failedScopes.get(scopeKey(staged))
+        || failedScopes.get(scopeKey({ ...staged, timeseries_id: undefined })) || null;
       const rawComplete = startResult?.month_matches === true && finalResult.month_matches === true
         && rawSourceFailure.length === 0 && !generationFailure;
       const localComplete = initiallyCurrent && finalScope?.result.matches === true
         && finalResult.matches === true && canonicalScope?.proof_state === 'established'
         && sourceFailure.length === 0 && !generationFailure
         && staged.aqi_complete && staged.context_complete && staged.terminal_complete;
+      if (!finalResult.matches) recordCurrentnessFailures({ month_utc: staged.month_utc,
+        ...staged.summary.identity }, canonicalScope, 'final_currentness', needsPmContext, rawComplete);
+      for (const failure of sourceFailure) recordFailure({ month_utc: staged.month_utc,
+        ...staged.summary.identity }, 'source_revalidation', failureReason({ message: failure.reason }),
+      { source_key: failure.key, message: failure.reason,
+        day_utc: failure.key.match(/day_utc=(\d{4}-\d{2}-\d{2})\//)?.[1] || null,
+        original_source_identity: reader.inventory.get(failure.key) || null,
+        currentness: finalScope,
+        raw_observation_candidate_complete: rawComplete });
       staged.candidate.currentness.final = finalScope || null;
       staged.candidate.source_stability = { state: sourceFailure.length ? 'not_established'
         : generationFailure ? 'scope_generation_failed' : 'original_selected_proof_revalidated',
@@ -800,6 +903,7 @@ export async function runBootstrap(options) {
       try {
         staged.summary.candidate = await contentJson(`${staged.prefix}/candidate`, staged.candidate);
       } catch (error) {
+        rethrowInvocationFault(error);
         staged.candidate.local_candidate_complete = false;
         staged.candidate.raw_observation_candidate_complete = false;
         staged.candidate.derived_aqi_candidate_complete = false;
@@ -811,7 +915,8 @@ export async function runBootstrap(options) {
           staged_products: { observations: staged.candidate.observations, aqi: staged.candidate.aqi } });
         report.errors.push({ scope: staged.candidate.identity, message: error.message });
         report.incomplete_scopes.push({ month_utc: staged.month_utc,
-          identity: staged.summary.identity, reason: 'candidate_descriptor_write_failed', message: error.message });
+          identity: staged.summary.identity, stage: 'candidate_output',
+          reason: 'candidate_descriptor_write_failed', message: error.message });
         continue;
       }
       report.candidates.push({ ...staged.summary });
@@ -819,6 +924,8 @@ export async function runBootstrap(options) {
         identity: staged.summary.identity, currentness: finalScope });
       else report.incomplete_scopes.push({ month_utc: staged.month_utc,
         identity: staged.summary.identity,
+        stage: sourceFailure.length ? 'source_revalidation'
+          : !initiallyCurrent ? 'initial_currentness' : !finalResult.matches ? 'final_currentness' : 'aqi_calculation',
         reason: generationFailure ? 'source_scope_generation_failed'
           : sourceFailure.length ? 'selected_source_revalidation_not_established'
             : !staged.terminal_complete ? 'pending_terminal_source_authority'
@@ -829,13 +936,24 @@ export async function runBootstrap(options) {
         context_complete: staged.context_complete, terminal_complete: staged.terminal_complete,
         raw_observation_candidate_complete: rawComplete, source_failures: sourceFailure });
     }
+    if (report.month_plan) for (const plan of report.month_plan.plans) {
+      plan.currentness_initial = report.currentness.start.scopes.find(scope => scope.month_utc === plan.month_utc) || null;
+      plan.currentness_final = report.currentness.final.scopes.find(scope => scope.month_utc === plan.month_utc) || null;
+      plan.successful_scope_count = report.successful_scopes.filter(scope => scope.month_utc === plan.month_utc).length;
+      plan.incomplete_scope_count = report.incomplete_scopes.filter(scope => scope.month_utc === plan.month_utc).length;
+      plan.result = plan.incomplete_scope_count ? 'incomplete' : 'local_candidates_complete';
+    }
     const manifest = await contentJson('candidate-manifest', { schema_version: 1,
       kind: 'uk_aq_jsongen_dropbox_bootstrap_candidate_manifest', environment: 'TEST',
-      source_checkpoint: source.checkpoint, requested_period: report.requested_period,
-      source_complete: report.completed_periods.length === periods.length * options.connectors.length * options.pollutants.length
+      source_checkpoint: source.checkpoint, requested_period: report.requested_period, month_plan: report.month_plan,
+      source_complete: report.completed_periods.length === (options.monthSelection
+        ? periods.length * options.timeseries.length : periods.length * options.connectors.length * options.pollutants.length)
+        && !report.month_plan?.plans.some(plan => plan.state === 'incomplete')
         && report.candidates.length > 0
         && report.candidates.every(candidate => candidate.raw_observation_candidate_complete),
-      terminal_source_complete: report.completed_periods.length === periods.length * options.connectors.length * options.pollutants.length
+      terminal_source_complete: report.completed_periods.length === (options.monthSelection
+        ? periods.length * options.timeseries.length : periods.length * options.connectors.length * options.pollutants.length)
+        && !report.month_plan?.plans.some(plan => plan.state === 'incomplete')
         && report.completed_periods.every(period => period.terminal_dependency.source_authority_established),
       aqi_complete: report.candidates.length > 0 && report.incomplete_scopes.length === 0
         && report.candidates.every(candidate => candidate.derived_aqi_candidate_complete),
@@ -849,8 +967,8 @@ export async function runBootstrap(options) {
     report.eligible_for_further_manual_review = complete;
   } catch (error) {
     report.state = 'failed';
-    report.errors.push({ scope: active, message: error.message });
-    report.incomplete_scopes.push({ scope: active, requested_period: report.requested_period, reason: error.message });
+    recordFailure({ invocation_wide: true }, 'invocation', failureReason(error), {
+      active_scope: active, message: error.message, requested_period: report.requested_period });
     const reportedCandidateIds = new Set(report.candidates.map(candidate => candidate.pub_id));
     for (const staged of stagedCandidates) {
       if (reportedCandidateIds.has(staged.summary.pub_id)) continue;
@@ -864,10 +982,13 @@ export async function runBootstrap(options) {
       report.candidates.push({ ...staged.summary, candidate: null,
         staged_products: { observations: staged.candidate.observations, aqi: staged.candidate.aqi } });
       report.incomplete_scopes.push({ month_utc: staged.month_utc,
-        identity: staged.summary.identity, reason: 'final_candidate_gate_not_completed' });
+        identity: staged.summary.identity, stage: 'invocation', reason: 'final_candidate_gate_not_completed' });
     }
   } finally {
     clearInterval(progress);
+    report.failure_summary = { incomplete_record_count: report.incomplete_scopes.length,
+      affected_months: [...new Set(report.incomplete_scopes.map(scope => scope.month_utc).filter(Boolean))].sort(),
+      reasons: [...new Set(report.incomplete_scopes.map(scope => scope.reason))].sort() };
     const used = process.cpuUsage(cpu);
     report.wall_ms = performance.now() - begun; report.cpu_ms = (used.user + used.system) / 1000;
     report.metrics = { ...reader.metrics, ...stats, physical_schemas: [...stats.physical_schemas.values()],
