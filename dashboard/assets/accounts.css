@@ -50,11 +50,18 @@
   font-weight: 600;
   cursor: pointer;
 }
+.accounts-dashboard a.accounts-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+}
 
 .accounts-mini-nav .is-active { color: #fff; background: var(--ink); border-color: var(--ink); }
 .accounts-button--primary { color: #fff; background: var(--accent-2); border-color: var(--accent-2); }
 .accounts-button:disabled { opacity: 0.5; cursor: default; }
 .accounts-dashboard button:focus-visible,
+.accounts-dashboard a:focus-visible,
 .accounts-dashboard input:focus-visible,
 .accounts-dashboard select:focus-visible,
 .accounts-table-scroll:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 3px; }
@@ -94,6 +101,9 @@
 .accounts-email { font-weight: 600; overflow-wrap: anywhere; }
 .accounts-message { padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); }
 .accounts-message--error { color: #861c17; border-color: #d0a39f; background: #fff3f0; }
+.accounts-message--error .accounts-actions { margin: 12px 0; }
+.accounts-message--error p { margin: 0; }
+.accounts-message--error .accounts-subtext { margin-top: 10px; }
 .accounts-counts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 18px 0 8px; }
 .accounts-counts > div { display: grid; gap: 6px; padding: 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--card); }
 .accounts-counts span { color: var(--ink-soft); font-size: 13px; }
