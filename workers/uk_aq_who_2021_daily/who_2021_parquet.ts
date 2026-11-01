@@ -1,3 +1,4 @@
+import { resolveWho2021Prefix } from "../shared/uk_aq_who_2021_storage.mjs";
 import * as arrow from "npm:apache-arrow";
 import * as parquetWasm from "npm:parquet-wasm/esm";
 
@@ -15,8 +16,6 @@ export type Who2021ParquetBatch = {
 
 const WRITER_VERSION = "uk-aq-who-2021-parquet-wasm-zstd-v1";
 const DEFAULT_ROW_GROUP_SIZE = 50_000;
-const VALID_OBJECT_KEY_RE =
-  /^history\/v2\/who_2021\/(daily_status|rolling_year_status|calendar_year_status)\/.+\/part-\d{5}\.parquet$/;
 
 let parquetWasmInitialized = false;
 let writerProperties: unknown | null = null;
@@ -277,21 +276,27 @@ function calendarRowsToTable(rows: Record<string, unknown>[]): arrow.Table {
 export function validateWho2021ParquetObjectKey(
   dataset: Who2021ParquetDataset,
   objectKey: string,
+  outputPrefix: string,
 ): void {
-  if (!VALID_OBJECT_KEY_RE.test(objectKey)) {
-    throw new Error(`invalid WHO 2021 parquet object key: ${objectKey}`);
+  if (!["daily_status", "rolling_year_status", "calendar_year_status"].includes(dataset)) {
+    throw new Error("Unknown WHO Parquet dataset");
   }
-  if (!objectKey.startsWith(`history/v2/who_2021/${dataset}/`)) {
-    throw new Error(
-      `WHO 2021 parquet object key does not match dataset ${dataset}: ${objectKey}`,
-    );
+  const prefix = resolveWho2021Prefix({ UK_AQ_WHO_2021_R2_PREFIX: outputPrefix });
+  if (typeof objectKey !== "string" || !objectKey.startsWith(prefix)) {
+    throw new Error("WHO Parquet key outside expected root");
+  }
+  const relative = objectKey.slice(prefix.length);
+  const validPartition = /^(?:daily_status\/day_utc=\d{4}-\d{2}-\d{2}|rolling_year_status\/as_of_day_utc=\d{4}-\d{2}-\d{2}|calendar_year_status\/calendar_year=\d{4}\/period_type=complete_year)\/connector_id=[1-9]\d*\/pollutant_code=(?:pm25|pm10|no2)\/part-\d{5}\.parquet$/;
+  if (!validPartition.test(relative) || !relative.startsWith(`${dataset}/`)) {
+    throw new Error("WHO dataset/key mismatch");
   }
 }
 
 export function rowsToWho2021ParquetBytes(
   batch: Who2021ParquetBatch,
+  outputPrefix: string,
 ): Uint8Array {
-  validateWho2021ParquetObjectKey(batch.dataset, batch.object_key);
+  validateWho2021ParquetObjectKey(batch.dataset, batch.object_key, outputPrefix);
   const rows = asRows(batch.rows_json);
   if (rows.length !== Number(batch.row_count)) {
     throw new Error(
@@ -309,4 +314,18 @@ export function rowsToWho2021ParquetBytes(
     return tableToParquetBytes(yearlyRowsToTable(rows));
   }
   return tableToParquetBytes(calendarRowsToTable(rows));
+}
+
+// The unchanged six-argument SQL RPC returns legacy output templates only.
+// Validate before extracting the suffix; never replace arbitrary key substrings.
+export function translateWho2021ParquetBatch(
+  batch: Who2021ParquetBatch,
+  outputPrefix: string,
+): Who2021ParquetBatch {
+  const legacyPrefix = "history/v2/who_2021/";
+  validateWho2021ParquetObjectKey(batch.dataset, batch.object_key, legacyPrefix);
+  const destinationPrefix = resolveWho2021Prefix({ UK_AQ_WHO_2021_R2_PREFIX: outputPrefix });
+  const translated = { ...batch, object_key: destinationPrefix + batch.object_key.slice(legacyPrefix.length) };
+  validateWho2021ParquetObjectKey(translated.dataset, translated.object_key, destinationPrefix);
+  return translated;
 }

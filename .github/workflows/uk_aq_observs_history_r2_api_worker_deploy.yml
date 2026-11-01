@@ -16,6 +16,7 @@ jobs:
       UK_AQ_R2_CLOUDFLARE_API_TOKEN: ${{ secrets.UK_AQ_R2_CLOUDFLARE_API_TOKEN || '' }}
       CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
       UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME || '' }}
+      UK_AQ_WHO_2021_R2_PREFIX: ${{ vars.UK_AQ_WHO_2021_R2_PREFIX }}
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
       UK_AQ_OBSERVS_HISTORY_R2_VERIFICATION_OVERLAY_ENABLED: ${{ vars.UK_AQ_OBSERVS_HISTORY_R2_VERIFICATION_OVERLAY_ENABLED || '' }}
     steps:
@@ -76,6 +77,8 @@ jobs:
       - name: Substitute wrangler.toml placeholders
         run: |
           set -euo pipefail
+          node --input-type=module -e 'import {resolveWho2021Prefix} from "./workers/shared/uk_aq_who_2021_storage.mjs"; resolveWho2021Prefix(process.env)'
+          sed -i "s|__UK_AQ_WHO_2021_R2_PREFIX__|${UK_AQ_WHO_2021_R2_PREFIX}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
           sed -i "s|__CFLARE_R2_BUCKET__|${CFLARE_R2_BUCKET}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
           sed -i "s|__UK_AQ_R2_HISTORY_VERSION__|${UK_AQ_R2_HISTORY_VERSION}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml
           sed -i "s|__UK_AQ_OBSERVS_HISTORY_R2_VERIFICATION_OVERLAY_ENABLED__|${UK_AQ_OBSERVS_HISTORY_R2_VERIFICATION_OVERLAY_ENABLED}|g" workers/uk_aq_observs_history_r2_api_worker/wrangler.toml

@@ -130,3 +130,20 @@ deno check \
 
 Do not use a local run as a substitute for the required real TEST workflow
 operation.
+
+
+## Configured R2 output prefix
+
+`UK_AQ_WHO_2021_R2_PREFIX` is required. Explicitly configure
+`history/v2/who_2021/` during preparation and `who_2021/` only at an approved
+cut-over. Historical path examples above describe the old root. This setting
+changes derived output paths only; `UK_AQ_R2_HISTORY_VERSION` continues selecting
+observation input independently.
+
+The existing six-argument Parquet-row RPC remains unchanged. The publisher
+validates its legacy WHO keys and maps their relative paths to the configured
+root before validation, logical hashing, comparison, publishing and reporting.
+Existing calculations, Parquet-before-dated-JSON-before-latest ordering,
+processing reports and Dropbox report uploads remain unchanged. No dataset
+snapshot, post-publication backup, restore tool or new backup flag is introduced.
+See [the cut-over procedure](../../docs/runbooks/who-2021-storage-cutover.md).

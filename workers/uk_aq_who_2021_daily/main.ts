@@ -1,3 +1,4 @@
+import { resolveWho2021Prefix } from "../shared/uk_aq_who_2021_storage.mjs";
 import {
   addDays,
   buildDailyRefreshPayload,
@@ -22,6 +23,7 @@ import {
 } from "./who_2021_daily_core.ts";
 import {
   rowsToWho2021ParquetBytes,
+  translateWho2021ParquetBatch,
   Who2021ParquetBatch,
 } from "./who_2021_parquet.ts";
 import {
@@ -51,6 +53,7 @@ import {
 import { SupabaseRpcClient } from "./supabase_rpc.ts";
 
 type RuntimeSettings = {
+  outputPrefix: string;
   client: SupabaseRpcClient;
   dailyRefreshRpc: string;
   preparedUpsertRpc: string;
@@ -197,6 +200,7 @@ function readSettings(now: Date): RuntimeSettings {
     }
   }
   return {
+    outputPrefix: resolveWho2021Prefix({ UK_AQ_WHO_2021_R2_PREFIX: Deno.env.get("UK_AQ_WHO_2021_R2_PREFIX") }),
     client: new SupabaseRpcClient(
       requiredEnv("OBS_AQIDB_SUPABASE_URL"),
       requiredEnv("OBS_AQIDB_SECRET_KEY"),
@@ -293,7 +297,8 @@ async function publishOutputs(args: {
     const usableDailyPublicationDays = new Set(
       args.usableDailyPublicationDays,
     );
-    for (const batch of parseRows<Who2021ParquetBatch>(response.data)) {
+    for (const sqlBatch of parseRows<Who2021ParquetBatch>(response.data)) {
+      const batch = translateWho2021ParquetBatch(sqlBatch, settings.outputPrefix);
       if (batch.dataset === "daily_status") {
         const dayUtc = batch.object_key.match(
           /\/daily_status\/day_utc=(\d{4}-\d{2}-\d{2})\//,
@@ -307,7 +312,7 @@ async function publishOutputs(args: {
         }
         if (!usableDailyPublicationDays.has(dayUtc)) continue;
       }
-      const bytes = rowsToWho2021ParquetBytes(batch);
+      const bytes = rowsToWho2021ParquetBytes(batch, settings.outputPrefix);
       const logicalHash = await sha256Hex(stableJson({
         dataset: batch.dataset,
         object_key: batch.object_key,
@@ -328,6 +333,7 @@ async function publishOutputs(args: {
 
   if (settings.config.r2PublishEnabled) {
     const plan = buildR2PublishPlan({
+      outputPrefix: settings.outputPrefix,
       asOfDayUtc: args.publicationDay,
       connectorId: settings.config.connectorId,
       pollutantCodes: settings.config.pollutantCodes,
