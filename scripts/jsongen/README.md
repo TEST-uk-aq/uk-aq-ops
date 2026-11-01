@@ -59,7 +59,10 @@ below. It is executable code, but it is not an enabled managed monthly publisher
 
 The separate [manual Dropbox historical bootstrap](bootstrap/README.md) creates
 bounded local/private monthly observation/AQI candidates from an explicitly pinned
-completed TEST backup. Its versioned candidate evidence is not a managed writer
+completed TEST backup. Inclusive `--months` supports explicit physical IDs or
+connector-1 `--all-eligible-timeseries`, with shared authenticated Dropbox decoding
+and bounded private row spools; see the [Stage 2 handover](bootstrap/STAGE_2_HANDOVER.md).
+Its versioned candidate evidence is not a managed writer
 receipt/publication. It does not activate pending Prune source, managed selection
 or chart serving; its first real TEST run requires separate operator authorisation.
 

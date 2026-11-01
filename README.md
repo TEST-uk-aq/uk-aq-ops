@@ -9,6 +9,11 @@ Cloud Run operations services for:
 - logging ingest/obs_aqidb database size samples
 - running operational backfill workflows across ingest/obs_aqidb
 
+The [manual JSONgen Dropbox bootstrap](scripts/jsongen/bootstrap/README.md) supports
+inclusive UTC month ranges, explicit physical series or opt-in all-eligible AURN
+PM2.5/PM10/NO2 discovery, shared decoding and private monthly candidates. Real
+bootstrap operations require separate authorisation; this code does not publish.
+
 ## Worker layout
 
 Each gcloud-facing service now lives under `workers/`:

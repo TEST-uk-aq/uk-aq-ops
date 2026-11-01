@@ -75,6 +75,7 @@ export async function openBackupSource(reader, options) {
     && s.pack_relative_path === r.pack_relative_path && s.pack_sha256 === r.pack_sha256
     && s.pack_size === r.pack_size && s.member_count === r.member_count), 'pack root/checkpoint disagreement');
   const bindings = new Map(), memberEvidence = new Map(), authorities = new Map(), months = new Map();
+  const physicalValidity = new Map();
   const monthDetails = new Map(), yearManifests = new Map();
   // One bounded range cache. All source bodies are also on disk, so moving
   // between ranges never causes another Dropbox download of an existing pack.
@@ -216,14 +217,26 @@ export async function openBackupSource(reader, options) {
     const member = cachedRange.members.find(m => m.timeseries_id === timeseriesId);
     check(member, `physical binding missing from authenticated pack: ${timeseriesId}`);
     const b = parseJson(Buffer.from(member.body_base64, 'base64'), member.relative_path);
-    validateTimeseriesBinding(b, { timeseriesId, connectorId: connectorId ?? b.connector_id, pollutant: code ?? b.pollutant_code });
-    check(!b.continuity, 'logical continuity requires a separately accepted bootstrap extension; select physical bindings');
+    const validated = validateTimeseriesBinding(b, { timeseriesId, connectorId: connectorId ?? b.connector_id, pollutant: code ?? b.pollutant_code });
+    check(options.monthSelection || !b.continuity,
+      'logical continuity requires a separately accepted bootstrap extension; select physical bindings');
+    // Month-range bulk mode extracts this physical member only. It never asks
+    // the logical reader to stitch members or relabel their station identities.
+    const physical = validated.continuity.members.find(member => member.timeseriesId === timeseriesId);
+    check(physical?.stationId === b.station_id, 'physical member station disagrees with binding');
+    physicalValidity.set(timeseriesId, physical);
     check(bindings.size < options.limits.series, 'invocation physical-series limit exceeded; select a smaller batch');
     bindings.set(timeseriesId, b);
     memberEvidence.set(timeseriesId, { key: member.relative_path, sha256: member.sha256, byte_size: member.size,
       pack_key: ref.pack_relative_path, pack_state_shard_key: s.state_shard_key,
       source_range_hash: ref.source_range_hash });
     return b;
+  }
+  function assertPhysicalRow(row) {
+    const member = physicalValidity.get(row.timeseries_id);
+    check(member && (!member.validFromDayUtc || row.observed_at_utc.slice(0, 10) >= member.validFromDayUtc)
+      && (!member.validToDayUtc || row.observed_at_utc.slice(0, 10) <= member.validToDayUtc),
+    'source row outside time-valid physical binding');
   }
   async function authority(connectorId) {
     if (authorities.has(connectorId)) return authorities.get(connectorId);
@@ -289,7 +302,7 @@ export async function openBackupSource(reader, options) {
       'backed-up physical schema/verification authority unresolved');
     return selected;
   }
-  return { pollutant, binding, authority, assertStatusMode, observationMonthSnapshot, bindings, memberEvidence, authorities,
+  return { pollutant, binding, authority, assertPhysicalRow, assertStatusMode, observationMonthSnapshot, bindings, memberEvidence, authorities,
     bindingPackRootEvidence: reader.inventory.get(packState.pack_root_relative_path),
     verificationLatestEvidence: verificationInventory
       ? reader.inventory.get(verificationInventory.latest.relative_path) || reader.inventory.get(VERIFICATION_LATEST_PATH)

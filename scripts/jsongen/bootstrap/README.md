@@ -11,14 +11,14 @@ precomputed-AQI, canonical observation hierarchy/schema/generation, verification
 station-history AQI and Dropbox checkpoint/pack routes. No authoritative docs or
 plans were edited. This README describes implementation, not a replacement contract.
 
-## Stage 1: inclusive UTC month-range selection
+## Inclusive UTC month-range selection and Stage 2 shared processing
 
 The selected-series manual generator now accepts `--months YYYY-MM:YYYY-MM`,
 inclusive, or a single `--months YYYY-MM`. Use this **instead of** every legacy
 period flag (`--month-utc`, `--start-utc`, `--end-utc`, `--partial-month-utc`,
 `--completed-before-utc`); combining them is rejected. Existing manual modes keep
-their original admission and date semantics. Stage 1 requires explicit bounded
-`--timeseries-ids`, alongside the existing connector/pollutant selection,
+their original admission and date semantics. Select either explicit bounded
+`--timeseries-ids` or the boolean opt-in `--all-eligible-timeseries`, alongside the existing connector/pollutant selection,
 checkpoint byte/root pins, verification modes, configured Dropbox/R2/lock access
 and a new private output directory. The new mode supports selected physical
 PM2.5, PM10 and NO2 series; it does not inherit the old single-PM2.5-month limit.
@@ -70,13 +70,79 @@ remain outside it. R2 supplies bounded authenticated comparison metadata only.
 There is no R2 observation/index discovery, Parquet fallback, new checkpoint
 selection, publication, selector or website integration.
 
-Stage 1 processes each selected physical series/month independently, reusing
-the authenticated Dropbox disk cache. Shared source files can be **decoded again
-for each selected series** and count against the same global decoded-row/time
-limits. In month-range mode the selected-row memory limit applies to that
-series/month including dependencies. This is deliberately bounded selected-series
-processing. **Stage 2 remains deferred:** all-AURN authenticated physical-series
-inventory, shared high-throughput Parquet decoding and bulk resource partitioning.
+Month-range mode now shares decoding across physical series. The legacy period
+modes retain their existing processing and date meanings. All-series mode requires
+`--months`, connector `1`, and a selected subset of `pm25,pm10,no2`; it cannot be
+combined with `--timeseries-ids`. To select all three pollutants, replace the
+selection fragment in a separately reviewed, fully pinned command with:
+
+```sh
+--months 2026-08:2026-11 --connector-ids 1 \
+  --all-eligible-timeseries --pollutants pm25,pm10,no2 --max-series 1024
+```
+
+This example represents three previous complete months and a potentially partial
+current month for an invocation during November 2026. The tool derives the actual
+UTC boundary and source admission; this fragment is not run authorisation. All
+checkpoint/root pins, verification modes, output and existing configuration remain
+required. The default physical-series cap remains 256; an all-AURN operation may
+need an explicitly reviewed larger bound, up to the existing 4096 hard maximum.
+
+Discovery walks only authenticated Dropbox reporting-day canonical manifests.
+A complete `timeseries_row_counts` map (positive counts summing to the canonical
+row count) proves physical membership. If the map is absent, the same whole-file
+decoder establishes bounded membership and saves its validated day partitions for
+candidate generation. Missing/unproved source coverage records an incomplete
+inventory scope; it is never treated as an empty station inventory. The selected
+union receives a pair for **every selected reporting month**, including months
+with authenticated natural gaps. Dependency-only identities are reported as
+excluded from candidate selection, with a reason. Explicit identities and binding
+failures are also reported. Inventory is never sliced to fit a processing cap.
+
+Each needed day/connector/pollutant is decoded once in an invocation, including
+shared monthly boundary days and discovery fallback. All canonical files in the
+day are still authenticated and decoded, including files containing unselected
+series. SHA-256, byte size, schema, millisecond timestamps, binary64 values, file
+and physical-series counts, row/status identity and original source proof remain
+required. The decoder partitions selected rows into private per-series/day JSONL
+spools, flushing at each file. No source-day spool is admitted after a defective
+shared file. Series binding/validity failures are isolated to that physical series.
+Schema-2 binding packs may supply the physical member's own station and inclusive
+valid-day bounds; logical members are never stitched or relabelled.
+
+Only requested raw intervals, preceding 23-hour PM inputs and exact closing
+midnights are retained. One physical series/month is loaded and hash-checked at a
+time for the existing observation/AQI writer, then released. Negative and null
+concentrations, timestamps, duplicate rows and status provenance stay in raw
+output. A null concentration supplies no AQI sample. Shared DAQI/EAQI algorithms
+are unchanged. Raw-day, PM and terminal failures have separate completeness
+results; a failed PM/terminal dependency cannot mark an independently proved raw
+month invalid. Unknown source coverage is not a natural measurement gap.
+
+`--max-temp-mib` adds a CLI-only budget (default 2048 MiB, maximum 32768 MiB)
+for the combined authenticated source cache and decoded spools in `--months` mode.
+Legacy modes retain their source-byte cache cap unless this new flag is supplied. File/object/row
+and all previous global limits remain. Spools are deleted after their last
+month/pollutant consumer, keeping adjacent PM/terminal days for reuse. Source cache
+bytes remain available for final original-byte proof. Controlled completion or
+failure removes the work directory; a hard kill can leave that bounded directory.
+A per-candidate selected-row breach reports that series/month incomplete; exhausted
+global bytes/rows/objects/time/series/disk budgets stop the invocation. No output is
+truncated. Diagnostic outputs and known pending candidates remain reported. A
+smaller explicit follow-on batch requires fresh checkpoint and currentness proof;
+there is no automatic resume or complete cross-batch claim.
+
+Metrics distinguish unique content-authenticated Parquet files, successful Parquet
+downloads, cached file reads, decoded-day spool reuse, actual Parquet decode passes per source
+file (failed reads/metadata admission do not count as decoding), decoded rows, assigned rows, retained rows and transferred bytes (including
+failed transfers). They also report bounded file-buffer rows/bytes, maximum
+candidate rows, sampled RSS and process maximum RSS, combined temporary disk
+peak, spool bytes written, output bytes/object counts, month/pollutant source and
+candidate time, and completed/incomplete requested monthly candidates. These are
+local process measurements, not estimates of every child process or HTTP overhead.
+The existing 15-second progress includes discovery, current source dependency,
+staged candidates, assigned rows and temporary bytes. No performance claim follows
+from structural validation; see [the implementation handover](STAGE_2_HANDOVER.md).
 
 `report.json.month_plan` and the private candidate manifest record the requested
 range, captured UTC time, full calendar boundaries, resolved partial cutoff,
@@ -84,8 +150,9 @@ selected/completed days, terminal evidence, source proofs and per-month results.
 Initial/final currentness and successful/incomplete scopes identify affected
 months/days, connector/pollutant/physical series where known, failure phase,
 safe reason, authenticated original/current hashes and independent raw/AQI
-completeness. A failed initial gate avoids source decoding; its raw-currentness
-match is reported separately from raw output, which has not been generated.
+completeness. A failed initial raw-month gate avoids candidate construction (inventory discovery
+may already have decoded a source lacking membership metadata). PM/terminal-only
+failures preserve independently proved raw candidates and leave the pair incomplete.
 
 Source-month planning failures, selected binding failures, currentness mismatches
 and source/readback defects fail dependent scopes while independent work continues.
@@ -108,7 +175,8 @@ Rollback is to stop using this CLI mode/revert the implementation; dated origina
 code is preserved under `archive/2026-11-01/scripts/jsongen/bootstrap/` and is never
 executed. No contract amendment was needed. ChatGPT should update implementation
 status in the two routed bootstrap contracts and Station Charts README after code
-review, keeping operational acceptance and Stage 2 explicitly deferred.
+review, keeping Stage 2 operational acceptance explicitly pending. See the
+[Stage 2 handover](STAGE_2_HANDOVER.md) for the implemented changes and remaining gates.
 
 ## Authority boundary and assumptions
 
@@ -168,8 +236,9 @@ JSONgen never infers ratification from age or fills stored null with `P`.
 Generic connector support grants no public publication permission. Explicitly
 review connector/physical-series/pollutant selection before operation. Other
 networks, including Sensor.Community, must not be promoted by inference. Logical
-continuity families are rejected in this physical-only version, rather than
-silently combined or relabelled. Supported canonical physical authority is
+continuity stitching is excluded. Legacy period modes reject continuity-bearing
+bindings; month-range mode accepts only the requested physical member and checks
+its own station/valid-day bounds, without combining or relabelling members. Supported canonical physical authority is
 schema 3/4; older schema-2 authority is rejected.
 
 ## Existing configuration and checkpoint pins
@@ -375,16 +444,18 @@ UK_AQ_ENV_NAME=TEST node --max-old-space-size=4096 \
 Whole UTC days are accepted. Full-month mode derives boundaries from the explicit
 `YYYY-MM`, accounts for every selected UTC day separately from natural missing
 measurements, and records preceding PM context days. Ranges split at month
-boundaries and process one connector/pollutant/month in memory. Legacy ranges
-decode each Parquet once for their selected physical series. Stage 1 `--months`
-uses one selected series per unit as described above. SHA-pinned local disk cache avoids repeat Dropbox downloads for
-adjacent-month context/multiple series. Total source-byte budget bounds cache disk;
-controlled completion/failure removes it. One binding range is cached in memory.
+boundaries. Legacy ranges process one connector/pollutant/month in memory and
+decode each Parquet once for that unit. `--months` shares source-day decoding and
+loads one series/month at a time as described above. SHA-pinned local disk cache
+avoids repeat Dropbox downloads. Source bytes and the new combined temporary-byte
+budget bound source cache plus spools; controlled completion/failure removes them.
+One binding range is cached in memory. Temporary-byte metrics reserve payload bytes
+and exclude filesystem allocation overhead. Operators still need adequate free disk.
 
 `--help` lists defaults and hard maxima for days, series across the invocation,
 selected rows per month unit including context, decoded rows, rows/bytes per file,
 metadata bytes per object, total source bytes, objects, read commands, output bytes
-and wall time. Exceeding any bound fails; no selected source data is truncated.
+temporary bytes and wall time. Exceeding any bound fails; no selected source data is truncated.
 Memory includes one decoded file, the month's rows, a binding range and JSON/gzip
 buffers; the proposed Node heap cap adds a process guard. Use smaller explicit
 series batches when needed. Limits are protective, not measured throughput claims.
