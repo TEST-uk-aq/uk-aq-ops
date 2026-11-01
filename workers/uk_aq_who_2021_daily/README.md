@@ -130,3 +130,19 @@ deno check \
 
 Do not use a local run as a substitute for the required real TEST workflow
 operation.
+
+## Independent output configuration and dataset backup
+
+`UK_AQ_WHO_2021_R2_PREFIX` is required: explicitly configure
+`history/v2/who_2021/` during preparation, and `who_2021/` only at approved
+cut-over. It controls SQL Parquet keys and all JSON/diagnostic paths independently
+of `UK_AQ_R2_HISTORY_VERSION`. All historical path examples above describe the
+pre-cut-over layout. The required-root RPC migration must precede this caller
+under WHO writer exclusion.
+
+Successful enabled R2 publication now requires a separately verified full Dropbox
+dataset snapshot; report upload remains a separate result. The additional
+`UK_AQ_WHO_2021_BACKUP_WRITER_EXCLUSION_CONFIRMED=true` acknowledgement requires
+real exclusion of other workflow/manual writers. No new cron or retention cleaner
+is installed. See [operator handover](../../docs/runbooks/who-2021-storage-cutover.md)
+for deployment ordering, bootstrap, approved copy, isolated restore and limits.

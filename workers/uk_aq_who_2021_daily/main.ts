@@ -1,3 +1,5 @@
+import { resolveWho2021Prefix } from "../shared/uk_aq_who_2021_storage.mjs";
+import { backupDataset } from "../../scripts/who_2021/dataset.mjs";
 import {
   addDays,
   buildDailyRefreshPayload,
@@ -51,6 +53,7 @@ import {
 import { SupabaseRpcClient } from "./supabase_rpc.ts";
 
 type RuntimeSettings = {
+  outputPrefix: string;
   client: SupabaseRpcClient;
   dailyRefreshRpc: string;
   preparedUpsertRpc: string;
@@ -117,6 +120,10 @@ function readSettings(now: Date): RuntimeSettings {
     Deno.env.get("UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED"),
     false,
   );
+  if (r2PublishEnabled || parquetR2WriteEnabled) {
+    if (Deno.env.get("UK_AQ_WHO_2021_BACKUP_WRITER_EXCLUSION_CONFIRMED") !== "true") throw new Error("WHO backup writer exclusion must be confirmed before publication");
+    for (const name of ["UK_AQ_DROPBOX_ROOT", "DROPBOX_APP_KEY", "DROPBOX_APP_SECRET", "DROPBOX_REFRESH_TOKEN"]) requiredEnv(name);
+  }
   const config = buildRunConfig({
     runMode,
     triggerMode: parseTriggerMode(
@@ -197,6 +204,7 @@ function readSettings(now: Date): RuntimeSettings {
     }
   }
   return {
+    outputPrefix: resolveWho2021Prefix({ UK_AQ_WHO_2021_R2_PREFIX: Deno.env.get("UK_AQ_WHO_2021_R2_PREFIX") }),
     client: new SupabaseRpcClient(
       requiredEnv("OBS_AQIDB_SUPABASE_URL"),
       requiredEnv("OBS_AQIDB_SECRET_KEY"),
@@ -279,6 +287,7 @@ async function publishOutputs(args: {
     const response = await settings.client.post<unknown>(
       settings.parquetRowsRpc,
       {
+        p_output_prefix: settings.outputPrefix,
         p_as_of_day_utc: args.publicationDay,
         p_start_day_utc: settings.config.startDayUtc,
         p_end_day_utc: args.publicationDay,
@@ -307,7 +316,7 @@ async function publishOutputs(args: {
         }
         if (!usableDailyPublicationDays.has(dayUtc)) continue;
       }
-      const bytes = rowsToWho2021ParquetBytes(batch);
+      const bytes = rowsToWho2021ParquetBytes(batch, settings.outputPrefix);
       const logicalHash = await sha256Hex(stableJson({
         dataset: batch.dataset,
         object_key: batch.object_key,
@@ -328,6 +337,7 @@ async function publishOutputs(args: {
 
   if (settings.config.r2PublishEnabled) {
     const plan = buildR2PublishPlan({
+      outputPrefix: settings.outputPrefix,
       asOfDayUtc: args.publicationDay,
       connectorId: settings.config.connectorId,
       pollutantCodes: settings.config.pollutantCodes,
@@ -834,6 +844,7 @@ export async function runWho2021Daily(): Promise<void> {
   let dailySummary = mergeDailyRefreshRows([]);
   let summaryRefresh: SummaryRefreshRpcRow | null = null;
   let summaryRefreshCompleted = false;
+  let datasetBackup: Record<string, unknown> = { status: "not_requested", publication_status: "not_published" };
   let publishSummary: PublishSummary = {
     checked: [],
     updated: [],
@@ -1320,6 +1331,14 @@ export async function runWho2021Daily(): Promise<void> {
         summaryRefresh,
         homepageSummary,
       });
+      datasetBackup = { status: "failed", publication_status: "published" };
+      try {
+        datasetBackup = { ...(await backupDataset(Deno.env.toObject())), publication_status: "published" };
+      } catch (error) {
+        datasetBackup = { ...((error as { datasetBackup?: Record<string, unknown> }).datasetBackup || {status: "failed"}), publication_status: "published" };
+        throw error;
+      }
+
     }
 
     if (
@@ -1382,6 +1401,7 @@ export async function runWho2021Daily(): Promise<void> {
     r2_bytes_read: r2Evidence.bytesRead,
     r2_parquet_row_count: r2Evidence.parquetRowCount,
     prepared_daily_row_count: r2Evidence.preparedDailyRowCount,
+    dataset_backup: datasetBackup,
     r2_objects_checked: publishSummary.checked,
     r2_objects_updated: publishSummary.updated,
     r2_objects_unchanged: publishSummary.unchanged,
@@ -1479,6 +1499,7 @@ export async function runWho2021Daily(): Promise<void> {
       not_enough_data_timeseries_days:
         dailySummary.not_enough_data_timeseries_days,
     },
+    dataset_backup: datasetBackup,
     r2_objects_checked: publishSummary.checked,
     r2_objects_updated: publishSummary.updated,
     r2_objects_unchanged: publishSummary.unchanged,

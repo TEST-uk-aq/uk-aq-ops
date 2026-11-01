@@ -149,3 +149,9 @@ cd workers/uk_aq_observs_history_r2_api_worker
 - `/v1/daily-validation-provenance` remains an independent, authenticated, authoritative P/R path; WHO provenance logic and verification manifest publication/storage are not altered. Do not treat concentration-only `verification_status: null` as source P/R, and do not enable a new status-dependent consumer without restoring accepted trusted provenance first.
 
 Changing this setting requires a separate Worker deployment and subsequent real TEST chart/API checks. It does not authorise LIVE operations or change canonical R2 history. The feature flag is **not** a request parameter and cannot be set by callers.
+
+The WHO summary reader now requires `UK_AQ_WHO_2021_R2_PREFIX`; its latest key is
+resolved from that explicit root and its validated-body cache includes the full
+physical source key. Configure the old root during preparation. No missing-object
+fallback to the old root is provided. Follow the WHO storage cut-over runbook
+before switching to `who_2021/`; public routes and observation inputs are unchanged.

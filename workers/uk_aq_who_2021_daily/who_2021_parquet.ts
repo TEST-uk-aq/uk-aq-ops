@@ -1,3 +1,4 @@
+import { whoRelativeKey } from "../shared/uk_aq_who_2021_storage.mjs";
 import * as arrow from "npm:apache-arrow";
 import * as parquetWasm from "npm:parquet-wasm/esm";
 
@@ -15,8 +16,6 @@ export type Who2021ParquetBatch = {
 
 const WRITER_VERSION = "uk-aq-who-2021-parquet-wasm-zstd-v1";
 const DEFAULT_ROW_GROUP_SIZE = 50_000;
-const VALID_OBJECT_KEY_RE =
-  /^history\/v2\/who_2021\/(daily_status|rolling_year_status|calendar_year_status)\/.+\/part-\d{5}\.parquet$/;
 
 let parquetWasmInitialized = false;
 let writerProperties: unknown | null = null;
@@ -277,21 +276,17 @@ function calendarRowsToTable(rows: Record<string, unknown>[]): arrow.Table {
 export function validateWho2021ParquetObjectKey(
   dataset: Who2021ParquetDataset,
   objectKey: string,
+  outputPrefix: string,
 ): void {
-  if (!VALID_OBJECT_KEY_RE.test(objectKey)) {
-    throw new Error(`invalid WHO 2021 parquet object key: ${objectKey}`);
-  }
-  if (!objectKey.startsWith(`history/v2/who_2021/${dataset}/`)) {
-    throw new Error(
-      `WHO 2021 parquet object key does not match dataset ${dataset}: ${objectKey}`,
-    );
-  }
+  const relative = whoRelativeKey(outputPrefix, objectKey);
+  if (!relative.startsWith(`${dataset}/`)) throw new Error("WHO dataset/key mismatch");
 }
 
 export function rowsToWho2021ParquetBytes(
   batch: Who2021ParquetBatch,
+  outputPrefix: string,
 ): Uint8Array {
-  validateWho2021ParquetObjectKey(batch.dataset, batch.object_key);
+  validateWho2021ParquetObjectKey(batch.dataset, batch.object_key, outputPrefix);
   const rows = asRows(batch.rows_json);
   if (rows.length !== Number(batch.row_count)) {
     throw new Error(

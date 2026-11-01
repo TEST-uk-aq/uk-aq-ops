@@ -252,6 +252,7 @@ Deno.test("refresh summaries merge chunk rows", () => {
 
 Deno.test("phase 4 R2 publish plan uses agreed summary and archive prefixes", () => {
   const plan = buildR2PublishPlan({
+    outputPrefix: "history/v2/who_2021/",
     asOfDayUtc: "2026-07-02",
     connectorId: 1,
     pollutantCodes: ["pm25", "pm10", "no2"],

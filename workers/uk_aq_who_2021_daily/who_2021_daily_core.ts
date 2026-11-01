@@ -1,3 +1,4 @@
+import { resolveWho2021Prefix } from "../shared/uk_aq_who_2021_storage.mjs";
 export type RunMode = "daily" | "backfill" | "dry_run";
 export type TriggerMode = "scheduler" | "manual" | "test";
 
@@ -457,28 +458,30 @@ export function stableJson(value: unknown): string {
 }
 
 export function buildR2PublishPlan(args: {
+  outputPrefix: string;
   asOfDayUtc: string;
   connectorId: number;
   pollutantCodes: string[];
   calendarYear: number | null | undefined;
 }): R2PublishPlan {
   assertIsoDay(args.asOfDayUtc, "asOfDayUtc");
+  const outputPrefix = resolveWho2021Prefix({ UK_AQ_WHO_2021_R2_PREFIX: args.outputPrefix });
   const connector = `connector_id=${args.connectorId}`;
   const pollutant = "pollutant_code=<pollutant>";
   const calendarYear = Number(args.calendarYear) ||
     Number(args.asOfDayUtc.slice(0, 4)) - 1;
   return {
     datedSummaryKey:
-      `history/v2/who_2021/summaries/as_of_day_utc=${args.asOfDayUtc}/who_2021_summary.json`,
-    latestSummaryKey: "history/v2/who_2021/latest_who_2021.json",
+      `${outputPrefix}summaries/as_of_day_utc=${args.asOfDayUtc}/who_2021_summary.json`,
+    latestSummaryKey: `${outputPrefix}latest_who_2021.json`,
     dailyCacheQuery: `?as_of=${args.asOfDayUtc}`,
     parquetPrefixes: {
       dailyStatus:
-        `history/v2/who_2021/daily_status/day_utc=<YYYY-MM-DD>/${connector}/${pollutant}/`,
+        `${outputPrefix}daily_status/day_utc=<YYYY-MM-DD>/${connector}/${pollutant}/`,
       rollingYearStatus:
-        `history/v2/who_2021/rolling_year_status/as_of_day_utc=${args.asOfDayUtc}/${connector}/${pollutant}/`,
+        `${outputPrefix}rolling_year_status/as_of_day_utc=${args.asOfDayUtc}/${connector}/${pollutant}/`,
       calendarYearStatus:
-        `history/v2/who_2021/calendar_year_status/calendar_year=${calendarYear}/period_type=complete_year/${connector}/${pollutant}/`,
+        `${outputPrefix}calendar_year_status/calendar_year=${calendarYear}/period_type=complete_year/${connector}/${pollutant}/`,
     },
   };
 }

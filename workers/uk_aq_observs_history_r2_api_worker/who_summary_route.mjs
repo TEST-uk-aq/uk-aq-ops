@@ -1,5 +1,6 @@
+import { resolveWho2021Prefix, whoLatestKey } from "../shared/uk_aq_who_2021_storage.mjs";
 export const WHO_SUMMARY_UPSTREAM_PATH = "/v1/who-summary";
-export const WHO_SUMMARY_R2_KEY = "history/v2/who_2021/latest_who_2021.json";
+
 
 const CACHE_CONTRACT_VERSION = "2";
 const VALIDATED_BODY_CACHE_SECONDS = 604_800;
@@ -59,10 +60,11 @@ function freshnessFor(dataAsOfDayUtc, requestedAsOfDayUtc) {
   return dataAsOfDayUtc < requestedAsOfDayUtc ? "behind" : "ahead";
 }
 
-function validatedBodyCacheRequest(request) {
+function validatedBodyCacheRequest(request, sourceKey) {
   const cacheUrl = new URL(request.url);
   cacheUrl.pathname = WHO_SUMMARY_UPSTREAM_PATH;
   cacheUrl.search = "";
+  cacheUrl.searchParams.set("__uk_aq_who_source_key", sourceKey);
   cacheUrl.searchParams.set("__uk_aq_who_body_contract", CACHE_CONTRACT_VERSION);
   return new Request(cacheUrl.toString(), { method: "GET" });
 }
@@ -226,15 +228,18 @@ export async function handleWhoSummaryUpstreamRequest(request, env, _ctx) {
     );
   }
 
-  const cacheRequest = validatedBodyCacheRequest(request);
+  let sourceKey;
+  try { sourceKey = whoLatestKey(resolveWho2021Prefix(env)); }
+  catch { return responseForMethod(request, jsonError(500, "invalid_who_output_prefix", "WHO output prefix is missing or invalid")); }
+  const cacheRequest = validatedBodyCacheRequest(request, sourceKey);
   const cached = await readValidatedBodyCache(cacheRequest);
   let object;
   try {
     object = cached
-      ? await env.UK_AQ_HISTORY_BUCKET.get(WHO_SUMMARY_R2_KEY, {
+      ? await env.UK_AQ_HISTORY_BUCKET.get(sourceKey, {
         onlyIf: { etagDoesNotMatch: cached.rawEtag },
       })
-      : await env.UK_AQ_HISTORY_BUCKET.get(WHO_SUMMARY_R2_KEY);
+      : await env.UK_AQ_HISTORY_BUCKET.get(sourceKey);
   } catch (error) {
     console.error("WHO summary R2 read failed", error);
     if (cached) {

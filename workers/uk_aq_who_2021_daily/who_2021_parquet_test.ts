@@ -2,7 +2,9 @@ import {
   rowsToWho2021ParquetBytes,
   validateWho2021ParquetObjectKey,
 } from "./who_2021_parquet.ts";
-import { assert, assertEquals, assertThrows } from "jsr:@std/assert";
+import assert from "node:assert/strict";
+const assertEquals: typeof assert.deepEqual = assert.deepEqual;
+const assertThrows = (fn: () => unknown, type: typeof Error, message: string) => assert.throws(fn, (error: unknown) => error instanceof type && error.message.includes(message));
 
 const DAILY_ROW = {
   day_utc: "2026-07-02",
@@ -61,7 +63,7 @@ Deno.test("WHO 2021 daily rows convert to parquet bytes", () => {
       "history/v2/who_2021/daily_status/day_utc=2026-07-02/connector_id=1/pollutant_code=pm25/part-00000.parquet",
     row_count: 1,
     rows_json: [DAILY_ROW],
-  });
+  }, "history/v2/who_2021/");
 
   assert(bytes.byteLength > 100);
   assertEquals(new TextDecoder().decode(bytes.slice(0, 4)), "PAR1");
@@ -75,6 +77,7 @@ Deno.test("WHO 2021 parquet object keys must match dataset", () => {
   validateWho2021ParquetObjectKey(
     "rolling_year_status",
     "history/v2/who_2021/rolling_year_status/as_of_day_utc=2026-07-02/connector_id=1/pollutant_code=pm25/part-00000.parquet",
+    "history/v2/who_2021/",
   );
 
   assertThrows(
@@ -82,9 +85,10 @@ Deno.test("WHO 2021 parquet object keys must match dataset", () => {
       validateWho2021ParquetObjectKey(
         "daily_status",
         "history/v2/who_2021/rolling_year_status/as_of_day_utc=2026-07-02/connector_id=1/pollutant_code=pm25/part-00000.parquet",
+    "history/v2/who_2021/",
       ),
     Error,
-    "does not match dataset",
+    "dataset/key mismatch",
   );
 });
 
@@ -110,7 +114,7 @@ Deno.test("WHO 2021 parquet handles true false null and all-null boolean columns
       "history/v2/who_2021/daily_status/day_utc=2026-07-02/connector_id=1/pollutant_code=pm25/part-00000.parquet",
     row_count: dailyRows.length,
     rows_json: dailyRows,
-  });
+  }, "history/v2/who_2021/");
 
   const rollingRows = [
     { ...ROLLING_ROW, timeseries_id: 394 },
@@ -123,7 +127,7 @@ Deno.test("WHO 2021 parquet handles true false null and all-null boolean columns
       "history/v2/who_2021/rolling_year_status/as_of_day_utc=2026-07-02/connector_id=1/pollutant_code=pm25/part-00000.parquet",
     row_count: rollingRows.length,
     rows_json: rollingRows,
-  });
+  }, "history/v2/who_2021/");
 
   assert(dailyBytes.byteLength > 100);
   assert(rollingBytes.byteLength > 100);
@@ -140,7 +144,7 @@ Deno.test("WHO 2021 parquet row count mismatches fail", () => {
           "history/v2/who_2021/daily_status/day_utc=2026-07-02/connector_id=1/pollutant_code=pm25/part-00000.parquet",
         row_count: 2,
         rows_json: [DAILY_ROW],
-      }),
+      }, "history/v2/who_2021/"),
     Error,
     "row count mismatch",
   );
