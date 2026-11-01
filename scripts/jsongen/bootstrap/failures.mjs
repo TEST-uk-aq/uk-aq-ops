@@ -1,7 +1,7 @@
 // Shared operation faults must escape every per-scope continuation boundary.
 export function rethrowInvocationFault(error) {
   if (error.invocationFatal || [401, 403].includes(error.status)
-    || /(?:invocation wall-time limit|Dropbox (?:read-command|source-byte) budget|source-object budget|decoded-row limit|output-byte limit|invocation physical-series limit)/i.test(error.message)
+    || /(?:invocation wall-time limit|Dropbox (?:read-command|source-byte) budget|source-object budget|decoded-row limit|output-byte limit|invocation physical-series limit|invocation temporary-disk limit)/i.test(error.message)
     || /Dropbox read failed \((?:authentication_or_permission|invalid_configuration|executable_start|syntax_or_usage|resource_limit|wall_time_limit|interrupted|local_stream_error)/.test(error.message)
     || ['ENOSPC', 'ENOMEM', 'EMFILE', 'EACCES', 'EPERM'].includes(error.code)) throw error;
 }

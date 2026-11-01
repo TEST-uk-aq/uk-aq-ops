@@ -85,25 +85,35 @@ export async function decodeCanonicalObservations(reader, fileDescriptor, manife
       }
     }
     let decoded;
+    selection.onDecode?.(fileKey);
     await parquetRead({ file, metadata, columns, rowStart: segment.row_start, rowEnd: segment.row_start + segment.row_count, compressors, onComplete: (rows) => { decoded = rows; } });
     check(Array.isArray(decoded) && decoded.length === segment.row_count, `Decode row count mismatch: ${fileKey}`);
     stats.rows_decoded += decoded.length;
     stats.row_groups_decoded += segments ? 1 : metadata.row_groups.length;
     for (const values of decoded) {
       const row = Object.fromEntries(columns.map((name, i) => [name, values[i]]));
-      check(integer(row.connector_id) && integer(row.timeseries_id) && (row.station_id === null || integer(row.station_id)) && typeof row.value === "number" && Number.isFinite(row.value) && row.observed_at_utc !== null, `Invalid canonical row: ${fileKey}`);
+      check(integer(row.connector_id) && integer(row.timeseries_id) && (row.station_id === null || integer(row.station_id))
+        && ((selection.allowNullValues && row.value === null) || (typeof row.value === "number" && Number.isFinite(row.value)))
+        && row.observed_at_utc !== null, `Invalid canonical row: ${fileKey}`);
       const observed = row.observed_at_utc instanceof Date ? row.observed_at_utc : new Date(row.observed_at_utc);
       check(!Number.isNaN(observed.getTime()), `Invalid observation timestamp: ${fileKey}`);
       const timestamp = observed.toISOString();
       check(Number(row.connector_id) === connectorId && row.pollutant_code === pollutant && timestamp.slice(0, 10) === day, `Canonical row outside file scope: ${fileKey}`);
       if (segments) check(Number(row.timeseries_id) === timeseriesId, `Exact row group contains another timeseries: ${fileKey}`);
-      if (timeseriesId != null && Number(row.timeseries_id) !== timeseriesId) continue;
-      if (selection.timeseriesIds && !selection.timeseriesIds.has(Number(row.timeseries_id))) continue;
-      const physicalBinding = selection.resolveBinding
-        ? await selection.resolveBinding(Number(row.timeseries_id)) : binding;
-      check(physicalBinding && (row.station_id === null || Number(row.station_id) === physicalBinding.station_id), "Physical station identity disagrees with binding");
       const embedded = statusColumn ? row[statusColumn] : null;
       check(statusColumn === "status" ? embedded === null || typeof embedded === "string" : embedded === null || embedded === "P" || embedded === "R", "Invalid persisted verification status");
+      if (timeseriesId != null && Number(row.timeseries_id) !== timeseriesId) continue;
+      if (selection.timeseriesIds && !selection.timeseriesIds.has(Number(row.timeseries_id))) continue;
+      let physicalBinding;
+      try {
+        physicalBinding = selection.resolveBinding
+          ? await selection.resolveBinding(Number(row.timeseries_id)) : binding;
+        check(physicalBinding && (row.station_id === null || Number(row.station_id) === physicalBinding.station_id), "Physical station identity disagrees with binding");
+      } catch (error) {
+        if (!selection.onPhysicalIdentityError) throw error;
+        await selection.onPhysicalIdentityError(error, Number(row.timeseries_id));
+        continue;
+      }
       const legacy = resolveLegacyVerificationStatus(row, { isSos: connectorId === 1 });
       const effective = resolveEffectiveObservationVerificationStatus({ authority, timeseriesId: Number(row.timeseries_id), observedAtUtc: timestamp, legacyStatus: legacy });
       const tuple = [timestamp, row.value, row.station_id === null ? null : Number(row.station_id), embedded, effective];

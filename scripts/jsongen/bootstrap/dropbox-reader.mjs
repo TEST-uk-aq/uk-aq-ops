@@ -62,15 +62,16 @@ export function parseJson(body, key) {
   catch { throw new Error(`Invalid UTF-8 JSON: ${key}`); }
 }
 export function createDropboxReader({ cacheDir, limits, checkpointKey = CHECKPOINT_KEY,
-  env = process.env, sourceRoot = resolveDropboxSource(env) }) {
+  env = process.env, sourceRoot = resolveDropboxSource(env), disk = null }) {
   check(env.UK_AQ_ENV_NAME === 'TEST', 'UK_AQ_ENV_NAME must be TEST');
   check(checkpointKey === CHECKPOINT_KEY, 'select the generation-v3 checkpoint root path');
   check(sourceRoot === configuredHistoryDropboxRoot(env), 'Dropbox source root must match shared operator configuration');
-  const inventory = new Map(), metadata = new Map();
+  const inventory = new Map(), metadata = new Map(), cachedDigests = new Set();
   const recoveredObjects = new Set(), exhaustedObjects = new Set();
   const metrics = { read_commands: 0, dropbox_api_requests: null, source_bytes_read: 0,
     parquet_bytes_read: 0, metadata_bytes_read: 0, read_wall_ms: 0, read_cpu_ms: 0,
-    cache_hits: 0, stability_read_commands: 0, transport_retry_attempts: 0,
+    cache_hits: 0, parquet_cache_hits: 0, parquet_downloads: 0, source_cache_bytes: 0,
+    stability_read_commands: 0, transport_retry_attempts: 0,
     transport_retry_objects_recovered: 0, transport_retry_objects_exhausted: 0,
     transport_failure_counts: {} };
   const rcloneBin = process.env.UK_AQ_R2_HISTORY_BACKUP_RCLONE_BIN || 'rclone';
@@ -203,6 +204,7 @@ export function createDropboxReader({ cacheDir, limits, checkpointKey = CHECKPOI
     let body;
     if (previous && !fresh) {
       metrics.cache_hits++;
+      if (key.endsWith('.parquet')) metrics.parquet_cache_hits++;
       body = await fs.readFile(path.join(cacheDir, previous.sha256));
     } else {
       if (!previous) check(inventory.size < limits.objects, 'source-object budget exceeded');
@@ -210,12 +212,18 @@ export function createDropboxReader({ cacheDir, limits, checkpointKey = CHECKPOI
       if (expected?.byte_size !== undefined) check(expected.byte_size > 0
         && expected.byte_size <= limits.objectBytes, `source object exceeds byte limit: ${key}`);
       body = await fetchBytes(key, key.endsWith('.parquet') ? limits.objectBytes : limits.metadataBytes);
+      if (key.endsWith('.parquet')) metrics.parquet_downloads++;
     }
     const object = { key, body, byte_size: body.length, sha256: sha256Hex(body) };
     verify(object, expected);
     if (previous) check(previous.sha256 === object.sha256 && previous.byte_size === object.byte_size,
       `selected backup changed during extraction: ${key}`);
     else {
+      if (!cachedDigests.has(object.sha256)) {
+        disk?.reserve(body.length);
+        metrics.source_cache_bytes += body.length;
+        cachedDigests.add(object.sha256);
+      }
       await fs.writeFile(path.join(cacheDir, object.sha256), body, { mode: 0o600 });
       inventory.set(key, { key, byte_size: object.byte_size, sha256: object.sha256 });
     }
