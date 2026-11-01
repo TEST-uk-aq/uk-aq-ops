@@ -1,73 +1,84 @@
-# WHO independent storage: implementation and operator handover
+# WHO output-prefix cut-over
 
-Authority: TEST system-docs `d799c1daf5da84187c012c474694132a53e26aed`, WHO relocation and independent dataset-backup contracts. This runbook does not authorise execution. No deployment, database apply, snapshot, copy, restore, workflow dispatch or deletion was performed during implementation. AQI retirement is excluded.
+Authority: system-docs `4c873cf18260698cc42faf1123665059b878be06`,
+`who_2021/r2_output_relocation_contract.md`. This is a future operator procedure;
+no deployment, WHO run, R2 copy, configuration change or deletion is authorised here.
 
-## Implementation and configuration
+## Prepare compatible code at the old root
 
-`workers/shared/uk_aq_who_2021_storage.mjs` owns the required `UK_AQ_WHO_2021_R2_PREFIX`. It resolves one trailing slash, rejects missing/unsafe paths and requires a directory ending in `who_2021`. It supports both `history/v2/who_2021/` and `who_2021/`. There is no default, environment fallback or observation-generation coupling. SQL uses the same validation rule and a required `p_output_prefix` named parameter. Both canonical definitions and grants are updated in the Schema PR.
+Set the existing repository variable `UK_AQ_WHO_2021_R2_PREFIX` explicitly to
+`history/v2/who_2021/` before deploying the updated authenticated reader or allowing
+Actions to use the updated publisher. Add that variable to the private
+`env-vars-master.csv` through the existing configuration process; do not commit
+the private master. There is no default prefix or cross-environment fallback.
 
-Operator actions **before the first deployment or scheduled run of the new code**:
+Use the existing bucket, credentials, API routes, six-argument SQL RPC and normal
+WHO workflow. **No schema apply or migration is needed. Schema PR #18 is
+superseded and should be closed without merging.** That PR and the Schema
+repository are unchanged by this simplification. Do not deploy its seven-argument
+interface. If it has independently been applied, stop and resolve the actual RPC
+state before deploying this six-argument caller.
 
-- Provision the non-secret GitHub repository variable `UK_AQ_WHO_2021_R2_PREFIX=history/v2/who_2021/`. Reader deployment receives it through Wrangler; publisher receives it through Actions. Do not select the new root yet.
-- Provision `UK_AQ_WHO_2021_BACKUP_WRITER_EXCLUSION_CONFIRMED=true` only after confirming that all WHO writers use the existing single workflow concurrency group, and installed/manual writers are held or cannot overlap capture. This new acknowledgement does not acquire a distributed lock or stop a scheduler. Never set it merely to bypass the guard. The publisher fails before calculation/publication if enabled publication lacks this acknowledgement or Dropbox credentials.
-- Update the **private** `env-vars-master.csv` with these two variables and the existing target catalogue. Do not commit that file. No private variable master is available in this checkout.
-- Verify existing `CFLARE_R2_*`/`R2_*` aliases select exactly one authorised account/bucket; contradictory credential/target aliases fail. Existing `UK_AQ_DROPBOX_ROOT`, `DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET`, `DROPBOX_REFRESH_TOKEN` are reused. No new secret, bucket, public endpoint, direct public R2 binding or independent cron is introduced.
-- Confirm actual TEST bucket/account, lifecycle/access rules, all WHO writers/readers, workflow admission controls and rollback owner. The CLI requires `UK_AQ_ENV_NAME=TEST` and `--confirm-bucket` matching the configured bucket for migration/restore. A label alone does not authenticate an account: inspect operator credential/bucket identity independently.
-- Preserve disabled Prune and the accumulated Prune/JSONgen integration observations. Do not run either system for these checks.
+The publisher validates SQL's legacy WHO Parquet key, extracts only its relative
+path and maps it to the configured root. With the old root configured this is an
+identity operation. The resulting destination key controls validation, PUT/HEAD,
+logical hash and reporting. JSON uses the same configured root. The summary
+reader includes its physical key in its existing validated-body cache identity.
+Science, source routing, scheduling, concurrency, health and processing/report
+uploads remain unchanged. No derived-dataset backup or restore system is added.
 
-## Distinct operational phases (each separately authorised)
+## Separately approved TEST cut-over
 
-1. **Preparation:** review paired Ops/Schema PRs and preserve their exact commits. Configure the old root explicitly. Stage reader changes with old-root configuration. The public API paths and browser payload stay unchanged. Do not allow scheduled Actions to pick up an incompatible publisher during a merge/apply gap.
-2. **Schema and caller transition:** hold WHO workflow admission and drain in-flight and installed/manual writers. Apply Schema `schemas/migrations/20261101_001_obs_aqidb_who_output_prefix.sql` to the independently verified TEST Obs AQI DB using the existing approved SQL apply mechanism. It transactionally removes the old six-argument RPC and installs the required-root seven-argument signature, revokes public/anon/authenticated execution, grants service-role and requests PostgREST schema reload. Then release the matching Ops caller with the old root. No incompatible caller may run between these steps. The canonical SQL files are desired-state definitions, not an alternative ad hoc migration. Apply/deploy is not authorised by this runbook.
-3. **Writer hold and bootstrap:** at the migration window hold/drain WHO again, confirm exclusion and take a standalone old-root snapshot using the tool below. Verify its manifest, immutable completion marker, latest-complete selector, byte hashes and coverage. Report upload or database dump is not this proof.
-4. **R2 copy:** create a fresh plan with source old-root and target new-root; independently review exact keys, metadata, source/destination bucket, totals and plan SHA-256. Resolve any destination collision or source change; do not overwrite a different object. Execute only that approved plan. Inspect operation evidence and independently verify the destination. Original objects remain untouched. The 92 objects / 773,057 bytes from the historical capture are comparison evidence, not hard-coded current expectations. Preserve the sparse 15-Parquet/77-JSON footprint; no calendar data or missing historical days are fabricated.
-5. **Reader switch:** while writers remain held deploy the authenticated reader with prefix `who_2021/`. Verify cold and conditional ETag reads, unchanged hits, private authentication, public summary, error/stale distinctions and physical-key cache isolation. No automatic old-root fallback exists; do not change the public proxy/browser configuration.
-6. **Publisher switch:** provision the same new root for the publisher, verify the installed RPC/caller match, then release only the authorised WHO schedule/admission. Preserve `UK_AQ_R2_HISTORY_VERSION` and canonical observation inputs. The moved Parquet logical hash includes the old absolute key; copied metadata is retained, and the first normal publication may rewrite once using the new-key logical identity.
-7. **Real publication/backup acceptance:** authorise an ordinary TEST cycle separately. Confirm daily/correction and rolling/calendar semantics, Parquet before dated JSON before latest, new-root output only, existing scientific results/public schema and no old-root writes. Backup follows successful enabled JSON and/or Parquet publication even when all logical writes are unchanged; disabled/deferred/dry-run publication remains `not_requested`. `dataset_backup.publication_status=published` survives a backup failure; that failure makes workflow/task health fail without rolling back publication. Existing report upload remains independent. Validate a complete new-root snapshot and source identities, not only bounded report arrays.
-8. **Isolated restore:** validate an explicitly approved immutable completed snapshot and hash, then restore to the tool's generated `who_2021_restore/<UUID>/who_2021/` prefix. Verify every restored byte and metadata identity and representative JSON/Parquet. No serving restore/overwrite option is implemented.
-9. **Rollback hold:** retain all snapshots and original R2 objects at least 14 days after accepted cut-over, extended for unresolved issues. After new publications, hold WHO and reconcile newer accepted data back before changing reader/publisher to the old root; merely pointing at frozen old latest loses corrections. Preserve the required-root RPC when rolling back configuration. An old six-argument binary requires an explicit coordinated schema rollback under exclusion; do not remove the new interface beneath its caller. Old-root object retirement requires a different per-object approval; this tool has no delete command. Release any Prune/JSONgen hold only through its separately authorised test.
+1. Confirm actual TEST R2 account, endpoint and exact configured bucket using the
+   authorised operator configuration. Check effective publisher/reader variables,
+   access/lifecycle policy and all scheduled/manual WHO writers. Do not alter or
+   run Prune, JSONgen or their retained observations.
+2. Hold admission of WHO writers for this window and drain scheduled/manual
+   executions. This is an operator action, not an automatic deployment pause.
+3. Refresh the complete old-prefix listing with the existing authorised R2 tools,
+   following all pagination. Retain a reviewable per-key old-to-new mapping,
+   integer sizes, identities, independent byte SHA-256, content types and relevant
+   custom/HTTP metadata. The historical **92 objects / 773,057 bytes (15 Parquet,
+   77 JSON)** are comparison evidence only; reconcile differences. Do not generate
+   missing calendar partitions or historical days. Check any embedded WHO output
+   references and stop for review if plain copying would leave invalid references.
+4. Completely list `who_2021/` and require the destination to be available. Any
+   collision or changed/unclassified source object requires review before writes.
+5. Under separate copy approval, use the existing authenticated R2/S3 CopyObject
+   facility, such as `workers/shared/r2_sigv4.mjs:r2CopyObject`, for each exact
+   reviewed mapping in the same bucket. The helper alone is not an identity or
+   collision verifier: recheck the held source and absent destination per key.
+   Copy Parquet first, dated JSON next and stable latest last. Preserve bytes,
+   content types and custom metadata. No move/delete operation or deployment-time
+   copy. Stop on failed or ambiguous results; do not overwrite collisions on retry.
+6. Independently GET/HEAD each destination and compare byte SHA-256, sizes and
+   relevant metadata to the reviewed source. ETag is an opaque identity, not an
+   assumed checksum. Verify source identities/inventory are unchanged and every
+   mapped destination exists. A successful CopyObject status alone is insufficient.
+   Preserve source and destination evidence before proceeding.
+7. Once the full destination is verified and writers remain held, deploy the
+   authenticated reader with prefix `who_2021/`. Check private authentication,
+   public summary, cold and conditional ETag reads, equal-day updates and normal
+   missing/invalid/stale behaviour. No new public route or old-root fallback.
+8. Set the publisher to the same new prefix and resume only authorised WHO
+   processing. Through real TEST operation verify daily/correction and rolling/
+   calendar behaviour, output ordering, actual destination/report keys, summary
+   freshness and no old-root writes. Leave `UK_AQ_R2_HISTORY_VERSION`, canonical
+   observations and normal observation backups unchanged. The destination key
+   participates in Parquet logical identity, so the first new-root publication can
+   legitimately rewrite copied objects once without changing the science.
+9. Retain original objects and evidence for an operator-owned rollback period.
+   To return to the old root after new publications, hold writers and first
+   reconcile newer accepted results; do not repoint to a stale frozen latest.
+   Old-object retirement is a separate exact per-key decision requiring consumer
+   closure and demonstrated historical regeneration inputs, or explicit acceptance
+   of loss. Regeneration needs authoritative observations, hour-ending boundaries,
+   guideline/configuration/calculation state and any necessary derived DB state;
+   it is not automatically byte-identical restoration. No deletion commands are
+   supplied here.
 
-## Operator utility
-
-Entry point: `node scripts/who_2021/dataset.mjs`. Importing the module performs no I/O. All commands require the existing authorised environment; commands below are examples for **later approval**, not commands executed by this change. Use unique private local report/manifest files. Store the plan's SHA-256 and reports durably before proceeding.
-
-Standalone bootstrap (requires a real writer hold; writes Dropbox only):
-
-```bash
-node scripts/who_2021/dataset.mjs --mode backup --execute true --report work/who-bootstrap-result.json
-```
-
-Read-only source/destination planning (remote LIST/GET only, local immutable plan write):
-
-```bash
-node scripts/who_2021/dataset.mjs --mode plan --confirm-bucket "$CFLARE_R2_BUCKET" --target who_2021/ --manifest work/who-plan.json --report work/who-plan-result.json
-```
-
-Copy only after independent review and explicit approval of the exact plan SHA:
-
-```bash
-node scripts/who_2021/dataset.mjs --mode copy --execute true --confirm-bucket "$CFLARE_R2_BUCKET" --target who_2021/ --manifest work/who-plan.json --approve "$APPROVED_WHO_PLAN_SHA256" --report work/who-copy-result.json
-```
-
-Validate a completed snapshot without R2 writes, then separately authorise its isolated restore:
-
-```bash
-node scripts/who_2021/dataset.mjs --mode restore --confirm-bucket "$CFLARE_R2_BUCKET" --snapshot "$APPROVED_WHO_SNAPSHOT_ID" --approve "$APPROVED_WHO_MANIFEST_SHA256" --report work/who-restore-validation.json
-node scripts/who_2021/dataset.mjs --mode restore --execute true --confirm-bucket "$CFLARE_R2_BUCKET" --snapshot "$APPROVED_WHO_SNAPSHOT_ID" --approve "$APPROVED_WHO_MANIFEST_SHA256" --report work/who-restore-result.json
-```
-
-The `APPROVED_*` shell variables above are per-invocation approval inputs, not new repository settings. Snapshot IDs/hashes come from verified backup evidence. Restore validates that snapshot's immutable `complete.json`, so an older bootstrap remains selectable after later snapshots advance latest-complete.
-
-## Backup, retry and safety semantics
-
-Snapshots live below `<UK_AQ_DROPBOX_ROOT>/who_2021/datasets/snapshots/<UTC-time-and-UUID>/objects/<relative-key>`. Each manifest records source bucket/root, exact source keys, ETags, byte SHA-256, sizes, content type/custom metadata, aggregate counts/bytes and absent optional-family coverage. Objects are copied and downloaded for independent SHA verification before manifest, per-snapshot completion marker and root latest-complete selector are published, in that order. Previous generations and selectors survive failures before selector publication. Ambiguous writes are reconciled by byte readback, never assumed successful. A selector transport failure can conservatively report failure even if an already verified complete generation was selected; inspect readback before retrying.
-
-Budgets: at most 10,000 objects, 8 MiB per object, 64 MiB aggregate held in memory, sequential transfer, three transport attempts, 30-second request/body timeouts, and a 20-minute source-capture budget. Exceeding limits fails closed. No automatic cleanup or deletion. Each fresh backup invocation gets a new immutable ID; failed partial generations remain unselected and retained. Restart by taking a new snapshot under writer exclusion; do not reuse an ID for a changed source. Migration copy retries require the same approved manifest and unchanged source; conditional create refuses overwrite, and exact existing destination bytes/metadata permit recovery of already copied members. A changed source requires a new review/plan, not expansion of the approved set.
-
-The source is completely listed with strict continuation validation and checked again after transfer, including a second body/metadata/ETag check. This detects changes but does not replace actual writer exclusion. No tool acquires or alters an observation-history lock. Snapshot completion means full preservation of the existing validated object set, not complete scientific/date coverage.
-
-Unknown key shapes, missing/changing objects, invalid summaries/Parquet or embedded WHO output references fail closed. This first implementation deliberately refuses encoded HTTP representations and embedded absolute WHO reference transforms rather than claiming exact-byte migration while changing bodies. Current WHO summaries contain no required output-reference contract. If actual refreshed data needs a transform or encoded transport, resolve that through a bounded approved extension before copying; observation-source references/hashes are never rewritten. The utility does not restore over serving data, implement serving rollback reconciliation, or delete old roots. Those remain separately approved operator procedures.
-
-## Review evidence and remaining acceptance
-
-The implementation record lists exact archives, checks and paired PR dependency. Local checks are structural/deterministic only. Actual bucket access, complete old/new-root snapshots, isolated restore, reader/cache transitions, source stability, schedules/flags and scientific/public acceptance remain unverified until separately authorised TEST operation. LIVE uses the same code but requires its own inventory, configuration, approvals and acceptance; no LIVE changes are included.
+Existing Dropbox processing reports continue at their existing destination. They
+are not dataset backups. No independent WHO snapshot, restore test, backup flag,
+new schedule or retention job is a prerequisite. Real TEST cut-over acceptance is
+pending separate approval; LIVE promotion requires its own approved operation
+using identical application code and environment-specific configuration.

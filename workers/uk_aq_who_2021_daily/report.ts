@@ -71,7 +71,6 @@ export function boundedReport(
     r2_objects_checked: boundedStrings(value.r2_objects_checked),
     r2_objects_updated: boundedStrings(value.r2_objects_updated),
     r2_objects_unchanged: boundedStrings(value.r2_objects_unchanged),
-    dataset_backup: value.dataset_backup || { status: "not_requested", publication_status: "not_published" },
     dropbox: value.dropbox || {
       destination_path: null,
       upload_result: "pending",

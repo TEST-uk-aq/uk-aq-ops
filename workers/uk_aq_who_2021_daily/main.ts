@@ -1,5 +1,4 @@
 import { resolveWho2021Prefix } from "../shared/uk_aq_who_2021_storage.mjs";
-import { backupDataset } from "../../scripts/who_2021/dataset.mjs";
 import {
   addDays,
   buildDailyRefreshPayload,
@@ -24,6 +23,7 @@ import {
 } from "./who_2021_daily_core.ts";
 import {
   rowsToWho2021ParquetBytes,
+  translateWho2021ParquetBatch,
   Who2021ParquetBatch,
 } from "./who_2021_parquet.ts";
 import {
@@ -120,10 +120,6 @@ function readSettings(now: Date): RuntimeSettings {
     Deno.env.get("UK_AQ_WHO_2021_PARQUET_R2_WRITE_ENABLED"),
     false,
   );
-  if (r2PublishEnabled || parquetR2WriteEnabled) {
-    if (Deno.env.get("UK_AQ_WHO_2021_BACKUP_WRITER_EXCLUSION_CONFIRMED") !== "true") throw new Error("WHO backup writer exclusion must be confirmed before publication");
-    for (const name of ["UK_AQ_DROPBOX_ROOT", "DROPBOX_APP_KEY", "DROPBOX_APP_SECRET", "DROPBOX_REFRESH_TOKEN"]) requiredEnv(name);
-  }
   const config = buildRunConfig({
     runMode,
     triggerMode: parseTriggerMode(
@@ -287,7 +283,6 @@ async function publishOutputs(args: {
     const response = await settings.client.post<unknown>(
       settings.parquetRowsRpc,
       {
-        p_output_prefix: settings.outputPrefix,
         p_as_of_day_utc: args.publicationDay,
         p_start_day_utc: settings.config.startDayUtc,
         p_end_day_utc: args.publicationDay,
@@ -302,7 +297,8 @@ async function publishOutputs(args: {
     const usableDailyPublicationDays = new Set(
       args.usableDailyPublicationDays,
     );
-    for (const batch of parseRows<Who2021ParquetBatch>(response.data)) {
+    for (const sqlBatch of parseRows<Who2021ParquetBatch>(response.data)) {
+      const batch = translateWho2021ParquetBatch(sqlBatch, settings.outputPrefix);
       if (batch.dataset === "daily_status") {
         const dayUtc = batch.object_key.match(
           /\/daily_status\/day_utc=(\d{4}-\d{2}-\d{2})\//,
@@ -844,7 +840,6 @@ export async function runWho2021Daily(): Promise<void> {
   let dailySummary = mergeDailyRefreshRows([]);
   let summaryRefresh: SummaryRefreshRpcRow | null = null;
   let summaryRefreshCompleted = false;
-  let datasetBackup: Record<string, unknown> = { status: "not_requested", publication_status: "not_published" };
   let publishSummary: PublishSummary = {
     checked: [],
     updated: [],
@@ -1331,14 +1326,6 @@ export async function runWho2021Daily(): Promise<void> {
         summaryRefresh,
         homepageSummary,
       });
-      datasetBackup = { status: "failed", publication_status: "published" };
-      try {
-        datasetBackup = { ...(await backupDataset(Deno.env.toObject())), publication_status: "published" };
-      } catch (error) {
-        datasetBackup = { ...((error as { datasetBackup?: Record<string, unknown> }).datasetBackup || {status: "failed"}), publication_status: "published" };
-        throw error;
-      }
-
     }
 
     if (
@@ -1401,7 +1388,6 @@ export async function runWho2021Daily(): Promise<void> {
     r2_bytes_read: r2Evidence.bytesRead,
     r2_parquet_row_count: r2Evidence.parquetRowCount,
     prepared_daily_row_count: r2Evidence.preparedDailyRowCount,
-    dataset_backup: datasetBackup,
     r2_objects_checked: publishSummary.checked,
     r2_objects_updated: publishSummary.updated,
     r2_objects_unchanged: publishSummary.unchanged,
@@ -1499,7 +1485,6 @@ export async function runWho2021Daily(): Promise<void> {
       not_enough_data_timeseries_days:
         dailySummary.not_enough_data_timeseries_days,
     },
-    dataset_backup: datasetBackup,
     r2_objects_checked: publishSummary.checked,
     r2_objects_updated: publishSummary.updated,
     r2_objects_unchanged: publishSummary.unchanged,

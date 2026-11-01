@@ -273,6 +273,18 @@ Deno.test("phase 4 R2 publish plan uses agreed summary and archive prefixes", ()
         "history/v2/who_2021/calendar_year_status/calendar_year=2025/period_type=complete_year/connector_id=1/pollutant_code=<pollutant>/",
     },
   });
+  const moved = buildR2PublishPlan({
+    outputPrefix: "who_2021/", asOfDayUtc: "2026-07-02",
+    connectorId: 1, pollutantCodes: ["pm25", "pm10", "no2"], calendarYear: 2025,
+  });
+  assert.equal(moved.datedSummaryKey, "who_2021/summaries/as_of_day_utc=2026-07-02/who_2021_summary.json");
+  assert.equal(moved.latestSummaryKey, "who_2021/latest_who_2021.json");
+  assert.equal(moved.parquetPrefixes.calendarYearStatus, "who_2021/calendar_year_status/calendar_year=2025/period_type=complete_year/connector_id=1/pollutant_code=<pollutant>/");
+  assert.throws(() => buildR2PublishPlan({
+    outputPrefix: "", asOfDayUtc: "2026-07-02", connectorId: 1,
+    pollutantCodes: ["pm25"], calendarYear: 2025,
+  }));
+
 });
 
 Deno.test("stable JSON sorts object keys recursively", () => {
