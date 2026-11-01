@@ -395,6 +395,25 @@ export async function runBootstrap(options) {
         recordFailure(requested, 'candidate_not_completed', 'requested_candidate_not_completed');
     }
   }
+  function reconcileInventoryCompletion() {
+    const complete = !options.allEligible || report.discovery?.state === 'complete';
+    if (!complete && !report.incomplete_scopes.some(scope => scope.stage === 'physical_inventory_completion')) {
+      // Inventory is a selection-wide gate, not a failure of independently
+      // authenticated candidate bytes. Record it once across finalization paths.
+      const failure = { selection_wide: true, stage: 'physical_inventory_completion',
+        reason: 'all_eligible_inventory_not_established',
+        discovery_state: report.discovery?.state ?? 'not_established',
+        unresolved_discovery_scopes: (report.discovery?.scopes || []).filter(scope =>
+          !['membership_established', 'authenticated_absence'].includes(scope.state)),
+        unproved_physical_identities: [
+          ...(report.discovery?.selected || []).filter(identity => identity.state !== 'selected'),
+          ...(report.discovery?.excluded || []).filter(identity => identity.state !== 'dependency_only'),
+        ] };
+      report.incomplete_scopes.push(failure);
+      report.errors.push({ scope: { selection_wide: true }, stage: failure.stage, reason: failure.reason });
+    }
+    return complete;
+  }
   function recordCurrentnessFailures(scope, canonical, stage, needsPmContext, rawComplete = false) {
     const result = classifyPeriodCurrentness(sourceScopeProof.scopes.find(item => item.month_utc === scope.month_utc),
       canonical, needsPmContext);
@@ -1039,6 +1058,7 @@ export async function runBootstrap(options) {
         raw_observation_candidate_complete: rawComplete, source_failures: sourceFailure });
     }
     if (bulk) bulk.finishDiscovery();
+    const inventoryComplete = reconcileInventoryCompletion();
     reconcileRequestedCandidates();
     if (report.month_plan) for (const plan of report.month_plan.plans) {
       plan.currentness_initial = report.currentness.start.scopes.find(scope => scope.month_utc === plan.month_utc) || null;
@@ -1050,7 +1070,6 @@ export async function runBootstrap(options) {
     const allRequestedProduced = !report.requested_candidates || report.requested_candidates.every(requested =>
       report.candidates.some(candidate => candidate.month_utc === requested.month_utc
         && candidate.identity.timeseries_id === requested.timeseries_id));
-    const inventoryComplete = !options.allEligible || report.discovery?.state === 'complete';
     const manifest = await contentJson('candidate-manifest', { schema_version: 1,
       kind: 'uk_aq_jsongen_dropbox_bootstrap_candidate_manifest', environment: 'TEST',
       source_checkpoint: source.checkpoint, requested_period: report.requested_period, month_plan: report.month_plan,
@@ -1063,13 +1082,13 @@ export async function runBootstrap(options) {
         && !report.month_plan?.plans.some(plan => plan.state === 'incomplete')
         && report.candidates.every(candidate => candidate.aqi_completeness.terminal_source_complete)
         && report.completed_periods.every(period => period.terminal_dependency.source_authority_established),
-      aqi_complete: report.candidates.length > 0 && report.incomplete_scopes.length === 0
+      aqi_complete: inventoryComplete && report.candidates.length > 0 && report.incomplete_scopes.length === 0
         && report.candidates.every(candidate => candidate.derived_aqi_candidate_complete),
       currentness: report.currentness,
       publication_state: 'local_private_candidate_not_managed_publication',
       managed_publication_eligible: false, candidates: report.candidates });
     report.manifest = manifest;
-    const complete = stagedCandidates.length > 0 && report.incomplete_scopes.length === 0
+    const complete = inventoryComplete && stagedCandidates.length > 0 && report.incomplete_scopes.length === 0
       && stagedCandidates.every(candidate => candidate.candidate.local_candidate_complete);
     report.state = complete ? 'local_candidates_complete' : 'incomplete';
     report.eligible_for_further_manual_review = complete;
@@ -1104,6 +1123,10 @@ export async function runBootstrap(options) {
     }
     reconcileRequestedCandidates();
     if (bulk) bulk.finishDiscovery();
+    if (!reconcileInventoryCompletion()) {
+      if (report.state !== 'failed') report.state = 'incomplete';
+      report.eligible_for_further_manual_review = false;
+    }
     report.failure_summary = { incomplete_record_count: report.incomplete_scopes.length,
       affected_months: [...new Set(report.incomplete_scopes.map(scope => scope.month_utc).filter(Boolean))].sort(),
       reasons: [...new Set(report.incomplete_scopes.map(scope => scope.reason))].sort() };

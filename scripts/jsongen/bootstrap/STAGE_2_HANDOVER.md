@@ -5,6 +5,30 @@ publication or LIVE change is part of this delivery. Authoritative system docs
 were read from fetched TEST `main`
 `0dc4775eeb2ffdddc4a4cb32047071e9b75db09c` and were not edited.
 
+## PR #163 completion-gate correction
+
+The follow-up changes only `generate.mjs` and this handover. All-series success
+now explicitly requires `discovery.state === 'complete'` in the overall completion
+decision and every manifest completeness declaration, including `aqi_complete`.
+Final report handling also clears manual-review eligibility for unestablished
+inventory, preventing `COMPLETE.json` and retaining the existing nonzero CLI exit.
+Existing invocation-wide fatal failures keep their failed state.
+
+One selection-wide `all_eligible_inventory_not_established` failure records the
+discovery state, unresolved discovery scopes and unproved selected/excluded
+identities. Finalization is idempotent and adds no duplicate per-identity failures.
+It leaves independently completed private candidates and their evidence intact.
+Explicit-ID and legacy modes bypass this all-series-only gate. Source admission,
+currentness, decoder, AQI and resource handling are unchanged; the existing
+same-day generator archive is reused without modification.
+
+Checks: generator syntax, inert import, completion-condition inspection and diff
+checks only. The authoritative contracts were re-read at TEST docs `main` for this
+correction. No real Dropbox/R2 operation or functional validation was performed;
+operator acceptance remains pending. ChatGPT can record the review correction in
+the authoritative Stage 2 implementation status after review, without implying
+operational acceptance or managed-publication authority.
+
 ## Changes and structural feasibility
 
 - `generate.mjs`: boolean `--all-eligible-timeseries`, mutually exclusive with
