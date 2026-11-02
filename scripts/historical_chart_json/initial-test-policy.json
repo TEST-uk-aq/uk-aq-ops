@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "mode": "manual_isolated_test",
+  "allowed": [{ "connector_id": 1, "timeseries_id": 43, "station_id": 1581, "pollutant_code": "pm10", "month_utc": "2026-08", "algorithm_version": "aqilevels_hourly_v3" }],
+  "allowed_unresolved_managed_authority": [
+    "all_writer_publication_freshness_unknown",
+    "independent_current_verification_transition_authority_unresolved",
+    "matching_core_publication_not_independently_authenticated",
+    "no_authenticated_managed_monthly_baseline",
+    "no_managed_preceding_month_publication"
+  ]
+}

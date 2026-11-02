@@ -1,3 +1,4 @@
+import { historicalJson } from "./historical-json.mjs";
 // Private, exact-allowlist TEST pilot. The cache proxy supplies the authenticated edge boundary.
 import { buildCalculatedHistory } from "../uk_aq_station_history/src/calculated_history.mjs";
 import {
@@ -100,6 +101,7 @@ export default {
     if (!equalSecret(request.headers.get(authHeader) || "", String(await secretValue(env.UK_AQ_EDGE_UPSTREAM_SECRET) || ""))) return error(403, "forbidden");
     if (request.method !== "GET") return error(405, "method_not_allowed");
     const url = new URL(request.url), route = url.pathname;
+    if (route.startsWith("/v2/history-json/")) return historicalJson(request, env);
     if (!["/v1/manifest", "/v1/month", "/v1/aqi"].includes(route)) return error(404, "route_not_found");
     const sampleId = url.searchParams.get("sample"), sample = Object.hasOwn(SAMPLES, sampleId) ? SAMPLES[sampleId] : null;
     if (!sample) return error(400, "pilot_sample_invalid");

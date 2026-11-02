@@ -549,7 +549,7 @@ export function addCorsHeaders(headers: Headers, requestOrigin: string | null, a
   headers.set("Access-Control-Max-Age", "86400");
   headers.set(
     "Access-Control-Expose-Headers",
-    "CF-Cache-Status,ETag,X-UK-AQ-Cache,X-UK-AQ-Cache-Profile,X-UK-AQ-Timeseries-Source-Mode,X-UK-AQ-Has-Gap,X-UK-AQ-R2-Coverage-End,X-UK-AQ-Ingest-Tail-Start,X-UK-AQ-R2-Rows,X-UK-AQ-Ingest-Rows,X-UK-AQ-Cache-Key-Version,X-UK-AQ-Station-History-Cache-Key-Version,X-UK-AQ-Station-History-Cache-State,X-UK-AQ-Station-History-Cached-At,X-UK-AQ-Station-History-Fresh-Until,X-UK-AQ-Station-History-Stale-Until,X-UK-AQ-Station-History-Stale-Reason,X-UK-AQ-Prototype-Request-ID,X-UK-AQ-Prototype-Publication,X-UK-AQ-Prototype-Compressed-Bytes,X-UK-AQ-Prototype-R2-Reads,X-UK-AQ-Prototype-Cache,X-UK-AQ-Prototype-AQI-Wall-MS",
+    "CF-Cache-Status,ETag,X-UK-AQ-Cache,X-UK-AQ-Cache-Profile,X-UK-AQ-Timeseries-Source-Mode,X-UK-AQ-Has-Gap,X-UK-AQ-R2-Coverage-End,X-UK-AQ-Ingest-Tail-Start,X-UK-AQ-R2-Rows,X-UK-AQ-Ingest-Rows,X-UK-AQ-Cache-Key-Version,X-UK-AQ-Station-History-Cache-Key-Version,X-UK-AQ-Station-History-Cache-State,X-UK-AQ-Station-History-Cached-At,X-UK-AQ-Station-History-Fresh-Until,X-UK-AQ-Station-History-Stale-Until,X-UK-AQ-Station-History-Stale-Reason,X-UK-AQ-Prototype-Request-ID,X-UK-AQ-Prototype-Publication,X-UK-AQ-Prototype-Compressed-Bytes,X-UK-AQ-Prototype-R2-Reads,X-UK-AQ-Prototype-Cache,X-UK-AQ-Prototype-AQI-Wall-MS,Server-Timing,Content-Length,X-UK-AQ-History-PubID,X-UK-AQ-History-Source,X-UK-AQ-History-Algorithm,X-UK-AQ-History-Selection-Checked-At,X-UK-AQ-History-Cache,X-UK-AQ-History-R2-Reads,X-UK-AQ-History-Object-SHA256,X-UK-AQ-History-Compressed-Bytes",
   );
   appendVary(headers, "Origin");
 }
@@ -2954,14 +2954,15 @@ export default {
     }
 
     const prototypeMatch = /^\/api\/aq\/chart-history-prototype\/(manifest|month|aqi)$/.exec(url.pathname);
-    const upstreamFunction = prototypeMatch ? null : resolveUpstreamFunction(url.pathname);
-    if (!upstreamFunction && !prototypeMatch) {
+    const historyJsonMatch = /^\/api\/aq\/history-json\/(manifest|observations|aqi)$/.exec(url.pathname);
+    const upstreamFunction = prototypeMatch || historyJsonMatch ? null : resolveUpstreamFunction(url.pathname);
+    if (!upstreamFunction && !prototypeMatch && !historyJsonMatch) {
       return makeErrorResponse(404, "route_not_found", requestOrigin, allowedOrigins);
     }
 
     // This experimental endpoint always requires the real session cookie. The
     // usual local-dev bypass and session-free read policies do not apply.
-    if (prototypeMatch) {
+    if (prototypeMatch || historyJsonMatch) {
       if (request.method !== "GET") return makeErrorResponse(405, "method_not_allowed", requestOrigin, allowedOrigins);
       if (requestOrigin === null) return makeErrorResponse(400, "origin_required", requestOrigin, allowedOrigins);
       if (!isOriginAllowed(requestOrigin, allowedOrigins)) return makeErrorResponse(403, "origin_not_allowed", requestOrigin, allowedOrigins);
@@ -2992,7 +2993,8 @@ export default {
         || origin.username || origin.password) {
         return makeErrorResponse(503, "prototype_origin_invalid", requestOrigin, allowedOrigins);
       }
-      const upstreamUrl = new URL(`/v1/${prototypeMatch[1]}${url.search}`, origin);
+      const upstreamPath = historyJsonMatch ? `/v2/history-json/${historyJsonMatch[1]}` : `/v1/${prototypeMatch![1]}`;
+      const upstreamUrl = new URL(`${upstreamPath}${url.search}`, origin);
       const prototypeHeaders = new Headers({
         "X-UK-AQ-Upstream-Auth": secret,
         "CF-Access-Client-Id": accessId,
@@ -3004,7 +3006,8 @@ export default {
       let upstream: Response;
       try {
         // Never follow a redirect carrying the Access service token.
-        upstream = await fetch(upstreamUrl.toString(), { method: "GET", headers: prototypeHeaders, redirect: "manual" });
+        upstream = await fetch(upstreamUrl.toString(), { method: "GET", headers: prototypeHeaders, redirect: "manual",
+          ...(historyJsonMatch ? { cache: "no-store" as const } : {}) });
       } catch {
         return makeErrorResponse(502, "prototype_upstream_unavailable", requestOrigin, allowedOrigins);
       }
@@ -3014,7 +3017,15 @@ export default {
       }
       const headers = new Headers(upstream.headers);
       headers.delete("Set-Cookie");
-      headers.set("Cache-Control", "no-store");
+      // Selector freshness has one owner (the browser's <=300s clock): proxy/CDN never cache it.
+      // Immutable responses retain private browser caching only, after authenticated forwarding.
+      headers.set("Cache-Control", historyJsonMatch && historyJsonMatch[1] !== "manifest" && upstream.ok
+        ? "private, max-age=31536000, immutable" : "no-store");
+      if (historyJsonMatch) {
+        headers.set("CDN-Cache-Control", "no-store");
+        headers.set("Cloudflare-CDN-Cache-Control", "no-store");
+        headers.set("Timing-Allow-Origin", requestOrigin!);
+      }
       addCorsHeaders(headers, requestOrigin, allowedOrigins);
       const init = { status: upstream.status, headers, ...(headers.get("Content-Encoding") === "gzip" ? { encodeBody: "manual" as const } : {}) };
       return new Response(upstream.body, init);
