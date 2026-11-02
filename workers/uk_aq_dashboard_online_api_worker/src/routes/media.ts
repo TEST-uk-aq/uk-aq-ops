@@ -41,6 +41,8 @@ const ROUTES: Array<{ pattern: RegExp; methods: ReadonlySet<string> }> = [
   { pattern: /^\/api\/media\/bluesky\/settings$/, methods: new Set(['GET', 'PUT']) },
   { pattern: /^\/api\/media\/facebook\/settings$/, methods: new Set(['GET', 'PUT']) },
   { pattern: /^\/api\/media\/facebook\/connection-check$/, methods: new Set(['POST']) },
+  { pattern: /^\/api\/media\/threads\/settings$/, methods: new Set(['GET', 'PUT']) },
+  { pattern: /^\/api\/media\/threads\/connection-check$/, methods: new Set(['POST']) },
   { pattern: /^\/api\/media\/ai-usage$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/runs$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/health$/, methods: new Set(['GET']) },
