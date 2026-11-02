@@ -177,10 +177,14 @@ export function assertReceipt(value) {
   requireValid(new Set(value.scopes.map(scopeKey)).size === value.scopes.length, 'duplicate replacement scope');
   requireValid(same(value.affected_months, affectedMonths(value.scopes)), 'affected month/context set mismatch');
   const pm = value.scopes.some((s) => s.identity.pollutant_code !== 'no2');
-  requireValid(same(value.rolling_aqi, { algorithm_version: ALGORITHM,
-    preceding_hours: pm ? DAQI_PM_ROLLING24H_WINDOW_HOURS - 1 : 0,
-    following_hours: pm ? DAQI_PM_ROLLING24H_WINDOW_HOURS - 1 : 0,
-    minimum_valid_hours: pm ? DAQI_PM_ROLLING24H_REQUIRED_HOURS : 1 }), 'rolling dependency mismatch');
+  // Immutable historical v2 receipts remain valid source-change evidence.
+  // Newly generated v3 receipts use ALGORITHM; old derived AQI is not relabelled.
+  const receiptAlgorithm = value.rolling_aqi?.algorithm_version;
+  requireValid((receiptAlgorithm === 'aqilevels_hourly_v2' || receiptAlgorithm === ALGORITHM)
+    && same(value.rolling_aqi, { algorithm_version: receiptAlgorithm,
+      preceding_hours: pm ? DAQI_PM_ROLLING24H_WINDOW_HOURS - 1 : 0,
+      following_hours: pm ? DAQI_PM_ROLLING24H_WINDOW_HOURS - 1 : 0,
+      minimum_valid_hours: pm ? DAQI_PM_ROLLING24H_REQUIRED_HOURS : 1 }), 'rolling dependency mismatch');
   fields(value.bundle, ['schema_version', 'format', 'change_id', 'object', 'scope_count', 'row_count']);
   requireValid(value.bundle.schema_version === 1 && value.bundle.format === 'complete_scope_ndjson_gzip'
     && value.bundle.change_id === value.change_id && value.bundle.scope_count === value.scopes.length && integer(value.bundle.row_count)
