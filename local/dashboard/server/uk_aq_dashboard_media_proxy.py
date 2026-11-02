@@ -52,6 +52,8 @@ _ROUTES = (
     (re.compile(r"^/api/media/bluesky/settings$"), {"GET", "PUT"}),
     (re.compile(r"^/api/media/facebook/settings$"), {"GET", "PUT"}),
     (re.compile(r"^/api/media/facebook/connection-check$"), {"POST"}),
+    (re.compile(r"^/api/media/threads/settings$"), {"GET", "PUT"}),
+    (re.compile(r"^/api/media/threads/connection-check$"), {"POST"}),
 )
 
 
