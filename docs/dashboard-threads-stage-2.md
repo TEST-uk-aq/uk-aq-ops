@@ -22,9 +22,10 @@ Changed files:
   automatic/manual Threads history.
 - `docs/dashboard-threads-stage-2.md`: this implementation/acceptance handover.
 
-The exact pre-change runtime source was already archived earlier on the same day
-at `archive/2026-11-02/dashboard/assets/media.js`. That existing daily archive was
-retained unchanged under the once-per-day rule. There are no new archive copies,
+The repository already contains the same-day source archive at
+`archive/2026-11-02/dashboard/assets/media.js` from the preceding Stage 1 work.
+That earlier snapshot was retained unchanged under the once-per-day rule rather
+than replaced with a Stage 2 baseline. There are no new archive copies,
 generated files, dependencies, environment settings, migrations or proxy changes.
 No archive was executed or copied to LIVE.
 
