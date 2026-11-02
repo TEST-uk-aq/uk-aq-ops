@@ -998,11 +998,16 @@
         && [null, "threads_manual_publishing_disabled"].includes(data.unavailable_reason);
       const manualEnabled = settings.manual_publishing_enabled === true;
       const automaticEnabled = settings.automatic_publishing_enabled === true;
+      const captureActive = settings.capture_only_enabled === true || data.dispatch_hold_reason === "threads_capture_only";
+      const remoteRequestsBlocked = captureActive || data.remote_requests_blocked === true;
+      const unknownHeldCount = Number.isSafeInteger(data.held_publication_count) && data.held_publication_count > 0
+        ? data.held_publication_count : 0;
+      const unknownHold = data.dispatch_hold_reason === "unknown_remote_state" || unknownHeldCount > 0;
       // Stage 1 also returns automatic=false; only Stage 2 supplies this eligibility.
       const automaticSupported = typeof data.automatic_enablement_available === "boolean"
         && typeof settings.automatic_publishing_enabled === "boolean"
         && Object.hasOwn(settings, "activation_event_id");
-      const canEnableAutomatic = automaticSupported && data.automatic_enablement_available === true;
+      const canEnableAutomatic = automaticSupported && data.automatic_enablement_available === true && !remoteRequestsBlocked;
       const countLabel = value => Number.isSafeInteger(value) && value >= 0 ? String(value) : "—";
       const activationLabel = automaticSupported
         ? settings.activation_event_id === null ? "Not activated" : countLabel(settings.activation_event_id)
@@ -1026,15 +1031,22 @@
         <dt>Last successful post</dt><dd>${esc(formatUtcDateTime(settings.last_successful_post_at))}</dd>
         <dt>Automatic activation event</dt><dd>${esc(activationLabel)}</dd>
         <dt>Automatic events processed through</dt><dd>${esc(countLabel(settings.automatic_events_through_id))}</dd>
+        ${typeof settings.capture_only_enabled === "boolean" ? `<dt>Capture-only</dt><dd>${captureActive ? "Active" : "Off"} · operator-controlled through Media API</dd>
+        <dt>Captured intents</dt><dd>${esc(countLabel(data.capture_only_intent_count))}</dd>
+        <dt>Outstanding capture events</dt><dd>${esc(countLabel(data.capture_only_events_pending_count))}</dd>
+        <dt>Threads API request block</dt><dd>${remoteRequestsBlocked ? "Active" : "Off"}</dd>` : ""}
         <dt>Dispatch hold</dt><dd>${data.dispatch_held === true ? "Held" : data.dispatch_held === false ? "Not held" : "Unavailable"}${data.dispatch_hold_reason ? ` · ${esc(boundedCode(data.dispatch_hold_reason))}` : ""}</dd></dl></div>
         ${data.manual_publishing_available ? message("Manual Threads publishing is available.", "success") : message(directPublishUnavailableMessage("Threads", data.unavailable_reason))}
-        ${data.dispatch_held ? message(`${data.held_publication_count} unknown Threads outcome(s) hold dispatch. The operator must reconcile them through Media before publishing resumes.`, "error") : ""}
+        ${captureActive ? message("Capture-only active: no Threads API requests permitted. Captured intents are not remote posts. Capture-only activation and deactivation are controlled through the authenticated Media API.") : ""}
+        ${data.capture_only_enablement_available === false ? message(`Capture-only activation is unavailable. ${data.capture_only_unavailable_reason ? directPublishUnavailableMessage("Threads capture-only", data.capture_only_unavailable_reason) : "Refresh Media status for the current reason."}`) : ""}
+        ${unknownHold ? message(`${unknownHeldCount > 0 ? `${unknownHeldCount} unknown Threads outcome(s) hold dispatch.` : "An unknown Threads outcome holds dispatch."} The operator must reconcile them through Media before publishing resumes.`, "error") : ""}
+        ${data.dispatch_held && !captureActive && !unknownHold ? message(`Threads dispatch is held. Reason: ${boundedCode(data.dispatch_hold_reason)}. Review Media status before resuming.`, "error") : ""}
         <label class="media-toggle"><input name="manual_publishing_enabled" type="checkbox"${manualEnabled ? " checked" : ""}${!manualEnabled && !canEnable ? " disabled" : ""}> <span>Manual publishing enabled</span></label>
         <p class="media-subtext">Disabling manual publishing preserves queued work. Re-enabling may resume eligible requests. A verified account is required to enable it.</p>
-        <label class="media-toggle"><input name="automatic_publishing_enabled" type="checkbox" aria-describedby="media-threads-automatic-explanation"${automaticEnabled ? " checked" : ""}${!automaticEnabled && !canEnableAutomatic ? " disabled" : ""}> <span>Automatic publishing enabled</span></label>
+        <label class="media-toggle"><input name="automatic_publishing_enabled" type="checkbox" aria-describedby="media-threads-automatic-explanation"${automaticEnabled ? " checked" : ""}${remoteRequestsBlocked || (!automaticEnabled && !canEnableAutomatic) ? " disabled" : ""}> <span>Automatic publishing enabled</span></label>
         <p class="media-subtext" id="media-threads-automatic-explanation">Only new genuine automatic approvals after first activation generate automatic Threads publication requests. There is no historical backfill. Disabling automatic publishing preserves queued history; re-enabling may resume eligible queued requests after that watermark. Manual publishing is controlled separately.</p>
-        ${data.automatic_publishing_available === true && automaticSupported ? message("Automatic Threads publishing is available.", "success") : message(automaticUnavailable)}
-        ${automaticSupported && !canEnableAutomatic ? message(`Automatic enablement unavailable. ${directPublishUnavailableMessage("Automatic Threads", data.automatic_enablement_unavailable_reason)}`) : ""}
+        ${remoteRequestsBlocked ? message("The automatic publishing control is disabled while Media blocks Threads API requests. Capture-only does not enable remote automatic publishing; the stored automatic setting is preserved.") : data.automatic_publishing_available === true && automaticSupported ? message("Automatic Threads publishing is available.", "success") : message(automaticUnavailable)}
+        ${automaticSupported && !canEnableAutomatic && !remoteRequestsBlocked ? message(`Automatic enablement unavailable. ${directPublishUnavailableMessage("Automatic Threads", data.automatic_enablement_unavailable_reason)}`) : ""}
         <div data-threads-automatic-confirmation hidden><label class="media-toggle"><input name="acknowledge_future_auto_approvals" type="checkbox"> <span>I understand that enabling automatic publishing can post genuine future automatic approvals and resume eligible queued requests after the activation watermark.</span></label></div>
         ${automaticSupported ? `<p class="media-subtext">Automatic requests: ${esc(countLabel(data.automatic_queued_count))} queued · ${esc(countLabel(data.automatic_paused_count))} paused · ${esc(countLabel(data.automatic_blocked_count))} blocked/failed. Manual queued: ${esc(countLabel(data.manual_queued_count))}. Automatic events awaiting processing: ${esc(countLabel(data.automatic_events_pending_count))}.</p>` : ""}
         ${data.automatic_intent_held || settings.automatic_intent_error_code ? message(`Automatic intent creation is held. Error: ${boundedCode(settings.automatic_intent_error_code)}. Approval event: ${countLabel(settings.automatic_intent_error_event_id)}. Review Media status before resuming.`, "error") : ""}
@@ -1045,7 +1057,7 @@
       const automatic = form.elements.automatic_publishing_enabled;
       const acknowledgement = form.elements.acknowledge_future_auto_approvals;
       automatic.addEventListener("change", () => {
-        const enabling = automatic.checked && !automaticEnabled;
+        const enabling = automatic.checked && !automaticEnabled && !remoteRequestsBlocked;
         form.querySelector("[data-threads-automatic-confirmation]").hidden = !enabling;
         acknowledgement.checked = false;
         acknowledgement.required = enabling;
@@ -1074,6 +1086,9 @@
         }
         if (minutes !== Number(settings.cooldown_minutes)) body.cooldown_minutes = minutes;
         if (automatic.checked !== automaticEnabled) {
+          if (remoteRequestsBlocked) {
+            output.innerHTML = message("The automatic publishing setting cannot be changed while Media blocks Threads API requests.", "error"); return;
+          }
           if (!automaticSupported) {
             output.innerHTML = message("The Media Stage 2 settings API is required for automatic publishing.", "error"); return;
           }
@@ -1284,6 +1299,8 @@
       threads_state_unavailable: "Threads state is unavailable. The Media Stage 1 backend is required.",
       threads_manual_publishing_disabled: "Manual Threads publishing is disabled.",
       threads_automatic_publishing_disabled: "Automatic Threads publishing is disabled.",
+      threads_capture_only: "Capture-only is active. No Threads API requests are permitted.",
+      threads_capture_activation_busy: "A Threads provider request or posting job is still active. Capture-only activation must wait for it to settle.",
       threads_token_expiry_required: "Automatic Threads publishing requires a known future credential expiry. Secure operator configuration is required.",
       threads_identity_not_verified: "The configured Threads account has not been verified.",
       threads_identity_configuration_invalid: "Threads account configuration is incomplete or invalid.",
@@ -1330,15 +1347,21 @@
   function threadsHistoryHtml(data) {
     const threads = data.threads || {};
     const publications = threads.publications || [];
+    const latestStatus = publications[0]?.capture_only === 1 ? "Captured, not published"
+      : facebookStatusLabel({ status: threads.latest_status });
+    const capturedCount = Number.isSafeInteger(threads.capture_only_count) && threads.capture_only_count >= 0
+      ? threads.capture_only_count : "—";
     const rows = publications.map(item => {
-      const href = threadsPostUrl(item.threads_permalink_url);
-      const status = item.last_error_code === "operator_cancelled" ? "Cancelled" : facebookStatusLabel(item);
+      const captured = item.capture_only === 1;
+      const href = captured ? "" : threadsPostUrl(item.threads_permalink_url);
+      const status = captured ? "Captured, not published"
+        : item.last_error_code === "operator_cancelled" ? "Cancelled" : facebookStatusLabel(item);
       const time = item.posted_at || item.next_attempt_at || item.last_attempted_at || item.updated_at || item.created_at;
       const reason = item.publication_reason === "auto_approved" ? "Automatic approval" : socialReasonLabel(item.publication_reason);
       const eventId = Number.isSafeInteger(item.approval_event_id) && item.approval_event_id > 0 ? item.approval_event_id : "—";
-      return `<tr${item.status === "unknown_remote_state" ? ' class="media-publication-state--held"' : ""}><td>${esc(status)}</td><td>${esc(reason)}</td><td>${esc(eventId)}</td><td>${esc(item.attempt_count ?? 0)}</td><td>${esc(formatUtcDateTime(time))}</td><td>${esc(boundedCode(item.last_error_code))}</td><td>${esc(boundedCode(item.threads_container_id))}</td><td>${esc(boundedCode(item.threads_post_id))}</td><td>${href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">Open post ↗</a>` : "—"}</td></tr>`;
+      return `<tr${!captured && item.status === "unknown_remote_state" ? ' class="media-publication-state--held"' : ""}><td>${esc(status)}</td><td>${esc(reason)}</td><td>${esc(eventId)}</td><td>${esc(item.attempt_count ?? 0)}</td><td>${esc(formatUtcDateTime(time))}</td><td>${esc(boundedCode(item.last_error_code))}</td><td>${esc(captured ? "—" : boundedCode(item.threads_container_id))}</td><td>${esc(captured ? "—" : boundedCode(item.threads_post_id))}</td><td>${href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">Open post ↗</a>` : "—"}</td></tr>`;
     }).join("");
-    return `<section><h4>Threads publication</h4><div class="media-stats"><div class="media-stat"><strong>${esc(threads.post_count ?? 0)}</strong><span>Successful posts</span></div><div class="media-stat"><strong>${esc(threads.publication_count ?? 0)}</strong><span>Publication requests</span></div><div class="media-stat"><strong>${esc(facebookStatusLabel({ status: threads.latest_status }))}</strong><span>Latest status</span></div></div>${data.threads ? "" : message("Threads state is unavailable. The Media Stage 1 backend is required.")}${Number(threads.unknown_count) > 0 ? message("Threads has an unknown remote outcome. Automatic retries are held; the operator must reconcile it through Media before posting again.", "error") : ""}${rows ? `<p class="media-subtext">Most recent ${publications.length} Threads requests, including automatic approvals and manual requests. A container alone is not a published post. Links appear only when supplied by Media.</p><div class="media-table-wrap"><table class="media-table media-table--threads"><thead><tr><th>Status</th><th>Reason</th><th>Approval event</th><th>Attempts</th><th>Relevant time</th><th>Error code</th><th>Container ID</th><th>Post ID</th><th>Post</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="media-subtext">No Threads publication history.</p>`}</section>`;
+    return `<section><h4>Threads publication</h4><div class="media-stats"><div class="media-stat"><strong>${esc(threads.post_count ?? 0)}</strong><span>Successful posts</span></div><div class="media-stat"><strong>${esc(threads.publication_count ?? 0)}</strong><span>Publication requests</span></div><div class="media-stat"><strong>${esc(capturedCount)}</strong><span>Captured intents</span></div><div class="media-stat"><strong>${esc(latestStatus)}</strong><span>Latest status</span></div></div>${data.threads ? "" : message("Threads state is unavailable. The Media Stage 1 backend is required.")}${Number(threads.unknown_count) > 0 ? message("Threads has an unknown remote outcome. Automatic retries are held; the operator must reconcile it through Media before posting again.", "error") : ""}${rows ? `<p class="media-subtext">Most recent ${publications.length} Threads requests, including automatic approvals and manual requests. Captured intents are not included in successful remote posts and never have post links. A container alone is not a published post. Other links appear only when supplied by Media.</p><div class="media-table-wrap"><table class="media-table media-table--threads"><thead><tr><th>Status</th><th>Reason</th><th>Approval event</th><th>Attempts</th><th>Relevant time</th><th>Error code</th><th>Container ID</th><th>Post ID</th><th>Post</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<p class="media-subtext">No Threads publication history.</p>`}</section>`;
   }
 
   function localCopyEvidenceHtml(evidence) {
