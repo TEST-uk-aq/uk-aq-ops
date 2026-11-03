@@ -1,7 +1,7 @@
 import {
   AQI_ALGORITHM_VERSION,
+  canonicalObservationKey,
   helperRowsToNormalizedAqiV1Rows,
-  mergeObservationRowsPreferR2,
   pivotNarrowRowsToHelperRows,
 } from "../../../lib/aqi/aqi_levels.mjs";
 import {
@@ -39,9 +39,11 @@ function memberAt(segments, timestampMs) {
   return null;
 }
 
+// Entries retain request-local merge keys and validated timestamps; only their
+// original-shaped rows are exposed in the observation response.
 function mergePhysicalObservations(r2Rows, ingestRows, segments, requiredStartMs, requiredEndExclusiveMs) {
-  function prepare(source) {
-    const prepared = [];
+  function prepare(source, defaultSource) {
+    const prepared = new Map();
     const seen = new Map();
     for (const row of source) {
       const timestamp = Date.parse(String(row?.observed_at || ""));
@@ -61,32 +63,40 @@ function mergePhysicalObservations(r2Rows, ingestRows, segments, requiredStartMs
       const previous = seen.get(key);
       if (previous !== undefined && previous !== value) throw new Error("station_history_continuity_observation_conflict");
       seen.set(key, value);
-      prepared.push(row.observed_at === observedAt && row.value === value
-        ? row : { ...row, observed_at: observedAt, value });
+      // Normalised readers supply observed_at. Preserve the shared helper's
+      // observed_at_utc alias priority for any other provider without reparsing
+      // the usual canonical timestamp or rebuilding its physical key.
+      const canonicalKey = row.observed_at_utc ? canonicalObservationKey(row) : key;
+      if (canonicalKey) prepared.set(canonicalKey, {
+        key: canonicalKey,
+        timestamp,
+        row: { ...row, observed_at: observedAt, value, source: row.source || defaultSource },
+      });
     }
     return prepared;
   }
-  const merged = mergeObservationRowsPreferR2({
-    r2Rows: prepare(Array.isArray(r2Rows) ? r2Rows : []),
-    ingestRows: prepare(Array.isArray(ingestRows) ? ingestRows : []),
-  }).rows;
+  // Validate both sources independently, R2 first as before. Equal duplicates
+  // retain the last row within each source; R2 then wins exact-key overlaps.
+  const preparedR2 = prepare(Array.isArray(r2Rows) ? r2Rows : [], "r2");
+  const merged = prepare(Array.isArray(ingestRows) ? ingestRows : [], "ingest");
+  for (const [key, entry] of preparedR2) merged.set(key, entry);
   const identityByTimestamp = new Map();
-  for (const row of merged) {
+  for (const { row } of merged.values()) {
     const previous = identityByTimestamp.get(row.observed_at);
     if (previous !== undefined && previous !== row.timeseries_id) throw new Error("station_history_continuity_observation_conflict");
     identityByTimestamp.set(row.observed_at, row.timeseries_id);
   }
-  // The shared merge orders by physical timeseries first. The logical chart
-  // stream must instead be chronological across continuity transitions.
-  return merged.sort((left, right) => left.observed_at.localeCompare(right.observed_at)
-    || left.timeseries_id - right.timeseries_id);
+  // One logical sort replaces the shared physical-key sort followed by this
+  // chronological sort. The key tie-break preserves the former stable order
+  // even for alias-keyed rows with identical observed_at and physical identity.
+  return Array.from(merged.values()).sort((left, right) => left.row.observed_at.localeCompare(right.row.observed_at)
+    || left.row.timeseries_id - right.row.timeseries_id
+    || left.key.localeCompare(right.key));
 }
 
 function sourceObservationsToHourEndingNarrowRows(rows, request, outputEndMs, expectedEndpoints) {
   const grouped = new Map();
-  for (const row of rows) {
-    const observedMs = Date.parse(row.observed_at);
-
+  for (const { row, timestamp: observedMs } of rows) {
     // Station-history AQI intervals are hour-ending. An observation exactly
     // on the hour keeps that timestamp as its endpoint; an observation inside
     // the hour belongs to the next clock-hour endpoint. This makes the bucket
@@ -240,8 +250,7 @@ export async function buildCalculatedHistory({ request, continuity, env, outputS
   const visibleRows = [];
   const observationPresent = new Set();
   const sourceCounts = { r2: 0, ingest: 0, ...(observationProvider ? { json: 0 } : {}) };
-  for (const row of rows) {
-    const timestamp = Date.parse(row.observed_at);
+  for (const { row, timestamp } of rows) {
     if (timestamp < outputStartMs || timestamp > outputEndMs) continue;
     visibleRows.push(row);
     observationPresent.add(hourEndingEndpoint(timestamp));
