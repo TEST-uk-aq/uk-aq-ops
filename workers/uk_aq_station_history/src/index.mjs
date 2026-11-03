@@ -48,7 +48,6 @@ import { resolveStationHistoryPolicy } from "./policy.mjs";
 import { buildCalculatedHistory } from "./calculated_history.mjs";
 import { readHistoricalIngestRecovery } from "./historical_ingest_recovery.mjs";
 import { publicContinuity, resolveTimeseriesBinding, selectContinuitySegments } from "./continuity.mjs";
-import { shouldValidateAqi, validateCalculatedAqiAgainstR2 } from "./aqi_validation.mjs";
 import { handleRecentAqiPrototype } from "./recent_aqi_prototype.mjs";
 import { handleRecentHourlyPrototype } from "./recent_hourly_prototype.mjs";
 
@@ -351,6 +350,8 @@ function buildIngestOnlyResponse(request, direct, capability, policy, nowMs) {
 }
 
 async function fetchR2AqiHead(request, bounds, env, rowLimit) {
+  // Retained v2 compatibility must never read persisted AQI for selected v3.
+  if (usesV3PhysicalObservationPages(env)) throw new Error("legacy_history_route_retired_for_v3");
   const baseUrl = required(env.UK_AQ_AQI_HISTORY_R2_API_URL);
   const secret = required(env.UK_AQ_EDGE_UPSTREAM_SECRET);
   if (!baseUrl || !secret) throw new Error("station_series_r2_config_missing");
@@ -683,6 +684,11 @@ function chunkHeaders(body) {
 
 async function handleAqiHistoryChunk(request, env) {
   const url = new URL(request.url);
+  try {
+    if (usesV3PhysicalObservationPages(env)) return errorResponse(410, "legacy_history_route_retired_for_v3", url.pathname);
+  } catch (_error) {
+    return errorResponse(500, "invalid_observation_history_generation", url.pathname);
+  }
   const parsed = parseHistoryChunkRequest(url, "aqi", resolveStationHistoryPolicy(env));
   if (!parsed.ok) return errorResponse(parsed.code === "history_chunk_overlaps_stable_head" ? 409 : 400, parsed.code, url.pathname);
   let chunk;
@@ -701,7 +707,7 @@ async function handleAqiHistoryChunk(request, env) {
   } catch (error) { return errorResponse(502, error instanceof Error ? error.message : "aqi_history_r2_failed", url.pathname); }
 }
 
-async function handleObservationHistoryChunk(request, env, ctx) {
+async function handleObservationHistoryChunk(request, env) {
   const url = new URL(request.url);
   const policy = resolveStationHistoryPolicy(env);
   const parsed = parseHistoryChunkRequest(url, "observations", policy);
@@ -756,11 +762,6 @@ async function handleObservationHistoryChunk(request, env, ctx) {
           replacement_policy: "extend_backwards_only", cache_class: immutable ? "immutable" : "mutable", retry_key: `v2|combined|${chunk.retryKey}`,
         },
       };
-      if (chunk.includeAqi && shouldValidateAqi(policy, chunk) && ctx?.waitUntil) {
-        ctx.waitUntil(validateCalculatedAqiAgainstR2({ response: combined, request: chunk, continuity, env }).catch((error) => {
-          console.warn(JSON.stringify({ event: "station_history_aqi_validation_error", error: error instanceof Error ? error.message : String(error) }));
-        }));
-      }
       return new Response(JSON.stringify(body), { status: 200, headers: applyHistoryDependencyHeaders(chunkHeaders(body), env, selectContinuitySegments(continuity, chunk.startMs - chunk.contextHours * HOUR_MS, chunk.endMs + (chunk.includeAqi ? 1 : 0)).segments.map((member) => member.timeseriesId)) });
     } catch (error) {
       return identityErrorResponse(error, url.pathname) || errorResponse(502, error instanceof Error ? error.message : "observation_history_combined_failed", url.pathname);
@@ -803,13 +804,13 @@ async function handleObservationHistoryChunk(request, env, ctx) {
 }
 
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     if (request.method !== "GET") return errorResponse(405, "internal_method_not_allowed", url.pathname);
     if (url.pathname === "/v1/recent-aqi-prototype") return handleRecentAqiPrototype(request, env);
     if (url.pathname === "/v1/recent-hourly-prototype") return handleRecentHourlyPrototype(request, env);
     if (url.pathname === "/v1/aqi-history") return handleAqiHistoryChunk(request, env);
-    if (url.pathname === "/v1/observations-history") return handleObservationHistoryChunk(request, env, ctx);
+    if (url.pathname === "/v1/observations-history") return handleObservationHistoryChunk(request, env);
     if (url.pathname !== "/v1/station-series") return errorResponse(404, "internal_route_not_found", url.pathname);
     if (String(url.searchParams.get("format") ?? "").toLowerCase() !== "objects") return errorResponse(400, "station_series_format_objects_required", url.pathname);
     const parsed = resolveStationSeriesRequest(url);
@@ -829,11 +830,6 @@ export default {
       const body = applyRequestedPartContract(attachAuthoritativeIdentity(built.body, identity), authoritative);
       const complete = (!authoritative.includeAqi || body.aqi.response_complete === true)
         && (!authoritative.includeObservations || body.observations.response_complete === true);
-      if (policy.calculatedHistoryAqiEnabled && authoritative.includeAqi && shouldValidateAqi(policy, authoritative) && ctx?.waitUntil) {
-        ctx.waitUntil(validateCalculatedAqiAgainstR2({ response: body, request: authoritative, continuity: built.continuity, env }).catch((error) => {
-          console.warn(JSON.stringify({ event: "station_history_aqi_validation_error", error: error instanceof Error ? error.message : String(error) }));
-        }));
-      }
       return new Response(JSON.stringify(body), { status: 200, headers: applyHistoryDependencyHeaders(headersFor({ "Content-Type": "application/json; charset=utf-8", "Cache-Control": complete ? "public, max-age=60, s-maxage=60" : "no-store", "X-UK-AQ-Station-History-Source-Mode": body.source.mode, "X-UK-AQ-Station-History-Ingest-Fetches": String(body.source.ingest_fetch_count) }), env, built.cacheTimeseriesIds || [identity.timeseriesId]) });
     } catch (error) {
       return ingestErrorResponse(error, url.pathname)

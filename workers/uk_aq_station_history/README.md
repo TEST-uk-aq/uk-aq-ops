@@ -4,6 +4,21 @@
 
 ## Station-series source policy
 
+For the selected v3 generation, normal charts use the existing calculated-history
+path with `UK_AQ_STATION_HISTORY_CALCULATED_HISTORY_AQI_ENABLED=true`.
+DAQI/EAQI are calculated from the authoritative R2-first/recent-IngestDB
+observations, including continuity and PM context. Stored R2 AQI is neither a
+source nor a validator. The retired stored-AQI validator and its mode/sample
+controls have been removed; stale deployed validation settings are ignored.
+Chart defaults and the separate compressed historical JSON service are unchanged.
+
+The older source policy below applies only to retained v2 compatibility.
+Its callers are not fully established, so it remains pending a separate consumer
+closure. On v3, `/v1/aqi-history` returns HTTP 410
+`legacy_history_route_retired_for_v3` before identity/configuration reads, and
+the old AQI-head reader also fails closed before resolving the stored-AQI URL.
+Disabling calculated history must not reactivate persisted AQI for v3.
+
 `GET /v1/station-series` resolves the authoritative timeseries identity before reading data. It performs exactly one logical recent observation read directly from the ingest database through `uk_aq_public.rpc/uk_aq_timeseries_rpc`, using the smallest supported RPC window that covers the required source interval. A required interval beyond the RPC's 30-day maximum is marked incomplete rather than treated as direct-source coverage. It never calls the stitched public `uk_aq_timeseries` Edge Function.
 
 A request uses ingest-only mode only when the direct response covers the complete requested output, the requested end, and any PM 23-hour AQI context. Otherwise the same direct result is reused with bounded R2 sources:
@@ -82,7 +97,9 @@ private Service Binding architecture and R2-over-live precedence are unchanged.
 Required data-path values:
 
 - `SUPABASE_URL` and `SB_SECRET_KEY` for authoritative identity lookup and direct recent-observation RPC calls.
-- `UK_AQ_AQI_HISTORY_R2_API_URL`, `UK_AQ_OBSERVS_HISTORY_R2_API_URL`, and `UK_AQ_EDGE_UPSTREAM_SECRET` for R2 fallback/history.
+- `UK_AQ_OBSERVS_HISTORY_R2_API_URL` and `UK_AQ_EDGE_UPSTREAM_SECRET` for canonical observation history.
+- `UK_AQ_R2_HISTORY_VERSION` selects the complete observation generation (`v2` or `v3`).
+- `UK_AQ_AQI_HISTORY_R2_API_URL` is required only for retained v2 compatibility. The station-history deployment workflow does not require or send it for v3; pre-existing remote settings are not deleted by this change.
 - `UK_AQ_PUBLIC_SCHEMA` (default `uk_aq_public`) and `INGESTDB_RETENTION_DAYS` (default `5`).
 
 Optional TEST tuning uses safe in-code defaults when absent:
