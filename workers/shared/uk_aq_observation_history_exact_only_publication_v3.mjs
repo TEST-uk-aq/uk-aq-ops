@@ -4,6 +4,9 @@ import { Buffer } from "node:buffer";
 import { sha256Hex } from "./r2_sigv4.mjs";
 import { getObservationHistoryGeneration } from "./uk_aq_observation_history_generation.mjs";
 import { exactLeafFormatV3 } from "./uk_aq_observation_history_exact_leaf_format_v3.mjs";
+import { validatePhaseBV3RunFinalizationResult, pruneBatchFinalizationIdentityV3 }
+  from './uk_aq_prune_batch_finalization_v3.mjs';
+import { originalOperationError } from '../../scripts/operations/lib/uk_aq_prune_original_operation.mjs';
 import {
   encodeObservationHistoryIndexV3Json as json,
   buildObservationHistoryIndexV3PublicationPlan,
@@ -14,6 +17,7 @@ import {
 } from "./uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import {
   assertObservationHistoryExactOnlyProofOperationV3,
+  assertObservationHistoryExactOnlyPruneProofV3,
   recheckObservationHistoryExactOnlyProofV3,
   acceptObservationHistoryExactOnlyScopeV3,
 } from "./uk_aq_observation_history_exact_only_verifier_v3.mjs";
@@ -57,6 +61,77 @@ function storedArtifact(object, kind, stage) {
   const payload = JSON.parse(body);
   if (body !== json(payload)) throw new Error("schema-2 compact latest noncanonical body");
   return { ...id(current), body, payload, kind, publication_stage: stage, dependencies: [], publication_prerequisites: [] };
+}
+
+// Prune-only pre-gate adapter. The real owner first runs/validates its mandatory
+// batch finalizer; authenticate that result's current identities and reuse only
+// physical proofs from the SAME live coordinator capability. The late reporting
+// run manifest is deliberately absent. No new durable artifact is produced.
+export async function preparePruneExactOnlyBatchCompletionV3({
+  preparedScopes, finalization, runId, originalOperation, expectedDays,
+  expectedConnectorPublicationCount, getObject,
+}) {
+  if (!originalOperation || originalOperation.run_id !== runId || typeof originalOperation.assertHeld !== 'function') {
+    throw originalOperationError('matching original coordinator capability required');
+  }
+  if (!Array.isArray(preparedScopes) || !preparedScopes.length || typeof getObject !== 'function') {
+    throw new Error('Original prepared exact-only scopes and authenticated GET required');
+  }
+  if (!Number.isSafeInteger(expectedConnectorPublicationCount) || expectedConnectorPublicationCount <= 0
+    || !Array.isArray(expectedDays) || !expectedDays.length
+    || finalization?.connector_results?.length !== expectedConnectorPublicationCount) {
+    throw new Error('Original complete Prune batch membership required');
+  }
+  const held = () => originalOperation.assertHeld('preparation');
+  await held();
+  validatePhaseBV3RunFinalizationResult({ result: finalization, expectedDays, expectedConnectorPublicationCount });
+  const batch = pruneBatchFinalizationIdentityV3(finalization);
+  const reports = [], seen = new Set();
+  for (const prepared of preparedScopes) {
+    await assertObservationHistoryExactOnlyPruneProofV3(prepared.proof, originalOperation);
+    const verified = await recheckObservationHistoryExactOnlyProofV3(prepared.proof);
+    if (verified !== prepared.hierarchy) throw new Error('Prune prepared hierarchy substitution');
+    const report = await acceptObservationHistoryExactOnlyScopeV3(prepared.proof);
+    same(report.selector, id(verified.scoped_manifest), 'original batch selector');
+    same(report.leaves, verified.exact_leaves.map(id), 'original batch leaves');
+    if (seen.has(report.selector.key) || !expectedDays.includes(report.scope.day_utc)) throw new Error('Invalid original batch scope set');
+    seen.add(report.selector.key); reports.push(report);
+  }
+  const get = async key => { await held(); const object = await getObject({ key }); await held(); return object; };
+  // These are required existing canonical/day/latest identities, not Parquet.
+  for (const ref of [...batch.day_manifests, ...batch.canonical_aggregate_references, ...batch.latest_global_references]) {
+    same(id(snapshot(await get(ref.key), ref.key)), ref, 'checked original batch identity');
+  }
+  const latestKey = generation.observations_timeseries_latest_key;
+  const latestObject = await get(latestKey);
+  const latest = storedArtifact(latestObject, 'observation_history_index_v3_latest_global', 'latest_global');
+  if (!batch.latest_global_references.some(r => json(r) === json(id(latest)))) throw new Error('Original batch latest identity missing');
+  const registry = validateObservationHistoryExactLeafIndexV3LatestRegistry({ artifact: latest });
+  for (const report of reports) {
+    const selected = registry.roots.find(r => r.key === report.selector.key);
+    const prepared = preparedScopes.find(s => s.hierarchy.scoped_manifest.key === report.selector.key);
+    same(selected, scopedRootDescriptor(prepared.hierarchy.scoped_manifest), 'completed latest scope/format');
+    if (!batch.exact_scope_references.some(r => json(r) === json(report.selector))
+      || report.canonical_chain.slice(0, 3).some(r => !batch.canonical_aggregate_references.some(b => json(b) === json(r)))
+      || !batch.day_manifests.some(r => json(r) === json(report.canonical_chain[3]))) {
+      throw new Error('Checked batch differs from the authenticated original canonical/index chain');
+    }
+    await recheckObservationHistoryExactOnlyProofV3(report);
+  }
+  await held();
+  const completion = Object.freeze({});
+  completions.set(completion, { proofs: reports, assertHeld: held,
+    assertUsable() { same(pruneBatchFinalizationIdentityV3(finalization), batch, 'original checked batch'); },
+    description: {
+      schema_version: 2, kind: 'uk_aq_prune_exact_only_completion', invocation_id: runId,
+      finalisation_complete: true, authority_state: 'prepared_before_original_gate_transaction',
+      batch_finalization: batch, latest: id(latest),
+      scopes: reports.map(report => ({ scope: report.scope, verifier_version: report.verifier_version,
+        inspector: report.inspector, physical_identity: report.physical_identity,
+        canonical_chain: report.canonical_chain, canonical_source_manifest: report.canonical_source_manifest,
+        selector: report.selector, leaves: report.leaves, files: report.files, row_count: report.row_count })),
+    } });
+  return completion;
 }
 
 // Pure GET preparation: original selectors, exact immutable revision conflict

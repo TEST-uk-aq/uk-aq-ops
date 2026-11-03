@@ -3,6 +3,8 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
+import { relayOriginalOperationAssertions } from './lib/uk_aq_prune_original_operation.mjs';
+import { OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV } from '../../workers/shared/uk_aq_r2_history_writer.mjs';
 
 const COORDINATOR_LIVENESS_FD = 3;
 const FORCED_EXIT_DELAY_MS = 10_000;
@@ -43,6 +45,7 @@ export async function superviseLockedCommand({
   let stoppingSignal = null;
   let forceTimer = null;
   let child = null;
+  let closeAssertions = null;
 
   const emergencyStop = () => {
     try {
@@ -89,13 +92,18 @@ export async function superviseLockedCommand({
   // After reporting the target result, remain alive until the coordinator
   // kills this whole process group and confirms no descendants survived.
   return await new Promise(() => {
+    const prune = env[OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.owner] === 'prune_daily';
     child = spawnProcess(command, commandArgs, {
       env,
-      stdio: "inherit",
+      stdio: prune ? ['inherit', 'inherit', 'inherit', 'ipc'] : 'inherit',
       detached: false,
+    });
+    if (prune) closeAssertions = relayOriginalOperationAssertions({
+      coordinator: process, child, onFailure: emergencyStop,
     });
     child.once("error", (error) => {
       finished = true;
+      closeAssertions?.();
       if (forceTimer) clearTimeout(forceTimer);
       process.off("SIGINT", onSigint);
       process.off("SIGTERM", onSigterm);
@@ -103,6 +111,7 @@ export async function superviseLockedCommand({
     });
     child.once("exit", (code, signal) => {
       finished = true;
+      closeAssertions?.();
       if (forceTimer) clearTimeout(forceTimer);
       process.off("SIGINT", onSigint);
       process.off("SIGTERM", onSigterm);

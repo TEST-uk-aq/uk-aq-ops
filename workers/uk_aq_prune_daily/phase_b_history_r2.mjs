@@ -1,3 +1,6 @@
+import { validatePhaseBV3RunFinalizationResult } from '../shared/uk_aq_prune_batch_finalization_v3.mjs';
+import { preparePruneExactOnlyBatchCompletionV3 }
+  from '../shared/uk_aq_observation_history_exact_only_publication_v3.mjs';
 import {
   runOperationalPruneDailyObservationHistoryV3ConnectorPublication,
   runOperationalPruneDailyObservationHistoryV3RunFinalization,
@@ -15,11 +18,14 @@ import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
 import { randomUUID } from "node:crypto";
+import { originalOperationError, isOriginalOperationError }
+  from '../../scripts/operations/lib/uk_aq_prune_original_operation.mjs';
 import { uploadPrunePendingSource, uploadPruneEvidenceBundle, resolvePruneSignerConfig,
   PRUNE_SIGNED_UPLOAD_DEADLINE_MS, PRUNE_EVIDENCE_BUNDLE_UPLOAD_DEADLINE_MS,
   isPrunePendingSourceConnector } from "../../scripts/jsongen/prune-signed-upload.mjs";
 import { preparePrunePendingSource } from "../../scripts/jsongen/prune-pending-source.mjs";
-import { preparePruneOriginalFinalEvidence, attachPruneOriginalEvidenceBundleReference }
+import { preparePruneOriginalFinalEvidence, preparePruneOriginalFinalEvidenceWithExactOnlyCompletion,
+  attachPruneOriginalEvidenceBundleReference }
   from "../../scripts/jsongen/prune-final-evidence.mjs";
 import { describePruneGateOutboxEvidence, preparePrunePostCommitHandover } from "../../scripts/jsongen/prune-outbox.mjs";
 import { createPruneOriginalMetadataCapture, preparePruneOriginalMetadataSnapshot,
@@ -2372,7 +2378,9 @@ async function markCandidateAndConnectorGateComplete(client, {
   sourceIdentity,
   writerGitSha,
   outbox = null,
+  assertOriginalOperationHeld = null,
 }) {
+  await assertOriginalOperationHeld?.('gate_begin');
   await client.query("begin");
   let commitStarted = false;
   try {
@@ -2429,11 +2437,15 @@ async function markCandidateAndConnectorGateComplete(client, {
         outboxState = 'inserted';
       }
     }
+    await assertOriginalOperationHeld?.('gate_commit');
     commitStarted = true;
     const commit = await client.query("commit");
     // PostgreSQL can acknowledge an aborted transaction with ROLLBACK instead.
     // A lost/ambiguous response or any other command is not successful COMMIT.
     if (commit?.command !== 'COMMIT') throw new Error('Original Prune gate COMMIT not acknowledged');
+    // No successful completion reference on loss/uncertainty during COMMIT.
+    // This is the same coordinator capability, never a new acquisition.
+    await assertOriginalOperationHeld?.('gate_committed');
     let handover = { state: 'not_prepared', delivery_state: 'not_attempted',
       ready_for_independent_authentication: false,
       reason: outboxState === 'disabled' ? 'disabled' : outboxState };
@@ -3794,6 +3806,7 @@ async function publishFrozenV2Observations({ candidate, runtime, streamClient, r
 }
 
 async function publishFrozenV3Observations({ candidate, runtime, streamClient, rows, backedUpAtUtc }) {
+  await assertPruneOriginalOperation(runtime, 'publication');
   const metadataCapture = optionalJsongenMetadataCapture(runtime, candidate.connector_id);
   const byPollutant = new Map();
   for (const row of rows) {
@@ -3983,6 +3996,7 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
     throw new Error("Side-by-side v3 connector publication is incomplete");
   }
   const result = publication.connector_results[0];
+  await assertPruneOriginalOperation(runtime, 'publication');
   const manifest = result.canonical.connector_manifest_payload;
   const files = result.partitions.flatMap((partition) => partition.pollutant_manifest.payload.files);
   return {
@@ -4014,26 +4028,6 @@ function validatePhaseBV2RunFinalizationResult({ result, expectedDays }) {
   return result;
 }
 
-function validatePhaseBV3RunFinalizationResult({
-  result,
-  expectedDays,
-  expectedConnectorPublicationCount,
-}) {
-  const aggregate = result?.canonical_aggregate_result;
-  const exactScopes = result?.v3_publication?.exact_scopes;
-  if (result?.ok !== true ||
-      !phaseBAffectedDaysMatch(result?.affected_days_utc, expectedDays) ||
-      aggregate?.canonical_aggregate_authority_verified !== true ||
-      aggregate?.parent_state_reread_under_lock !== true ||
-      !phaseBAffectedDaysMatch(aggregate?.affected_days_utc, expectedDays) ||
-      !Array.isArray(exactScopes) ||
-      exactScopes.length !== expectedConnectorPublicationCount ||
-      exactScopes.some((publication) => publication?.ok !== true) ||
-      result?.v3_publication?.latest_global?.ok !== true) {
-    throw new Error("Phase B v3 run finalization did not establish complete canonical/latest authority");
-  }
-  return result;
-}
 
 async function finalizeSelectedObservationRun({ client, runtime, publishedCandidates, diagnostics }) {
   if (runtime.history_write_version === "v2") {
@@ -4201,7 +4195,11 @@ async function writeFrozenCandidateObservationsToV2({
         connectorId: candidate.connector_id,
         rows,
         headObject: r2HeadObject,
-        assertOperationHeld: () => {
+        assertOperationHeld: async () => {
+          if (runtime.original_operation) {
+            await assertPruneOriginalOperation(runtime, 'publication');
+            return;
+          }
           // The existing outer supervisor owns this original session and kills
           // its child on loss. The run-local cache binds its lifetime and nonce.
           const current = observationsGlobalOperationLockContext({ expectedOwner: 'prune_daily', expectedRunId: runtime.run_id });
@@ -4566,6 +4564,7 @@ async function finalizePublishedPhaseBConnectors({
   const expectedDays = uniqueSorted(publishedCandidates.map(({ candidate }) => candidate.day_utc));
   let result;
   try {
+    await assertPruneOriginalOperation(runtime, 'batch_finalization');
     result = await runFinalizer({ client, runtime, publishedCandidates, diagnostics: lockDiagnostics });
     if (runtime.history_write_version === "v2") {
       validatePhaseBV2RunFinalizationResult({ result, expectedDays });
@@ -4578,6 +4577,7 @@ async function finalizePublishedPhaseBConnectors({
     } else {
       throw new Error(`Unsupported Phase B history write version: ${String(runtime.history_write_version || "")}`);
     }
+    await assertPruneOriginalOperation(runtime, 'batch_finalization');
   } catch (error) {
     for (const { candidate, exportResult } of publishedCandidates) {
       if (runtime.history_write_version !== 'v3' || runtime.jsongen_pending_source?.enabled !== true
@@ -4606,6 +4606,24 @@ async function finalizePublishedPhaseBConnectors({
         && isPrunePendingSourceConnector(candidate.connector_id)) {
         if (exportResult.jsongen_pending_source?.state === 'put_acknowledged_unverified') {
           try {
+            await assertPruneOriginalOperation(runtime, 'preparation');
+            // Future schema-2 producer supplies the original operation-local
+            // preparations, never serialized flags. Operational rejection and
+            // the hard publisher-inactive constant are unchanged in Stage 2A.
+            let exactOnlyCompletion = null;
+            if (exportResult.exact_only_prepared_scopes?.length) {
+              await assertPruneOriginalOperation(runtime, 'preparation', true);
+              exactOnlyCompletion = await preparePruneExactOnlyBatchCompletionV3({
+                preparedScopes: exportResult.exact_only_prepared_scopes,
+                finalization: result, runId, originalOperation: runtime.original_operation,
+                expectedDays, expectedConnectorPublicationCount: publishedCandidates.length,
+                getObject: async ({ key }) => {
+                  assertBudget(runtime, 'jsongen_original_batch_identity', { key },
+                    R2_REQUEST_WORST_CASE_DURATION_MS + R2_PUBLICATION_SAFETY_MARGIN_MS);
+                  return { ...await r2GetObject({ r2: runtime.r2, key }), key };
+                },
+              });
+            }
             const dayReferences = (result.affected_days_utc || []).map(dayUtc =>
               (result.day_results || []).find(entry => entry.day_utc === dayUtc)?.day_manifest);
             const originalMetadataSnapshot = preparePruneOriginalMetadataSnapshot({
@@ -4619,7 +4637,7 @@ async function finalizePublishedPhaseBConnectors({
               aggregateReferences: result.canonical_aggregate_result?.aggregate_manifests,
               latestReferences: result.v3_publication?.latest_global?.objects,
             });
-            published.jsongen_final_evidence_preparation = prepareJsonGenFinalEvidence({
+            const preparationArgs = {
               pending: exportResult.jsongen_pending_source,
               connector: connectorGateEvidence.jsongen_connector_snapshot,
               finalization: result, runId, dayUtc: candidate.day_utc,
@@ -4628,7 +4646,11 @@ async function finalizePublishedPhaseBConnectors({
               originalMetadataSnapshot,
               originalAuthorityCapture: exportResult.jsongen_original_authority,
               evidenceMode: 'r2_bundle',
-            });
+              ...(exactOnlyCompletion ? { exactOnlyCompletion } : {}),
+            };
+            published.jsongen_final_evidence_preparation = exactOnlyCompletion
+              ? await preparePruneOriginalFinalEvidenceWithExactOnlyCompletion(preparationArgs)
+              : prepareJsonGenFinalEvidence(preparationArgs);
             const finalPreparation = published.jsongen_final_evidence_preparation;
             if (!hasBudgetFor(runtime, PRUNE_EVIDENCE_BUNDLE_UPLOAD_DEADLINE_MS)
               || Date.now() >= evidenceBundleDeadlineAtMs) {
@@ -4674,6 +4696,7 @@ async function finalizePublishedPhaseBConnectors({
               independent_consumer_authentication: 'outstanding',
             });
           } catch (error) {
+            if (isOriginalOperationError(error)) throw error;
             logJsongenPhaseB(runtime, 'WARNING', 'phase_b_jsongen_original_final_evidence_unavailable', {
               day_utc: candidate.day_utc, connector_id: candidate.connector_id,
               reason: error?.original_authority_code || (error?.message === 'JSONgen final preparation exceeds bounded metadata size'
@@ -4709,6 +4732,9 @@ async function finalizePublishedPhaseBConnectors({
         sourceIdentity: exportResult.source_identity,
         writerGitSha: runtime.writer_git_sha,
         outbox,
+        ...(runtime.original_operation ? {
+          assertOriginalOperationHeld: stage => assertPruneOriginalOperation(runtime, stage),
+        } : {}),
       });
       published.jsongen_outbox = gateOutcome || {
         gate_state: 'unconfirmed',
@@ -4775,6 +4801,7 @@ async function finalizePublishedPhaseBConnectors({
           ready_for_independent_authentication: false, reason: 'original_gate_not_confirmed',
         });
       }
+      if (isOriginalOperationError(error)) throw error;
       gateFailures.push({ published, error });
     }
   }
@@ -7152,6 +7179,18 @@ export function createPhaseBRunLocalV3EvidenceContextForTest(args) {
   return createPhaseBRunLocalV3EvidenceContext(args);
 }
 
+async function assertPruneOriginalOperation(runtime, stage, required = false) {
+  const operation = runtime.original_operation;
+  if (!operation) {
+    if (required) throw originalOperationError('original coordinator capability required');
+    return; // Preserve schema-1 callers without the private supervisor channel.
+  }
+  if (operation.run_id !== runtime.run_id || typeof operation.assertHeld !== 'function') {
+    throw originalOperationError('original invocation differs');
+  }
+  await operation.assertHeld(stage);
+}
+
 export async function runPhaseBBackup({
   dryRun,
   phaseB,
@@ -7161,6 +7200,7 @@ export async function runPhaseBBackup({
   nowUtc = nowIso(),
   nowMs = Date.now,
   createPgClient = (config) => new Client(config),
+  originalOperation = null,
 }) {
   const runtime = {
     ...phaseB,
@@ -7174,6 +7214,7 @@ export async function runPhaseBBackup({
     }),
     global_operation_lock_context: null,
     v3_run_local_evidence_cache: null,
+    original_operation: originalOperation,
   };
 
   if (!runtime.enabled) {
@@ -7289,6 +7330,7 @@ export async function runPhaseBBackup({
   const controlPgTimeouts = derivePhaseBPgTimeoutsForTest(runtime);
   try {
     await withPgClient(runtime.supabase_db_url, async (controlClient) => {
+    if (!dryRun) await assertPruneOriginalOperation(runtime, 'publication');
     if (!hasBudgetFor(runtime, PHASE_B_STAGE_MIN_MS.candidate_start)) {
       stopPhaseBForBudget(summary, runtime, { operation: "candidate_discovery" });
       return;

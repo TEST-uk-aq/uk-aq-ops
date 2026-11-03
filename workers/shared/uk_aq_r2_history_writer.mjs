@@ -246,17 +246,42 @@ export async function withObservationsGlobalOperationLock({
   });
 
   let callbackError;
+  let operationActive = true, originalSessionPid = null;
+  const assertHeld = () => {
+    if (!operationActive) throw Object.assign(new Error('Original observations operation has ended'),
+      { code: 'UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_LOST' });
+    if (lostController.signal.aborted) throw lostController.signal.reason;
+  };
   try {
     return await callback(identity, {
       signal: lostController.signal,
-      assertHeld() {
-        if (lostController.signal.aborted) throw lostController.signal.reason;
+      assertHeld,
+      async assertOwned() {
+        assertHeld();
+        try {
+          // Query ONLY the original owning client. Never pg_try_advisory_lock:
+          // a released/replaced session cannot repair an assertion by acquiring.
+          const result = await client.query(`select pg_backend_pid() as session_pid,
+            exists (select 1 from pg_locks where locktype = 'advisory'
+              and pid = pg_backend_pid() and classid = $1::oid and objid = $2::oid
+              and objsubid = 2 and mode = 'ExclusiveLock' and granted) as held`,
+          [identity.class_id >>> 0, identity.object_id >>> 0]);
+          assertHeld();
+          const row = result.rows?.[0];
+          if (row?.held !== true || !Number.isSafeInteger(row.session_pid) || row.session_pid <= 0
+            || (originalSessionPid !== null && row.session_pid !== originalSessionPid)) {
+            throw new Error('original lock ownership/session changed');
+          }
+          originalSessionPid = row.session_pid;
+          return originalSessionPid;
+        } catch (error) { lostError(error); throw lostController.signal.reason; }
       },
     });
   } catch (error) {
     callbackError = error;
     throw error;
   } finally {
+    operationActive = false;
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     client.off?.("error", clientErrorListener);
     try {
