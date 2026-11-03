@@ -3185,7 +3185,11 @@ export default {
     const supabaseUrl = await readSecret(env.SUPABASE_URL);
     const supabasePublishableKey = await readSecret(env.SB_PUBLISHABLE_DEFAULT_KEY);
     const sbSecretKey = await readSecret(env.SB_SECRET_KEY);
-    const aqiHistoryUpstreamUrl = await readSecret(env.UK_AQ_AQI_HISTORY_R2_API_URL);
+    // Only the retained direct v2 compatibility route owns this setting.
+    // Selected-v3 charts and Service Binding requests do not resolve it.
+    const aqiHistoryUpstreamUrl = usingExternalAqiHistoryUpstream && !stationHistoryInternalRoute
+      ? await readSecret(env.UK_AQ_AQI_HISTORY_R2_API_URL)
+      : "";
     const observsHistoryR2ApiUrl = await readSecret(env.UK_AQ_OBSERVS_HISTORY_R2_API_URL);
     const latestSnapshotUpstreamUrl = await readSecret(env.UK_AQ_LATEST_SNAPSHOT_R2_API_URL);
     const postcodeLookupUpstreamUrl = await readSecret(env.UK_AQ_POSTCODE_LOOKUP_R2_API_URL);
@@ -3205,7 +3209,7 @@ export default {
     if (!usingExternalUpstream && (!supabaseUrl || !supabasePublishableKey)) {
       return makeErrorResponse(500, "missing_worker_secrets", requestOrigin, allowedOrigins);
     }
-    if (usingExternalAqiHistoryUpstream && !aqiHistoryUpstreamUrl) {
+    if (usingExternalAqiHistoryUpstream && !stationHistoryInternalRoute && !aqiHistoryUpstreamUrl) {
       return makeErrorResponse(500, "missing_aqi_history_upstream_url", requestOrigin, allowedOrigins);
     }
     if (usingExternalLatestSnapshotUpstream && !latestSnapshotUpstreamUrl) {

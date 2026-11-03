@@ -13,11 +13,6 @@ function boolFlag(value, fallback = false) {
   return ["1", "true", "yes", "on"].includes(text);
 }
 
-function validationMode(value) {
-  const mode = String(value ?? "off").trim().toLowerCase();
-  return ["off", "all", "sample"].includes(mode) ? mode : "off";
-}
-
 export const STATION_HISTORY_POLICY_DEFAULTS = Object.freeze({
   stableAqiHeadMaxHours: 168,
   aqiChunkMaxHours: 31 * 24,
@@ -27,8 +22,6 @@ export const STATION_HISTORY_POLICY_DEFAULTS = Object.freeze({
   ingestRetentionDays: 5,
   continuityEnabled: false,
   calculatedHistoryAqiEnabled: false,
-  aqiValidationMode: "off",
-  aqiValidationSamplePercent: 0,
 });
 
 export function resolveStationHistoryPolicy(env = {}) {
@@ -41,7 +34,5 @@ export function resolveStationHistoryPolicy(env = {}) {
     ingestRetentionDays: intInRange(env.INGESTDB_RETENTION_DAYS, STATION_HISTORY_POLICY_DEFAULTS.ingestRetentionDays, 1, 31),
     continuityEnabled: boolFlag(env.UK_AQ_STATION_HISTORY_CONTINUITY_ENABLED),
     calculatedHistoryAqiEnabled: boolFlag(env.UK_AQ_STATION_HISTORY_CALCULATED_HISTORY_AQI_ENABLED),
-    aqiValidationMode: validationMode(env.UK_AQ_STATION_HISTORY_AQI_VALIDATION_MODE),
-    aqiValidationSamplePercent: intInRange(env.UK_AQ_STATION_HISTORY_AQI_VALIDATION_SAMPLE_PERCENT, STATION_HISTORY_POLICY_DEFAULTS.aqiValidationSamplePercent, 0, 100),
   };
 }
