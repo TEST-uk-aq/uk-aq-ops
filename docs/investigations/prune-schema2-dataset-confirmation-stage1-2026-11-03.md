@@ -164,3 +164,47 @@ this TEST code milestone and its minimal versioned evidence field in system docs
 this task has not edited authoritative `system_docs/`. Before future activation,
 rollback is a code revert only. Never roll back a future selected scope to stale
 schema-1 authority or remove historical data/receipts as a code rollback.
+
+## PR #167 follow-up: completion lifetime after normal release
+
+The initial completion accessor checked only latched invalidation state. A normal
+release of the original lock could therefore leave an old handle apparently
+usable until another method detected the release. This is corrected without
+changing schema-1 preparation or any active gate/publication path.
+
+`describeObservationHistoryExactOnlyCompletionV3()` now freshly awaits the
+original publisher's held-operation assertion and each original inspector
+context's operation assertion. It then executes the synchronous evidence builder
+inside that continuation. `preparePruneOriginalFinalEvidenceWithExactOnlyCompletion()`
+is the explicit async schema-2 entry; the public synchronous
+`preparePruneOriginalFinalEvidence()` remains schema-1 compatible and rejects
+schema-2 handles/bytes. A detached description cannot enter its private schema-2
+builder. There are no new durable records, caches, file identity reads or Parquet
+inspections. Today's existing pre-change archive copies are reused unchanged.
+
+The directly targeted regression completes successfully, prepares evidence while
+the lock is held, releases the original lock normally, then calls schema-2
+preparation with the old handle **without first running an invalidating method**.
+Preparation rejects directly, with unchanged Parquet GET/HEAD counts. Existing
+completion checks use an asynchronous original lock assertion too.
+
+Follow-up validation: `node --check` on the two changed active modules and the
+changed test, direct imports, `git diff --check` and archive identity checks;
+**11 selected checks passed, zero failures/skips**, with the same process-local
+fixture environment documented above:
+
+```sh
+node --test --test-isolation=none tests/jsongen_prune_exact_only_completion.test.mjs
+# 7 pass, including the one new normal-release regression.
+node --test --test-isolation=none --test-name-pattern='pre-commit final preparation|COMMIT acknowledgement|default-off Prune completion|schema-2 committed' tests/jsongen_prune_pending_source.test.mjs tests/uk_aq_prune_history_gate.test.mjs tests/uk_aq_prune_committed_history_guard.test.mjs
+# 4 pass: synchronous schema-1 preparation, default-off completion,
+# lost/ROLLBACK COMMIT, and schema-2 operational rejection.
+```
+
+The later owning-writer integration must bind those existing assertions to the
+**original retained PostgreSQL session**, detecting normal release and session
+loss, and must await preparation while retaining that lock through the original
+protected gate/outbox transaction and acknowledged COMMIT. A preparatory helper
+cannot extend the owner's lock lifetime or make a precommit envelope into commit
+authority. No reacquisition or new confirmation gate is added here; all inactive
+schema-2, best-effort optional handover and source-deletion safeguards remain.

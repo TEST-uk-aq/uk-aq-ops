@@ -3,7 +3,8 @@ import test from 'node:test';
 import { gunzipSync } from 'node:zlib';
 import { sourceAndOriginalEvent } from './jsongen_prune_consumer_fixture.mjs';
 import { decodePruneMetadataEvidence } from '../scripts/jsongen/prune-metadata-codec.mjs';
-import { preparePruneOriginalFinalEvidence, attachPruneOriginalEvidenceBundleReference }
+import { preparePruneOriginalFinalEvidence, preparePruneOriginalFinalEvidenceWithExactOnlyCompletion,
+  attachPruneOriginalEvidenceBundleReference }
   from '../scripts/jsongen/prune-final-evidence.mjs';
 import { describePruneGateOutboxEvidence, preparePrunePostCommitHandover } from '../scripts/jsongen/prune-outbox.mjs';
 import { sha256Hex } from '../workers/shared/r2_sigv4.mjs';
@@ -43,7 +44,7 @@ async function fixture({ checksumHead = true, operationRunId = null } = {}) {
     const body = objects.get(key);
     return { key, exists: true, bytes: body.length, sha256: sha256Hex(body), etag: sha256Hex(body) };
   };
-  const assertOperationHeld = () => { if (!held) throw new Error('original lock lost'); };
+  const assertOperationHeld = async () => { if (!held) throw new Error('original lock lost'); };
   const prepared = await prepareObservationHistoryExactOnlyScopeV3({ scope: partition.scope,
     getObject, headObject: checksumHead ? headObject : null, assertOperationHeld });
   const run = { key: `history/v3/_ops/observations/runs/run_id=${event.row.run_id}/run_manifest.json`,
@@ -104,7 +105,7 @@ test('one actual file inspection survives final acceptance; existing envelope/ou
   assert.equal(f.count.heads, 8 * f.fileCount);
   assert.equal(f.count.finalize, 1);
   const args = f.evidenceArgs(completion);
-  const preparation = preparePruneOriginalFinalEvidence(args);
+  const preparation = await preparePruneOriginalFinalEvidenceWithExactOnlyCompletion(args);
   const extension = preparation.envelope.original_final_batch.exact_only_completion;
   assert.equal(extension.dataset_id, f.event.pendingRef.key);
   assert.equal(extension.invocation_id, f.event.row.run_id);
@@ -126,7 +127,7 @@ test('one actual file inspection survives final acceptance; existing envelope/ou
   assert.equal(handover.message.authority_state, 'requires_independent_authentication');
   assert.equal(handover.delivery_state, 'not_attempted');
   // Existing inline transport can also preserve the small versioned extension.
-  const inline = preparePruneOriginalFinalEvidence({ ...args, evidenceMode: 'inline' });
+  const inline = await preparePruneOriginalFinalEvidenceWithExactOnlyCompletion({ ...args, evidenceMode: 'inline' });
   assert.deepEqual(JSON.parse(inline.bytes).original_final_batch.exact_only_completion, extension);
 });
 
@@ -146,7 +147,7 @@ test('copied proofs, incomplete finalisation and the real inactive publisher can
   }), /schema-2 publication inactive/);
   assert.equal(f.count.mutations, 0);
   await assert.rejects(f.publication.completedPublication(), /finalisation.*incomplete/);
-  assert.throws(() => preparePruneOriginalFinalEvidence(f.evidenceArgs({})), /operation-local/);
+  await assert.rejects(preparePruneOriginalFinalEvidenceWithExactOnlyCompletion(f.evidenceArgs({})), /operation-local/);
 });
 
 test('changed pinned file or lost lock invalidates original proof and cannot resurrect completion', async () => {
@@ -159,7 +160,7 @@ test('changed pinned file or lost lock invalidates original proof and cannot res
     else f.setHeld(false);
     await assert.rejects(f.publication.completedPublication(), /changed pinned|lock lost/);
     f.objects.set(key, original); f.setHeld(true);
-    assert.throws(() => describeObservationHistoryExactOnlyCompletionV3(completion), /ended|usable/);
+    await assert.rejects(describeObservationHistoryExactOnlyCompletionV3(completion), /ended|usable/);
     await assert.rejects(f.publication.completedPublication(), /incomplete/);
   }
 });
@@ -176,7 +177,7 @@ test('mismatched source, batch and selected leaf bytes cannot prepare optional s
     a => { a.originalMetadataSnapshot.objects = a.originalMetadataSnapshot.objects.filter(o => o.key !== f.prepared.hierarchy.exact_leaves[0].key); },
   ]) {
     const args = f.evidenceArgs(completion); mutate(args);
-    assert.throws(() => preparePruneOriginalFinalEvidence(args), /JSONgen|operation-local/);
+    await assert.rejects(preparePruneOriginalFinalEvidenceWithExactOnlyCompletion(args), /JSONgen|operation-local/);
   }
 });
 
@@ -184,9 +185,29 @@ test('an index-only operation cannot confirm a historical observation event with
   const f = await fixture({ operationRunId: '11111111-1111-4111-8111-111111111111' });
   const before = Buffer.from(f.event.row.final_evidence_bytes);
   const completion = await f.complete();
-  assert.throws(() => preparePruneOriginalFinalEvidence(f.evidenceArgs(completion)), /differs from original frozen publication/);
+  await assert.rejects(preparePruneOriginalFinalEvidenceWithExactOnlyCompletion(f.evidenceArgs(completion)), /differs from original frozen publication/);
   // The index module has no PENDING upload, outbox or receipt writer. Its only
   // mutation entry is still hard-inactive; historical original bytes stay put.
   assert.deepEqual(f.event.row.final_evidence_bytes, before);
   assert.equal(f.count.mutations, 0);
+});
+
+test('normal original lock release rejects the old completion directly at evidence preparation', async () => {
+  const f = await fixture();
+  const completion = await f.complete();
+  const args = f.evidenceArgs(completion);
+  const prepared = await preparePruneOriginalFinalEvidenceWithExactOnlyCompletion(args);
+  assert.equal(prepared.envelope.original_final_batch.exact_only_completion.dataset_id, f.event.pendingRef.key);
+  const reads = { files: f.count.files, heads: f.count.heads };
+
+  // Normal release only: do not re-enter publication/proof methods or perform
+  // a failing recheck that could invalidate the cached handle before use.
+  f.setHeld(false);
+  await assert.rejects(preparePruneOriginalFinalEvidenceWithExactOnlyCompletion(args), /original lock lost/);
+  assert.deepEqual({ files: f.count.files, heads: f.count.heads }, reads);
+  assert.throws(() => preparePruneOriginalFinalEvidence(args), /asynchronous operation-bound/);
+  // Removing the handle or supplying its detached data cannot bypass the
+  // asynchronous boundary through the legacy synchronous schema-1 entry.
+  assert.throws(() => preparePruneOriginalFinalEvidence({ ...args, exactOnlyCompletion: null }),
+    { code: 'PRUNE_EXACT_ONLY_DURABLE_HANDOVER_UNSUPPORTED' });
 });

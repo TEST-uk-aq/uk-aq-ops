@@ -14,7 +14,6 @@ import {
 } from "./uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import {
   assertObservationHistoryExactOnlyProofOperationV3,
-  assertObservationHistoryExactOnlyProofUsableV3,
   recheckObservationHistoryExactOnlyProofV3,
   acceptObservationHistoryExactOnlyScopeV3,
 } from "./uk_aq_observation_history_exact_only_verifier_v3.mjs";
@@ -25,12 +24,19 @@ const completions = new WeakMap();
 // A completion is only a transient original-writer snapshot for the optional
 // existing outbox. Copies/JSON cannot assert completion, and this is never a
 // source-deletion permission or an independently authenticated DB commit.
-export function describeObservationHistoryExactOnlyCompletionV3(completion) {
+// Fresh liveness checks use the original publisher and inspector contexts. Run
+// synchronous evidence preparation here, without handing a detached description
+// back across an await before it is consumed. The owner must retain its session
+// lock until preparation and the original protected gate transaction finish.
+export async function describeObservationHistoryExactOnlyCompletionV3(completion,
+  prepare = description => description) {
   const state = completions.get(completion);
   if (!state) throw new Error("missing completed operation-local exact-only publication");
   state.assertUsable();
-  for (const proof of state.proofs) assertObservationHistoryExactOnlyProofUsableV3(proof);
-  return structuredClone(state.description);
+  await state.assertHeld();
+  for (const proof of state.proofs) await assertObservationHistoryExactOnlyProofOperationV3(proof);
+  state.assertUsable();
+  return prepare(structuredClone(state.description));
 }
 function id(o) { return { key: o.key, byte_size: o.byte_size, sha256: o.sha256 }; }
 function same(a, b, label) {
@@ -214,7 +220,7 @@ export async function prepareObservationHistoryExactOnlyPublicationV3({
       await held();
       const completion = Object.freeze({});
       const run = completedRun;
-      completions.set(completion, { proofs: reports,
+      completions.set(completion, { proofs: reports, assertHeld: held,
         assertUsable() {
           if (lost || failed || completedRun !== run) throw new Error("exact-only completion operation ended or changed");
         }, description: {

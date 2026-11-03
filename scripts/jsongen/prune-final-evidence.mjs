@@ -13,7 +13,11 @@ import { describeObservationHistoryExactOnlyCompletionV3 }
 
 // This boundary owns only the existing original envelope. Merely retaining
 // schema-2 JSON bytes cannot attest an independently completed direct proof.
-export function assertPruneOriginalExactEvidenceV3(objects = [], completion = null) {
+export function assertPruneOriginalExactEvidenceV3(objects = []) {
+  return originalExactEvidence(objects);
+}
+
+function originalExactEvidence(objects = [], description = null) {
   const exactOnly = [];
   for (const object of objects) {
     if (!object.roles?.includes('exact_v3_index')) continue;
@@ -23,11 +27,10 @@ export function assertPruneOriginalExactEvidenceV3(objects = [], completion = nu
     if (format.schema_version === 2) exactOnly.push(reference(object));
   }
   if (!exactOnly.length) {
-    if (completion) throw new Error('Exact-only completion lacks original schema-2 index bytes');
+    if (description) throw new Error('Exact-only completion lacks original schema-2 index bytes');
     return null;
   }
-  if (!completion) rejectExactOnlyOriginalHandoverV3();
-  const description = describeObservationHistoryExactOnlyCompletionV3(completion);
+  if (!description) rejectExactOnlyOriginalHandoverV3();
   return { description, exactOnly };
 }
 
@@ -39,10 +42,23 @@ const reference = value => value && typeof value.key === 'string'
 const references = values => (Array.isArray(values) ? values : [])
   .map(reference).filter(Boolean).sort((a, b) => a.key.localeCompare(b.key));
 
-export function preparePruneOriginalFinalEvidence({ pending, connector, finalization,
+// Preserve the synchronous schema-1 interface. Schema 2 must freshly establish
+// original operation liveness through the async entry below; a retained handle
+// or detached description cannot enter this synchronous public path.
+export function preparePruneOriginalFinalEvidence(args) {
+  if (args.exactOnlyCompletion) throw new Error('Schema-2 completion requires asynchronous operation-bound preparation');
+  return prepareOriginalFinalEvidence(args);
+}
+
+export async function preparePruneOriginalFinalEvidenceWithExactOnlyCompletion(args) {
+  return await describeObservationHistoryExactOnlyCompletionV3(args.exactOnlyCompletion,
+    description => prepareOriginalFinalEvidence(args, description));
+}
+
+function prepareOriginalFinalEvidence({ pending, connector, finalization,
   runId, dayUtc, connectorId, writerGitSha, sourceIdentity, originalMetadataSnapshot = null,
-  originalAuthorityCapture = null, evidenceMode = 'inline', exactOnlyCompletion = null }) {
-  const exactOnly = assertPruneOriginalExactEvidenceV3(originalMetadataSnapshot?.objects, exactOnlyCompletion);
+  originalAuthorityCapture = null, evidenceMode = 'inline' }, exactOnlyDescription = null) {
+  const exactOnly = originalExactEvidence(originalMetadataSnapshot?.objects, exactOnlyDescription);
   if (pending?.state !== 'put_acknowledged_unverified'
     || pending.pending_evidence?.writer?.invocation_id !== runId
     || pending.pending_evidence?.connector_id !== connectorId
