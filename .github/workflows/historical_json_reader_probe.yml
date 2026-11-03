@@ -30,7 +30,7 @@ jobs:
           let url;
           try { url = new URL(raw); } catch { process.exit(1); }
           if (url.protocol !== 'https:' || !/^[a-z0-9-]+\.sleepercar\.co\.uk$/.test(url.hostname)
-              || url.origin !== raw || url.port || url.username || url.password
+              || url.origin !== raw.replace(/\/$/, '') || url.port || url.username || url.password
               || url.pathname !== '/' || url.search || url.hash) {
             console.error('TEST upstream must be a clean HTTPS Sleepercar origin.');
             process.exit(1);
