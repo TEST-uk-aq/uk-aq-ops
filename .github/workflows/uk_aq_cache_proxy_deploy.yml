@@ -17,9 +17,9 @@ on:
         default: ""
         type: string
       activate_compressed_chart_history:
-        description: "Opt in to the TEST compressed-chart service binding after its private Worker exists"
+        description: "Enable the verified TEST compressed-chart upstream (default on for TEST manual runs)"
         required: false
-        default: false
+        default: true
         type: boolean
 
 permissions:
@@ -32,6 +32,10 @@ jobs:
       UK_AQ_CACHE_WORKER_NAME: ${{ vars.UK_AQ_CACHE_WORKER_NAME || 'uk-aq-cache-proxy' }}
       UK_AQ_STATION_HISTORY_WORKER_NAME: ${{ vars.UK_AQ_STATION_HISTORY_WORKER_NAME || '' }}
       UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME || '' }}
+      # TEST automatically enables the verified private JSON upstream; manual
+      # dispatch can explicitly disable it for a single deployment.
+      # No environment-specific upstream address or token is stored in source.
+      ENABLE_COMPRESSED_CHART_HISTORY: ${{ vars.UK_AQ_ENV_NAME == 'TEST' && (github.event_name != 'workflow_dispatch' || inputs.activate_compressed_chart_history) && 'true' || 'false' }}
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
       UK_AQ_MEDIA_PUBLIC_URL: ${{ vars.UK_AQ_MEDIA_PUBLIC_URL || '' }}
       STATION_HISTORY_SERVICE_OVERRIDE: ${{ inputs.station_history_service_override || '' }}
@@ -128,8 +132,8 @@ jobs:
             exit 1
           fi
 
-      - name: Verify and enable optional Sleepercar compressed-chart HTTPS upstream
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.activate_compressed_chart_history }}
+      - name: Verify and enable configured TEST compressed-chart HTTPS upstream
+        if: ${{ env.ENABLE_COMPRESSED_CHART_HISTORY == 'true' }}
         working-directory: workers/uk_aq_cache_proxy
         env:
           PILOT_ORIGIN: ${{ vars.UK_AQ_COMPRESSED_CHART_UPSTREAM_URL || '' }}
@@ -177,7 +181,7 @@ jobs:
           }
           sed -i 's/^UK_AQ_COMPRESSED_CHART_ENABLED = "false"$/UK_AQ_COMPRESSED_CHART_ENABLED = "true"/' wrangler.deploy.toml
           grep -Fx 'UK_AQ_COMPRESSED_CHART_ENABLED = "true"' wrangler.deploy.toml >/dev/null
-          echo "Validated Sleepercar pilot; HTTPS proxy enabled for this explicit deployment."
+          echo "Validated protected Sleepercar upstream; compressed-chart proxy enabled for this TEST deployment."
 
       - name: Validate required Worker secrets and vars
         run: |
@@ -278,8 +282,7 @@ jobs:
           if [ -n "${RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN}" ]; then
             secrets_json="$(jq --arg value "${RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN}" '. + {UK_AQ_RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN: $value}' <<<"$secrets_json")"
           fi
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] &&
-             [ "${{ inputs.activate_compressed_chart_history }}" = "true" ]; then
+          if [ "${ENABLE_COMPRESSED_CHART_HISTORY}" = "true" ]; then
             secrets_json="$(jq \
               --arg origin "${PILOT_ORIGIN}" \
               --arg id "${PILOT_ACCESS_ID}" \
