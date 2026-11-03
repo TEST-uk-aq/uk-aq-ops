@@ -55,6 +55,7 @@ export async function consumePruneAcceptance({ reader, key, derivedR2, mode = 'r
     Object.assign(result, { original_evidence: authentication.original_final_evidence,
       pending_source: authentication.pending_source, physical_scope_count: authentication.physical_scope_count,
       observation_count: authentication.observation_count, authentication,
+      ...(authentication.dataset_id ? { dataset_id: authentication.dataset_id, dataset_state: authentication.dataset_state } : {}),
       receipt_eligible: authentication.receipt_eligible, missing_authority: authentication.missing_authority });
     // Stage 1 stops before constructing ANY receipt. Unsupported observations
     // remain authenticated/accounted in coverage, never admitted to schema 2.

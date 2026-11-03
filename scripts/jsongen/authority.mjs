@@ -21,6 +21,8 @@ import { assertScope, assertReference, scopeKey, same, canonicalJson, BUCKET } f
 import { createBudget, createInspectionBudget, evidence, parseJson, freeze, INSPECTION_CONCURRENCY, JSONgenEvidenceError } from './limits.mjs';
 import { planInspection, planMetadataRequests } from './inspection-plan.mjs';
 import { inspectionMap } from './inspection-runtime.mjs';
+import { exactLeafFormatV3, assertExactLeafKeyV3 } from '../../workers/shared/uk_aq_observation_history_exact_leaf_format_v3.mjs';
+import { exactMetadataArtifact, authenticateExactOnlyMetadata } from './exact-only-metadata.mjs';
 
 const inspectionSessions = new WeakSet();
 
@@ -250,6 +252,38 @@ export async function readCanonicalScopes({ r2, generation, bindingPrefix = null
   const exact = async (scope, h) => {
     const id = scope.identity; const suffix = `day_utc=${scope.day_utc}/connector_id=${id.connector_id}/pollutant_code=${id.pollutant_code}`;
     const manifest = await read(`${indexRoot}/${suffix}/manifest.json`); inspectIndex(manifest);
+    const format = exactLeafFormatV3(manifest.value);
+    if (format.schema_version === 2) return await memo(`exact_only:${manifest.reference.key}`, async () => {
+      const tuples = Object.entries(manifest.value.leaves_by_timeseries_id || {});
+      evidence(tuples.length > 0 && tuples.length <= 1024, 'resource_limit', 'Complete exact-only scope exceeds metadata inspection capacity');
+      for (const [series, tuple] of tuples) {
+        evidence(/^[1-9]\d*$/.test(series) && Array.isArray(tuple) && tuple.length === 3,
+          'invalid_canonical_metadata', 'Invalid exact-only leaf membership');
+        assertExactLeafKeyV3(tuple[0], indexRoot, suffix, Number(series), format);
+        assertReference({ bucket: r2.bucket, key: tuple[0], byte_size: tuple[1], sha256: tuple[2] });
+      }
+      if (session) session.admitExactOnlyLeaves(tuples.map(([, t]) => t[0]));
+      const leaves = [];
+      for (const [, t] of tuples) {
+        const object = await pinned({ key: t[0], byte_size: t[1], sha256: t[2] }); inspectIndex(object);
+        leaves.push(exactMetadataArtifact({ ...object, canonicalSource: manifest.value.canonical_source_manifest }, 'leaf'));
+      }
+      const selector = exactMetadataArtifact(manifest);
+      authenticateExactOnlyMetadata({ selector, leaves, canonical: h.pollutant, canonicalReference: h.chain.at(-1),
+        scope: { day_utc: scope.day_utc, connector_id: id.connector_id, pollutant_code: id.pollutant_code } });
+      return { manifest, leaves };
+    }).then(({ manifest: selected, leaves }) => {
+      const leaf = leaves.find(l => l.payload.timeseries_id === id.timeseries_id);
+      evidence(leaf, 'invalid_canonical_metadata', 'Requested physical scope absent from exact-only selector');
+      return { membership: 'present', row_count: leaf.payload.row_count,
+        physical_identity: { history_schema_version: selected.value.history_schema_version,
+          writer_version: selected.value.writer_version, physical_layout_version: selected.value.physical_layout_version },
+        scope_sha256: physicalScopeDigest(scope, leaf.payload), index: selected.reference,
+        leaf: { bucket: r2.bucket, key: leaf.key, sha256: leaf.sha256, byte_size: leaf.byte_size },
+        exact_index_schema_version: 2,
+        canonical_source: { bucket: r2.bucket, key: h.chain.at(-1).key,
+          sha256: h.chain.at(-1).sha256, byte_size: h.chain.at(-1).byte_size } };
+    });
     const aligned = await pinned(manifest.value.source_aligned_scoped_manifest); inspectIndex(aligned);
     evidence(aligned.reference.key === `${indexRoot}/_aligned/${suffix}/manifest.json`, 'invalid_canonical_metadata', 'wrong aligned scope');
     const source = aligned.value.canonical_source_manifest;
@@ -480,7 +514,7 @@ export async function readCanonicalScopePages({ scopes, budget = createInspectio
   const selection = planInspection(scopes, partitionIndex, budget.limits.scopes);
   const byKey = new Map(scopes.map(s => [scopeKey(s), s]));
   const selected = selection.selected_scope_keys.map(key => byKey.get(key));
-  const requestPlan = planMetadataRequests(selected, canonical.generation);
+  let requestPlan = planMetadataRequests(selected, canonical.generation);
   budget.configureMetadataLimit(requestPlan.metadata_get_allowance);
   const session = { cache: new Map(), provenance: new Map(), missing: new Map(), inflight: new Map(),
     memo: new Map(), indexed: new WeakSet(), controller: new AbortController(), closed: false, failure: null,
@@ -488,6 +522,13 @@ export async function readCanonicalScopePages({ scopes, budget = createInspectio
     stats: { initial_gets: 0, recheck_gets: 0, closing_root_gets: 0,
       initial_bytes: 0, recheck_bytes: 0, closing_root_bytes: 0, cache_bytes: 0, peak_concurrency: 0 } };
   session.plannedKeys = new Set(requestPlan.deterministic_keys);
+  session.admitExactOnlyLeaves = keys => {
+    const leaves = [...new Set([...(requestPlan.exact_only_leaf_keys || []), ...keys])];
+    const expanded = planMetadataRequests(selected, canonical.generation, leaves);
+    budget.configureMetadataLimit(expanded.metadata_get_allowance);
+    session.plannedKeys = new Set(expanded.deterministic_keys);
+    requestPlan = expanded;
+  };
   session.connectors = new Set(selected.map(s => s.identity.connector_id));
   const previousMetadataGets = budget.snapshot().metadata_gets;
   const previousMetadataBytes = budget.snapshot().metadata_bytes;

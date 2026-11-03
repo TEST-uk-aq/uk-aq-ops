@@ -1,6 +1,7 @@
 import { getObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "./uk_aq_observation_history_generation.mjs";
 // @ts-nocheck -- post-cutover-only Node writer shared by every canonical source.
 import { Buffer } from "node:buffer";
+import { preparePruneExactOnlyConnectorScopesV3 } from './uk_aq_observation_history_exact_only_publication_v3.mjs';
 
 import {
   buildObservationHistoryIndexV3PublicationPlan,
@@ -1308,6 +1309,7 @@ export async function runObservationHistoryV3ConnectorPublication({
   beforePublicationStage,
   lockTimeoutMs,
   prepareCompleteDayReplacement = null,
+  originalOperation = null,
   exactV3PublicationConcurrency =
     DEFAULT_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY,
   selectedScopeRemovalAuthority = null,
@@ -1492,6 +1494,9 @@ export async function runObservationHistoryV3ConnectorPublication({
         });
         throw error;
       }
+      const exactOnlyPreparedScopes = normalizedSource === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily
+        ? await preparePruneExactOnlyConnectorScopesV3({ partitions: partitionResults, canonical,
+          originalOperation, getObject: async ({ key }) => ({ ...await getObject({ key }), key }) }) : [];
       const exactFields = {
         publication_stage: "exact_v3_connector_publication",
         day_utc: group.day_utc,
@@ -1593,6 +1598,7 @@ export async function runObservationHistoryV3ConnectorPublication({
         canonical,
         removal_results: canonical.removal_results,
         v3_exact_publication: exact.publication,
+        ...(exactOnlyPreparedScopes.length ? { exact_only_prepared_scopes: exactOnlyPreparedScopes } : {}),
       });
     });
     connectorResults.push(result);

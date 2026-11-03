@@ -18,6 +18,9 @@ import { validateCanonicalHistoryV2Manifest } from '../../workers/shared/uk_aq_r
 import { validateObservationHistoryExactLeafArtifactV3, validateObservationHistoryExactLeafScopedManifestArtifactV3 }
   from '../../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs';
 
+import { exactLeafFormatV3 } from '../../workers/shared/uk_aq_observation_history_exact_leaf_format_v3.mjs';
+import { authenticatePruneExactOnlyCompletion } from './prune-exact-only-authentication.mjs';
+
 // Retained for precise diagnostics on legacy incomplete events only.
 export const PRUNE_RECEIPT_AUTHORITY_GAPS = freeze([
   { code: 'original_before_membership_not_retained', field: 'scopes[].before',
@@ -100,6 +103,7 @@ function bindOriginalPublication(e, row, source, metadata, onStage) {
     && manifest.file_count === Number(row.history_file_count) && manifest.total_bytes === Number(row.history_total_bytes),
   'connector_manifest.accepted_identity');
   const expected = source.scope.pollutant_partitions;
+  const schema2Roots = [];
   check(Array.isArray(c.pollutant_manifests) && c.pollutant_manifests.length === expected.length
     && new Set(c.pollutant_manifests.map(p => p.pollutant_code)).size === expected.length,
   'complete_pollutant_partition_membership');
@@ -150,6 +154,10 @@ function bindOriginalPublication(e, row, source, metadata, onStage) {
       return { kind, publication_stage: stage, key: reference.key, sha256: reference.sha256,
         byte_size: reference.byte_size, body: Buffer.from(object.bytes_base64, 'base64').toString(), payload };
     };
+    if (exactLeafFormatV3(index).schema_version === 2) {
+      schema2Roots.push(roots[0]);
+      continue; // Direct canonical/file/leaf authentication below, never aligned reinterpretation.
+    }
     const aligned = metadata.lookup(index.source_aligned_scoped_manifest, 'exact_v3_index');
     check(aligned.canonical_source_manifest?.key === p.manifest.key
       && aligned.canonical_source_manifest.sha256 === p.manifest.sha256
@@ -178,6 +186,7 @@ function bindOriginalPublication(e, row, source, metadata, onStage) {
       'observation_history_index_v3_exact_leaf_scoped_manifest', 'scoped_manifest'), exactLeaves: leaves });
   }
   check(c.scoped_roots.length === expected.length, 'complete_exact_scope_membership');
+  return schema2Roots;
 }
 
 function authenticateFinalHierarchy(e, row, metadata) {
@@ -391,9 +400,11 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
     && row.original_source_status_provenance === unsigned.original_source_status.classification,
   'complete_source_scope_and_status_provenance');
   onStage('original_publication_references');
-  bindOriginalPublication(e, row, unsigned, metadata, onStage);
+  const schema2Roots = bindOriginalPublication(e, row, unsigned, metadata, onStage);
   onStage('original_final_hierarchy');
   const root = authenticateFinalHierarchy(e, row, metadata);
+  onStage('original_exact_only_completion');
+  const datasetId = authenticatePruneExactOnlyCompletion({ envelope: e, row, metadata, source: unsigned, schema2Roots });
   onStage('original_physical_scope_binding');
   const original = authenticatePruneOriginalAuthority({ envelope: e, row, source: unsigned,
     budget, bundleMode });
@@ -429,7 +440,8 @@ export async function authenticatePruneHandover({ acceptance, derivedR2, budget 
     final_evidence_byte_size: Number(row.final_evidence_byte_size), post_commit_reference_sha256: acceptance.post_commit_reference.sha256 };
   const result = freeze({ state: 'authenticated', event_id: acceptance.event_id, key: acceptance.key,
     original_gate: 'authenticated_committed_immutable_outbox', original_final_evidence: 'authenticated_original_prune_attestation',
-    pending_source: 'source_bytes_verified', physical_scope_count: unsigned.scope.physical_timeseries_days.length,
+    pending_source: 'source_bytes_verified',
+    ...(datasetId ? { dataset_id: datasetId, dataset_state: 'CONFIRMED' } : {}), physical_scope_count: unsigned.scope.physical_timeseries_days.length,
     observation_count: unsigned.original_ndjson.row_count,
     effective_status: 'original_schema3_embedded_status_bound',
     source_status: unsigned.original_source_status.classification,

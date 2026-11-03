@@ -11,6 +11,11 @@ export function currentScopeMatch(change, item, canonical) {
   if (now.physical.membership === 'authoritative_absent') return item.declared_state === 'authoritative_empty' ? 'matches' : 'differs';
   if (now.verification?.state !== 'embedded_status_requires_writer_evidence'
     || original.effective_status !== 'original_schema3_embedded_status_bound') return 'unavailable';
+  // An index-only format change is no new observation event. Keep the original
+  // receipt immutable and require the exact same root-authenticated canonical
+  // source bytes plus the existing physical digest before accepting equivalence.
+  if (now.physical.exact_index_schema_version === 2 && !same(original.index, now.physical.index)
+    && !same(item.declared_scope.after.authority, now.physical.canonical_source)) return 'unavailable';
   return item.declared_state === 'present' && item.declared_scope.after.row_count === now.physical.row_count
     && original.physical_sha256 === now.physical.scope_sha256 && same(original.binding, now.binding)
     ? 'matches' : 'differs';
