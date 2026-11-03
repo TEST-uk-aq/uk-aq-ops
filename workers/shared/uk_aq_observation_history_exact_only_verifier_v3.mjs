@@ -131,7 +131,11 @@ function context({ getObject, headObject = null, assertOperationHeld }) {
       throw error;
     }
   }
-  return { read, held, pins, recheck };
+  return { read, held, pins, recheck,
+    invalidate() { invalidated = true; },
+    assertUsable() {
+      if (lost || invalidated) throw new Error("direct verification proof is no longer usable");
+    } };
 }
 
 function aliases(parent, collection, identifier) {
@@ -381,6 +385,25 @@ export async function verifyObservationHistoryExactOnlyScopeV3({
   const ctx = context({ getObject, headObject, assertOperationHeld });
   const source = await canonicalSource(ctx, scope, expectedRoot);
   const metadata = await physicalMetadata(ctx, source.payload, scope);
+  return await verifiedScope({ ctx, scope, source, metadata, hierarchy, indexRoot });
+}
+
+// Complete root/index acceptance reuses the actual-byte inspection from child
+// preparation. Its original context pins the source body, files and lock session;
+// no caller-provided metadata, new adapters or cross-operation cache is admitted.
+export async function acceptObservationHistoryExactOnlyScopeV3(preparedProof) {
+  const proof = physicalProofs.get(preparedProof);
+  if (!proof) throw new Error("missing operation-local direct verification proof");
+  const { ctx, scope, metadata, indexRoot } = proof;
+  try {
+    await ctx.held();
+    const source = await canonicalSource(ctx, scope);
+    equal(source.descriptor, proof.source, "prepared canonical source");
+    return await verifiedScope({ ctx, scope, source, metadata, hierarchy: null, indexRoot });
+  } catch (error) { ctx.invalidate(); throw error; }
+}
+
+async function verifiedScope({ ctx, scope, source, metadata, hierarchy, indexRoot }) {
   const selected = hierarchy || await readStoredExactOnlyHierarchy(ctx, scope, source, indexRoot);
   reconcile(selected, source.descriptor, metadata, indexRoot);
   for (const leaf of selected.exact_leaves) for (const file of leaf.payload.files) {
@@ -389,16 +412,29 @@ export async function verifyObservationHistoryExactOnlyScopeV3({
   await ctx.recheck();
   const report = Object.freeze({ verifier_version: EXACT_ONLY_DIRECT_VERIFIER_V3,
     inspector: OBSERVATION_HISTORY_OFFLINE_INSPECTOR_V3, scope: Object.freeze({ ...scope }),
-    canonical_chain: Object.freeze(source.chain), canonical_source_manifest: Object.freeze(source.descriptor),
+    canonical_chain: Object.freeze(source.chain.map(ref => Object.freeze(ref))),
+    canonical_source_manifest: Object.freeze(source.descriptor),
     selector: Object.freeze(identity(selected.scoped_manifest)),
     leaves: Object.freeze(selected.exact_leaves.map((l) => Object.freeze(identity(l)))),
     files: Object.freeze(metadata.files.map((f) => Object.freeze({ ...descriptor(f), etag: ctx.pins.get(f.key).etag }))),
     row_count: metadata.row_count, canonical_hierarchy_complete: true, stored_selection_verified: hierarchy === null,
     finalisation_complete: false, source_to_final_verified: false,
     file_identity_proof: "authenticated_complete_body_sha256",
+    physical_identity: Object.freeze({ history_schema_version: metadata.history_schema_version,
+      writer_version: metadata.writer_version, physical_layout_version: metadata.physical_layout_version,
+      decode_profile_id: metadata.decode_profile.version }),
   });
-  physicalProofs.set(report, { ctx, hierarchy: selected, source: source.descriptor, metadata, indexRoot });
+  physicalProofs.set(report, { ctx, scope: Object.freeze({ ...scope }), hierarchy: selected,
+    source: source.descriptor, metadata, indexRoot });
   return report;
+}
+
+// Shape/provenance guard for an already completed original operation snapshot.
+// Does not refresh identities or replace the owning writer's live lock checks.
+export function assertObservationHistoryExactOnlyProofUsableV3(report) {
+  const proof = physicalProofs.get(report);
+  if (!proof) throw new Error("missing operation-local direct verification proof");
+  proof.ctx.assertUsable();
 }
 
 // Only operation liveness, not current object identity or physical inspection.
@@ -413,7 +449,7 @@ export async function assertObservationHistoryExactOnlyProofOperationV3(report) 
 // Opaque operation-local proof: serialised/copied reports cannot admit a write.
 // Recheck current identities and complete prepared artifact consistency. This
 // reuses inspection evidence, not a new full physical inspection; the latter
-// remains mandatory in verifyObservationHistoryExactOnlyScopeV3().
+// remains mandatory when no original operation-local inspection exists.
 export async function recheckObservationHistoryExactOnlyProofV3(report) {
   const proof = physicalProofs.get(report);
   if (!proof) throw new Error("missing operation-local direct verification proof");
@@ -450,7 +486,7 @@ export async function prepareObservationHistoryExactOnlyScopeV3({ scope, getObje
     leaves: Object.freeze(hierarchy.exact_leaves.map((l) => Object.freeze(identity(l)))),
     canonical_hierarchy_complete: false, finalisation_complete: false, source_to_final_verified: false,
   });
-  physicalProofs.set(proof, { ctx, hierarchy, source, metadata,
+  physicalProofs.set(proof, { ctx, scope: Object.freeze({ ...scope }), hierarchy, source, metadata,
     indexRoot: generation.observations_timeseries_index_prefix });
   return Object.freeze({ hierarchy, proof });
 }
