@@ -1,7 +1,7 @@
 // Preparatory schema-2 publication integration. The shared finaliser has a hard
 // inactive gate; the owning Prune writer can prepare but cannot enable it.
 import { Buffer } from "node:buffer";
-import { sha256Hex } from "./r2_sigv4.mjs";
+import { sha256Hex, isStrongR2Etag, r2PutObjectConditional } from "./r2_sigv4.mjs";
 import { getObservationHistoryGeneration } from "./uk_aq_observation_history_generation.mjs";
 import { exactLeafFormatV3 } from "./uk_aq_observation_history_exact_leaf_format_v3.mjs";
 import { validatePhaseBV3RunFinalizationResult, pruneBatchFinalizationIdentityV3 }
@@ -70,7 +70,7 @@ function storedArtifact(object, kind, stage) {
 // Initial actual-byte inspection is here; the later pre-gate adapter reuses its
 // opaque same-session proof rather than inspecting Parquet again for handover.
 export async function preparePruneExactOnlyConnectorScopesV3({ partitions, canonical,
-  originalOperation, getObject }) {
+  originalOperation, getObject, headObject = null }) {
   const selected = partitions.filter(p => exactLeafFormatV3(p.v3_hierarchy.scoped_manifest.payload).schema_version === 2);
   if (!selected.length) return [];
   if (selected.length !== partitions.length) throw new Error('Incomplete Prune exact-only connector source selection');
@@ -81,7 +81,7 @@ export async function preparePruneExactOnlyConnectorScopesV3({ partitions, canon
   const prepared = [];
   for (const partition of selected) {
     const scope = await prepareObservationHistoryExactOnlyScopeV3({ scope: partition.scope,
-      originalOperation, getObject });
+      originalOperation, getObject, headObject });
     const canonicalRef = canonical.pollutant_manifests.find(r => r.key === scope.proof.canonical_source_manifest.key);
     same(id(canonicalRef || {}), id(scope.proof.canonical_source_manifest), 'owning writer canonical child');
     same(id(scope.hierarchy.scoped_manifest), id(partition.v3_hierarchy.scoped_manifest), 'owning writer prepared selector');
@@ -344,5 +344,180 @@ export async function prepareObservationHistoryExactOnlyPublicationV3({
     // durable-evidence adapter. There is no opt-in argument or env switch.
     finalize: (adapters) => finalizeObservationHistoryIndexV3Publication({ ...adapters,
       plan, exactOnlyLifecycle: lifecycle, publicationConcurrency: 1 }),
+  });
+}
+// Internal, adapter-only Prune publication. This deliberately does not call or
+// enable the hard-disabled shared schema-2 finaliser. The owning split writer
+// captures selectors BEFORE canonical writes and retains this closure only in
+// its original operation. It is not a conversion or cross-invocation recovery API.
+export function createDormantPruneExactOnlyPublicationV3({ originalOperation, r2,
+  getObject, recordDurableEvidence }) {
+  if (!r2?.adapter || typeof r2.adapter.putObjectConditional !== 'function'
+    || typeof getObject !== 'function' || typeof recordDurableEvidence !== 'function'
+    || typeof originalOperation?.assertHeld !== 'function') {
+    throw new Error('Dormant Prune publication requires isolated injected adapters and original operation');
+  }
+  let lost = false;
+  let batchLatest = null;
+  const scopes = new Map();
+  const held = async () => {
+    if (lost) throw originalOperationError('dormant publication original session lost');
+    try {
+      if (await originalOperation.assertHeld('publication') === false) throw originalOperationError('session not held');
+    } catch (error) { lost = true; throw error; }
+  };
+  const read = async key => {
+    await held(); const object = await getObject({ key }); await held();
+    const pin = snapshot(object, key);
+    if (pin.exists && !isStrongR2Etag(pin.etag)) throw new Error('Conditional publication requires a strong current ETag');
+    return { object, pin };
+  };
+  const exact = (object, artifact) => {
+    const pin = snapshot(object, artifact.key);
+    same(id(pin), id(artifact), 'immutable/selected bytes');
+    if (!Buffer.from(object.body).equals(Buffer.from(artifact.body))) throw new Error('Exact publication bytes differ');
+    return pin;
+  };
+  // One conditional attempt, followed by authoritative readback. No blind
+  // retry, rollback, or GET/ordinary-PUT claimed as atomic compare-and-swap.
+  const write = async (artifact, expected, attempt) => {
+    if (attempt.blocked) throw new Error('Conditional publication conflict requires explicit recovery');
+    const before = await read(artifact.key);
+    if (attempt.started) {
+      if (before.pin.exists && before.pin.sha256 === artifact.sha256) {
+        const pin = exact(before.object, artifact);
+        if (attempt.etag) same(pin.etag, attempt.etag, 'original write object identity');
+        return pin;
+      }
+      // If the original write did not land, only its unchanged predecessor may
+      // be retried. Any other authority requires explicit external recovery.
+    }
+    same(before.pin, expected, 'previous selector/object identity');
+    attempt.started = true;
+    let outcome;
+    try {
+      await held();
+      outcome = await r2PutObjectConditional({ r2, key: artifact.key, body: Buffer.from(artifact.body),
+        sha256: artifact.sha256, content_type: artifact.content_type || 'application/json',
+        ...(expected.exists ? { if_match: expected.etag } : { if_none_match: '*' }) });
+      attempt.etag = outcome.etag;
+      await held();
+    } catch (error) {
+      // Even rejected/ambiguous attempts require identity readback. A failed
+      // precondition never authorises accepting another writer's selection.
+      const current = await read(artifact.key);
+      if (error.code !== 'R2_WRITE_AMBIGUOUS') { attempt.blocked = true; throw error; }
+      const pin = exact(current.object, artifact);
+      attempt.etag = pin.etag;
+      return pin;
+    }
+    const current = await read(artifact.key);
+    const pin = exact(current.object, artifact);
+    same(pin.etag, outcome.etag, 'conditional write readback identity');
+    return pin;
+  };
+  const verifyLeaves = async state => {
+    for (const leaf of state.prepared.hierarchy.exact_leaves) {
+      const current = await read(leaf.key);
+      exact(current.object, leaf);
+      same(current.pin, state.leaves.get(leaf.key), 'verified immutable object identity');
+    }
+  };
+  return Object.freeze({ held,
+    async beginBatch() {
+      await this.recheck();
+      const current = await read(generation.observations_timeseries_latest_key);
+      if (!batchLatest) batchLatest = { original: current.pin, attempt: {}, artifact: null };
+      else if (batchLatest.artifact && current.pin.exists && current.pin.sha256 === batchLatest.artifact.sha256) {
+        exact(current.object, batchLatest.artifact);
+        if (batchLatest.attempt.etag) same(current.pin.etag, batchLatest.attempt.etag, 'original latest write identity');
+      } else same(current.pin, batchLatest.original, 'original latest retry identity');
+    },
+    async capture(partitions) {
+      for (const partition of partitions) {
+        const artifact = partition.v3_hierarchy.scoped_manifest;
+        if (scopes.has(artifact.key)) throw new Error('Duplicate dormant Prune scope');
+        const { pin, object } = await read(artifact.key);
+        if (pin.exists) {
+          if (exactLeafFormatV3(JSON.parse(Buffer.from(object.body).toString('utf8'))).schema_version === 2) {
+            throw new Error('Already selected schema-2 scope requires original-attempt recovery authority');
+          }
+          // This is a first-publication owner, never index-only conversion.
+          // Existing schema-1 selector bytes remain pinned until the switch.
+        }
+        scopes.set(artifact.key, { original: pin, expected: id(artifact), prepared: null,
+          selected: null, attempt: {}, leaves: new Map(), leafAttempts: new Map() });
+      }
+    },
+    async publish({ preparedScopes, plan }) {
+      // Validate the existing publication graph and the original scope set;
+      // leaves from ALL scopes are durable before ANY selector is changed.
+      const states = preparedScopes.map(prepared => {
+        const state = scopes.get(prepared.hierarchy.scoped_manifest.key);
+        if (!state) throw new Error('Missing original pre-write selector identity');
+        same(state.expected, id(prepared.hierarchy.scoped_manifest), 'original prepared selector');
+        state.prepared = prepared; return state;
+      });
+      const artifacts = preparedScopes.flatMap(p => p.hierarchy.publication_objects);
+      same(plan.entries.map(id).sort((a,b) => a.key.localeCompare(b.key)),
+        artifacts.map(id).sort((a,b) => a.key.localeCompare(b.key)), 'complete connector plan');
+      for (const state of states) {
+        await assertObservationHistoryExactOnlyPruneProofV3(state.prepared.proof, originalOperation);
+        await recheckObservationHistoryExactOnlyProofV3(state.prepared.proof);
+        for (const leaf of state.prepared.hierarchy.exact_leaves) {
+          const current = await read(leaf.key);
+          let pin;
+          if (current.pin.exists) {
+            pin = exact(current.object, leaf);
+            if (state.leaves.has(leaf.key)) same(pin, state.leaves.get(leaf.key), 'reused immutable identity');
+            const attempt = state.leafAttempts.get(leaf.key);
+            if (attempt?.etag) same(pin.etag, attempt.etag, 'original immutable write identity');
+          } else {
+            const attempt = state.leafAttempts.get(leaf.key) || {};
+            state.leafAttempts.set(leaf.key, attempt);
+            pin = await write(leaf, current.pin, attempt);
+          }
+          state.leaves.set(leaf.key, pin);
+        }
+      }
+      for (const state of states) {
+        await recheckObservationHistoryExactOnlyProofV3(state.prepared.proof);
+        await verifyLeaves(state);
+        const selector = state.prepared.hierarchy.scoped_manifest;
+        if (state.selected) same((await read(selector.key)).pin, state.selected, 'selected scope identity');
+        else state.selected = await write(selector, state.original, state.attempt);
+        await verifyLeaves(state);
+      }
+      const objects = [];
+      for (const entry of plan.entries) {
+        const current = await read(entry.key); exact(current.object, entry);
+        const durable = await recordDurableEvidence({ ...id(entry), publication_stage: entry.publication_stage,
+          post_put_get_verified: true, schedule_sha256: plan.schedule_sha256, position: entry.position });
+        if (durable?.durable !== true) throw new Error('Dormant exact publication durable evidence incomplete');
+        objects.push(Object.freeze({ ...id(entry), verified: true, durable: true }));
+      }
+      await held();
+      return Object.freeze({ ok: true, status: 'published', objects: Object.freeze(objects) });
+    },
+    async recheck() {
+      for (const state of scopes.values()) {
+        if (!state.selected || !state.prepared) throw new Error('Leaf-only/interrupted selector publication is incomplete');
+        await assertObservationHistoryExactOnlyPruneProofV3(state.prepared.proof, originalOperation);
+        await recheckObservationHistoryExactOnlyProofV3(state.prepared.proof);
+        await verifyLeaves(state);
+        same((await read(state.selected.key)).pin, state.selected, 'selected scope identity');
+      }
+      await held();
+    },
+    async publishLatest(artifact) {
+      await this.recheck();
+      if (!batchLatest) throw new Error('Missing original batch latest identity');
+      if (batchLatest.artifact) same(id(artifact), id(batchLatest.artifact), 'prepared latest retry');
+      batchLatest.artifact = artifact;
+      const result = await write(artifact, batchLatest.original, batchLatest.attempt);
+      await this.recheck();
+      return { ok: true, key: result.key, byte_size: result.byte_size, sha256: result.sha256,
+        verified: true, post_put_get_verified: true, status: 'succeeded' };
+    },
   });
 }
