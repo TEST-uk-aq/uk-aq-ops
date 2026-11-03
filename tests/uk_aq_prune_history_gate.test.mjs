@@ -496,6 +496,38 @@ test('lost or ROLLBACK COMMIT acknowledgement cannot return a successful origina
   }
 });
 
+test('original-session assertions surround the separate protected COMMIT and remain mandatory on optional failure', async () => {
+  for (const optionalFailure of [false, true]) {
+    const { client, calls, input } = originalGateCompletionFixture(optionalFailure
+      ? { outboxError: Object.assign(new Error('optional evidence rejected'), { code: '23514' }) } : {});
+    const boundaries = [];
+    const outcome = await markCandidateAndConnectorGateCompleteForTest(client, { ...input,
+      outbox: { evidence: { pending_disposition: 'not_attempted' } },
+      assertOriginalOperationHeld: async stage => {
+        boundaries.push(stage);
+        if (stage === 'gate_begin') assert.equal(calls.length, 0);
+        if (stage === 'gate_commit') assert.notEqual(calls.at(-1)?.sql, 'commit');
+        if (stage === 'gate_committed') assert.equal(calls.at(-1)?.sql, 'commit');
+      },
+    });
+    assert.equal(outcome.gate_state, 'committed');
+    assert.deepEqual(boundaries, ['gate_begin', 'gate_commit', 'gate_committed']);
+    if (optionalFailure) assert.equal(outcome.outbox_state, 'outbox_missing');
+  }
+  for (const lostAt of ['gate_begin', 'gate_commit', 'gate_committed']) {
+    const { client, calls, input } = originalGateCompletionFixture();
+    await assert.rejects(markCandidateAndConnectorGateCompleteForTest(client, { ...input,
+      outbox: { evidence: { pending_disposition: 'not_attempted' } },
+      assertOriginalOperationHeld: async stage => {
+        if (stage === lostAt) throw Object.assign(new Error('original owner lost'), { code: 'UK_AQ_PRUNE_ORIGINAL_OPERATION_LOST' });
+      },
+    }), error => error.code === 'UK_AQ_PRUNE_ORIGINAL_OPERATION_LOST'
+      && (lostAt !== 'gate_committed' || error.original_gate_state === 'unconfirmed'));
+    assert.equal(calls.some(c => c.sql === 'commit'), lostAt === 'gate_committed');
+    if (lostAt === 'gate_begin') assert.equal(calls.length, 0);
+  }
+});
+
 test("incomplete connector gate clears all source identity fields", async () => {
   let statement = "";
   await setConnectorDayGateIncomplete({

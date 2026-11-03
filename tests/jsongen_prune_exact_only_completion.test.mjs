@@ -11,12 +11,13 @@ import { sha256Hex } from '../workers/shared/r2_sigv4.mjs';
 import { buildObservationHistoryV3SteadyStatePartition } from '../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs';
 import { prepareObservationHistoryExactOnlyScopeV3, acceptObservationHistoryExactOnlyScopeV3 }
   from '../workers/shared/uk_aq_observation_history_exact_only_verifier_v3.mjs';
-import { prepareObservationHistoryExactOnlyPublicationV3, describeObservationHistoryExactOnlyCompletionV3 }
+import { prepareObservationHistoryExactOnlyPublicationV3, describeObservationHistoryExactOnlyCompletionV3,
+  preparePruneExactOnlyBatchCompletionV3 }
   from '../workers/shared/uk_aq_observation_history_exact_only_publication_v3.mjs';
 
 // Reuse the existing original-event fixture; exercise only the new preparatory
 // boundary with actual serialized Parquet, local adapters and two whole series.
-async function fixture({ checksumHead = true, operationRunId = null } = {}) {
+async function fixture({ checksumHead = true, operationRunId = null, pruneBatch = false } = {}) {
   const event = await sourceAndOriginalEvent(2);
   const envelope = JSON.parse(event.row.final_evidence_bytes);
   const decoded = decodePruneMetadataEvidence(envelope);
@@ -33,6 +34,8 @@ async function fixture({ checksumHead = true, operationRunId = null } = {}) {
   for (const f of partition.file_intents) objects.set(f.key, Buffer.from(f.body));
   const count = { files: 0, heads: 0, finalize: 0, mutations: 0 };
   let held = true;
+  const originalOperation = { run_id: event.row.run_id,
+    async assertHeld() { if (!held) throw new Error('original lock lost'); } };
   const getObject = async ({ key }) => {
     if (key.endsWith('.parquet')) count.files++;
     const body = objects.get(key);
@@ -46,7 +49,8 @@ async function fixture({ checksumHead = true, operationRunId = null } = {}) {
   };
   const assertOperationHeld = async () => { if (!held) throw new Error('original lock lost'); };
   const prepared = await prepareObservationHistoryExactOnlyScopeV3({ scope: partition.scope,
-    getObject, headObject: checksumHead ? headObject : null, assertOperationHeld });
+    getObject, headObject: checksumHead ? headObject : null, assertOperationHeld,
+    ...(pruneBatch ? { originalOperation } : {}) });
   const run = { key: `history/v3/_ops/observations/runs/run_id=${event.row.run_id}/run_manifest.json`,
     body: Buffer.from(JSON.stringify({ run_id: event.row.run_id, completed: true })) };
   Object.assign(run, { byte_size: run.body.length, sha256: sha256Hex(run.body) });
@@ -62,8 +66,11 @@ async function fixture({ checksumHead = true, operationRunId = null } = {}) {
       objects.set(entry.key, Buffer.from(entry.body));
       await publication.lifecycle.afterReadback(entry);
     }
-    await publication.lifecycle.finalizeRun();
-    return await publication.completedPublication();
+    if (!pruneBatch) {
+      await publication.lifecycle.finalizeRun();
+      return await publication.completedPublication();
+    }
+    return await preparePruneExactOnlyBatchCompletionV3(batchArgs());
   }
   function evidenceArgs(completion) {
     const exact = prepared.hierarchy.publication_objects;
@@ -81,6 +88,8 @@ async function fixture({ checksumHead = true, operationRunId = null } = {}) {
       connector: { ...envelope.original_connector_publication,
         scoped_roots: [{ scope: partition.scope, reference: prepared.proof.selector }] },
       finalization: { ok: true, affected_days_utc: [event.row.day_utc],
+        connector_results: [{ day_utc: event.row.day_utc, connector_id: 1,
+          partitions: [{ scoped_root: { evidence: prepared.proof.selector } }] }],
         day_results: [{ day_utc: event.row.day_utc, day_manifest: envelope.original_final_batch.day_manifest }],
         canonical_aggregate_result: { canonical_aggregate_authority_verified: true, parent_state_reread_under_lock: true,
           affected_days_utc: [event.row.day_utc], aggregate_manifests: envelope.original_final_batch.canonical_aggregate_references },
@@ -93,7 +102,12 @@ async function fixture({ checksumHead = true, operationRunId = null } = {}) {
       evidenceMode: 'r2_bundle', exactOnlyCompletion: completion,
     };
   }
-  return { event, prepared, publication, objects, complete, count, evidenceArgs,
+  function batchArgs() {
+    return { preparedScopes: [prepared], finalization: evidenceArgs(null).finalization,
+      runId: event.row.run_id, originalOperation, expectedDays: [event.row.day_utc],
+      expectedConnectorPublicationCount: 1, getObject };
+  }
+  return { event, prepared, publication, objects, complete, count, evidenceArgs, batchArgs,
     setHeld: value => { held = value; }, fileCount: partition.file_intents.length };
 }
 
@@ -210,4 +224,31 @@ test('normal original lock release rejects the old completion directly at eviden
   // asynchronous boundary through the legacy synchronous schema-1 entry.
   assert.throws(() => preparePruneOriginalFinalEvidence({ ...args, exactOnlyCompletion: null }),
     { code: 'PRUNE_EXACT_ONLY_DURABLE_HANDOVER_UNSUPPORTED' });
+});
+
+test('Prune completion uses the checked original batch without a late run-summary object', async () => {
+  const f = await fixture({ pruneBatch: true });
+  const completion = await f.complete();
+  const description = await describeObservationHistoryExactOnlyCompletionV3(completion);
+  assert.equal(description.schema_version, 2);
+  assert.equal(description.run, undefined);
+  assert.equal(f.count.finalize, 0, 'late report writer is not a prerequisite');
+  assert.equal([...f.objects.keys()].some(k => k.includes('/_ops/observations/runs/')), false);
+  const result = await preparePruneOriginalFinalEvidenceWithExactOnlyCompletion(f.evidenceArgs(completion));
+  assert.equal(result.envelope.authority_state, 'precommit_prepared_unverified');
+  assert.equal(result.envelope.original_final_batch.exact_only_completion.dataset_id, f.event.pendingRef.key);
+  assert.equal(f.count.files, f.fileCount, 'the original physical inspection is reused');
+  for (const mutate of [
+    a => { a.finalization.v3_publication.latest_global.ok = false; },
+    a => { a.finalization.canonical_aggregate_result.parent_state_reread_under_lock = false; },
+    a => { a.finalization.v3_publication.exact_scopes = []; },
+    a => { a.finalization.connector_results = []; },
+    a => { a.finalization.v3_publication.latest_global.objects = [{ key: 'wrong', byte_size: 1, sha256: 'f'.repeat(64) }]; },
+    a => { a.originalOperation = { ...a.originalOperation }; },
+  ]) {
+    const args = f.batchArgs(); mutate(args);
+    await assert.rejects(preparePruneExactOnlyBatchCompletionV3(args));
+  }
+  f.setHeld(false);
+  await assert.rejects(preparePruneOriginalFinalEvidenceWithExactOnlyCompletion(f.evidenceArgs(completion)), /original lock lost/);
 });

@@ -10,6 +10,7 @@ import { exactLeafFormatV3 } from '../../workers/shared/uk_aq_observation_histor
 import { rejectExactOnlyOriginalHandoverV3 } from '../../workers/shared/uk_aq_observation_history_exact_only_consumer_v3.mjs';
 import { describeObservationHistoryExactOnlyCompletionV3 }
   from '../../workers/shared/uk_aq_observation_history_exact_only_publication_v3.mjs';
+import { pruneBatchFinalizationIdentityV3 } from '../../workers/shared/uk_aq_prune_batch_finalization_v3.mjs';
 
 // This boundary owns only the existing original envelope. Merely retaining
 // schema-2 JSON bytes cannot attest an independently completed direct proof.
@@ -263,6 +264,8 @@ function prepareExactOnlyCompletion({ description, exactOnly, pending, connector
   if (originalMetadataSnapshot?.completeness !== 'exact_writer_metadata_captured_unverified'
     || description.finalisation_complete !== true || scopes.length !== expected.length
     || description.invocation_id !== runId
+    || ![1, 2].includes(description.schema_version)
+    || (description.schema_version === 2 && !same(description.batch_finalization, pruneBatchFinalizationIdentityV3(finalization)))
     || !references(finalization.v3_publication.latest_global.objects).some(r => same(r, description.latest))
     || !same(references(scopes.map(s => s.selector)), references(connector.scoped_roots?.map(s => s.reference)))
     || !same(references(scopes.flatMap(s => [s.selector, ...s.leaves])), references(exactOnly))) reject();

@@ -399,11 +399,12 @@ export async function acceptObservationHistoryExactOnlyScopeV3(preparedProof) {
     await ctx.held();
     const source = await canonicalSource(ctx, scope);
     equal(source.descriptor, proof.source, "prepared canonical source");
-    return await verifiedScope({ ctx, scope, source, metadata, hierarchy: null, indexRoot });
+    return await verifiedScope({ ctx, scope, source, metadata, hierarchy: null, indexRoot,
+      originalOperation: proof.originalOperation });
   } catch (error) { ctx.invalidate(); throw error; }
 }
 
-async function verifiedScope({ ctx, scope, source, metadata, hierarchy, indexRoot }) {
+async function verifiedScope({ ctx, scope, source, metadata, hierarchy, indexRoot, originalOperation = null }) {
   const selected = hierarchy || await readStoredExactOnlyHierarchy(ctx, scope, source, indexRoot);
   reconcile(selected, source.descriptor, metadata, indexRoot);
   for (const leaf of selected.exact_leaves) for (const file of leaf.payload.files) {
@@ -425,7 +426,7 @@ async function verifiedScope({ ctx, scope, source, metadata, hierarchy, indexRoo
       decode_profile_id: metadata.decode_profile.version }),
   });
   physicalProofs.set(report, { ctx, scope: Object.freeze({ ...scope }), hierarchy: selected,
-    source: source.descriptor, metadata, indexRoot });
+    source: source.descriptor, metadata, indexRoot, originalOperation });
   return report;
 }
 
@@ -446,6 +447,14 @@ export async function assertObservationHistoryExactOnlyProofOperationV3(report) 
   await proof.ctx.held();
 }
 
+export async function assertObservationHistoryExactOnlyPruneProofV3(report, originalOperation) {
+  const proof = physicalProofs.get(report);
+  if (!originalOperation || proof?.originalOperation !== originalOperation) {
+    throw new Error('Prune physical proof belongs to another original operation/session');
+  }
+  await proof.ctx.held();
+}
+
 // Opaque operation-local proof: serialised/copied reports cannot admit a write.
 // Recheck current identities and complete prepared artifact consistency. This
 // reuses inspection evidence, not a new full physical inspection; the latter
@@ -463,8 +472,11 @@ export async function recheckObservationHistoryExactOnlyProofV3(report) {
 // Shared producer entry for future writer adapters. Files and the canonical
 // pollutant child must already be durably written. No completed root is required
 // yet; it is mandatory at final acceptance. Always inspect actual pinned files.
-export async function prepareObservationHistoryExactOnlyScopeV3({ scope, getObject, headObject = null, assertOperationHeld }) {
-  const ctx = context({ getObject, headObject, assertOperationHeld });
+export async function prepareObservationHistoryExactOnlyScopeV3({ scope, getObject, headObject = null, assertOperationHeld,
+  originalOperation = null }) {
+  if (originalOperation && typeof originalOperation.assertHeld !== 'function') throw new Error('invalid original Prune operation');
+  const ctx = context({ getObject, headObject, assertOperationHeld: originalOperation
+    ? () => originalOperation.assertHeld('publication') : assertOperationHeld });
   const key = `${generation.observations_prefix}/${scopePath(scope)}/manifest.json`;
   const object = await ctx.read(key);
   const canonical = JSON.parse(object.body.toString("utf8"));
@@ -487,6 +499,6 @@ export async function prepareObservationHistoryExactOnlyScopeV3({ scope, getObje
     canonical_hierarchy_complete: false, finalisation_complete: false, source_to_final_verified: false,
   });
   physicalProofs.set(proof, { ctx, scope: Object.freeze({ ...scope }), hierarchy, source, metadata,
-    indexRoot: generation.observations_timeseries_index_prefix });
+    indexRoot: generation.observations_timeseries_index_prefix, originalOperation });
   return Object.freeze({ hierarchy, proof });
 }

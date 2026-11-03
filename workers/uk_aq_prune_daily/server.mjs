@@ -2871,6 +2871,7 @@ async function runPrune(config, adapters = {}) {
     ingestRetentionDays: config.ingestDbRetentionDays,
     logStructured,
     runId: phaseBRunId,
+    ...(adapters.originalOperation ? { originalOperation: adapters.originalOperation } : {}),
   });
   // Budget exhaustion never erases failures recorded earlier in Phase B.
   const phaseBFailed = Number(phaseBHistorySummary?.failed_candidates || 0) > 0

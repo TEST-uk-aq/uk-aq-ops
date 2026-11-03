@@ -2,6 +2,7 @@
 
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { serveOriginalOperationAssertions } from './lib/uk_aq_prune_original_operation.mjs';
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
@@ -93,6 +94,7 @@ export async function runChildWhileLockHeld({
   commandArgs = [],
   env,
   lockSignal,
+  originalOperation = null,
   spawnProcess = spawn,
   terminate = terminateProcessGroup,
 }) {
@@ -113,16 +115,21 @@ export async function runChildWhileLockHeld({
       reject(new Error("Locked child supervisor liveness pipe was not created"));
       return;
     }
-    let lossTimer = null;
+    let lossTimer = null, stoppedForLoss = false;
     let forwardedSignal = null;
     let supervisorResult = null;
     const stopForLostLock = () => {
+      if (stoppedForLoss) return;
+      stoppedForLoss = true;
       terminate(child, "SIGTERM");
       lossTimer = setTimeout(() => terminate(child, "SIGKILL"), 10_000);
       lossTimer.unref?.();
     };
     if (lockSignal?.aborted) stopForLostLock();
     else lockSignal?.addEventListener("abort", stopForLostLock, { once: true });
+    const closeAssertions = originalOperation ? serveOriginalOperationAssertions({
+      channel: child, ...originalOperation, onFailure: stopForLostLock,
+    }) : null;
 
     const forwardSignal = (signal) => {
       forwardedSignal = signal;
@@ -139,6 +146,7 @@ export async function runChildWhileLockHeld({
     };
     child.on?.("message", onSupervisorMessage);
     const cleanup = () => {
+      closeAssertions?.();
       if (lossTimer) clearTimeout(lossTimer);
       livenessPipe.destroy?.();
       lockSignal?.removeEventListener("abort", stopForLostLock);
@@ -234,6 +242,9 @@ export async function runCommandWithObservationsGlobalOperationLock({
           diagnosticEnvironment: env.UK_AQ_ENV_NAME,
         }, async (identity, lock) => {
           acquired = true;
+          // Pin the actual backend before exposing the original session to the
+          // child. Other owners retain their existing supervisor protocol.
+          if (owner === 'prune_daily' && typeof lock.assertOwned === 'function') await lock.assertOwned();
           const acquiredDiagnostic = [...diagnostics].reverse().find(
             (entry) => entry.event === "lock_acquired",
           );
@@ -273,6 +284,10 @@ export async function runCommandWithObservationsGlobalOperationLock({
             commandArgs,
             env: childEnv,
             lockSignal: lock.signal,
+            ...(owner === 'prune_daily' ? { originalOperation: {
+              runId: String(runId), nonce,
+              assertOwned: async () => { lock.assertHeld(); return await lock.assertOwned(); },
+            } } : {}),
             spawnProcess,
           });
           lock.assertHeld();

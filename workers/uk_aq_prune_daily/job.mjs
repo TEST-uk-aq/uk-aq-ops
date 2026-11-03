@@ -2,6 +2,7 @@ import { flushPhaseBServiceEgressMetrics } from "./pg_source_egress_diagnostic.m
 import { mkdir, writeFile } from "node:fs/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from 'node:crypto';
+import { createPruneOriginalOperation } from '../../scripts/operations/lib/uk_aq_prune_original_operation.mjs';
 import {
   observationsGlobalOperationLockContext,
 } from "../shared/uk_aq_r2_history_writer.mjs";
@@ -67,6 +68,8 @@ export async function runPruneDailyJob({
     wait_ms: lockContext.wait_ms,
     outcome: lockContext.outcome,
   } : null;
+  const originalOperation = lockContext.valid && process.connected && typeof process.send === 'function'
+    ? createPruneOriginalOperation({ runId: lockContext.run_id, nonce: lockContext.nonce }) : null;
   const url = new URL("http://localhost/");
   if (env.INPUT_DRY_RUN === "true") {
     url.searchParams.set("dryRun", "true");
@@ -74,7 +77,9 @@ export async function runPruneDailyJob({
 
   try {
     const config = buildRunConfigAdapter(url);
-    const summary = await executePruneDailyAdapter(config);
+    const summary = originalOperation
+      ? await executePruneDailyAdapter(config, { originalOperation })
+      : await executePruneDailyAdapter(config);
     const payload = {
       ok: true,
       summary,
@@ -96,6 +101,7 @@ export async function runPruneDailyJob({
     setExitCode(1);
     return payload;
   } finally {
+    originalOperation?.close();
     try {
       await flushPhaseBServiceEgressMetrics({ env });
     } catch (_metricsError) {
