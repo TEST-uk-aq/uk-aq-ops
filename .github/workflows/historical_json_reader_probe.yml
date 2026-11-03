@@ -1,0 +1,119 @@
+name: Verify historical JSON TEST Worker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-private-history:
+    runs-on: ubuntu-latest
+    env:
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME || '' }}
+      HISTORY_UPSTREAM_URL: ${{ vars.UK_AQ_COMPRESSED_CHART_UPSTREAM_URL || '' }}
+      HISTORY_ACCESS_CLIENT_ID: ${{ secrets.UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_ID || '' }}
+      HISTORY_ACCESS_CLIENT_SECRET: ${{ secrets.UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_SECRET || '' }}
+      HISTORY_UPSTREAM_SECRET: ${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET || '' }}
+    steps:
+      - name: Validate TEST identity and private HTTPS origin
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REPOSITORY}" = "TEST-uk-aq/uk-aq-ops"
+          test "${UK_AQ_ENV_NAME}" = "TEST"
+          for name in HISTORY_UPSTREAM_URL HISTORY_ACCESS_CLIENT_ID HISTORY_ACCESS_CLIENT_SECRET HISTORY_UPSTREAM_SECRET; do
+            if [ -z "${!name:-}" ]; then echo "Missing required TEST variable/secret: ${name}"; exit 1; fi
+          done
+          node --input-type=module <<'NODE'
+          const raw = process.env.HISTORY_UPSTREAM_URL;
+          let url;
+          try { url = new URL(raw); } catch { process.exit(1); }
+          if (url.protocol !== 'https:' || !/^[a-z0-9-]+\.sleepercar\.co\.uk$/.test(url.hostname)
+              || url.origin !== raw || url.port || url.username || url.password
+              || url.pathname !== '/' || url.search || url.hash) {
+            console.error('TEST upstream must be a clean HTTPS Sleepercar origin.');
+            process.exit(1);
+          }
+          NODE
+          echo "TEST identity, origin and existing GitHub secrets verified."
+
+      - name: Verify selected August PM10 manifest and both immutable gzip objects
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+
+          base="${HISTORY_UPSTREAM_URL}/v2/history-json"
+          query="connector_id=1&station_id=1581&timeseries_id=43&pollutant=pm10&month=2026-08"
+          request() {
+            local path="$1" output="$2" status
+            status="$(curl --silent --show-error --max-time 30 --connect-timeout 10 \
+              --output "$output" --write-out '%{http_code}' \
+              --header "CF-Access-Client-Id: ${HISTORY_ACCESS_CLIENT_ID}" \
+              --header "CF-Access-Client-Secret: ${HISTORY_ACCESS_CLIENT_SECRET}" \
+              --header "X-UK-AQ-Upstream-Auth: ${HISTORY_UPSTREAM_SECRET}" \
+              --header "Accept-Encoding: gzip" \
+              "${base}/${path}")"
+            if [ "$status" != 200 ]; then
+              echo "Private historical JSON ${path%%\?*} returned HTTP $status."
+              return 1
+            fi
+          }
+
+          request "manifest?${query}" "$tmp/manifest.json"
+          jq -e '
+            .schema_version == 1
+            and .kind == "uk_aq_historical_json_pair_selection"
+            and .identity.connector_id == 1
+            and .identity.station_id == 1581
+            and .identity.timeseries_id == 43
+            and .identity.pollutant_code == "pm10"
+            and .month_utc == "2026-08"
+            and .pub_id == "e4f51e3d-e0a9-4223-bcf1-1f574d76a0cf"
+            and .algorithm_version == "aqilevels_hourly_v3"
+            and .admission.readback_verified == true
+            and .objects.observations.byte_size == 4834
+            and .objects.aqi.byte_size == 26737
+          ' "$tmp/manifest.json" >/dev/null
+
+          pub="$(jq -er '.pub_id' "$tmp/manifest.json")"
+          source="$(jq -er '.source_id' "$tmp/manifest.json")"
+          algorithm="$(jq -er '.algorithm_version' "$tmp/manifest.json")"
+          echo "Selected August PM10 manifest validated. Publication: $pub"
+
+          for kind in observations aqi; do
+            sha="$(jq -er --arg k "$kind" '.objects[$k].sha256' "$tmp/manifest.json")"
+            decoded_sha="$(jq -er --arg k "$kind" '.objects[$k].json_sha256' "$tmp/manifest.json")"
+            stored_bytes="$(jq -er --arg k "$kind" '.objects[$k].byte_size' "$tmp/manifest.json")"
+            decoded_bytes="$(jq -er --arg k "$kind" '.objects[$k].json_byte_size' "$tmp/manifest.json")"
+
+            request "${kind}?${query}&pub_id=${pub}&source_id=${source}&algorithm_version=${algorithm}&sha256=${sha}" "$tmp/${kind}.json.gz"
+
+            test "$(sha256sum "$tmp/${kind}.json.gz" | cut -d' ' -f1)" = "$sha" || {
+              echo "$kind compressed digest mismatch."; exit 1;
+            }
+            test "$(wc -c < "$tmp/${kind}.json.gz" | tr -d ' ')" = "$stored_bytes" || {
+              echo "$kind compressed size mismatch."; exit 1;
+            }
+            gzip -cd "$tmp/${kind}.json.gz" > "$tmp/${kind}.json"
+            test "$(sha256sum "$tmp/${kind}.json" | cut -d' ' -f1)" = "$decoded_sha" || {
+              echo "$kind decoded digest mismatch."; exit 1;
+            }
+            test "$(wc -c < "$tmp/${kind}.json" | tr -d ' ')" = "$decoded_bytes" || {
+              echo "$kind decoded size mismatch."; exit 1;
+            }
+            jq -e 'type == "object"' "$tmp/${kind}.json" >/dev/null
+            echo "$kind: HTTP 200, gzip/JSON SHA-256 and lengths verified."
+          done
+
+          unauth_status="$(curl --silent --show-error --max-time 20 --connect-timeout 10 \
+            --output /dev/null --write-out '%{http_code}' "${base}/manifest?${query}")"
+          if [ "$unauth_status" = 200 ]; then
+            echo "SECURITY FAILURE: private manifest returned HTTP 200 without credentials."
+            exit 1
+          fi
+          echo "Unauthenticated request denied (HTTP $unauth_status)."
+          echo "SUCCESS: Deployed TEST Worker serves the selected August observation/AQI pair through Cloudflare Access."
