@@ -49,13 +49,14 @@ jobs:
           base="${HISTORY_UPSTREAM_URL}/v2/history-json"
           query="connector_id=1&station_id=1581&timeseries_id=43&pollutant=pm10&month=2026-08"
           request() {
-            local path="$1" output="$2" status
+            local path="$1" output="$2" encoding="$3" status
             status="$(curl --silent --show-error --max-time 30 --connect-timeout 10 \
-              --output "$output" --write-out '%{http_code}' \
+              --output "$output" --dump-header "${output}.headers" --write-out '%{http_code}' \
               --header "CF-Access-Client-Id: ${HISTORY_ACCESS_CLIENT_ID}" \
               --header "CF-Access-Client-Secret: ${HISTORY_ACCESS_CLIENT_SECRET}" \
               --header "X-UK-AQ-Upstream-Auth: ${HISTORY_UPSTREAM_SECRET}" \
-              --header "Accept-Encoding: gzip" \
+              --header "Accept: application/json" \
+              --header "Accept-Encoding: ${encoding}" \
               "${base}/${path}")"
             if [ "$status" != 200 ]; then
               echo "Private historical JSON ${path%%\?*} returned HTTP $status."
@@ -63,7 +64,22 @@ jobs:
             fi
           }
 
-          request "manifest?${query}" "$tmp/manifest.json"
+          # Manifest must be plain JSON. Preserve gzip bytes only for immutable objects.
+          request "manifest?${query}" "$tmp/manifest.json" identity
+          if ! jq -e 'type == "object"' "$tmp/manifest.json" >/dev/null 2>&1; then
+            echo "::error::Private manifest returned HTTP 200 but not a JSON object."
+            awk -F: 'tolower($1) ~ /^(content-type|content-encoding|cf-mitigated)$/ {
+              gsub(/\r/, "", $2); print $1 ":" $2
+            }' "$tmp/manifest.json.headers"
+            if gzip -t "$tmp/manifest.json" 2>/dev/null; then
+              echo "Body diagnosis: gzipped content instead of plain JSON."
+            elif LC_ALL=C grep -aqiE '<!doctype html|<html' "$tmp/manifest.json"; then
+              echo "Body diagnosis: HTML instead of JSON (possible Access/WAF challenge)."
+            else
+              echo "Body diagnosis: unexpected non-JSON response."
+            fi
+            exit 1
+          fi
           jq -e '
             .schema_version == 1
             and .kind == "uk_aq_historical_json_pair_selection"
@@ -90,7 +106,7 @@ jobs:
             stored_bytes="$(jq -er --arg k "$kind" '.objects[$k].byte_size' "$tmp/manifest.json")"
             decoded_bytes="$(jq -er --arg k "$kind" '.objects[$k].json_byte_size' "$tmp/manifest.json")"
 
-            request "${kind}?${query}&pub_id=${pub}&source_id=${source}&algorithm_version=${algorithm}&sha256=${sha}" "$tmp/${kind}.json.gz"
+            request "${kind}?${query}&pub_id=${pub}&source_id=${source}&algorithm_version=${algorithm}&sha256=${sha}" "$tmp/${kind}.json.gz" gzip
 
             test "$(sha256sum "$tmp/${kind}.json.gz" | cut -d' ' -f1)" = "$sha" || {
               echo "$kind compressed digest mismatch."; exit 1;
