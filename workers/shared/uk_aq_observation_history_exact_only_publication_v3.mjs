@@ -1,5 +1,5 @@
 // Preparatory schema-2 publication integration. The shared finaliser has a hard
-// inactive gate; no production writer imports or enables this path.
+// inactive gate; the owning Prune writer can prepare but cannot enable it.
 import { Buffer } from "node:buffer";
 import { sha256Hex } from "./r2_sigv4.mjs";
 import { getObservationHistoryGeneration } from "./uk_aq_observation_history_generation.mjs";
@@ -20,6 +20,7 @@ import {
   assertObservationHistoryExactOnlyPruneProofV3,
   recheckObservationHistoryExactOnlyProofV3,
   acceptObservationHistoryExactOnlyScopeV3,
+  prepareObservationHistoryExactOnlyScopeV3,
 } from "./uk_aq_observation_history_exact_only_verifier_v3.mjs";
 
 const generation = getObservationHistoryGeneration("v3");
@@ -61,6 +62,34 @@ function storedArtifact(object, kind, stage) {
   const payload = JSON.parse(body);
   if (body !== json(payload)) throw new Error("schema-2 compact latest noncanonical body");
   return { ...id(current), body, payload, kind, publication_stage: stage, dependencies: [], publication_prerequisites: [] };
+}
+
+// Owning-writer seam, before selecting any schema-2 index. Ordinary schema-1
+// publication performs no additional reads. This is intentionally dormant:
+// the normal builder still emits schema 1 and the shared finalizer rejects 2.
+// Initial actual-byte inspection is here; the later pre-gate adapter reuses its
+// opaque same-session proof rather than inspecting Parquet again for handover.
+export async function preparePruneExactOnlyConnectorScopesV3({ partitions, canonical,
+  originalOperation, getObject }) {
+  const selected = partitions.filter(p => exactLeafFormatV3(p.v3_hierarchy.scoped_manifest.payload).schema_version === 2);
+  if (!selected.length) return [];
+  if (selected.length !== partitions.length) throw new Error('Incomplete Prune exact-only connector source selection');
+  if (!originalOperation || typeof originalOperation.assertHeld !== 'function') {
+    throw originalOperationError('original coordinator capability required for exact-only producer');
+  }
+  await originalOperation.assertHeld('publication');
+  const prepared = [];
+  for (const partition of selected) {
+    const scope = await prepareObservationHistoryExactOnlyScopeV3({ scope: partition.scope,
+      originalOperation, getObject });
+    const canonicalRef = canonical.pollutant_manifests.find(r => r.key === scope.proof.canonical_source_manifest.key);
+    same(id(canonicalRef || {}), id(scope.proof.canonical_source_manifest), 'owning writer canonical child');
+    same(id(scope.hierarchy.scoped_manifest), id(partition.v3_hierarchy.scoped_manifest), 'owning writer prepared selector');
+    same(scope.hierarchy.exact_leaves.map(id), partition.v3_hierarchy.exact_leaves.map(id), 'owning writer prepared leaves');
+    prepared.push(scope);
+  }
+  await originalOperation.assertHeld('publication');
+  return Object.freeze(prepared);
 }
 
 // Prune-only pre-gate adapter. The real owner first runs/validates its mandatory

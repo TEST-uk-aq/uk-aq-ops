@@ -67,7 +67,9 @@ function makeBudget(overrides, ceiling) {
     remainingMs() { check(); return Math.max(1, Math.floor(limits.duration_ms - (performance.now() - started))); },
     elapsedMs() { return Math.ceil(performance.now() - started); },
     metadataLimit: () => metadataLimit,
-    configureMetadataLimit(n) { requireValid(Number.isSafeInteger(n) && n > 0, 'invalid metadata plan'); metadataLimit = Math.min(metadataLimit, n); },
+    // Replanning may admit authenticated immutable selector dependencies; the
+    // fixed inspection ceiling always remains authoritative.
+    configureMetadataLimit(n) { requireValid(Number.isSafeInteger(n) && n > 0, 'invalid metadata plan'); metadataLimit = Math.min(limits.metadata_gets, n); },
     reserveBytes(n) {
       check(); evidence(Number.isSafeInteger(n) && n > 0 && n <= limits.total_bytes - used.derived_bytes - used.metadata_bytes - used.decompressed_bytes - reserved,
         'resource_limit', 'concurrent metadata byte reservation exceeded');

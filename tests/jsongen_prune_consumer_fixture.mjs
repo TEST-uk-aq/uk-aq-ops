@@ -6,18 +6,21 @@ import { canonicalJson, BUCKET } from '../scripts/jsongen/schema.mjs';
 import { sha256Hex } from '../workers/shared/r2_sigv4.mjs';
 import { computePruneConnectorSourceIdentity } from '../workers/shared/uk_aq_prune_connector_source_identity.mjs';
 import { describePrunePendingSource } from '../scripts/jsongen/prune-evidence.mjs';
-import { preparePruneOriginalFinalEvidence, attachPruneOriginalEvidenceBundleReference } from '../scripts/jsongen/prune-final-evidence.mjs';
+import { preparePruneOriginalFinalEvidence, preparePruneOriginalFinalEvidenceWithExactOnlyCompletion, attachPruneOriginalEvidenceBundleReference } from '../scripts/jsongen/prune-final-evidence.mjs';
 import { pruneEvidenceBundleIntentId } from '../scripts/jsongen/prune-evidence-bundle.mjs';
 import { createPruneOriginalMetadataCapture, preparePruneOriginalMetadataSnapshot } from '../scripts/jsongen/prune-original-metadata.mjs';
 import { observationsGlobalOperationLockIdentity, OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV } from '../workers/shared/uk_aq_r2_history_writer.mjs';
 import { buildObservationHistoryV3SteadyStatePartition } from '../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs';
-import { buildObservationHistoryExactLeafIndexV3Latest } from '../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs';
+import { buildObservationHistoryExactLeafIndexV3Latest, buildObservationHistoryExactLeafIndexV3ScopedHierarchy } from '../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs';
 import { buildHistoryV2ConnectorManifest, buildHistoryV2DayManifest } from '../workers/shared/uk_aq_r2_history_canonical.mjs';
 import { buildR2HistoryV2ObservationsRootManifest, buildR2HistoryV2ObservationsYearManifest,
   buildR2HistoryV2ObservationsMonthManifest, serializeR2HistoryV2ObservationsAggregateManifest } from '../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs';
 import { buildTimeseriesBindingSourceRangeManifest, buildTimeseriesBindingSourceRootManifest,
   timeseriesBindingSourceRangeManifestKey, TIMESERIES_BINDING_SOURCE_REFRESH_STATE_KIND } from '../scripts/backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs';
 import { buildTimeseriesBindingSourceState } from '../scripts/backup_r2/lib/timeseries_binding_source_state_v2.mjs';
+
+import { preparePruneExactOnlyConnectorScopesV3, preparePruneExactOnlyBatchCompletionV3 }
+  from '../workers/shared/uk_aq_observation_history_exact_only_publication_v3.mjs';
 
 const etag = body => `"${sha256Hex(body)}"`;
 export async function sourceAndOriginalEvent(scopes = 1024, options = {}) {
@@ -51,6 +54,15 @@ export async function sourceAndOriginalEvent(scopes = 1024, options = {}) {
   const connectorFor = (id, p) => buildHistoryV2ConnectorManifest({ ...common, connectorId: id,
     manifestKey: `${base}/day_utc=${day}/connector_id=${id}/manifest.json`, pollutantManifests: [p].flat().map(p => p.payload) });
   const previous = connectorFor(8, prior.canonical_pollutant_manifest), manifest = connectorFor(1, currents.map(c => c.canonical_pollutant_manifest));
+  if (options.exactOnly) for (let i = 0; i < currents.length; i++) {
+    const c = currents[i], m = c.canonical_pollutant_manifest;
+    currents[i] = { ...c, v3_hierarchy: buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
+      metadata: c.target_metadata, exactSchemaVersion: 2,
+      canonicalManifest: { key: m.key, byte_size: m.byte_size, sha256: m.sha256,
+        manifest_hash: m.payload.manifest_hash, row_count: m.payload.row_count,
+        observation_content_hash: m.payload.observation_content_hash, observation_content_hash_version: 1 } }) };
+  }
+
   const hierarchy = connectors => {
     const d = buildHistoryV2DayManifest({ ...common, manifestKey: `${base}/day_utc=${day}/manifest.json`, connectorManifests: connectors });
     const m = buildR2HistoryV2ObservationsMonthManifest({ basePrefix: base, year: day.slice(0, 4), month: day.slice(5, 7), dayManifests: [d] });
@@ -115,13 +127,40 @@ export async function sourceAndOriginalEvent(scopes = 1024, options = {}) {
   const snapshot = preparePruneOriginalMetadataSnapshot({ capture, bucket, dayUtc: day, connectorId: 1, runId: run, writerGitSha: git,
     canonicalReferences: [connectorRef, ...childRefs], exactReferences: exact, dayReferences: [finals.at(-1)], affectedDaysUtc: [day],
     aggregateReferences: finals.slice(0, 3), latestReferences: [latest] });
-  let prepared = preparePruneOriginalFinalEvidence({ pending, connector, runId: run, dayUtc: day, connectorId: 1, writerGitSha: git,
-    evidenceMode: options.evidenceBundle ? 'r2_bundle' : 'inline',
-    sourceIdentity, originalMetadataSnapshot: snapshot, originalAuthorityCapture: original,
-    finalization: { ok: true, affected_days_utc: [day], day_results: [{ day_utc: day, day_manifest: finals.at(-1) }],
-      canonical_aggregate_result: { canonical_aggregate_authority_verified: true, parent_state_reread_under_lock: true,
-        affected_days_utc: [day], aggregate_manifests: finals.slice(0, 3) },
-      v3_publication: { exact_scopes: currents.map(() => ({ ok: true })), latest_global: { ok: true, objects: [latest] } } } });
+  const finalization = { ok: true, affected_days_utc: [day], day_results: [{ day_utc: day, day_manifest: finals.at(-1) }],
+    connector_results: [{ day_utc: day, connector_id: 1,
+      partitions: currents.map(c => ({ scoped_root: { evidence: pin(c.v3_hierarchy.scoped_manifest) } })) }],
+    canonical_aggregate_result: { canonical_aggregate_authority_verified: true, parent_state_reread_under_lock: true,
+      affected_days_utc: [day], aggregate_manifests: finals.slice(0, 3) },
+    v3_publication: { exact_scopes: [{ ok: true }], latest_global: { ok: true, objects: [latest] } } };
+  // Explicit synthetic materialisation only. The real shared publication entry
+  // remains inactive; use actual serialized Parquet for the producer proof seam.
+  const canonicalObjects = new Map([...snapshot.objects.map(o => [o.key, Buffer.from(o.bytes_base64, 'base64')]),
+    ...currents.flatMap(c => c.file_intents.map(f => [f.key, Buffer.from(f.body)]))]);
+  for (const o of original.snapshot().objects.filter(o => o.phase === 'binding'))
+    canonicalObjects.set(o.key, Buffer.from(o.bytes_base64, 'base64'));
+  let operationHeld = true; const fileGets = [];
+  const originalOperation = { run_id: run, async assertHeld() {
+    if (!operationHeld) throw Object.assign(new Error('fixture original operation lost'), { code: 'UK_AQ_PRUNE_ORIGINAL_OPERATION_LOST' });
+  } };
+  const getObject = async ({ key }) => {
+    if (key.endsWith('.parquet')) fileGets.push(key);
+    const body = canonicalObjects.get(key);
+    return body ? { key, body, bytes: body.length, etag: etag(body), exists: true } : { key, exists: false };
+  };
+  let exactOnlyPreparedScopes = [], exactOnlyCompletion = null;
+  if (options.exactOnly) {
+    exactOnlyPreparedScopes = await preparePruneExactOnlyConnectorScopesV3({
+      partitions: currents, canonical: { pollutant_manifests: childRefs }, originalOperation, getObject });
+    exactOnlyCompletion = await preparePruneExactOnlyBatchCompletionV3({ preparedScopes: exactOnlyPreparedScopes,
+      finalization, runId: run, originalOperation, expectedDays: [day], expectedConnectorPublicationCount: 1, getObject });
+  }
+  const preparationArgs = { pending, connector, runId: run, dayUtc: day, connectorId: 1, writerGitSha: git,
+    evidenceMode: options.evidenceBundle ? 'r2_bundle' : 'inline', sourceIdentity,
+    originalMetadataSnapshot: snapshot, originalAuthorityCapture: original, finalization,
+    ...(exactOnlyCompletion ? { exactOnlyCompletion } : {}) };
+  let prepared = exactOnlyCompletion ? await preparePruneOriginalFinalEvidenceWithExactOnlyCompletion(preparationArgs)
+    : preparePruneOriginalFinalEvidence(preparationArgs);
   let bundleObject = null;
   if (options.mutateOriginal) {
     assert.equal(options.evidenceBundle, true);
@@ -130,6 +169,8 @@ export async function sourceAndOriginalEvent(scopes = 1024, options = {}) {
     // hashes while leaving semantic authority corruption for the reader to find.
     const { encodePruneEvidenceBundle } = await import('../scripts/jsongen/prune-evidence-bundle.mjs');
     prepared.bundle = encodePruneEvidenceBundle(prepared.envelope);
+    const { pruneEvidenceBundleIdentity } = await import('../scripts/jsongen/prune-final-evidence.mjs');
+    prepared.bundle_identity = pruneEvidenceBundleIdentity(prepared.envelope);
   }
   if (options.evidenceBundle) {
     const b = prepared.bundle, identity = prepared.bundle_identity;
@@ -167,7 +208,9 @@ export async function sourceAndOriginalEvent(scopes = 1024, options = {}) {
       const old = objects.get(args.key);
       if ((args.if_none_match === '*' && old) || (args.if_match && (!old || args.if_match !== etag(old)))) return { status: 412 };
       objects.set(args.key, Buffer.from(args.body)); return { status: 200, etag: etag(args.body) }; } } };
-  return { Client, row, key, r2, objects, queries, pendingRef: object, setVisible: v => { visible = v; }, setHook: v => { hook = v; },
+  return { Client, row, key, r2, objects, queries, pendingRef: object, canonicalObjects, currents,
+    finalization, originalOperation, exactOnlyPreparedScopes, preparationArgs, fileGets,
+    setOperationHeld: v => { operationHeld = v; }, setVisible: v => { visible = v; }, setHook: v => { hook = v; },
     setBody: v => { objects.set(object.key, v); }, setEnvelope: e => { row.final_evidence_bytes = canonicalJson(e);
       row.final_evidence_sha256 = sha256Hex(row.final_evidence_bytes); row.final_evidence_byte_size = row.final_evidence_bytes.length; } };
 }

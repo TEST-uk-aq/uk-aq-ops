@@ -1,6 +1,6 @@
 import { canonicalJson, scopeKey } from './schema.mjs';
 import { assertInspectionScope } from './scope-authority.mjs';
-import { LIMITS, PRUNE_PENDING_SOURCE_LIMITS, evidence } from './limits.mjs';
+import { LIMITS, PRUNE_PENDING_SOURCE_LIMITS, INSPECTION_MAX_METADATA_GETS, evidence } from './limits.mjs';
 import { sha256Hex } from '../../workers/shared/r2_sigv4.mjs';
 import { observationHistoryIndexV3RangeForTimeseriesId } from '../../workers/shared/uk_aq_observation_history_index_v3.mjs';
 import { timeseriesBindingSourceRangeManifestKey } from '../backup_r2/lib/timeseries_binding_source_hierarchy_v2.mjs';
@@ -29,7 +29,7 @@ export function planInspection(scopes, partitionIndex = 0, partitionSize = LIMIT
 // Upper bound from actual deterministic key names, not a global GET multiplier.
 // A selected immutable overlay manifest cannot be named until latest is read;
 // reserve one such object per connector, although unsupported transitions fail closed.
-export function planMetadataRequests(scopes, generation) {
+export function planMetadataRequests(scopes, generation, exactOnlyLeafKeys = []) {
   const keys = new Set(), connectors = new Set();
   const base = generation.observations_prefix, index = generation.observations_timeseries_index_prefix;
   const binding = generation.timeseries_binding_index_prefix;
@@ -49,7 +49,19 @@ export function planMetadataRequests(scopes, generation) {
       `${binding}/timeseries_id=${id.timeseries_id}.json`, 'history/_index_v3/verification/latest.json'].forEach(key => keys.add(key));
     connectors.add(id.connector_id);
   }
-  return { deterministic_keys: [...keys].sort(), status_manifest_allowance: connectors.size,
+  evidence(Array.isArray(exactOnlyLeafKeys) && exactOnlyLeafKeys.length <= PRUNE_PENDING_SOURCE_LIMITS.scopes
+    && new Set(exactOnlyLeafKeys).size === exactOnlyLeafKeys.length
+    && exactOnlyLeafKeys.every(key => scopes.some(scope => {
+      const id = scope.identity;
+      const prefix = `${index}/day_utc=${scope.day_utc}/connector_id=${id.connector_id}/pollutant_code=${id.pollutant_code}`;
+      return key.startsWith(`${prefix}/_exact_v2/`)
+        && /^timeseries_id=[0-9]{9}\/revision=[a-f0-9]{64}\.json$/.test(key.slice(`${prefix}/_exact_v2/`.length));
+    })), 'resource_limit', 'Exact-only dependency plan exceeds admitted scopes or leaf capacity');
+  for (const key of exactOnlyLeafKeys) keys.add(key);
+  evidence(2 * (keys.size + connectors.size) + 1 <= INSPECTION_MAX_METADATA_GETS,
+    'resource_limit', 'Complete exact-only metadata exceeds inspection GET capacity');
+  return { ...(exactOnlyLeafKeys.length ? { exact_only_leaf_keys: [...exactOnlyLeafKeys].sort() } : {}),
+    deterministic_keys: [...keys].sort(), status_manifest_allowance: connectors.size,
     initial_get_allowance: keys.size + connectors.size,
     metadata_get_allowance: 2 * (keys.size + connectors.size) + 1 };
 }

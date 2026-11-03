@@ -3961,6 +3961,7 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
     publication = await runOperationalPruneDailyObservationHistoryV3ConnectorPublication({
       env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
       client: streamClient, r2: runtime.r2,
+      originalOperation: runtime.original_operation,
       observationsPrefix: runtime.committed_prefix,
       targetWriterGitSha: runtime.writer_git_sha, backedUpAtUtc,
       partitions: [...byPollutant.entries()].map(([code, partitionRows]) => ({
@@ -4005,6 +4006,8 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
     total_bytes: BigInt(manifest.total_bytes), file_count: files.length,
     files, parquet_object_keys: files.map((file) => file.key),
     v3_connector_publication: publication.run_finalization_evidence,
+    ...(result.exact_only_prepared_scopes?.length
+      ? { exact_only_prepared_scopes: result.exact_only_prepared_scopes } : {}),
     ...(metadataCapture ? { jsongen_original_metadata_references: {
       canonical: [...result.canonical.pollutant_manifests,
         result.canonical.connector_manifest],
@@ -4609,7 +4612,7 @@ async function finalizePublishedPhaseBConnectors({
             await assertPruneOriginalOperation(runtime, 'preparation');
             // Future schema-2 producer supplies the original operation-local
             // preparations, never serialized flags. Operational rejection and
-            // the hard publisher-inactive constant are unchanged in Stage 2A.
+            // the hard publisher-inactive constant remain unchanged.
             let exactOnlyCompletion = null;
             if (exportResult.exact_only_prepared_scopes?.length) {
               await assertPruneOriginalOperation(runtime, 'preparation', true);

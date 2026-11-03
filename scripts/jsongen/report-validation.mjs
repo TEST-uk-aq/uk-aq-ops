@@ -241,7 +241,7 @@ export function assertReconciliationReport(report, { controlRead = null } = {}) 
         }
       }
       if (item.physical !== undefined) {
-        keys(item.physical, ['membership', 'row_count'], ['index', 'leaf', 'aligned_shard', 'physical_identity',
+        keys(item.physical, ['membership', 'row_count'], ['index', 'leaf', 'aligned_shard', 'physical_identity', 'exact_index_schema_version', 'canonical_source',
           ...(stage3c ? ['scope_sha256'] : [])]);
         evidence(safe(item.physical.row_count)
           && (item.physical.membership === 'present') === (item.physical.row_count > 0),
@@ -254,9 +254,15 @@ export function assertReconciliationReport(report, { controlRead = null } = {}) 
             && p.physical_layout_version === 'timeseries-aligned-v2',
           'invalid_report', 'unsupported scoped physical identity');
         }
-        for (const field of ['index', 'leaf', 'aligned_shard']) {
+        for (const field of ['index', 'leaf', 'aligned_shard', 'canonical_source']) {
           if (item.physical[field] !== undefined) canonicalReference(item.physical[field]);
         }
+        if (item.physical.exact_index_schema_version !== undefined) {
+          evidence(item.physical.exact_index_schema_version === 2 && item.physical.canonical_source
+            && !item.physical.aligned_shard && item.physical.physical_identity?.history_schema_version === 3
+            && item.observations?.chain?.some(({ logical_hash: _h, ...r }) => same(r, item.physical.canonical_source)),
+          'invalid_report', 'Exact-only source must be root-authenticated schema-3 metadata');
+        } else evidence(!item.physical.canonical_source, 'invalid_report', 'Unexpected exact-only canonical source');
         if (stage3c && item.physical.membership === 'present') evidence(sha.test(item.physical.scope_sha256),
           'invalid_report', 'Stage 3C present scope requires its exact physical projection');
       }
@@ -402,7 +408,7 @@ function assertSourceAsOf(c, report) {
     'invalid_report', 'Read-consistent inspection requires its exact observed root');
   for (const item of c.scopes) {
     const refs = [...(item.observations?.chain || []).map(({ logical_hash: _h, ...r }) => r),
-      ...['index', 'leaf', 'aligned_shard'].map(k => item.physical?.[k]), item.binding, item.verification?.manifest].filter(Boolean);
+      ...['index', 'leaf', 'aligned_shard', 'canonical_source'].map(k => item.physical?.[k]), item.binding, item.verification?.manifest].filter(Boolean);
     evidence(refs.every(ref => c.provenance.some(p => same(p, ref))), 'invalid_report', 'Scope combines incompatible metadata snapshots');
   }
 }
@@ -502,11 +508,11 @@ function assertInspectionCapacity(c, report) {
   for (const s of c.scopes) evidence(selected.has(s.scope_key) ? s.state !== 'not_inspected_partition'
     : s.state === 'not_inspected_partition' && s.diagnostics.length === 0 && !s.physical && !s.binding && !s.verification && !s.observations,
   'invalid_report', 'Unselected scopes cannot carry current-inspection authority');
-  const p = planMetadataRequests(c.scopes.filter(s => selected.has(s.scope_key)), c.generation), cap = c.capacity;
+  const p = planMetadataRequests(c.scopes.filter(s => selected.has(s.scope_key)), c.generation, c.capacity?.exact_only_leaf_keys || []), cap = c.capacity;
   keys(cap, ['deterministic_keys', 'status_manifest_allowance', 'initial_get_allowance', 'metadata_get_allowance',
     'metadata_get_limit', 'initial_gets', 'recheck_gets', 'closing_root_gets', 'cache_bytes', 'peak_concurrency',
     'initial_bytes', 'recheck_bytes', 'closing_root_bytes', 'previous_metadata_bytes',
-    'previous_metadata_gets', 'initial_keys', 'recheck_keys', 'concurrency_limit', 'cache_byte_limit', 'elapsed_ms', 'duration_limit_ms']);
+    'previous_metadata_gets', 'initial_keys', 'recheck_keys', 'concurrency_limit', 'cache_byte_limit', 'elapsed_ms', 'duration_limit_ms'], ['exact_only_leaf_keys']);
   evidence(Object.entries(p).every(([key, value]) => same(cap[key], value))
     && set(cap.initial_keys) && set(cap.recheck_keys) && cap.initial_gets === cap.initial_keys.length
     && cap.recheck_gets === cap.recheck_keys.length && cap.recheck_keys.every(key => cap.initial_keys.includes(key))

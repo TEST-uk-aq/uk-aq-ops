@@ -18,6 +18,7 @@ import { createBudget, createInspectionBudget } from '../scripts/jsongen/limits.
 import { encodeCompactReport, decodeCompactReport } from '../scripts/jsongen/report-codec.mjs';
 import { getObservationHistoryGeneration } from '../workers/shared/uk_aq_observation_history_generation.mjs';
 import { buildR2HistoryV2ObservationsRootManifest } from '../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs';
+import { buildObservationHistoryExactLeafIndexV3ScopedHierarchy } from '../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs';
 import { buildObservationVerificationLatest, encodeObservationVerificationJson,
   OBSERVATION_VERIFICATION_LATEST_KEY } from '../workers/shared/uk_aq_observation_verification_overlay.mjs';
 
@@ -115,6 +116,27 @@ test('unrelated root and aligned-parent identities do not supersede unaffected p
     const prior = physicalScopeDigest(s.scopes[0], leaf);
     leaf.source_aligned_child.sha256 = 'b'.repeat(64);
     assert.equal(physicalScopeDigest(s.scopes[0], leaf), prior);
+  } finally { await s.reader.close(); }
+});
+
+test('equivalent exact-only selector keeps historical receipts and complete currentness reports compatible', async () => {
+  const s = await setup(3);
+  try {
+    const originalObjects = new Map([...s.f.objects].map(([k, b]) => [k, Buffer.from(b)]));
+    for (const c of s.f.currents) {
+      const m = c.canonical_pollutant_manifest;
+      const hierarchy = buildObservationHistoryExactLeafIndexV3ScopedHierarchy({ metadata: c.target_metadata, exactSchemaVersion: 2,
+        canonicalManifest: { key: m.key, byte_size: m.byte_size, sha256: m.sha256, manifest_hash: m.payload.manifest_hash,
+          row_count: m.payload.row_count, observation_content_hash: m.payload.observation_content_hash, observation_content_hash_version: 1 } });
+      for (const a of hierarchy.publication_objects) s.canonical.bodies.set(a.key, Buffer.from(a.body));
+    }
+    const r = await reconcileManagedInputs(s.options);
+    assert.ok(r.stage3c.scopes.every(s => s.current_metadata_match === 'matches'), JSON.stringify(r.stage3c.scopes));
+    assertReconciliationReport(r);
+    assert.deepEqual(decodeCompactReport(encodeCompactReport(r)), r);
+    assert.deepEqual(s.f.objects, originalObjects);
+    assert.ok(!s.canonical.gets.some(key => key.includes('/_aligned/')));
+    assert.equal(r.stage3c.publication_eligible, false); assert.throws(selectManagedPublications);
   } finally { await s.reader.close(); }
 });
 
