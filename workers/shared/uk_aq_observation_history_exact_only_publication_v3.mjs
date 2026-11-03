@@ -14,11 +14,24 @@ import {
 } from "./uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import {
   assertObservationHistoryExactOnlyProofOperationV3,
+  assertObservationHistoryExactOnlyProofUsableV3,
   recheckObservationHistoryExactOnlyProofV3,
-  verifyObservationHistoryExactOnlyScopeV3,
+  acceptObservationHistoryExactOnlyScopeV3,
 } from "./uk_aq_observation_history_exact_only_verifier_v3.mjs";
 
 const generation = getObservationHistoryGeneration("v3");
+const completions = new WeakMap();
+
+// A completion is only a transient original-writer snapshot for the optional
+// existing outbox. Copies/JSON cannot assert completion, and this is never a
+// source-deletion permission or an independently authenticated DB commit.
+export function describeObservationHistoryExactOnlyCompletionV3(completion) {
+  const state = completions.get(completion);
+  if (!state) throw new Error("missing completed operation-local exact-only publication");
+  state.assertUsable();
+  for (const proof of state.proofs) assertObservationHistoryExactOnlyProofUsableV3(proof);
+  return structuredClone(state.description);
+}
 function id(o) { return { key: o.key, byte_size: o.byte_size, sha256: o.sha256 }; }
 function same(a, b, label) {
   if (json(a) !== json(b)) throw new Error(`schema-2 publication ${label} changed`);
@@ -46,16 +59,16 @@ function storedArtifact(object, kind, stage) {
 // observations-operation session for the lifetime of the returned closure.
 export async function prepareObservationHistoryExactOnlyPublicationV3({
   preparedScopes, getObject, headObject = null, assertOperationHeld,
-  finalizeCanonicalHierarchy, finalizeRun,
+  finalizeCanonicalHierarchy, finalizeRun, runId = null,
 }) {
   if (!Array.isArray(preparedScopes) || !preparedScopes.length ||
       [getObject, assertOperationHeld, finalizeCanonicalHierarchy, finalizeRun].some((fn) => typeof fn !== "function")) {
     throw new Error("schema-2 preparation requires verified scopes, held operation and existing finalisation adapters");
   }
   if (headObject !== null && typeof headObject !== "function") throw new Error("invalid schema-2 publication HEAD adapter");
-  let lost = false;
+  let lost = false, failed = false;
   const held = async () => {
-    if (lost) throw new Error("schema-2 operation exclusion previously lost");
+    if (lost || failed) throw new Error("schema-2 operation exclusion lost or publication invalidated");
     try { if (await assertOperationHeld() === false) throw new Error("schema-2 operation exclusion absent"); }
     catch (error) { lost = true; throw error; }
   };
@@ -109,9 +122,13 @@ export async function prepareObservationHistoryExactOnlyPublicationV3({
     objects: [...hierarchies.flatMap((h) => h.publication_objects), latest],
     externalReferences: [...external.values()],
   });
-  let rootAccepted = false, latestReadback = false;
+  let rootAccepted = false, latestReadback = false, completedRun = null;
   let reports = [];
-  const lifecycle = Object.freeze({
+  const guarded = fn => async (...args) => {
+    try { return await fn(...args); }
+    catch (error) { failed = true; completedRun = null; throw error; }
+  };
+  const lifecycle = Object.freeze(Object.fromEntries(Object.entries({
     async beforePublish(entry, policy) {
       await held();
       // Immutable leaves do not mutate canonical files. Keep the original
@@ -143,6 +160,8 @@ export async function prepareObservationHistoryExactOnlyPublicationV3({
       }
     },
     async acceptCurrentRoot() {
+      completedRun = null;
+      rootAccepted = false;
       if ([...selectors.values()].some((s) => !s.selected)) throw new Error("not all selectors selected/read back");
       await held();
       const result = await finalizeCanonicalHierarchy();
@@ -150,12 +169,8 @@ export async function prepareObservationHistoryExactOnlyPublicationV3({
       // Authenticate the completed current root and all stored exact objects;
       // bottom-up child preparation did not require this root to exist earlier.
       reports = [];
-      for (const hierarchy of hierarchies) {
-        const p = hierarchy.scoped_manifest.payload;
-        const report = await verifyObservationHistoryExactOnlyScopeV3({
-          scope: { day_utc: p.day_utc, connector_id: p.connector_id, pollutant_code: p.pollutant_code },
-          getObject, headObject, assertOperationHeld: held,
-        });
+      for (const [index, hierarchy] of hierarchies.entries()) {
+        const report = await acceptObservationHistoryExactOnlyScopeV3(proofs[index]);
         same(report.selector, id(hierarchy.scoped_manifest), "accepted current selector");
         same(report.leaves, hierarchy.exact_leaves.map(id), "accepted immutable leaves");
         reports.push(report);
@@ -163,6 +178,7 @@ export async function prepareObservationHistoryExactOnlyPublicationV3({
       await checkLatestRoots(); await held(); rootAccepted = true;
     },
     async finalizeRun() {
+      completedRun = null;
       if (!rootAccepted || !latestReadback) throw new Error("selector-selected/latest-unfinalised is not success");
       await checkLatestRoots();
       same(id(snapshot(await get(latestKey), latestKey)), id(latest), "current completed latest");
@@ -181,10 +197,39 @@ export async function prepareObservationHistoryExactOnlyPublicationV3({
       same(id(snapshot(await get(latestKey), latestKey)), id(latest), "final completed latest");
       for (const report of reports) await recheckObservationHistoryExactOnlyProofV3(report);
       await held();
+      completedRun = Object.freeze(id(expected));
     },
-  });
+  }).map(([name, fn]) => [name, guarded(fn)])));
   return Object.freeze({ plan, latest, lifecycle, original_selectors: Object.freeze(
     [...selectors.values()].map((s) => s.original)),
+    completedPublication: guarded(async () => {
+      if (!completedRun || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(runId || "")) {
+        throw new Error("exact-only publication/run finalisation or original invocation incomplete");
+      }
+      await held();
+      for (const report of reports) await recheckObservationHistoryExactOnlyProofV3(report);
+      await checkLatestRoots();
+      same(id(snapshot(await get(latestKey), latestKey)), id(latest), "completed latest");
+      same(id(snapshot(await get(completedRun.key), completedRun.key)), completedRun, "completed run");
+      await held();
+      const completion = Object.freeze({});
+      const run = completedRun;
+      completions.set(completion, { proofs: reports,
+        assertUsable() {
+          if (lost || failed || completedRun !== run) throw new Error("exact-only completion operation ended or changed");
+        }, description: {
+          schema_version: 1, kind: "uk_aq_prune_exact_only_completion",
+          invocation_id: runId, finalisation_complete: true, latest: id(latest), run: completedRun,
+          scopes: reports.map((report) => ({
+            scope: report.scope, verifier_version: report.verifier_version, inspector: report.inspector,
+            physical_identity: report.physical_identity, canonical_chain: report.canonical_chain,
+            canonical_source_manifest: report.canonical_source_manifest,
+            selector: report.selector, leaves: report.leaves, files: report.files,
+            row_count: report.row_count,
+          })),
+        } });
+      return completion;
+    }),
     // Shared finaliser always rejects schema 2 in this phase, before any PUT or
     // durable-evidence adapter. There is no opt-in argument or env switch.
     finalize: (adapters) => finalizeObservationHistoryIndexV3Publication({ ...adapters,

@@ -8,17 +8,27 @@ import { compactPruneMetadataEvidence } from './prune-metadata-codec.mjs';
 import { encodePruneEvidenceBundle } from './prune-evidence-bundle.mjs';
 import { exactLeafFormatV3 } from '../../workers/shared/uk_aq_observation_history_exact_leaf_format_v3.mjs';
 import { rejectExactOnlyOriginalHandoverV3 } from '../../workers/shared/uk_aq_observation_history_exact_only_consumer_v3.mjs';
+import { describeObservationHistoryExactOnlyCompletionV3 }
+  from '../../workers/shared/uk_aq_observation_history_exact_only_publication_v3.mjs';
 
 // This boundary owns only the existing original envelope. Merely retaining
 // schema-2 JSON bytes cannot attest an independently completed direct proof.
-export function assertPruneOriginalExactEvidenceV3(objects = []) {
+export function assertPruneOriginalExactEvidenceV3(objects = [], completion = null) {
+  const exactOnly = [];
   for (const object of objects) {
     if (!object.roles?.includes('exact_v3_index')) continue;
     const payload = JSON.parse(Buffer.from(object.bytes_base64, 'base64').toString('utf8'));
     if (!String(payload.kind || '').startsWith('observation_timeseries_physical_leaf')) continue;
     const format = exactLeafFormatV3(payload, Object.hasOwn(payload, 'timeseries_id') ? 'leaf' : 'manifest');
-    if (format.schema_version === 2) rejectExactOnlyOriginalHandoverV3();
+    if (format.schema_version === 2) exactOnly.push(reference(object));
   }
+  if (!exactOnly.length) {
+    if (completion) throw new Error('Exact-only completion lacks original schema-2 index bytes');
+    return null;
+  }
+  if (!completion) rejectExactOnlyOriginalHandoverV3();
+  const description = describeObservationHistoryExactOnlyCompletionV3(completion);
+  return { description, exactOnly };
 }
 
 const same = (a, b) => canonicalJson(a).equals(canonicalJson(b));
@@ -31,8 +41,8 @@ const references = values => (Array.isArray(values) ? values : [])
 
 export function preparePruneOriginalFinalEvidence({ pending, connector, finalization,
   runId, dayUtc, connectorId, writerGitSha, sourceIdentity, originalMetadataSnapshot = null,
-  originalAuthorityCapture = null, evidenceMode = 'inline' }) {
-  assertPruneOriginalExactEvidenceV3(originalMetadataSnapshot?.objects);
+  originalAuthorityCapture = null, evidenceMode = 'inline', exactOnlyCompletion = null }) {
+  const exactOnly = assertPruneOriginalExactEvidenceV3(originalMetadataSnapshot?.objects, exactOnlyCompletion);
   if (pending?.state !== 'put_acknowledged_unverified'
     || pending.pending_evidence?.writer?.invocation_id !== runId
     || pending.pending_evidence?.connector_id !== connectorId
@@ -163,6 +173,11 @@ export function preparePruneOriginalFinalEvidence({ pending, connector, finaliza
       'evidence_envelope_retention_depends_on_optional_outbox_commit',
     ],
   };
+  if (exactOnly) {
+    envelope.original_final_batch.exact_only_completion = prepareExactOnlyCompletion({
+      ...exactOnly, pending, connector, finalization, originalMetadataSnapshot, runId, dayUtc, connectorId,
+    });
+  }
   // Compatible schema-1 addition: neither the legacy metadata group meanings
   // nor the immutable SQL event/version/identity changes. Absence of this
   // versioned extension remains a legacy incomplete event for the consumer.
@@ -211,6 +226,63 @@ export function preparePruneOriginalFinalEvidence({ pending, connector, finaliza
     throw new Error('JSONgen final preparation exceeds bounded metadata size');
   return { envelope, bytes, sha256: sha256Hex(bytes), byte_size: bytes.length,
     retention_state: 'transient_writer_memory_only' };
+}
+
+// Minimal versioned addition to the EXISTING original-final-batch evidence.
+// No new event/table/catalogue, no new ID, and no assertion of PostgreSQL COMMIT.
+// Only the protected optional outbox can make this eligible for authentication.
+function prepareExactOnlyCompletion({ description, exactOnly, pending, connector,
+  finalization, originalMetadataSnapshot, runId, dayUtc, connectorId }) {
+  const reject = () => { throw new Error('JSONgen exact-only completion differs from original frozen publication'); };
+  const scopes = description.scopes.filter(s => s.scope.day_utc === dayUtc && s.scope.connector_id === connectorId);
+  const expected = pending.pending_evidence.scope.pollutant_partitions;
+  const objects = originalMetadataSnapshot?.objects || [];
+  const body = ref => {
+    const object = objects.find(o => same(reference(o), reference(ref)));
+    if (!object || object.canonical_bucket !== connector.connector_manifest.bucket) reject();
+    const bytes = Buffer.from(object.bytes_base64, 'base64');
+    if (bytes.length !== object.byte_size || sha256Hex(bytes) !== object.sha256) reject();
+    return JSON.parse(bytes.toString('utf8'));
+  };
+  if (originalMetadataSnapshot?.completeness !== 'exact_writer_metadata_captured_unverified'
+    || description.finalisation_complete !== true || scopes.length !== expected.length
+    || description.invocation_id !== runId
+    || !references(finalization.v3_publication.latest_global.objects).some(r => same(r, description.latest))
+    || !same(references(scopes.map(s => s.selector)), references(connector.scoped_roots?.map(s => s.reference)))
+    || !same(references(scopes.flatMap(s => [s.selector, ...s.leaves])), references(exactOnly))) reject();
+  const codes = new Set();
+  for (const scope of scopes) {
+    const code = scope.scope.pollutant_code;
+    if (codes.has(code)) reject();
+    codes.add(code);
+    const partition = expected.find(p => p.pollutant_code === code);
+    const child = connector.pollutant_manifests.find(p => p.pollutant_code === code);
+    const canonical = body(scope.canonical_source_manifest);
+    const selected = body(scope.selector);
+    if (!partition || !child || !same(reference(child.manifest), reference(scope.canonical_source_manifest))
+      || scope.row_count !== partition.row_count
+      || scope.canonical_source_manifest.observation_content_hash !== partition.observation_content_hash
+      || scope.canonical_source_manifest.observation_content_hash_version !== partition.observation_content_hash_contract_version
+      || !same(canonical.verification_status_counts, partition.verification_status_counts)
+      || !same(selected.canonical_source_manifest, scope.canonical_source_manifest)
+      || !same(scope.files.map(f => [f.key, f.byte_size, f.sha256, f.row_count]),
+        child.files.map(f => [f.key, f.byte_size, f.sha256, f.row_count]))) reject();
+    // Complete physical membership, including duplicate rows. Status and values
+    // are bound by the independently decoded canonical hash above, not counts.
+    const counts = {};
+    for (const s of pending.pending_evidence.scope.physical_timeseries_days.filter(s => s.pollutant_code === code))
+      counts[s.timeseries_id] = (counts[s.timeseries_id] || 0) + s.row_count;
+    if (!same(canonical.timeseries_row_counts, counts)) reject();
+    for (const ref of [...scope.canonical_chain, ...scope.leaves]) body(ref);
+  }
+  return { ...description, scopes,
+    // Existing signed pending key already binds invocation + connector/day +
+    // compressed/uncompressed source SHA. The outbox and post-COMMIT message
+    // retain this identical key; no second identifier or message format needed.
+    dataset_id: pending.source.key,
+    source_evidence_sha256: pending.source_evidence_sha256,
+    source_identity: pending.pending_evidence.source_identity,
+    authority_state: 'prepared_before_original_gate_transaction' };
 }
 
 export function pruneEvidenceBundleIdentity(envelope) {
