@@ -1,7 +1,14 @@
 import { getObservationHistoryGeneration, assertObservationHistoryGenerationPrefixes } from "./uk_aq_observation_history_generation.mjs";
 // @ts-nocheck -- post-cutover-only Node writer shared by every canonical source.
 import { Buffer } from "node:buffer";
-import { preparePruneExactOnlyConnectorScopesV3 } from './uk_aq_observation_history_exact_only_publication_v3.mjs';
+import { preparePruneExactOnlyConnectorScopesV3, createDormantPruneExactOnlyPublicationV3,
+  preparePruneExactOnlyBatchCompletionV3 } from './uk_aq_observation_history_exact_only_publication_v3.mjs';
+import { exactCanonicalHashVersionV3 } from './uk_aq_observation_history_exact_only_verifier_v3.mjs';
+import { computePruneConnectorSourceIdentity } from './uk_aq_prune_connector_source_identity.mjs';
+import { admitPruneFrozenConnectorSnapshot } from '../uk_aq_prune_daily/committed_history_guard.mjs';
+
+// Unexported capability: ordinary/operational writer options cannot choose 2.
+const DORMANT_PRUNE_EXACT_ONLY = Symbol('dormant Prune exact-only owner');
 
 import {
   buildObservationHistoryIndexV3PublicationPlan,
@@ -1209,6 +1216,8 @@ async function publishConnectorExactV3Scopes({
   finalizeV3Publication,
   publicationConcurrency,
   onProgress,
+  dormantOwner = null,
+  preparedScopes = [],
 }) {
   const exactObjects = partitions.flatMap((partition) =>
     partition.v3_hierarchy.publication_objects
@@ -1243,7 +1252,9 @@ async function publishConnectorExactV3Scopes({
     objects: exactObjects,
     externalReferences: [...externalByKey.values()],
   });
-  const publication = await finalizeV3Publication({
+  const publication = dormantOwner
+    ? await dormantOwner.publish({ plan, preparedScopes })
+    : await finalizeV3Publication({
     plan,
     putIfChanged,
     getObject,
@@ -1313,6 +1324,7 @@ export async function runObservationHistoryV3ConnectorPublication({
   exactV3PublicationConcurrency =
     DEFAULT_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY,
   selectedScopeRemovalAuthority = null,
+  [DORMANT_PRUNE_EXACT_ONLY]: dormantOwner = null,
 }) {
   assertObservationHistoryGenerationPrefixes(getObservationHistoryGeneration("v3"), { observationsPrefix, indexRoot, latestKey });
   if (!client?.query) throw new Error("V3 steady-state writer requires PostgreSQL lock client");
@@ -1331,6 +1343,9 @@ export async function runObservationHistoryV3ConnectorPublication({
   }
   assertObservationHistoryGenerationPrefixes(getObservationHistoryGeneration("v3"), { observationsPrefix, indexRoot });
   const normalizedSource = normalizeSource(source);
+  if (dormantOwner && normalizedSource !== OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily) {
+    throw new Error('Dormant exact-only ownership is Prune-specific');
+  }
   const normalizedRemovedScopes = normalizeRemovedScopes(removedScopes);
   const selectedScopeReconciliation = normalizedSource ===
     OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.selectedScopeReconciliation;
@@ -1375,6 +1390,17 @@ export async function runObservationHistoryV3ConnectorPublication({
     indexRoot,
     diagnosticLog,
   });
+  if (dormantOwner) {
+    for (let i = 0; i < prepared.length; i++) {
+      const partition = prepared[i], manifest = partition.canonical_pollutant_manifest;
+      prepared[i] = Object.freeze({ ...partition,
+        v3_hierarchy: buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
+          metadata: partition.target_metadata, exactSchemaVersion: 2,
+          canonicalManifest: { ...canonicalManifestDescriptor(manifest),
+            observation_content_hash_version: exactCanonicalHashVersionV3(manifest.payload) },
+        }) });
+    }
+  }
   assertReplacementRemovalDisjoint(prepared, normalizedRemovedScopes);
   const canonicalObservationsPrefix = normalizePrefix(
     observationsPrefix,
@@ -1426,6 +1452,7 @@ export async function runObservationHistoryV3ConnectorPublication({
       diagnosticEnvironment,
       timeoutMs: lockTimeoutMs,
     }, async () => {
+      if (dormantOwner) await dormantOwner.capture(group.partitions);
       const partitionResults = [];
       for (const partition of group.partitions) {
         const fileEvidence = [];
@@ -1496,115 +1523,126 @@ export async function runObservationHistoryV3ConnectorPublication({
       }
       const exactOnlyPreparedScopes = normalizedSource === OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily
         ? await preparePruneExactOnlyConnectorScopesV3({ partitions: partitionResults, canonical,
-          originalOperation, getObject: async ({ key }) => ({ ...await getObject({ key }), key }) }) : [];
-      const exactFields = {
-        publication_stage: "exact_v3_connector_publication",
-        day_utc: group.day_utc,
-        connector_id: group.connector_id,
-        pollutant_count: partitionResults.length,
-        affected_object_count: partitionResults.reduce(
-          (sum, partition) => sum + partition.v3_hierarchy.publication_objects.length,
-          0,
-        ),
-        configured_concurrency: exactV3PublicationConcurrency,
-      };
-      assertV3PublicationStageBudget(
-        beforePublicationStage,
-        "exact_v3_connector_publication",
-        exactFields,
-      );
-      emitV3PublicationDiagnostic(diagnosticLog, "exact_v3_connector_publication_start", exactFields);
-      const exactStartedAtMs = Date.now();
-      let exact;
-      let exactProgress = null;
-      let lastLoggedProgress = 0;
-      try {
-        exact = partitionResults.length === 0
-          ? Object.freeze({
-            publication: Object.freeze({
-              ok: true,
-              status: "no_replacement_scopes",
-              objects: Object.freeze([]),
-            }),
-            scoped_roots: Object.freeze([]),
-          })
-          : await publishConnectorExactV3Scopes({
-            partitions: partitionResults,
-            canonical,
-            getObject,
-            putIfChanged,
-            recordDurableEvidence,
-            finalizeV3Publication,
-            publicationConcurrency: exactV3PublicationConcurrency,
-            onProgress: (progress) => {
-              exactProgress = progress;
-              if (
-                progress?.status === "running" &&
-                progress.completed_object_count > 0 &&
-                progress.completed_object_count % 100 === 0 &&
-                progress.completed_object_count !== lastLoggedProgress
-              ) {
-                lastLoggedProgress = progress.completed_object_count;
-                emitV3PublicationDiagnostic(
-                  diagnosticLog,
-                  "exact_v3_connector_publication_progress",
-                  {
-                    ...exactFields,
-                    completed: progress.completed_object_count,
-                    total: progress.total_object_count,
-                    active: progress.active_publication_count,
-                    ready: progress.ready_object_count,
-                    blocked: progress.blocked_object_count,
-                    maximum_active_publications:
-                      progress.maximum_active_publications,
-                    reused_object_count: progress.reused_object_count,
-                    newly_written_object_count:
-                      progress.newly_written_object_count,
-                    elapsed_ms: progress.elapsed_ms,
-                  },
-                );
-              }
-            },
+          originalOperation, getObject: dormantOwner ? getObject : async ({ key }) => ({ ...await getObject({ key }), key }),
+          ...(dormantOwner ? { headObject: dormantOwner.headObject } : {}) }) : [];
+      const finishExactPublication = async () => {
+        const exactFields = {
+          publication_stage: "exact_v3_connector_publication",
+          day_utc: group.day_utc,
+          connector_id: group.connector_id,
+          pollutant_count: partitionResults.length,
+          affected_object_count: partitionResults.reduce(
+            (sum, partition) => sum + partition.v3_hierarchy.publication_objects.length,
+            0,
+          ),
+          configured_concurrency: exactV3PublicationConcurrency,
+        };
+        assertV3PublicationStageBudget(
+          beforePublicationStage,
+          "exact_v3_connector_publication",
+          exactFields,
+        );
+        emitV3PublicationDiagnostic(diagnosticLog, "exact_v3_connector_publication_start", exactFields);
+        const exactStartedAtMs = Date.now();
+        let exact;
+        let exactProgress = null;
+        let lastLoggedProgress = 0;
+        try {
+          exact = partitionResults.length === 0
+            ? Object.freeze({
+              publication: Object.freeze({
+                ok: true,
+                status: "no_replacement_scopes",
+                objects: Object.freeze([]),
+              }),
+              scoped_roots: Object.freeze([]),
+            })
+            : await publishConnectorExactV3Scopes({
+              partitions: partitionResults,
+              canonical,
+              getObject,
+              putIfChanged,
+              recordDurableEvidence,
+              finalizeV3Publication,
+              publicationConcurrency: exactV3PublicationConcurrency,
+              dormantOwner,
+              preparedScopes: exactOnlyPreparedScopes,
+              onProgress: (progress) => {
+                exactProgress = progress;
+                if (
+                  progress?.status === "running" &&
+                  progress.completed_object_count > 0 &&
+                  progress.completed_object_count % 100 === 0 &&
+                  progress.completed_object_count !== lastLoggedProgress
+                ) {
+                  lastLoggedProgress = progress.completed_object_count;
+                  emitV3PublicationDiagnostic(
+                    diagnosticLog,
+                    "exact_v3_connector_publication_progress",
+                    {
+                      ...exactFields,
+                      completed: progress.completed_object_count,
+                      total: progress.total_object_count,
+                      active: progress.active_publication_count,
+                      ready: progress.ready_object_count,
+                      blocked: progress.blocked_object_count,
+                      maximum_active_publications:
+                        progress.maximum_active_publications,
+                      reused_object_count: progress.reused_object_count,
+                      newly_written_object_count:
+                        progress.newly_written_object_count,
+                      elapsed_ms: progress.elapsed_ms,
+                    },
+                  );
+                }
+              },
+            });
+        } catch (error) {
+          emitV3PublicationDiagnostic(diagnosticLog, "exact_v3_connector_publication_failed", {
+            ...exactFields,
+            ...(exactProgress || {}),
+            duration_ms: Math.max(0, Date.now() - exactStartedAtMs),
+            error: error instanceof Error ? error.message : String(error),
           });
-      } catch (error) {
-        emitV3PublicationDiagnostic(diagnosticLog, "exact_v3_connector_publication_failed", {
+          throw error;
+        }
+        emitV3PublicationDiagnostic(diagnosticLog, "exact_v3_connector_publication_complete", {
           ...exactFields,
-          ...(exactProgress || {}),
+          ...(exact.publication.publication_diagnostics || {}),
           duration_ms: Math.max(0, Date.now() - exactStartedAtMs),
-          error: error instanceof Error ? error.message : String(error),
         });
-        throw error;
-      }
-      emitV3PublicationDiagnostic(diagnosticLog, "exact_v3_connector_publication_complete", {
-        ...exactFields,
-        ...(exact.publication.publication_diagnostics || {}),
-        duration_ms: Math.max(0, Date.now() - exactStartedAtMs),
-      });
-      const scopedRootByIdentity = new Map(
-        exact.scoped_roots.map((root) => [scopeIdentity(root.scope), root]),
-      );
-      return Object.freeze({
-        day_utc: group.day_utc,
-        connector_id: group.connector_id,
-        partitions: Object.freeze(partitionResults.map((partition) =>
-          Object.freeze({
-            scope: partition.scope,
-            target_metadata: partition.target_metadata,
-            pollutant_manifest: partition.pollutant_manifest,
-            file_evidence: partition.file_evidence,
-            scoped_root: scopedRootByIdentity.get(scopeIdentity(partition.scope)),
-          })
-        )),
-        canonical,
-        removal_results: canonical.removal_results,
-        v3_exact_publication: exact.publication,
-        ...(exactOnlyPreparedScopes.length ? { exact_only_prepared_scopes: exactOnlyPreparedScopes } : {}),
-      });
+        const scopedRootByIdentity = new Map(
+          exact.scoped_roots.map((root) => [scopeIdentity(root.scope), root]),
+        );
+        return Object.freeze({
+          day_utc: group.day_utc,
+          connector_id: group.connector_id,
+          partitions: Object.freeze(partitionResults.map((partition) =>
+            Object.freeze({
+              scope: partition.scope,
+              target_metadata: partition.target_metadata,
+              pollutant_manifest: partition.pollutant_manifest,
+              file_evidence: partition.file_evidence,
+              scoped_root: scopedRootByIdentity.get(scopeIdentity(partition.scope)),
+            })
+          )),
+          canonical,
+          removal_results: canonical.removal_results,
+          v3_exact_publication: exact.publication,
+          ...(exactOnlyPreparedScopes.length ? { exact_only_prepared_scopes: exactOnlyPreparedScopes } : {}),
+        });
+      };
+      if (dormantOwner) dormantOwner.retainConnectorContinuation(finishExactPublication);
+      return await finishExactPublication();
     });
     connectorResults.push(result);
     group.partitions.length = 0;
   }
 
+  return connectorPublicationResult(connectorResults, normalizedSource, completeDayReplacementResults);
+}
+
+function connectorPublicationResult(connectorResults, normalizedSource, completeDayReplacementResults = []) {
   const connectorPublication = {
     ok: connectorResults.every((entry) =>
       entry.v3_exact_publication?.ok === true
@@ -2459,5 +2497,125 @@ export function runSelectedScopeReconciliationObservationHistoryV3Writer(options
     source:
       OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.selectedScopeReconciliation,
     selectedScopeRemovalAuthority: SELECTED_SCOPE_REMOVAL_AUTHORITY,
+  });
+}
+/**
+ * Dormant, injected-adapter surface for Stage 2C. No operational caller imports
+ * this factory; native R2 configuration is rejected. Its private capability is
+ * never exported or selected from configuration. The existing canonical writer
+ * and full batch finaliser still own all physical and hierarchy work.
+ */
+export function createDormantPruneExactOnlyWriterV3(options) {
+  options = Object.freeze({ ...options });
+  const { originalOperation, getObject, r2, headObject = null } = options;
+  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(originalOperation?.run_id || '')) {
+    throw new Error('Dormant Prune writer requires its original invocation');
+  }
+  const publisher = createDormantPruneExactOnlyPublicationV3({ originalOperation, getObject, r2,
+    recordDurableEvidence: options.recordDurableEvidence });
+  for (const name of ['getObject', 'headObject', 'putObject', 'putIfChanged', 'recordDurableEvidence',
+    'withConnectorDayLock', 'runDayFinalizer', 'runGlobalFinalizer',
+    'publishConnectorScopedCanonicalManifests', 'finalizeCanonicalDayManifests', 'finalizeCanonicalAggregateManifests']) {
+    if (typeof options[name] !== 'function') throw new Error(`Dormant Prune writer requires isolated adapter: ${name}`);
+  }
+  // Keep fatal original-session checks at the real mutation/finalisation
+  // boundaries. Read-only batch discovery may be concurrent; it must not issue
+  // overlapping requests on the coordinator's single-use IPC capability.
+  const operationOptions = { ...options };
+  for (const name of ['putObject', 'putAndVerifyParquet', 'publishConnectorScopedCanonicalManifests',
+    'finalizeCanonicalDayManifests', 'finalizeCanonicalAggregateManifests']) {
+    if (typeof options[name] !== 'function') continue;
+    operationOptions[name] = async (...args) => {
+      await publisher.held(); const result = await options[name](...args); await publisher.held(); return result;
+    };
+  }
+  const publications = [], pending = new Map();
+  let busy = false, batchStarted = false;
+  const exclusive = fn => async (...args) => {
+    if (busy) throw new Error('Overlapping original Prune lifecycle calls');
+    busy = true;
+    try { await publisher.held(); return await fn(...args); }
+    finally { busy = false; }
+  };
+  const register = publication => {
+    publications.push(publication);
+    return publication;
+  };
+  const ownerFor = entry => Object.freeze({ ...publisher, headObject,
+    retainConnectorContinuation(fn) { entry.continue = fn; },
+  });
+  return Object.freeze({
+    publishConnector: exclusive(async ({ partitions, sourceIdentity }) => {
+      if (batchStarted) throw new Error('Cannot add a connector after batch finalisation starts');
+      const inputs = structuredClone(normalizePartitionInputs(partitions));
+      const rows = inputs.flatMap(p => p.rows);
+      const identity = computePruneConnectorSourceIdentity(rows);
+      if (encodeObservationHistoryIndexV3Json(identity) !== encodeObservationHistoryIndexV3Json(sourceIdentity)) {
+        throw new Error('Complete frozen Prune source identity differs');
+      }
+      const day = String(rows[0]?.observed_at_utc || '').slice(0, 10), connector = rows[0]?.connector_id;
+      if (rows.some(r => r.connector_id !== connector || r.observed_at_utc.slice(0,10) !== day)) {
+        throw new Error('Dormant publication requires one complete connector/day');
+      }
+      const key = `${day}/${connector}`;
+      if (pending.has(key)) throw new Error('Use the original connector continuation after interruption');
+      // Actual existing root/index admission, before any canonical write. No
+      // invented gate-only recovery, prior receipt or counts-only authority.
+      await admitPruneFrozenConnectorSnapshot({ r2, getObject, headObject,
+        observationsPrefix: DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
+        dayUtc: day, connectorId: connector, rows, assertOperationHeld: publisher.held });
+      await publisher.held();
+      const entry = { continue: null, sourceIdentity: identity, complete: false };
+      pending.set(key, entry);
+      const publication = await runPruneDailyObservationHistoryV3ConnectorPublication({
+        ...operationOptions, partitions: inputs, [DORMANT_PRUNE_EXACT_ONLY]: ownerFor(entry),
+      });
+      entry.complete = true;
+      return register(publication);
+    }),
+    resumeConnector: exclusive(async ({ dayUtc, connectorId, sourceIdentity }) => {
+      const entry = pending.get(`${dayUtc}/${connectorId}`);
+      if (!entry || entry.complete || !entry.continue) {
+        throw new Error('No original exact-publication continuation; reauthenticate the unfinished canonical attempt explicitly');
+      }
+      if (encodeObservationHistoryIndexV3Json(entry.sourceIdentity) !== encodeObservationHistoryIndexV3Json(sourceIdentity)) {
+        throw new Error('Original frozen source changed during recovery');
+      }
+      // Canonical files/children are never rewritten by this continuation. Its
+      // opaque original physical proof checks all current identities first.
+      const result = await entry.continue();
+      const publication = connectorPublicationResult([result], OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily);
+      entry.complete = true;
+      return register(publication);
+    }),
+    finalizeBatch: exclusive(async () => {
+      if (!publications.length || [...pending.values()].some(e => !e.complete)) {
+        throw new Error('Incomplete connector publication cannot complete a Prune batch');
+      }
+      batchStarted = true;
+      await publisher.beginBatch();
+      const result = await runPruneDailyObservationHistoryV3RunFinalization({ ...operationOptions,
+        connectorPublications: publications.map(p => p.run_finalization_evidence),
+        // Existing finaliser publishes only latest here, after mandatory day,
+        // month/year/root work. Protect its originally read identity with CAS.
+        putIfChanged: artifact => publisher.publishLatest(artifact),
+      });
+      await publisher.recheck();
+      const expectedDays = [...new Set(publications.flatMap(p => p.connector_results.map(c => c.day_utc)))].sort();
+      const completions = [];
+      for (const publication of publications) {
+        const connector = publication.connector_results[0];
+        const completion = await preparePruneExactOnlyBatchCompletionV3({
+          preparedScopes: connector.exact_only_prepared_scopes, finalization: result,
+          runId: originalOperation.run_id, originalOperation, expectedDays,
+          expectedConnectorPublicationCount: publications.length, getObject,
+        });
+        completions.push(Object.freeze({ day_utc: connector.day_utc, connector_id: connector.connector_id, completion }));
+      }
+      await publisher.held();
+      // These are precommit preparation handles. Existing Prune alone owns
+      // candidate/gate/outbox COMMIT and separate atomic source deletion.
+      return Object.freeze({ ...result, exact_only_completions: Object.freeze(completions) });
+    }),
   });
 }
