@@ -205,6 +205,8 @@ function normalizeV3PhysicalPage(payload, identity, piece, expectedPage, supplie
   }
   const rows = [];
   let previousMs = null;
+  let firstAcceptedMs = null;
+  let lastAcceptedMs = null;
   for (const raw of Array.isArray(payload.rows) ? payload.rows : []) {
     const observedAtMs = Date.parse(String(raw?.observed_at || raw?.observed_at_utc || ""));
     const value = Number(raw?.value);
@@ -220,6 +222,8 @@ function normalizeV3PhysicalPage(payload, identity, piece, expectedPage, supplie
     // v2 and direct-ingest paths by omitting them rather than treating the v3
     // leaf as structurally invalid.
     if (value < 0) continue;
+    if (firstAcceptedMs === null) firstAcceptedMs = observedAtMs;
+    lastAcceptedMs = observedAtMs;
     rows.push({
       connector_id: identity.connectorId,
       station_id: identity.stationId,
@@ -233,7 +237,7 @@ function normalizeV3PhysicalPage(payload, identity, piece, expectedPage, supplie
   if (rows.length > page.physical_rows_decoded) {
     throw new Error("station_history_v3_leaf_page_contradiction");
   }
-  return { page, paginationComplete, rows };
+  return { page, paginationComplete, rows, firstAcceptedMs, lastAcceptedMs };
 }
 
 async function fetchObservationJson(target, secret, fetchApi) {
@@ -327,13 +331,14 @@ async function readV3R2Observations({ env, identity, startMs, endMs, readBudget,
         allPiecesComplete = false;
         break outer;
       }
-      for (const row of normalized.rows) {
-        const observedAtMs = Date.parse(row.observed_at);
-        if (previousMs !== null && observedAtMs < previousMs) {
+      // Page validation already orders every accepted row. Only the boundary
+      // with the previous accepted page needs checking, after the row budget.
+      if (normalized.rows.length > 0) {
+        if (previousMs !== null && normalized.firstAcceptedMs < previousMs) {
           throw new Error("station_history_v3_cross_page_row_order_invalid");
         }
-        previousMs = observedAtMs;
-        rows.push(row);
+        for (const row of normalized.rows) rows.push(row);
+        previousMs = normalized.lastAcceptedMs;
       }
       budget.rowsUsed += normalized.rows.length;
       if (normalized.paginationComplete) {
