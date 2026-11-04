@@ -15,6 +15,7 @@ import {
 import { validateOfficialRdataPreservationDependencies } from "./official_rdata_evidence_validation.mjs";
 import { validateOfficialRdataV10PreservedOnlyAuthority } from "./official_rdata_v10_validation.mjs";
 import { authenticateOfficialRdataPinnedHierarchy } from "./official_rdata_pinned_hierarchy.mjs";
+import { validateGenericV3SelectedFormats } from "./generic_v3_selected_format_validation.mjs";
 
 const OFFICIAL_RDATA_TIMESTAMP_MAPPING =
   "rdata_date_beginning_plus_one_hour_to_observed_at_utc";
@@ -841,6 +842,7 @@ export function validateLocalGenericV3Proposal(runState, env = process.env) {
 
 export async function validateFinalGenericV3ProposalGraph({ runState, proposal }) {
   const authority = canonicalGenericV3SelectedScopeAuthority(runState);
+  validateGenericV3SelectedFormats({ runState, proposal, authority });
   if (["waqn", "saqn"].includes(runState.official_rdata_source_adapter)) {
     const seen = new Set();
     for (const scope of authority.selected_scopes) {
