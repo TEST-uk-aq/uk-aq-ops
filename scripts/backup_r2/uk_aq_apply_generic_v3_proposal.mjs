@@ -13,6 +13,7 @@ import {
   withHistoryWriterClient,
 } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
 import { applyValidatedProposal } from "./uk_aq_apply_integrity_proposal.mjs";
+import { requireNoSchema2PreparationExecution } from "./lib/schema2_preparation_execution_guard.mjs";
 import {
   requireGenericV3CoordinatorFreeze,
   validateFinalGenericV3ProposalGraph,
@@ -33,6 +34,7 @@ export async function applyValidatedGenericV3Proposal({
   env = process.env,
 }) {
   const coordinatorState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
+  requireNoSchema2PreparationExecution(coordinatorState);
   if (coordinatorState.execution_path !== "generic_integrity") {
     throw new Error("Generic fixed-v3 bridge accepts generic_integrity proposals only");
   }
@@ -56,8 +58,10 @@ export async function applyValidatedGenericV3Proposal({
       env,
       generation: "v3",
       expectedExecutionPath: "generic_integrity",
-      coordinatorFreezeValidator: (runState) =>
-        requireGenericV3CoordinatorFreeze(runState, env),
+      coordinatorFreezeValidator: (runState) => {
+        requireNoSchema2PreparationExecution(runState);
+        return requireGenericV3CoordinatorFreeze(runState, env);
+      },
       localProposalValidator: (runState) =>
         validateLocalGenericV3Proposal(runState, env),
       finalProposalGraphValidator: validateFinalGenericV3ProposalGraph,
@@ -69,6 +73,7 @@ export async function applyValidatedGenericV3Proposal({
 
 async function main() {
   const runStatePath = parseArgs(process.argv.slice(2));
+  requireNoSchema2PreparationExecution(JSON.parse(fs.readFileSync(runStatePath, "utf8")));
   const config = resolveR2HistoryIndexConfig(process.env);
   if (!hasRequiredR2Config(config.r2)) {
     throw new Error("Generic fixed-v3 requires complete R2 configuration");

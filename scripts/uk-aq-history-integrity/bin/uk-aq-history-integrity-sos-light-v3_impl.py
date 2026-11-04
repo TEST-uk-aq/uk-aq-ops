@@ -24068,6 +24068,106 @@ def _resolve_v3_proposal_body_reference(
     return resolved, actual_sha256, actual_bytes
 
 
+def _require_no_schema2_preparation_execution(
+    run_state: Mapping[str, Any], *, reject_sidecar: bool = True,
+) -> None:
+    """Preparation evidence is separate from every executable proposal graph."""
+    preparation_contract = "uk_aq_integrity_v3_schema2_preparation_v1"
+    if (
+        (reject_sidecar and "schema2_preparation" in run_state)
+        or "preparation_contract_version" in run_state
+        or run_state.get("contract_version") == preparation_contract
+        or run_state.get("state") == "prepared_only"
+    ):
+        raise ValueError("schema2_preparation_not_executable: preparation-only state cannot authorise APPLY")
+    pending = [run_state.get("objects"), run_state.get("planning")]
+    seen: set[int] = set()
+    while pending:
+        value = pending.pop()
+        if not isinstance(value, (Mapping, list)) or id(value) in seen:
+            continue
+        seen.add(id(value))
+        if isinstance(value, Mapping):
+            if (
+                "schema2_preparation" in value
+                or "preparation_contract_version" in value
+                or value.get("contract_version") == preparation_contract
+                or value.get("state") == "prepared_only"
+            ):
+                raise ValueError("schema2_preparation_not_executable: preparation-only state cannot authorise APPLY")
+            pending.extend(value.values())
+        else:
+            pending.extend(value)
+
+
+def _authenticate_schema2_preparation_projection(
+    sidecar: Any, *, run_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Authenticate the opaque Node freeze, without claiming physical validation."""
+    if not isinstance(sidecar, Mapping):
+        raise ValueError("schema-2 preparation sidecar is invalid")
+    freeze = sidecar.get("freeze")
+    fingerprint = sidecar.get("fingerprint")
+    if (
+        sidecar.get("contract_version") != "uk_aq_integrity_v3_schema2_preparation_v1"
+        or type(sidecar.get("run_id")) is not str
+        or not sidecar.get("run_id")
+        or sidecar.get("run_id") != run_state.get("run_id")
+        or sidecar.get("owner") != "integrity"
+        or sidecar.get("execution_path") not in {"generic_integrity", "sos_light"}
+        or sidecar.get("execution_path") != run_state.get("execution_path")
+        or sidecar.get("history_generation") != "v3"
+        or sidecar.get("state") != "prepared_only"
+        or sidecar.get("read_only") is not True
+        or sidecar.get("repair_apply_eligible") is not False
+        or sidecar.get("publication_eligible") is not False
+        or "current_object_authority" not in sidecar
+        or sidecar["current_object_authority"] is not None
+        or "conditional_publication_authority" not in sidecar
+        or sidecar["conditional_publication_authority"] is not None
+        or not isinstance(freeze, Mapping)
+        or set(freeze) != {"contract_version", "canonical_json", "sha256", "byte_size"}
+        or freeze.get("contract_version") != "uk_aq_integrity_v3_schema2_preparation_freeze_v1"
+        or not isinstance(fingerprint, Mapping)
+        or set(fingerprint) != {"contract_version", "sha256"}
+        or fingerprint.get("contract_version") != "uk_aq_integrity_v3_schema2_preparation_fingerprint_v1"
+    ):
+        raise ValueError("schema-2 preparation authority or freeze is invalid")
+    canonical_json = freeze.get("canonical_json")
+    declared_bytes = freeze.get("byte_size")
+    expected_sha = freeze.get("sha256")
+    if (
+        not isinstance(canonical_json, str)
+        or len(canonical_json) > 8 * 1024 * 1024
+        or type(declared_bytes) is not int
+        or not 0 < declared_bytes <= 8 * 1024 * 1024
+        or not isinstance(expected_sha, str)
+        or not re.fullmatch(r"[a-f0-9]{64}", expected_sha)
+        or fingerprint.get("sha256") != expected_sha
+    ):
+        raise ValueError("schema-2 preparation projection exceeds its bound or has an invalid identity")
+    body = canonical_json.encode("utf-8")
+    if len(body) != declared_bytes or hashlib.sha256(body).hexdigest() != expected_sha:
+        raise ValueError("schema-2 preparation projection byte identity is invalid")
+    projection = {key: value for key, value in sidecar.items() if key not in {"freeze", "fingerprint"}}
+    def unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("schema-2 preparation projection has duplicate members")
+            result[key] = value
+        return result
+
+    decoded = json.loads(canonical_json, object_pairs_hook=unique_pairs)
+    # Serialised comparison distinguishes Python's otherwise-equal True/1 and
+    # 1/1.0 values. The original canonical bytes remain opaque and unchanged.
+    if json.dumps(decoded, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False) != json.dumps(
+        projection, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+    ):
+        raise ValueError("schema-2 preparation projection does not match the retained sidecar")
+    return dict(sidecar)
+
+
 def _load_authenticated_v3_proposal_result(
     *,
     run_state: Mapping[str, Any],
@@ -24164,11 +24264,14 @@ def _load_authenticated_v3_proposal_result(
     elif output.get("ok") is not True:
         raise ValueError("fixed-v3 compact proposal did not complete successfully")
     planning = output.get("planning")
+    _require_no_schema2_preparation_execution(output, reject_sidecar=not allow_blocked)
     proposals = planning.get("proposals") if isinstance(planning, Mapping) else None
     if not isinstance(proposals, list):
         raise ValueError("fixed-v3 compact proposal graph is unavailable")
     if allow_blocked and proposals:
         raise ValueError("fixed-v3 blocked proposal contains planned objects")
+    if "schema2_preparation" in output:
+        _authenticate_schema2_preparation_projection(output["schema2_preparation"], run_state=run_state)
     progress.total_objects = len(proposals)
     file_backed_count = 0
     file_backed_bytes = 0
@@ -24399,6 +24502,12 @@ def _record_metadata_executor_overlay(
     planning = output.get("planning") if isinstance(output, Mapping) else None
     if not isinstance(planning, Mapping):
         return
+    # An empty blocked result can coexist with independent preparation evidence;
+    # no preparation object may be promoted into this executable write set.
+    _require_no_schema2_preparation_execution(
+        output,
+        reject_sidecar=bool(planning.get("proposals")) or output.get("status") != "blocked_dependency",
+    )
     transport = executor_result.get("transport")
     if require_file_backed_bodies:
         if not isinstance(transport, Mapping) or transport.get("status") != "authenticated":
@@ -24406,6 +24515,12 @@ def _record_metadata_executor_overlay(
                 "fixed-v3 authenticated proposal transport evidence is unavailable"
             )
         run_state["proposal_transport"] = dict(transport)
+    if "schema2_preparation" in output:
+        if not require_file_backed_bodies or planning.get("proposals") != []:
+            raise ValueError("schema-2 preparation retention requires authenticated file-backed transport")
+        run_state["schema2_preparation"] = _authenticate_schema2_preparation_projection(
+            output["schema2_preparation"], run_state=run_state,
+        )
     core_identity_audit = planning.get("core_snapshot_identity_validation")
     if isinstance(core_identity_audit, Mapping):
         consumer_audit = run_state.setdefault(
@@ -27047,6 +27162,13 @@ def record_integrity_object_operations(
     log: logging.Logger | None = None,
 ) -> dict[str, int]:
     """Persist planned and completed object states without conflating them."""
+    _require_no_schema2_preparation_execution(
+        run_state,
+        reject_sidecar=bool(run_state.get("objects")) or any(
+            isinstance(entry, Mapping) and entry.get("proposed")
+            for entry in list(run_state.get("tombstone_prefixes") or [])
+        ),
+    )
     now_iso = fmt_iso(utc_now())
     counts = {"planned_writes": 0, "planned_deletions": 0, "completed_writes": 0, "completed_deletions": 0}
     object_entries = sorted(dict(run_state.get("objects") or {}).items())
@@ -27197,6 +27319,7 @@ def validate_proposal_run_state_transition(
     *,
     log: logging.Logger | None = None,
 ) -> dict[str, Any]:
+    _require_no_schema2_preparation_execution(run_state)
     execution_path = str(run_state.get("execution_path") or "")
     if execution_path == "generic_integrity":
         _canonical_generic_integrity_selected_scope_authority(run_state)
@@ -27653,6 +27776,7 @@ def validate_proposal_run_state_transition(
 def _require_complete_persisted_file_backed_proposal(
     run_state: Mapping[str, Any],
 ) -> None:
+    _require_no_schema2_preparation_execution(run_state)
     transport = run_state.get("proposal_transport")
     if (
         not isinstance(transport, Mapping)
