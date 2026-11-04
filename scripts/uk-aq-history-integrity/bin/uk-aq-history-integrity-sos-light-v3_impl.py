@@ -79,6 +79,7 @@ from integrity.current_state.audit import (
     start_target_attempt,
 )
 from integrity.runtime import CANONICAL_REPAIR_STAGE_ORDER
+from integrity.original_operation import ORIGINAL_INTEGRITY_CHANNEL
 from integrity.local_cleanup import (
     POLICY as LOCAL_CLEANUP_POLICY,
     persist_cleanup_state,
@@ -27820,8 +27821,10 @@ def run_canonical_apply_executor(
         "--run-state-json", str(run_state["run_state_path"]),
         "--write-r2",
     ]
-    process = subprocess.Popen(
+    process = ORIGINAL_INTEGRITY_CHANNEL.popen_apply(
         command,
+        repo_root=repo_root,
+        execution_path=execution_path,
         cwd=repo_root,
         env={**os.environ, **{str(key): str(value) for key, value in env.items()}},
         stdout=subprocess.PIPE,

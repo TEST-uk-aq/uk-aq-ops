@@ -3,6 +3,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { integrityOriginalOperationForApply } from "../operations/lib/uk_aq_integrity_original_operation.mjs";
+export { assertOriginalIntegrityOperationHeld } from "../operations/lib/uk_aq_integrity_original_operation.mjs";
 
 import { hasRequiredR2Config } from "../../workers/shared/r2_sigv4.mjs";
 import { resolveR2HistoryIndexConfig } from "../../workers/shared/uk_aq_r2_history_index.mjs";
@@ -42,22 +44,27 @@ export async function applyValidatedGenericV3Proposal({
     expectedOwner: "integrity",
     expectedRunId: lockRunId,
   });
-  if (!hasRequiredR2Config(r2)) {
-    throw new Error("Generic fixed-v3 requires complete R2 configuration");
+  const originalOperation = integrityOriginalOperationForApply({ env, expectedRunId: lockRunId });
+  try {
+    if (!hasRequiredR2Config(r2)) {
+      throw new Error("Generic fixed-v3 requires complete R2 configuration");
+    }
+    return await applyValidatedProposal({
+      runStatePath,
+      r2,
+      adapters,
+      env,
+      generation: "v3",
+      expectedExecutionPath: "generic_integrity",
+      coordinatorFreezeValidator: (runState) =>
+        requireGenericV3CoordinatorFreeze(runState, env),
+      localProposalValidator: (runState) =>
+        validateLocalGenericV3Proposal(runState, env),
+      finalProposalGraphValidator: validateFinalGenericV3ProposalGraph,
+    });
+  } finally {
+    await originalOperation?.complete();
   }
-  return await applyValidatedProposal({
-    runStatePath,
-    r2,
-    adapters,
-    env,
-    generation: "v3",
-    expectedExecutionPath: "generic_integrity",
-    coordinatorFreezeValidator: (runState) =>
-      requireGenericV3CoordinatorFreeze(runState, env),
-    localProposalValidator: (runState) =>
-      validateLocalGenericV3Proposal(runState, env),
-    finalProposalGraphValidator: validateFinalGenericV3ProposalGraph,
-  });
 }
 
 async function main() {
