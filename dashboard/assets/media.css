@@ -601,3 +601,14 @@ button.media-save-state { cursor: pointer; }
 .media-health__details summary { cursor: pointer; font-weight: 650; }
 .media-health__table { min-width: 920px; }
 .media-health__error { color: #8c1515 !important; font-weight: 700; }
+.media-syndication { margin-block: 1rem; }
+.media-syndication > summary { cursor: pointer; font-weight: 650; }
+.media-syndication__groups { display: grid; gap: .5rem; margin-block: 1rem; }
+.media-syndication__groups > button { text-align: left; white-space: normal; }
+.media-syndication__members { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 1rem; margin-block: 1rem; }
+.media-syndication__member { border: 1px solid var(--border-color, #cad3d9); border-radius: 8px; padding: 1rem; min-width: 0; overflow-wrap: anywhere; }
+.media-syndication__member h5 { font-size: 1rem; margin-top: 0; }
+.media-syndication__member form { display: grid; gap: .75rem; }
+.media-syndication__member textarea { width: 100%; box-sizing: border-box; }
+.media-syndication__history { border-top: 1px solid var(--border-color, #cad3d9); padding-block: .75rem; }
+.media-syndication__history pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .75rem; }
