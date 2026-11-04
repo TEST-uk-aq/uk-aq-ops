@@ -1469,6 +1469,7 @@ test("fallback treats a Dropbox-owned overlay manifest as pinned baseline", asyn
   ]);
   const pinnedReads = [];
   const hierarchy = await buildExactV3HierarchyForCatalogueEntry({
+    selectedFormat: { schema_version: 1 },
     entry: catalogue.entries[0],
     proposalsByKey: new Map([[manifest.key, {
       key: manifest.key,
@@ -1501,6 +1502,7 @@ test("fallback treats a Dropbox-owned overlay manifest as pinned baseline", asyn
   assert.equal(pinnedReads.every(([, source]) => source === "dropbox"), true);
 
   await assert.rejects(() => buildExactV3HierarchyForCatalogueEntry({
+    selectedFormat: { schema_version: 1 },
     entry: catalogue.entries[0],
     proposalsByKey: new Map(),
     runState: { objects: { [manifest.key]: {
@@ -1516,6 +1518,7 @@ test("fallback treats a Dropbox-owned overlay manifest as pinned baseline", asyn
   }), /pinned pollutant manifest is unavailable/);
 
   await assert.rejects(() => buildExactV3HierarchyForCatalogueEntry({
+    selectedFormat: { schema_version: 1 },
     entry: catalogue.entries[0],
     proposalsByKey: new Map([[manifest.key, {
       proposal_owner: "source_derived_observation_repair",
@@ -1546,6 +1549,7 @@ test("fallback retains derived ownership for a genuine current-run manifest", as
   });
   const combinedReads = [];
   const hierarchy = await buildExactV3HierarchyForCatalogueEntry({
+    selectedFormat: { schema_version: 1 },
     entry: catalogue.entries[0],
     proposalsByKey: new Map(),
     runState: { objects: { [manifest.key]: {
@@ -1686,7 +1690,7 @@ test("registry catalogue cross-check rejects an unchanged summary contradiction"
       key: artifact.key, size: artifact.byte_size, content_sha256: artifact.sha256,
     }],
   });
-  const fallback = resolveExactV3PlanningAuthority({
+  assert.throws(() => resolveExactV3PlanningAuthority({
     runState: { dropbox_currentness: { allowed: true, checkpoint: {
       observations_timeseries_latest: {
         key: latest.key,
@@ -1703,8 +1707,5 @@ test("registry catalogue cross-check rejects an unchanged summary contradiction"
     }) },
     finalCatalogue: catalogue,
     delta,
-  });
-  assert.equal(fallback.mode, "full_canonical_reconstruction_fallback");
-  assert.equal(fallback.compact_latest, null);
-  assert.match(fallback.fallback_reason, /identity disagrees/);
+  }), /identity disagrees/);
 });

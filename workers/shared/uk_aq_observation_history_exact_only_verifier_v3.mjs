@@ -6,6 +6,7 @@ import { sha256Hex } from "./r2_sigv4.mjs";
 import { encodeObservationHistoryIndexV3Json as json,
   validateObservationHistoryExactLeafScopedManifestArtifactV3,
   buildObservationHistoryExactLeafIndexV3ScopedHierarchy,
+  validateObservationHistoryExactLeafIndexV3LatestRegistry,
 } from "./uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import { inspectPinnedCanonicalObservationFilesV3,
   OBSERVATION_HISTORY_OFFLINE_INSPECTOR_V3,
@@ -501,4 +502,59 @@ export async function prepareObservationHistoryExactOnlyScopeV3({ scope, getObje
   physicalProofs.set(proof, { ctx, scope: Object.freeze({ ...scope }), hierarchy, source, metadata,
     indexRoot: generation.observations_timeseries_index_prefix, originalOperation });
   return Object.freeze({ hierarchy, proof });
+}
+
+// Read-only existing-scope reconstruction preparation. This always performs a
+// fresh independent full-file inspection; no supplied/cross-invocation proof is
+// consumed. It neither replaces the selector nor grants repair APPLY authority.
+export async function reconstructObservationHistoryExactOnlyScopeV3({
+  scope, selected, getObject, headObject = null, assertOperationHeld,
+  indexRoot = generation.observations_timeseries_index_prefix,
+}) {
+  if (indexRoot !== generation.observations_timeseries_index_prefix ||
+      selected?.exact_index_schema_version !== 2 ||
+      selected?.exact_index_kind !== "observation_timeseries_physical_leaf_scoped_manifest_v2" ||
+      selected?.exact_leaf_index_version !== "exact-timeseries-leaf-v2") {
+    throw new Error("unsupported selected-format reconstruction; conversion is not supported");
+  }
+  const ctx = context({ getObject, headObject, assertOperationHeld });
+  const latest = await ctx.read(generation.observations_timeseries_latest_key);
+  const latestPayload = JSON.parse(latest.body.toString("utf8"));
+  const registry = validateObservationHistoryExactLeafIndexV3LatestRegistry({ artifact: {
+    ...identity(latest), body: latest.body.toString("utf8"), payload: latestPayload,
+    kind: "observation_history_index_v3_latest_global", publication_stage: "latest_global",
+    dependencies: latestPayload.day_summaries.flatMap(day => day.scoped_roots.map(root =>
+      ({ ...identity(root), kind: "scoped_manifest" }))), publication_prerequisites: [],
+  }, indexRoot, latestKey: generation.observations_timeseries_latest_key });
+  const current = registry.roots.find(root => root.day_utc === scope.day_utc &&
+    root.connector_id === scope.connector_id && root.pollutant_code === scope.pollutant_code);
+  equal(current, selected, "current selected-format registry");
+  const source = await canonicalSource(ctx, scope);
+  const prior = await readStoredExactOnlyHierarchy(ctx, scope, source, indexRoot);
+  equal(identity(prior.scoped_manifest), identity(selected), "selected selector identity");
+  const metadata = await physicalMetadata(ctx, source.payload, scope);
+  reconcile(prior, source.descriptor, metadata, indexRoot);
+  const tags = new Map();
+  for (const leaf of prior.exact_leaves) for (const file of leaf.payload.files) {
+    if (file.etag) equal(file.etag, ctx.pins.get(file.key).etag, "selected file ETag");
+    tags.set(file.key, file.etag);
+  }
+  const hierarchy = buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
+    metadata: { ...metadata, files: metadata.files.map(file => ({ ...file,
+      ...(tags.get(file.key) ? { etag: tags.get(file.key) } : {}) })) },
+    canonicalManifest: source.descriptor, exactSchemaVersion: 2, indexRoot,
+  });
+  reconcile(hierarchy, source.descriptor, metadata, indexRoot);
+  // Rebuilding unchanged canonical content must reproduce every immutable key
+  // and byte identity. An existing revision is never overwritten or redefined.
+  equal(identity(hierarchy.scoped_manifest), identity(prior.scoped_manifest), "reconstructed selector identity");
+  equal(hierarchy.exact_leaves.map(identity), prior.exact_leaves.map(identity), "immutable reconstruction identities");
+  await ctx.recheck();
+  return Object.freeze({ hierarchy, selected_format: Object.freeze({ schema_version: 2,
+    kind: prior.scoped_manifest.payload.kind, exact_leaf_index_version: prior.scoped_manifest.payload.exact_leaf_index_version,
+    selector: Object.freeze(identity(prior.scoped_manifest)) }),
+    canonical_source_manifest: Object.freeze(source.descriptor),
+    verifier_version: EXACT_ONLY_DIRECT_VERIFIER_V3, inspector: OBSERVATION_HISTORY_OFFLINE_INSPECTOR_V3,
+    publication_eligible: false, observation_event_created: false,
+    blocker: "repair selector replacement and complete canonical/latest finalisation are not connected to this preparation helper" });
 }

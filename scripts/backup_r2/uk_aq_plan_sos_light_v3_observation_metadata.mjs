@@ -68,6 +68,8 @@ import {
   writeSosLightV3ProposalArtifact,
 } from "./lib/sos_light_v3_proposal_transport.mjs";
 
+import { exactLeafFormatV3, EXACT_LEAF_FORMATS_V3 } from "../../workers/shared/uk_aq_observation_history_exact_leaf_format_v3.mjs";
+
 const GENERATION = getObservationHistoryGeneration("v3");
 const FULL_LOWER_GIT_SHA = /^[0-9a-f]{40}$/;
 
@@ -945,8 +947,10 @@ export function resolveExactV3PlanningAuthority({
   finalCatalogue,
   delta,
 }) {
+  // Format authority cannot be discarded with the summary optimisation. Without
+  // authenticated latest, canonical data alone cannot distinguish the formats.
+  const compactLatest = authenticateExactV3CompactLatest({ runState, store });
   try {
-    const compactLatest = authenticateExactV3CompactLatest({ runState, store });
     crossCheckExactV3RegistryCatalogue({
       registryRoots: compactLatest.roots,
       finalCatalogue,
@@ -955,12 +959,14 @@ export function resolveExactV3PlanningAuthority({
     return Object.freeze({
       mode: "exact_index_fast_path",
       compact_latest: compactLatest,
+      selected_roots: compactLatest.roots,
       fallback_reason: null,
     });
   } catch (error) {
     return Object.freeze({
       mode: "full_canonical_reconstruction_fallback",
       compact_latest: null,
+      selected_roots: compactLatest.roots,
       fallback_reason: error instanceof Error ? error.message : String(error),
     });
   }
@@ -1146,6 +1152,77 @@ export function assertFixedV3Proposal(output) {
   return output;
 }
 
+// The checkpoint-authenticated registry retains the selected selector identity
+// without requiring bulk derived trees in the normal Dropbox backup.
+export function resolveExactV3SelectedFormat({ entry, selectedRoots, baselineManifestKeys, assertNewScope, removing = false }) {
+  if (!Array.isArray(selectedRoots) || !(baselineManifestKeys instanceof Set)) {
+    throw new Error(`Fixed-v3 selected-format authority unavailable: ${entry.key}`);
+  }
+  const matches = selectedRoots.filter(root => scopeIdentity(root) === entry.scope_id);
+  if (matches.length > 1) throw new Error(`Fixed-v3 duplicate selected-format scope: ${entry.key}`);
+  const root = matches[0];
+  if (!root) {
+    if (baselineManifestKeys.has(entry.key)) {
+      throw new Error(`Fixed-v3 selected-format identity unavailable for existing scope: ${entry.key}`);
+    }
+    if (typeof assertNewScope !== "function" || assertNewScope(entry.scope) !== true) {
+      throw new Error(`Fixed-v3 new scope requires authenticated canonical absence: ${entry.key}`);
+    }
+    return Object.freeze({ ...EXACT_LEAF_FORMATS_V3[0], selector: null, source: "new_canonical_scope" });
+  }
+  if (!baselineManifestKeys.has(entry.key)) {
+    throw new Error(`Fixed-v3 selected-format scope lacks pinned canonical source: ${entry.key}`);
+  }
+  const explicit = ["exact_index_schema_version", "exact_index_kind", "exact_leaf_index_version"]
+    .some(field => Object.hasOwn(root, field));
+  const format = explicit ? exactLeafFormatV3({ schema_version: root.exact_index_schema_version,
+    kind: root.exact_index_kind, exact_leaf_index_version: root.exact_leaf_index_version }) : EXACT_LEAF_FORMATS_V3[0];
+  if (explicit && format.schema_version !== 2) throw new Error("contradictory selected-format registry representation");
+  if (removing && format.schema_version === 2) {
+    throw new Error(`Fixed-v3 schema-2 scope removal is blocked: legacy prefix deletion cannot retire immutable revisions: ${entry.key}`);
+  }
+  return Object.freeze({ ...format, selector: Object.freeze({ key: root.key,
+    byte_size: root.byte_size, sha256: root.sha256 }), source: "pinned_checkpoint_compact_latest_registry" });
+}
+
+// Absence must be established through the pinned canonical hierarchy. A missing
+// local pollutant file or a missing latest entry is never proof of a new scope.
+export function assertPinnedExactV3ScopeAbsent({ scope, store }) {
+  let aggregate = readPinnedAggregate({ store,
+    key: buildR2HistoryV2ObservationsRootManifestKey(GENERATION.observations_prefix), level: "root" });
+  const year = scope.day_utc.slice(0, 4), month = scope.day_utc.slice(5, 7);
+  for (const [key, level] of [
+    [buildR2HistoryV2ObservationsYearManifestKey(GENERATION.observations_prefix, year), "year"],
+    [buildR2HistoryV2ObservationsMonthManifestKey(GENERATION.observations_prefix, year, month), "month"],
+  ]) {
+    const ref = aggregate.payload.children.find(child => child.manifest_key === key);
+    if (!ref) return true;
+    const child = readPinnedAggregate({ store, key, level });
+    if (ref.content_hash !== child.payload.content_hash) throw new Error(`Fixed-v3 pinned absence parent mismatch: ${key}`);
+    aggregate = child;
+  }
+  const dayKey = buildHistoryV2DayManifestKey(GENERATION.observations_prefix, scope.day_utc);
+  let ref = aggregate.payload.children.find(child => child.manifest_key === dayKey);
+  if (!ref) return true;
+  for (const [key, kind, collection, idField, id] of [
+    [dayKey, "day", "connector_manifests", "connector_id", scope.connector_id],
+    [`${GENERATION.observations_prefix}/day_utc=${scope.day_utc}/connector_id=${scope.connector_id}/manifest.json`,
+      "connector", "pollutant_manifests", "pollutant_code", scope.pollutant_code],
+  ]) {
+    const object = store.getObjectFromSourceIfExists(key, "dropbox");
+    if (!object) throw new Error(`Fixed-v3 pinned absence manifest unavailable: ${key}`);
+    const payload = parseJsonBody(object.body, key);
+    validateCanonicalHistoryV2Manifest(payload, { manifest_kind: kind, domain: "observations",
+      day_utc: scope.day_utc, manifest_key: key, ...(kind === "connector" ? { connector_id: scope.connector_id } : {}) });
+    if (payload.manifest_hash !== ref.manifest_hash || !sameJson(payload.child_manifests, payload[collection])) {
+      throw new Error(`Fixed-v3 pinned absence aliases/identity disagree: ${key}`);
+    }
+    ref = payload[collection].find(child => child[idField] === id);
+    if (!ref) return true;
+  }
+  throw new Error(`Fixed-v3 canonical scope already exists; selected-format identity required: ${scopeIdentity(scope)}`);
+}
+
 export async function buildExactV3HierarchyForCatalogueEntry({
   entry,
   proposalsByKey,
@@ -1153,7 +1230,15 @@ export async function buildExactV3HierarchyForCatalogueEntry({
   store,
   combinedObject,
   targetWriterGitSha,
+  selectedFormat,
 }) {
+  if (![1, 2].includes(selectedFormat?.schema_version)) {
+    throw new Error(`Fixed-v3 selected-format is required: ${entry.key}`);
+  }
+  if (selectedFormat.schema_version === 2) {
+    throw new Error(`Fixed-v3 schema-2 reconstruction blocked: held-operation and current-object/ETag verifier adapters, ` +
+      `authenticated selected selector/leaves and canonical root-to-scope proof are unavailable in the offline proposal child: ${entry.key}`);
+  }
   const { key: manifestKey, scope } = entry;
   const proposalOwner = resolveCurrentRunProposalOwner(proposalsByKey.get(manifestKey));
   const stagedOwner = resolveCurrentRunProposalOwner(runState.objects?.[manifestKey]);
@@ -1220,6 +1305,7 @@ export async function buildExactV3HierarchyForCatalogueEntry({
   return buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
     metadata: targetMetadata,
     canonicalManifest,
+    exactSchemaVersion: selectedFormat.schema_version,
     indexRoot: GENERATION.observations_timeseries_index_prefix,
   });
 }
@@ -1268,6 +1354,12 @@ async function addExactV3Indexes({
     prefixes,
     exactKeys: [GENERATION.observations_timeseries_latest_key],
   });
+  const pinnedRoot = readPinnedAggregate({ store,
+    key: buildR2HistoryV2ObservationsRootManifestKey(GENERATION.observations_prefix), level: "root" });
+  if (runState?.dropbox_currentness?.allowed !== true || pinnedRoot.payload.content_hash !==
+      runState.dropbox_currentness.checkpoint?.observations_processed_source_root_hash) {
+    throw new Error("Fixed-v3 canonical baseline root disagrees with accepted checkpoint");
+  }
   const canonicalAggregateHierarchy = reconstructCanonicalObservationAggregateHierarchy({
     proposals,
     proposalsByKey,
@@ -1370,6 +1462,22 @@ async function addExactV3Indexes({
   const rebuildEntries = optimizationMode === "exact_index_fast_path"
     ? effectiveDelta.affected_entries
     : finalCatalogue.entries;
+  const baselineManifestKeys = new Set(baselineManifestObjects.map(({ key }) => key));
+  const selections = new Map(rebuildEntries.map(entry => [entry.scope_id, resolveExactV3SelectedFormat({
+    entry, selectedRoots: authority.selected_roots, baselineManifestKeys,
+    assertNewScope: scope => assertPinnedExactV3ScopeAbsent({ scope, store }),
+  })]));
+  const removedSelections = manifestDelta.removed_scopes.map(scope => {
+    const key = `${GENERATION.observations_prefix}/day_utc=${scope.day_utc}/connector_id=${scope.connector_id}/pollutant_code=${scope.pollutant_code}/manifest.json`;
+    return { day_utc: scope.day_utc, connector_id: scope.connector_id, pollutant_code: scope.pollutant_code,
+      ...resolveExactV3SelectedFormat({ entry: { key, scope, scope_id: scopeIdentity(scope) },
+        selectedRoots: authority.selected_roots, baselineManifestKeys, removing: true }) };
+  });
+  output.planning.v3_exact_leaf_reconstruction = {
+    observation_event_created: false,
+    scopes: rebuildEntries.map(entry => ({ ...entry.scope, ...selections.get(entry.scope_id) })),
+    removed_scopes: removedSelections,
+  };
   const hierarchies = [];
   let completedManifestCount = 0;
   let lastManifestProgressAt = Date.now();
@@ -1381,6 +1489,7 @@ async function addExactV3Indexes({
       store,
       combinedObject,
       targetWriterGitSha,
+      selectedFormat: selections.get(entry.scope_id),
     }));
     completedManifestCount += 1;
     const now = Date.now();
@@ -1547,6 +1656,9 @@ async function addExactV3Indexes({
       included_in_write_set: true,
       status: "planned",
       ...dependencyFields,
+      ...(exactByKey.get(entry.key).kind === "observation_history_index_v3_exact_leaf_scoped_manifest" ? {
+        selected_exact_index_format: selections.get(scopeIdentity(exactByKey.get(entry.key).payload)),
+      } : {}),
       provenance: "fixed_v3_exact_leaf_operational_primitives",
     });
   }
@@ -1557,6 +1669,7 @@ async function addExactV3Indexes({
     schedule_sha256: publicationPlan.schedule_sha256,
     object_count: publicationPlan.entries.length,
     status: publicationPlan.entries.length === 0 ? "noop" : "planned",
+    selected_formats: output.planning.v3_exact_leaf_reconstruction.scopes,
   };
   output.planning.removed_exact_v3_scopes = rebuilt.removedScopes;
   output.planning.v3_exact_leaf_optimization = {
