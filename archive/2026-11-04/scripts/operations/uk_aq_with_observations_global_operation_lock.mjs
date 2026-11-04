@@ -1,0 +1,395 @@
+#!/usr/bin/env node
+
+import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { serveOriginalOperationAssertions } from './lib/uk_aq_prune_original_operation.mjs';
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+import {
+  OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV,
+  withHistoryWriterClient,
+  withObservationsGlobalOperationLock,
+} from "../../workers/shared/uk_aq_r2_history_writer.mjs";
+import {
+  FIXED_V2_SOS_LIGHT_RECOVERY_GENERATION_ENV,
+  FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE,
+  FIXED_V2_SOS_LIGHT_RECOVERY_REENTRY_ENV,
+  FIXED_V2_SOS_LIGHT_RECOVERY_STATE_ENV,
+  FIXED_V2_SOS_LIGHT_RECOVERY_WINDOW_MS,
+  recordLockLoss,
+  recordReacquireAttempt,
+  recordReacquired,
+  recordRecoveryOutcome,
+} from "./lib/uk_aq_sos_light_v2_lock_recovery.mjs";
+
+const CHILD_SUPERVISOR_PATH = fileURLToPath(
+  new URL("./uk_aq_observations_global_operation_child_supervisor.mjs", import.meta.url),
+);
+
+function requireValue(argv, index, flag) {
+  const value = argv[index + 1];
+  if (!value || value === "--") throw new Error(`${flag} requires a value`);
+  return value;
+}
+
+export function parseLockedCommandArgs(argv) {
+  const separator = argv.indexOf("--");
+  if (separator < 0 || separator === argv.length - 1) {
+    throw new Error("Lock coordinator requires -- followed by a command");
+  }
+  const options = {
+    owner: null,
+    runId: null,
+    timeoutMs: 60_000,
+    heartbeatMs: 5_000,
+    recoveryProfile: null,
+    recoveryStateJson: null,
+  };
+  for (let index = 0; index < separator; index += 1) {
+    const flag = argv[index];
+    if (flag === "--owner") options.owner = requireValue(argv, index++, flag);
+    else if (flag === "--run-id") options.runId = requireValue(argv, index++, flag);
+    else if (flag === "--timeout-ms") options.timeoutMs = Number(requireValue(argv, index++, flag));
+    else if (flag === "--heartbeat-ms") options.heartbeatMs = Number(requireValue(argv, index++, flag));
+    else if (flag === "--recovery-profile") options.recoveryProfile = requireValue(argv, index++, flag);
+    else if (flag === "--recovery-state-json") options.recoveryStateJson = requireValue(argv, index++, flag);
+    else throw new Error(`Unknown lock coordinator argument: ${flag}`);
+  }
+  if (!String(options.owner || "").trim()) throw new Error("--owner is required");
+  if (!String(options.runId || "").trim()) throw new Error("--run-id is required");
+  if (!Number.isFinite(options.timeoutMs) || options.timeoutMs < 0) {
+    throw new Error("--timeout-ms must be a non-negative number");
+  }
+  if (!Number.isFinite(options.heartbeatMs) || options.heartbeatMs < 250) {
+    throw new Error("--heartbeat-ms must be at least 250");
+  }
+  if (options.recoveryProfile !== null
+      && options.recoveryProfile !== FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE) {
+    throw new Error("Unsupported observations-lock recovery profile");
+  }
+  if (options.recoveryProfile && !String(options.recoveryStateJson || "").trim()) {
+    throw new Error("--recovery-state-json is required for the fixed-v2 recovery profile");
+  }
+  if (!options.recoveryProfile && options.recoveryStateJson) {
+    throw new Error("--recovery-state-json requires --recovery-profile");
+  }
+  return Object.freeze({
+    ...options,
+    command: argv[separator + 1],
+    commandArgs: Object.freeze(argv.slice(separator + 2)),
+  });
+}
+
+function terminateProcessGroup(child, signal) {
+  if (!child?.pid) return;
+  try {
+    process.kill(-child.pid, signal);
+  } catch (error) {
+    if (error?.code !== "ESRCH") child.kill?.(signal);
+  }
+}
+
+export async function runChildWhileLockHeld({
+  command,
+  commandArgs = [],
+  env,
+  lockSignal,
+  originalOperation = null,
+  spawnProcess = spawn,
+  terminate = terminateProcessGroup,
+}) {
+  return await new Promise((resolve, reject) => {
+    const child = spawnProcess(process.execPath, [
+      CHILD_SUPERVISOR_PATH,
+      "--",
+      command,
+      ...commandArgs,
+    ], {
+      env,
+      stdio: ["inherit", "inherit", "inherit", "pipe", "ipc"],
+      detached: true,
+    });
+    const livenessPipe = child?.stdio?.[3];
+    if (!livenessPipe) {
+      terminate(child, "SIGKILL");
+      reject(new Error("Locked child supervisor liveness pipe was not created"));
+      return;
+    }
+    let lossTimer = null, stoppedForLoss = false;
+    let forwardedSignal = null;
+    let supervisorResult = null;
+    const stopForLostLock = () => {
+      if (stoppedForLoss) return;
+      stoppedForLoss = true;
+      terminate(child, "SIGTERM");
+      lossTimer = setTimeout(() => terminate(child, "SIGKILL"), 10_000);
+      lossTimer.unref?.();
+    };
+    if (lockSignal?.aborted) stopForLostLock();
+    else lockSignal?.addEventListener("abort", stopForLostLock, { once: true });
+    const closeAssertions = originalOperation ? serveOriginalOperationAssertions({
+      channel: child, ...originalOperation, onFailure: stopForLostLock,
+    }) : null;
+
+    const forwardSignal = (signal) => {
+      forwardedSignal = signal;
+      terminate(child, signal);
+    };
+    const onSigint = () => forwardSignal("SIGINT");
+    const onSigterm = () => forwardSignal("SIGTERM");
+    process.once("SIGINT", onSigint);
+    process.once("SIGTERM", onSigterm);
+    const onSupervisorMessage = (message) => {
+      if (message?.type !== "uk_aq_locked_command_result" || supervisorResult) return;
+      supervisorResult = message;
+      terminate(child, "SIGKILL");
+    };
+    child.on?.("message", onSupervisorMessage);
+    const cleanup = () => {
+      closeAssertions?.();
+      if (lossTimer) clearTimeout(lossTimer);
+      livenessPipe.destroy?.();
+      lockSignal?.removeEventListener("abort", stopForLostLock);
+      process.off("SIGINT", onSigint);
+      process.off("SIGTERM", onSigterm);
+      child.off?.("message", onSupervisorMessage);
+    };
+    child.once("error", (error) => {
+      cleanup();
+      reject(error);
+    });
+    child.once("exit", (code, signal) => {
+      // The supervisor is the protected process-group leader. Kill any
+      // descendants which outlived it before the PostgreSQL lock can release.
+      terminate(child, "SIGKILL");
+      cleanup();
+      if (lockSignal?.aborted) {
+        reject(lockSignal.reason || new Error("Observations global operation lock was lost"));
+      } else if (supervisorResult?.error) {
+        const error = new Error(`Locked command supervisor failed: ${supervisorResult.error}`);
+        error.code = "UK_AQ_LOCKED_COMMAND_SUPERVISOR_FAILED";
+        reject(error);
+      } else if (supervisorResult?.stopping_signal) {
+        resolve(supervisorResult.stopping_signal === "SIGINT" ? 130 : 143);
+      } else if (supervisorResult?.target_signal) {
+        const error = new Error(`Locked command terminated by ${supervisorResult.target_signal}`);
+        error.code = "UK_AQ_LOCKED_COMMAND_SIGNAL";
+        reject(error);
+      } else if (supervisorResult) {
+        resolve(Number(supervisorResult.exit_code || 0));
+      } else if (signal && signal === forwardedSignal) {
+        resolve(signal === "SIGINT" ? 130 : 143);
+      } else if (signal) {
+        const error = new Error(`Locked command terminated by ${signal}`);
+        error.code = "UK_AQ_LOCKED_COMMAND_SIGNAL";
+        reject(error);
+      } else {
+        resolve(Number(code || 0));
+      }
+    });
+  });
+}
+
+export async function runCommandWithObservationsGlobalOperationLock({
+  databaseUrl,
+  owner,
+  runId,
+  command,
+  commandArgs = [],
+  env = process.env,
+  timeoutMs = 60_000,
+  heartbeatMs = 5_000,
+  diagnostics = [],
+  spawnProcess = spawn,
+  withClient = withHistoryWriterClient,
+  withLock = withObservationsGlobalOperationLock,
+  runChild = runChildWhileLockHeld,
+  recoveryProfile = null,
+  recoveryStatePath = null,
+  now = Date.now,
+  sleep = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+} = {}) {
+  const connectionString = String(databaseUrl || "").trim();
+  if (!connectionString) {
+    const error = new Error(
+      "Observations global operation lock requires a direct SUPABASE_DB_URL (or DATABASE_URL)",
+    );
+    error.code = "UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_DATABASE_URL_REQUIRED";
+    throw error;
+  }
+  const recoveryEnabled = recoveryProfile === FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE;
+  if (recoveryEnabled && !String(recoveryStatePath || "").trim()) {
+    throw new Error("Fixed-v2 SOS-light recovery requires a durable state path");
+  }
+  let recoveryGeneration = 0;
+
+  const runOneSession = async ({
+    acquisitionTimeoutMs,
+    connectionTimeoutMs,
+    recoveryAttempt = 0,
+  }) => {
+    const nonce = randomUUID();
+    let acquired = false;
+    try {
+      return await withClient(connectionString, async (client) => {
+        return await withLock({
+          client,
+          owner,
+          runId,
+          timeoutMs: acquisitionTimeoutMs,
+          heartbeatMs,
+          diagnostics,
+          diagnosticEnvironment: env.UK_AQ_ENV_NAME,
+        }, async (identity, lock) => {
+          acquired = true;
+          // Pin the actual backend before exposing the original session to the
+          // child. Other owners retain their existing supervisor protocol.
+          if (owner === 'prune_daily' && typeof lock.assertOwned === 'function') await lock.assertOwned();
+          const acquiredDiagnostic = [...diagnostics].reverse().find(
+            (entry) => entry.event === "lock_acquired",
+          );
+          if (recoveryAttempt > 0) {
+            recoveryGeneration += 1;
+            recordReacquired({
+              statePath: recoveryStatePath,
+              expectedRunId: runId,
+              attemptCount: recoveryAttempt,
+              recoveryGeneration,
+              lockIdentity: identity,
+              lockNonce: nonce,
+            });
+          }
+          const childEnv = {
+            ...env,
+            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.held]: "true",
+            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.owner]: String(owner),
+            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.runId]: String(runId),
+            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.logicalIdentity]: identity.logical_identity,
+            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.classId]: String(identity.class_id),
+            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.objectId]: String(identity.object_id),
+            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.nonce]: nonce,
+            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.acquired]: "true",
+            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.waitMs]: String(acquiredDiagnostic?.wait_ms || 0),
+            [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.outcome]: "held",
+            ...(recoveryEnabled ? {
+              [FIXED_V2_SOS_LIGHT_RECOVERY_STATE_ENV]: String(recoveryStatePath),
+            } : {}),
+            ...(recoveryAttempt > 0 ? {
+              [FIXED_V2_SOS_LIGHT_RECOVERY_REENTRY_ENV]: "true",
+              [FIXED_V2_SOS_LIGHT_RECOVERY_GENERATION_ENV]: String(recoveryGeneration),
+            } : {}),
+          };
+          const code = await runChild({
+            command,
+            commandArgs,
+            env: childEnv,
+            lockSignal: lock.signal,
+            ...(owner === 'prune_daily' ? { originalOperation: {
+              runId: String(runId), nonce,
+              assertOwned: async () => { lock.assertHeld(); return await lock.assertOwned(); },
+            } } : {}),
+            spawnProcess,
+          });
+          lock.assertHeld();
+          return code;
+        });
+      }, {
+        applicationName: `uk-aq-observations-global-operation-lock:${String(owner)}`,
+        statementTimeoutMs: Math.min(30_000, Math.max(1, connectionTimeoutMs)),
+        queryTimeoutMs: Math.min(30_000, Math.max(1, connectionTimeoutMs)),
+        connectionTimeoutMs: Math.min(15_000, Math.max(1, connectionTimeoutMs)),
+      });
+    } catch (error) {
+      error.ukAqLockAcquired = acquired;
+      throw error;
+    }
+  };
+
+  let recoveryDeadlineMs = null;
+  let recoveryAttempt = 0;
+  while (true) {
+    try {
+      const remainingMs = recoveryDeadlineMs === null
+        ? Math.max(1, Number(timeoutMs) || 1)
+        : Math.max(1, recoveryDeadlineMs - now());
+      return await runOneSession({
+        acquisitionTimeoutMs: recoveryDeadlineMs === null
+          ? timeoutMs : Math.min(30_000, remainingMs),
+        connectionTimeoutMs: recoveryDeadlineMs === null
+          ? 30_000 : Math.min(15_000, remainingMs),
+        recoveryAttempt,
+      });
+    } catch (error) {
+      const lostHeldSession = error?.code === "UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_LOST";
+      if (lostHeldSession) {
+        if (!recoveryEnabled) throw error;
+        const lossIso = new Date(now()).toISOString();
+        recordLockLoss({
+          statePath: recoveryStatePath,
+          expectedRunId: runId,
+          error,
+          nowIso: lossIso,
+        });
+        recoveryDeadlineMs = now() + FIXED_V2_SOS_LIGHT_RECOVERY_WINDOW_MS;
+        recoveryAttempt = 0;
+      } else if (recoveryDeadlineMs === null || error?.ukAqLockAcquired) {
+        throw error;
+      }
+      if (now() >= recoveryDeadlineMs) {
+        recordRecoveryOutcome({
+          statePath: recoveryStatePath,
+          expectedRunId: runId,
+          outcome: "reacquire_timeout",
+          error,
+        });
+        const timeout = new Error(
+          "Fixed-v2 SOS-light pre-mutation lock recovery timed out",
+          { cause: error instanceof Error ? error : undefined },
+        );
+        timeout.code = "UK_AQ_SOS_LIGHT_V2_LOCK_RECOVERY_TIMEOUT";
+        throw timeout;
+      }
+      recoveryAttempt += 1;
+      recordReacquireAttempt({
+        statePath: recoveryStatePath,
+        expectedRunId: runId,
+        attemptCount: recoveryAttempt,
+      });
+      await sleep(Math.min(1_000, Math.max(1, recoveryDeadlineMs - now())));
+    }
+  }
+}
+
+export async function main({ argv = process.argv.slice(2), env = process.env } = {}) {
+  const args = parseLockedCommandArgs(argv);
+  const diagnostics = [];
+  try {
+    return await runCommandWithObservationsGlobalOperationLock({
+      databaseUrl: env.SUPABASE_DB_URL || env.DATABASE_URL,
+      owner: args.owner,
+      runId: args.runId,
+      command: args.command,
+      commandArgs: args.commandArgs,
+      env,
+      timeoutMs: args.timeoutMs,
+      heartbeatMs: args.heartbeatMs,
+      diagnostics,
+      recoveryProfile: args.recoveryProfile,
+      recoveryStatePath: args.recoveryStateJson,
+    });
+  } finally {
+    for (const diagnostic of diagnostics) {
+      process.stderr.write(`${JSON.stringify(diagnostic)}\n`);
+    }
+  }
+}
+
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  main().then((code) => {
+    process.exitCode = code;
+  }).catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
+    process.exitCode = 1;
+  });
+}

@@ -3,6 +3,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { integrityOriginalOperationForApply } from "../operations/lib/uk_aq_integrity_original_operation.mjs";
+export { assertOriginalIntegrityOperationHeld } from "../operations/lib/uk_aq_integrity_original_operation.mjs";
 import {
   hasRequiredR2Config,
   r2GetObject,
@@ -57,62 +59,67 @@ export async function applyValidatedSosLightV3Proposal({
   if (runState.execution_path !== "sos_light") throw new Error("Fixed-v3 bridge accepts SOS-light proposals only");
   const lockRunId = String(runState?.observations_global_operation_lock?.run_id || "").trim();
   requireObservationsGlobalOperationLockContext({ env, expectedOwner: "integrity", expectedRunId: lockRunId });
-  if (!hasRequiredR2Config(r2)) throw new Error("SOS-light-v3 requires complete R2 configuration");
+  const originalOperation = integrityOriginalOperationForApply({ env, expectedRunId: lockRunId });
   try {
-    const validation = validateIntegrityCoreSnapshotIdentity({
-      env,
+    if (!hasRequiredR2Config(r2)) throw new Error("SOS-light-v3 requires complete R2 configuration");
+    try {
+      const validation = validateIntegrityCoreSnapshotIdentity({
+        env,
+        runState,
+        dropboxRoot: runState.base_dropbox_root,
+        stage: "fixed_v3_canonical_apply_child",
+      });
+      const consumerAudit = runState.core_snapshot_consumer_audit ||= [];
+      consumerAudit.push(validation);
+      writeSosLightV3RunState(runStatePath, runState);
+    } catch (error) {
+      runState.apply = {
+        ...(runState.apply || {}),
+        status: "failed",
+        current_phase: "core_snapshot_identity_validation",
+        core_snapshot_identity_validation: "failed",
+        r2_mutation_possible: false,
+        error: error instanceof Error ? error.message : String(error),
+        finished_at_utc: new Date().toISOString(),
+      };
+      writeSosLightV3RunState(runStatePath, runState);
+      throw error;
+    }
+    let proposal;
+    try {
+      proposal = validateLocalSosLightV3Proposal(runState);
+      await validateFinalSosLightV3ProposalGraph({ runState, proposal });
+      requirePinnedSosLightConnectorGate({
+        runState, generation: "v3",
+        selectedDays: runState.sos_light.days.map((entry) => entry.day_utc),
+      });
+    } catch (error) {
+      runState.apply = {
+        ...(runState.apply || {}),
+        status: "failed",
+        current_phase: "final_proposal_validation",
+        r2_mutation_possible: false,
+        error: error instanceof Error ? error.message : String(error),
+        ...(error?.classification ? {
+          classification: error.classification,
+          blocked_connectors: error.evidence,
+          r2_observation_index_mutation_count: 0,
+        } : {}),
+        finished_at_utc: new Date().toISOString(),
+      };
+      writeSosLightV3RunState(runStatePath, runState);
+      throw error;
+    }
+    return await runPersistedSosLightV3Apply({
+      runStatePath,
       runState,
-      dropboxRoot: runState.base_dropbox_root,
-      stage: "fixed_v3_canonical_apply_child",
+      proposal,
+      r2,
+      adapters,
     });
-    const consumerAudit = runState.core_snapshot_consumer_audit ||= [];
-    consumerAudit.push(validation);
-    writeSosLightV3RunState(runStatePath, runState);
-  } catch (error) {
-    runState.apply = {
-      ...(runState.apply || {}),
-      status: "failed",
-      current_phase: "core_snapshot_identity_validation",
-      core_snapshot_identity_validation: "failed",
-      r2_mutation_possible: false,
-      error: error instanceof Error ? error.message : String(error),
-      finished_at_utc: new Date().toISOString(),
-    };
-    writeSosLightV3RunState(runStatePath, runState);
-    throw error;
+  } finally {
+    await originalOperation?.complete();
   }
-  let proposal;
-  try {
-    proposal = validateLocalSosLightV3Proposal(runState);
-    await validateFinalSosLightV3ProposalGraph({ runState, proposal });
-    requirePinnedSosLightConnectorGate({
-      runState, generation: "v3",
-      selectedDays: runState.sos_light.days.map((entry) => entry.day_utc),
-    });
-  } catch (error) {
-    runState.apply = {
-      ...(runState.apply || {}),
-      status: "failed",
-      current_phase: "final_proposal_validation",
-      r2_mutation_possible: false,
-      error: error instanceof Error ? error.message : String(error),
-      ...(error?.classification ? {
-        classification: error.classification,
-        blocked_connectors: error.evidence,
-        r2_observation_index_mutation_count: 0,
-      } : {}),
-      finished_at_utc: new Date().toISOString(),
-    };
-    writeSosLightV3RunState(runStatePath, runState);
-    throw error;
-  }
-  return await runPersistedSosLightV3Apply({
-    runStatePath,
-    runState,
-    proposal,
-    r2,
-    adapters,
-  });
 }
 
 async function main() {

@@ -3,6 +3,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { serveOriginalOperationAssertions } from './lib/uk_aq_prune_original_operation.mjs';
+import { INTEGRITY_CHANNEL_ENV, isIntegrityCoordinator, serveIntegrityAssertions } from './lib/uk_aq_integrity_original_operation.mjs';
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
@@ -95,17 +96,21 @@ export async function runChildWhileLockHeld({
   env,
   lockSignal,
   originalOperation = null,
+  integrityOperation = null,
   spawnProcess = spawn,
   terminate = terminateProcessGroup,
 }) {
   return await new Promise((resolve, reject) => {
+    const supervisorEnv = { ...env };
+    delete supervisorEnv[INTEGRITY_CHANNEL_ENV];
+    if (integrityOperation) supervisorEnv[INTEGRITY_CHANNEL_ENV] = JSON.stringify({ fd: 3, binding: integrityOperation.binding });
     const child = spawnProcess(process.execPath, [
       CHILD_SUPERVISOR_PATH,
       "--",
       command,
       ...commandArgs,
     ], {
-      env,
+      env: supervisorEnv,
       stdio: ["inherit", "inherit", "inherit", "pipe", "ipc"],
       detached: true,
     });
@@ -118,6 +123,7 @@ export async function runChildWhileLockHeld({
     let lossTimer = null, stoppedForLoss = false;
     let forwardedSignal = null;
     let supervisorResult = null;
+    let integrityFailure = null;
     const stopForLostLock = () => {
       if (stoppedForLoss) return;
       stoppedForLoss = true;
@@ -130,9 +136,14 @@ export async function runChildWhileLockHeld({
     const closeAssertions = originalOperation ? serveOriginalOperationAssertions({
       channel: child, ...originalOperation, onFailure: stopForLostLock,
     }) : null;
+    const closeIntegrity = integrityOperation ? serveIntegrityAssertions({
+      channel: child, ...integrityOperation, signal: lockSignal,
+      onFailure: error => { integrityFailure ||= error; stopForLostLock(); },
+    }) : null;
 
     const forwardSignal = (signal) => {
       forwardedSignal = signal;
+      closeIntegrity?.();
       terminate(child, signal);
     };
     const onSigint = () => forwardSignal("SIGINT");
@@ -147,6 +158,7 @@ export async function runChildWhileLockHeld({
     child.on?.("message", onSupervisorMessage);
     const cleanup = () => {
       closeAssertions?.();
+      closeIntegrity?.();
       if (lossTimer) clearTimeout(lossTimer);
       livenessPipe.destroy?.();
       lockSignal?.removeEventListener("abort", stopForLostLock);
@@ -165,6 +177,8 @@ export async function runChildWhileLockHeld({
       cleanup();
       if (lockSignal?.aborted) {
         reject(lockSignal.reason || new Error("Observations global operation lock was lost"));
+      } else if (integrityFailure) {
+        reject(integrityFailure);
       } else if (supervisorResult?.error) {
         const error = new Error(`Locked command supervisor failed: ${supervisorResult.error}`);
         error.code = "UK_AQ_LOCKED_COMMAND_SUPERVISOR_FAILED";
@@ -218,6 +232,9 @@ export async function runCommandWithObservationsGlobalOperationLock({
     throw error;
   }
   const recoveryEnabled = recoveryProfile === FIXED_V2_SOS_LIGHT_RECOVERY_PROFILE;
+  if (recoveryEnabled && owner === 'integrity' && isIntegrityCoordinator({ command, commandArgs })) {
+    throw new Error('Fixed-v3 original Integrity assertions forbid lock recovery');
+  }
   if (recoveryEnabled && !String(recoveryStatePath || "").trim()) {
     throw new Error("Fixed-v2 SOS-light recovery requires a durable state path");
   }
@@ -245,6 +262,11 @@ export async function runCommandWithObservationsGlobalOperationLock({
           // Pin the actual backend before exposing the original session to the
           // child. Other owners retain their existing supervisor protocol.
           if (owner === 'prune_daily' && typeof lock.assertOwned === 'function') await lock.assertOwned();
+          const integrity = owner === 'integrity' && isIntegrityCoordinator({ command, commandArgs });
+          const integrityBinding = integrity ? Object.freeze({
+            owner: 'integrity', run_id: String(runId), nonce,
+            session_pid: await lock.assertOwned(), operation_lifetime: randomUUID(),
+          }) : null;
           const acquiredDiagnostic = [...diagnostics].reverse().find(
             (entry) => entry.event === "lock_acquired",
           );
@@ -286,6 +308,10 @@ export async function runCommandWithObservationsGlobalOperationLock({
             lockSignal: lock.signal,
             ...(owner === 'prune_daily' ? { originalOperation: {
               runId: String(runId), nonce,
+              assertOwned: async () => { lock.assertHeld(); return await lock.assertOwned(); },
+            } } : {}),
+            ...(integrity ? { integrityOperation: {
+              binding: integrityBinding,
               assertOwned: async () => { lock.assertHeld(); return await lock.assertOwned(); },
             } } : {}),
             spawnProcess,

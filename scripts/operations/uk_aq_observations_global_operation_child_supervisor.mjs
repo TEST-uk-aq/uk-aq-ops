@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
 import { relayOriginalOperationAssertions } from './lib/uk_aq_prune_original_operation.mjs';
+import { INTEGRITY_CHANNEL_ENV, isIntegrityCoordinator, relayIntegrityAssertions } from './lib/uk_aq_integrity_original_operation.mjs';
 import { OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV } from '../../workers/shared/uk_aq_r2_history_writer.mjs';
 
 const COORDINATOR_LIVENESS_FD = 3;
@@ -46,6 +47,7 @@ export async function superviseLockedCommand({
   let forceTimer = null;
   let child = null;
   let closeAssertions = null;
+  let closeIntegrity = null;
 
   const emergencyStop = () => {
     try {
@@ -79,6 +81,7 @@ export async function superviseLockedCommand({
   const requestControlledStop = (signal) => {
     if (finished || stoppingSignal) return;
     stoppingSignal = signal;
+    closeIntegrity?.();
     // The coordinator signals this entire process group, so the protected
     // child has already received the same controlled cancellation signal.
     forceTimer = setTimeout(() => signalProcessGroup("SIGKILL"), FORCED_EXIT_DELAY_MS);
@@ -93,17 +96,28 @@ export async function superviseLockedCommand({
   // kills this whole process group and confirms no descendants survived.
   return await new Promise(() => {
     const prune = env[OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.owner] === 'prune_daily';
+    const integrity = !prune && env[OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.owner] === 'integrity'
+      && Boolean(env[INTEGRITY_CHANNEL_ENV]) && isIntegrityCoordinator({ command, commandArgs });
+    const targetEnv = { ...env };
+    delete targetEnv[INTEGRITY_CHANNEL_ENV];
+    if (integrity) targetEnv[INTEGRITY_CHANNEL_ENV] = env[INTEGRITY_CHANNEL_ENV];
     child = spawnProcess(command, commandArgs, {
-      env,
-      stdio: prune ? ['inherit', 'inherit', 'inherit', 'ipc'] : 'inherit',
+      env: targetEnv,
+      stdio: prune ? ['inherit', 'inherit', 'inherit', 'ipc']
+        : integrity ? ['inherit', 'inherit', 'inherit', 'pipe'] : 'inherit',
       detached: false,
     });
     if (prune) closeAssertions = relayOriginalOperationAssertions({
       coordinator: process, child, onFailure: emergencyStop,
     });
+    if (integrity) closeIntegrity = relayIntegrityAssertions({
+      coordinator: process, stream: child.stdio[3],
+      binding: JSON.parse(env[INTEGRITY_CHANNEL_ENV]).binding, onFailure: emergencyStop,
+    });
     child.once("error", (error) => {
       finished = true;
       closeAssertions?.();
+      closeIntegrity?.();
       if (forceTimer) clearTimeout(forceTimer);
       process.off("SIGINT", onSigint);
       process.off("SIGTERM", onSigterm);
@@ -112,6 +126,7 @@ export async function superviseLockedCommand({
     child.once("exit", (code, signal) => {
       finished = true;
       closeAssertions?.();
+      closeIntegrity?.();
       if (forceTimer) clearTimeout(forceTimer);
       process.off("SIGINT", onSigint);
       process.off("SIGTERM", onSigterm);
