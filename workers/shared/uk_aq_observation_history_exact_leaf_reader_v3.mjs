@@ -1499,20 +1499,27 @@ export async function readObservationHistoryExactLeafPageV3({
       nextScopeSegmentNumber = nextSegment?.scope_segment_number || null;
     } else {
       discovery = decodedCursor.discovery;
-      if (decodedCursor.schema_version === 4) {
-        // Validate exact selector identities, without rediscovering/sorting the
-        // remaining logical range. At most two selectors plus one leaf.
+      {
+        // Retained leaves alone cannot authenticate current selection. Cursor 3
+        // keeps its schema-1 fields/meaning: recheck format, physical identity
+        // and selected membership. Cursor 4 additionally pins exact selector
+        // bytes. At most two selectors plus one leaf, with no range rediscovery.
         for (const selected of discovery.scopes) {
           const expected = { ...request, dayUtc: selected.day_utc };
           const scope = scopePath(expected);
           const key = `${normalizedIndex.root}/${scope}/manifest.json`;
           const object = await readIndex(source, key, diagnostics, { manifest: true });
-          if (selected.state === "missing_scope" && !object) continue;
-          if (!object || !selected.selector_descriptor) throw codedError("physical_cursor_invalid", "cursor selector presence changed");
+          if (selected.state === "missing_scope") {
+            if (!object) continue;
+            throw codedError("physical_cursor_invalid", "cursor selector presence changed");
+          }
+          if (!object) throw codedError("physical_cursor_invalid", "cursor selector presence changed");
           try {
-            await assertBodyIdentity(object, selected.selector_descriptor, "cursor scoped selector");
+            if (decodedCursor.schema_version === 4) {
+              await assertBodyIdentity(object, selected.selector_descriptor, "cursor scoped selector");
+            }
             const manifest = validateManifest(parseJson(object.body, key), expected, key, scope, normalizedIndex);
-            if (manifest.format !== selected.exact_format ||
+            if (manifest.format !== (selected.exact_format || EXACT_LEAF_FORMATS_V3[0]) ||
                 !sameFields(manifest.physicalIdentity, selected.physical_identity) ||
                 JSON.stringify(manifest.descriptor) !== JSON.stringify(selected.leaf_descriptor)) {
               throw new Error("cursor selected format, physical identity or membership changed");
