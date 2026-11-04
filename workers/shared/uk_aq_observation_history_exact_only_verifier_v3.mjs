@@ -558,3 +558,40 @@ export async function reconstructObservationHistoryExactOnlyScopeV3({
     publication_eligible: false, observation_event_created: false,
     blocker: "repair selector replacement and complete canonical/latest finalisation are not connected to this preparation helper" });
 }
+
+// Local-byte preparation deliberately has no operational context, ETags or
+// physicalProofs entry. The caller must independently authenticate the backup
+// checkpoint/selected format and any repair source. No live adapter is used by
+// the offline planner entry point below this boundary.
+export async function prepareOfflineObservationHistoryScopeV3({ scope, getObject, exactSchemaVersion }) {
+  if (typeof getObject !== "function" || ![1, 2].includes(exactSchemaVersion)) {
+    throw new Error("offline preparation requires local canonical bytes and explicit selected format");
+  }
+  const pins = new Map();
+  const read = async key => {
+    const object = await getObject({ key });
+    if (!object || object.key !== key || !(typeof object.body === "string" || object.body instanceof Uint8Array)) {
+      throw new Error(`offline canonical body unavailable: ${key}`);
+    }
+    const body = Buffer.from(object.body);
+    const pin = { key, byte_size: body.length, sha256: sha256Hex(body) };
+    if (pins.has(key)) equal(pin, pins.get(key), `changed offline canonical object ${key}`);
+    pins.set(key, pin);
+    return { ...pin, body };
+  };
+  const ctx = { read };
+  const source = await canonicalSource(ctx, scope);
+  const metadata = await physicalMetadata(ctx, source.payload, scope);
+  const hierarchy = buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
+    metadata, canonicalManifest: source.descriptor, exactSchemaVersion,
+    indexRoot: generation.observations_timeseries_index_prefix,
+  });
+  if (exactSchemaVersion === 2) reconcile(hierarchy, source.descriptor, metadata, generation.observations_timeseries_index_prefix);
+  for (const key of [...pins.keys()]) await read(key);
+  return { hierarchy, canonical_chain: source.chain, canonical_source_manifest: source.descriptor,
+    semantic_metadata: Object.fromEntries(["observation_content_hash", "observation_content_hash_algorithm",
+      "observation_content_hash_contract_version", "observation_content_hash_row_count",
+      "observation_content_hash_columns", "verification_status_counts"].map(key => [key, metadata[key]])),
+    inspector: OBSERVATION_HISTORY_OFFLINE_INSPECTOR_V3,
+    publication_eligible: false, observation_event_created: false };
+}
