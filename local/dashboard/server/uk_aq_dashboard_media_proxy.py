@@ -21,6 +21,9 @@ _ARTICLE_LOCAL_IMAGE_PATH = re.compile(r"^/api/media/articles/[1-9]\d*/local-ima
 _LOCAL_IMAGE_VERSION = re.compile(r"^[a-f0-9]{64}$")
 
 _ROUTES = (
+    (re.compile(r"^/api/media/syndication$"), {"GET"}),
+    (re.compile(r"^/api/media/syndication/[1-9]\d*$"), {"GET"}),
+    (re.compile(r"^/api/media/syndication/[1-9]\d*/decisions$"), {"POST"}),
     (re.compile(r"^/api/media/articles$"), {"GET", "POST"}),
     (re.compile(r"^/api/media/articles/selectors$"), {"GET"}),
     (re.compile(r"^/api/media/articles/lookup$"), {"POST"}),

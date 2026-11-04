@@ -508,7 +508,7 @@
       setView(`<section class="media-card"><div class="media-toolbar"><div><h3>Articles</h3><p>Authoritative Media D1 editorial state.</p></div>
         <div class="media-actions"><button class="media-button" data-open-bluesky>Bluesky</button><button class="media-button" data-open-facebook>Facebook</button><button class="media-button" data-open-threads>Threads</button></div></div>
         <form class="media-url-form" data-url-lookup><label class="media-field media-field--grow"><span>Search / Add article URL</span><input name="url" type="url" required placeholder="https://publisher.example/article"></label><button class="media-button media-button--primary">Search</button></form>
-        <div data-url-result></div>${aiUsageHtml()}</section>
+        <div data-url-result></div>${aiUsageHtml()}<details class="media-syndication" data-syndication-panel><summary>Possible syndicated articles · cross-publisher review</summary><p>Unverified publisher-title matches. This is separate from the automatic <strong>Possible duplicate</strong> safety hold. Article Status and social/email publication remain independent.</p><div data-syndication-content></div></details></section>
         <section class="media-card"><div class="media-toolbar"><form class="media-toolbar__group" data-table-search><label class="media-field"><span>Search existing rows</span><input name="q" type="search" value="${esc(state.filters.q)}" placeholder="Title, URL or author"></label><button class="media-button">Search</button><button type="button" class="media-button" data-clear-filters>Clear filters</button></form></div>
           ${filterPanel()}<div class="media-article-controls">${articleSortControl()}</div><div data-article-table>${articleTableHtml()}</div></section>`);
       bindArticleEvents();
@@ -559,7 +559,176 @@
     updateFilterScrolls();
   }
 
+  const syndication = { after: 0, view: "open", group: null, memberAfter: 0, historyAfter: 0,
+    sequence: 0 };
+  const SYNDICATION_CLASS_LABELS = { candidate: "Candidate / unverified",
+    confirmed_syndicated: "Confirmed syndicated copy", not_duplicate: "Related / different reporting",
+    insufficient_evidence: "Insufficient evidence" };
+
+  function syndicationContent() { return state.root.querySelector("[data-syndication-content]"); }
+
+  function publisherReviewLink(url, label) {
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== "https:" || parsed.username || parsed.password) return esc(url);
+      return `<a href="${esc(parsed.href)}" target="_blank" rel="noopener noreferrer">${esc(label || url)}</a>`;
+    } catch { return esc(url); }
+  }
+
+  async function loadSyndicationGroups(after = 0) {
+    const sequence = ++syndication.sequence;
+    const target = syndicationContent();
+    if (!target) return;
+    syndication.after = after;
+    target.innerHTML = `<p role="status">Loading bounded candidate groups…</p>`;
+    try {
+      const data = await request("syndication", { params: new URLSearchParams({ after: String(after), view: syndication.view }) });
+      if (sequence !== syndication.sequence || !target.isConnected) return;
+      target.innerHTML = `<div class="media-actions"><label class="media-field"><span>Relationships</span><select data-syndication-view><option value="open"${syndication.view === "open" ? " selected" : ""}>Open review / confirmed groups</option><option value="all"${syndication.view === "all" ? " selected" : ""}>All, including different reporting</option></select></label><button class="media-button" data-syndication-refresh>Refresh from start</button></div>
+        <p>Normalised exact original-title equality across publisher domains. Text comparison unavailable. Missing publication dates are allowed. Scanned ${esc(data.scanned_title_groups)} title groups in this page.</p>
+        <div class="media-syndication__groups">${(data.groups || []).map(g => `<button class="media-button" data-syndication-group="${g.id}">${esc(g.normalised_title)} · review ${esc(g.revision)}</button>`).join("") || `<p>No candidate groups on this bounded page. Historical records require separately authorised metadata population.</p>`}</div>
+        <div class="media-actions">${data.next_after !== null ? `<button class="media-button" data-syndication-next>Next title groups</button>` : `<span>End of indexed title groups.</span>`}</div><div data-syndication-detail></div>`;
+      target.querySelector("[data-syndication-view]")?.addEventListener("change", event => {
+        syndication.view = event.target.value; void loadSyndicationGroups();
+      });
+      target.querySelector("[data-syndication-refresh]")?.addEventListener("click", () => void loadSyndicationGroups());
+      target.querySelector("[data-syndication-next]")?.addEventListener("click", () => void loadSyndicationGroups(data.next_after));
+      target.querySelectorAll("[data-syndication-group]").forEach(button => button.addEventListener("click", () => {
+        syndication.memberAfter = 0; syndication.historyAfter = 0;
+        void loadSyndicationDetail(Number(button.dataset.syndicationGroup));
+      }));
+    } catch (error) {
+      if (sequence === syndication.sequence && target.isConnected) target.innerHTML = message(error.message, "error");
+    }
+  }
+
+  function syndicationDateEvidence(member, representative) {
+    const a = Date.parse(member.published_at || "");
+    const b = Date.parse(representative?.published_at || "");
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return "Publication-date comparison unavailable.";
+    const days = Math.abs(a - b) / 86400000;
+    return days >= 1 ? `Publication dates differ by ${Math.round(days * 10) / 10} days; review this discrepancy.` : "Publication dates are within one day; this does not confirm syndication.";
+  }
+
+  async function loadSyndicationDetail(id, feedback = "") {
+    const target = syndicationContent()?.querySelector("[data-syndication-detail]");
+    if (!target) return;
+    const sequence = ++syndication.sequence;
+    target.innerHTML = `<p role="status">Loading comparison evidence…</p>`;
+    try {
+      const data = await request(`syndication/${id}`, { params: new URLSearchParams({
+        after: String(syndication.memberAfter), history_after: String(syndication.historyAfter) }) });
+      if (sequence !== syndication.sequence || !target.isConnected) return;
+      syndication.group = data;
+      const g = data.group;
+      const members = data.members || [];
+      const representatives = new Map(members.map(m => [m.id, m]));
+      if (data.representative?.valid === 1 && data.representative.group_id === g.id) {
+        representatives.set(data.representative.id, data.representative);
+      }
+      target.innerHTML = `<h4>Possible syndicated article · group ${g.id}</h4>${feedback ? message(feedback, "success") : ""}
+        <p>Match evidence: normalised exact publisher headline; different publisher domains and canonical identities. Each member needs its own explicit relationship decision.</p>
+        <p>${esc(data.text_comparison_reason)} Confirm same text is unavailable. Open the publisher links below to review the reporting manually.</p>
+        ${data.needs_representative_review ? message("Representative needs review. It is ineligible or its comparison evidence changed; confirmed secondary copies fail open to normal News eligibility.", "error") : ""}
+        ${data.representative ? `<p>Current preferred publication: ${publisherReviewLink(data.representative.canonical_url, data.representative.title)} · ${esc(data.representative.publisher)} · ${esc(data.representative.status)}</p>` : ""}
+        <label class="media-field"><span>Comparison representative / preferred publication</span><select data-syndication-representative><option value="">Choose explicitly</option>${[...representatives.values()].map(m => `<option value="${m.id}"${g.representative_article_id === m.id ? " selected" : ""}>${esc(m.publisher)} · ${esc(m.title)} · ${esc(m.status)}</option>`).join("")}</select></label>
+        <p>Choosing a different representative resets every earlier relationship and suppression in this group. Save explicitly below to apply the choice. Pending, Hidden and Rejected representatives never become public through this workflow.</p>
+        <div class="media-syndication__members">${members.map(m => `<section class="media-syndication__member" data-syndication-member="${m.id}"><h5>${esc(m.title)}</h5>
+          <p>${esc(m.publisher)} · ${esc(m.publisher_domain)} · Article Status: ${esc(STATUS_LABELS[m.status] || m.status)}</p>
+          <p>Original URL: ${publisherReviewLink(m.original_url)}${m.original_url !== m.canonical_url ? `<br>Canonical URL: ${publisherReviewLink(m.canonical_url)}` : ""}</p>
+          <p>Published: ${esc(formatPublishedDateTime(m.published_at))} · Discovered: ${esc(formatUtcDateTime(m.discovered_at))}</p>
+          <p data-syndication-date>${esc(syndicationDateEvidence(m, data.representative))}</p>
+          <p>Recorded classification: ${esc(SYNDICATION_CLASS_LABELS[m.classification] || "Candidate / unverified")}${m.classification && !m.decision_current ? " · stale metadata; review again" : ""}. ${m.public_suppressed ? "Suppressed from public News while the representative remains eligible." : "Normal editorial visibility applies."}</p>
+          ${m.rationale ? `<p>Review note: ${esc(m.rationale)} · ${esc(m.evidence_type)} · ${esc(formatUtcDateTime(m.reviewed_at))}</p>` : ""}
+          <form data-syndication-form><label class="media-field"><span>Relationship to selected representative</span><select name="classification">${Object.entries(SYNDICATION_CLASS_LABELS).map(([value, label]) => `<option value="${value}"${m.decision_current && m.classification === value ? " selected" : ""}>${esc(label)}</option>`).join("")}<option value="confirmed_same_text" disabled>Confirm same text — comparison unavailable</option></select></label>
+          <label><input name="reviewed" type="checkbox"> I reviewed this article and the selected representative at their publisher URLs.</label>
+          <label><input name="suppress" type="checkbox"${m.decision_current && m.suppress ? " checked" : ""}> Suppress this confirmed secondary from public News while the representative is eligible.</label>
+          <label class="media-field"><span>Bounded rationale / evidence note (no article text or quotations)</span><textarea name="rationale" maxlength="500" required rows="2">${esc(m.rationale || "")}</textarea></label>
+          <p data-syndication-eligibility></p><button class="media-button" type="submit">Save relationship and visibility</button><button class="media-button" type="button" data-syndication-undo>Undo / review again</button></form></section>`).join("")}</div>
+        <div class="media-actions"><button class="media-button" data-syndication-members-start>First members</button>${data.next_after !== null ? `<button class="media-button" data-syndication-members-next>More members (group continues)</button>` : ""}<button class="media-button" data-syndication-reset>Undo all group decisions and preference</button></div>
+        <details><summary>Audited review and reversal history</summary>${(data.history || []).map(e => `<div class="media-syndication__history"><strong>${esc(e.action)} · revision ${esc(e.revision)} · ${esc(e.actor_type)} · ${esc(formatUtcDateTime(e.created_at))}</strong><pre>${esc(e.before_json)}</pre><pre>${esc(e.after_json)}</pre></div>`).join("") || "No operator decisions recorded."}${data.history_next_after !== null ? `<button class="media-button" data-syndication-history-next>More history</button>` : ""}</details><div role="status" data-syndication-feedback></div>`;
+      const select = target.querySelector("[data-syndication-representative]");
+      const updateEligibility = () => target.querySelectorAll("[data-syndication-member]").forEach(section => {
+        const m = members.find(member => member.id === Number(section.dataset.syndicationMember));
+        const rep = representatives.get(Number(select.value));
+        const eligible = Boolean(rep && rep.id !== m.id && rep.publisher_domain !== m.publisher_domain);
+        section.querySelectorAll("button").forEach(button => { button.disabled = !eligible; });
+        section.querySelector("[data-syndication-date]").textContent = syndicationDateEvidence(m, rep);
+        section.querySelector("[data-syndication-eligibility]").textContent = eligible
+          ? "This member can be reviewed against the selected representative." : "Choose a different publisher as representative to review this member.";
+      });
+      select.addEventListener("change", () => {
+        target.querySelectorAll("[data-syndication-form]").forEach(form => {
+          form.elements.classification.value = "candidate";
+          form.elements.reviewed.checked = false;
+          form.elements.suppress.checked = false;
+        });
+        updateEligibility();
+      });
+      updateEligibility();
+      const save = async (m, form, undo = false) => {
+        const rep = representatives.get(Number(select.value));
+        if (!rep) return;
+        const values = new FormData(form);
+        const classification = undo ? "candidate" : String(values.get("classification"));
+        const suppress = !undo && values.has("suppress");
+        const reviewed = !undo && values.has("reviewed");
+        if ((classification === "confirmed_syndicated" && !reviewed) || (suppress && classification !== "confirmed_syndicated")) {
+          target.querySelector("[data-syndication-feedback]").innerHTML = message("Suppression requires confirmed syndication and manual review of both publisher URLs.", "error"); return;
+        }
+        const rationale = undo ? "Operator reset this member for renewed review." : String(values.get("rationale") || "").trim();
+        if (!rationale) { form.reportValidity(); return; }
+        const consequence = `${rep.id !== g.representative_article_id ? "Earlier relationships and suppression will reset. " : ""}${suppress ? "This secondary will be omitted from public News while the chosen representative is eligible." : "This member will use normal Article Status visibility."} Article Status and publication history stay unchanged.`;
+        if (!window.confirm(consequence)) return;
+        await mutateSyndication(id, g.revision, { action: "review", representative_article_id: rep.id,
+          representative_metadata_revision: rep.metadata_revision, confirm_visibility_change: true,
+          decisions: [{ article_id: m.id, metadata_revision: m.metadata_revision, classification,
+            suppress, reviewed_publisher_urls: reviewed, rationale }] }, target);
+      };
+      target.querySelectorAll("[data-syndication-member]").forEach(section => {
+        const m = members.find(member => member.id === Number(section.dataset.syndicationMember));
+        const form = section.querySelector("form");
+        form.addEventListener("submit", event => { event.preventDefault(); void save(m, form); });
+        section.querySelector("[data-syndication-undo]").addEventListener("click", () => void save(m, form, true));
+      });
+      target.querySelector("[data-syndication-reset]").addEventListener("click", () => {
+        if (!window.confirm("Restore normal editorial visibility for every member and clear the preferred publication? Review history will be retained.")) return;
+        void mutateSyndication(id, g.revision, { action: "reset", confirm_visibility_change: true,
+          rationale: "Operator reversed the group preference and all active relationship decisions." }, target);
+      });
+      target.querySelector("[data-syndication-members-start]").addEventListener("click", () => { syndication.memberAfter = 0; void loadSyndicationDetail(id); });
+      target.querySelector("[data-syndication-members-next]")?.addEventListener("click", () => { syndication.memberAfter = data.next_after; void loadSyndicationDetail(id); });
+      target.querySelector("[data-syndication-history-next]")?.addEventListener("click", () => { syndication.historyAfter = data.history_next_after; void loadSyndicationDetail(id); });
+    } catch (error) {
+      if (sequence === syndication.sequence && target.isConnected) target.innerHTML = message(error.message, "error");
+    }
+  }
+
+  async function mutateSyndication(id, revision, body, target) {
+    const buttons = [...target.querySelectorAll("button")];
+    buttons.forEach(button => { button.disabled = true; });
+    try {
+      await request(`syndication/${id}/decisions`, { method: "POST", body,
+        revision, idempotent: "syndication" });
+      articleDetailCache.clear();
+      await loadSyndicationDetail(id, "Decision saved. Public News visibility follows the recorded representative and normal editorial eligibility.");
+    } catch (error) {
+      target.querySelector("[data-syndication-feedback]").innerHTML = message(`${error.message}. Reload the group before retrying; its state or evidence may have changed.`, "error");
+      // Keep edits disabled after a revision conflict; reload provides fresh evidence.
+      const reload = document.createElement("button");
+      reload.className = "media-button"; reload.textContent = "Reload group";
+      reload.addEventListener("click", () => void loadSyndicationDetail(id));
+      target.querySelector("[data-syndication-feedback]").append(reload);
+    }
+  }
+
   function bindArticleEvents() {
+    state.root.querySelector("[data-syndication-panel]")?.addEventListener("toggle", event => {
+      if (event.currentTarget.open && !event.currentTarget.dataset.loaded) {
+        event.currentTarget.dataset.loaded = "true";
+        void loadSyndicationGroups();
+      }
+    });
     [["bluesky", openBlueskySettings], ["facebook", openFacebookSettings], ["threads", openThreadsSettings]].forEach(([key, open]) => {
       state.root.querySelector(`[data-open-${key}]`)?.addEventListener("click", () => {
         clearBulkSocialSelection();
