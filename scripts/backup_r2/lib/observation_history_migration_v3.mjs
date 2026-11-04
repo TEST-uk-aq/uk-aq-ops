@@ -34,6 +34,7 @@ import {
   buildObservationHistoryExactLeafIndexV3ScopedHierarchy,
   validateObservationHistoryExactLeafArtifactV3,
   validateObservationHistoryExactLeafIndexV3LatestArtifact,
+  validateObservationHistoryExactLeafIndexV3LatestRegistry,
   validateObservationHistoryExactLeafScopedManifestArtifactV3,
 } from "../../../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import {
@@ -90,6 +91,8 @@ import {
 } from "./hierarchical_backup_v2.mjs";
 import { compressors } from "./uk_aq_parquet_dependencies.mjs";
 import { buildObservationsManifestHierarchy } from "../uk_aq_observations_manifest_hierarchy.mjs";
+import { exactLeafFormatV3 } from "../../../workers/shared/uk_aq_observation_history_exact_leaf_format_v3.mjs";
+
 export const OBSERVATION_HISTORY_V3_MIGRATION_SCHEMA_VERSION = 1;
 export const LEGACY_HASH_DERIVATION_LIMITS = Object.freeze({
   max_rows_per_partition: 262144,
@@ -1584,6 +1587,30 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
   if (!Number.isInteger(legacyHashConcurrency) || legacyHashConcurrency < 1 || legacyHashConcurrency > 4 ||
       !Number.isSafeInteger(legacyHashInFlightBytes) || legacyHashInFlightBytes < 1) throw new Error('Invalid legacy hash derivation profile');
   const prefix = normalizePrefix(observationsPrefix, "observations prefix");
+  // This legacy repack/recovery implementation emits schema 1. Selected schema 2
+  // must never be silently downgraded by treating v3-rebuild as conversion.
+  const selectedV3 = prefix === "history/v3/observations" || v2LatestKey === DEFAULT_V3_LATEST_KEY;
+  let selectedLatestObject = null;
+  let selectedRegistry = null;
+  if (selectedV3) {
+    if (v2LatestKey !== DEFAULT_V3_LATEST_KEY || v2IndexRoot !== DEFAULT_V3_INDEX_ROOT) {
+      throw new Error("Selected v3 rebuild requires its authenticated format-aware latest/index roots");
+    }
+    selectedLatestObject = await getRequiredObject(getR2Object, v2LatestKey, "Selected v3 latest");
+    const payload = parseJsonBody(v2LatestKey, selectedLatestObject.body);
+    const body = Buffer.from(selectedLatestObject.body);
+    const registry = validateObservationHistoryExactLeafIndexV3LatestRegistry({ artifact: {
+      key: v2LatestKey, body: body.toString("utf8"), payload, byte_size: body.length, sha256: sha256Hex(body),
+      kind: "observation_history_index_v3_latest_global", publication_stage: "latest_global",
+      dependencies: (payload.day_summaries || []).flatMap(day => (day.scoped_roots || []).map(root => ({
+        key: root.key, byte_size: root.byte_size, sha256: root.sha256, kind: "scoped_manifest" }))),
+      publication_prerequisites: [],
+    }, indexRoot: v2IndexRoot, latestKey: v2LatestKey });
+    selectedRegistry = registry;
+    if (registry.roots.some(root => root.exact_index_schema_version === 2)) {
+      throw new Error("Selected schema-2 v3-rebuild is unsupported by the legacy schema-1 migration/recovery executor");
+    }
+  }
   const rootKey = buildR2HistoryV2ObservationsRootManifestKey(prefix);
   const rootObject = await getRequiredObject(getR2Object, rootKey, "R2");
   const rootPayload = assertCanonicalAggregate(parseJsonBody(rootKey, rootObject.body), { basePrefix: prefix });
@@ -1676,6 +1703,26 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
     return { scope: { day_utc: connector.day_utc, connector_id: connector.connector_id, pollutant_code: pollutantCode },
       payload, identity, selfHash, sourceReference };
   });
+  if (selectedRegistry) {
+    const rootsByScope = new Map(selectedRegistry.roots.map(root => [partitionIdentity(root), root]));
+    if (rootsByScope.size !== pollutantResults.length) {
+      throw new Error("Selected-format v3 rebuild registry does not cover the complete canonical scope set");
+    }
+    for (const { scope, payload } of pollutantResults) {
+      const root = rootsByScope.get(partitionIdentity(scope));
+      if (!root || root.row_count !== payload.row_count || root.physical_file_count !== payload.file_count ||
+          root.timeseries_count !== Object.keys(payload.timeseries_row_counts || {}).length ||
+          root.min_observed_at_utc !== payload.min_observed_at_utc || root.max_observed_at_utc !== payload.max_observed_at_utc) {
+        throw new Error(`Selected-format v3 rebuild registry contradicts canonical scope: ${partitionIdentity(scope)}`);
+      }
+      const selector = await getRequiredObject(getR2Object, root.key, "Selected v3 selector");
+      const current = bodyIdentity(root.key, selector.body);
+      if (current.byte_size !== root.byte_size || current.sha256 !== root.sha256 ||
+          exactLeafFormatV3(parseJsonBody(root.key, selector.body)).schema_version !== 1) {
+        throw new Error(`Selected-format v3 rebuild selector identity/format mismatch: ${root.key}`);
+      }
+    }
+  }
   // Only genuine hashless legacy partitions enter the bounded decode stage.
   // Results are assigned by their original canonical position, never arrival.
   const partitions = [];
@@ -1743,7 +1790,7 @@ export async function inventoryAuthoritativeCanonicalObservationHistory({
   emptyConnectors.sort((left, right) => left.scope.day_utc.localeCompare(right.scope.day_utc) || left.scope.connector_id - right.scope.connector_id);
   partitions.sort((left, right) => left.scope.day_utc.localeCompare(right.scope.day_utc) ||
     left.scope.connector_id - right.scope.connector_id || left.scope.pollutant_code.localeCompare(right.scope.pollutant_code));
-  const latestObject = await getOptionalObject(getR2Object, v2LatestKey);
+  const latestObject = selectedLatestObject || await getOptionalObject(getR2Object, v2LatestKey);
   return Object.freeze({ observations_prefix: prefix, root_manifest: Object.freeze(rootRecord),
     hierarchy_objects: Object.freeze(hierarchyObjects), day_manifests: Object.freeze(days),
     connector_manifests: Object.freeze(connectors), empty_source_connectors: Object.freeze(emptyConnectors),

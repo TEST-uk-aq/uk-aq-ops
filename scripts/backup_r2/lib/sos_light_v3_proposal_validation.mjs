@@ -482,6 +482,17 @@ export function requireCoordinatorProposalFreeze(runState) {
 }
 
 export function validateDedicatedSosHistoricalProposalV3({ runState, proposal }) {
+  // The dedicated APPLY route executes frozen bytes directly rather than the
+  // legacy Integrity writer adapter. Keep schema-2 preparation disconnected here
+  // as well, before any complete-day deletion can become eligible.
+  for (const object of proposal?.objects || []) {
+    if (!/^history\/_index_v3\/observations_timeseries\/day_utc=\d{4}-\d{2}-\d{2}\/connector_id=[1-9]\d*\/pollutant_code=[a-z0-9_]+\/manifest\.json$/.test(object.key)) continue;
+    const payload = JSON.parse(Buffer.from(object.body).toString("utf8"));
+    if (payload.schema_version !== 1 || payload.kind !== "observation_timeseries_physical_leaf_scoped_manifest" ||
+        payload.exact_leaf_index_version !== "exact-timeseries-leaf-v1") {
+      throw new Error("Selected schema-2 or unknown-format SOS-light APPLY is unsupported");
+    }
+  }
   if (runState?.execution_path !== "sos_light" || runState.mode !== "sos-light"
       || !["TEST", "LIVE"].includes(runState.environment)
       || !exactArray(runState.mutation_connector_ids, [1])

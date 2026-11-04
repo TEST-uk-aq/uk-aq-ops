@@ -29,6 +29,18 @@ function assertValidatedApplyRepresentation({ runState, validatedProposal }) {
   ) {
     throw new TypeError("Integrity v3 apply requires validateLocalProposal() output");
   }
+  // Preparation of schema-2 metadata is not an operational repair mode. The
+  // legacy adapter reconstructs schema 1, so reject before loading source rows.
+  for (const object of validatedProposal.objects) {
+    if (!String(object.key || "").startsWith("history/_index_v3/observations_timeseries/") ||
+        !/^history\/_index_v3\/observations_timeseries\/day_utc=\d{4}-\d{2}-\d{2}\/connector_id=[1-9]\d*\/pollutant_code=[a-z0-9_]+\/manifest\.json$/.test(object.key)) continue;
+    const payload = JSON.parse(Buffer.from(object.body).toString("utf8"));
+    if (payload.schema_version !== 1 ||
+        payload.kind !== "observation_timeseries_physical_leaf_scoped_manifest" ||
+        payload.exact_leaf_index_version !== "exact-timeseries-leaf-v1") {
+      throw new Error("Selected schema-2 or unknown-format Integrity/SOS-light APPLY is unsupported");
+    }
+  }
   const audit = runState.final_proposal_graph_validation;
   if (
     audit?.status !== "succeeded" ||
