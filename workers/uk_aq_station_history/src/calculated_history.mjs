@@ -139,7 +139,7 @@ function sourceObservationsToHourEndingNarrowRows(rows, request, outputEndMs, ex
 }
 
 function calculateLogicalAqi(observationRows, request, segments, outputStartMs, outputEndMs, expectedEndpoints) {
-  return helperRowsToNormalizedAqiV1Rows(
+  const normalizedRows = helperRowsToNormalizedAqiV1Rows(
     pivotNarrowRowsToHelperRows(
       sourceObservationsToHourEndingNarrowRows(observationRows, request, outputEndMs, expectedEndpoints),
       {
@@ -148,26 +148,26 @@ function calculateLogicalAqi(observationRows, request, segments, outputStartMs, 
       },
     ),
     { computedAtUtc: null },
-  ).filter((row) => {
+  );
+  const aqiRows = [];
+  // The normalizer returns fresh request-local rows with canonical hourly ISO
+  // timestamps. Finalise them in place, reusing each parsed endpoint and string.
+  for (const row of normalizedRows) {
     const endpoint = Date.parse(row.timestamp_hour_utc);
-    return endpoint > outputStartMs && endpoint <= outputEndMs;
-  }).map((row) => {
-    const endpoint = Date.parse(row.timestamp_hour_utc);
+    if (!(endpoint > outputStartMs && endpoint <= outputEndMs)) continue;
     // The AQI row belongs to the physical member valid at its canonical
     // hour-ending timestamp, including at a midnight continuity boundary.
     const physical = memberAt(segments, endpoint);
     if (!physical) throw new Error("station_history_continuity_aqi_identity_missing");
-    return {
-      ...row,
-      connector_id: physical.connectorId,
-      station_id: physical.stationId,
-      timeseries_id: physical.timeseriesId,
-      period_start_utc: new Date(endpoint - HOUR_MS).toISOString(),
-      period_end_utc: new Date(endpoint).toISOString(),
-      timestamp_hour_utc: new Date(endpoint).toISOString(),
-      source: "calculated_from_observations",
-    };
-  });
+    row.connector_id = physical.connectorId;
+    row.station_id = physical.stationId;
+    row.timeseries_id = physical.timeseriesId;
+    row.period_start_utc = new Date(endpoint - HOUR_MS).toISOString();
+    row.period_end_utc = row.timestamp_hour_utc;
+    row.source = "calculated_from_observations";
+    aqiRows.push(row);
+  }
+  return aqiRows;
 }
 
 function missingRanges(expected, present) {
