@@ -11,6 +11,11 @@ binding = "STATION_HISTORY"
 service = "__UK_AQ_STATION_HISTORY_WORKER_NAME__"
 
 [vars]
+UK_AQ_STATION_HISTORY_WORKER_NAME = "__UK_AQ_STATION_HISTORY_WORKER_NAME__"
+# Optional comparison UUIDs are validated/injected from GitHub variables by the deploy workflow.
+# Empty values keep normal routing available and selected comparison requests fail closed.
+UK_AQ_STATION_HISTORY_STAGE3_VERSION_ID = ""
+UK_AQ_STATION_HISTORY_STAGE4_VERSION_ID = ""
 UK_AQ_MEDIA_PUBLIC_URL = "__UK_AQ_MEDIA_PUBLIC_URL__"
 # Fail-closed template default. The TEST deployment workflow verifies the protected
 # Sleepercar upstream, then enables this in generated wrangler.deploy.toml on
@@ -23,6 +28,7 @@ UK_AQ_COMPRESSED_CHART_ENABLED = "false"
 # - /api/aq/latest-snapshot is the sole current-reading route.
 
 # Runtime secrets expected:
+# - UK_AQ_STATION_HISTORY_VERSION_OPERATOR_TOKEN (optional dedicated TEST comparison secret, 32-512 characters)
 # - SUPABASE_URL
 # - SB_PUBLISHABLE_DEFAULT_KEY
 # - SB_SECRET_KEY

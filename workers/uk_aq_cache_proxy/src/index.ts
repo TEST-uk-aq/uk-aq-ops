@@ -18,6 +18,10 @@ import * as stationHistoryStaleCache from "./station_history/stale_cache.mjs";
 export interface Env {
   UK_AQ_R2_HISTORY_VERSION: unknown;
   UK_AQ_ENV_NAME: unknown;
+  UK_AQ_STATION_HISTORY_WORKER_NAME?: unknown;
+  UK_AQ_STATION_HISTORY_STAGE3_VERSION_ID?: unknown;
+  UK_AQ_STATION_HISTORY_STAGE4_VERSION_ID?: unknown;
+  UK_AQ_STATION_HISTORY_VERSION_OPERATOR_TOKEN?: unknown;
   STATION_HISTORY?: { fetch(input: Request | string, init?: RequestInit): Promise<Response> };
   UK_AQ_COMPRESSED_CHART_ENABLED?: unknown;
   UK_AQ_COMPRESSED_CHART_UPSTREAM_URL?: unknown;
@@ -544,7 +548,7 @@ export function addCorsHeaders(headers: Headers, requestOrigin: string | null, a
   headers.set("Access-Control-Allow-Methods", "GET,HEAD,POST,OPTIONS");
   headers.set(
     "Access-Control-Allow-Headers",
-    "Content-Type,If-None-Match,If-Modified-Since,X-UK-AQ-Bypass-Token,X-UK-AQ-Session-Init,X-UK-AQ-Prototype-Request-ID,CF-Turnstile-Token",
+    "Content-Type,If-None-Match,If-Modified-Since,X-UK-AQ-Bypass-Token,X-UK-AQ-Session-Init,X-UK-AQ-Prototype-Request-ID,CF-Turnstile-Token,X-UK-AQ-Station-History-Version-Selection,X-UK-AQ-Station-History-Version-Operator-Token",
   );
   headers.set("Access-Control-Max-Age", "86400");
   headers.set(
@@ -552,6 +556,7 @@ export function addCorsHeaders(headers: Headers, requestOrigin: string | null, a
     "CF-Cache-Status,ETag,X-UK-AQ-Cache,X-UK-AQ-Cache-Profile,X-UK-AQ-Timeseries-Source-Mode,X-UK-AQ-Has-Gap,X-UK-AQ-R2-Coverage-End,X-UK-AQ-Ingest-Tail-Start,X-UK-AQ-R2-Rows,X-UK-AQ-Ingest-Rows,X-UK-AQ-Cache-Key-Version,X-UK-AQ-Station-History-Cache-Key-Version,X-UK-AQ-Station-History-Cache-State,X-UK-AQ-Station-History-Cached-At,X-UK-AQ-Station-History-Fresh-Until,X-UK-AQ-Station-History-Stale-Until,X-UK-AQ-Station-History-Stale-Reason,X-UK-AQ-Prototype-Request-ID,X-UK-AQ-Prototype-Publication,X-UK-AQ-Prototype-Compressed-Bytes,X-UK-AQ-Prototype-R2-Reads,X-UK-AQ-Prototype-Cache,X-UK-AQ-Prototype-AQI-Wall-MS,Server-Timing,Content-Length,X-UK-AQ-History-PubID,X-UK-AQ-History-Source,X-UK-AQ-History-Algorithm,X-UK-AQ-History-Selection-Checked-At,X-UK-AQ-History-Cache,X-UK-AQ-History-R2-Reads,X-UK-AQ-History-Object-SHA256,X-UK-AQ-History-Compressed-Bytes",
   );
   appendVary(headers, "Origin");
+  headers.append("Access-Control-Expose-Headers", "X-UK-AQ-Station-History-Requested-Version,X-UK-AQ-Station-History-Requested-Version-ID,X-UK-AQ-Station-History-Version-Verification");
 }
 
 function compactChartMetricPayload(metric: ChartMetricsPayload): Record<string, unknown> {
@@ -2917,6 +2922,47 @@ export default {
       return makeErrorResponse(405, "method_not_allowed", requestOrigin, allowedOrigins);
     }
 
+    // This opt-in experiment never accepts local-dev/session bypass authority.
+    // Validate only after the existing Origin + authenticated session boundary.
+    let historyVersionSelection: { label: string; versionId: string; override: string } | null = null;
+    if (request.headers.has("X-UK-AQ-Station-History-Version-Selection")) {
+      if (requestOrigin === null) return makeErrorResponse(400, "origin_required", requestOrigin, allowedOrigins);
+      if (!isOriginAllowed(requestOrigin, allowedOrigins)) return makeErrorResponse(403, "origin_not_allowed", requestOrigin, allowedOrigins);
+      const sessionToken = getCookieValue(request.headers.get("Cookie"), SESSION_COOKIE_NAME);
+      if (!sessionToken) return makeErrorResponse(401, "missing_session_cookie", requestOrigin, allowedOrigins);
+      const authCheck = await verifyAccessToken(sessionToken, tokenSecret, requestOrigin);
+      if (!authCheck.ok) return makeErrorResponse(401, authCheck.error, requestOrigin, allowedOrigins);
+      if (String(await readSecret(env.UK_AQ_ENV_NAME)) !== "TEST") {
+        return makeErrorResponse(403, "station_history_version_test_only", requestOrigin, allowedOrigins);
+      }
+      if (request.method !== "GET" || !["/api/aq/station-series", "/api/aq/timeseries"].includes(url.pathname)) {
+        return makeErrorResponse(400, "station_history_version_route_ineligible", requestOrigin, allowedOrigins);
+      }
+      const operatorToken = await readSecret(env.UK_AQ_STATION_HISTORY_VERSION_OPERATOR_TOKEN);
+      if (operatorToken.length < 32 || operatorToken.length > 512) {
+        return makeErrorResponse(503, "station_history_version_operator_auth_unavailable", requestOrigin, allowedOrigins);
+      }
+      if (!timingSafeEqual(operatorToken, request.headers.get("X-UK-AQ-Station-History-Version-Operator-Token") || "")) {
+        return makeErrorResponse(403, "station_history_version_operator_auth_required", requestOrigin, allowedOrigins);
+      }
+      const label = request.headers.get("X-UK-AQ-Station-History-Version-Selection");
+      if (label !== "stage3" && label !== "stage4") {
+        return makeErrorResponse(400, "station_history_version_selection_invalid", requestOrigin, allowedOrigins);
+      }
+      const workerName = await readSecret(env.UK_AQ_STATION_HISTORY_WORKER_NAME);
+      const stage3 = await readSecret(env.UK_AQ_STATION_HISTORY_STAGE3_VERSION_ID);
+      const stage4 = await readSecret(env.UK_AQ_STATION_HISTORY_STAGE4_VERSION_ID);
+      const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      // A single safe Structured Fields dictionary key and two distinct UUID strings.
+      // The name is injected from the same resolved configuration as STATION_HISTORY.
+      if (workerName.length > 63 || !/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/.test(workerName)
+        || !uuid.test(stage3) || !uuid.test(stage4) || stage3.toLowerCase() === stage4.toLowerCase()) {
+        return makeErrorResponse(503, "station_history_version_configuration_invalid", requestOrigin, allowedOrigins);
+      }
+      const versionId = (label === "stage3" ? stage3 : stage4).toLowerCase();
+      historyVersionSelection = { label, versionId, override: `${workerName}="${versionId}"` };
+    }
+
     if (url.pathname === "/api/aq/recent-aqi-prototype" || url.pathname === "/api/aq/recent-hourly-prototype") {
       if (request.method !== "GET") return makeErrorResponse(405, "method_not_allowed", requestOrigin, allowedOrigins);
       if (requestOrigin === null) return makeErrorResponse(400, "origin_required", requestOrigin, allowedOrigins);
@@ -3140,6 +3186,12 @@ export default {
       : upstreamFunction === TIMESERIES_UPSTREAM_FUNCTION && stationHistoryRouting.timeseries && progressiveStationHistoryChunk
       ? "/v1/observations-history"
       : null;
+    // Never fall through to a legacy/direct upstream for a selected comparison.
+    if (historyVersionSelection && (!env.STATION_HISTORY
+      || !["/v1/station-series", "/v1/observations-history"].includes(stationHistoryInternalRoute || "")
+      || useTimeseriesV2Skeleton)) {
+      return makeErrorResponse(503, "station_history_version_route_unavailable", requestOrigin, allowedOrigins);
+    }
     // v3 has one observation-history authority. Retire the legacy v2
     // stitching/Origin path and persisted-AQI public route before cache lookup:
     // disabling the v2 feature flag alone would otherwise fall through to
@@ -3174,6 +3226,7 @@ export default {
     });
     const stationHistoryStaleRequestSupported = Boolean(
       stationHistoryInternalRoute
+      && !historyVersionSelection
       && stationHistoryStaleConfig.enabled
       && env.STATION_HISTORY
       && stationHistoryStaleCache.isSupportedStationHistoryStaleRequest(
@@ -3228,7 +3281,7 @@ export default {
       return makeErrorResponse(500, "missing_upstream_auth_secret", requestOrigin, allowedOrigins);
     }
 
-    let shouldUseCache = shouldCacheRequest(request, bypassRequested);
+    let shouldUseCache = shouldCacheRequest(request, bypassRequested) && !historyVersionSelection;
     const cache = (caches as unknown as { default: Cache }).default;
     const historyCacheEnv = {
       UK_AQ_ENV_NAME: await readSecret(env.UK_AQ_ENV_NAME),
@@ -3430,7 +3483,7 @@ export default {
         internalUrl.searchParams.set("connector_id", String(url.searchParams.get("connector_id") ?? ""));
       }
       const internalHeaders = new Headers();
-      const forwardedConditionalHeaders = stationHistoryStaleRequestSupported
+      const forwardedConditionalHeaders = stationHistoryStaleRequestSupported || historyVersionSelection
         ? ["Accept"]
         : ["Accept", "If-None-Match", "If-Modified-Since"];
       for (const name of forwardedConditionalHeaders) {
@@ -3438,6 +3491,11 @@ export default {
         if (value) internalHeaders.set(name, value);
       }
       internalHeaders.set("X-UK-AQ-Station-History-Contract", "v2");
+      if (historyVersionSelection) {
+        // Fresh headers: never forward browser Cloudflare overrides or operator secrets.
+        internalHeaders.set("Cloudflare-Workers-Version-Overrides", historyVersionSelection.override);
+        internalHeaders.set("Cache-Control", "no-store");
+      }
       const tryStaleFallback = async (reason: string): Promise<Response | null> => {
         if (!stationHistoryStaleCache.shouldAttemptStaleFallback({
           enabled: stationHistoryStaleConfig.enabled,
@@ -3500,7 +3558,20 @@ export default {
         )
         : null;
       const responseHeaders = new Headers(internalResponse.headers);
-      if (targetedHistoryCache) {
+      if (historyVersionSelection) {
+        if (internalResponse.status === 304) {
+          await internalResponse.body?.cancel();
+          return makeErrorResponse(502, "station_history_version_conditional_response_refused", requestOrigin, allowedOrigins);
+        }
+        responseHeaders.set("Cache-Control", "no-store");
+        responseHeaders.delete("ETag");
+        responseHeaders.delete("Last-Modified");
+        responseHeaders.delete("Cache-Tag");
+        responseHeaders.set("X-UK-AQ-Station-History-Requested-Version", historyVersionSelection.label);
+        responseHeaders.set("X-UK-AQ-Station-History-Requested-Version-ID", historyVersionSelection.versionId);
+        responseHeaders.set("X-UK-AQ-Station-History-Version-Verification", "unverified");
+      }
+      if (targetedHistoryCache && !historyVersionSelection) {
         if (dependencyTags) responseHeaders.set("Cache-Tag", dependencyTags.join(","));
         else responseHeaders.set("Cache-Control", "no-store");
       }

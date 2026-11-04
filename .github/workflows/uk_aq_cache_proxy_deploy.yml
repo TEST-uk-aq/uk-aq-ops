@@ -31,6 +31,8 @@ jobs:
     env:
       UK_AQ_CACHE_WORKER_NAME: ${{ vars.UK_AQ_CACHE_WORKER_NAME || 'uk-aq-cache-proxy' }}
       UK_AQ_STATION_HISTORY_WORKER_NAME: ${{ vars.UK_AQ_STATION_HISTORY_WORKER_NAME || '' }}
+      UK_AQ_STATION_HISTORY_STAGE3_VERSION_ID: ${{ vars.UK_AQ_STATION_HISTORY_STAGE3_VERSION_ID || '' }}
+      UK_AQ_STATION_HISTORY_STAGE4_VERSION_ID: ${{ vars.UK_AQ_STATION_HISTORY_STAGE4_VERSION_ID || '' }}
       UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME || '' }}
       # TEST automatically enables the verified private JSON upstream; manual
       # dispatch can explicitly disable it for a single deployment.
@@ -119,6 +121,19 @@ jobs:
             -e "s|__UK_AQ_STATION_HISTORY_WORKER_NAME__|${STATION_HISTORY_SERVICE}|g" \
             -e "s|__UK_AQ_MEDIA_PUBLIC_URL__|${media_url_escaped}|g" \
             wrangler.toml > wrangler.deploy.toml
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          const keys = ['UK_AQ_STATION_HISTORY_STAGE3_VERSION_ID', 'UK_AQ_STATION_HISTORY_STAGE4_VERSION_ID'];
+          const ids = keys.map(key => process.env[key] || '');
+          const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+          if (ids.some(Boolean) && (process.env.UK_AQ_ENV_NAME !== 'TEST'
+              || !ids.every(id => uuid.test(id)) || ids[0].toLowerCase() === ids[1].toLowerCase())) {
+            throw new Error('Version comparison requires TEST and two distinct configured version UUIDs.');
+          }
+          let config = readFileSync('wrangler.deploy.toml', 'utf8');
+          keys.forEach((key, index) => { config = config.replace(`${key} = ""`, `${key} = ${JSON.stringify(ids[index].toLowerCase())}`); });
+          writeFileSync('wrangler.deploy.toml', config);
+          NODE
           grep -F "service = \"${STATION_HISTORY_SERVICE}\"" wrangler.deploy.toml >/dev/null || {
             echo "Failed to resolve STATION_HISTORY Service Binding target."
             exit 1
@@ -213,6 +228,7 @@ jobs:
         working-directory: workers/uk_aq_cache_proxy
         env:
           RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN: ${{ secrets.UK_AQ_RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN || '' }}
+          STATION_HISTORY_VERSION_OPERATOR_TOKEN: ${{ secrets.UK_AQ_STATION_HISTORY_VERSION_OPERATOR_TOKEN || '' }}
           PILOT_ORIGIN: ${{ vars.UK_AQ_COMPRESSED_CHART_UPSTREAM_URL || '' }}
           PILOT_ACCESS_ID: ${{ secrets.UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_ID || '' }}
           PILOT_ACCESS_SECRET: ${{ secrets.UK_AQ_COMPRESSED_CHART_ACCESS_CLIENT_SECRET || '' }}
@@ -281,6 +297,13 @@ jobs:
           secrets_json="$(jq --arg value "${{ secrets.UK_AQ_EDGE_UPSTREAM_SECRET }}" '. + {UK_AQ_EDGE_UPSTREAM_SECRET: $value}' <<<"$secrets_json")"
           if [ -n "${RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN}" ]; then
             secrets_json="$(jq --arg value "${RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN}" '. + {UK_AQ_RECENT_AQI_PROTOTYPE_OPERATOR_TOKEN: $value}' <<<"$secrets_json")"
+          fi
+          if [ -n "${STATION_HISTORY_VERSION_OPERATOR_TOKEN}" ]; then
+            if [ "${UK_AQ_ENV_NAME}" != "TEST" ] || [ "${#STATION_HISTORY_VERSION_OPERATOR_TOKEN}" -lt 32 ] || [ "${#STATION_HISTORY_VERSION_OPERATOR_TOKEN}" -gt 512 ]; then
+              echo "Version comparison operator secret requires TEST and 32-512 characters."
+              exit 1
+            fi
+            secrets_json="$(jq --arg value "${STATION_HISTORY_VERSION_OPERATOR_TOKEN}" '. + {UK_AQ_STATION_HISTORY_VERSION_OPERATOR_TOKEN: $value}' <<<"$secrets_json")"
           fi
           if [ "${ENABLE_COMPRESSED_CHART_HISTORY}" = "true" ]; then
             secrets_json="$(jq \
