@@ -28,6 +28,7 @@ import {
   ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
 } from "../../workers/shared/uk_aq_observation_history_writer_limits_v3.mjs";
 import {
+  loadImmutableSourcePartition,
   readCanonicalObservationRows,
 } from "./uk_aq_apply_integrity_proposal.mjs";
 import {
@@ -69,6 +70,7 @@ import {
 } from "./lib/sos_light_v3_proposal_transport.mjs";
 
 import { exactLeafFormatV3, EXACT_LEAF_FORMATS_V3 } from "../../workers/shared/uk_aq_observation_history_exact_leaf_format_v3.mjs";
+import { prepareOfflineObservationHistoryScopeV3 } from "../../workers/shared/uk_aq_observation_history_exact_only_verifier_v3.mjs";
 
 const GENERATION = getObservationHistoryGeneration("v3");
 const FULL_LOWER_GIT_SHA = /^[0-9a-f]{40}$/;
@@ -1308,6 +1310,141 @@ export async function buildExactV3HierarchyForCatalogueEntry({
     exactSchemaVersion: selectedFormat.schema_version,
     indexRoot: GENERATION.observations_timeseries_index_prefix,
   });
+}
+
+// Explicit offline preparation interface, separate from the ordinary proposal
+// and APPLY graph. baselineStore must expose the unmasked pinned backup, even
+// when a combined overlay store hides replaced objects under tombstones.
+// runState is the already accepted checkpoint/current-run source state, not a
+// newly asserted live-currentness or writer-lock capability.
+export async function prepareOfflineExactV3Reconstruction({ runState, baselineStore, scopes, repairOverlay = null }) {
+  if (!Array.isArray(scopes) || !scopes.length ||
+      new Set(scopes.map(scopeIdentity)).size !== scopes.length) {
+    throw new Error("offline reconstruction requires explicit nonempty unique scopes");
+  }
+  if (typeof baselineStore?.getObjectFromSourceIfExists !== "function" ||
+      (repairOverlay !== null && typeof repairOverlay?.store?.getObjectFromSourceIfExists !== "function")) {
+    throw new Error("offline reconstruction requires local baseline/overlay stores");
+  }
+  const state = structuredClone(runState);
+  const pins = new Map();
+  function localObject(store, key, source) {
+    const object = store.getObjectFromSourceIfExists(key, source);
+    if (!object) return null;
+    if (object.source !== (source === "overlay" ? "planned_overlay" : "dropbox")) {
+      throw new Error(`offline ${source} source provenance disagrees: ${key}`);
+    }
+    if (object.key !== key || !(typeof object.body === "string" || object.body instanceof Uint8Array)) {
+      throw new Error(`offline ${source} body unavailable: ${key}`);
+    }
+    const body = Buffer.from(object.body), sha256 = sha256Hex(body);
+    const pinId = `${source}:${key}`;
+    const prior = pins.get(pinId);
+    if (prior && (prior.sha256 !== sha256 || prior.bytes !== body.length)) {
+      throw new Error(`changed offline ${source} object identity: ${key}`);
+    }
+    pins.set(pinId, { store, source, key, sha256, bytes: body.length });
+    return { key, body, bytes: body.length, content_sha256: sha256,
+      source: source === "overlay" ? "planned_overlay" : "dropbox" };
+  }
+  const baseline = key => localObject(baselineStore, key, "dropbox");
+  const removed = key => state.tombstones?.[key]?.proposed === true || state.tombstones?.[key]?.deleted === true ||
+    (state.tombstone_prefixes || []).some(entry => {
+      if (entry?.proposed !== true || typeof entry.prefix !== "string") return false;
+      const prefix = entry.prefix.replace(/\/+$/, "");
+      return key === prefix || (entry.exact_object !== true && key.startsWith(`${prefix}/`));
+    });
+  const checkpointStore = { getObjectFromSourceIfExists: key => baseline(key) };
+  const registry = authenticateExactV3CompactLatest({ runState: state, store: checkpointStore });
+  const rootKey = buildR2HistoryV2ObservationsRootManifestKey(GENERATION.observations_prefix);
+  const root = baseline(rootKey);
+  if (!root || parseJsonBody(root.body, rootKey).content_hash !==
+      state.dropbox_currentness.checkpoint.observations_processed_source_root_hash) {
+    throw new Error("offline canonical baseline root disagrees with accepted checkpoint");
+  }
+  const results = [];
+  for (const scope of [...scopes].sort((a, b) => scopeIdentity(a).localeCompare(scopeIdentity(b)))) {
+    const selected = registry.roots.find(root => scopeIdentity(root) === scopeIdentity(scope));
+    if (!selected) throw new Error(`offline selected-format identity unavailable for scope: ${scopeIdentity(scope)}`);
+    const format = selected.exact_index_schema_version === 2 ? 2 : 1;
+    const original = await prepareOfflineObservationHistoryScopeV3({ scope, exactSchemaVersion: format,
+      getObject: async ({ key }) => baseline(key) });
+    // Compare the entire registry descriptor, including summaries and format.
+    // Its exact selector SHA commits the entire immutable leaf identity map.
+    const reproduced = validateObservationHistoryExactLeafIndexV3LatestRegistry({ artifact:
+      buildObservationHistoryExactLeafIndexV3Latest({ scopedHierarchies: [original.hierarchy] }) }).roots[0];
+    if (!sameJson(reproduced, selected)) {
+      throw new Error(`offline selected identity is not reproducible; original selector/leaf bodies or format details unavailable: ${selected.key}`);
+    }
+    let prepared = original;
+    let sourceEvidence = null;
+    if (repairOverlay) {
+      const manifestKey = original.canonical_source_manifest.key;
+      const readOverlay = key => {
+        const staged = state.objects?.[key];
+        // Unchanged planning records cannot shadow the baseline. A tombstone,
+        // however, cannot be satisfied by borrowing a deleted baseline body.
+        if (!isChangedCurrentRunObject(staged)) {
+          if (removed(key)) throw new Error(`offline scope removal/tombstone lacks replacement: ${key}`);
+          return baseline(key);
+        }
+        const object = localObject(repairOverlay.store, key, "overlay");
+        if (!object || staged.built !== true ||
+            object.bytes !== staged.bytes || object.content_sha256 !== (staged.sha256 || staged.content_sha256)) {
+          throw new Error(`offline repair overlay provenance/identity unavailable or disagrees: ${key}`);
+        }
+        if ((key === manifestKey || key.endsWith(".parquet")) &&
+            resolveCurrentRunProposalOwner(staged) !== SOURCE_DERIVED_OWNER) {
+          throw new Error(`offline repair overlay source ownership unavailable: ${key}`);
+        }
+        return object;
+      };
+      prepared = await prepareOfflineObservationHistoryScopeV3({ scope, exactSchemaVersion: format,
+        getObject: async ({ key }) => readOverlay(key) });
+      if (!sameRootIdentity(prepared.canonical_source_manifest, original.canonical_source_manifest)) {
+        if (!isChangedCurrentRunObject(state.objects?.[manifestKey])) {
+          throw new Error(`offline changed canonical source lacks repair overlay provenance: ${manifestKey}`);
+        }
+        const sourceId = manifestKey.slice(`${GENERATION.observations_prefix}/`.length, -"/manifest.json".length);
+        if (!state.source_evidence_partitions?.[sourceId]) {
+          throw new Error(`offline changed overlay requires independently pinned source provenance: ${sourceId}`);
+        }
+        const source = loadImmutableSourcePartition({ runState: state, dayUtc: scope.day_utc,
+          connectorId: scope.connector_id, pollutantCode: scope.pollutant_code });
+        if (!sameJson(prepared.semantic_metadata, source.finalTargetMetadata)) {
+          throw new Error(`offline repair overlay differs from immutable source evidence: ${manifestKey}`);
+        }
+        sourceEvidence = { identity: source.identity, evidence_sha256: source.evidenceSha256, rows_sha256: source.rowsSha256 };
+      }
+    }
+    const selector = prepared.hierarchy.scoped_manifest;
+    results.push({ scope: { ...scope }, selected_format: format,
+      checkpoint_selected_selector: { key: selected.key, byte_size: selected.byte_size, sha256: selected.sha256 },
+      prepared_selector: { key: selector.key, byte_size: selector.byte_size, sha256: selector.sha256 },
+      selected_identity_reproduced: true, prepared_matches_checkpoint_selection: sameRootIdentity(selector, selected),
+      source_changed: !sameRootIdentity(prepared.canonical_source_manifest, original.canonical_source_manifest),
+      baseline_canonical_source: original.canonical_source_manifest, canonical_source_manifest: prepared.canonical_source_manifest,
+      canonical_chain: prepared.canonical_chain, source_evidence: sourceEvidence, inspector: prepared.inspector,
+      hierarchy: prepared.hierarchy });
+  }
+  // Recheck actual bytes across the whole requested subset, including latest.
+  for (const pin of [...pins.values()]) {
+    if (!localObject(pin.store, pin.key, pin.source)) throw new Error(`offline pinned body became unavailable: ${pin.key}`);
+  }
+  for (const result of results.filter(result => result.source_evidence)) {
+    const source = loadImmutableSourcePartition({ runState: state, dayUtc: result.scope.day_utc,
+      connectorId: result.scope.connector_id, pollutantCode: result.scope.pollutant_code });
+    if (source.evidenceSha256 !== result.source_evidence.evidence_sha256 ||
+        source.rowsSha256 !== result.source_evidence.rows_sha256) {
+      throw new Error(`offline immutable source evidence changed: ${result.source_evidence.identity}`);
+    }
+  }
+  return { mode: "offline_read_only_reconstruction_preparation", read_only: true,
+    publication_eligible: false, repair_apply_eligible: false, current_object_authority: null,
+    original_writer_completion: false, observation_event_created: false,
+    jsongen_pending_created: false, jsongen_confirmed_created: false, source_deletion_eligible: false,
+    scopes: results,
+    blocker: "actual current selector, strong ETags, immutable dependencies, held global writer exclusion and conditional publication remain unproved" };
 }
 
 async function addExactV3Indexes({
