@@ -426,7 +426,7 @@ def send(subject: str, plain: str, body: str, report_day: date, report_type: str
                 raise RuntimeError("SMTP XOAUTH2 is unavailable")
             connection.auth(
                 "XOAUTH2",
-                lambda _: f"user={username}\x01auth=Bearer {token}\x01\x01",
+                lambda challenge=None: f"user={username}\x01auth=Bearer {token}\x01\x01",
                 initial_response_ok=True,
             )
             connection.send_message(msg, from_addr=sender, to_addrs=[recipient])
