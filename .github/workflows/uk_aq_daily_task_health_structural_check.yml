@@ -39,3 +39,36 @@ jobs:
           assert slots[0].hour < 7 <= slots[1].hour < 10, slots
           print('Python syntax and two WHO UTC windows structurally valid')
           PYCHECK
+
+      - name: Check TEST email configuration names without exposing values
+        env:
+          UK_AQ_HEALTH_EMAIL_TO: ${{ vars.UK_AQ_HEALTH_EMAIL_TO }}
+          UK_AQ_HEALTH_EMAIL_FROM: ${{ vars.UK_AQ_HEALTH_EMAIL_FROM }}
+          UK_AQ_HEALTH_EMAIL_SMTP_HOST: ${{ vars.UK_AQ_HEALTH_EMAIL_SMTP_HOST }}
+          UK_AQ_HEALTH_EMAIL_SMTP_PORT: ${{ vars.UK_AQ_HEALTH_EMAIL_SMTP_PORT }}
+          UK_AQ_HEALTH_EMAIL_SEND_ENABLED: ${{ vars.UK_AQ_HEALTH_EMAIL_SEND_ENABLED }}
+          GOOGLE_SMTP_USERNAME: ${{ secrets.GOOGLE_SMTP_USERNAME }}
+          GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+          GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+          GOOGLE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
+        shell: bash
+        run: |
+          python3 - <<'PYCHECK'
+          import os
+          names = (
+              'UK_AQ_HEALTH_EMAIL_TO',
+              'UK_AQ_HEALTH_EMAIL_FROM',
+              'UK_AQ_HEALTH_EMAIL_SMTP_HOST',
+              'UK_AQ_HEALTH_EMAIL_SMTP_PORT',
+              'GOOGLE_SMTP_USERNAME',
+              'GOOGLE_OAUTH_CLIENT_ID',
+              'GOOGLE_OAUTH_CLIENT_SECRET',
+              'GOOGLE_OAUTH_REFRESH_TOKEN',
+          )
+          for name in names:
+              print(name + ": " + ("present" if os.environ.get(name, "").strip() else "MISSING"))
+          print("Delivery is " + (
+              "explicitly enabled" if os.environ.get('UK_AQ_HEALTH_EMAIL_SEND_ENABLED', '').lower() == 'true'
+              else "disabled (safe default)"
+          ))
+          PYCHECK
