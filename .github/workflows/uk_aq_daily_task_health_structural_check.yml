@@ -1,0 +1,41 @@
+name: UK AQ Daily Task Health Structural Check
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "scripts/daily_task_health_email.py"
+      - ".github/workflows/uk_aq_daily_task_health_email.yml"
+      - ".github/workflows/uk_aq_daily_task_health_structural_check.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Parse health email script and WHO UTC slots
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/daily_task_health_email.py
+          python3 - <<'PYCHECK'
+          import importlib.util
+          from pathlib import Path
+          path = Path('scripts/daily_task_health_email.py')
+          spec = importlib.util.spec_from_file_location('health_digest', path)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          slots = module.expected_who_slots()
+          assert len(slots) == 2, slots
+          assert slots[0].hour < 7 <= slots[1].hour < 10, slots
+          print('Python syntax and two WHO UTC windows structurally valid')
+          PYCHECK
