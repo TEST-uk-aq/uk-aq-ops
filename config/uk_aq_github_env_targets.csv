@@ -392,7 +392,6 @@ UK_AQ_MEDIA_D1_DAILY_READ_LIMIT,variable
 UK_AQ_MEDIA_D1_DAILY_WRITE_LIMIT,variable
 UK_AQ_WHO_2021_R2_PREFIX,variable
 
-# Daily Task Health Google Workspace email settings
 UK_AQ_HEALTH_EMAIL_TO,variable
 UK_AQ_HEALTH_EMAIL_FROM,variable
 UK_AQ_HEALTH_EMAIL_SMTP_HOST,variable
