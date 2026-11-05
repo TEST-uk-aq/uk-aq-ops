@@ -80,6 +80,10 @@ from integrity.current_state.audit import (
 )
 from integrity.runtime import CANONICAL_REPAIR_STAGE_ORDER
 from integrity.original_operation import ORIGINAL_INTEGRITY_CHANNEL
+from integrity.schema2_diagnostic import (
+    run_schema2_diagnostic, finish_schema2_diagnostic, diagnostic_flags,
+    run_protected_diagnostic_command,
+)
 from integrity.local_cleanup import (
     POLICY as LOCAL_CLEANUP_POLICY,
     persist_cleanup_state,
@@ -28286,10 +28290,20 @@ def run_integrity_under_global_operation_lock(
         log_path=log_path,
     )
     close_logging_handlers()
-    completed = subprocess.run(
-        command,
-        cwd=repo_root,
-        env={
+    diagnostic_workspace = None
+    if getattr(args, "schema2_read_only_diagnostic", False):
+        # This outer caller owns scratch until the holder has killed/reaped its
+        # protected group and released the lock, including abrupt child loss.
+        temporary_root = Path(env["UK_AQ_HISTORY_INTEGRITY_TMP_DIR"])
+        temporary_root.mkdir(parents=True, exist_ok=True)
+        diagnostic_workspace = tempfile.TemporaryDirectory(prefix=f"schema2-{run_compact}-", dir=temporary_root)
+        command.extend(["--schema2-diagnostic-work-root", diagnostic_workspace.name])
+    try:
+        locked_runner = run_protected_diagnostic_command if diagnostic_workspace is not None else subprocess.run
+        completed = locked_runner(
+            command,
+            cwd=repo_root,
+            env={
             **os.environ,
             **{str(key): str(value) for key, value in env.items()},
             "SUPABASE_DB_URL": database_url,
@@ -28298,9 +28312,14 @@ def run_integrity_under_global_operation_lock(
                 sort_keys=True,
                 separators=(",", ":"),
             ),
-        },
-        check=False,
-    )
+            },
+            **({} if diagnostic_workspace is not None else {"check": False}),
+        )
+        if diagnostic_workspace is not None:
+            finish_schema2_diagnostic(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, completed.returncode)
+    finally:
+        if diagnostic_workspace is not None:
+            diagnostic_workspace.cleanup()
     return int(completed.returncode)
 
 
@@ -30986,6 +31005,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="UTC scheduled logical date (YYYY-MM-DD); daily profile retries reuse this identity.",
     )
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--schema2-read-only-diagnostic", action="store_true",
+                   help="Explicit manual TEST-only Stage 2K/2L diagnostic; never APPLY or repair.")
+    p.add_argument("--diagnostic-pollutants", default="",
+                   help="Explicit nonempty pollutant subset for the schema-2 diagnostic.")
+    p.add_argument("--schema2-diagnostic-work-root", default=None, help=argparse.SUPPRESS)
     p.add_argument(
         "--check-only",
         action="store_true",
@@ -31082,6 +31106,29 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parsed = p.parse_args(argv)
+    if parsed.schema2_read_only_diagnostic:
+        if (parsed.env != "TEST" or parsed.profile != "manual" or not parsed.from_day
+                or parsed.from_day != parsed.to_day or parsed.run_backfill or parsed.dry_run
+                or parsed.check_only or parsed.force_replace_selected or parsed.repair_pollutants
+                or parsed.allow_stale_dropbox or parsed.history_version != "v3"
+                or os.environ.get("UK_AQ_HISTORY_INTEGRITY_LAUNCHD_JOB_LABEL")
+                or os.environ.get("GITHUB_ACTIONS", "").lower() == "true"):
+            p.error("schema2 diagnostic requires explicit manual TEST v3 one-day selection, without repair/dry-run/scheduler flags")
+        try:
+            dt.date.fromisoformat(parsed.from_day)
+            parsed.diagnostic_pollutants = _parse_repair_pollutants_arg(parsed.diagnostic_pollutants)
+        except ValueError as exc:
+            p.error(str(exc))
+        if not parsed.diagnostic_pollutants:
+            p.error("schema2 diagnostic requires --diagnostic-pollutants")
+        if parsed.max_runtime_minutes is None:
+            parsed.max_runtime_minutes = 5
+        if not 1 <= parsed.max_runtime_minutes <= 30:
+            p.error("schema2 diagnostic runtime must be 1..30 minutes")
+        if parsed.schema2_diagnostic_work_root and ORIGINAL_INTEGRITY_CHANNEL.metadata is None:
+            p.error("schema2 diagnostic workspace is internal to the protected invocation")
+    elif parsed.diagnostic_pollutants or parsed.schema2_diagnostic_work_root:
+        p.error("diagnostic-only arguments require --schema2-read-only-diagnostic")
     if parsed.logical_run_date:
         try:
             dt.date.fromisoformat(parsed.logical_run_date)
@@ -31152,9 +31199,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def resolve_effective_mode(args: argparse.Namespace) -> Literal[
-    "check_only", "repair_dry_run", "repair_apply"
+    "check_only", "repair_dry_run", "repair_apply", "schema2_diagnostic"
 ]:
     """Map the compatible CLI flags onto the three Integrity modes."""
+    if getattr(args, "schema2_read_only_diagnostic", False):
+        return "schema2_diagnostic"
     if args.run_backfill:
         return "repair_dry_run" if args.dry_run else "repair_apply"
     return "check_only"
@@ -34243,6 +34292,12 @@ def write_reports(
     summary: dict[str, Any],
     *, atomic_refresh: bool = False,
 ) -> tuple[Path, Path]:
+    if summary.get("effective_mode") == "schema2_diagnostic":
+        # Precondition failures remain diagnostic-only too. Normal report and
+        # schema-1 mutation semantics are unchanged.
+        summary = {**summary, **diagnostic_flags(),
+                   "original_session_continuity_lost": None,
+                   "original_session_continuity": "not_asserted_precondition_failed"}
     Path(report_dir).mkdir(parents=True, exist_ok=True)
     json_path = Path(report_dir) / f"{run_compact}-summary.json"
     md_path = Path(report_dir) / f"{run_compact}-summary.md"
@@ -34685,6 +34740,16 @@ def main(argv: list[str]) -> int:
         }
         write_reports(env["UK_AQ_HISTORY_INTEGRITY_REPORT_DIR"], run_compact, summary)
         return 2
+
+    if getattr(args, "schema2_read_only_diagnostic", False):
+        # A separate return path before normal source/planning/SQLite/repair.
+        # No preparation can enter executable APPLY through this invocation.
+        return run_schema2_diagnostic(
+            args=args, env=env, run_compact=run_compact, dropbox_root=dropbox_root,
+            dropbox_currentness=dropbox_currentness, ingest_boundary=ingest_boundary,
+            global_operation_lock=global_operation_lock, original_channel=ORIGINAL_INTEGRITY_CHANNEL,
+            repo_root=_repo_root_for_integrity_script(env), started_mono=started_mono, log=log,
+        )
 
     # Only after the request-wide boundary and backup readiness pass may
     # normal Dropbox inspection and mutable local run state begin.
