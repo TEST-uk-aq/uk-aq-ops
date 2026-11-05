@@ -44,8 +44,6 @@ jobs:
         env:
           UK_AQ_HEALTH_EMAIL_TO: ${{ vars.UK_AQ_HEALTH_EMAIL_TO }}
           UK_AQ_HEALTH_EMAIL_FROM: ${{ vars.UK_AQ_HEALTH_EMAIL_FROM }}
-          UK_AQ_HEALTH_EMAIL_SMTP_HOST: ${{ vars.UK_AQ_HEALTH_EMAIL_SMTP_HOST }}
-          UK_AQ_HEALTH_EMAIL_SMTP_PORT: ${{ vars.UK_AQ_HEALTH_EMAIL_SMTP_PORT }}
           UK_AQ_HEALTH_EMAIL_SEND_ENABLED: ${{ vars.UK_AQ_HEALTH_EMAIL_SEND_ENABLED }}
           GOOGLE_SMTP_USERNAME: ${{ secrets.GOOGLE_SMTP_USERNAME }}
           GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
@@ -58,8 +56,6 @@ jobs:
           names = (
               'UK_AQ_HEALTH_EMAIL_TO',
               'UK_AQ_HEALTH_EMAIL_FROM',
-              'UK_AQ_HEALTH_EMAIL_SMTP_HOST',
-              'UK_AQ_HEALTH_EMAIL_SMTP_PORT',
               'GOOGLE_SMTP_USERNAME',
               'GOOGLE_OAUTH_CLIENT_ID',
               'GOOGLE_OAUTH_CLIENT_SECRET',
