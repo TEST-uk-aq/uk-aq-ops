@@ -4,6 +4,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
+import { OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV as LOCK_ENV, observationsGlobalOperationLockIdentity,
+  observationsGlobalOperationLockContext } from "../../../workers/shared/uk_aq_r2_history_writer.mjs";
+import { serveIntegrityAssertions, INTEGRITY_CHANNEL_ENV } from "../../operations/lib/uk_aq_integrity_original_operation.mjs";
 import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
 import { buildObservationHistoryV3SteadyStatePartition } from "../../../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
 import { buildHistoryV2ConnectorManifest, buildHistoryV2DayManifest } from "../../../workers/shared/uk_aq_r2_history_canonical.mjs";
@@ -17,6 +23,7 @@ import { prepareSchema2PreparationV1, validateSchema2PreparationV1,
   SCHEMA2_PREPARATION_FREEZE_V1, SCHEMA2_PREPARATION_FINGERPRINT_V1,
 } from "../lib/schema2_preparation.mjs";
 import { SCHEMA2_PREPARATION_LIMITS } from "../lib/schema2_preparation_resources.mjs";
+import { admitSchema2CurrentObjectsV1 } from "../lib/schema2_current_object_admission.mjs";
 
 const base = "history/v3/observations", day = "2026-10-10";
 const rootKey = `${base}/_manifests/manifest.json`;
@@ -187,6 +194,162 @@ test("complete source-authenticated replacement retains prior identity and canno
   await assert.rejects(() => validateSchema2PreparationV1(f.request), /ENOENT|missing|local|identity/);
   const mutated = Buffer.from(original); mutated[4] ^= 1; fs.writeFileSync(local, mutated);
   await assert.rejects(() => validateSchema2PreparationV1(f.request), /changed body|identity/);
+});
+
+// Stage 2L checks reuse these real preparation/physical fixtures. Only remote
+// R2 and PostgreSQL ownership are substituted. The production original-session
+// client and server framing run over an actual inherited descriptor; this is
+// structural evidence, not real PostgreSQL continuity or TEST acceptance.
+async function admissionFixture(t, changed = false) {
+  const f = fixture(t, 10, true);
+  if (changed) installCompleteOverlay(f, fixture(t, 50, true));
+  const lock = observationsGlobalOperationLockIdentity(), nonce = randomUUID();
+  f.env = { ...process.env, [LOCK_ENV.held]: "true", [LOCK_ENV.acquired]: "true", [LOCK_ENV.owner]: "integrity",
+    [LOCK_ENV.runId]: f.request.runState.run_id, [LOCK_ENV.logicalIdentity]: lock.logical_identity,
+    [LOCK_ENV.classId]: String(lock.class_id), [LOCK_ENV.objectId]: String(lock.object_id),
+    [LOCK_ENV.nonce]: nonce, [LOCK_ENV.waitMs]: "0", [LOCK_ENV.outcome]: "held" };
+  f.request.runState.observations_global_operation_lock = observationsGlobalOperationLockContext({ env: f.env });
+  f.preparation = await prepareSchema2PreparationV1(f.request);
+  f.remote = new Map(f.bodies);
+  for (const hierarchy of [f.hierarchy, f.retainedHierarchy]) {
+    for (const artifact of hierarchy.publication_objects) f.remote.set(artifact.key, Buffer.from(artifact.body));
+  }
+  return f;
+}
+
+async function runAdmissionChild(f, { fault = null, loseAt = null, channel = true, phase = "APPLY" } = {}) {
+  const binding = { owner: "integrity", run_id: f.request.runState.run_id,
+    nonce: f.env[LOCK_ENV.nonce], session_pid: 71, operation_lifetime: randomUUID() };
+  const script = `
+    import fs from 'node:fs';
+    import { admitSchema2CurrentObjectsV1 } from './scripts/backup_r2/lib/schema2_current_object_admission.mjs';
+    import { integrityOriginalOperationForApply, assertOriginalIntegrityOperationHeld } from './scripts/operations/lib/uk_aq_integrity_original_operation.mjs';
+    process.on('SIGTERM', () => {}); // Let a cancelled check report its diagnostics.
+    const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+    const remote = new Map(input.remote.map(([key, body]) => [key, Buffer.from(body, 'base64')]));
+    const counts = new Map(); let writes = 0, gets = 0;
+    const before = JSON.stringify(input.request);
+    const r2 = { adapter: {
+      async getObjectBounded({ key, max_bytes, accept_encoding_identity }) {
+        gets++; counts.set(key, (counts.get(key) || 0) + 1);
+        if (!accept_encoding_identity) throw new Error('identity encoding required');
+        let body = remote.get(key), etag = '"current-' + key + '"';
+        if (input.fault === 'missing_leaf' && key.includes('/_exact_v2/')) throw Object.assign(new Error('missing current leaf'), { status: 404 });
+        if (input.fault === 'changed_current' && gets === 1) { body = Buffer.from(body); body[0] ^= 1; }
+        if (input.fault === 'weak_selector' && key === input.selector) etag = 'W/"weak"';
+        if (input.fault === 'changed_recheck' && key === input.selector && counts.get(key) === 2) etag = '"different"';
+        if (input.fault === 'local_tamper' && gets === 1) fs.appendFileSync(input.localBody, ' ');
+        if (input.fault === 'mutate_caller' && gets === 1) input.request.runState.run_id = 'swapped';
+        if (!body || body.length > max_bytes) throw new Error('bounded current object unavailable');
+        return { body, bytes: body.length, etag };
+      },
+      putObject() { writes++; throw new Error('unexpected write'); },
+      deleteObjects() { writes++; throw new Error('unexpected delete'); },
+    } };
+    let output;
+    try {
+      const report = await admitSchema2CurrentObjectsV1({ request: input.request, phase: input.phase, r2 });
+      output = { report, gets, writes, unchanged: before === JSON.stringify(input.request),
+        diagnosticFrozen: Object.isFrozen(report.authenticated_objects[0]) && Object.isFrozen(report.selectors[0].frozen_proposed) };
+      await integrityOriginalOperationForApply({ expectedRunId: report.original_session.run_id }).complete();
+    } catch (error) {
+      let permanentlyLost = false;
+      try { await assertOriginalIntegrityOperationHeld({ expectedRunId: input.request.runState.run_id }); }
+      catch { permanentlyLost = true; }
+      output = { blocked: true, error: error.message, gets, writes, permanentlyLost };
+    }
+    // Production cancellation terminates this child. Our SIGTERM handler only
+    // keeps it alive long enough to report permanent rejection to the parent.
+    process.stdout.write(JSON.stringify(output) + '\\n', () => process.exit(0));
+  `;
+  const childEnv = { ...f.env };
+  delete childEnv[INTEGRITY_CHANNEL_ENV];
+  if (channel) childEnv[INTEGRITY_CHANNEL_ENV] = JSON.stringify({ fd: 3, binding });
+  const child = spawn(process.execPath, ["--import", "./tests/jsongen_test_environment.mjs", "--input-type=module", "-e", script],
+    { cwd: process.cwd(), env: childEnv, stdio: ["pipe", "pipe", "pipe", "pipe"] });
+  let stdout = "", stderr = "", wire = "", assertions = 0;
+  child.stdout.on("data", chunk => { stdout += chunk; }); child.stderr.on("data", chunk => { stderr += chunk; });
+  const owner = new EventEmitter(); owner.connected = true;
+  owner.send = (message, callback) => child.stdio[3].write(`${JSON.stringify(message)}\n`, callback);
+  child.stdio[3].on("error", () => {});
+  const stop = serveIntegrityAssertions({ channel: owner, binding,
+    assertOwned: async () => {
+      if (++assertions === loseAt) throw new Error("injected original ownership loss");
+      return 71;
+    }, onFailure: () => child.stdio[3].destroy() });
+  child.stdio[3].on("data", chunk => {
+    wire += chunk;
+    for (;;) {
+      const end = wire.indexOf("\n"); if (end < 0) break;
+      const frame = wire.slice(0, end); wire = wire.slice(end + 1);
+      owner.emit("message", JSON.parse(frame));
+    }
+  });
+  const timer = setTimeout(() => child.kill("SIGKILL"), 15000);
+  const ended = new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code, signal) => { clearTimeout(timer); stop();
+      if (code !== 0) reject(new Error(`admission child ${code}/${signal}: ${stderr} ${stdout}`));
+      else { try { resolve({ ...JSON.parse(stdout), assertions }); } catch (e) { reject(e); } }
+    });
+  });
+  child.stdin.end(JSON.stringify({ request: f.request, remote: [...f.remote].map(([key, body]) => [key, body.toString("base64")]),
+    fault, phase, selector: f.hierarchy.scoped_manifest.key,
+    localBody: path.join(f.runRoot, f.preparation.inventory[0].body_ref.relative_path) }));
+  return await ended;
+}
+
+test("Stage 2L authenticates complete fresh mixed-format prior closure, distinct proposed bytes and original descriptor assertions", async t => {
+  const f = await admissionFixture(t, true), result = await runAdmissionChild(f);
+  assert.equal(result.report?.state, "authenticated_read_only_diagnostic", JSON.stringify(result));
+  assert.equal(result.gets, 2 * f.remote.size);
+  assert.equal(result.assertions, 4 * f.remote.size + 2 * f.preparation.outcomes.length + 2);
+  assert.equal(result.report.original_session.session_pid, 71);
+  assert.equal(result.report.repair_apply_eligible, false);
+  assert.equal(result.report.publication_eligible, false);
+  assert.equal(result.report.reusable_currentness, false);
+  assert.equal(result.report.current_object_authority, null);
+  assert.equal(result.report.evidence_scope, "completed_call_only");
+  assert.deepEqual(result.report.preparation_fingerprint, f.preparation.fingerprint);
+  assert.notEqual(result.report.selectors[0].current_predecessor.sha256, result.report.selectors[0].frozen_proposed.sha256);
+  assert.equal(result.report.selectors[0].current_predecessor.sha256, f.hierarchy.scoped_manifest.sha256);
+  assert.ok(result.report.authenticated_objects.some(o => o.key.includes("/_aligned/")));
+  assert.ok(result.report.authenticated_objects.some(o => o.key.includes("/_exact_v2/")));
+  assert.deepEqual(result.report.authenticated_objects.map(o => o.key).sort(), [...f.remote.keys()].sort());
+  assert.equal(result.unchanged, true); assert.equal(result.writes, 0);
+  assert.equal(result.diagnosticFrozen, true);
+  const mutatedCaller = await runAdmissionChild(f, { fault: "mutate_caller" });
+  assert.equal(mutatedCaller.report?.original_session.run_id, f.request.runState.run_id);
+  assert.deepEqual(mutatedCaller.report?.preparation_fingerprint, f.preparation.fingerprint);
+  assert.equal(mutatedCaller.writes, 0);
+});
+
+test("Stage 2L current drift, weak selector ETag, missing leaf, recheck ETag drift and local tamper permanently reject without writes", async t => {
+  for (const fault of ["changed_current", "weak_selector", "missing_leaf", "changed_recheck", "local_tamper"]) {
+    const result = await runAdmissionChild(await admissionFixture(t), { fault });
+    assert.equal(result.blocked, true, `${fault}: ${JSON.stringify(result)}`);
+    assert.equal(result.permanentlyLost, true, fault);
+    assert.equal(result.writes, 0, fault);
+    assert.ok(result.gets > 0, fault);
+  }
+});
+
+test("Stage 2L context-only/non-APPLY inputs cannot read; ownership loss before/after reads and at final admission cannot succeed", async t => {
+  const f = await admissionFixture(t);
+  for (const options of [{ channel: false }, { phase: "PROPOSE" }, { loseAt: 2 }, { loseAt: 3 },
+    { loseAt: 4 * f.remote.size + 2 * f.preparation.outcomes.length + 2 }]) {
+    const result = await runAdmissionChild(f, options);
+    assert.equal(result.blocked, true, JSON.stringify({ options, result }));
+    assert.equal(result.writes, 0);
+    if (!options.loseAt || options.loseAt === 2) assert.equal(result.gets, 0);
+    if (options.loseAt) assert.equal(result.permanentlyLost, true);
+  }
+});
+
+test("Stage 2L rejects hidden binary/map and sparse-array control payloads before cloning ignored run-state fields", async () => {
+  for (const extra of [new ArrayBuffer(16), new Map([["hidden", new Uint8Array(16)]]), new Array(1000000)]) {
+    await assert.rejects(() => admitSchema2CurrentObjectsV1({ phase: "APPLY", request: { runState: { extra } } }), /JSON control/);
+  }
 });
 
 test("finite affected-scope admission rejects before materialising a preparation directory", async t => {
