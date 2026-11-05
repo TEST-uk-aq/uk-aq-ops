@@ -195,8 +195,6 @@ def expected_who_slots() -> list[time]:
     try:
         manifest = tomllib.loads(SCHEDULER_MANIFEST.read_text(encoding="utf-8"))
         job = manifest["jobs"][WHO_SCHEDULER_JOB]
-        if job.get("enabled") is not True or job.get("dry_run") is True:
-            raise ValueError("WHO scheduling is disabled or dry-run")
         if job.get("target_type") != "github_workflow":
             raise ValueError("WHO scheduler target type has changed")
         parts = str(job["cron_expr"]).split()
@@ -241,9 +239,10 @@ def build_period(day: date, start_hour: int, end_hour: int, rows: list[dict],
         seen.add(task_key)
 
     if check_missing:
-        # WHO has two canonical dispatches but just one database task definition.
-        # Match the two independent slots, not merely the presence of ANY WHO run.
-        for slot in who_slots:
+        # WHO has two canonical dispatch slots but one database task definition.
+        # A due time enables missing-run alerts even if its scheduler is disabled.
+        # Removing the due time exempts both slots, as for every other task.
+        for slot in (who_slots if time_value(definitions[WHO_TASK_KEY].get("due_time_utc")) is not None else []):
             slot_at = datetime.combine(day, slot, tzinfo=UTC)
             if not start <= slot_at < end:
                 continue
