@@ -44,6 +44,14 @@ Per-environment SMTP OAuth secrets, reusing the existing Media transport names w
 
 No Gmail connector or Gmail API is used. Outbound mail uses Google Workspace SMTP with STARTTLS and XOAUTH2. Maintain complete TEST/LIVE separation and never hard-code environment account, hostname, recipient or credential values in source. Update env-vars-master.csv and the environment-sync target mapping when provisioning these new names.
 
+## Real TEST preview evidence (5 November 2026)
+
+- [GitHub Actions run 42099301240](https://github.com/TEST-uk-aq/uk-aq-ops/actions/runs/42099301240) completed successfully. The Python syntax and two WHO UTC slot check passed, followed by a real read-only TEST Obs AQI DB preview of both emails. The script was invoked without `--send`; its logs explicitly state that no email was sent.
+- 07:00 digest, today 00:00–07:00 UTC: **0 failed, 2 warnings, 6 finished**. The warnings were Prune daily missing and Observations partition maintenance Finished with structured warnings. Yesterday 07:00–24:00 UTC: **0 failed, 0 warnings, 1 finished**.
+- 10:00 supplement, today 07:00–10:00 UTC: **0 failed, 0 warnings, 1 finished** (the second WHO 2021 daily run).
+- The one-off preview step was subsequently removed from the structural workflow to avoid reading the database on future code pushes. The structural workflow still compiles the Python file and checks both canonical WHO slots; it does not send mail.
+- No real TEST SMTP submission, inbox arrival, sender authentication, installed GitHub Action variables, 07:00/10:00 scheduler dispatch, or LIVE promotion has been accepted.
+
 ## Scheduler and acceptance (not activated)
 
 Desired **two independent central Cloudflare scheduler dispatches** at `07:00 UTC` (`report_type=morning`) and `10:00 UTC` (`report_type=supplement`), each with `send_email=true` and `trigger_mode=scheduler`. The current canonical scheduler manifest uses environment-specific repository names. Resolve that pre-existing configuration mechanism by injecting the execution environment's repository target rather than committing another hard-coded TEST/LIVE name.
