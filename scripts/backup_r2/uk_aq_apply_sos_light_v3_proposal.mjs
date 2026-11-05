@@ -5,6 +5,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { integrityOriginalOperationForApply } from "../operations/lib/uk_aq_integrity_original_operation.mjs";
 export { assertOriginalIntegrityOperationHeld } from "../operations/lib/uk_aq_integrity_original_operation.mjs";
+import { requireNoSchema2PreparationExecution } from "./lib/schema2_preparation_execution_guard.mjs";
 import {
   hasRequiredR2Config,
   r2GetObject,
@@ -56,6 +57,7 @@ export async function applyValidatedSosLightV3Proposal({
 }) {
   requireV3(env);
   const runState = JSON.parse(fs.readFileSync(runStatePath, "utf8"));
+  requireNoSchema2PreparationExecution(runState);
   if (runState.execution_path !== "sos_light") throw new Error("Fixed-v3 bridge accepts SOS-light proposals only");
   const lockRunId = String(runState?.observations_global_operation_lock?.run_id || "").trim();
   requireObservationsGlobalOperationLockContext({ env, expectedOwner: "integrity", expectedRunId: lockRunId });

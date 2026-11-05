@@ -1841,7 +1841,7 @@ function sourceEvidencePaths(runState, dayUtc, connectorId, pollutantCode) {
   };
 }
 
-export function loadImmutableSourcePartition({ runState, dayUtc, connectorId, pollutantCode }) {
+export function loadImmutableSourcePartition({ runState, dayUtc, connectorId, pollutantCode, readSourceBody = fs.readFileSync }) {
   const {
     evidencePath,
     rowsPath,
@@ -1850,8 +1850,8 @@ export function loadImmutableSourcePartition({ runState, dayUtc, connectorId, po
     retainedEvidenceSha256,
     retainedRowsSha256,
   } = sourceEvidencePaths(runState, dayUtc, connectorId, pollutantCode);
-  const evidenceBody = fs.readFileSync(evidencePath);
-  const rowsBody = fs.readFileSync(rowsPath);
+  const evidenceBody = readSourceBody(evidencePath);
+  const rowsBody = readSourceBody(rowsPath);
   if (pollutantScoped && (
     sha256Hex(evidenceBody) !== retainedEvidenceSha256
     || sha256Hex(rowsBody) !== retainedRowsSha256
@@ -1966,7 +1966,7 @@ export function loadImmutableSourcePartition({ runState, dayUtc, connectorId, po
   let finalTargetTimeseriesRowCounts = timeseriesRowCounts(selectedRows);
   if (evidence.semantic_evidence_contract === "official_rdata_semantic_evidence") {
     const preservedRowsPath = path.join(path.dirname(rowsPath), "preserved_baseline_rows.json");
-    const preservedRowsBody = fs.readFileSync(preservedRowsPath);
+    const preservedRowsBody = readSourceBody(preservedRowsPath);
     const preservedRows = JSON.parse(preservedRowsBody.toString("utf8"));
     if (!Array.isArray(preservedRows)
         || preservedRowsBody.byteLength !== Number(evidence.preserved_baseline_rows_bytes)

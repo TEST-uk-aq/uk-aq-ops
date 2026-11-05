@@ -1317,7 +1317,7 @@ export async function buildExactV3HierarchyForCatalogueEntry({
 // when a combined overlay store hides replaced objects under tombstones.
 // runState is the already accepted checkpoint/current-run source state, not a
 // newly asserted live-currentness or writer-lock capability.
-export async function prepareOfflineExactV3Reconstruction({ runState, baselineStore, scopes, repairOverlay = null }) {
+export async function prepareOfflineExactV3Reconstruction({ runState, baselineStore, scopes, repairOverlay = null, readSourceBody = fs.readFileSync }) {
   if (!Array.isArray(scopes) || !scopes.length ||
       new Set(scopes.map(scopeIdentity)).size !== scopes.length) {
     throw new Error("offline reconstruction requires explicit nonempty unique scopes");
@@ -1410,7 +1410,7 @@ export async function prepareOfflineExactV3Reconstruction({ runState, baselineSt
           throw new Error(`offline changed overlay requires independently pinned source provenance: ${sourceId}`);
         }
         const source = loadImmutableSourcePartition({ runState: state, dayUtc: scope.day_utc,
-          connectorId: scope.connector_id, pollutantCode: scope.pollutant_code });
+          connectorId: scope.connector_id, pollutantCode: scope.pollutant_code, readSourceBody });
         if (!sameJson(prepared.semantic_metadata, source.finalTargetMetadata)) {
           throw new Error(`offline repair overlay differs from immutable source evidence: ${manifestKey}`);
         }
@@ -1433,7 +1433,7 @@ export async function prepareOfflineExactV3Reconstruction({ runState, baselineSt
   }
   for (const result of results.filter(result => result.source_evidence)) {
     const source = loadImmutableSourcePartition({ runState: state, dayUtc: result.scope.day_utc,
-      connectorId: result.scope.connector_id, pollutantCode: result.scope.pollutant_code });
+      connectorId: result.scope.connector_id, pollutantCode: result.scope.pollutant_code, readSourceBody });
     if (source.evidenceSha256 !== result.source_evidence.evidence_sha256 ||
         source.rowsSha256 !== result.source_evidence.rows_sha256) {
       throw new Error(`offline immutable source evidence changed: ${result.source_evidence.identity}`);
