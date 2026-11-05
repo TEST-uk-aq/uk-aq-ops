@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 UTC = timezone.utc
 ROW_LIMIT = 1000
 REPORT_DIR = Path("tmp/daily_task_health_email")
+SMTP_RELAY_HOST = "smtp-relay.gmail.com"  # Shared Google Workspace provider host, same in TEST and LIVE
 WHO_TASK_KEY = "ops.who_2021_daily"
 WHO_SCHEDULER_JOB = "uk_aq_who_2021_daily"
 SCHEDULER_MANIFEST = Path("cloudflare/scheduler/jobs.toml")
@@ -404,12 +405,6 @@ def send(subject: str, plain: str, body: str, report_day: date, report_type: str
     sender = valid_mailbox(require_env("UK_AQ_HEALTH_EMAIL_FROM"), "UK_AQ_HEALTH_EMAIL_FROM")
     recipient = valid_mailbox(require_env("UK_AQ_HEALTH_EMAIL_TO"), "UK_AQ_HEALTH_EMAIL_TO")
     username = valid_mailbox(require_env("GOOGLE_SMTP_USERNAME"), "GOOGLE_SMTP_USERNAME")
-    host = require_env("UK_AQ_HEALTH_EMAIL_SMTP_HOST")
-    if not re.fullmatch(r"[A-Za-z0-9.-]+", host):
-        raise ValueError("Invalid SMTP hostname")
-    port = int(os.environ.get("UK_AQ_HEALTH_EMAIL_SMTP_PORT", "587"))
-    if port != 587:
-        raise ValueError("Only STARTTLS on port 587 is supported")
     token = oauth_token()
     msg = EmailMessage()
     msg["From"] = formataddr(("UK AQ Daily Task Health", sender))
@@ -421,7 +416,7 @@ def send(subject: str, plain: str, body: str, report_day: date, report_type: str
     msg.set_content(plain)
     msg.add_alternative(body, subtype="html")
     try:
-        with smtplib.SMTP(host=host, port=port, timeout=35) as connection:
+        with smtplib.SMTP(host=SMTP_RELAY_HOST, port=587, timeout=35) as connection:
             connection.ehlo()
             if not connection.has_extn("starttls"):
                 raise RuntimeError("SMTP STARTTLS is unavailable")
