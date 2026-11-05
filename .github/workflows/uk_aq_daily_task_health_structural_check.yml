@@ -39,3 +39,35 @@ jobs:
           assert slots[0].hour < 7 <= slots[1].hour < 10, slots
           print('Python syntax and two WHO UTC windows structurally valid')
           PYCHECK
+
+  preview:
+    needs: syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
+      OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
+      UK_AQ_OPS_SCHEMA: ${{ vars.UK_AQ_OPS_SCHEMA || 'uk_aq_ops' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Read real TEST records and render both reports without sending
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/daily_task_health_email.py --report-type morning
+          mkdir -p tmp/daily_task_health_email_preview/morning
+          cp tmp/daily_task_health_email/report.* tmp/daily_task_health_email_preview/morning/
+          python3 scripts/daily_task_health_email.py --report-type supplement
+          mkdir -p tmp/daily_task_health_email_preview/supplement
+          cp tmp/daily_task_health_email/report.* tmp/daily_task_health_email_preview/supplement/
+      - name: Retain private preview artefacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: uk-aq-health-email-two-window-test-preview
+          path: tmp/daily_task_health_email_preview/
+          if-no-files-found: error
+          retention-days: 2
+
