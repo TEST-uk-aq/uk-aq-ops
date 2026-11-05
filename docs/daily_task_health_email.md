@@ -32,8 +32,6 @@ Existing: OBS_AQIDB_SUPABASE_URL (variable), OBS_AQIDB_SECRET_KEY (secret); opti
 New per-environment variables:
 - UK_AQ_HEALTH_EMAIL_TO: the single approved recipient.
 - UK_AQ_HEALTH_EMAIL_FROM: authorised Google Workspace sender mailbox.
-- UK_AQ_HEALTH_EMAIL_SMTP_HOST: authorised SMTP relay hostname.
-- UK_AQ_HEALTH_EMAIL_SMTP_PORT: 587.
 - UK_AQ_HEALTH_EMAIL_SEND_ENABLED: false until a real TEST send is approved; true only after provisioning.
 
 
@@ -43,14 +41,13 @@ Per-environment SMTP authentication secrets, using the existing Media naming con
 - GOOGLE_OAUTH_CLIENT_SECRET
 - GOOGLE_OAUTH_REFRESH_TOKEN (Google SMTP mail scope)
 
-No Gmail connector or Gmail API is used. Outbound mail uses Google Workspace SMTP with STARTTLS and XOAUTH2. Maintain complete TEST/LIVE separation and never hard-code environment account, hostname, recipient or credential values in source. Update env-vars-master.csv and the environment-sync target mapping when provisioning these new names.
+No Gmail connector or Gmail API is used. Outbound mail uses Google Workspace SMTP with STARTTLS and XOAUTH2. As with UK AQ Media, the Google provider relay `smtp-relay.gmail.com:587` is fixed in the shared application code because it does not vary between TEST and LIVE. Keep environment-specific service URLs, credentials, sender and recipient outside source, with no TEST/LIVE cross-environment fallback. Update env-vars-master.csv and the environment-sync target mapping when provisioning these new names.
 
 ## Approved TEST identities and settings (GitHub variables, not code)
 
 - UK_AQ_HEALTH_EMAIL_TO = mikehinford@hotmail.com
 - UK_AQ_HEALTH_EMAIL_FROM = daily-task-health@ukaq.co.uk
-- UK_AQ_HEALTH_EMAIL_SMTP_HOST = smtp-relay.gmail.com
-- UK_AQ_HEALTH_EMAIL_SMTP_PORT = 587
+- Google Workspace SMTP relay = `smtp-relay.gmail.com:587`, fixed in the shared code, with no extra GitHub Actions variables required.
 - UK_AQ_HEALTH_EMAIL_SEND_ENABLED = false until an explicitly authorised TEST email submission.
 
 The Google Admin SMTP relay is already configured for **Only addresses in my domains**, **Require SMTP Authentication**, and **Require TLS encryption**. The above From address does not require a separate Workspace mailbox. Use the same real Workspace authenticated identity as the existing Media email transport through GOOGLE_SMTP_USERNAME; its OAuth client and refresh-token credentials are held as secrets and must never be pasted into chat or committed.
