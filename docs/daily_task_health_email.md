@@ -35,14 +35,29 @@ New per-environment variables:
 - UK_AQ_HEALTH_EMAIL_SMTP_HOST: authorised SMTP relay hostname.
 - UK_AQ_HEALTH_EMAIL_SMTP_PORT: 587.
 - UK_AQ_HEALTH_EMAIL_SEND_ENABLED: false until a real TEST send is approved; true only after provisioning.
-- GOOGLE_SMTP_USERNAME: authenticated Google Workspace mailbox.
 
-Per-environment SMTP OAuth secrets, reusing the existing Media transport names where semantics match:
+
+Per-environment SMTP authentication secrets, using the existing Media naming convention:
+- `GOOGLE_SMTP_USERNAME` is a **GitHub Actions secret**, using the same name/classification as UK AQ Media. It is the authenticated licensed Workspace account, NOT the unregistered From address.
 - GOOGLE_OAUTH_CLIENT_ID
 - GOOGLE_OAUTH_CLIENT_SECRET
 - GOOGLE_OAUTH_REFRESH_TOKEN (Google SMTP mail scope)
 
 No Gmail connector or Gmail API is used. Outbound mail uses Google Workspace SMTP with STARTTLS and XOAUTH2. Maintain complete TEST/LIVE separation and never hard-code environment account, hostname, recipient or credential values in source. Update env-vars-master.csv and the environment-sync target mapping when provisioning these new names.
+
+## Approved TEST identities and settings (GitHub variables, not code)
+
+- UK_AQ_HEALTH_EMAIL_TO = mikehinford@hotmail.com
+- UK_AQ_HEALTH_EMAIL_FROM = daily-task-health@ukaq.co.uk
+- UK_AQ_HEALTH_EMAIL_SMTP_HOST = smtp-relay.gmail.com
+- UK_AQ_HEALTH_EMAIL_SMTP_PORT = 587
+- UK_AQ_HEALTH_EMAIL_SEND_ENABLED = false until an explicitly authorised TEST email submission.
+
+The Google Admin SMTP relay is already configured for **Only addresses in my domains**, **Require SMTP Authentication**, and **Require TLS encryption**. The above From address does not require a separate Workspace mailbox. Use the same real Workspace authenticated identity as the existing Media email transport through GOOGLE_SMTP_USERNAME; its OAuth client and refresh-token credentials are held as secrets and must never be pasted into chat or committed.
+
+Until credentials are supplied, GitHub's contents API cannot configure repository Actions variables/secrets. An authorised operator can enter the non-secret variables in the Ops repository's Settings > Secrets and variables > Actions > Variables. For secrets, use the corresponding Secrets tab, or existing organisation-level Actions secrets granted explicitly to this TEST repository. Do not share LIVE secrets with TEST or copy credential values through source files.
+
+The TEST sender and recipient are deployment-specific values only. No source file should contain these addresses.
 
 ## Real TEST preview evidence (5 November 2026)
 
