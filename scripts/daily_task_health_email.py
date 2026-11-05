@@ -349,16 +349,15 @@ def counts(period: dict) -> tuple[int, int, int]:
 def render(report_day: date, periods: list[dict], report_type: str) -> tuple[str, str, str]:
     failures, warnings, finished = counts(periods[0])
     dispatch_hour = "07:00" if report_type == "morning" else "10:00"
-    flavour = "Daily digest" if report_type == "morning" else "Morning supplement"
     subject = (f"UK AQ Daily Health | {format_date(report_day)} {dispatch_hour} UTC | "
                f"{failures} failed, {warnings} warnings, {finished} finished")
-    header = f"UK AQ Daily Task Health: {flavour}\nAll dates and times UTC.\n"
+    header = "UK AQ Daily Task Health\nAll dates and times UTC.\n"
     plain = header + "\n\n" + "\n\n".join(plain_period(p) for p in periods)
     body = (
         '<!doctype html><html><body style="margin:0;padding:18px;background:#f5f5f5;'
         'font-family:Arial,Helvetica,sans-serif;color:#111827">'
         '<main style="max-width:680px;margin:auto;background:#fff;padding:22px">'
-        f'<h1 style="font-size:24px;margin:0 0 6px">UK AQ {flavour}</h1>'
+        '<h1 style="font-size:24px;margin:0 0 6px">UK AQ Daily Task Health</h1>'
         '<p style="color:#4b5563;margin:0">All dates and times UTC.</p>'
         + "".join(html_period(p) for p in periods)
         + '<p style="font-size:12px;color:#6b7280">Generated from UK AQ Daily Task Health records.</p>'
