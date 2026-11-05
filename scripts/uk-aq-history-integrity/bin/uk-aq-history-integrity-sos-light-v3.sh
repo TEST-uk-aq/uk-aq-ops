@@ -304,8 +304,20 @@ remove_ignored_macos_metadata() {
   printf '%s\n' "${removed}"
 }
 
-IGNORED_MACOS_METADATA_REMOVED="$(remove_ignored_macos_metadata "${R2_ROOT}")"
-echo "Integrity preflight removed ${IGNORED_MACOS_METADATA_REMOVED} ignored macOS metadata files from ${R2_ROOT}"
+HAS_SCHEMA2_READ_ONLY_DIAGNOSTIC=false
+for arg in "${REMAINING_ARGS[@]}"; do
+  if [[ "${arg}" == "--schema2-read-only-diagnostic" ]]; then
+    HAS_SCHEMA2_READ_ONLY_DIAGNOSTIC=true
+    break
+  fi
+done
+
+if [[ "${ENV_NAME}" == "TEST" && "${HAS_SCHEMA2_READ_ONLY_DIAGNOSTIC}" == true ]]; then
+  echo "Integrity preflight skipped macOS metadata cleanup for TEST schema-2 read-only diagnostic"
+else
+  IGNORED_MACOS_METADATA_REMOVED="$(remove_ignored_macos_metadata "${R2_ROOT}")"
+  echo "Integrity preflight removed ${IGNORED_MACOS_METADATA_REMOVED} ignored macOS metadata files from ${R2_ROOT}"
+fi
 
 HAS_CHECK_ONLY=false
 HAS_RUN_BACKFILL=false
