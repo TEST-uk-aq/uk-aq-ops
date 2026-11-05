@@ -26,6 +26,14 @@ REPORT_DIR = Path("tmp/daily_task_health_email")
 SMTP_RELAY_HOST = "smtp-relay.gmail.com"  # Shared Google Workspace provider host, same in TEST and LIVE
 WHO_TASK_KEY = "ops.who_2021_daily"
 WHO_SCHEDULER_JOB = "uk_aq_who_2021_daily"
+SCHEDULED_TASK_JOBS = {
+    "ops.supabase_db_dump_backup": "uk_aq_supabase_db_dump_backup",
+    "ops.prune_daily": "uk_aq_prune_daily",
+    "ops.observs_partition_maintenance": "uk_aq_observs_partition_maintenance",
+    "ops.r2_core_snapshot": "uk_aq_r2_core_snapshot",
+    "ops.r2_history_dropbox_backup": "uk_aq_r2_history_dropbox_backup",
+    "ops.dropbox_prune_raw": "uk_aq_dropbox_prune_raw",
+}
 SCHEDULER_MANIFEST = Path("cloudflare/scheduler/jobs.toml")
 MAILBOX = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_\x60{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
@@ -219,8 +227,27 @@ def expected_who_slots() -> list[time]:
         raise RuntimeError("Invalid or unavailable canonical WHO 2021 schedule") from None
 
 
+def active_scheduler_jobs() -> dict[str, bool]:
+    """Only an enabled configured dispatch creates a missing-run expectation.
+
+    Health registry entries can stay active while their scheduler jobs are
+    deliberately disabled. Manual runs of those tasks still appear normally.
+    """
+    try:
+        jobs = tomllib.loads(SCHEDULER_MANIFEST.read_text(encoding="utf-8"))["jobs"]
+        result = {}
+        for task_key, job_name in SCHEDULED_TASK_JOBS.items():
+            job = jobs[job_name]
+            if not isinstance(job, dict) or job.get("target_type") != "github_workflow":
+                raise ValueError(f"Invalid scheduler job for {task_key}")
+            result[task_key] = job.get("enabled") is True and job.get("dry_run") is not True
+        return result
+    except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError, ValueError):
+        raise RuntimeError("Unable to resolve canonical daily task scheduler activation") from None
+
+
 def build_period(day: date, start_hour: int, end_hour: int, rows: list[dict],
-                 definitions: dict[str, dict], who_slots: list[time], *,
+                 definitions: dict[str, dict], who_slots: list[time], scheduler_active: dict[str, bool], *,
                  check_missing: bool, label: str) -> dict:
     start = datetime.combine(day, time(start_hour, 0), tzinfo=UTC)
     end = (datetime.combine(day + timedelta(days=1), time(0, 0), tzinfo=UTC)
@@ -250,8 +277,8 @@ def build_period(day: date, start_hour: int, end_hour: int, rows: list[dict],
             if any(task_key == WHO_TASK_KEY and slot_at <= instant < end
                    for instant, _, task_key in selected):
                 continue
-            groups["warnings"].append({
-                "group": "warnings", "status": "Missing",
+            groups["failed"].append({
+                "group": "failed", "status": "Missing",
                 "task": clean(definitions[WHO_TASK_KEY].get("task_name") or WHO_TASK_KEY, 120),
                 "time": f"expected {slot.strftime('%H:%M')} UTC",
                 "detail": "No recorded WHO 2021 run starting after this scheduled dispatch and before the report cutoff",
@@ -265,14 +292,17 @@ def build_period(day: date, start_hour: int, end_hour: int, rows: list[dict],
                 continue
             if not definition.get("include_in_daily_check"):
                 continue
+            if not scheduler_active.get(task_key, True):
+                # No synthetic failure for intentionally disabled dispatches.
+                continue
             due = time_value(definition.get("due_time_utc"))
             scheduled = time_value(definition.get("scheduled_time_utc"))
             if (due is None or scheduled is None
                     or not time(start_hour, 0) <= scheduled < time(end_hour, 0)
                     or not time(start_hour, 0) <= due < time(end_hour, 0)):
                 continue
-            groups["warnings"].append({
-                "group": "warnings", "status": "Missing",
+            groups["failed"].append({
+                "group": "failed", "status": "Missing",
                 "task": clean(definition.get("task_name") or task_key, 120),
                 "time": f"due {due.strftime('%H:%M')} UTC",
                 "detail": (f"No recorded run in the {start_hour:02d}:00–"
@@ -459,6 +489,7 @@ def main() -> int:
     if WHO_TASK_KEY not in definitions or not definitions[WHO_TASK_KEY].get("include_in_daily_check"):
         raise RuntimeError("WHO 2021 daily task is not configured for email and daily health checking")
     who_slots = expected_who_slots()
+    scheduler_active = active_scheduler_jobs()
 
     query = {
         "select": "run_id,task_key,task_name,scheduled_for_date,scheduled_at_utc,raw_status,started_at,finished_at,failed_at,summary,error_message,log_url,attempt",
@@ -473,12 +504,12 @@ def main() -> int:
             **query, "scheduled_for_date": f"eq.{previous_day.isoformat()}"
         })
         periods.append(build_period(report_day, 0, 7, today_rows, definitions,
-                                    who_slots, check_missing=True, label="Today"))
+                                    who_slots, scheduler_active, check_missing=True, label="Today"))
         periods.append(build_period(previous_day, 7, 24, yesterday_rows, definitions,
-                                    who_slots, check_missing=False, label="Yesterday"))
+                                    who_slots, scheduler_active, check_missing=False, label="Yesterday"))
     else:
         periods.append(build_period(report_day, 7, 10, today_rows, definitions,
-                                    who_slots, check_missing=True, label="Today"))
+                                    who_slots, scheduler_active, check_missing=True, label="Today"))
 
     subject, plain, body = render(report_day, periods, args.report_type)
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
