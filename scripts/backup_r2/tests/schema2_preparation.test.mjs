@@ -7,6 +7,8 @@ import test from "node:test";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
+import { fileURLToPath } from "node:url";
+import { runCommandWithObservationsGlobalOperationLock } from "../../operations/uk_aq_with_observations_global_operation_lock.mjs";
 import { OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV as LOCK_ENV, observationsGlobalOperationLockIdentity,
   observationsGlobalOperationLockContext } from "../../../workers/shared/uk_aq_r2_history_writer.mjs";
 import { serveIntegrityAssertions, INTEGRITY_CHANNEL_ENV } from "../../operations/lib/uk_aq_integrity_original_operation.mjs";
@@ -24,6 +26,7 @@ import { prepareSchema2PreparationV1, validateSchema2PreparationV1,
 } from "../lib/schema2_preparation.mjs";
 import { SCHEMA2_PREPARATION_LIMITS } from "../lib/schema2_preparation_resources.mjs";
 import { admitSchema2CurrentObjectsV1 } from "../lib/schema2_current_object_admission.mjs";
+import { prepareSchema2Diagnostic, SCHEMA2_DIAGNOSTIC_V1 } from "../lib/schema2_diagnostic.mjs";
 
 const base = "history/v3/observations", day = "2026-10-10";
 const rootKey = `${base}/_manifests/manifest.json`;
@@ -349,6 +352,136 @@ test("Stage 2L context-only/non-APPLY inputs cannot read; ownership loss before/
 test("Stage 2L rejects hidden binary/map and sparse-array control payloads before cloning ignored run-state fields", async () => {
   for (const extra of [new ArrayBuffer(16), new Map([["hidden", new Uint8Array(16)]]), new Array(1000000)]) {
     await assert.rejects(() => admitSchema2CurrentObjectsV1({ phase: "APPLY", request: { runState: { extra } } }), /JSON control/);
+  }
+});
+
+test("Stage 2M compact-latest JSON limits precede registry parsing and snapshot materialisation", async t => {
+  const f = await admissionFixture(t);
+  const key = f.request.runState.dropbox_currentness.checkpoint.observations_timeseries_latest.key;
+  const body = Buffer.from('{"unused":' + "[".repeat(33) + "0" + "]".repeat(33) + "}");
+  fs.writeFileSync(path.join(f.dropboxRoot, key), body);
+  fs.writeFileSync(path.join(f.dropboxRoot, "checkpoint.json"), "{}");
+  const checkpoint = { ...f.request.runState.dropbox_currentness.checkpoint, relative_key: "checkpoint.json", byte_size: 2,
+    sha256: sha256Hex("{}"), observations_timeseries_latest: { key, byte_size: body.length, sha256: sha256Hex(body) } };
+  const runRoot = fs.mkdtempSync(path.join(f.runRoot, "stage2m-preflight-"));
+  const seed = { contract_version: SCHEMA2_DIAGNOSTIC_V1, environment: "TEST", run_id: f.request.runState.run_id,
+    operation_nonce: f.env[LOCK_ENV.nonce], original_root: f.dropboxRoot, scopes: f.request.scopes,
+    execution_path: "generic_integrity", dropbox_currentness: { allowed: true, checkpoint_live_root_match: true,
+      lock_run_id: f.request.runState.run_id, checkpoint } };
+  await assert.rejects(() => prepareSchema2Diagnostic({ seed, runRoot,
+    env: { ...f.env, UK_AQ_R2_HISTORY_VERSION: "v3", UK_AQ_R2_HISTORY_INDEX_VERSION: "v3" } }), /JSON nesting depth/);
+  assert.equal(fs.existsSync(path.join(runRoot, "baseline")), false);
+});
+
+test("Stage 2M real protected preparation/Python handoff/admission stays read-only and tears down on success, blocked preparation, current failure and cancellation", { timeout: 60000 }, async t => {
+  const root = fileURLToPath(new URL("../../..", import.meta.url));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "stage2m-chain-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const f = fixture(t, 10, true), runCompact = "2026-11-05T160000Z", runId = `integrity:TEST:${runCompact}`;
+  const checkpointBody = Buffer.from('{"synthetic_complete_checkpoint":true}');
+  fs.writeFileSync(path.join(f.dropboxRoot, "checkpoint.json"), checkpointBody);
+  const currentness = { ...f.request.runState.dropbox_currentness, lock_run_id: runId,
+    checkpoint: { ...f.request.runState.dropbox_currentness.checkpoint, relative_key: "checkpoint.json",
+      byte_size: checkpointBody.length, sha256: sha256Hex(checkpointBody) } };
+  const remote = new Map(f.bodies);
+  for (const h of [f.hierarchy, f.retainedHierarchy]) for (const a of h.publication_objects) remote.set(a.key, Buffer.from(a.body));
+  const remotePath = path.join(dir, "remote.json");
+  fs.writeFileSync(remotePath, JSON.stringify([...remote].map(([key, body]) => [key, body.toString("base64")])));
+  const nodeShim = path.join(dir, "node-diagnostic.mjs"), pythonShim = path.join(dir, "python3");
+  const commandUrl = new URL("../uk_aq_schema2_read_only_diagnostic.mjs", import.meta.url).href;
+  fs.writeFileSync(nodeShim, `#!${process.execPath}
+import fs from 'node:fs';
+import { schema2DiagnosticMain } from ${JSON.stringify(commandUrl)};
+const mode = process.argv[3];
+fs.writeFileSync(process.env.STAGE2M_PID_PREFIX + mode + '.pid', String(process.pid));
+globalThis.fetch = () => { throw new Error('Unexpected remote request'); };
+const objects = new Map(JSON.parse(fs.readFileSync(process.env.STAGE2M_REMOTE_JSON)).map(([k,b]) => [k, Buffer.from(b,'base64')]));
+const r2 = { endpoint:'fixture', bucket:'fixture', region:'auto', access_key_id:'fixture', secret_access_key:'fixture', adapter: {
+  async getObjectBounded({key}) {
+    fs.appendFileSync(process.env.STAGE2M_READ_MARKER, key+'\\n');
+    if (process.env.STAGE2M_ACTION === 'cancel') { process.kill(process.ppid, 'SIGTERM'); await new Promise(() => {}); }
+    if (process.env.STAGE2M_ACTION === 'current_missing') throw new Error('Synthetic missing current object');
+    const body = objects.get(key); if (!body) throw new Error('Synthetic object missing');
+    return {key,body,bytes:body.length,etag:'"original-'+key+'"'};
+  },
+  putObject() { fs.writeFileSync(process.env.STAGE2M_WRITE_MARKER,'put'); throw new Error('unexpected PUT'); },
+  deleteObjects() { fs.writeFileSync(process.env.STAGE2M_WRITE_MARKER,'delete'); throw new Error('unexpected DELETE'); }
+} };
+const code = await schema2DiagnosticMain({argv:process.argv.slice(3),r2});
+process.exit(code);
+`, { mode: 0o755 });
+  const impl = path.join(root, "scripts/uk-aq-history-integrity/bin/uk-aq-history-integrity-sos-light-v3_impl.py");
+  fs.writeFileSync(pythonShim, `#!/usr/bin/env python3
+import sys, os, json, logging, time
+from pathlib import Path
+from types import SimpleNamespace
+sys.path.insert(0,str(Path(sys.argv[1]).parent))
+from integrity.original_operation import ORIGINAL_INTEGRITY_CHANNEL, CHANNEL_ENV
+from integrity.schema2_diagnostic import run_schema2_diagnostic
+assert CHANNEL_ENV not in os.environ
+data=json.loads(Path(sys.argv[2]).read_text())
+args=SimpleNamespace(schema2_read_only_diagnostic=True,env='TEST',profile='manual',source='sos',from_day='2026-10-10',
+  diagnostic_pollutants=['pm10' if os.environ['STAGE2M_ACTION']=='unsupported' else 'no2'], max_runtime_minutes=1,
+  schema2_diagnostic_work_root=data['work'])
+ctx={'valid':True,'owner':'integrity','run_id':os.environ['UK_AQ_OBSERVATIONS_GLOBAL_OPERATION_LOCK_RUN_ID']}
+code=run_schema2_diagnostic(args=args,env=os.environ,run_compact=data['compact'],dropbox_root=data['baseline'],
+ dropbox_currentness=data['currentness'],ingest_boundary={'allowed':True,'connectors':[{'connector_id':1,'allowed':True}]},
+ global_operation_lock=ctx,original_channel=ORIGINAL_INTEGRITY_CHANNEL,repo_root=Path(data['repo']),started_mono=time.monotonic(),log=logging.getLogger('test'))
+sys.exit(code)
+`, { mode: 0o755 });
+  for (const action of ["success", "unsupported", "current_missing", "cancel"]) {
+    const tmp = path.join(dir, action), reports = path.join(tmp, "reports");
+    fs.mkdirSync(reports, { recursive: true });
+    const work = fs.mkdtempSync(path.join(tmp, `schema2-${runCompact}-`));
+    const dataPath = path.join(tmp, "input.json");
+    fs.writeFileSync(dataPath, JSON.stringify({ work, compact: runCompact, baseline: f.dropboxRoot, currentness, repo: root }));
+    const sql = [], db = new EventEmitter(); let held = false;
+    db.query = async query => {
+      sql.push(query);
+      if (query.includes("pg_try_advisory_lock")) { held = true; return { rows: [{ acquired: true }] }; }
+      if (query.includes("pg_locks")) return { rows: [{ held, session_pid: 71 }] };
+      if (query.includes("pg_advisory_unlock")) { held = false; return { rows: [{ released: true }] }; }
+      return { rows: [] };
+    };
+    const writes = path.join(tmp, "writes"), reads = path.join(tmp, "reads"), pidPrefix = path.join(tmp, "child");
+    const operation = runCommandWithObservationsGlobalOperationLock({ databaseUrl: "synthetic", owner: "integrity", runId,
+      command: pythonShim, commandArgs: [impl, dataPath], heartbeatMs: 60000,
+      env: { ...process.env, UK_AQ_ENV_NAME: "TEST", UK_AQ_BACKFILL_NODE_BIN: nodeShim,
+        UK_AQ_R2_HISTORY_VERSION: "v3", UK_AQ_R2_HISTORY_INDEX_VERSION: "v3",
+        UK_AQ_HISTORY_INTEGRITY_TMP_DIR: tmp, UK_AQ_HISTORY_INTEGRITY_REPORT_DIR: reports,
+        STAGE2M_ACTION: action, STAGE2M_REMOTE_JSON: remotePath, STAGE2M_WRITE_MARKER: writes,
+        STAGE2M_READ_MARKER: reads, STAGE2M_PID_PREFIX: pidPrefix },
+      withClient: async (_url, callback) => callback(db) });
+    if (["current_missing", "cancel"].includes(action)) await assert.rejects(operation);
+    else assert.equal(await operation, action === "success" ? 0 : 2);
+    const result = JSON.parse(fs.readFileSync(path.join(reports, `${runCompact}-schema2-diagnostic.json`)));
+    assert.equal(result.repair_apply_eligible, false); assert.equal(result.publication_eligible, false);
+    assert.equal(result.repair_completed, false); assert.equal(result.writer_finalisation_completed, false);
+    assert.doesNotMatch(JSON.stringify(result), /secret_access_key|access_key_id|operation_lifetime|"nonce"|proposed_body|canonical_json/);
+    assert.equal(fs.existsSync(writes), false, action);
+    assert.equal(sql.filter(s => s.includes("pg_try_advisory_lock")).length, 1);
+    assert.equal(sql.filter(s => s.includes("pg_advisory_unlock")).length, 1);
+    if (action === "success") {
+      assert.equal(result.status, "diagnostic_authenticated", JSON.stringify(result));
+      assert.equal(result.get_count, 2 * remote.size); assert.equal(result.original_session.session_pid, 71);
+      assert.ok(result.current_objects <= 220); assert.ok(result.get_count <= 440);
+      assert.equal(result.reusable_currentness, false); assert.equal(result.original_session_continuity_lost, false);
+    } else assert.notEqual(result.status, "diagnostic_authenticated");
+    if (action === "current_missing") assert.match(result.reason, /Synthetic missing current object/);
+    if (action === "unsupported") assert.equal(fs.existsSync(reads), false);
+    for (const mode of ["--prepare-only", "--admit-only"]) {
+      const pidPath = `${pidPrefix}${mode}.pid`; if (!fs.existsSync(pidPath)) continue;
+      const pid = Number(fs.readFileSync(pidPath));
+      const running = () => {
+        try { process.kill(pid, 0); return process.platform !== "linux" || !/^State:\s+Z/m.test(fs.readFileSync(`/proc/${pid}/status`, "utf8")); }
+        catch (error) { if (!["ESRCH", "ENOENT"].includes(error.code)) throw error; return false; }
+      };
+      // Match the existing Stage 2J process check: allow the kernel's SIGKILL
+      // transition, while treating an unreaped zombie as unable to execute.
+      const deadline = Date.now() + 3000;
+      while (running() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+      assert.equal(running(), false, `${action} left ${mode} running`);
+    }
   }
 });
 

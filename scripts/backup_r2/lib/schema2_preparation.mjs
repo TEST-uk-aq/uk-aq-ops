@@ -382,7 +382,9 @@ function freeze(projection) {
 }
 function bodyDirectory(request) {
   const relative = `schema2-preparation/${request.runState.run_id}`;
-  if (!/^[a-zA-Z0-9_-]+$/.test(request.runState.run_id)) block("authority", "unsafe run ID");
+  // The retained coordinator uses integrity:TEST:<timestamp>. A colon is a
+  // safe POSIX filename character; separators and traversal remain forbidden.
+  if (!/^[a-zA-Z0-9_:-]+$/.test(request.runState.run_id)) block("authority", "unsafe run ID");
   const target = path.resolve(request.runRoot, relative);
   // Validate every existing ancestor before creating one missing component.
   let current = path.parse(target).root;
