@@ -346,26 +346,9 @@ export async function prepareObservationHistoryExactOnlyPublicationV3({
       plan, exactOnlyLifecycle: lifecycle, publicationConcurrency: 1 }),
   });
 }
-// Internal, adapter-only Prune publication. This deliberately does not call or
-// enable the hard-disabled shared schema-2 finaliser. The owning split writer
-// captures selectors BEFORE canonical writes and retains this closure only in
-// its original operation. It is not a conversion or cross-invocation recovery API.
-export function createDormantPruneExactOnlyPublicationV3({ originalOperation, r2,
-  getObject, recordDurableEvidence }) {
-  if (!r2?.adapter || typeof r2.adapter.putObjectConditional !== 'function'
-    || typeof getObject !== 'function' || typeof recordDurableEvidence !== 'function'
-    || typeof originalOperation?.assertHeld !== 'function') {
-    throw new Error('Dormant Prune publication requires isolated injected adapters and original operation');
-  }
-  let lost = false;
-  let batchLatest = null;
-  const scopes = new Map();
-  const held = async () => {
-    if (lost) throw originalOperationError('dormant publication original session lost');
-    try {
-      if (await originalOperation.assertHeld('publication') === false) throw originalOperationError('session not held');
-    } catch (error) { lost = true; throw error; }
-  };
+// Exact object IO remains bound to the owning operation through its held
+// assertion. The caller owns proof, attempt state and publication order.
+function createExactOnlyObjectPublicationV3({ held, getObject, r2 }) {
   const read = async key => {
     await held(); const object = await getObject({ key }); await held();
     const pin = snapshot(object, key);
@@ -416,6 +399,30 @@ export function createDormantPruneExactOnlyPublicationV3({ originalOperation, r2
     same(pin.etag, outcome.etag, 'conditional write readback identity');
     return pin;
   };
+  return Object.freeze({ read, exact, write });
+}
+
+// Internal, adapter-only Prune publication. This deliberately does not call or
+// enable the hard-disabled shared schema-2 finaliser. The owning split writer
+// captures selectors BEFORE canonical writes and retains this closure only in
+// its original operation. It is not a conversion or cross-invocation recovery API.
+export function createDormantPruneExactOnlyPublicationV3({ originalOperation, r2,
+  getObject, recordDurableEvidence }) {
+  if (!r2?.adapter || typeof r2.adapter.putObjectConditional !== 'function'
+    || typeof getObject !== 'function' || typeof recordDurableEvidence !== 'function'
+    || typeof originalOperation?.assertHeld !== 'function') {
+    throw new Error('Dormant Prune publication requires isolated injected adapters and original operation');
+  }
+  let lost = false;
+  let batchLatest = null;
+  const scopes = new Map();
+  const held = async () => {
+    if (lost) throw originalOperationError('dormant publication original session lost');
+    try {
+      if (await originalOperation.assertHeld('publication') === false) throw originalOperationError('session not held');
+    } catch (error) { lost = true; throw error; }
+  };
+  const { read, exact, write } = createExactOnlyObjectPublicationV3({ held, getObject, r2 });
   const verifyLeaves = async state => {
     for (const leaf of state.prepared.hierarchy.exact_leaves) {
       const current = await read(leaf.key);
