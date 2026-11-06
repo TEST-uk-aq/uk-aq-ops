@@ -19,6 +19,7 @@ import {
 } from "./uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import {
   MAX_OBSERVATION_HISTORY_INDEX_V3_PUBLICATION_CONCURRENCY,
+  assertObservationHistoryExactOnlyPublicationActiveV3,
 } from "./uk_aq_observation_history_index_v3.mjs";
 import {
   OBSERVATION_HISTORY_V3_INDEX_ROOT,
@@ -2500,10 +2501,10 @@ export function runSelectedScopeReconciliationObservationHistoryV3Writer(options
   });
 }
 /**
- * Dormant, injected-adapter surface for Stage 2C. No operational caller imports
- * this factory; native R2 configuration is rejected. Its private capability is
+ * Original-operation-owned exact-only Prune writer. Its private capability is
  * never exported or selected from configuration. The existing canonical writer
- * and full batch finaliser still own all physical and hierarchy work.
+ * and full batch finaliser still own all physical and hierarchy work. The
+ * shared inactive publication policy guards every mutating lifecycle entry.
  */
 export function createDormantPruneExactOnlyWriterV3(options) {
   options = Object.freeze({ ...options });
@@ -2512,7 +2513,8 @@ export function createDormantPruneExactOnlyWriterV3(options) {
     throw new Error('Dormant Prune writer requires its original invocation');
   }
   const publisher = createDormantPruneExactOnlyPublicationV3({ originalOperation, getObject, r2,
-    recordDurableEvidence: options.recordDurableEvidence });
+    recordDurableEvidence: options.recordDurableEvidence,
+    admitConditionalWrite: options.admitConditionalWrite });
   for (const name of ['getObject', 'headObject', 'putObject', 'putIfChanged', 'recordDurableEvidence',
     'withConnectorDayLock', 'runDayFinalizer', 'runGlobalFinalizer',
     'publishConnectorScopedCanonicalManifests', 'finalizeCanonicalDayManifests', 'finalizeCanonicalAggregateManifests']) {
@@ -2546,6 +2548,7 @@ export function createDormantPruneExactOnlyWriterV3(options) {
   });
   return Object.freeze({
     publishConnector: exclusive(async ({ partitions, sourceIdentity }) => {
+      assertObservationHistoryExactOnlyPublicationActiveV3();
       if (batchStarted) throw new Error('Cannot add a connector after batch finalisation starts');
       const inputs = structuredClone(normalizePartitionInputs(partitions));
       const rows = inputs.flatMap(p => p.rows);
@@ -2570,10 +2573,16 @@ export function createDormantPruneExactOnlyWriterV3(options) {
       const publication = await runPruneDailyObservationHistoryV3ConnectorPublication({
         ...operationOptions, partitions: inputs, [DORMANT_PRUNE_EXACT_ONLY]: ownerFor(entry),
       });
+      for (const connector of publication.connector_results) {
+        for (const prepared of connector.exact_only_prepared_scopes || []) {
+          for (const artifact of prepared.hierarchy.publication_objects) options.onVerifiedArtifact?.(artifact);
+        }
+      }
       entry.complete = true;
       return register(publication);
     }),
     resumeConnector: exclusive(async ({ dayUtc, connectorId, sourceIdentity }) => {
+      assertObservationHistoryExactOnlyPublicationActiveV3();
       const entry = pending.get(`${dayUtc}/${connectorId}`);
       if (!entry || entry.complete || !entry.continue) {
         throw new Error('No original exact-publication continuation; reauthenticate the unfinished canonical attempt explicitly');
@@ -2584,11 +2593,15 @@ export function createDormantPruneExactOnlyWriterV3(options) {
       // Canonical files/children are never rewritten by this continuation. Its
       // opaque original physical proof checks all current identities first.
       const result = await entry.continue();
+      for (const prepared of result.exact_only_prepared_scopes || []) {
+        for (const artifact of prepared.hierarchy.publication_objects) options.onVerifiedArtifact?.(artifact);
+      }
       const publication = connectorPublicationResult([result], OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily);
       entry.complete = true;
       return register(publication);
     }),
     finalizeBatch: exclusive(async () => {
+      assertObservationHistoryExactOnlyPublicationActiveV3();
       if (!publications.length || [...pending.values()].some(e => !e.complete)) {
         throw new Error('Incomplete connector publication cannot complete a Prune batch');
       }
@@ -2598,7 +2611,11 @@ export function createDormantPruneExactOnlyWriterV3(options) {
         connectorPublications: publications.map(p => p.run_finalization_evidence),
         // Existing finaliser publishes only latest here, after mandatory day,
         // month/year/root work. Protect its originally read identity with CAS.
-        putIfChanged: artifact => publisher.publishLatest(artifact),
+        putIfChanged: async artifact => {
+          const published = await publisher.publishLatest(artifact);
+          options.onVerifiedArtifact?.(artifact);
+          return published;
+        },
       });
       await publisher.recheck();
       const expectedDays = [...new Set(publications.flatMap(p => p.connector_results.map(c => c.day_utc)))].sort();

@@ -5,17 +5,21 @@ import { sha256Hex } from '../workers/shared/r2_sigv4.mjs';
 import { buildObservationHistoryV3SteadyStatePartition, createDormantPruneExactOnlyWriterV3,
   runPruneDailyObservationHistoryV3ConnectorPublication } from '../workers/shared/uk_aq_observation_history_steady_state_writer_v3.mjs';
 import { createObservationHistoryV3CanonicalConnectorPublisher, createObservationHistoryV3CanonicalDayPublisher,
-  createObservationHistoryV3CanonicalAggregatePublisher } from '../workers/shared/uk_aq_observation_history_operational_writer_v3.mjs';
+  createObservationHistoryV3CanonicalAggregatePublisher, createOperationalPruneDailyExactOnlyWriterV3 }
+  from '../workers/shared/uk_aq_observation_history_operational_writer_v3.mjs';
 import { buildObservationHistoryExactLeafIndexV3Latest, buildObservationHistoryExactLeafIndexV3ScopedHierarchy,
   finalizeObservationHistoryIndexV3Publication, buildObservationHistoryIndexV3PublicationPlan }
   from '../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs';
 import { OBSERVATION_HISTORY_EXACT_ONLY_PUBLICATION_ACTIVE_V3 } from '../workers/shared/uk_aq_observation_history_index_v3.mjs';
-import { describeObservationHistoryExactOnlyCompletionV3 } from '../workers/shared/uk_aq_observation_history_exact_only_publication_v3.mjs';
+import { describeObservationHistoryExactOnlyCompletionV3, createDormantPruneExactOnlyPublicationV3 }
+  from '../workers/shared/uk_aq_observation_history_exact_only_publication_v3.mjs';
 import { computePruneConnectorSourceIdentity } from '../workers/shared/uk_aq_prune_connector_source_identity.mjs';
 import { buildHistoryV2ConnectorManifest, buildHistoryV2DayManifest } from '../workers/shared/uk_aq_r2_history_canonical.mjs';
 import { buildR2HistoryV2ObservationsRootManifest, buildR2HistoryV2ObservationsYearManifest,
   buildR2HistoryV2ObservationsMonthManifest, serializeR2HistoryV2ObservationsAggregateManifest }
   from '../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs';
+
+const publicationLifecycleTest = OBSERVATION_HISTORY_EXACT_ONLY_PUBLICATION_ACTIVE_V3 ? test : test.skip;
 
 const base = 'history/v3/observations', day = '2026-10-10', git = '4'.repeat(40);
 const run = 'ca2a2ad8-c46c-4d65-9ee0-7147f03684eb';
@@ -87,7 +91,7 @@ function fixture() {
   };
 }
 
-test('actual connector -> checked batch publishes exact-only leaves/selectors/root/latest without a run report',async()=>{
+publicationLifecycleTest('actual connector -> checked batch publishes exact-only leaves/selectors/root/latest without a run report',async()=>{
   const f=fixture(); const publication=await f.publish();
   const results=publication.connector_results[0], scopes=results.exact_only_prepared_scopes;
   assert.equal(scopes.length,2);
@@ -106,7 +110,7 @@ test('actual connector -> checked batch publishes exact-only leaves/selectors/ro
   assert.ok(f.writes.indexOf(f.latest.key)>f.writes.indexOf(`${base}/_manifests/manifest.json`));
 });
 
-test('matching revision reuse and conflicting actual revision bytes',async()=>{
+publicationLifecycleTest('matching revision reuse and conflicting actual revision bytes',async()=>{
   for(const conflict of [false,true]) {
     const f=fixture(), p=f.build(rows.filter(r=>r.pollutant_code==='pm25')),m=p.canonical_pollutant_manifest;
     const h=buildObservationHistoryExactLeafIndexV3ScopedHierarchy({metadata:p.target_metadata,exactSchemaVersion:2,
@@ -118,7 +122,7 @@ test('matching revision reuse and conflicting actual revision bytes',async()=>{
   }
 });
 
-test('interrupted leaf/selector publication resumes under original operation without canonical rewrites',async()=>{
+publicationLifecycleTest('interrupted leaf/selector publication resumes under original operation without canonical rewrites',async()=>{
   for(const stage of ['leaf','selector']) {
     const f=fixture();let tripped=false;
     f.setFault(async(event,key)=>{if(!tripped&&event==='conditional_before'&&(stage==='leaf'?key.includes('/_exact_v2/'):key.endsWith('/manifest.json'))) {
@@ -131,13 +135,13 @@ test('interrupted leaf/selector publication resumes under original operation wit
   }
 });
 
-test('ambiguous successful conditional writes are reconciled by exact current readback',async()=>{
+publicationLifecycleTest('ambiguous successful conditional writes are reconciled by exact current readback',async()=>{
   const f=fixture();let faults=0;
   f.setFault(async(event)=>{if(event==='conditional_after'){faults++;throw new Error('lost response');}});
   await f.publish();assert.equal((await f.writer.finalizeBatch()).ok,true);assert.equal(faults,5);
 });
 
-test('changed predecessor and a selector replaced between GET and conditional PUT cannot select',async()=>{
+publicationLifecycleTest('changed predecessor and a selector replaced between GET and conditional PUT cannot select',async()=>{
   for(const race of [false,true]) {
     const f=fixture();let changed=false;
     f.setFault(async(event,key)=>{
@@ -156,7 +160,7 @@ test('changed predecessor and a selector replaced between GET and conditional PU
   }
 });
 
-test('lost selector readback resumes only the original written object; replacement ETag blocks recovery',async()=>{
+publicationLifecycleTest('lost selector readback resumes only the original written object; replacement ETag blocks recovery',async()=>{
   for(const replaced of [false,true]) {
     const f=fixture();let selectedKey=null,failed=false;
     f.setFault(async(event,key)=>{
@@ -172,7 +176,7 @@ test('lost selector readback resumes only the original written object; replaceme
   }
 });
 
-test('selected parent with incomplete latest is not success; same-session batch retry finishes',async()=>{
+publicationLifecycleTest('selected parent with incomplete latest is not success; same-session batch retry finishes',async()=>{
   const f=fixture();await f.publish();
   f.setFault(async(event,key)=>{if(event==='conditional_before'&&key===f.latest.key)throw new Error('latest interrupted');});
   await assert.rejects(f.writer.finalizeBatch());
@@ -181,7 +185,7 @@ test('selected parent with incomplete latest is not success; same-session batch 
   assert.deepEqual(f.writes.filter(k=>k.includes('/_exact_v2/')||k.endsWith('/pollutant_code=pm25/manifest.json')),before);
 });
 
-test('loss at a real canonical write boundary stops subsequent writes and cannot resume on a replacement session',async()=>{
+publicationLifecycleTest('loss at a real canonical write boundary stops subsequent writes and cannot resume on a replacement session',async()=>{
   const f=fixture();
   f.setFault(async(event,key)=>{if(event==='put'&&key.endsWith('.parquet'))f.setHeld(false);});
   await assert.rejects(f.publish(),/session lost/);assert.equal(f.writes.length,1);
@@ -191,7 +195,7 @@ test('loss at a real canonical write boundary stops subsequent writes and cannot
   assert.equal(f.writes.length,1);
 });
 
-test('selector identity changes, newer latest, changed canonical files and original lock loss fail closed',async()=>{
+publicationLifecycleTest('selector identity changes, newer latest, changed canonical files and original lock loss fail closed',async()=>{
   for(const mode of ['selector','file','lock','latest']) {
     const f=fixture();await f.publish();
     if(mode==='lock')f.setHeld(false);
@@ -205,16 +209,25 @@ test('selector identity changes, newer latest, changed canonical files and origi
   }
 });
 
-test('complete source admission, dormant boundary and normal schema-1 route retain guards',async()=>{
+test('inactive policy blocks every exact-only mutation entrance before R2 writes',async()=>{
   const f=fixture();assert.equal(OBSERVATION_HISTORY_EXACT_ONLY_PUBLICATION_ACTIVE_V3,false);
-  await assert.rejects(f.writer.publishConnector({partitions:inputs(),sourceIdentity:{...sourceIdentity,source_content_hash:'a'.repeat(64)}}),/source identity/);
+  await assert.rejects(f.writer.publishConnector({partitions:inputs(),sourceIdentity}),/publication inactive/);
+  await assert.rejects(f.writer.resumeConnector({dayUtc:day,connectorId:1,sourceIdentity}),/publication inactive/);
+  await assert.rejects(f.writer.finalizeBatch(),/publication inactive/);
   assert.equal(f.writes.length,0);
-  assert.throws(()=>createDormantPruneExactOnlyWriterV3({...f.options,r2:{bucket:'native'}}),/isolated/);
+  assert.equal(f.reads.length,0);
+  assert.throws(()=>createOperationalPruneDailyExactOnlyWriterV3(f.options),/publication inactive/);
+  const publisher=createDormantPruneExactOnlyPublicationV3({originalOperation:f.options.originalOperation,
+    r2:f.options.r2,getObject:f.options.getObject,recordDurableEvidence:f.options.recordDurableEvidence});
+  await assert.rejects(publisher.publish({preparedScopes:[],plan:{entries:[]}}),/publication inactive/);
+  await assert.rejects(publisher.publishLatest({key:'unused'}),/publication inactive/);
+  assert.equal(f.writes.length,0);
+  assert.equal(f.reads.length,0);
+  assert.throws(()=>createDormantPruneExactOnlyWriterV3({...f.options,r2:{bucket:'native'}}),/conditional R2 capability/);
   const p=await runPruneDailyObservationHistoryV3ConnectorPublication({...f.options,partitions:inputs(),exactSchemaVersion:2});
   assert.ok(p.connector_results[0].partitions.every(p=>p.scoped_root.artifact.payload.schema_version===1));
   assert.equal(f.reads.filter(k=>k.endsWith('.parquet')).length,0);
-  const other=fixture();await other.publish();
-  const prepared=other.build(rows.filter(r=>r.pollutant_code==='pm25')),m=prepared.canonical_pollutant_manifest;
+  const prepared=f.build(rows.filter(r=>r.pollutant_code==='pm25')),m=prepared.canonical_pollutant_manifest;
   const h=buildObservationHistoryExactLeafIndexV3ScopedHierarchy({metadata:prepared.target_metadata,exactSchemaVersion:2,
     canonicalManifest:{key:m.key,byte_size:m.byte_size,sha256:m.sha256,manifest_hash:m.payload.manifest_hash,row_count:m.payload.row_count,
       observation_content_hash:m.payload.observation_content_hash,observation_content_hash_version:1}});

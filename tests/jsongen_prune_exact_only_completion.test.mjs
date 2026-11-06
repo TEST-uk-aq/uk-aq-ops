@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { gunzipSync } from 'node:zlib';
+import { OBSERVATION_HISTORY_EXACT_ONLY_PUBLICATION_ACTIVE_V3 } from '../workers/shared/uk_aq_observation_history_index_v3.mjs';
 import { sourceAndOriginalEvent } from './jsongen_prune_consumer_fixture.mjs';
 import { decodePruneMetadataEvidence } from '../scripts/jsongen/prune-metadata-codec.mjs';
 import { preparePruneOriginalFinalEvidence, preparePruneOriginalFinalEvidenceWithExactOnlyCompletion,
@@ -14,6 +15,8 @@ import { prepareObservationHistoryExactOnlyScopeV3, acceptObservationHistoryExac
 import { prepareObservationHistoryExactOnlyPublicationV3, describeObservationHistoryExactOnlyCompletionV3,
   preparePruneExactOnlyBatchCompletionV3 }
   from '../workers/shared/uk_aq_observation_history_exact_only_publication_v3.mjs';
+
+const completionLifecycleTest = OBSERVATION_HISTORY_EXACT_ONLY_PUBLICATION_ACTIVE_V3 ? test : test.skip;
 
 // Reuse the existing original-event fixture; exercise only the new preparatory
 // boundary with actual serialized Parquet, local adapters and two whole series.
@@ -111,7 +114,7 @@ async function fixture({ checksumHead = true, operationRunId = null, pruneBatch 
     setHeld: value => { held = value; }, fileCount: partition.file_intents.length };
 }
 
-test('one actual file inspection survives final acceptance; existing envelope/outbox identify the same PENDING dataset', async () => {
+completionLifecycleTest('one actual file inspection survives final acceptance; existing envelope/outbox identify the same PENDING dataset', async () => {
   const f = await fixture();
   assert.equal(f.count.files, f.fileCount);
   const completion = await f.complete();
@@ -145,14 +148,14 @@ test('one actual file inspection survives final acceptance; existing envelope/ou
   assert.deepEqual(JSON.parse(inline.bytes).original_final_batch.exact_only_completion, extension);
 });
 
-test('no checksum-capable HEAD retains complete-body identity reads without another physical inspection path', async () => {
+completionLifecycleTest('no checksum-capable HEAD retains complete-body identity reads without another physical inspection path', async () => {
   const f = await fixture({ checksumHead: false });
   await f.complete();
   assert.equal(f.count.files, 9 * f.fileCount);
   assert.equal(f.count.heads, 0);
 });
 
-test('copied proofs, incomplete finalisation and the real inactive publisher cannot grant completion', async () => {
+completionLifecycleTest('copied proofs, incomplete finalisation and the real inactive publisher cannot grant completion', async () => {
   const f = await fixture();
   await assert.rejects(acceptObservationHistoryExactOnlyScopeV3({ ...f.prepared.proof }), /operation-local/);
   await assert.rejects(f.publication.finalize({
@@ -164,7 +167,7 @@ test('copied proofs, incomplete finalisation and the real inactive publisher can
   await assert.rejects(preparePruneOriginalFinalEvidenceWithExactOnlyCompletion(f.evidenceArgs({})), /operation-local/);
 });
 
-test('changed pinned file or lost lock invalidates original proof and cannot resurrect completion', async () => {
+completionLifecycleTest('changed pinned file or lost lock invalidates original proof and cannot resurrect completion', async () => {
   for (const mode of ['file', 'lock']) {
     const f = await fixture();
     const completion = await f.complete();
@@ -179,7 +182,7 @@ test('changed pinned file or lost lock invalidates original proof and cannot res
   }
 });
 
-test('mismatched source, batch and selected leaf bytes cannot prepare optional schema-2 evidence', async () => {
+completionLifecycleTest('mismatched source, batch and selected leaf bytes cannot prepare optional schema-2 evidence', async () => {
   const f = await fixture();
   const completion = await f.complete();
   for (const mutate of [
@@ -195,7 +198,7 @@ test('mismatched source, batch and selected leaf bytes cannot prepare optional s
   }
 });
 
-test('an index-only operation cannot confirm a historical observation event with unchanged data', async () => {
+completionLifecycleTest('an index-only operation cannot confirm a historical observation event with unchanged data', async () => {
   const f = await fixture({ operationRunId: '11111111-1111-4111-8111-111111111111' });
   const before = Buffer.from(f.event.row.final_evidence_bytes);
   const completion = await f.complete();
@@ -206,7 +209,7 @@ test('an index-only operation cannot confirm a historical observation event with
   assert.equal(f.count.mutations, 0);
 });
 
-test('normal original lock release rejects the old completion directly at evidence preparation', async () => {
+completionLifecycleTest('normal original lock release rejects the old completion directly at evidence preparation', async () => {
   const f = await fixture();
   const completion = await f.complete();
   const args = f.evidenceArgs(completion);
@@ -226,7 +229,7 @@ test('normal original lock release rejects the old completion directly at eviden
     { code: 'PRUNE_EXACT_ONLY_DURABLE_HANDOVER_UNSUPPORTED' });
 });
 
-test('Prune completion uses the checked original batch without a late run-summary object', async () => {
+completionLifecycleTest('Prune completion uses the checked original batch without a late run-summary object', async () => {
   const f = await fixture({ pruneBatch: true });
   const completion = await f.complete();
   const description = await describeObservationHistoryExactOnlyCompletionV3(completion);
@@ -251,4 +254,17 @@ test('Prune completion uses the checked original batch without a late run-summar
   }
   f.setHeld(false);
   await assert.rejects(preparePruneOriginalFinalEvidenceWithExactOnlyCompletion(f.evidenceArgs(completion)), /original lock lost/);
+});
+
+
+test('inactive schema-2 lifecycle cannot mutate or claim completion', async () => {
+  const f = await fixture();
+  const entry = f.publication.plan.entries[0];
+  await assert.rejects(f.publication.lifecycle.beforePublish(entry, entry.exact_only_policy), /publication inactive/);
+  await assert.rejects(f.publication.lifecycle.afterReadback(entry), /publication inactive/);
+  await assert.rejects(f.publication.lifecycle.acceptCurrentRoot(), /publication inactive/);
+  await assert.rejects(f.publication.lifecycle.finalizeRun(), /publication inactive/);
+  await assert.rejects(f.publication.completedPublication(), /publication inactive/);
+  assert.equal(f.count.finalize, 0);
+  assert.equal(f.count.mutations, 0);
 });

@@ -8,6 +8,11 @@ import { exactLeafFormatV3 } from "./uk_aq_observation_history_exact_leaf_format
 // Deliberately no environment switch or caller override. Compatible consumers,
 // original evidence and reconstruction require separate acceptance first.
 export const OBSERVATION_HISTORY_EXACT_ONLY_PUBLICATION_ACTIVE_V3 = false;
+export function assertObservationHistoryExactOnlyPublicationActiveV3() {
+  if (!OBSERVATION_HISTORY_EXACT_ONLY_PUBLICATION_ACTIVE_V3) {
+    throw new Error("schema-2 publication inactive: consumer/original-evidence/reconstruction acceptance is outstanding");
+  }
+}
 
 function exactOnlyPublicationPolicy(object) {
   const body = object.body;
@@ -2729,9 +2734,7 @@ export async function finalizeObservationHistoryIndexV3Publication({
   // bypass inactive production or immutable revision semantics.
   const policies = plan.entries.map(exactOnlyPublicationPolicy);
   const exactOnly = policies.some(Boolean) || plan.entries.some((entry) => entry.exact_only_policy);
-  if (exactOnly && !OBSERVATION_HISTORY_EXACT_ONLY_PUBLICATION_ACTIVE_V3) {
-    throw new Error("schema-2 publication inactive: consumer/original-evidence/reconstruction acceptance is outstanding");
-  }
+  if (exactOnly) assertObservationHistoryExactOnlyPublicationActiveV3();
   if (exactOnly) {
     for (const [index, entry] of plan.entries.entries()) {
       const body = Buffer.from(entry.body);

@@ -4,7 +4,10 @@ import { preparePruneExactOnlyBatchCompletionV3 }
 import {
   runOperationalPruneDailyObservationHistoryV3ConnectorPublication,
   runOperationalPruneDailyObservationHistoryV3RunFinalization,
+  createOperationalPruneDailyExactOnlyWriterV3,
 } from "../shared/uk_aq_observation_history_operational_writer_v3.mjs";
+import { OBSERVATION_HISTORY_EXACT_ONLY_PUBLICATION_ACTIVE_V3 }
+  from '../shared/uk_aq_observation_history_index_v3.mjs';
 import {
   createPruneDailyObservationHistoryV3RunLocalEvidenceCache,
 } from "../shared/uk_aq_observation_history_steady_state_writer_v3.mjs";
@@ -3805,6 +3808,69 @@ async function publishFrozenV2Observations({ candidate, runtime, streamClient, r
   };
 }
 
+function createPhaseBPruneExactOnlyWriter({ runtime, client }) {
+  const admitR2 = (operation, key, count = 1) => assertBudget(runtime, operation, { key },
+    count * R2_REQUEST_WORST_CASE_DURATION_MS + R2_PUBLICATION_SAFETY_MARGIN_MS);
+  const getObject = async ({ key }) => {
+    admitR2('v3_exact_only_r2_read', key);
+    try { return { ...await r2GetObject({ r2: runtime.r2, key }), key, exists: true }; }
+    catch (error) {
+      if (error?.status === 404) return { key, exists: false };
+      throw error;
+    }
+  };
+  const recordPublished = object => optionalJsongenMetadataCapture(
+    runtime, runtime.prune_exact_only_connector_id ?? null)?.recordPublishedObject(object);
+  return createOperationalPruneDailyExactOnlyWriterV3({
+    env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
+    client, r2: runtime.r2, originalOperation: runtime.original_operation,
+    observationsPrefix: runtime.committed_prefix, targetWriterGitSha: runtime.writer_git_sha,
+    globalOperationLockContext: runtime.global_operation_lock_context,
+    runLocalReferenceEvidenceCache: runtime.v3_run_local_evidence_cache,
+    lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+    beforePublicationStage: ({ stage, ...fields }) => assertBudget(runtime,
+      `v3_${stage}_start`, fields, R2_REQUEST_WORST_CASE_DURATION_MS + R2_PUBLICATION_SAFETY_MARGIN_MS),
+    getObject,
+    headObject: async ({ key }) => {
+      admitR2('v3_exact_only_r2_head', key);
+      return r2HeadObject({ r2: runtime.r2, key });
+    },
+    putObject: async object => {
+      admitR2('v3_exact_only_r2_put', object?.key, 2);
+      runtime.v3_run_local_evidence_cache?.invalidateKey(object?.key);
+      const result = await r2PutObject({ ...object, r2: runtime.r2 });
+      if (result?.ok !== false) recordPublished(object);
+      return result;
+    },
+    putIfChanged: async object => {
+      admitR2('v3_exact_only_r2_put_if_changed', object?.key, 3);
+      runtime.v3_run_local_evidence_cache?.invalidateKey(object?.key);
+      const result = await r2PutObjectIfChanged({ ...object, r2: runtime.r2 });
+      if (result?.ok !== false) recordPublished(object);
+      return result;
+    },
+    putAndVerifyParquet: async ({ r2, intent }) => {
+      assertBudget(runtime, 'v3_exact_only_parquet_write', { key: intent?.key },
+        R2_CHECKSUM_PUT_HEAD_WORST_CASE_DURATION_MS);
+      return putAndVerifyR2ObjectWithSha256({ r2, intent });
+    },
+    listAllCommonPrefixes: async ({ r2, prefix, delimiter = '/', max_keys = 1000 }) => {
+      const prefixes = [];
+      let continuationToken = null;
+      for (;;) {
+        admitR2('v3_exact_only_r2_list', prefix);
+        const page = await r2ListObjectsV2({ r2: r2 || runtime.r2, prefix,
+          continuation_token: continuationToken, max_keys, delimiter });
+        prefixes.push(...(Array.isArray(page.common_prefixes) ? page.common_prefixes : []));
+        if (!page.next_token) return Array.from(new Set(prefixes)).sort((left, right) => left.localeCompare(right));
+        continuationToken = page.next_token;
+      }
+    },
+    admitConditionalWrite: artifact => admitR2('v3_exact_only_conditional_put', artifact?.key, 2),
+    onVerifiedArtifact: recordPublished,
+  });
+}
+
 async function publishFrozenV3Observations({ candidate, runtime, streamClient, rows, backedUpAtUtc }) {
   await assertPruneOriginalOperation(runtime, 'publication');
   const metadataCapture = optionalJsongenMetadataCapture(runtime, candidate.connector_id);
@@ -3958,26 +4024,32 @@ async function publishFrozenV3Observations({ candidate, runtime, streamClient, r
   const publicationDiagnostics = [];
   let publication;
   try {
-    publication = await runOperationalPruneDailyObservationHistoryV3ConnectorPublication({
-      env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
-      client: streamClient, r2: runtime.r2,
-      originalOperation: runtime.original_operation,
-      observationsPrefix: runtime.committed_prefix,
-      targetWriterGitSha: runtime.writer_git_sha, backedUpAtUtc,
-      partitions: [...byPollutant.entries()].map(([code, partitionRows]) => ({
-        scope: { day_utc: candidate.day_utc, connector_id: candidate.connector_id, pollutant_code: code },
-        rows: partitionRows,
-      })),
-      lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
-      putAndVerifyParquet,
-      withConnectorDayLock,
-      diagnostics: publicationDiagnostics,
-      getObject: publicationGetObject,
-      putIfChanged: publicationPutIfChanged,
-      diagnosticLog,
-      beforePublicationStage,
-      diagnosticEnvironment: runtime.environment,
-    });
+    const partitions = [...byPollutant.entries()].map(([code, partitionRows]) => ({
+      scope: { day_utc: candidate.day_utc, connector_id: candidate.connector_id, pollutant_code: code },
+      rows: partitionRows,
+    }));
+    publication = runtime.prune_exact_only_writer
+      ? await runtime.prune_exact_only_writer.publishConnector({
+        partitions: partitions.map(partition => ({ ...partition, backed_up_at_utc: backedUpAtUtc })),
+        sourceIdentity: runtime.prune_exact_only_source_identity,
+      })
+      : await runOperationalPruneDailyObservationHistoryV3ConnectorPublication({
+        env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
+        client: streamClient, r2: runtime.r2,
+        originalOperation: runtime.original_operation,
+        observationsPrefix: runtime.committed_prefix,
+        targetWriterGitSha: runtime.writer_git_sha, backedUpAtUtc,
+        partitions,
+        lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+        putAndVerifyParquet,
+        withConnectorDayLock,
+        diagnostics: publicationDiagnostics,
+        getObject: publicationGetObject,
+        putIfChanged: publicationPutIfChanged,
+        diagnosticLog,
+        beforePublicationStage,
+        diagnosticEnvironment: runtime.environment,
+      });
   } catch (error) {
     logPhaseB(runtime, "ERROR", "phase_b_history_v3_connector_publication_failed", {
       ...publicationFields,
@@ -4119,22 +4191,24 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
     finalizationStage = stage;
     assertFinalizationRequestBudget(`v3_${stage}_start`, 1, fields);
   };
-  const result = await runOperationalPruneDailyObservationHistoryV3RunFinalization({
-    env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
-    client, r2: runtime.r2, observationsPrefix: runtime.committed_prefix,
-    targetWriterGitSha: runtime.writer_git_sha,
-    connectorPublications: publishedCandidates.map(({ exportResult }) => exportResult.v3_connector_publication),
-    diagnostics, diagnosticEnvironment: runtime.environment,
-    lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
-    getObject: finalizationGetObject,
-    putIfChanged: finalizationPutIfChanged,
-    putObject: finalizationPutObject,
-    listAllCommonPrefixes: finalizationListAllCommonPrefixes,
-    diagnosticLog,
-    beforePublicationStage,
-    runLocalReferenceEvidenceCache: runtime.v3_run_local_evidence_cache,
-    globalOperationLockContext: runtime.global_operation_lock_context,
-  });
+  const result = runtime.prune_exact_only_writer
+    ? await runtime.prune_exact_only_writer.finalizeBatch()
+    : await runOperationalPruneDailyObservationHistoryV3RunFinalization({
+      env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
+      client, r2: runtime.r2, observationsPrefix: runtime.committed_prefix,
+      targetWriterGitSha: runtime.writer_git_sha,
+      connectorPublications: publishedCandidates.map(({ exportResult }) => exportResult.v3_connector_publication),
+      diagnostics, diagnosticEnvironment: runtime.environment,
+      lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+      getObject: finalizationGetObject,
+      putIfChanged: finalizationPutIfChanged,
+      putObject: finalizationPutObject,
+      listAllCommonPrefixes: finalizationListAllCommonPrefixes,
+      diagnosticLog,
+      beforePublicationStage,
+      runLocalReferenceEvidenceCache: runtime.v3_run_local_evidence_cache,
+      globalOperationLockContext: runtime.global_operation_lock_context,
+    });
   return validatePhaseBV3RunFinalizationResult({
     result,
     expectedDays: affectedDays,
@@ -4369,7 +4443,18 @@ async function writeFrozenCandidateObservationsToV2({
       day_utc: candidate.day_utc, connector_id: candidate.connector_id,
       replayed_row_count: rows.length,
     }, PHASE_B_STAGE_MIN_MS.observation_connector_publication);
-    const result = await connectorPublisher({ candidate, runtime, streamClient, rows, backedUpAtUtc });
+    if (runtime.prune_exact_only_writer) {
+      runtime.prune_exact_only_source_identity = frozen.sourceIdentity;
+      runtime.prune_exact_only_connector_id = candidate.connector_id;
+    }
+    let result;
+    try { result = await connectorPublisher({ candidate, runtime, streamClient, rows, backedUpAtUtc }); }
+    finally {
+      if (runtime.prune_exact_only_writer) {
+        runtime.prune_exact_only_connector_id = null;
+        runtime.prune_exact_only_source_identity = null;
+      }
+    }
     if (emitV3Diagnostics) {
       logPhaseB(runtime, "INFO", "phase_b_history_v3_candidate_write_complete", {
         day_utc: candidate.day_utc,
@@ -4616,7 +4701,12 @@ async function finalizePublishedPhaseBConnectors({
             let exactOnlyCompletion = null;
             if (exportResult.exact_only_prepared_scopes?.length) {
               await assertPruneOriginalOperation(runtime, 'preparation', true);
-              exactOnlyCompletion = await preparePruneExactOnlyBatchCompletionV3({
+              const owned = result.exact_only_completions?.find(entry =>
+                entry.day_utc === candidate.day_utc && entry.connector_id === candidate.connector_id);
+              if (runtime.prune_exact_only_writer && !owned) {
+                throw new Error('Missing original exact-only checked-batch completion');
+              }
+              exactOnlyCompletion = owned?.completion || await preparePruneExactOnlyBatchCompletionV3({
                 preparedScopes: exportResult.exact_only_prepared_scopes,
                 finalization: result, runId, originalOperation: runtime.original_operation,
                 expectedDays, expectedConnectorPublicationCount: publishedCandidates.length,
@@ -7434,6 +7524,12 @@ export async function runPhaseBBackup({
     });
     runtime.global_operation_lock_context = evidenceContext.lock_context;
     runtime.v3_run_local_evidence_cache = evidenceContext.evidence_cache;
+    if (OBSERVATION_HISTORY_EXACT_ONLY_PUBLICATION_ACTIVE_V3) {
+      await assertPruneOriginalOperation(runtime, 'publication', true);
+      runtime.prune_exact_only_writer = createPhaseBPruneExactOnlyWriter({
+        runtime, client: controlClient,
+      });
+    }
 
     const finalizeAccumulatedBatch = async ({ trigger }) => {
       const batch = [...publishedCandidates];
@@ -7459,6 +7555,11 @@ export async function runPhaseBBackup({
         batchTrigger: trigger,
       });
       publishedCandidates.splice(0, batch.length);
+      if (runtime.prune_exact_only_writer && outcome.can_continue === true) {
+        runtime.prune_exact_only_writer = createPhaseBPruneExactOnlyWriter({
+          runtime, client: controlClient,
+        });
+      }
       totalWrittenRows += outcome.completed_written_rows;
       totalWrittenBytes += outcome.completed_written_bytes;
       return outcome;

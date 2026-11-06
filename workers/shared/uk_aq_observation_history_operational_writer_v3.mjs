@@ -31,6 +31,7 @@ import {
   runPruneDailyObservationHistoryV3ConnectorPublication,
   runPruneDailyObservationHistoryV3RunFinalization,
   runPruneDailyObservationHistoryV3Writer,
+  createDormantPruneExactOnlyWriterV3,
   runSelectedScopeReconciliationObservationHistoryV3Writer,
   runSosHistoricalReplacementObservationHistoryV3Writer,
   runSupportedBackfillObservationHistoryV3Writer,
@@ -45,8 +46,14 @@ import {
 } from "./uk_aq_r2_history_canonical.mjs";
 import {
   r2GetObject,
+  r2HeadObject,
+  r2PutObject,
   sha256Hex,
 } from "./r2_sigv4.mjs";
+import { withConnectorDayHistoryLock, runCanonicalDayFinalizer,
+  runCanonicalGlobalIndexFinalizer } from './uk_aq_r2_history_writer.mjs';
+import { assertObservationHistoryExactOnlyPublicationActiveV3 }
+  from './uk_aq_observation_history_index_v3.mjs';
 import {
   r2PutObjectIfChanged,
 } from "./uk_aq_r2_history_index.mjs";
@@ -1390,6 +1397,24 @@ export function runDisconnectedPruneDailyObservationHistoryV3RunFinalization(opt
 
 export const runOperationalPruneDailyObservationHistoryV3RunFinalization =
   runDisconnectedPruneDailyObservationHistoryV3RunFinalization;
+
+// Phase B supplies its bounded native R2 adapters and retained original
+// PostgreSQL capability. The shared inactive policy is checked before this
+// owning writer can reach even its first canonical Parquet mutation.
+export function createOperationalPruneDailyExactOnlyWriterV3(options) {
+  assertObservationHistoryExactOnlyPublicationActiveV3();
+  if (!options?.originalOperation || typeof options.originalOperation.assertHeld !== 'function') {
+    throw new Error('Operational exact-only Prune requires the original PostgreSQL operation');
+  }
+  return createDormantPruneExactOnlyWriterV3({
+    ...v3OnlyOptions(options),
+    headObject: options.headObject || r2HeadObject,
+    putObject: options.putObject || r2PutObject,
+    withConnectorDayLock: options.withConnectorDayLock || withConnectorDayHistoryLock,
+    runDayFinalizer: options.runDayFinalizer || runCanonicalDayFinalizer,
+    runGlobalFinalizer: options.runGlobalFinalizer || runCanonicalGlobalIndexFinalizer,
+  });
+}
 
 export function runDisconnectedIntegrityObservationHistoryV3Writer(options) {
   return runIntegrityObservationHistoryV3Writer(v3OnlyOptions(options));

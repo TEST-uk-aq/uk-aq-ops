@@ -4,6 +4,7 @@ import { Buffer } from "node:buffer";
 import { sha256Hex, isStrongR2Etag, r2PutObjectConditional } from "./r2_sigv4.mjs";
 import { getObservationHistoryGeneration } from "./uk_aq_observation_history_generation.mjs";
 import { exactLeafFormatV3 } from "./uk_aq_observation_history_exact_leaf_format_v3.mjs";
+import { assertObservationHistoryExactOnlyPublicationActiveV3 } from "./uk_aq_observation_history_index_v3.mjs";
 import { validatePhaseBV3RunFinalizationResult, pruneBatchFinalizationIdentityV3 }
   from './uk_aq_prune_batch_finalization_v3.mjs';
 import { originalOperationError } from '../../scripts/operations/lib/uk_aq_prune_original_operation.mjs';
@@ -240,6 +241,7 @@ export async function prepareObservationHistoryExactOnlyPublicationV3({
   };
   const lifecycle = Object.freeze(Object.fromEntries(Object.entries({
     async beforePublish(entry, policy) {
+      assertObservationHistoryExactOnlyPublicationActiveV3();
       await held();
       // Immutable leaves do not mutate canonical files. Keep the original
       // operation proof live per entry; check current source/file identities
@@ -261,6 +263,7 @@ export async function prepareObservationHistoryExactOnlyPublicationV3({
       await held();
     },
     async afterReadback(entry) {
+      assertObservationHistoryExactOnlyPublicationActiveV3();
       await held();
       const guard = selectors.get(entry.key);
       if (guard) guard.selected = true;
@@ -270,6 +273,7 @@ export async function prepareObservationHistoryExactOnlyPublicationV3({
       }
     },
     async acceptCurrentRoot() {
+      assertObservationHistoryExactOnlyPublicationActiveV3();
       completedRun = null;
       rootAccepted = false;
       if ([...selectors.values()].some((s) => !s.selected)) throw new Error("not all selectors selected/read back");
@@ -288,6 +292,7 @@ export async function prepareObservationHistoryExactOnlyPublicationV3({
       await checkLatestRoots(); await held(); rootAccepted = true;
     },
     async finalizeRun() {
+      assertObservationHistoryExactOnlyPublicationActiveV3();
       completedRun = null;
       if (!rootAccepted || !latestReadback) throw new Error("selector-selected/latest-unfinalised is not success");
       await checkLatestRoots();
@@ -313,6 +318,7 @@ export async function prepareObservationHistoryExactOnlyPublicationV3({
   return Object.freeze({ plan, latest, lifecycle, original_selectors: Object.freeze(
     [...selectors.values()].map((s) => s.original)),
     completedPublication: guarded(async () => {
+      assertObservationHistoryExactOnlyPublicationActiveV3();
       if (!completedRun || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(runId || "")) {
         throw new Error("exact-only publication/run finalisation or original invocation incomplete");
       }
@@ -348,7 +354,7 @@ export async function prepareObservationHistoryExactOnlyPublicationV3({
 }
 // Exact object IO remains bound to the owning operation through its held
 // assertion. The caller owns proof, attempt state and publication order.
-function createExactOnlyObjectPublicationV3({ held, getObject, r2 }) {
+function createExactOnlyObjectPublicationV3({ held, getObject, r2, admitConditionalWrite }) {
   const read = async key => {
     await held(); const object = await getObject({ key }); await held();
     const pin = snapshot(object, key);
@@ -364,6 +370,7 @@ function createExactOnlyObjectPublicationV3({ held, getObject, r2 }) {
   // One conditional attempt, followed by authoritative readback. No blind
   // retry, rollback, or GET/ordinary-PUT claimed as atomic compare-and-swap.
   const write = async (artifact, expected, attempt) => {
+    assertObservationHistoryExactOnlyPublicationActiveV3();
     if (attempt.blocked) throw new Error('Conditional publication conflict requires explicit recovery');
     const before = await read(artifact.key);
     if (attempt.started) {
@@ -376,6 +383,7 @@ function createExactOnlyObjectPublicationV3({ held, getObject, r2 }) {
       // be retried. Any other authority requires explicit external recovery.
     }
     same(before.pin, expected, 'previous selector/object identity');
+    admitConditionalWrite?.(artifact);
     attempt.started = true;
     let outcome;
     try {
@@ -407,11 +415,13 @@ function createExactOnlyObjectPublicationV3({ held, getObject, r2 }) {
 // captures selectors BEFORE canonical writes and retains this closure only in
 // its original operation. It is not a conversion or cross-invocation recovery API.
 export function createDormantPruneExactOnlyPublicationV3({ originalOperation, r2,
-  getObject, recordDurableEvidence }) {
-  if (!r2?.adapter || typeof r2.adapter.putObjectConditional !== 'function'
+  getObject, recordDurableEvidence, admitConditionalWrite = null }) {
+  if (!(typeof r2?.adapter?.putObjectConditional === 'function'
+      || (r2?.endpoint && r2?.region && r2?.access_key_id && r2?.secret_access_key && r2?.bucket))
     || typeof getObject !== 'function' || typeof recordDurableEvidence !== 'function'
-    || typeof originalOperation?.assertHeld !== 'function') {
-    throw new Error('Dormant Prune publication requires isolated injected adapters and original operation');
+    || typeof originalOperation?.assertHeld !== 'function'
+    || (admitConditionalWrite !== null && typeof admitConditionalWrite !== 'function')) {
+    throw new Error('Dormant Prune publication requires conditional R2 capability and original operation');
   }
   let lost = false;
   let batchLatest = null;
@@ -422,7 +432,9 @@ export function createDormantPruneExactOnlyPublicationV3({ originalOperation, r2
       if (await originalOperation.assertHeld('publication') === false) throw originalOperationError('session not held');
     } catch (error) { lost = true; throw error; }
   };
-  const { read, exact, write } = createExactOnlyObjectPublicationV3({ held, getObject, r2 });
+  const { read, exact, write } = createExactOnlyObjectPublicationV3({
+    held, getObject, r2, admitConditionalWrite,
+  });
   const verifyLeaves = async state => {
     for (const leaf of state.prepared.hierarchy.exact_leaves) {
       const current = await read(leaf.key);
@@ -457,6 +469,7 @@ export function createDormantPruneExactOnlyPublicationV3({ originalOperation, r2
       }
     },
     async publish({ preparedScopes, plan }) {
+      assertObservationHistoryExactOnlyPublicationActiveV3();
       // Validate the existing publication graph and the original scope set;
       // leaves from ALL scopes are durable before ANY selector is changed.
       const states = preparedScopes.map(prepared => {
@@ -517,6 +530,7 @@ export function createDormantPruneExactOnlyPublicationV3({ originalOperation, r2
       await held();
     },
     async publishLatest(artifact) {
+      assertObservationHistoryExactOnlyPublicationActiveV3();
       await this.recheck();
       if (!batchLatest) throw new Error('Missing original batch latest identity');
       if (batchLatest.artifact) same(id(artifact), id(batchLatest.artifact), 'prepared latest retry');
