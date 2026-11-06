@@ -4,6 +4,7 @@ import { buildJsonResponse, errorEnvelope } from "./http";
 import type { WorkerEnv } from "./upstream";
 import { recordDashboardSupabaseResponse } from "./service_egress_metrics";
 import { billingConfigurationKey, billingConfigurationValid, billingPeriodError, billingTimestamp, fetchR2BillingPeriod, guardR2Usage } from "./r2_billing_period";
+import { applyIngestDayPresence, coverageDay, type IngestCoverageMetadata } from "./storage_day_presence";
 
 type JsonObject = Record<string, unknown>;
 
@@ -38,10 +39,13 @@ type DashboardPayload = {
   dropbox_backup_state_fallback_attempted: boolean;
   dropbox_backup_observations_earliest_day: string | null;
   dropbox_backup_observations_latest_day: string | null;
-  dropbox_backup_aqilevels_earliest_day: string | null;
-  dropbox_backup_aqilevels_latest_day: string | null;
   storage_coverage_source: string;
   storage_coverage_days: unknown[];
+  ingest_coverage?: IngestCoverageMetadata;
+  ingest_coverage_error?: string | null;
+  obs_aqidb_coverage_error?: string | null;
+  obs_aqidb_coverage_generated_at?: string | null;
+  storage_coverage_independent_sources?: JsonObject;
   pollutants: unknown[];
   dispatch_runs: unknown[];
   dispatcher_settings: JsonObject;
@@ -177,17 +181,21 @@ let storageCoverageCache: CacheEntry<{
   dropbox_backup_state_fallback_attempted: boolean;
   dropbox_backup_observations_earliest_day: string | null;
   dropbox_backup_observations_latest_day: string | null;
-  dropbox_backup_aqilevels_earliest_day: string | null;
-  dropbox_backup_aqilevels_latest_day: string | null;
 }> | null = null;
 let r2UsageCache: CacheEntry<{ usage: JsonObject | null; error: string | null }> | null = null;
 let r2UsageBillingKey = "";
-let r2HistoryDaysCache: CacheEntry<{ daySets: R2DaySets | null; window: JsonObject | null; bucket: string | null; error: string | null; readVersion: R2HistoryReadVersionResolution }> | null = null;
+let r2HistoryDaysCache: CacheEntry<{ daySets: R2DaySets | null; window: JsonObject | null; bucket: string | null; error: string | null; readVersion: R2HistoryReadVersionResolution; checkedAt?: string }> | null = null;
 let r2HistoryDaysCacheVersionKey: string | null = null;
 let storageCoverageCacheVersionKey: string | null = null;
 let dropboxMtimeCache: CacheEntry<{ payload: JsonObject; error: string | null }> | null = null;
 
+let obsObservationCache: { key: string; expires: number; counts: Map<string, boolean>; checked: string | null } | null = null;
+let coverageRefreshRevision = 0;
+
 function clearStorageCoverageCaches(): void {
+  coverageRefreshRevision++;
+  dashboardCache.clear();
+  obsObservationCache = null;
   storageCoverageCache = null;
   storageCoverageCacheVersionKey = null;
   r2HistoryDaysCache = null;
@@ -357,6 +365,27 @@ function postgrestHeaders(serviceRoleKey: string, schema: PostgrestSchema, write
     headers.set("Content-Profile", schema);
   }
   return headers;
+}
+
+// Reuse exactly the established server-side IngestDB POST/schema/authentication path.
+export function applyStorageIngestCoverage<T extends { storage_coverage_days: unknown[] }>(
+  env: WorkerEnv, payload: T, forceRefresh = false,
+) {
+  return applyIngestDayPresence(payload, () => {
+    const schema = defaultPublicSchema(env);
+    const headers = postgrestHeaders(requireServiceKey(env), schema, true);
+    headers.set("Content-Type", "application/json");
+    headers.set("Accept", "application/json");
+    const url = ingestRestBase(env) + "/rpc/uk_aq_rpc_observation_day_presence_v1";
+    return {
+      key: url + "|" + schema,
+      fetchChunk: (from: string, to: string) => fetchJsonObject(url, {
+        method: "POST", headers, cache: "no-store", redirect: "manual",
+        signal: AbortSignal.timeout(15000),
+        body: JSON.stringify({ p_from_day_utc: from, p_to_day_utc_exclusive: to }),
+      }, "IngestDB daily presence", env, 65536),
+    };
+  }, forceRefresh);
 }
 
 async function fetchJsonObject(
@@ -692,8 +721,9 @@ function cacheGet<T>(entry: CacheEntry<T> | null): T | null {
 function parseHistoryDaySets(payload: JsonObject): R2DaySets {
   const domains = payload.domains;
   const sets: R2DaySets = { observations: new Set<string>(), aqilevels: new Set<string>() };
-  if (!domains || typeof domains !== "object" || Array.isArray(domains)) {
-    return sets;
+  if (!domains || typeof domains !== "object" || Array.isArray(domains)
+    || !Array.isArray(((domains as JsonObject).observations as JsonObject | undefined)?.days)) {
+    throw new Error("R2 history-days response has no authoritative observation-day array");
   }
   for (const domainName of ["observations", "aqilevels"] as const) {
     const domain = (domains as JsonObject)[domainName];
@@ -705,10 +735,9 @@ function parseHistoryDaySets(payload: JsonObject): R2DaySets {
       continue;
     }
     for (const value of days) {
-      const day = normalizeIsoDay(value);
-      if (day) {
-        sets[domainName].add(day);
-      }
+      const day = coverageDay(value);
+      if (!day || sets[domainName].has(day)) throw new Error("Invalid or duplicate R2 history day");
+      sets[domainName].add(day);
     }
   }
   return sets;
@@ -737,7 +766,8 @@ function buildR2Window(daySets: R2DaySets, env: WorkerEnv): JsonObject {
 async function fetchR2HistoryDays(
   env: WorkerEnv,
   forceRefresh = false,
-): Promise<{ daySets: R2DaySets | null; window: JsonObject | null; bucket: string | null; error: string | null; readVersion: R2HistoryReadVersionResolution }> {
+): Promise<{ daySets: R2DaySets | null; window: JsonObject | null; bucket: string | null; error: string | null; readVersion: R2HistoryReadVersionResolution; checkedAt?: string }> {
+  const revision = coverageRefreshRevision;
   const versionCacheKey = r2HistoryReadVersionCacheKey(env);
   if (!forceRefresh && r2HistoryDaysCacheVersionKey === versionCacheKey) {
     const cached = cacheGet(r2HistoryDaysCache);
@@ -755,8 +785,10 @@ async function fetchR2HistoryDays(
       error: "R2 history-days API not configured",
       readVersion: resolveR2HistoryReadVersion(env),
     };
-    r2HistoryDaysCacheVersionKey = versionCacheKey;
-    r2HistoryDaysCache = { value: fallback, expiresAt: Date.now() + R2_HISTORY_DAYS_TTL_MS };
+    if (revision === coverageRefreshRevision) {
+      r2HistoryDaysCacheVersionKey = versionCacheKey;
+      r2HistoryDaysCache = { value: fallback, expiresAt: Date.now() + R2_HISTORY_DAYS_TTL_MS };
+    }
     return fallback;
   }
 
@@ -781,9 +813,12 @@ async function fetchR2HistoryDays(
       bucket: String(payload.bucket || "").trim() || null,
       error: null,
       readVersion: resolveR2HistoryReadVersion(env),
+      checkedAt: typeof payload.generated_at === "string" && Number.isFinite(Date.parse(payload.generated_at)) ? payload.generated_at : nowIso(),
     };
-    r2HistoryDaysCacheVersionKey = versionCacheKey;
-    r2HistoryDaysCache = { value, expiresAt: Date.now() + R2_HISTORY_DAYS_TTL_MS };
+    if (revision === coverageRefreshRevision) {
+      r2HistoryDaysCacheVersionKey = versionCacheKey;
+      r2HistoryDaysCache = { value, expiresAt: Date.now() + R2_HISTORY_DAYS_TTL_MS };
+    }
     return value;
   } catch (err) {
     const value = {
@@ -793,8 +828,10 @@ async function fetchR2HistoryDays(
       error: err instanceof Error ? err.message : String(err),
       readVersion: resolveR2HistoryReadVersion(env),
     };
-    r2HistoryDaysCacheVersionKey = versionCacheKey;
-    r2HistoryDaysCache = { value, expiresAt: Date.now() + R2_HISTORY_DAYS_TTL_MS };
+    if (revision === coverageRefreshRevision) {
+      r2HistoryDaysCacheVersionKey = versionCacheKey;
+      r2HistoryDaysCache = { value, expiresAt: Date.now() + R2_HISTORY_DAYS_TTL_MS };
+    }
     return value;
   }
 }
@@ -1301,7 +1338,7 @@ function resolveDropboxStatePath(env: WorkerEnv): DropboxStatePathResolution {
 
 function storageCoverageCacheKey(env: WorkerEnv): string {
   const dropboxStatePath = resolveDropboxStatePath(env);
-  return `storage_coverage:${r2HistoryReadVersionCacheKey(env)}:${dropboxStatePath.cacheKey}`;
+  return `storage_coverage:observations-v1:${new Date().toISOString().slice(0, 10)}:${r2HistoryReadVersionCacheKey(env)}:${dropboxStatePath.cacheKey}`;
 }
 
 function resolveDropboxHistoryPath(env: WorkerEnv): string {
@@ -1600,12 +1637,9 @@ function daySetBounds(days: Set<string>): { earliest: string | null; latest: str
 
 function dropboxBackupDaysDiagnostics(days: R2DaySets): JsonObject {
   const observations = daySetBounds(days.observations);
-  const aqilevels = daySetBounds(days.aqilevels);
   return {
     dropbox_backup_observations_earliest_day: observations.earliest,
     dropbox_backup_observations_latest_day: observations.latest,
-    dropbox_backup_aqilevels_earliest_day: aqilevels.earliest,
-    dropbox_backup_aqilevels_latest_day: aqilevels.latest,
   };
 }
 
@@ -1626,7 +1660,7 @@ function filterDropboxBackupDaysForReadVersion(
 
   const filtered: R2DaySets = { observations: new Set<string>(), aqilevels: new Set<string>() };
   const warnings: string[] = [];
-  for (const domainName of ["observations", "aqilevels"] as const) {
+  for (const domainName of ["observations"] as const) {
     const r2Set = r2Days[domainName];
     const dropboxSet = dropboxDays[domainName];
     const r2Bounds = daySetBounds(r2Set);
@@ -1651,82 +1685,73 @@ function filterDropboxBackupDaysForReadVersion(
 
 function buildStorageCoverageRows(
   dbRows: unknown[],
-  schemaRows: unknown[],
   r2Days: R2DaySets | null,
   dropboxDays: R2DaySets,
+  dropboxAvailable: boolean,
 ): unknown[] {
-  const ingestOldest = latestOldestDay(
-    dbRows,
-    (row) => String(row.database_label || "").trim().toLowerCase() === "ingestdb",
-  );
-  const obsOldest = latestOldestDay(
-    dbRows,
-    (row) => String(row.database_label || "").trim().toLowerCase() === "obs_aqidb",
-  );
-  const aqiOldest = latestOldestDay(
-    schemaRows,
-    (row) => String(row.schema_name || "").trim().toLowerCase() === "uk_aq_aqilevels",
-  );
-  const dateCandidates: Date[] = [];
-  for (const value of [ingestOldest, obsOldest, aqiOldest]) {
-    const parsed = parseIsoDay(value);
-    if (parsed) {
-      dateCandidates.push(parsed);
-    }
-  }
-  for (const day of r2Days?.observations || []) {
-    const parsed = parseIsoDay(day);
-    if (parsed) {
-      dateCandidates.push(parsed);
-    }
-  }
-  for (const day of r2Days?.aqilevels || []) {
-    const parsed = parseIsoDay(day);
-    if (parsed) {
-      dateCandidates.push(parsed);
-    }
-  }
-  for (const day of dropboxDays.observations) {
-    const parsed = parseIsoDay(day);
-    if (parsed) {
-      dateCandidates.push(parsed);
-    }
-  }
-  for (const day of dropboxDays.aqilevels) {
-    const parsed = parseIsoDay(day);
-    if (parsed) {
-      dateCandidates.push(parsed);
-    }
-  }
-
+  // Boundaries choose the dates to inspect; they never establish positive presence.
+  const oldest = ["ingestdb", "obs_aqidb"].map(label => latestOldestDay(
+    dbRows, row => String(row.database_label || "").trim().toLowerCase() === label,
+  ));
+  const candidates = [...oldest, ...Array.from(r2Days?.observations || []), ...dropboxDays.observations]
+    .flatMap(day => { const parsed = parseIsoDay(day); return parsed ? [parsed.getTime()] : []; });
   const today = new Date();
   const todayUtc = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
   const defaultStart = addUtcDays(todayUtc, -90);
-  const minStart = dateCandidates.length
-    ? new Date(Math.min(...dateCandidates.map((item) => item.getTime())))
-    : defaultStart;
-  const start = minStart.getTime() < defaultStart.getTime() ? minStart : defaultStart;
-
-  const ingestStart = parseIsoDay(ingestOldest);
-  const obsStart = parseIsoDay(obsOldest);
-  const aqiStart = parseIsoDay(aqiOldest);
+  const start = new Date(Math.min(defaultStart.getTime(), ...candidates));
   const rows: unknown[] = [];
-  for (let cursor = new Date(start.getTime()); cursor.getTime() <= todayUtc.getTime(); cursor = addUtcDays(cursor, 1)) {
+  for (let cursor = start; cursor <= todayUtc; cursor = addUtcDays(cursor, 1)) {
     const day = toIsoDay(cursor);
-    const r2Observs = Boolean(r2Days?.observations.has(day));
     rows.push({
       date: day,
-      ingest: Boolean(ingestStart && cursor.getTime() >= ingestStart.getTime()) && !r2Observs,
-      obs_aqi_observs: Boolean(obsStart && cursor.getTime() >= obsStart.getTime()),
-      obs_aqi_aqilevels: Boolean(aqiStart && cursor.getTime() >= aqiStart.getTime()),
-      r2_observs: r2Observs,
-      r2_aqilevels: Boolean(r2Days?.aqilevels.has(day)),
-      dropbox_observs: dropboxDays.observations.has(day),
-      dropbox_aqilevels: dropboxDays.aqilevels.has(day),
+      ingest: null,
+      obs_aqi_observs: null,
+      r2_observs: r2Days ? r2Days.observations.has(day) : null,
+      dropbox_observs: dropboxDays.observations.has(day) ? true : dropboxAvailable ? false : null,
       isToday: cursor.getTime() === todayUtc.getTime(),
     });
   }
   return rows;
+}
+
+// Existing authoritative observation summary, also used by the local dashboard.
+// Never replace an unavailable day summary with a continuous oldest-date interval.
+async function addObsObservationCoverage(env: WorkerEnv, rows: unknown[], forceRefresh: boolean): Promise<{ error: string | null; checked: string | null }> {
+  if (!rows.length) return { error: null, checked: null };
+  const dates = rows.map(row => coverageDay((row as JsonObject).date)).filter((day): day is string => Boolean(day));
+  try {
+    const headers = postgrestHeaders(requireObsServiceKey(env), defaultPublicSchema(env));
+    const revision = coverageRefreshRevision;
+    const key = obsRestBase(env) + "|" + defaultPublicSchema(env) + "|" + dates[0] + "|" + dates[dates.length - 1];
+    if (!forceRefresh && obsObservationCache?.key === key && Date.now() < obsObservationCache.expires) {
+      for (const value of rows) (value as JsonObject).obs_aqi_observs = obsObservationCache.counts.get(String((value as JsonObject).date)) ?? null;
+      return { error: null, checked: obsObservationCache.checked };
+    }
+    const counts = await fetchAllRows(obsRestBase(env), "uk_aq_obs_aqidb_day_counts_current", headers, {
+      dataset: "eq.observs", select: "day_utc,row_count,recorded_at",
+      and: `(day_utc.gte.${dates[0]},day_utc.lte.${dates[dates.length - 1]})`, order: "day_utc.asc",
+    }, 1000, env, dates.length + 1);
+    const byDay = new Map<string, boolean>();
+    for (const row of counts) {
+      const day = coverageDay(row.day_utc);
+      const count = row.row_count;
+      if (!day || byDay.has(day) || !(typeof count === "number" && Number.isSafeInteger(count) && count >= 0
+        || typeof count === "string" && /^[0-9]+$/.test(count))) throw new Error("Invalid observation summary");
+      byDay.set(day, Number(count) > 0);
+    }
+    const timestamps = counts.map(row => Date.parse(String(row.recorded_at || "")));
+    if (!counts.length || timestamps.some(ms => !Number.isFinite(ms) || ms < Date.now() - 3 * 3600000)) {
+      throw new Error("Observation summary has no fresh source timestamp");
+    }
+    const checked = new Date(Math.min(...timestamps)).toISOString();
+    if (revision === coverageRefreshRevision) obsObservationCache = { key, expires: Date.now() + STORAGE_COVERAGE_TTL_MS, counts: byDay, checked };
+    for (const value of rows) {
+      const row = value as JsonObject;
+      // Missing summary dates are unknown, not proven zeroes (e.g. today's unrefreshed product).
+      row.obs_aqi_observs = byDay.get(String(row.date)) ?? null;
+    }
+    return { error: null, checked };
+  } catch { return { error: "Authoritative ObsAQIDB observation-day summary is unavailable or invalid", checked: null }; }
 }
 
 async function fetchServiceEgressMetrics(env: WorkerEnv): Promise<{ rows: unknown[]; error: string | null }> {
@@ -1770,8 +1795,11 @@ async function fetchDashboardBaseData(
   },
 ): Promise<DashboardPayload> {
   const now = new Date();
-  const ingestBase = ingestRestBase(env);
-  const serviceKey = requireServiceKey(env);
+  // Calendar-only reads retain independent R2/Dropbox/ObsAQIDB evidence even
+  // when the IngestDB connection is missing. Connector reads still fail closed.
+  const ingestBase = options.includeIngestContext
+    ? ingestRestBase(env) : String(env.SUPABASE_URL || "").trim().replace(/\/+$/, "") + "/rest/v1";
+  const serviceKey = options.includeIngestContext ? requireServiceKey(env) : String(env.SB_SECRET_KEY || "").trim();
   const coreSchema = defaultCoreSchema(env);
   const headersCore = postgrestHeaders(serviceKey, coreSchema);
   const connectorsSettings: unknown[] = [];
@@ -2000,9 +2028,10 @@ async function fetchDashboardBaseData(
   let dropbox_backup_state_fallback_attempted = false;
   let dropbox_backup_observations_earliest_day: string | null = null;
   let dropbox_backup_observations_latest_day: string | null = null;
-  let dropbox_backup_aqilevels_earliest_day: string | null = null;
-  let dropbox_backup_aqilevels_latest_day: string | null = null;
   let storage_coverage_days: unknown[] = [];
+  let obs_aqidb_coverage_error: string | null = null;
+  let obs_aqidb_coverage_generated_at: string | null = null;
+  let storage_coverage_independent_sources: JsonObject = {};
 
   if (options.includeMetricContext || options.includeStorageCoverage) {
     const [dbMetrics, r2Usage, r2History, egress, dropboxState] = await Promise.all([
@@ -2047,10 +2076,6 @@ async function fetchDashboardBaseData(
       dropboxDiagnostics.dropbox_backup_observations_earliest_day as string | null;
     dropbox_backup_observations_latest_day =
       dropboxDiagnostics.dropbox_backup_observations_latest_day as string | null;
-    dropbox_backup_aqilevels_earliest_day =
-      dropboxDiagnostics.dropbox_backup_aqilevels_earliest_day as string | null;
-    dropbox_backup_aqilevels_latest_day =
-      dropboxDiagnostics.dropbox_backup_aqilevels_latest_day as string | null;
     if (filteredDropbox.warning) {
       dropbox_backup_state_warning = dropbox_backup_state_warning
         ? `${dropbox_backup_state_warning} ${filteredDropbox.warning}`
@@ -2072,10 +2097,22 @@ async function fetchDashboardBaseData(
     if (options.includeStorageCoverage) {
       storage_coverage_days = buildStorageCoverageRows(
         dbMetrics.dbRows,
-        dbMetrics.schemaRows,
         r2History.daySets,
         dropboxDays,
+        Boolean(dropboxState.path && !dropboxState.error && r2History.daySets),
       );
+      const obsCoverage = await addObsObservationCoverage(env, storage_coverage_days, options.forceRefresh);
+      obs_aqidb_coverage_error = obsCoverage.error;
+      obs_aqidb_coverage_generated_at = obsCoverage.checked;
+      storage_coverage_independent_sources = {
+        generated_at: now.toISOString(),
+        r2_status: r2History.daySets ? "ok" : "unavailable",
+        r2_checked_at_utc: r2History.checkedAt || null,
+        r2_error: r2History.error,
+        backup_status: dropboxState.path && !dropboxState.error && r2History.daySets ? "ok" : "unavailable",
+        backup_checked_at_utc: dropboxState.path ? now.toISOString() : null,
+        backup_error: dropboxState.error || (dropboxState.path ? null : "Dropbox checkpoint is unavailable"),
+      };
     }
   }
 
@@ -2094,7 +2131,7 @@ async function fetchDashboardBaseData(
     }
   }
 
-  return {
+  return applyStorageIngestCoverage(env, {
     project_ref: extractProjectRef(String(env.SUPABASE_URL || "")),
     obs_aqidb_project_ref: extractProjectRef(String(env.OBS_AQIDB_SUPABASE_URL || "")),
     generated_at: now.toISOString(),
@@ -2123,17 +2160,18 @@ async function fetchDashboardBaseData(
     dropbox_backup_state_fallback_attempted,
     dropbox_backup_observations_earliest_day,
     dropbox_backup_observations_latest_day,
-    dropbox_backup_aqilevels_earliest_day,
-    dropbox_backup_aqilevels_latest_day,
     storage_coverage_source: "live_per_day_presence",
     storage_coverage_days,
+    obs_aqidb_coverage_error,
+    obs_aqidb_coverage_generated_at,
+    storage_coverage_independent_sources,
     r2_history_read_version,
     r2_history_read_version_effective,
     pollutants: pollutantsPayload,
     dispatch_runs: dispatchRuns,
     dispatcher_settings: dispatcherSettings,
     connectors_settings: connectorsSettings,
-  };
+  }, options.forceRefresh);
 }
 
 function dashboardCacheKey(search: URLSearchParams, env: WorkerEnv): string {
@@ -2148,12 +2186,14 @@ export async function getDirectDashboardPayload(
   env: WorkerEnv,
   search: URLSearchParams,
 ): Promise<DashboardPayload> {
-  const forceRefresh = asTruthy(search.get("force"));
+  const forceRefresh = ["force", "refresh", "nocache", "cache_bust", "cacheBust"].some(key => asTruthy(search.get(key)));
+  if (forceRefresh) clearStorageCoverageCaches();
+  const revision = coverageRefreshRevision;
   const cacheKey = dashboardCacheKey(search, env);
   if (!forceRefresh) {
     const cached = dashboardCache.get(cacheKey);
     if (cached && Date.now() <= cached.expiresAt) {
-      return { ...cached.value, r2_usage: guardR2Usage(cached.value.r2_usage, env) };
+      return applyStorageIngestCoverage(env, { ...cached.value, r2_usage: guardR2Usage(cached.value.r2_usage, env) });
     }
   }
 
@@ -2169,7 +2209,7 @@ export async function getDirectDashboardPayload(
     payload.r2_domain_size_metrics_error = "Historical domain byte metrics have no generation identity; unavailable for v3";
   }
   const freshUntil = billingTimestamp(payload.r2_usage?.billing_period_fresh_until_utc);
-  dashboardCache.set(cacheKey, { value: payload, expiresAt: Math.min(Date.now() + DASHBOARD_TTL_MS, Number.isFinite(freshUntil) ? freshUntil : Infinity) });
+  if (revision === coverageRefreshRevision) dashboardCache.set(cacheKey, { value: payload, expiresAt: Math.min(Date.now() + DASHBOARD_TTL_MS, Number.isFinite(freshUntil) ? freshUntil : Infinity) });
   payload.r2_usage = guardR2Usage(payload.r2_usage, env);
   return payload;
 }
@@ -2181,6 +2221,11 @@ export async function getDirectStorageCoveragePayload(
   generated_at: string;
   storage_coverage_source: string;
   storage_coverage_days: unknown[];
+  ingest_coverage?: IngestCoverageMetadata;
+  ingest_coverage_error?: string | null;
+  obs_aqidb_coverage_error?: string | null;
+  obs_aqidb_coverage_generated_at?: string | null;
+  storage_coverage_independent_sources?: JsonObject;
   r2_backup_window: JsonObject | null;
   r2_backup_window_error: string | null;
   r2_history_days_bucket: string | null;
@@ -2196,18 +2241,17 @@ export async function getDirectStorageCoveragePayload(
   dropbox_backup_state_fallback_attempted: boolean;
   dropbox_backup_observations_earliest_day: string | null;
   dropbox_backup_observations_latest_day: string | null;
-  dropbox_backup_aqilevels_earliest_day: string | null;
-  dropbox_backup_aqilevels_latest_day: string | null;
 }> {
-  const forceRefresh = asTruthy(search.get("force"));
+  const forceRefresh = ["force", "refresh", "nocache", "cache_bust", "cacheBust"].some(key => asTruthy(search.get(key)));
   if (forceRefresh) {
     clearStorageCoverageCaches();
   }
+  const revision = coverageRefreshRevision;
   const cacheKey = storageCoverageCacheKey(env);
   if (!forceRefresh && storageCoverageCacheVersionKey === cacheKey) {
     const cached = cacheGet(storageCoverageCache);
     if (cached) {
-      return cached;
+      return applyStorageIngestCoverage(env, cached);
     }
   }
   const payload = await fetchDashboardBaseData(env, {
@@ -2220,6 +2264,11 @@ export async function getDirectStorageCoveragePayload(
   const response = {
     generated_at: nowIso(),
     storage_coverage_source: payload.storage_coverage_source,
+    ingest_coverage: payload.ingest_coverage,
+    ingest_coverage_error: payload.ingest_coverage_error,
+    obs_aqidb_coverage_error: payload.obs_aqidb_coverage_error,
+    obs_aqidb_coverage_generated_at: payload.obs_aqidb_coverage_generated_at,
+    storage_coverage_independent_sources: payload.storage_coverage_independent_sources,
     storage_coverage_days: Array.isArray(payload.storage_coverage_days) ? payload.storage_coverage_days : [],
     r2_backup_window: payload.r2_backup_window || null,
     r2_backup_window_error: payload.r2_backup_window_error || null,
@@ -2236,11 +2285,11 @@ export async function getDirectStorageCoveragePayload(
     dropbox_backup_state_fallback_attempted: payload.dropbox_backup_state_fallback_attempted || false,
     dropbox_backup_observations_earliest_day: payload.dropbox_backup_observations_earliest_day || null,
     dropbox_backup_observations_latest_day: payload.dropbox_backup_observations_latest_day || null,
-    dropbox_backup_aqilevels_earliest_day: payload.dropbox_backup_aqilevels_earliest_day || null,
-    dropbox_backup_aqilevels_latest_day: payload.dropbox_backup_aqilevels_latest_day || null,
   };
-  storageCoverageCacheVersionKey = cacheKey;
-  storageCoverageCache = { value: response, expiresAt: Date.now() + STORAGE_COVERAGE_TTL_MS };
+  if (revision === coverageRefreshRevision) {
+    storageCoverageCacheVersionKey = cacheKey;
+    storageCoverageCache = { value: response, expiresAt: Date.now() + STORAGE_COVERAGE_TTL_MS };
+  }
   return response;
 }
 
@@ -2248,7 +2297,7 @@ export async function getDirectR2MetricsPayload(
   env: WorkerEnv,
   search: URLSearchParams,
 ): Promise<JsonObject> {
-  const forceRefresh = asTruthy(search.get("force"));
+  const forceRefresh = ["force", "refresh", "nocache", "cache_bust", "cacheBust"].some(key => asTruthy(search.get(key)));
   const [r2Usage, r2History] = await Promise.all([
     fetchR2Usage(env, forceRefresh),
     fetchR2HistoryDays(env, forceRefresh),
@@ -2345,7 +2394,7 @@ export async function getDirectDropboxMtimePayload(
   env: WorkerEnv,
   search: URLSearchParams,
 ): Promise<JsonObject> {
-  const forceRefresh = asTruthy(search.get("force"));
+  const forceRefresh = ["force", "refresh", "nocache", "cache_bust", "cacheBust"].some(key => asTruthy(search.get(key)));
   if (!forceRefresh) {
     const cached = cacheGet(dropboxMtimeCache);
     if (cached) {
@@ -2544,6 +2593,7 @@ export async function updateDirectConnectors(env: WorkerEnv, request: Request): 
     }
   }
   dashboardCache.clear();
+  obsObservationCache = null;
   return buildJsonResponse({ status: "ok" }, 200, "no-store");
 }
 
@@ -2576,6 +2626,7 @@ export async function updateDirectDispatcherSettings(env: WorkerEnv, request: Re
     return errorEnvelope("UPSTREAM_HTTP_ERROR", `Failed to update dispatcher settings (${response.status}): ${detail}`, 502);
   }
   dashboardCache.clear();
+  obsObservationCache = null;
   return buildJsonResponse({ status: "ok" }, 200, "no-store");
 }
 

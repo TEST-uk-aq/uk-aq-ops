@@ -22,7 +22,6 @@ type Evidence = {
 type SourceCache = {
   revision: number;
   entries: Map<string, { expires: number; evidence: Evidence }>;
-  pending: Map<string, Promise<Evidence>>;
 };
 const sources = new Map<string, SourceCache>();
 const DAY_MS = 86400000;
@@ -53,6 +52,8 @@ function validateChunk(value: unknown, from: string, to: string): { days: Map<st
     || payload.from_day_utc !== from || payload.to_day_utc_exclusive !== to
     || payload.checked_day_count !== count || !Array.isArray(payload.days) || payload.days.length !== count
     || !timestamp(payload.checked_at_utc)
+    || Date.parse(payload.checked_at_utc) > Date.now() + 60000
+    || Date.parse(payload.checked_at_utc) < Date.now() - TTL_MS
     || payload.current_day_utc !== payload.checked_at_utc.slice(0, 10)
     || to > addDays(String(payload.current_day_utc), 1)) {
     throw new Error("IngestDB daily presence response failed validation");
@@ -72,7 +73,7 @@ function validateChunk(value: unknown, from: string, to: string): { days: Map<st
 async function load(connection: PresenceConnection, from: string, to: string, force: boolean): Promise<Evidence> {
   let source = sources.get(connection.key);
   if (!source) {
-    source = { revision: 0, entries: new Map(), pending: new Map() };
+    source = { revision: 0, entries: new Map() };
     // Environment-bound cache identities; bounded process memory, no persisted authority.
     if (sources.size >= 8) sources.delete(sources.keys().next().value!);
     sources.set(connection.key, source);
@@ -80,52 +81,50 @@ async function load(connection: PresenceConnection, from: string, to: string, fo
   if (force) {
     source.revision++;
     source.entries.clear();
-    source.pending.clear();
   }
   const range = from + ":" + to;
   const cached = source.entries.get(range);
   if (cached && Date.now() < cached.expires) return cached.evidence;
-  const pending = source.pending.get(range);
-  if (pending) return pending;
   const revision = source.revision;
   const currentSource = source;
-  const task = (async (): Promise<Evidence> => {
-    const checked: string[] = [];
-    const days = new Map<string, boolean>();
-    let error: string | null = null;
-    try {
-      for (let cursor = from; cursor < to;) {
-        const end = addDays(cursor, Math.min(366, (Date.parse(to) - Date.parse(cursor)) / DAY_MS));
-        const chunk = validateChunk(await connection.fetchChunk(cursor, end), cursor, end);
-        for (const [day, present] of chunk.days) days.set(day, present);
-        checked.push(chunk.checked);
-        cursor = end;
-      }
-    } catch {
-      // Bounded diagnostic; no provider body, URL or credentials in public errors.
-      error = "Authoritative IngestDB daily presence is unavailable or invalid";
+  // Keep provider I/O owned by this request; only completed data is shared.
+  const checked: string[] = [];
+  const days = new Map<string, boolean>();
+  let error: string | null = null;
+  try {
+    for (let cursor = from; cursor < to;) {
+      const end = addDays(cursor, Math.min(366, (Date.parse(to) - Date.parse(cursor)) / DAY_MS));
+      const chunk = validateChunk(await connection.fetchChunk(cursor, end), cursor, end);
+      for (const [day, present] of chunk.days) days.set(day, present);
+      checked.push(chunk.checked);
+      cursor = end;
     }
-    if (revision !== currentSource.revision) return load(connection, from, to, false);
-    checked.sort((a, b) => Date.parse(a) - Date.parse(b));
-    const expires = error ? Date.now() + 30000 : Math.min(Date.now() + TTL_MS, Date.parse(checked[0]) + TTL_MS);
-    const evidence: Evidence = {
-      days: error ? null : days,
-      error,
-      metadata: {
-        source: RPC, status: error ? "unavailable" : "ok",
-        checked_at_utc: error ? null : checked[0],
-        checked_through_utc: error ? null : checked[checked.length - 1],
-        expires_at_utc: new Date(expires).toISOString(),
-        from_day_utc: from, to_day_utc_exclusive: to, stale: false,
-      },
-    };
-    if (currentSource.entries.size >= 8) currentSource.entries.delete(currentSource.entries.keys().next().value!);
-    currentSource.entries.set(range, { expires, evidence });
-    return evidence;
-  })();
-  source.pending.set(range, task);
-  try { return await task; }
-  finally { if (source.pending.get(range) === task) source.pending.delete(range); }
+  } catch {
+    // Bounded diagnostic; no provider body, URL or credentials in public errors.
+    error = "Authoritative IngestDB daily presence is unavailable or invalid";
+  }
+  if (revision !== currentSource.revision) return load(connection, from, to, false);
+  checked.sort((a, b) => Date.parse(a) - Date.parse(b));
+  const expires = error ? Date.now() + 30000 : Math.min(Date.now() + TTL_MS, Date.parse(checked[0]) + TTL_MS);
+  const evidence: Evidence = {
+    days: error ? null : days,
+    error,
+    metadata: {
+      source: RPC, status: error ? "unavailable" : "ok",
+      checked_at_utc: error ? null : checked[0],
+      checked_through_utc: error ? null : checked[checked.length - 1],
+      expires_at_utc: new Date(expires).toISOString(),
+      from_day_utc: from, to_day_utc_exclusive: to, stale: false,
+    },
+  };
+  const existing = currentSource.entries.get(range);
+  if (existing && existing.expires > Date.now()
+    && Date.parse(existing.evidence.metadata.checked_at_utc || "") > Date.parse(evidence.metadata.checked_at_utc || "")) {
+    return existing.evidence;
+  }
+  if (currentSource.entries.size >= 8) currentSource.entries.delete(currentSource.entries.keys().next().value!);
+  currentSource.entries.set(range, { expires, evidence });
+  return evidence;
 }
 
 export function stripRetiredCalendarCoverage<T extends { storage_coverage_days: unknown[] }>(payload: T): T {
@@ -151,6 +150,16 @@ export async function applyIngestDayPresence<T extends { storage_coverage_days: 
   }).sort();
   if (!dates.length) return clean;
   const from = dates[0], to = addDays(dates[dates.length - 1], 1);
+  // A proxied local fingerprint diagnostic is not the hosted RPC's result.
+  // Preserve its provenance without letting legacy fields mask fresh RPC flags.
+  const hosted = clean as T & JsonObject;
+  const upstreamDiagnostics: JsonObject = {};
+  for (const key of ["ingest_coverage_warning", "ingest_coverage_failed_days",
+    "ingest_coverage_checked_day_count", "ingest_coverage_diagnostics_updated_at"]) {
+    if (key in hosted) upstreamDiagnostics[key] = hosted[key];
+    delete hosted[key];
+  }
+  if (Object.keys(upstreamDiagnostics).length) Object.assign(clean, { upstream_ingest_coverage: upstreamDiagnostics });
   let evidence: Evidence;
   try { evidence = await load(connection(), from, to, force); }
   catch {

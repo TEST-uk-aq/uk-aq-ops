@@ -29,9 +29,7 @@
         --shadow: 0 20px 40px rgba(34, 24, 12, 0.12);
         --color-ingest-db: #FE2E2E;
         --color-r2-observs: #F48021;
-        --color-r2-aqilevels: #F4C04B;
         --color-obsaqi-observs: #3C82F5;
-        --color-obsaqi-aqilevels: #61D836;
       }
 
       * {
@@ -764,7 +762,7 @@
         flex: 1 1 auto;
         min-height: 0;
         display: grid;
-        grid-template-rows: repeat(3, minmax(0, 1fr));
+        grid-template-rows: repeat(4, minmax(0, 1fr));
         gap: 6px;
       }
 
@@ -834,37 +832,6 @@
         white-space: nowrap;
       }
 
-      .coverage-bar-label.has-secondary .coverage-bar-label-primary {
-        font-size: 12px;
-      }
-
-      .coverage-bar-label-secondary {
-        display: inline-flex;
-        align-items: center;
-        gap: 3px;
-        margin-top: 1px;
-        font-size: 12px;
-        font-weight: 700;
-        line-height: 1;
-        white-space: nowrap;
-        opacity: 0.95;
-      }
-
-      .coverage-bar-label-secondary.is-dropbox-badge {
-        color: #ffffff;
-      }
-
-      .coverage-bar-label-secondary-icon {
-        width: 12px;
-        height: 12px;
-        display: inline-block;
-      }
-
-      .coverage-bar-label-secondary-icon.is-dropbox-blue {
-        filter: none !important;
-        opacity: 1;
-      }
-
       .coverage-bar-ingest {
         background: var(--color-ingest-db);
       }
@@ -873,34 +840,39 @@
         background: var(--color-r2-observs);
       }
 
-      .coverage-bar-r2-aqilevels {
-        background: var(--color-r2-aqilevels);
-      }
-
       .coverage-bar-obsaqi-observs {
         background: var(--color-obsaqi-observs);
       }
 
-      .coverage-bar-obsaqi-aqilevels {
-        background: var(--color-obsaqi-aqilevels);
+      .coverage-bar-dropbox-observs {
+        background: #ffffff;
+        border: 2px solid var(--color-r2-observs);
       }
 
-      .coverage-bar-dropbox-only-observs {
-        background: var(--color-r2-observs);
-        border: 0;
+      .coverage-bar-dropbox-observs .coverage-bar-label {
+        color: #1f1c16;
+        text-shadow: none;
       }
 
-      .coverage-bar-dropbox-only-aqilevels {
-        background: var(--color-r2-aqilevels);
-        border: 0;
+      .coverage-bar.is-unknown,
+      .coverage-square.is-unknown {
+        background: #eeeeee;
+        border: 1px dashed #777777;
+        color: #4b443a;
+        justify-content: center;
+        text-align: center;
+        font-size: 11px;
+        line-height: 1;
       }
 
-      .coverage-bar-aqilevels-striped {
-        background: repeating-linear-gradient(
-          45deg,
-          var(--color-r2-aqilevels) 0 22px,
-          var(--color-obsaqi-aqilevels) 22px 44px
-        );
+      .coverage-day-cell:focus-visible,
+      .coverage-year-day:focus-visible {
+        outline: 2px solid var(--accent-2);
+        outline-offset: 2px;
+      }
+
+      .coverage-source-warning {
+        color: #805000;
       }
 
       .coverage-year-grid {
@@ -1080,17 +1052,10 @@
         min-height: 0;
       }
 
-      .coverage-square-dropbox-only-observs,
-      .coverage-square-dropbox-only-aqilevels {
-        box-sizing: border-box;
-      }
-
-      .coverage-square-dropbox-only-observs {
-        background-color: var(--color-r2-observs);
-      }
-
-      .coverage-square-dropbox-only-aqilevels {
-        background-color: var(--color-r2-aqilevels);
+      .coverage-square {
+        display: flex;
+        align-items: center;
+        justify-content: center;
       }
 
       .coverage-square.has-backup-icon {
@@ -1697,6 +1662,21 @@
           width: 100%;
         }
 
+        .coverage-day-cell {
+          padding: 3px;
+          min-width: 0;
+          min-height: 150px;
+        }
+
+        .coverage-day-weekday {
+          display: none;
+        }
+
+        .coverage-bar-label {
+          padding: 2px 3px;
+          font-size: 10px;
+        }
+
         .coverage-year-grid {
           grid-template-columns: 1fr;
         }
@@ -2081,8 +2061,6 @@
       const STORAGE_COVERAGE_MONTH_STORAGE_KEY = "uk_aq_storage_coverage_month";
       const STORAGE_COVERAGE_MODE_STORAGE_KEY = "uk_aq_storage_coverage_mode";
       const STORAGE_COVERAGE_MODE_VALUES = new Set(["month", "year"]);
-      const R2_CONNECTOR_COUNTS_MODE_STORAGE_KEY = "uk_aq_r2_connector_counts_mode";
-      const R2_CONNECTOR_COUNTS_MODE_VALUES = new Set(["stacked", "observs", "aqi"]);
       const R2_CONNECTOR_COUNTS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
       const STORAGE_COVERAGE_MANUAL_TIMEOUT_MS = 3 * 60 * 1000;
       const STORAGE_COVERAGE_STATUS_POLL_MS = 1000;
@@ -2105,7 +2083,6 @@
       let dbSizePeriodHours = 24;
       let storageCoverageMonthCursor = null;
       let storageCoverageMode = "month";
-      let r2ConnectorCountsMode = "stacked";
       let latestDashboardData = null;
       let r2MetricsRequestInFlight = false;
       let r2RefreshPollTimer = null;
@@ -2115,6 +2092,8 @@
       let dashboardLoadSequence = 0;
       let storageCoverageLoadSequence = 0;
       let manualStorageCoverageRefresh = null;
+      let latestStorageCoveragePayload = null;
+      const storageCoverageSourceWatermarks = new Map();
       let r2ConnectorCountsLoadSequence = 0;
       let operationsLoadSequence = 0;
       const R2_CONNECTOR_CHARTS = [
@@ -2122,49 +2101,41 @@
           connectorId: 1,
           title: "SOS",
           observsColor: "#013566",
-          aqiColor: "#015FA4",
         },
         {
           connectorId: 2,
           title: "Breathe London Nodes",
           observsColor: "#4B443A",
-          aqiColor: "#A08D74",
         },
         {
           connectorId: 3,
           title: "Breathe London Communities",
           observsColor: "#007A6C",
-          aqiColor: "#279F8D",
         },
         {
           connectorId: 6,
           title: "Open AQ",
           observsColor: "#000000",
-          aqiColor: "#1A8BFF",
         },
         {
           connectorId: 7,
           title: "Sensor.Community",
           observsColor: "#000000",
-          aqiColor: "#6ECE98",
         },
         {
           connectorId: 9,
           title: "WAQN",
           observsColor: "#4B443A",
-          aqiColor: "#A08D74",
         },
         {
           connectorId: 10,
           title: "SAQN",
           observsColor: "#4B443A",
-          aqiColor: "#A08D74",
         },
         {
           connectorId: 11,
           title: "NI-Air",
           observsColor: "#4B443A",
-          aqiColor: "#A08D74",
         },
       ];
 
@@ -2222,13 +2193,6 @@
         const storedCoverageMode = localStorage.getItem(STORAGE_COVERAGE_MODE_STORAGE_KEY);
         if (storedCoverageMode && STORAGE_COVERAGE_MODE_VALUES.has(storedCoverageMode)) {
           storageCoverageMode = storedCoverageMode;
-        }
-        const storedR2ConnectorCountsMode = localStorage.getItem(R2_CONNECTOR_COUNTS_MODE_STORAGE_KEY);
-        if (
-          storedR2ConnectorCountsMode &&
-          R2_CONNECTOR_COUNTS_MODE_VALUES.has(storedR2ConnectorCountsMode)
-        ) {
-          r2ConnectorCountsMode = storedR2ConnectorCountsMode;
         }
       } catch (_err) {
         // Ignore storage read issues and use defaults.
@@ -4388,349 +4352,161 @@
         return panel;
       }
 
-      /**
-       * @typedef {Object} DayCoverage
-       * @property {string} date
-       * @property {boolean} ingest
-       * @property {boolean} obsAqiObservs
-       * @property {boolean} obsAqiAqilevels
-       * @property {boolean} r2Observs
-       * @property {boolean} r2Aqilevels
-       * @property {boolean=} isToday
-       */
+      // Fixed source positions preserve every independently checked storage layer.
+      const COVERAGE_SOURCES = [
+        { field: "ingest", rawField: "ingest", label: "IngestDB", className: "coverage-bar-ingest" },
+        { field: "obsAqiObservs", rawField: "obs_aqi_observs", alias: "observs", label: "ObsAQIDB observations", className: "coverage-bar-obsaqi-observs" },
+        { field: "r2Observs", rawField: "r2_observs", alias: "r2", label: "R2 observations", className: "coverage-bar-r2-observs" },
+        { field: "dropboxObservs", rawField: "dropbox_observs", label: "Dropbox observations", className: "coverage-bar-dropbox-observs", dropbox: true },
+      ];
 
-      function normalizeDayCoverageRows(rows) {
-        if (!Array.isArray(rows)) {
-          return [];
-        }
-        return rows
-          .map((row) => {
-            const dateObj = parseUtcDateKey(row && row.date);
-            if (!dateObj) {
-              return null;
-            }
-            const obsAqiObservs = row && row.obs_aqi_observs !== undefined
-              ? Boolean(row.obs_aqi_observs)
-              : Boolean(row && row.observs);
-            const obsAqiAqilevels = row && row.obs_aqi_aqilevels !== undefined
-              ? Boolean(row.obs_aqi_aqilevels)
-              : Boolean(row && row.aqilevels);
-            const r2Observs = row && row.r2_observs !== undefined
-              ? Boolean(row.r2_observs)
-              : Boolean(row && row.r2);
-            const r2Aqilevels = row && row.r2_aqilevels !== undefined
-              ? Boolean(row.r2_aqilevels)
-              : false;
-            const dropboxObservs = row && row.dropbox_observs !== undefined
-              ? Boolean(row.dropbox_observs)
-              : false;
-            const dropboxAqilevels = row && row.dropbox_aqilevels !== undefined
-              ? Boolean(row.dropbox_aqilevels)
-              : false;
-            const ingest = Boolean(row && row.ingest) && !r2Observs;
-            return {
-              date: toUtcDateKey(dateObj),
-              ingest,
-              obsAqiObservs,
-              obsAqiAqilevels,
-              r2Observs,
-              r2Aqilevels,
-              dropboxObservs,
-              dropboxAqilevels,
-              isToday: Boolean(row && row.isToday),
-            };
-          })
-          .filter(Boolean);
+      function normalizeCoveragePresence(row, field, alias) {
+        const value = row && row[field] !== undefined ? row[field] : alias && row && row[alias];
+        return typeof value === "boolean" ? value : null;
+      }
+
+      function normalizeDayCoverageRows(rows, payload = latestStorageCoveragePayload || {}) {
+        if (!Array.isArray(rows)) return [];
+        const failedIngestDays = new Set(
+          (Array.isArray(payload.ingest_coverage_failed_days) ? payload.ingest_coverage_failed_days : [])
+            .map((entry) => entry && entry.day_utc),
+        );
+        return rows.map((row) => {
+          const dateObj = parseUtcDateKey(row && row.date);
+          if (!dateObj) return null;
+          const date = toUtcDateKey(dateObj);
+          const normalized = { date, isToday: Boolean(row && row.isToday) };
+          COVERAGE_SOURCES.forEach((source) => {
+            normalized[source.field] = normalizeCoveragePresence(row, source.rawField, source.alias);
+          });
+          if (failedIngestDays.has(date) || payload.ingest_coverage?.status === "unavailable") {
+            normalized.ingest = null;
+          }
+          return normalized;
+        }).filter(Boolean);
       }
 
       function resolveCoverageRowsForMonth(_monthStartUtc, serverCoverageRows) {
-        const normalizedRows = normalizeDayCoverageRows(serverCoverageRows);
-        return { rows: normalizedRows, source: "api" };
+        return { rows: normalizeDayCoverageRows(serverCoverageRows), source: "api" };
       }
 
       function buildCoverageCalendarCells(monthStartUtc, dayCoverageRows, includeTodayCoverage = false) {
         const todayKey = toUtcDateKey(startOfUtcDay(new Date()));
-        const coverageByDate = new Map(
-          dayCoverageRows.map((row) => [row.date, row]),
-        );
+        const coverageByDate = new Map(dayCoverageRows.map((row) => [row.date, row]));
         const monthEndUtc = addUtcDays(addUtcMonths(monthStartUtc, 1), -1);
         const leadingDays = (monthStartUtc.getUTCDay() + 6) % 7;
         const trailingDays = 6 - ((monthEndUtc.getUTCDay() + 6) % 7);
         const gridStartUtc = addUtcDays(monthStartUtc, -leadingDays);
         const gridEndUtc = addUtcDays(monthEndUtc, trailingDays);
-
         const cells = [];
-        for (
-          let cursor = new Date(gridStartUtc.getTime());
-          cursor <= gridEndUtc;
-          cursor = addUtcDays(cursor, 1)
-        ) {
+        for (let cursor = new Date(gridStartUtc.getTime()); cursor <= gridEndUtc; cursor = addUtcDays(cursor, 1)) {
           const dateKey = toUtcDateKey(cursor);
-          const weekdayIndex = (cursor.getUTCDay() + 6) % 7;
-          const row = coverageByDate.get(dateKey) || {
-            date: dateKey,
-            ingest: false,
-            obsAqiObservs: false,
-            obsAqiAqilevels: false,
-            r2Observs: false,
-            r2Aqilevels: false,
-            dropboxObservs: false,
-            dropboxAqilevels: false,
-            isToday: dateKey === todayKey,
-          };
-          const isToday = Boolean(row.isToday) || dateKey === todayKey;
-          const showCoverage = includeTodayCoverage || !isToday;
+          const row = coverageByDate.get(dateKey) || { date: dateKey };
+          const isToday = dateKey === todayKey;
+          const isFuture = dateKey > todayKey;
+          const excluded = isFuture || (!includeTodayCoverage && isToday);
+          const coverage = { date: dateKey, isToday, isFuture, excluded };
+          COVERAGE_SOURCES.forEach((source) => {
+            coverage[source.field] = excluded ? null : (typeof row[source.field] === "boolean" ? row[source.field] : null);
+          });
           cells.push({
-            date: new Date(cursor.getTime()),
-            dateKey,
+            date: new Date(cursor.getTime()), dateKey,
             isInMonth: sameUtcMonth(cursor, monthStartUtc),
             dayNumber: cursor.getUTCDate(),
-            weekdayLabel: COVERAGE_WEEKDAY_NAMES[weekdayIndex],
-            coverage: {
-              date: row.date,
-              ingest: showCoverage && Boolean(row.ingest),
-              obsAqiObservs: showCoverage && Boolean(row.obsAqiObservs),
-              obsAqiAqilevels: showCoverage && Boolean(row.obsAqiAqilevels),
-              r2Observs: showCoverage && Boolean(row.r2Observs),
-              r2Aqilevels: showCoverage && Boolean(row.r2Aqilevels),
-              dropboxObservs: showCoverage && Boolean(row.dropboxObservs),
-              dropboxAqilevels: showCoverage && Boolean(row.dropboxAqilevels),
-              isToday,
-            },
+            weekdayLabel: COVERAGE_WEEKDAY_NAMES[(cursor.getUTCDay() + 6) % 7],
+            coverage,
           });
         }
         return cells;
       }
 
-      function summarizeCoverageSources(coverage) {
-        const sources = [];
-        if (coverage.ingest) {
-          sources.push("Ingest DB");
-        }
-        if (coverage.r2Observs) {
-          sources.push("R2 History - Obs");
-        }
-        if (coverage.r2Aqilevels) {
-          sources.push("R2 History - AQI");
-        }
-        if (coverage.obsAqiObservs) {
-          sources.push("ObsAQI DB - Obs");
-        }
-        if (coverage.obsAqiAqilevels) {
-          sources.push("ObsAQI DB - AQI");
-        }
-        if (coverage.dropboxObservs) {
-          sources.push("Backup - Obs");
-        }
-        if (coverage.dropboxAqilevels) {
-          sources.push("Backup - AQI");
-        }
-        return sources;
+      function summarizeCoverageSources(coverage, state = true) {
+        return COVERAGE_SOURCES.filter((source) => coverage[source.field] === state).map((source) => source.label);
       }
 
       function resolveCoverageBarLayers(coverage) {
-        let topLayer = coverage.r2Observs
-          ? { key: "r2-observs", label: "R2 History - Obs", className: "coverage-bar-r2-observs", dropboxDomain: "observations" }
-          : coverage.dropboxObservs
-            ? {
-                key: "dropbox-observs",
-                label: "Backup - Obs",
-                className: "coverage-bar-dropbox-only-observs",
-                dropboxDomain: "observations",
-                dropboxOnly: true,
-                primaryDropboxIcon: true,
-              }
-          : coverage.ingest
-            ? { key: "ingest", label: "Ingest DB", className: "coverage-bar-ingest" }
-            : null;
-        let middleLayer = coverage.obsAqiObservs
-          ? { key: "obsaqi-observs", label: "ObsAQI DB - Obs", className: "coverage-bar-obsaqi-observs" }
-          : null;
-        let bottomLayer = null;
-        if (coverage.r2Aqilevels && coverage.obsAqiAqilevels) {
-          bottomLayer = {
-            key: "aqilevels-striped",
-            label: "R2 History - AQI + ObsAQI DB - AQI",
-            className: "coverage-bar-aqilevels-striped",
-            dropboxDomain: "both",
-            hideLabel: true,
+        return COVERAGE_SOURCES.map((source) => {
+          if (coverage.excluded || coverage[source.field] === false) return null;
+          const unknown = coverage[source.field] !== true;
+          return {
+            ...source, unknown,
+            label: `${source.label}${unknown ? " • coverage unknown/unavailable" : ""}`,
+            className: unknown ? "is-unknown" : source.className,
           };
-        } else if (coverage.r2Aqilevels) {
-          bottomLayer = {
-            key: "r2-aqilevels",
-            label: "R2 History - AQI",
-            className: "coverage-bar-r2-aqilevels",
-            dropboxDomain: "aqilevels",
-          };
-        } else if (coverage.dropboxAqilevels) {
-          bottomLayer = {
-            key: "dropbox-aqilevels",
-            label: "Backup - AQI",
-            className: "coverage-bar-dropbox-only-aqilevels",
-            dropboxDomain: "aqilevels",
-            dropboxOnly: true,
-            primaryDropboxIcon: true,
-          };
-        } else if (coverage.obsAqiAqilevels) {
-          bottomLayer = {
-            key: "obsaqi-aqilevels",
-            label: "ObsAQI DB - AQI",
-            className: "coverage-bar-obsaqi-aqilevels",
-          };
-        }
-        if (
-          !middleLayer &&
-          topLayer &&
-          (topLayer.key === "r2-observs" || topLayer.key === "dropbox-observs") &&
-          bottomLayer &&
-          (bottomLayer.key === "r2-aqilevels" || bottomLayer.key === "dropbox-aqilevels")
-        ) {
-          middleLayer = bottomLayer;
-          bottomLayer = null;
-        }
-        return { topLayer, middleLayer, bottomLayer };
-      }
-
-      function coverageLayerHasDropboxBackup(layer, coverage) {
-        if (!layer || !coverage || layer.dropboxOnly) {
-          return false;
-        }
-        if (layer.dropboxDomain === "observations") {
-          return Boolean(coverage.dropboxObservs);
-        }
-        if (layer.dropboxDomain === "aqilevels") {
-          return Boolean(coverage.dropboxAqilevels);
-        }
-        if (layer.dropboxDomain === "both") {
-          return Boolean(coverage.dropboxObservs) && Boolean(coverage.dropboxAqilevels);
-        }
-        return false;
+        });
       }
 
       function resolveCoverageSquareLayers(coverage) {
-        const slots = [null, null, null, null];
-        if (coverage.isToday) {
-          return slots;
-        }
-        if (coverage.ingest) {
-          slots[0] = { key: "ingest", label: "Ingest DB", className: "coverage-bar-ingest" };
-          if (coverage.obsAqiObservs) {
-            slots[2] = {
-              key: "obsaqi-observs-bottom",
-              label: "ObsAQI DB - Obs",
-              className: "coverage-bar-obsaqi-observs",
-            };
-          }
-          if (coverage.obsAqiAqilevels) {
-            slots[3] = {
-              key: "obsaqi-aqilevels-bottom",
-              label: "ObsAQI DB - AQI",
-              className: "coverage-bar-obsaqi-aqilevels",
-            };
-          }
-          return slots;
-        }
-        if (coverage.obsAqiObservs) {
-          slots[0] = {
-            key: "obsaqi-observs-top",
-            label: "ObsAQI DB - Obs",
-            className: "coverage-bar-obsaqi-observs",
-          };
-        }
-        if (coverage.obsAqiAqilevels) {
-          slots[1] = {
-            key: "obsaqi-aqilevels-top",
-            label: "ObsAQI DB - AQI",
-            className: "coverage-bar-obsaqi-aqilevels",
-          };
-        }
-        if (coverage.r2Observs) {
-          slots[2] = {
-            key: "r2-observs-bottom",
-            label: "R2 History - Obs",
-            className: "coverage-bar-r2-observs",
-            dropboxDomain: "observations",
-          };
-        } else if (coverage.dropboxObservs) {
-          slots[2] = {
-            key: "dropbox-observs-bottom",
-            label: "Backup - Obs",
-            className: "coverage-square-dropbox-only-observs",
-            dropboxDomain: "observations",
-            forceBackupIcon: true,
-          };
-        }
-        if (coverage.r2Aqilevels) {
-          slots[3] = {
-            key: "r2-aqilevels-bottom",
-            label: "R2 History - AQI",
-            className: "coverage-bar-r2-aqilevels",
-            dropboxDomain: "aqilevels",
-          };
-        } else if (coverage.dropboxAqilevels) {
-          slots[3] = {
-            key: "dropbox-aqilevels-bottom",
-            label: "Backup - AQI",
-            className: "coverage-square-dropbox-only-aqilevels",
-            dropboxDomain: "aqilevels",
-            forceBackupIcon: true,
-          };
-        }
-        return slots;
+        return resolveCoverageBarLayers(coverage);
       }
 
       function formatCoverageDayTooltip(cell) {
-        const cellSources = summarizeCoverageSources(cell.coverage);
-        if (cell.coverage.isToday && !cellSources.length) {
-          return `${cell.dateKey} • Today excluded (complete days only)`;
-        }
-        if (!cellSources.length) {
-          return `${cell.dateKey} • No data in storage layers`;
-        }
-        return `${cell.dateKey} • Sources: ${cellSources.join(", ")}`;
+        if (cell.coverage.isFuture) return `${cell.dateKey} • Future date`;
+        if (cell.coverage.excluded) return `${cell.dateKey} • Today excluded (complete days only)`;
+        const present = summarizeCoverageSources(cell.coverage);
+        const absent = summarizeCoverageSources(cell.coverage, false);
+        const unknown = summarizeCoverageSources(cell.coverage, null);
+        return [
+          cell.dateKey,
+          present.length ? `Sources: ${present.join(", ")}` : "",
+          absent.length ? `Confirmed absent: ${absent.join(", ")}` : "",
+          unknown.length ? `Unknown/unavailable: ${unknown.join(", ")}` : "",
+        ].filter(Boolean).join(" • ");
       }
 
       function renderCoverageYearGrid(yearStartUtc, dayCoverageRows) {
         const monthMarkup = Array.from({ length: 12 }, (_, monthOffset) => {
           const monthStartUtc = addUtcMonths(yearStartUtc, monthOffset);
           const monthCells = buildCoverageCalendarCells(monthStartUtc, dayCoverageRows);
-          const weekdayMarkup = COVERAGE_WEEKDAY_ABBREVIATIONS
-            .map((weekdayLabel) => `<span class="coverage-year-weekday">${weekdayLabel}</span>`)
-            .join("");
-          const dayMarkup = monthCells
-            .map((cell) => {
-              const outsideClass = cell.isInMonth ? "" : " is-outside";
-              const todayClass = cell.coverage.isToday ? " is-today" : "";
-              const slotLayers = cell.isInMonth
-                ? resolveCoverageSquareLayers(cell.coverage)
-                : [null, null, null, null];
-              const squaresMarkup = slotLayers
-                .map((layer) => {
-                  if (!layer) {
-                    return '<span class="coverage-square is-empty"></span>';
-                  }
-                  const hasBackupIcon = layer.forceBackupIcon || coverageLayerHasDropboxBackup(layer, cell.coverage);
-                  const backupClass = hasBackupIcon ? " has-backup-icon" : "";
-                  const squareTitle = hasBackupIcon ? `${layer.label} • Backup` : layer.label;
-                  return `<span class="coverage-square ${layer.className}${backupClass}" title="${escapeHtml(squareTitle)}"></span>`;
-                })
-                .join("");
-              return `
-                <div class="coverage-year-day${outsideClass}${todayClass}" title="${escapeHtml(formatCoverageDayTooltip(cell))}">
-                  <div class="coverage-square-grid">${squaresMarkup}</div>
-                </div>
-              `;
-            })
-            .join("");
-          return `
-            <section class="coverage-year-month">
-              <h3 class="coverage-year-month-title">${escapeHtml(formatCoverageMonthShortTitle(monthStartUtc))}</h3>
-              <div class="coverage-year-weekdays">${weekdayMarkup}</div>
-              <div class="coverage-year-days">${dayMarkup}</div>
-            </section>
-          `;
+          const weekdayMarkup = COVERAGE_WEEKDAY_ABBREVIATIONS.map((label) => `<span class="coverage-year-weekday">${label}</span>`).join("");
+          const dayMarkup = monthCells.map((cell) => {
+            const outsideClass = cell.isInMonth ? "" : " is-outside";
+            const todayClass = cell.coverage.isToday ? " is-today" : "";
+            const layers = cell.isInMonth ? resolveCoverageSquareLayers(cell.coverage) : [null, null, null, null];
+            const squares = layers.map((layer) => {
+              if (!layer) return '<span class="coverage-square is-empty" aria-hidden="true"></span>';
+              const iconClass = layer.dropbox && !layer.unknown ? " has-backup-icon" : "";
+              return `<span class="coverage-square ${layer.className}${iconClass}" title="${escapeHtml(layer.label)}" aria-hidden="true">${layer.unknown ? "?" : ""}</span>`;
+            }).join("");
+            const tooltip = escapeHtml(formatCoverageDayTooltip(cell));
+            return `<div class="coverage-year-day${outsideClass}${todayClass}" title="${tooltip}"${cell.isInMonth ? ` tabindex="0" role="img" aria-label="${tooltip}"` : ' aria-hidden="true"'}><div class="coverage-square-grid">${squares}</div></div>`;
+          }).join("");
+          return `<section class="coverage-year-month"><h3 class="coverage-year-month-title">${escapeHtml(formatCoverageMonthShortTitle(monthStartUtc))}</h3><div class="coverage-year-weekdays">${weekdayMarkup}</div><div class="coverage-year-days">${dayMarkup}</div></section>`;
         }).join("");
         return `<div class="coverage-year-grid">${monthMarkup}</div>`;
+      }
+
+      function coverageCacheMetadata(payload) {
+        return payload.local_cache?.storage_coverage || {};
+      }
+
+      function renderCoverageDiagnostics(payload = latestStorageCoveragePayload || {}) {
+        const cache = coverageCacheMetadata(payload);
+        const details = [];
+        const warnings = [];
+        const generatedAt = payload.storage_coverage_generated_at || cache.source_generated_at;
+        if (generatedAt) details.push(`Coverage generated ${generatedAt}`);
+        if (payload.ingest_coverage?.checked_at_utc) details.push(`IngestDB checked ${payload.ingest_coverage.checked_at_utc}`);
+        if (payload.storage_coverage_next_refresh_at) details.push(`next automatic refresh ${payload.storage_coverage_next_refresh_at}`);
+        if (payload.ingest_coverage?.expires_at_utc) details.push(`IngestDB evidence expires ${payload.ingest_coverage.expires_at_utc}`);
+        if (cache.state === "stale" || cache.stale || payload.ingest_coverage?.stale
+            || Date.parse(payload.ingest_coverage?.expires_at_utc || "") < Date.now()) warnings.push("Cached coverage is stale; showing previous evidence.");
+        if (cache.last_error_code) warnings.push(`Local cache: ${cache.last_error_code}`);
+        [payload.ingest_coverage_error, payload.ingest_coverage_warning, payload.r2_history_days_error,
+          payload.dropbox_backup_state_error, payload.obs_aqidb_coverage_error, payload.storage_coverage_response_warning]
+          .filter(Boolean).forEach((warning) => warnings.push(String(warning)));
+        const independent = payload.storage_coverage_independent_sources || {};
+        if (independent.r2_stale || independent.backup_stale || payload.obs_aqidb_coverage_stale) {
+          warnings.push("Some source evidence is stale; source timestamps identify the retained checks.");
+        }
+        Object.entries(independent).forEach(([key, value]) => {
+          if (key.endsWith("_error") && value) warnings.push(`${key.replace(/_/g, " ")}: ${value}`);
+        });
+        if (payload.ingest_coverage?.status === "unavailable") warnings.push("IngestDB coverage unavailable; absence is not confirmed.");
+        if (Array.isArray(payload.ingest_coverage_failed_days) && payload.ingest_coverage_failed_days.length) {
+          warnings.push(`IngestDB checks failed for ${payload.ingest_coverage_failed_days.length} day(s); those dates are unknown.`);
+        }
+        return `${details.length ? `<div class="footnote">${escapeHtml(details.join(" · "))}</div>` : ""}${warnings.length ? `<div class="footnote coverage-source-warning" role="status">${escapeHtml([...new Set(warnings)].join(" · "))}</div>` : ""}`;
       }
 
       function formatR2CountAxisValue(value) {
@@ -4803,7 +4579,6 @@
             connectorId,
             title: `Connector ${connectorId}`,
             observsColor: "#4B443A",
-            aqiColor: "#A08D74",
           });
         });
         return resolved.sort((a, b) => Number(a.connectorId) - Number(b.connectorId));
@@ -4827,11 +4602,6 @@
               observations_rows: 0,
               observations_present_days: 0,
               observations_avg_rows_per_day: 0,
-              aqilevels_rows: 0,
-              aqilevels_present_days: 0,
-              aqilevels_avg_rows_per_day: 0,
-              total_rows: 0,
-              total_avg_rows_per_day: 0,
             });
           }
           cursorDay = addUtcDays(parseUtcDateKey(cursorDay), 1);
@@ -4849,36 +4619,18 @@
       }
 
       function buildR2ConnectorBucketTooltip(config, bucket, isYearMode) {
-        const obsRows = Number(bucket?.observations_rows || 0);
-        const aqiRows = Number(bucket?.aqilevels_rows || 0);
-        const totalRows = obsRows + aqiRows;
         const periodLabel = isYearMode
           ? formatMonthYearLabel(bucket?.bucket_start_day_utc)
           : (formatDateDdMmYyyy(bucket?.bucket_start_day_utc) || String(bucket?.bucket_start_day_utc || ""));
-        if (isYearMode) {
-          return [
-            config.title,
-            periodLabel,
-            `Obs avg/day: ${formatRowRate(bucket?.observations_avg_rows_per_day || 0)}`,
-            `AQI avg/day: ${formatRowRate(bucket?.aqilevels_avg_rows_per_day || 0)}`,
-            `Obs rows: ${formatCount(obsRows)}`,
-            `AQI rows: ${formatCount(aqiRows)}`,
-            `Total rows: ${formatCount(totalRows)}`,
-            `Calendar days: ${formatCount(bucket?.calendar_day_count || 0)}`,
-          ].join("\n");
-        }
-        return [
-          config.title,
-          periodLabel,
-          `Obs rows: ${formatCount(obsRows)}`,
-          `AQI rows: ${formatCount(aqiRows)}`,
-          `Total rows: ${formatCount(totalRows)}`,
-        ].join("\n");
+        return [config.title, periodLabel,
+          isYearMode ? `Observation avg/day: ${formatRowRate(bucket?.observations_avg_rows_per_day || 0)}` : "",
+          `Observation rows: ${formatCount(Number(bucket?.observations_rows || 0))}`,
+          isYearMode ? `Calendar days: ${formatCount(bucket?.calendar_day_count || 0)}` : "",
+        ].filter(Boolean).join("\n");
       }
 
       function buildR2ConnectorChartSvg({ connectorConfig, entry, request, isYearMode }) {
         const buckets = normalizeR2ConnectorBuckets(entry, request);
-        const displayMode = r2ConnectorCountsMode;
         const width = 960;
         const height = 210;
         const margin = { top: 10, right: 10, bottom: 28, left: 44 };
@@ -4889,28 +4641,10 @@
         const stepX = innerWidth / bucketCount;
         const barWidth = Math.max(1.5, stepX * 0.72);
 
-        const seriesValues = buckets.map((bucket) => {
-          const obsValue = isYearMode
-            ? Number(bucket?.observations_avg_rows_per_day || 0)
-            : Number(bucket?.observations_rows || 0);
-          const aqiValue = isYearMode
-            ? Number(bucket?.aqilevels_avg_rows_per_day || 0)
-            : Number(bucket?.aqilevels_rows || 0);
-          return {
-            observations: obsValue,
-            aqilevels: aqiValue,
-            total: obsValue + aqiValue,
-          };
-        });
-        const maxValue = seriesValues.reduce((max, value) => {
-          if (displayMode === "observs") {
-            return Math.max(max, value.observations);
-          }
-          if (displayMode === "aqi") {
-            return Math.max(max, value.aqilevels);
-          }
-          return Math.max(max, value.total);
-        }, 0);
+        const seriesValues = buckets.map((bucket) => isYearMode
+          ? Number(bucket?.observations_avg_rows_per_day || 0)
+          : Number(bucket?.observations_rows || 0));
+        const maxValue = seriesValues.reduce((max, value) => Math.max(max, value), 0);
 
         if (maxValue <= 0) {
           return `<div class="coverage-connector-chart-empty">No R2 rows in the selected period.</div>`;
@@ -4922,36 +4656,10 @@
 
         const barsMarkup = buckets.map((bucket, index) => {
           const x = margin.left + index * stepX + (stepX - barWidth) / 2;
-          const obsValue = seriesValues[index].observations;
-          const aqiValue = seriesValues[index].aqilevels;
+          const y = yFor(seriesValues[index]);
+          const barHeight = Math.max(0, baselineY - y);
           const tooltip = escapeHtml(buildR2ConnectorBucketTooltip(connectorConfig, bucket, isYearMode));
-
-          if (displayMode === "observs" || displayMode === "aqi") {
-            const value = displayMode === "observs" ? obsValue : aqiValue;
-            const y = yFor(value);
-            const barHeight = Math.max(0, baselineY - y);
-            const color = displayMode === "observs"
-              ? connectorConfig.observsColor
-              : connectorConfig.aqiColor;
-            return `
-              <g>
-                <title>${tooltip}</title>
-                <rect x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${barWidth.toFixed(2)}" height="${barHeight.toFixed(2)}" rx="3" fill="${color}" />
-              </g>
-            `;
-          }
-
-          const aqiTopY = yFor(aqiValue);
-          const totalTopY = yFor(aqiValue + obsValue);
-          const aqiHeight = Math.max(0, baselineY - aqiTopY);
-          const obsHeight = Math.max(0, aqiTopY - totalTopY);
-          return `
-            <g>
-              <title>${tooltip}</title>
-              <rect x="${x.toFixed(2)}" y="${aqiTopY.toFixed(2)}" width="${barWidth.toFixed(2)}" height="${aqiHeight.toFixed(2)}" rx="3" fill="${connectorConfig.aqiColor}" />
-              <rect x="${x.toFixed(2)}" y="${totalTopY.toFixed(2)}" width="${barWidth.toFixed(2)}" height="${obsHeight.toFixed(2)}" rx="3" fill="${connectorConfig.observsColor}" />
-            </g>
-          `;
+          return `<g><title>${tooltip}</title><rect x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${barWidth.toFixed(2)}" height="${barHeight.toFixed(2)}" rx="3" fill="${connectorConfig.observsColor}" /></g>`;
         }).join("");
 
         const xLabelsMarkup = buckets.map((bucket, index) => {
@@ -4983,20 +4691,6 @@
       function renderR2ConnectorCountsBody(container, request, isYearMode, payload, errorMessage = "", isLoading = false) {
         const chartConfigs = resolveR2ConnectorChartConfigs(payload);
         const sectionTitle = "R2 connector row counts";
-        const toggleMarkup = Array.from(R2_CONNECTOR_COUNTS_MODE_VALUES).map((mode) => {
-          const active = mode === r2ConnectorCountsMode;
-          const label = mode === "stacked" ? "Stacked" : mode === "observs" ? "Observs" : "AQI";
-          return `
-            <button
-              type="button"
-              class="coverage-calendar-view-btn${active ? " is-active" : ""}"
-              data-action="r2-counts-mode"
-              data-mode="${mode}"
-              ${active ? "disabled aria-pressed=\"true\"" : "aria-pressed=\"false\""}
-            >${label}</button>
-          `;
-        }).join("");
-
         let bodyMarkup = `<div class="coverage-connector-chart-empty">Loading R2 connector counts...</div>`;
         if (errorMessage) {
           bodyMarkup = `<div class="coverage-connector-chart-empty">Failed to load R2 connector counts: ${escapeHtml(errorMessage)}</div>`;
@@ -5015,8 +4709,7 @@
                 <div class="coverage-connector-chart-head">
                   <h3>${escapeHtml(chartTitle)}</h3>
                   <div class="coverage-connector-chart-legend">
-                    <span><span class="coverage-connector-chart-swatch" style="background:${config.observsColor}"></span>Observs</span>
-                    <span><span class="coverage-connector-chart-swatch" style="background:${config.aqiColor}"></span>AQI</span>
+                    <span><span class="coverage-connector-chart-swatch" style="background:${config.observsColor}"></span>Observations</span>
                   </div>
                 </div>
                 <div class="coverage-connector-chart-wrap">${svgMarkup}</div>
@@ -5027,8 +4720,8 @@
         }
 
         const subtitle = isYearMode
-          ? "Year view shows monthly average rows per day. Stacked mode places AQI on the bottom and Observs on the top."
-          : "Month view shows daily row totals. Stacked mode places AQI on the bottom and Observs on the top.";
+          ? "Year view shows monthly average observation rows per day."
+          : "Month view shows daily observation row totals.";
         const payloadWarningParts = [];
         if (payload && payload.read_version_label) {
           payloadWarningParts.push(`active version ${payload.read_version_label}`);
@@ -5049,44 +4742,11 @@
         container.innerHTML = `
           <div class="coverage-connector-counts-head">
             <h3 class="coverage-connector-counts-title">${escapeHtml(sectionTitle)}</h3>
-            <div class="coverage-calendar-view">
-              <span class="coverage-calendar-view-label">Series</span>
-              <span class="coverage-calendar-view-toggle" role="group" aria-label="R2 connector count display mode">
-                ${toggleMarkup}
-              </span>
-            </div>
           </div>
           <div class="coverage-connector-counts-note">${escapeHtml(subtitle)}</div>
           ${payloadWarningMarkup}
           ${bodyMarkup}
         `;
-
-        const modeButtons = Array.from(container.querySelectorAll('[data-action="r2-counts-mode"]'));
-        modeButtons.forEach((button) => {
-          button.addEventListener("click", () => {
-            const requestedMode = String(button.dataset.mode || "");
-            if (!R2_CONNECTOR_COUNTS_MODE_VALUES.has(requestedMode) || requestedMode === r2ConnectorCountsMode) {
-              return;
-            }
-            r2ConnectorCountsMode = requestedMode;
-            try {
-              localStorage.setItem(R2_CONNECTOR_COUNTS_MODE_STORAGE_KEY, r2ConnectorCountsMode);
-            } catch (_err) {
-              // Ignore localStorage write failures.
-            }
-            const cachedPayload = latestR2ConnectorCounts && latestR2ConnectorCounts.requestKey === request.requestKey
-              ? latestR2ConnectorCounts.payload
-              : payload;
-            renderR2ConnectorCountsBody(
-              container,
-              request,
-              isYearMode,
-              cachedPayload,
-              errorMessage,
-              isLoading,
-            );
-          });
-        });
       }
 
       async function loadR2ConnectorCounts(container, { monthStartUtc, isYearMode, forceRefresh = false }) {
@@ -5360,12 +5020,12 @@
         if (isYearMode) {
           const yearStartUtc = new Date(Date.UTC(monthStartUtc.getUTCFullYear(), 0, 1, 0, 0, 0, 0));
           bodyMarkup = renderCoverageYearGrid(yearStartUtc, resolved.rows);
-          footnoteText = "Squares only and complete days only (today excluded). With ingest: red top-left and blue/green on the bottom row. Without ingest: blue/green on top row and R2 orange/yellow on bottom row. Backup-only days use the same filled orange/yellow storage colours with a blue Dropbox icon.";
+          footnoteText = "Complete days only (today excluded). Fixed squares: IngestDB top-left (red), ObsAQIDB observations top-right (blue), R2 observations bottom-left (orange), Dropbox observations bottom-right (orange outline and Dropbox icon). ? means unknown/unavailable; empty means confirmed absent.";
         } else {
           const calendarCells = buildCoverageCalendarCells(monthStartUtc, resolved.rows, true);
           const cellsMarkup = calendarCells
             .map((cell) => {
-              const { topLayer, middleLayer, bottomLayer } = resolveCoverageBarLayers(cell.coverage);
+              const layers = resolveCoverageBarLayers(cell.coverage);
               const outsideClass = cell.isInMonth ? "" : " is-outside";
               const todayClass = cell.coverage.isToday ? " is-today" : "";
               const dayTooltip = formatCoverageDayTooltip(cell);
@@ -5374,39 +5034,30 @@
                 if (!layer) return "";
                 const isToday = cell.coverage.isToday;
                 const halfClass = isToday ? " is-half" : "";
-                const hasDropboxBackup = !isToday && coverageLayerHasDropboxBackup(layer, cell.coverage);
-                const backupBadgeMarkup = hasDropboxBackup
-                  ? `<span class="coverage-bar-label-secondary is-dropbox-badge"><img class="coverage-bar-label-secondary-icon is-dropbox-blue" src="${DASHBOARD_DROPBOX_ICON_PATH}" alt="" aria-hidden="true">Backup</span>`
+                const label = layer.unknown ? "?" : layer.label;
+                const icon = layer.dropbox && !layer.unknown
+                  ? `<img class="coverage-bar-label-primary-icon" src="${DASHBOARD_DROPBOX_ICON_PATH}" alt="" aria-hidden="true">`
                   : "";
-                const primaryLabelMarkup = layer.primaryDropboxIcon
-                  ? `<span class="coverage-bar-label-primary with-icon"><img class="coverage-bar-label-primary-icon" src="${DASHBOARD_DROPBOX_ICON_PATH}" alt="" aria-hidden="true"><span class="coverage-bar-label-primary-text">${escapeHtml(layer.label)}</span></span>`
-                  : `<span class="coverage-bar-label-primary">${escapeHtml(layer.label)}</span>`;
-                let labelMarkup = "";
-                if (!isToday && layer.hideLabel && backupBadgeMarkup) {
-                  labelMarkup = `<span class="coverage-bar-label">${backupBadgeMarkup}</span>`;
-                } else if (!isToday && !layer.hideLabel && layer.label) {
-                  labelMarkup = `<span class="coverage-bar-label${hasDropboxBackup ? " has-secondary" : ""}">${primaryLabelMarkup}${backupBadgeMarkup}</span>`;
-                }
-                return `<span class="coverage-bar ${layer.className}${halfClass}" title="${escapeHtml(layer.label)}">${labelMarkup}</span>`;
+                const labelMarkup = isToday ? (layer.unknown ? "?" : "")
+                  : `<span class="coverage-bar-label"><span class="coverage-bar-label-primary${icon ? " with-icon" : ""}">${icon}<span class="coverage-bar-label-primary-text">${escapeHtml(label)}</span></span></span>`;
+                return `<span class="coverage-bar ${layer.className}${halfClass}" title="${escapeHtml(layer.label)}" aria-hidden="true">${labelMarkup}</span>`;
               };
 
               return `
-                <div class="coverage-day-cell${outsideClass}${todayClass}" title="${escapeHtml(dayTooltip)}">
+                <div class="coverage-day-cell${outsideClass}${todayClass}" title="${escapeHtml(dayTooltip)}" tabindex="0" role="img" aria-label="${escapeHtml(dayTooltip)}">
                   <div class="coverage-day-title">
                     <span class="coverage-day-number">${cell.dayNumber}</span>
                     <span class="coverage-day-weekday">${escapeHtml(cell.weekdayLabel)}</span>
                   </div>
                   <div class="coverage-bars">
-                    <div class="coverage-bar-slot">${renderBar(topLayer)}</div>
-                    <div class="coverage-bar-slot">${renderBar(middleLayer)}</div>
-                    <div class="coverage-bar-slot">${renderBar(bottomLayer)}</div>
+                    ${layers.map((layer) => `<div class="coverage-bar-slot">${renderBar(layer)}</div>`).join("")}
                   </div>
                 </div>
               `;
             })
             .join("");
           bodyMarkup = `<div class="coverage-calendar-grid">${cellsMarkup}</div>`;
-          footnoteText = "Top: Ingest DB (red), R2 History - Obs (orange), or Backup - Obs (orange filled). Middle: ObsAQI DB - Obs (blue). Bottom: AQI (yellow/green, striped when both R2 + ObsAQI are present) or Backup - AQI (yellow filled). R2 bars with Dropbox copy show a second line (blue Dropbox icon + Backup). Today shows half-width bars.";
+          footnoteText = "Fixed rows: IngestDB (red), ObsAQIDB observations (blue), R2 observations (orange), Dropbox observations (orange outline and Dropbox icon). Each source is independent. ? means unknown/unavailable; empty means confirmed absent. Today shows half-width bars without labels.";
         }
 
         panel.innerHTML = `
@@ -5441,6 +5092,7 @@
           </div>
           ${bodyMarkup}
           <div class="footnote">${escapeHtml(footnoteText)}</div>
+          ${renderCoverageDiagnostics()}
           ${r2VersionWarning ? `<div class="footnote">${escapeHtml(r2VersionWarning)}</div>` : ""}
           <div class="coverage-connector-counts-section" data-role="r2-connector-counts"></div>
         `;
@@ -5859,7 +5511,89 @@
         return payload || {};
       }
 
-      function applyStorageCoveragePayload(data) {
+      function coveragePayloadTime(payload) {
+        const cache = coverageCacheMetadata(payload);
+        return Date.parse(payload.storage_coverage_generated_at || cache.source_generated_at || payload.generated_at || "");
+      }
+
+      function preserveNewerCoverageEvidence(incoming) {
+        const previous = latestStorageCoveragePayload;
+        if (!previous) return incoming;
+        const version = String(incoming.r2_history_read_version?.version || "");
+        const previousVersion = String(previous.r2_history_read_version?.version || "");
+        if (version !== previousVersion) {
+          storageCoverageSourceWatermarks.clear();
+          return incoming;
+        }
+        const incomingTime = coveragePayloadTime(incoming);
+        const previousTime = coveragePayloadTime(previous);
+        const incomingDates = new Set(incoming.storage_coverage_days.map((row) => row.date));
+        if (Number.isFinite(previousTime) && (!Number.isFinite(incomingTime) || incomingTime < previousTime)
+            && previous.storage_coverage_days.some((row) => !incomingDates.has(row.date))) {
+          return { ...previous, storage_coverage_response_warning: "An older cached calendar range was ignored; the refreshed dates remain visible." };
+        }
+        const payload = { ...incoming };
+        const rows = new Map(incoming.storage_coverage_days.map((row) => [row.date, { ...row }]));
+        const previousRows = new Map(previous.storage_coverage_days.map((row) => [row.date, row]));
+        const sourceTimes = {
+          ingest: incoming.ingest_coverage?.checked_at_utc || incoming.ingest_coverage_diagnostics_updated_at || incomingTime,
+          obs_aqi_observs: incoming.obs_aqidb_coverage_generated_at || incomingTime,
+          r2_observs: incoming.storage_coverage_independent_sources?.r2_checked_at_utc || incoming.storage_coverage_independent_sources?.generated_at || incomingTime,
+          dropbox_observs: incoming.storage_coverage_independent_sources?.backup_checked_at_utc || incoming.storage_coverage_independent_sources?.generated_at || incomingTime,
+        };
+        const retained = [];
+        COVERAGE_SOURCES.forEach((source) => {
+          const value = sourceTimes[source.rawField];
+          const timestamp = typeof value === "number" ? value : Date.parse(value || "");
+          const watermark = storageCoverageSourceWatermarks.get(source.rawField);
+          if (!Number.isFinite(timestamp) || !Number.isFinite(watermark) || timestamp >= watermark) return;
+          retained.push(source.label);
+          previousRows.forEach((oldRow, date) => {
+            if (!rows.has(date)) rows.set(date, { date });
+            const row = rows.get(date);
+            row[source.rawField] = normalizeCoveragePresence(oldRow, source.rawField, source.alias);
+          });
+          rows.forEach((row, date) => {
+            if (!previousRows.has(date)) row[source.rawField] = null;
+          });
+          if (source.rawField === "ingest") {
+            ["ingest_coverage_error", "ingest_coverage_warning", "ingest_coverage_failed_days", "ingest_coverage_diagnostics_updated_at"]
+              .forEach((key) => { payload[key] = previous[key]; });
+            payload.ingest_coverage = previous.ingest_coverage ? { ...previous.ingest_coverage, stale: true } : undefined;
+          } else if (source.rawField === "obs_aqi_observs") {
+            payload.obs_aqidb_coverage_generated_at = previous.obs_aqidb_coverage_generated_at;
+            payload.obs_aqidb_coverage_stale = true;
+          } else {
+            const prefix = source.rawField === "r2_observs" ? "r2" : "backup";
+            payload.storage_coverage_independent_sources = {
+              ...payload.storage_coverage_independent_sources,
+              [prefix + "_stale"]: true,
+              [prefix + "_checked_at_utc"]: previous.storage_coverage_independent_sources?.[prefix + "_checked_at_utc"],
+            };
+          }
+        });
+        payload.storage_coverage_days = [...rows.values()].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+        if (retained.length) payload.storage_coverage_response_warning = `Older source evidence ignored for ${retained.join(", ")}; previous coverage retained. Other sources use the returned snapshot.`;
+        return payload;
+      }
+
+      function recordCoverageSourceWatermarks(payload) {
+        const sourceTimes = {
+          ingest: payload.ingest_coverage?.checked_at_utc || payload.ingest_coverage_diagnostics_updated_at || coveragePayloadTime(payload),
+          obs_aqi_observs: payload.obs_aqidb_coverage_generated_at || coveragePayloadTime(payload),
+          r2_observs: payload.storage_coverage_independent_sources?.r2_checked_at_utc || payload.storage_coverage_independent_sources?.generated_at || coveragePayloadTime(payload),
+          dropbox_observs: payload.storage_coverage_independent_sources?.backup_checked_at_utc || payload.storage_coverage_independent_sources?.generated_at || coveragePayloadTime(payload),
+        };
+        Object.entries(sourceTimes).forEach(([key, value]) => {
+          const timestamp = typeof value === "number" ? value : Date.parse(value || "");
+          if (Number.isFinite(timestamp)) storageCoverageSourceWatermarks.set(key, Math.max(timestamp, storageCoverageSourceWatermarks.get(key) || 0));
+        });
+      }
+
+      function applyStorageCoveragePayload(incoming) {
+        const data = preserveNewerCoverageEvidence(incoming);
+        latestStorageCoveragePayload = data;
+        recordCoverageSourceWatermarks(data);
         const coverageRows = Array.isArray(data.storage_coverage_days)
           ? data.storage_coverage_days
           : [];

@@ -1,6 +1,6 @@
 import { resolveHistoryEnvironment, historyResolution } from "../lib/history_generation";
 import { errorEnvelope } from "../lib/http";
-import { handleDirectCompatRoute } from "../lib/direct";
+import { applyStorageIngestCoverage, handleDirectCompatRoute } from "../lib/direct";
 import {
   enrichStorageCoverageFromMetrics,
   proxyR2ConnectorCounts,
@@ -137,6 +137,21 @@ export async function handleCompatRoute(
         response = await enrichStorageCoverageResponse(response, request, env);
       }
       response = await enrichStorageCoverageFromMetrics(response, request, env);
+      // Upstream payloads may be old or use legacy inference. Apply the same
+      // authoritative source once, after all transport-specific enrichment.
+      if (useUpstream && response.ok) {
+        const payload = await response.clone().json() as Record<string, unknown>;
+        if (Array.isArray(payload.storage_coverage_days)) {
+          const enriched = await applyStorageIngestCoverage(
+            env, { ...payload, storage_coverage_days: payload.storage_coverage_days },
+            ["force", "refresh", "nocache", "cache_bust", "cacheBust"].some(key =>
+              ["1", "true", "yes"].includes(String(new URL(request.url).searchParams.get(key) || "").toLowerCase())),
+          );
+          const headers = new Headers(response.headers);
+          headers.delete("content-length");
+          response = new Response(JSON.stringify(enriched), { status: response.status, headers });
+        }
+      }
     }
     return historyRoute ? withHistoryDiagnostics(response, env) : response;
   }

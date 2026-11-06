@@ -223,6 +223,21 @@ def provenance(product):
 
 
 def assert_complete(product, payload):
+    if product == "storage_coverage":
+        # Builders can return useful independent evidence alongside a source
+        # failure. That diagnostic candidate must never replace a successful
+        # materialised calendar or resolve a manual refresh as successful.
+        if payload.get("storage_coverage_complete") is not True:
+            raise RuntimeError("storage_coverage_incomplete")
+        rows = payload.get("storage_coverage_days")
+        if not isinstance(rows, list) or any(
+            not isinstance(row, dict) or any(type(row.get(key)) is not bool for key in (
+                "ingest", "obs_aqi_observs", "r2_observs", "dropbox_observs"
+            )) for row in rows
+        ):
+            raise RuntimeError("storage_coverage_evidence_unavailable")
+        if payload.get("ingest_coverage_warning"):
+            raise RuntimeError("storage_coverage_ingest_unavailable")
     for key, value in payload.items():
         if value and (key == "error" or key.endswith("_error") or key in {"ingest_coverage_failed_days", "upstream_refresh_errors"}):
             raise RuntimeError("upstream_product_incomplete")

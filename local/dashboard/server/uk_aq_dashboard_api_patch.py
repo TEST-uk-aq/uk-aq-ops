@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Apply storage-coverage accuracy fixes to the local dashboard backend.
 
-This wrapper keeps the main dashboard backend unchanged while TEST validates the
-behaviour. It prevents failed IngestDB day checks from becoming an inferred
-continuous date range, retains confirmed days after partial failures, exposes
-coverage diagnostics, and preserves IngestDB presence when R2 also exists.
+This wrapper keeps the existing local per-day fingerprint adapter and exposes
+failed checks as unavailable alongside confirmed independent source evidence.
+Incomplete candidates remain diagnostic responses, never successful MySQL
+calendar publications.
 """
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ def _fetch_ingest_observation_days(
         _set_ingest_coverage_diagnostics(
             checked_day_count=0,
             failed_days=[],
-            warning=None,
+            warning="IngestDB coverage unavailable: oldest observation boundary is missing.",
         )
         return set()
 
@@ -100,7 +100,7 @@ def _fetch_ingest_observation_days(
         _set_ingest_coverage_diagnostics(
             checked_day_count=0,
             failed_days=[],
-            warning=None,
+            warning="IngestDB coverage unavailable: oldest observation boundary is in the future.",
         )
         return set()
 
@@ -141,6 +141,17 @@ def _fetch_ingest_observation_days(
                     "offset": "0",
                 },
             )
+            if not isinstance(batch, list) or len(batch) > 1:
+                raise ValueError("Invalid IngestDB daily fingerprint response")
+            observation_count = 0
+            if batch:
+                first_row = batch[0]
+                if not isinstance(first_row, dict):
+                    raise ValueError("Invalid IngestDB daily fingerprint row")
+                raw_count = first_row.get("observation_count")
+                if isinstance(raw_count, bool) or not str(raw_count).isdigit():
+                    raise ValueError("Invalid IngestDB daily observation count")
+                observation_count = int(raw_count)
             checked_day_count += 1
         except Exception as exc:  # noqa: BLE001
             error_text = str(exc).strip().replace("\n", " ")
@@ -155,14 +166,8 @@ def _fetch_ingest_observation_days(
             cursor = next_day_utc
             continue
 
-        first_row = batch[0] if batch and isinstance(batch[0], dict) else None
-        if first_row:
-            try:
-                observation_count = int(first_row.get("observation_count") or 0)
-            except (TypeError, ValueError):
-                observation_count = 0
-            if observation_count > 0:
-                days_with_rows.add(cursor)
+        if observation_count > 0:
+            days_with_rows.add(cursor)
 
         cursor = next_day_utc
 
@@ -170,7 +175,7 @@ def _fetch_ingest_observation_days(
     if failed_days:
         warning = (
             f"IngestDB coverage is partial: {len(failed_days)} day check(s) failed. "
-            "Only positively confirmed IngestDB days are shown."
+            "Failed dates are unavailable; successful day checks remain visible."
         )
 
     _set_ingest_coverage_diagnostics(
@@ -200,12 +205,15 @@ def _build_live_storage_coverage_days(*args: Any, **kwargs: Any) -> List[Dict[st
     if not isinstance(ingest_days, set):
         return rows
 
-    # The base implementation makes the top layer mutually exclusive by clearing
-    # ingest whenever R2 exists. Restore the independently confirmed IngestDB flag;
-    # the front-end enhancement presents both sources together.
+    diagnostics = _get_ingest_coverage_diagnostics()
+    failed_days = {item.get("day_utc") for item in diagnostics.get("failed_days", [])}
+    unavailable = bool(diagnostics.get("warning")) and not failed_days
     for row in rows:
         parsed_day = dashboard._parse_iso_day(row.get("date"))
-        row["ingest"] = parsed_day in ingest_days if parsed_day is not None else False
+        row["ingest"] = (
+            None if unavailable or row.get("date") in failed_days
+            else parsed_day in ingest_days if parsed_day is not None else None
+        )
 
     return rows
 
@@ -240,6 +248,26 @@ def _build_storage_coverage_payload(*args: Any, **kwargs: Any) -> Dict[str, Any]
                 diagnostics.get("updated_at")
             ),
         }
+    )
+    rows = payload.get("storage_coverage_days")
+    source_errors = dict(payload.get("upstream_refresh_errors") or {})
+    if (payload.get("r2_history_read_version") or {}).get("version") == "v3":
+        # Generation-blind legacy byte metrics are deliberately unavailable in
+        # v3 and do not determine observation calendar presence.
+        source_errors.pop("r2_domain_size_metrics_error", None)
+    payload["storage_coverage_complete"] = (
+        isinstance(rows, list)
+        and not diagnostics.get("warning")
+        and not diagnostics.get("failed_days")
+        and not source_errors
+        and not payload.get("dropbox_backup_state_error")
+        and all(
+            isinstance(row, dict)
+            and all(type(row.get(key)) is bool for key in (
+                "ingest", "obs_aqi_observs", "r2_observs", "dropbox_observs"
+            ))
+            for row in rows
+        )
     )
     return payload
 

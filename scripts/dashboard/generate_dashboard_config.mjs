@@ -43,9 +43,6 @@ const config = {
 
 const patchPaths = [
   "dashboard/assets/dashboard_api_error_patch.js",
-  "dashboard/assets/storage_coverage_patch.js",
-  "dashboard/assets/storage_coverage_missing_r2_hotfix.js",
-  "dashboard/assets/storage_coverage_backup_only_style_patch.js",
   "dashboard/assets/freshness_table_layout_patch.js",
 ];
 

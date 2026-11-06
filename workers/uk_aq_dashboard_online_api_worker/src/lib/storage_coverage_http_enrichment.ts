@@ -4,7 +4,6 @@ import type { WorkerEnv } from "./upstream";
 type JsonObject = Record<string, unknown>;
 type DaySets = {
   observations: Set<string>;
-  aqilevels: Set<string>;
 };
 type SourceSnapshot = {
   generatedAt: string;
@@ -14,8 +13,6 @@ type SourceSnapshot = {
   backupDays: DaySets | null;
   backupKey: string | null;
   backupError: string | null;
-  ingestOldestDay: string | null;
-  ingestError: string | null;
 };
 type CacheEntry = {
   key: string;
@@ -28,18 +25,14 @@ type BackupMonthRef = {
   stateKey: string;
 };
 
-type ExtendedWorkerEnv = WorkerEnv & {
-  UK_AQ_R2_HISTORY_HIERARCHICAL_STATE_PREFIX?: string;
-};
-
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
 const DROPBOX_DOWNLOAD_URL = "https://content.dropboxapi.com/2/files/download";
-const DEFAULT_HIERARCHICAL_STATE_PREFIX = "_ops/checkpoints/r2_history_backup_state_v2";
 const HIERARCHICAL_ROOT_KIND = "uk_aq_r2_history_backup_state_v2_root";
 const HIERARCHICAL_MONTH_KIND = "uk_aq_r2_history_backup_state_observations_month";
 let sourceCache: CacheEntry | null = null;
+let refreshSequence = 0;
 
 function normaliseDay(value: unknown): string | null {
   const text = String(value || "").trim();
@@ -70,10 +63,10 @@ function resolveHistoryToken(env: WorkerEnv): string {
 
 function shouldForceRefresh(request: Request): boolean {
   const params = new URL(request.url).searchParams;
-  for (const key of ["force", "refresh", "nocache", "cache_bust", "cacheBust", "t", "ts"]) {
+  for (const key of ["force", "refresh", "nocache", "cache_bust", "cacheBust"]) {
     const value = String(params.get(key) || "").trim().toLowerCase();
     if (!value) continue;
-    if (["1", "true", "yes"].includes(value) || key === "t" || key === "ts") return true;
+    if (["1", "true", "yes"].includes(value)) return true;
   }
   return false;
 }
@@ -114,43 +107,21 @@ async function fetchJsonObject(url: string, token: string): Promise<JsonObject> 
 }
 
 function parseDomainDays(payload: unknown): DaySets {
-  const sets: DaySets = {
-    observations: new Set<string>(),
-    aqilevels: new Set<string>(),
-  };
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return sets;
-
-  for (const domain of ["observations", "aqilevels"] as const) {
-    const domainPayload = (payload as JsonObject)[domain];
-    if (!domainPayload || typeof domainPayload !== "object" || Array.isArray(domainPayload)) continue;
-    const values = (domainPayload as JsonObject).days;
-    if (!Array.isArray(values)) continue;
-    for (const value of values) {
-      const day = normaliseDay(value);
-      if (day) sets[domain].add(day);
-    }
+  const domains = payload && typeof payload === "object" && !Array.isArray(payload)
+    ? payload as JsonObject : {};
+  const observations = domains.observations;
+  if (!observations || typeof observations !== "object" || Array.isArray(observations)
+    || !Array.isArray((observations as JsonObject).days)) {
+    throw new Error("R2 history-days response has no observation-day array");
   }
-  return sets;
-}
-
-function latestIngestOldestDay(rows: unknown[]): string | null {
-  let latestSampleMs = Number.NEGATIVE_INFINITY;
-  let oldestDay: string | null = null;
-
-  for (const value of rows) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-    const row = value as JsonObject;
-    const label = String(row.database_label || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
-    if (label !== "ingestdb") continue;
-
-    const sampleText = String(row.recorded_at || row.bucket_hour || "").trim();
-    const sampleMs = Date.parse(sampleText);
-    const candidate = normaliseDay(row.oldest_observed_at);
-    if (!Number.isFinite(sampleMs) || !candidate || sampleMs < latestSampleMs) continue;
-    latestSampleMs = sampleMs;
-    oldestDay = candidate;
+  const days = new Set<string>();
+  for (const value of (observations as JsonObject).days as unknown[]) {
+    if (typeof value !== "string" || !DAY_RE.test(value)
+      || new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) !== value
+      || days.has(value)) throw new Error("R2 history-days response contains an invalid or duplicate observation day");
+    days.add(value);
   }
-  return oldestDay;
+  return { observations: days };
 }
 
 function normaliseRelativeKey(value: unknown): string {
@@ -234,7 +205,7 @@ async function fetchDropboxJson(token: string, remotePath: string): Promise<Json
 }
 
 function parseHierarchicalStateRoot(payload: JsonObject): BackupMonthRef[] {
-  if (payload.kind !== HIERARCHICAL_ROOT_KIND || payload.backup_version !== "v2") {
+  if (payload.schema_version !== 1 || payload.kind !== HIERARCHICAL_ROOT_KIND || payload.backup_version !== "v2") {
     throw new Error("Hierarchical Dropbox state root identity mismatch");
   }
   const observations = payload.observations;
@@ -247,18 +218,25 @@ function parseHierarchicalStateRoot(payload: JsonObject): BackupMonthRef[] {
   }
 
   const refs: BackupMonthRef[] = [];
+  const seen = new Set<string>();
   for (const rawYear of years) {
-    if (!rawYear || typeof rawYear !== "object" || Array.isArray(rawYear)) continue;
+    if (!rawYear || typeof rawYear !== "object" || Array.isArray(rawYear)) {
+      throw new Error("Hierarchical Dropbox state root contains an invalid year entry");
+    }
     const year = String((rawYear as JsonObject).year || "").trim();
     if (!/^\d{4}$/.test(year)) throw new Error(`Invalid hierarchical Dropbox state year: ${year}`);
     const months = (rawYear as JsonObject).months;
-    if (!Array.isArray(months)) continue;
+    if (!Array.isArray(months)) throw new Error("Hierarchical Dropbox state root months is not an array");
     for (const rawMonth of months) {
-      if (!rawMonth || typeof rawMonth !== "object" || Array.isArray(rawMonth)) continue;
+      if (!rawMonth || typeof rawMonth !== "object" || Array.isArray(rawMonth)) {
+        throw new Error("Hierarchical Dropbox state root contains an invalid month entry");
+      }
       const month = String((rawMonth as JsonObject).month || "").trim().padStart(2, "0");
       if (!/^(0[1-9]|1[0-2])$/.test(month)) {
         throw new Error(`Invalid hierarchical Dropbox state month: ${month}`);
       }
+      if (seen.has(`${year}-${month}`)) throw new Error("Duplicate hierarchical Dropbox state month");
+      seen.add(`${year}-${month}`);
       refs.push({
         year,
         month,
@@ -280,7 +258,8 @@ function parseHierarchicalMonthDays(
   expectedMonth: string,
 ): Set<string> {
   if (
-    payload.kind !== HIERARCHICAL_MONTH_KIND
+    payload.schema_version !== 1
+    || payload.kind !== HIERARCHICAL_MONTH_KIND
     || payload.backup_version !== "v2"
     || payload.domain !== "observations"
   ) {
@@ -301,9 +280,16 @@ function parseHierarchicalMonthDays(
     if (!rawDay || typeof rawDay !== "object" || Array.isArray(rawDay)) {
       throw new Error("Hierarchical Dropbox month state contains an invalid day entry");
     }
-    const day = normaliseDay((rawDay as JsonObject).day_utc);
-    if (!day || !day.startsWith(`${expectedYear}-${expectedMonth}-`)) {
+    const entry = rawDay as JsonObject;
+    const day = entry.day_utc;
+    if (typeof day !== "string" || !DAY_RE.test(day)
+      || !day.startsWith(`${expectedYear}-${expectedMonth}-`)
+      || new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day || days.has(day)) {
       throw new Error("Hierarchical Dropbox month state contains an invalid day_utc");
+    }
+    if (typeof entry.manifest_hash !== "string" || !/^[a-f0-9]{64}$/i.test(entry.manifest_hash)
+      || typeof entry.copied_at !== "string" || !Number.isFinite(Date.parse(entry.copied_at))) {
+      throw new Error("Hierarchical Dropbox month state day has no valid copied-source evidence");
     }
     days.add(day);
   }
@@ -365,7 +351,9 @@ async function loadHierarchicalBackupDays(env: WorkerEnv): Promise<{
     });
 
     return {
-      days: { observations, aqilevels: new Set<string>() },
+      // Missing/malformed shards make absence unknowable. Never publish a
+      // partial set as though every other day had been checked successfully.
+      days: errors.length ? null : { observations },
       key: rootRemotePath,
       error: errors.length ? errors.join("; ") : null,
     };
@@ -380,7 +368,6 @@ async function loadHierarchicalBackupDays(env: WorkerEnv): Promise<{
 
 async function loadSources(request: Request, env: WorkerEnv): Promise<SourceSnapshot> {
   const historyUrl = resolveHistoryDaysUrl(env);
-  const dbSizeUrl = String(env.UK_AQ_DB_SIZE_API_URL || "").trim();
   const version = historyResolution(env).version;
   const rootPath = (() => {
     try {
@@ -389,13 +376,14 @@ async function loadSources(request: Request, env: WorkerEnv): Promise<SourceSnap
       return "";
     }
   })();
-  const cacheKey = `${historyUrl}|${dbSizeUrl}|${version}|${rootPath}`;
+  const cacheKey = `${historyUrl}|${version}|${rootPath}`;
   const forceRefresh = shouldForceRefresh(request);
 
   if (!forceRefresh && sourceCache && sourceCache.key === cacheKey && Date.now() < sourceCache.expiresAt) {
     return sourceCache.value;
   }
 
+  const sequence = ++refreshSequence;
   const generatedAt = new Date().toISOString();
   let r2Days: DaySets | null = null;
   let r2Bucket: string | null = null;
@@ -403,8 +391,6 @@ async function loadSources(request: Request, env: WorkerEnv): Promise<SourceSnap
   let backupDays: DaySets | null = null;
   let backupKey: string | null = rootPath || null;
   let backupError: string | null = null;
-  let ingestOldestDay: string | null = null;
-  let ingestError: string | null = null;
 
   const historyPromise = (async () => {
     if (!historyUrl) throw new Error("R2 history-days API is not configured");
@@ -416,43 +402,21 @@ async function loadSources(request: Request, env: WorkerEnv): Promise<SourceSnap
     url.searchParams.set("max_days", "3660");
     const payload = await fetchJsonObject(url.toString(), resolveHistoryToken(env));
     assertHistoryPayload(payload, env);
-    return payload;
+    return { payload, days: parseDomainDays(payload.domains) };
   })();
 
-  const dbPromise = (async () => {
-    if (!dbSizeUrl) throw new Error("UK_AQ_DB_SIZE_API_URL is not configured");
-    const url = new URL(dbSizeUrl);
-    const lookback = Math.max(1, Math.trunc(Number(env.UK_AQ_DB_SIZE_LOOKBACK_DAYS || 28) || 28));
-    url.searchParams.set("lookback_days", String(lookback));
-    return fetchJsonObject(url.toString(), String(env.UK_AQ_DB_SIZE_API_TOKEN || "").trim());
-  })();
-
-  const [historyResult, dbResult, backupResult] = await Promise.allSettled([
+  const [historyResult, backupResult] = await Promise.allSettled([
     historyPromise,
-    dbPromise,
     loadHierarchicalBackupDays(env),
   ]);
 
   if (historyResult.status === "fulfilled") {
-    const payload = historyResult.value;
-    r2Bucket = String(payload.bucket || "").trim() || null;
-    r2Days = parseDomainDays(payload.domains);
+    r2Bucket = String(historyResult.value.payload.bucket || "").trim() || null;
+    r2Days = historyResult.value.days;
   } else {
     r2Error = historyResult.reason instanceof Error
       ? historyResult.reason.message
       : String(historyResult.reason);
-  }
-
-  if (dbResult.status === "fulfilled") {
-    const rows = Array.isArray(dbResult.value.db_size_metrics)
-      ? dbResult.value.db_size_metrics
-      : [];
-    ingestOldestDay = latestIngestOldestDay(rows);
-    if (!ingestOldestDay) ingestError = "DB size metrics contain no usable IngestDB retention boundary";
-  } else {
-    ingestError = dbResult.reason instanceof Error
-      ? dbResult.reason.message
-      : String(dbResult.reason);
   }
 
   if (backupResult.status === "fulfilled") {
@@ -473,14 +437,15 @@ async function loadSources(request: Request, env: WorkerEnv): Promise<SourceSnap
     backupDays,
     backupKey,
     backupError,
-    ingestOldestDay,
-    ingestError,
   };
-  sourceCache = {
-    key: cacheKey,
-    expiresAt: Date.now() + CACHE_TTL_MS,
-    value,
-  };
+  // An earlier overlapping load must not replace a later Refresh's snapshot.
+  if (sequence === refreshSequence) {
+    sourceCache = {
+      key: cacheKey,
+      expiresAt: Date.now() + CACHE_TTL_MS,
+      value,
+    };
+  }
   return value;
 }
 
@@ -493,57 +458,79 @@ function dayBounds(days: Set<string> | null): { earliest: string | null; latest:
 }
 
 function enrichPayload(payload: JsonObject, sources: SourceSnapshot): JsonObject {
+  const previous = payload.storage_coverage_independent_sources;
+  const details: JsonObject = previous && typeof previous === "object" && !Array.isArray(previous)
+    ? { ...previous as JsonObject } : {};
+  const priorCheckedAt = (source: "r2" | "backup"): string | null => {
+    const value = details[`${source}_checked_at_utc`];
+    return details[`${source}_status`] === "ok" && typeof value === "string"
+      && Number.isFinite(Date.parse(value)) ? value : null;
+  };
+  const priorR2CheckedAt = priorCheckedAt("r2");
+  const priorBackupCheckedAt = priorCheckedAt("backup");
   const rawRows = Array.isArray(payload.storage_coverage_days)
     ? payload.storage_coverage_days
     : [];
   const rows = rawRows.map((value) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) return value;
     const row = { ...(value as JsonObject) };
+    delete row.obs_aqi_aqilevels;
+    delete row.r2_aqilevels;
+    delete row.dropbox_aqilevels;
+    delete row.aqilevels;
+    delete row.r2;
     const day = normaliseDay(row.date);
     if (!day) return row;
 
-    if (sources.ingestOldestDay) {
-      row.ingest = day >= sources.ingestOldestDay;
-    }
     if (sources.r2Days) {
-      const observationsPresent = sources.r2Days.observations.has(day);
-      row.r2_observs = observationsPresent;
-      row.r2 = observationsPresent;
-      row.r2_aqilevels = sources.r2Days.aqilevels.has(day);
+      row.r2_observs = sources.r2Days.observations.has(day);
+    } else if (!priorR2CheckedAt || typeof row.r2_observs !== "boolean") {
+      row.r2_observs = null;
     }
 
-    row.dropbox_observs = Boolean(sources.backupDays?.observations.has(day));
-    row.dropbox_aqilevels = false;
+    if (sources.backupDays) {
+      row.dropbox_observs = sources.backupDays.observations.has(day);
+    } else if (!priorBackupCheckedAt || typeof row.dropbox_observs !== "boolean") {
+      row.dropbox_observs = null;
+    }
     return row;
   });
 
   const backupObservations = dayBounds(sources.backupDays?.observations || null);
+  delete details.r2_aqilevels_day_count;
+  delete details.backup_aqilevels_day_count;
+  delete details.ingest_oldest_day;
+  delete details.ingest_error;
+  const cleaned = { ...payload };
+  delete cleaned.dropbox_backup_aqilevels_earliest_day;
+  delete cleaned.dropbox_backup_aqilevels_latest_day;
 
   return {
-    ...payload,
+    ...cleaned,
     storage_coverage_days: rows,
     storage_coverage_source: `${String(payload.storage_coverage_source || "dashboard")}+independent_http_sources`,
     r2_history_days_bucket: sources.r2Bucket || payload.r2_history_days_bucket || null,
-    r2_history_days_error: mergeMessages(payload.r2_history_days_error, sources.r2Error),
+    r2_history_days_error: sources.r2Days ? null : mergeMessages(payload.r2_history_days_error, sources.r2Error),
     dropbox_backup_state_path: sources.backupKey ? `dropbox:${sources.backupKey}` : null,
     dropbox_backup_state_source: "dropbox-hierarchical-v2",
     dropbox_backup_state_error: sources.backupError,
     dropbox_backup_observations_earliest_day: backupObservations.earliest,
     dropbox_backup_observations_latest_day: backupObservations.latest,
-    dropbox_backup_aqilevels_earliest_day: null,
-    dropbox_backup_aqilevels_latest_day: null,
     storage_coverage_independent_sources: {
+      ...details,
       generated_at: sources.generatedAt,
       r2_bucket: sources.r2Bucket,
       r2_observations_day_count: sources.r2Days?.observations.size ?? null,
-      r2_aqilevels_day_count: sources.r2Days?.aqilevels.size ?? null,
+      r2_checked_at_utc: sources.r2Days ? sources.generatedAt : priorR2CheckedAt,
+      r2_status: sources.r2Days || priorR2CheckedAt ? "ok" : "unavailable",
+      r2_stale: !sources.r2Days && Boolean(priorR2CheckedAt),
       backup_state_root_key: sources.backupKey,
       backup_observations_day_count: sources.backupDays?.observations.size ?? null,
-      backup_aqilevels_day_count: 0,
-      ingest_oldest_day: sources.ingestOldestDay,
+      backup_checked_at_utc: sources.backupDays ? sources.generatedAt : priorBackupCheckedAt,
+      backup_status: sources.backupDays || priorBackupCheckedAt ? "ok" : "unavailable",
+      backup_stale: !sources.backupDays && Boolean(priorBackupCheckedAt),
       r2_error: sources.r2Error,
       backup_error: sources.backupError,
-      ingest_error: sources.ingestError,
     },
   };
 }
@@ -563,6 +550,11 @@ export async function enrichStorageCoverageResponse(
   }
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return response;
   if (!Array.isArray((payload as JsonObject).storage_coverage_days)) return response;
+  // A successfully published local snapshot already includes its configured
+  // physical intersection and checkpoint checks. Do not undo those constraints
+  // using an unconstrained HTTP listing; IngestDB is still rechecked by the
+  // common final adapter in the compatibility route.
+  if ((payload as JsonObject).storage_coverage_complete === true) return response;
 
   const sources = await loadSources(request, env);
   const enriched = enrichPayload(payload as JsonObject, sources);

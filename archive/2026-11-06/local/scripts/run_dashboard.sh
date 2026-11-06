@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# Starts the UK AQ dashboard API server.
+# Loads .env from this repo's root. Set PORT env var to override port (default: 8000).
+# The live dashboard launchd plist sets PORT=8001.
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT_DIR"
+
+ENV_FILE="$ROOT_DIR/.env"
+PYTHON_BIN="$ROOT_DIR/.venv/bin/python3"
+
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "Missing env file: $ENV_FILE" >&2
+  exit 1
+fi
+
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "Python venv not found: $PYTHON_BIN" >&2
+  exit 1
+fi
+
+load_dotenv_file() {
+  local env_file="$1"
+  local line=""
+  local key value first_char last_char char previous_char quote_char
+  local line_number=0 index
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ((line_number += 1))
+    line="${line%$'\r'}"
+
+    if [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]]; then
+      continue
+    fi
+
+    if [[ "$line" != *=* ]]; then
+      echo "Malformed env assignment at ${env_file}:${line_number}: expected KEY=VALUE" >&2
+      return 1
+    fi
+
+    key="${line%%=*}"
+    value="${line#*=}"
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "Malformed env assignment at ${env_file}:${line_number}: invalid environment key" >&2
+      return 1
+    fi
+
+    quote_char=""
+    if (( ${#value} > 0 )); then
+      first_char="${value:0:1}"
+      if [[ "$first_char" == '"' || "$first_char" == "'" ]]; then
+        quote_char="$first_char"
+      fi
+    fi
+    for ((index = 0; index < ${#value}; index += 1)); do
+      char="${value:index:1}"
+      if [[ -n "$quote_char" ]]; then
+        if (( index > 0 )) && [[ "$char" == "$quote_char" ]]; then
+          quote_char=""
+        fi
+        continue
+      fi
+      if [[ "$char" == "#" ]] && (( index > 0 )); then
+        previous_char="${value:index-1:1}"
+        if [[ "$previous_char" =~ [[:space:]] ]]; then
+          value="${value:0:index}"
+          while [[ "$value" =~ [[:space:]]$ ]]; do
+            value="${value%?}"
+          done
+          break
+        fi
+      fi
+    done
+
+    if (( ${#value} >= 2 )); then
+      first_char="${value:0:1}"
+      last_char="${value: -1}"
+      if [[ ( "$first_char" == '"' || "$first_char" == "'" ) && "$last_char" == "$first_char" ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+
+    export "$key=$value"
+  done < "$env_file"
+}
+
+load_dotenv_file "$ENV_FILE"
+
+# Never pass interactive/local MySQL administration helper secrets into either
+# dashboard process, even when this script is started from an operator shell.
+unset PRO_MYSQL_PSWD DASHBOARD_TEST_READER_MYSQLPSWD DASHBOARD_TEST_WRITER_MYSQLPSWD
+
+# Separate process credentials: the HTTP server never loads the writer file.
+if [[ "${1:-}" == "--cache-refresh" ]]; then
+  shift
+  cache_env_file="$ROOT_DIR/.env.dashboard-cache.writer"
+  [[ -f "$cache_env_file" ]] || { echo "Missing dashboard cache writer environment file" >&2; exit 1; }
+  load_dotenv_file "$cache_env_file"
+  exec "$PYTHON_BIN" local/dashboard/server/uk_aq_dashboard_cache_refresh.py "$@"
+fi
+if [[ -f "$ROOT_DIR/.env.dashboard-cache.reader" ]]; then
+  load_dotenv_file "$ROOT_DIR/.env.dashboard-cache.reader"
+fi
+
+
+generate_dashboard_config() {
+  "$PYTHON_BIN" - <<'PY'
+import json
+import os
+from pathlib import Path
+
+def strip_wrapping_quotes(value: str) -> str:
+    text = str(value)
+    while len(text) >= 2 and (
+        (text[0] == '"' and text[-1] == '"')
+        or (text[0] == "'" and text[-1] == "'")
+    ):
+        text = text[1:-1]
+    return text
+
+try:
+    refresh_seconds = int(strip_wrapping_quotes(str(os.getenv("UKAQ_DEFAULT_REFRESH_SECONDS", "300"))).strip())
+except ValueError:
+    refresh_seconds = 300
+if refresh_seconds <= 0:
+    refresh_seconds = 300
+
+config = {
+    "envName": strip_wrapping_quotes(str(os.getenv("UK_AQ_ENV_NAME", "local"))),
+    "apiBaseUrl": strip_wrapping_quotes(str(os.getenv("UKAQ_API_BASE_URL", "/api"))),
+    "dashboardTitle": strip_wrapping_quotes(str(os.getenv("UKAQ_DASHBOARD_TITLE", "UK AQ Dashboard"))),
+    "dashboardSubtitle": strip_wrapping_quotes(
+        str(
+            os.getenv(
+                "UKAQ_DASHBOARD_SUBTITLE",
+                "Live snapshot of PM2.5, PM10, and NO2 freshness using timeseries last_value_at. Data updates from your local API.",
+            )
+        )
+    ),
+    "defaultRefreshSeconds": refresh_seconds,
+}
+
+out_path = Path(str(os.getenv("UKAQ_CONFIG_OUT_PATH", "dashboard/assets/config.js")))
+patch_paths = [
+    Path("dashboard/assets/dashboard_api_error_patch.js"),
+    Path("dashboard/assets/storage_coverage_patch.js"),
+    Path("dashboard/assets/storage_coverage_missing_r2_hotfix.js"),
+    Path("dashboard/assets/storage_coverage_backup_only_style_patch.js"),
+    Path("dashboard/assets/freshness_table_layout_patch.js"),
+    Path("dashboard/assets/daily_task_refresh_patch.js"),
+]
+for patch_path in patch_paths:
+    if not patch_path.is_file():
+        raise SystemExit(f"Missing dashboard storage coverage patch: {patch_path}")
+
+out_path.parent.mkdir(parents=True, exist_ok=True)
+out_path.write_text(
+    "window.UKAQ_OPS_CONFIG = "
+    + json.dumps(config, indent=2)
+    + ";\n\n"
+    + "\n\n".join(
+        patch_path.read_text(encoding="utf-8")
+        for patch_path in patch_paths
+    )
+    + "\n",
+    encoding="utf-8",
+)
+print(f"Wrote dashboard config: {out_path.resolve()}")
+PY
+}
+
+generate_dashboard_config
+
+export DASHBOARD_UPSTREAM_BEARER_TOKEN=""
+
+exec "$PYTHON_BIN" local/dashboard/server/uk_aq_dashboard_direct_r2_patch.py \
+  --host "${HOST:-127.0.0.1}" \
+  --port "${PORT:-8000}"

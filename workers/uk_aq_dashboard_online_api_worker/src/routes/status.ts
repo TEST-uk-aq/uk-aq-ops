@@ -28,6 +28,9 @@ type DashboardPayload = {
   dropbox_backup_state_error?: unknown;
   storage_coverage_source?: unknown;
   storage_coverage_days?: unknown;
+  ingest_coverage?: unknown;
+  ingest_coverage_error?: unknown;
+  obs_aqidb_coverage_error?: unknown;
 };
 
 function arrayLength(value: unknown): number {
@@ -148,6 +151,9 @@ export async function handleStatusHistoryRoute(
       dropbox_backup_state_path: payload.dropbox_backup_state_path || null,
       dropbox_backup_state_error: payload.dropbox_backup_state_error || null,
       storage_coverage_source: payload.storage_coverage_source || null,
+      ingest_coverage: payload.ingest_coverage || null,
+      ingest_coverage_error: payload.ingest_coverage_error || null,
+      obs_aqidb_coverage_error: payload.obs_aqidb_coverage_error || null,
       storage_coverage_days: Array.isArray(payload.storage_coverage_days)
         ? payload.storage_coverage_days
         : [],
@@ -167,6 +173,9 @@ export async function handleHistoryManifestsRoute(
     return okEnvelope({
       generated_at: payload.generated_at || null,
       storage_coverage_source: payload.storage_coverage_source || null,
+      ingest_coverage: payload.ingest_coverage || null,
+      ingest_coverage_error: payload.ingest_coverage_error || null,
+      obs_aqidb_coverage_error: payload.obs_aqidb_coverage_error || null,
       storage_coverage_days: Array.isArray(payload.storage_coverage_days)
         ? payload.storage_coverage_days
         : [],

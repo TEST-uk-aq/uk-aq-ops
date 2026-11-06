@@ -115,6 +115,20 @@ Optional direct-mode data sources:
 - `UK_AQ_R2_CLOUDFLARE_API_TOKEN` or `CFLARE_API_READ_TOKEN`
 - Dropbox optional fields (`DROPBOX_APP_KEY`, `DROPBOX_APP_SECRET`, `DROPBOX_REFRESH_TOKEN`) for `/api/operations_dropbox_mtime`
 
+Storage calendar IngestDB evidence uses
+`uk_aq_public.uk_aq_rpc_observation_day_presence_v1(date,date)` through the
+existing IngestDB POST/auth/schema-profile helpers. All requested UTC dates
+are checked in complete chunks of at most 366 days, with strict response
+validation and five-minute evidence caching. Ordinary timestamp cache-busting
+does not force a new source lookup; explicit Refresh does. The
+`ingest_coverage` metadata preserves check/expiry timestamps and errors.
+The four independent observation flags are `ingest`, `obs_aqi_observs`,
+`r2_observs` and `dropbox_observs`: true, false or null when unavailable.
+No R2 flag suppresses IngestDB. Hosted ObsAQIDB observations use its existing
+day-count summary, not an oldest-date span. Local fingerprints remain unchanged.
+See [the Stage 2 handover](../../docs/handovers/2026-11-06-storage-coverage-calendar.md)
+for local-only status, deployment acceptance, failed-refresh behaviour and rollback.
+
 R2 history API fallback behavior:
 
 - If `UK_AQ_R2_HISTORY_DAYS_API_URL` is unset, the worker derives it from `UK_AQ_DB_SIZE_API_URL` origin as `/v1/r2-history-days`.
@@ -127,15 +141,13 @@ R2 history API fallback behavior:
   `dropbox_backup_state_path`, `dropbox_backup_state_source`,
   `dropbox_backup_state_cache_key`,
   `dropbox_backup_observations_earliest_day`,
-  `dropbox_backup_observations_latest_day`,
-  `dropbox_backup_aqilevels_earliest_day`,
-  `dropbox_backup_aqilevels_latest_day`, and related warning fields so the
+  `dropbox_backup_observations_latest_day`, and related warning fields so the
   hosted dashboard can show the active R2 history source and the current
-  hierarchical v2 Dropbox checkpoint source. AQI Dropbox bounds remain empty
-  because AQI history is outside the current backup scope.
+  hierarchical v2 Dropbox checkpoint source. Retired calculated AQI calendar
+  fields are removed; unrelated legacy v2 window metrics remain compatible.
 - With a v2/v3 serving descriptor, the storage coverage calendar does not use
   version-blind Supabase R2 day/window fallbacks. If the selected history-days API is
-  unavailable, R2 presence remains false/unknown instead of being filled from
+  unavailable, R2 presence is null (unknown) instead of being filled from
   v1-derived RPC data.
 - With a v2/v3 serving descriptor, Dropbox checkpoint day coverage is only
   counted for days also returned by the explicit selected-generation R2 history-days API. A

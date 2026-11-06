@@ -5,7 +5,6 @@ import type { WorkerEnv } from "./upstream";
 type JsonObject = Record<string, unknown>;
 type DaySets = {
   observations: Set<string>;
-  aqilevels: Set<string>;
 };
 type ServiceFetcher = {
   fetch(input: Request | string, init?: RequestInit): Promise<Response>;
@@ -90,43 +89,21 @@ async function fetchMetricsBindingJson(
 }
 
 function parseDomainDays(payload: unknown): DaySets {
-  const sets: DaySets = {
-    observations: new Set<string>(),
-    aqilevels: new Set<string>(),
-  };
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return sets;
-
-  for (const domain of ["observations", "aqilevels"] as const) {
-    const domainPayload = (payload as JsonObject)[domain];
-    if (!domainPayload || typeof domainPayload !== "object" || Array.isArray(domainPayload)) continue;
-    const values = (domainPayload as JsonObject).days;
-    if (!Array.isArray(values)) continue;
-    for (const value of values) {
-      const day = normaliseDay(value);
-      if (day) sets[domain].add(day);
-    }
+  const domains = payload && typeof payload === "object" && !Array.isArray(payload)
+    ? payload as JsonObject : {};
+  const observations = domains.observations;
+  if (!observations || typeof observations !== "object" || Array.isArray(observations)
+    || !Array.isArray((observations as JsonObject).days)) {
+    throw new Error("R2 history-days response has no observation-day array");
   }
-  return sets;
-}
-
-function latestIngestOldestDay(rows: unknown[]): string | null {
-  let latestSampleMs = Number.NEGATIVE_INFINITY;
-  let oldestDay: string | null = null;
-
-  for (const value of rows) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-    const row = value as JsonObject;
-    const label = String(row.database_label || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
-    if (label !== "ingestdb") continue;
-
-    const sampleText = String(row.recorded_at || row.bucket_hour || "").trim();
-    const sampleMs = Date.parse(sampleText);
-    const candidate = normaliseDay(row.oldest_observed_at);
-    if (!Number.isFinite(sampleMs) || !candidate || sampleMs < latestSampleMs) continue;
-    latestSampleMs = sampleMs;
-    oldestDay = candidate;
+  const days = new Set<string>();
+  for (const value of (observations as JsonObject).days as unknown[]) {
+    if (typeof value !== "string" || !DAY_RE.test(value)
+      || new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) !== value
+      || days.has(value)) throw new Error("R2 history-days response contains an invalid or duplicate observation day");
+    days.add(value);
   }
-  return oldestDay;
+  return { observations: days };
 }
 
 function mergeMessages(...values: unknown[]): string | null {
@@ -205,13 +182,17 @@ export async function enrichStorageCoverageFromMetrics(
   let r2Days: DaySets | null = null;
   let r2Bucket: string | null = null;
   let r2Error: string | null = null;
-  let ingestOldestDay: string | null = null;
-  let ingestError: string | null = null;
   let dbPayload: JsonObject | null = null;
+  let dbError: string | null = null;
+  const checkedAt = new Date().toISOString();
 
   if (historyResult.status === "fulfilled") {
-    r2Bucket = String(historyResult.value.bucket || "").trim() || null;
-    r2Days = parseDomainDays(historyResult.value.domains);
+    try {
+      r2Days = parseDomainDays(historyResult.value.domains);
+      r2Bucket = String(historyResult.value.bucket || "").trim() || null;
+    } catch (error) {
+      r2Error = error instanceof Error ? error.message : String(error);
+    }
   } else {
     r2Error = historyResult.reason instanceof Error
       ? historyResult.reason.message
@@ -220,13 +201,8 @@ export async function enrichStorageCoverageFromMetrics(
 
   if (dbResult.status === "fulfilled") {
     dbPayload = dbResult.value;
-    const rows = Array.isArray(dbPayload.db_size_metrics) ? dbPayload.db_size_metrics : [];
-    ingestOldestDay = latestIngestOldestDay(rows);
-    if (!ingestOldestDay) {
-      ingestError = "DB size metrics contain no usable IngestDB retention boundary";
-    }
   } else {
-    ingestError = dbResult.reason instanceof Error
+    dbError = dbResult.reason instanceof Error
       ? dbResult.reason.message
       : String(dbResult.reason);
   }
@@ -234,15 +210,18 @@ export async function enrichStorageCoverageFromMetrics(
   const rows = object.storage_coverage_days.map((value) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) return value;
     const row = { ...(value as JsonObject) };
+    delete row.obs_aqi_aqilevels;
+    delete row.r2_aqilevels;
+    delete row.dropbox_aqilevels;
+    delete row.aqilevels;
+    delete row.r2;
     const day = normaliseDay(row.date);
     if (!day) return row;
 
-    if (ingestOldestDay) row.ingest = day >= ingestOldestDay;
-    if (r2Days) {
-      const observationsPresent = r2Days.observations.has(day);
-      row.r2_observs = observationsPresent;
-      row.r2 = observationsPresent;
-      row.r2_aqilevels = r2Days.aqilevels.has(day);
+    if (r2Days && object.storage_coverage_complete !== true) {
+      row.r2_observs = r2Days.observations.has(day);
+    } else if (typeof row.r2_observs !== "boolean") {
+      row.r2_observs = null;
     }
     return row;
   });
@@ -254,12 +233,27 @@ export async function enrichStorageCoverageFromMetrics(
     ? { ...(existingSources as JsonObject) }
     : {};
   sourceDetails.transport = "service_binding";
+  delete sourceDetails.r2_aqilevels_day_count;
+  delete sourceDetails.backup_aqilevels_day_count;
+  delete sourceDetails.ingest_oldest_day;
+  delete sourceDetails.ingest_error;
   sourceDetails.r2_bucket = r2Bucket || sourceDetails.r2_bucket || null;
   sourceDetails.r2_observations_day_count = r2Days?.observations.size ?? null;
-  sourceDetails.r2_aqilevels_day_count = r2Days?.aqilevels.size ?? null;
-  sourceDetails.ingest_oldest_day = ingestOldestDay;
   sourceDetails.r2_error = r2Days ? null : mergeMessages(sourceDetails.r2_error, r2Error);
-  sourceDetails.ingest_error = dbPayload ? ingestError : mergeMessages(sourceDetails.ingest_error, ingestError);
+  // Binding failure does not invalidate successful evidence already supplied by
+  // the direct adapter (or timestamped HTTP enrichment).
+  if (object.storage_coverage_complete === true) {
+    sourceDetails.r2_checked_at_utc = object.storage_coverage_generated_at || object.generated_at || null;
+    sourceDetails.r2_status = "ok";
+    sourceDetails.r2_preserved_upstream_snapshot = true;
+  } else if (r2Days) {
+    sourceDetails.r2_checked_at_utc = checkedAt;
+    sourceDetails.r2_status = "ok";
+    sourceDetails.r2_stale = false;
+  } else if (sourceDetails.r2_status !== "ok") {
+    sourceDetails.r2_status = rows.some(row => row && typeof row === "object"
+      && typeof (row as JsonObject).r2_observs === "boolean") ? "ok" : "unavailable";
+  }
 
   const enriched: JsonObject = {
     ...object,
@@ -283,6 +277,10 @@ export async function enrichStorageCoverageFromMetrics(
     enriched.db_size_metrics_error = dbPayload.db_size_metrics_error || null;
     enriched.schema_size_metrics_error = dbPayload.schema_size_metrics_error || null;
     enriched.r2_domain_size_metrics_error = dbPayload.r2_domain_size_metrics_error || null;
+  } else if (dbError) {
+    enriched.db_size_metrics_error = mergeMessages(object.db_size_metrics_error, dbError);
+    enriched.schema_size_metrics_error = mergeMessages(object.schema_size_metrics_error, dbError);
+    enriched.r2_domain_size_metrics_error = mergeMessages(object.r2_domain_size_metrics_error, dbError);
   }
 
   const headers = new Headers(response.headers);

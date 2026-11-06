@@ -24,8 +24,6 @@ test('storage coverage response exposes actual R2 history diagnostics', () => {
     'r2_history_read_version_effective',
     'dropbox_backup_observations_earliest_day',
     'dropbox_backup_observations_latest_day',
-    'dropbox_backup_aqilevels_earliest_day',
-    'dropbox_backup_aqilevels_latest_day',
   ]) {
     assert.match(directSource, new RegExp(`${field}: payload\\.${field}`));
   }
