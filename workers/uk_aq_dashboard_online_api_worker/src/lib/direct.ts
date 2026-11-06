@@ -1,3 +1,4 @@
+import { CoverageRequestBudget } from "./coverage_request_budget";
 import { AccountsSourceError, accountsReadStage, readAccountsJson } from "./accounts_diagnostics";
 import { assertHistoryPayload, historyResolution, type HistoryResolution } from "./history_generation";
 import { buildJsonResponse, errorEnvelope } from "./http";
@@ -41,6 +42,7 @@ type DashboardPayload = {
   dropbox_backup_observations_latest_day: string | null;
   storage_coverage_source: string;
   storage_coverage_days: unknown[];
+  dropbox_coverage?: JsonObject;
   ingest_coverage?: IngestCoverageMetadata;
   ingest_coverage_error?: string | null;
   obs_aqidb_coverage_error?: string | null;
@@ -71,12 +73,6 @@ type DropboxStatePathResolution = {
   readVersion: R2HistoryReadVersionResolution;
 };
 
-type DropboxMonthStateReference = {
-  year: string;
-  month: string;
-  stateKey: string;
-};
-
 const BUCKETS = ["0-3 Hours", "3-6 Hours", "6-24 Hours", "1 - 7 Days", "Older than 7 Days"] as const;
 const POLLUTANTS: Record<string, { label: string }> = {
   pm25: { label: "PM2.5" },
@@ -90,7 +86,7 @@ const R2_USAGE_TTL_MS = 60 * 60_000;
 const R2_HISTORY_DAYS_TTL_MS = 5 * 60_000;
 const DROPBOX_MTIME_TTL_MS = 20_000;
 const DROPBOX_TOKEN_URL = "https://api.dropbox.com/oauth2/token";
-const DROPBOX_DOWNLOAD_URL = "https://content.dropboxapi.com/2/files/download";
+export const DROPBOX_DOWNLOAD_URL = "https://content.dropboxapi.com/2/files/download";
 const DROPBOX_GET_METADATA_URL = "https://api.dropboxapi.com/2/files/get_metadata";
 const R2_BYTES_PER_GB = 1024 ** 3;
 const R2_CLASS_A_ACTION_TYPES = new Set([
@@ -128,10 +124,6 @@ const R2_FREE_ACTION_TYPES = new Set([
 ]);
 const DEFAULT_HIERARCHICAL_STATE_PREFIX =
   "_ops/checkpoints/r2_history_backup_state_v2";
-const HIERARCHICAL_STATE_ROOT_KIND =
-  "uk_aq_r2_history_backup_state_v2_root";
-const HIERARCHICAL_MONTH_STATE_KIND =
-  "uk_aq_r2_history_backup_state_observations_month";
 
 const R2_OPS_GQL_QUERY = `
 query R2OpsBillingPeriod($accountTag: string!, $startDate: Time!, $endDate: Time!) {
@@ -396,7 +388,8 @@ async function fetchJsonObject(
   maxResponseBytes = 0,
 ): Promise<JsonObject> {
   const startedAt = Date.now();
-  const response = await fetch(url, init);
+  const response = metricEnv?.coverageRequestBudget
+    ? await metricEnv.coverageRequestBudget.fetch(url, init) : await fetch(url, init);
   let text: string;
   if (maxResponseBytes && response.body) {
     const reader = response.body.getReader();
@@ -484,7 +477,8 @@ async function fetchJsonArray(
   metricQueryName = "dashboard_read",
 ): Promise<unknown[]> {
   const startedAt = Date.now();
-  const response = await fetch(url, init);
+  const response = metricEnv?.coverageRequestBudget
+    ? await metricEnv.coverageRequestBudget.fetch(url, init) : await fetch(url, init);
   const text = await response.text();
   if (metricEnv) {
     recordDashboardSupabaseResponse(metricEnv, url, response, text, Date.now() - startedAt, metricQueryName);
@@ -724,7 +718,7 @@ function parseHistoryDaySets(payload: JsonObject): R2DaySets {
   const sets: R2DaySets = { observations: new Set<string>(), aqilevels: new Set<string>() };
   if (!domains || typeof domains !== "object" || Array.isArray(domains)
     || !Array.isArray(((domains as JsonObject).observations as JsonObject | undefined)?.days)) {
-    throw new Error("R2 history-days response has no authoritative observation-day array");
+    throw new CoverageEvidenceError("R2 history-days response has no authoritative observation-day array");
   }
   for (const domainName of ["observations", "aqilevels"] as const) {
     const domain = (domains as JsonObject)[domainName];
@@ -737,7 +731,7 @@ function parseHistoryDaySets(payload: JsonObject): R2DaySets {
     }
     for (const value of days) {
       const day = coverageDay(value);
-      if (!day || sets[domainName].has(day)) throw new Error("Invalid or duplicate R2 history day");
+      if (!day || sets[domainName].has(day)) throw new CoverageEvidenceError("Invalid or duplicate R2 history day");
       sets[domainName].add(day);
     }
   }
@@ -804,7 +798,7 @@ async function fetchR2HistoryDays(
     const payload = await fetchJsonObject(
       appendQueryParams(apiUrl, addR2HistoryReadVersionParam({ max_days: String(maxDays) }, env)),
       { method: "GET", headers },
-      "R2 history-days API",
+      "R2 history-days API", env,
     );
     assertHistoryPayload(payload, env);
     const daySets = parseHistoryDaySets(payload);
@@ -826,7 +820,7 @@ async function fetchR2HistoryDays(
       daySets: null,
       window: null,
       bucket: null,
-      error: err instanceof Error ? err.message : String(err),
+      error: `R2 history-days unavailable: ${coverageFailureReason(err)}`,
       readVersion: resolveR2HistoryReadVersion(env),
     };
     if (revision === coverageRefreshRevision) {
@@ -1286,7 +1280,7 @@ function latestOldestDay(rows: unknown[], selector: (row: JsonObject) => boolean
   return latestDay;
 }
 
-function joinDropboxStatePath(env: WorkerEnv, stateRel: string): string {
+export function joinDropboxStatePath(env: WorkerEnv, stateRel: string): string {
   const root = String(env.UK_AQ_DROPBOX_ROOT || "TEST").trim().replace(/^\/+|\/+$/g, "");
   const historyDir = String(env.UK_AQ_R2_HISTORY_DROPBOX_DIR || "R2_history_backup").trim().replace(/^\/+|\/+$/g, "");
   const normalizedStateRel = stateRel.trim().replace(/^\/+|\/+$/g, "");
@@ -1297,7 +1291,7 @@ function joinDropboxStatePath(env: WorkerEnv, stateRel: string): string {
   return `/${parts.join("/")}`;
 }
 
-function resolveDropboxStatePath(env: WorkerEnv): DropboxStatePathResolution {
+export function resolveDropboxStatePath(env: WorkerEnv): DropboxStatePathResolution {
   const readVersion = resolveR2HistoryReadVersion(env);
   if (!readVersion.valid || !readVersion.version) {
     return {
@@ -1352,7 +1346,7 @@ function resolveDropboxHistoryPath(env: WorkerEnv): string {
   return `/${parts.join("/")}`;
 }
 
-async function fetchDropboxAccessToken(env: WorkerEnv): Promise<{ token: string | null; error: string | null }> {
+export async function fetchDropboxAccessToken(env: WorkerEnv): Promise<{ token: string | null; error: string | null }> {
   const appKey = String(env.DROPBOX_APP_KEY || "").trim();
   const appSecret = String(env.DROPBOX_APP_SECRET || "").trim();
   const refreshToken = String(env.DROPBOX_REFRESH_TOKEN || "").trim();
@@ -1375,9 +1369,9 @@ async function fetchDropboxAccessToken(env: WorkerEnv): Promise<{ token: string 
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
         },
-        body: form.toString(),
+        body: form.toString(), redirect: "manual", signal: AbortSignal.timeout(15000),
       },
-      "Dropbox token request",
+      "Dropbox token request", env, 16384,
     );
     const token = String(payload.access_token || "").trim();
     if (!token) {
@@ -1387,245 +1381,6 @@ async function fetchDropboxAccessToken(env: WorkerEnv): Promise<{ token: string 
   } catch (err) {
     return { token: null, error: err instanceof Error ? err.message : String(err) };
   }
-}
-
-async function fetchDropboxStateJson(env: WorkerEnv): Promise<{
-  days: R2DaySets;
-  path: string | null;
-  error: string | null;
-  source: string;
-  attemptedPaths: string[];
-  cacheKey: string;
-  warning: string | null;
-  fallbackAttempted: boolean;
-}> {
-  const resolvedPath = resolveDropboxStatePath(env);
-  const remotePath = resolvedPath.path;
-  const emptyDays = (): R2DaySets => ({
-    observations: new Set<string>(),
-    aqilevels: new Set<string>(),
-  });
-  if (!remotePath) {
-    return {
-      days: emptyDays(),
-      path: null,
-      error: null,
-      source: resolvedPath.source,
-      attemptedPaths: resolvedPath.attemptedPaths,
-      cacheKey: resolvedPath.cacheKey,
-      warning: resolvedPath.warning,
-      fallbackAttempted: resolvedPath.fallbackAttempted,
-    };
-  }
-  const { token, error: tokenError } = await fetchDropboxAccessToken(env);
-  if (tokenError) {
-    return {
-      days: emptyDays(),
-      path: `dropbox:${remotePath}`,
-      error: tokenError,
-      source: resolvedPath.source,
-      attemptedPaths: resolvedPath.attemptedPaths,
-      cacheKey: resolvedPath.cacheKey,
-      warning: resolvedPath.warning,
-      fallbackAttempted: resolvedPath.fallbackAttempted,
-    };
-  }
-  if (!token) {
-    return {
-      days: emptyDays(),
-      path: null,
-      error: null,
-      source: resolvedPath.source,
-      attemptedPaths: resolvedPath.attemptedPaths,
-      cacheKey: resolvedPath.cacheKey,
-      warning: resolvedPath.warning,
-      fallbackAttempted: resolvedPath.fallbackAttempted,
-    };
-  }
-  try {
-    const root = await fetchDropboxJson(token, remotePath);
-    if (root.observation_generation !== historyResolution(env).version) throw new Error("Dropbox checkpoint generation mismatch");
-    const references = parseHierarchicalStateMonthReferences(root);
-    if (references.some(ref => !ref.stateKey.startsWith(historyResolution(env).generation.backup_state_prefix + "/"))) throw new Error("Dropbox shard outside selected generation");
-    const days = emptyDays();
-    const shardErrors: string[] = [];
-    await mapWithConcurrency(references, 6, async (reference) => {
-      try {
-        const shardPath = joinDropboxStatePath(env, reference.stateKey);
-        const shard = await fetchDropboxJson(token, shardPath);
-        const shardDays = parseHierarchicalMonthStateDays(
-          shard,
-          reference.year,
-          reference.month,
-        );
-        for (const day of shardDays) days.observations.add(day);
-      } catch (error) {
-        shardErrors.push(
-          `${reference.stateKey}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-    });
-    return {
-      days,
-      path: `dropbox:${remotePath}`,
-      error: shardErrors.length ? shardErrors.join("; ") : null,
-      source: resolvedPath.source,
-      attemptedPaths: resolvedPath.attemptedPaths,
-      cacheKey: resolvedPath.cacheKey,
-      warning: resolvedPath.warning,
-      fallbackAttempted: resolvedPath.fallbackAttempted,
-    };
-  } catch (err) {
-    return {
-      days: emptyDays(),
-      path: `dropbox:${remotePath}`,
-      error: err instanceof Error ? err.message : String(err),
-      source: resolvedPath.source,
-      attemptedPaths: resolvedPath.attemptedPaths,
-      cacheKey: resolvedPath.cacheKey,
-      warning: resolvedPath.warning,
-      fallbackAttempted: resolvedPath.fallbackAttempted,
-    };
-  }
-}
-
-async function fetchDropboxJson(
-  token: string,
-  remotePath: string,
-): Promise<JsonObject> {
-  const headers = new Headers();
-  headers.set("Authorization", `Bearer ${token}`);
-  headers.set("Dropbox-API-Arg", JSON.stringify({ path: remotePath }));
-  const response = await fetch(DROPBOX_DOWNLOAD_URL, {
-    method: "POST",
-    headers,
-  });
-  const text = await response.text();
-  if (!response.ok) {
-    throw new Error(
-      `Dropbox checkpoint download failed (${response.status}): ${text}`,
-    );
-  }
-  const parsed = text ? JSON.parse(text) : null;
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("Dropbox checkpoint payload is not a JSON object.");
-  }
-  return parsed as JsonObject;
-}
-
-function normalizeHierarchicalStateKey(value: unknown): string {
-  const key = String(value || "")
-    .trim()
-    .replace(/\\/g, "/")
-    .replace(/^\/+|\/+$/g, "");
-  if (!key || key === "." || key === ".." || key.startsWith("../") || key.includes("/../")) {
-    throw new Error(`Invalid hierarchical Dropbox state key: ${String(value || "")}`);
-  }
-  return key;
-}
-
-function parseHierarchicalStateMonthReferences(
-  root: JsonObject,
-): DropboxMonthStateReference[] {
-  if (
-    root.kind !== HIERARCHICAL_STATE_ROOT_KIND
-    || root.backup_version !== "v2"
-  ) {
-    throw new Error("Hierarchical Dropbox state root identity mismatch");
-  }
-  const observations = root.observations;
-  if (!observations || typeof observations !== "object" || Array.isArray(observations)) {
-    throw new Error("Hierarchical Dropbox state root has no observations object");
-  }
-  const years = (observations as JsonObject).years;
-  if (!Array.isArray(years)) {
-    throw new Error("Hierarchical Dropbox state root observations.years is not an array");
-  }
-  const references: DropboxMonthStateReference[] = [];
-  for (const rawYear of years) {
-    if (!rawYear || typeof rawYear !== "object" || Array.isArray(rawYear)) continue;
-    const year = String((rawYear as JsonObject).year || "").trim();
-    if (!/^\d{4}$/.test(year)) {
-      throw new Error(`Invalid hierarchical Dropbox state year: ${year}`);
-    }
-    const months = (rawYear as JsonObject).months;
-    if (!Array.isArray(months)) continue;
-    for (const rawMonth of months) {
-      if (!rawMonth || typeof rawMonth !== "object" || Array.isArray(rawMonth)) continue;
-      const month = String((rawMonth as JsonObject).month || "").trim().padStart(2, "0");
-      if (!/^(0[1-9]|1[0-2])$/.test(month)) {
-        throw new Error(`Invalid hierarchical Dropbox state month: ${month}`);
-      }
-      references.push({
-        year,
-        month,
-        stateKey: normalizeHierarchicalStateKey(
-          (rawMonth as JsonObject).state_shard_key,
-        ),
-      });
-    }
-  }
-  references.sort((left, right) =>
-    `${left.year}-${left.month}-${left.stateKey}`.localeCompare(
-      `${right.year}-${right.month}-${right.stateKey}`,
-    )
-  );
-  return references;
-}
-
-function parseHierarchicalMonthStateDays(
-  shard: JsonObject,
-  expectedYear: string,
-  expectedMonth: string,
-): Set<string> {
-  if (
-    shard.kind !== HIERARCHICAL_MONTH_STATE_KIND
-    || shard.backup_version !== "v2"
-    || shard.domain !== "observations"
-  ) {
-    throw new Error("Hierarchical Dropbox month state identity mismatch");
-  }
-  if (String(shard.year || "").trim() !== expectedYear) {
-    throw new Error("Hierarchical Dropbox month state year mismatch");
-  }
-  if (String(shard.month || "").trim().padStart(2, "0") !== expectedMonth) {
-    throw new Error("Hierarchical Dropbox month state month mismatch");
-  }
-  if (!Array.isArray(shard.days)) {
-    throw new Error("Hierarchical Dropbox month state days is not an array");
-  }
-  const days = new Set<string>();
-  for (const rawDay of shard.days) {
-    if (!rawDay || typeof rawDay !== "object" || Array.isArray(rawDay)) {
-      throw new Error("Hierarchical Dropbox month state contains an invalid day entry");
-    }
-    const day = normalizeIsoDay((rawDay as JsonObject).day_utc);
-    if (!day || !day.startsWith(`${expectedYear}-${expectedMonth}-`)) {
-      throw new Error("Hierarchical Dropbox month state contains an invalid day_utc");
-    }
-    days.add(day);
-  }
-  return days;
-}
-
-async function mapWithConcurrency<T>(
-  items: T[],
-  concurrency: number,
-  worker: (item: T) => Promise<void>,
-): Promise<void> {
-  let nextIndex = 0;
-  const runners = Array.from(
-    { length: Math.min(Math.max(1, concurrency), Math.max(1, items.length)) },
-    async () => {
-      while (true) {
-        const index = nextIndex;
-        nextIndex += 1;
-        if (index >= items.length) return;
-        await worker(items[index]);
-      }
-    },
-  );
-  await Promise.all(runners);
 }
 
 function daySetBounds(days: Set<string>): { earliest: string | null; latest: string | null } {
@@ -2039,13 +1794,21 @@ async function fetchDashboardBaseData(
   let storage_coverage_independent_sources: JsonObject = {};
 
   if (options.includeMetricContext || options.includeStorageCoverage) {
-    const [dbMetrics, r2Usage, r2History, egress, dropboxState] = await Promise.all([
-      fetchDbMetrics(env),
-      fetchR2Usage(env, options.forceRefresh),
+    // Calendar-only collection must not spend its request budget on account,
+    // egress or size metrics. Dropbox is collected in separate bounded requests.
+    const [dbMetrics, r2Usage, r2History, egress] = await Promise.all([
+      options.includeMetricContext ? fetchDbMetrics(env) : Promise.resolve({
+        dbRows: [], schemaRows: [], r2DomainRows: [], dbError: null, schemaError: null, r2DomainError: null,
+      }),
+      options.includeMetricContext ? fetchR2Usage(env, options.forceRefresh) : Promise.resolve({ usage: null, error: null }),
       fetchR2HistoryDays(env, options.forceRefresh),
-      fetchServiceEgressMetrics(env),
-      fetchDropboxStateJson(env),
+      options.includeMetricContext ? fetchServiceEgressMetrics(env) : Promise.resolve({ rows: [], error: null }),
     ]);
+    const dropboxState = {
+      days: { observations: new Set<string>(), aqilevels: new Set<string>() },
+      path: null, error: null, source: "bounded_checkpoint_collection",
+      attemptedPaths: [], cacheKey: null, warning: null, fallbackAttempted: false,
+    };
     db_size_metrics = dbMetrics.dbRows;
     schema_size_metrics = dbMetrics.schemaRows;
     r2_domain_size_metrics = dbMetrics.r2DomainRows;
@@ -2116,9 +1879,9 @@ async function fetchDashboardBaseData(
         r2_status: storage_coverage_days.length ? "ok" : "unavailable",
         r2_checked_at_utc: r2History.checkedAt || null,
         r2_error: r2_history_days_error,
-        backup_status: dropboxState.path && !dropboxState.error && r2History.daySets ? "ok" : "unavailable",
+        backup_status: "pending",
         backup_checked_at_utc: dropboxState.path ? now.toISOString() : null,
-        backup_error: dropboxState.error || (dropboxState.path ? null : "Dropbox checkpoint is unavailable"),
+        backup_error: null,
       };
     }
   }
@@ -2169,6 +1932,9 @@ async function fetchDashboardBaseData(
     dropbox_backup_observations_latest_day,
     storage_coverage_source: "live_per_day_presence",
     storage_coverage_days,
+    dropbox_coverage: options.includeStorageCoverage ? {
+      protocol: "checkpoint_batches_v1", status: "pending", complete: false,
+    } : undefined,
     obs_aqidb_coverage_error,
     obs_aqidb_coverage_generated_at,
     storage_coverage_independent_sources,
@@ -2193,6 +1959,9 @@ export async function getDirectDashboardPayload(
   env: WorkerEnv,
   search: URLSearchParams,
 ): Promise<DashboardPayload> {
+  if (asBoolFlag(search.get("include_storage_coverage"), true) && !env.coverageRequestBudget) {
+    env = { ...env, coverageRequestBudget: new CoverageRequestBudget() };
+  }
   const forceRefresh = ["force", "refresh", "nocache", "cache_bust", "cacheBust"].some(key => asTruthy(search.get(key)));
   if (forceRefresh) clearStorageCoverageCaches();
   const revision = coverageRefreshRevision;
@@ -2228,6 +1997,8 @@ export async function getDirectStorageCoveragePayload(
   generated_at: string;
   storage_coverage_source: string;
   storage_coverage_days: unknown[];
+  dropbox_coverage?: JsonObject;
+  storage_coverage_request_budget?: JsonObject;
   ingest_coverage?: IngestCoverageMetadata;
   ingest_coverage_error?: string | null;
   obs_aqidb_coverage_error?: string | null;
@@ -2249,6 +2020,8 @@ export async function getDirectStorageCoveragePayload(
   dropbox_backup_observations_earliest_day: string | null;
   dropbox_backup_observations_latest_day: string | null;
 }> {
+  const budget = env.coverageRequestBudget || new CoverageRequestBudget();
+  env = { ...env, coverageRequestBudget: budget };
   const forceRefresh = ["force", "refresh", "nocache", "cache_bust", "cacheBust"].some(key => asTruthy(search.get(key)));
   if (forceRefresh) {
     clearStorageCoverageCaches();
@@ -2258,12 +2031,15 @@ export async function getDirectStorageCoveragePayload(
   if (!forceRefresh && storageCoverageCacheVersionKey === cacheKey) {
     const cached = cacheGet(storageCoverageCache);
     if (cached) {
-      return applyStorageIngestCoverage(env, cached);
+      const refreshed = await applyStorageIngestCoverage(env, cached);
+      return { ...refreshed, storage_coverage_request_budget: {
+        used: budget.used, limit: budget.limit,
+      } };
     }
   }
   const payload = await fetchDashboardBaseData(env, {
     includeStorageCoverage: true,
-    includeMetricContext: true,
+    includeMetricContext: false,
     includeIngestContext: false,
     dispatchCursor: null,
     forceRefresh,
@@ -2271,6 +2047,8 @@ export async function getDirectStorageCoveragePayload(
   const response = {
     generated_at: nowIso(),
     storage_coverage_source: payload.storage_coverage_source,
+    dropbox_coverage: payload.dropbox_coverage,
+    storage_coverage_request_budget: { used: budget.used, limit: budget.limit },
     ingest_coverage: payload.ingest_coverage,
     ingest_coverage_error: payload.ingest_coverage_error,
     obs_aqidb_coverage_error: payload.obs_aqidb_coverage_error,

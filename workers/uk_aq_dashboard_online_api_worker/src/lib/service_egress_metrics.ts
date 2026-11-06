@@ -179,6 +179,7 @@ export async function flushDashboardServiceEgressMetrics(env: WorkerEnv): Promis
   try {
     const response = await fetch(`${metricsUrl}/rest/v1/rpc/${METRICS_RPC}`, {
       method: "POST",
+      redirect: "manual",
       headers: {
         apikey: serviceKey,
         Authorization: `Bearer ${serviceKey}`,

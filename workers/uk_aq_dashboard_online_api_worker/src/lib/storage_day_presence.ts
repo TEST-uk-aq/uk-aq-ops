@@ -34,8 +34,9 @@ export class CoverageEvidenceError extends Error {}
 export function coverageFailureReason(error: unknown): string {
   if (error instanceof CoverageEvidenceError) return error.message;
   if (error instanceof Error) {
+    if (/subrequest.*(?:limit|budget)|too many (?:subrequests|api requests)/i.test(error.message)) return "subrequest budget exhausted";
     if (["TimeoutError", "AbortError"].includes(error.name)) return "request timed out";
-    const status = /^(?:IngestDB daily presence|Failed to fetch uk_aq_obs_aqidb_day_counts_current) \(([1-5][0-9]{2})\)/.exec(error.message)?.[1];
+    const status = /^(?:IngestDB daily presence|R2 history-days API|Failed to fetch uk_aq_obs_aqidb_day_counts_current) \(([1-5][0-9]{2})\)/.exec(error.message)?.[1];
     if (status) return ["401", "403"].includes(status) ? `authentication failed (HTTP ${status})` : `request failed (HTTP ${status})`;
     if (/returned non-(?:object|array) JSON payload/.test(error.message)) return "invalid response";
   }

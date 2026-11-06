@@ -2120,6 +2120,8 @@
       let storageCoverageLoadSequence = 0;
       let manualStorageCoverageRefresh = null;
       let latestStorageCoveragePayload = null;
+      let storageCoverageBackupExpiryTimer = null;
+      let latestCompleteDropboxCoverage = null;
       const storageCoverageSourceWatermarks = new Map();
       let r2ConnectorCountsLoadSequence = 0;
       let operationsLoadSequence = 0;
@@ -4463,12 +4465,13 @@
         });
         const r2 = coverage.r2Observs;
         const backup = coverage.dropboxObservs;
+        const backupStale = Boolean(latestStorageCoveragePayload?.storage_coverage_independent_sources?.backup_stale);
         const present = r2 === true || backup === true;
-        const uncertain = typeof r2 !== "boolean" || typeof backup !== "boolean";
+        const uncertain = typeof r2 !== "boolean" || typeof backup !== "boolean" || backupStale;
         const stateLabel = (value) => value === true ? "present" : value === false ? "absent" : "unknown/unavailable";
         const orange = coverage.excluded || (!present && !uncertain) ? null : {
           label: r2 === true ? "R2 observations" : backup === true ? "Dropbox backup" : "R2 / Dropbox unknown",
-          title: `R2 observations: ${stateLabel(r2)} • Dropbox backup: ${stateLabel(backup)}`,
+          title: `R2 observations: ${stateLabel(r2)} • Dropbox backup: ${stateLabel(backup)}${backupStale ? " in previous snapshot; current checkpoint unknown" : ""}`,
           className: present ? "coverage-bar-r2-observs" : "is-unknown",
           unknown: !present,
           unknownPartial: present && uncertain,
@@ -4489,11 +4492,21 @@
         const present = summarizeCoverageSources(cell.coverage);
         const absent = summarizeCoverageSources(cell.coverage, false);
         const unknown = summarizeCoverageSources(cell.coverage, null);
+        const backupStale = Boolean(latestStorageCoveragePayload?.storage_coverage_independent_sources?.backup_stale);
+        const backupLabel = "Dropbox observations";
+        if (backupStale) {
+          [present, absent].forEach(labels => {
+            const index = labels.indexOf(backupLabel);
+            if (index !== -1) labels.splice(index, 1);
+          });
+          if (!unknown.includes(backupLabel)) unknown.push(backupLabel);
+        }
         return [
           cell.dateKey,
           present.length ? `Sources: ${present.join(", ")}` : "",
           absent.length ? `Confirmed absent: ${absent.join(", ")}` : "",
           unknown.length ? `Unknown/unavailable: ${unknown.join(", ")}` : "",
+          backupStale ? `Dropbox marker retained from previous snapshot (${latestStorageCoveragePayload.storage_coverage_independent_sources.backup_checked_at_utc}); current checkpoint unknown` : "",
         ].filter(Boolean).join(" • ");
       }
 
@@ -4533,6 +4546,16 @@
         if (payload.ingest_coverage?.checked_at_utc) details.push(`IngestDB checked ${payload.ingest_coverage.checked_at_utc}`);
         if (payload.storage_coverage_next_refresh_at) details.push(`next automatic refresh ${payload.storage_coverage_next_refresh_at}`);
         if (payload.ingest_coverage?.expires_at_utc) details.push(`IngestDB evidence expires ${payload.ingest_coverage.expires_at_utc}`);
+        const backup = payload.dropbox_coverage || {};
+        if (backup.protocol === "checkpoint_batches_v1") {
+          if (backup.status === "pending") details.push(Number.isInteger(backup.total_shards)
+            ? `Dropbox checkpoints: ${backup.checked_shards}/${backup.total_shards} checked; ${backup.remaining_shards} remaining`
+            : "Checking Dropbox backup checkpoints...");
+          if (backup.complete) details.push(`Dropbox checkpoints: all ${backup.total_shards} shards checked`);
+          if (backup.complete && !backup.checkpoint_complete) warnings.push("Dropbox backup checkpoint is incomplete; unconfirmed dates remain unknown.");
+          if (backup.retained_complete) warnings.push("Previous verified Dropbox snapshot retained temporarily while its replacement is unavailable or being checked.");
+          if (backup.evidence_expired) warnings.push("Previous Dropbox evidence expired; backup coverage is unknown until revalidated.");
+        }
         if (cache.state === "stale" || cache.stale || payload.ingest_coverage?.stale
             || Date.parse(payload.ingest_coverage?.expires_at_utc || "") < Date.now()) warnings.push("Cached coverage is stale; showing previous evidence.");
         if (cache.last_error_code) warnings.push(`Local cache: ${cache.last_error_code}`);
@@ -5146,7 +5169,7 @@
           </div>
           ${bodyMarkup}
           <div class="footnote">${escapeHtml(footnoteText)}</div>
-          ${renderCoverageDiagnostics()}
+          <div data-role="coverage-diagnostics">${renderCoverageDiagnostics()}</div>
           ${r2VersionWarning ? `<div class="footnote">${escapeHtml(r2VersionWarning)}</div>` : ""}
           <div class="coverage-connector-counts-section" data-role="r2-connector-counts"></div>
         `;
@@ -5512,6 +5535,12 @@
           }
           const data = payload || {};
           applyStorageCoveragePayload(data);
+          const completed = await collectHostedDropboxCoverage(data, () =>
+            requestId === storageCoverageLoadSequence
+              && (!parentLoadId || parentLoadId === operationsLoadSequence));
+          if (!completed || requestId !== storageCoverageLoadSequence
+              || (parentLoadId && parentLoadId !== operationsLoadSequence)) return;
+          if (completed !== data) applyStorageCoveragePayload(completed);
           if (String(errorEl.textContent || "").startsWith(STORAGE_COVERAGE_ERROR_PREFIX)) {
             setError("");
           }
@@ -5570,15 +5599,197 @@
         return Date.parse(payload.storage_coverage_generated_at || cache.source_generated_at || payload.generated_at || "");
       }
 
+      // Console-only summary of the real responses already used by the page.
+      // No new fetch, credentials, private configuration or provider body output.
+      window.ukAqStorageCoverageDiagnostic = () => {
+        const payload = latestStorageCoveragePayload || {}, rows = payload.storage_coverage_days || [];
+        const backup = payload.dropbox_coverage || {};
+        const errorKind = (value) => {
+          if (!value) return null;
+          const text = String(value);
+          if (/subrequest/i.test(text)) return "subrequest budget exhausted";
+          if (/timed? ?out|timeout/i.test(text)) return "timeout";
+          if (/stale|expired/i.test(text)) return "stale source evidence";
+          if (/auth|credential|HTTP (401|403)/i.test(text)) return "authentication unavailable";
+          if (/incomplete|missing/i.test(text)) return "incomplete source evidence";
+          if (/invalid|malformed|mismatch/i.test(text)) return "invalid source evidence";
+          const http = /HTTP ([1-5][0-9]{2})/.exec(text);
+          return http ? `HTTP ${http[1]}` : "source unavailable";
+        };
+        const counts = Object.fromEntries(COVERAGE_SOURCES.map(source => [source.rawField, {
+          present: rows.filter(row => row[source.rawField] === true).length,
+          absent: rows.filter(row => row[source.rawField] === false).length,
+          unknown: rows.filter(row => typeof row[source.rawField] !== "boolean").length,
+        }]));
+        const result = {
+          status: rows.length ? "loaded" : "unavailable", generation: payload.r2_history_read_version?.version,
+          range: [rows[0]?.date, rows[rows.length - 1]?.date], dates: rows.length,
+          ingest_status: payload.ingest_coverage?.status,
+          errors: { ingest: errorKind(payload.ingest_coverage_error), obs_aqidb: errorKind(payload.obs_aqidb_coverage_error),
+            r2: errorKind(payload.r2_history_days_error), dropbox: errorKind(payload.dropbox_backup_state_error || backup.error) },
+          dropbox: { status: backup.status, collection_complete: backup.complete, checkpoint_complete: backup.checkpoint_complete,
+            checked: backup.checked_shards, remaining: backup.remaining_shards, total: backup.total_shards,
+            retained: Boolean(backup.retained_complete), checked_at: payload.storage_coverage_independent_sources?.backup_checked_at_utc,
+            request_budget_used: backup.request_budget_used },
+          database_request_budget: payload.storage_coverage_request_budget, source_days: counts,
+          confirmed_r2_days_in_2020: rows.filter(row => row.date.startsWith("2020-") && row.r2_observs === true).length,
+        };
+        console.log(result);
+        return result;
+      };
+
+      function retainIncompleteDropboxEvidence(incoming) {
+        if (incoming.dropbox_coverage?.protocol !== "checkpoint_batches_v1" || incoming.dropbox_coverage.complete) return incoming;
+        const previous = latestCompleteDropboxCoverage;
+        const checked = previous?.checked;
+        const sameGeneration = incoming.r2_history_read_version?.version === previous?.generation;
+        const reusable = sameGeneration
+          && Date.parse(checked || "") >= Date.now() - 300000;
+        return {
+          ...incoming,
+          storage_coverage_days: incoming.storage_coverage_days.map(row => ({
+            ...row, dropbox_observs: reusable ? previous.days.get(row.date) ?? null : null,
+          })),
+          dropbox_coverage: { ...incoming.dropbox_coverage, retained_complete: Boolean(reusable) },
+          storage_coverage_independent_sources: {
+            ...incoming.storage_coverage_independent_sources,
+            backup_status: incoming.dropbox_coverage.status,
+            backup_stale: Boolean(reusable), backup_checked_at_utc: reusable ? checked : null,
+          },
+        };
+      }
+
+      function scheduleRetainedDropboxExpiry() {
+        window.clearTimeout(storageCoverageBackupExpiryTimer);
+        storageCoverageBackupExpiryTimer = null;
+        const payload = latestStorageCoveragePayload;
+        if (!payload?.dropbox_coverage?.retained_complete) return;
+        const checked = payload.storage_coverage_independent_sources?.backup_checked_at_utc;
+        const version = payload.r2_history_read_version?.version;
+        const expiry = Date.parse(checked || "") + 300000;
+        if (!Number.isFinite(expiry)) return;
+        storageCoverageBackupExpiryTimer = window.setTimeout(() => {
+          const current = latestStorageCoveragePayload;
+          if (!current?.dropbox_coverage?.retained_complete
+              || current.r2_history_read_version?.version !== version
+              || current.storage_coverage_independent_sources?.backup_checked_at_utc !== checked) return;
+          applyStorageCoveragePayload({ ...current,
+            dropbox_coverage: { ...current.dropbox_coverage, retained_complete: false, evidence_expired: true },
+          });
+        }, Math.max(0, expiry - Date.now()) + 5);
+      }
+
+      async function collectHostedDropboxCoverage(data, isCurrent) {
+        if (data.dropbox_coverage?.protocol !== "checkpoint_batches_v1" || !data.storage_coverage_days.length) return data;
+        const version = data.r2_history_read_version?.version;
+        const started = Date.now();
+        let params = new URLSearchParams({ source: "dropbox" }), restarts = 0;
+        let collection = null, checkpoint = null, checkedShards = 0, totalShards = null;
+        try {
+          while (isCurrent()) {
+            if (Date.now() - started > 600000) throw new Error("Dropbox checkpoint collection timed out");
+            const response = await fetchStorageCoverageJson(params);
+            if (!isCurrent()) return null;
+            if (response.r2_history_read_version?.version !== version) {
+              return { ...data, storage_coverage_days: [], r2_history_read_version: response.r2_history_read_version,
+                r2_history_days_error: "History generation changed; refresh the calendar again",
+                dropbox_coverage: { protocol: "checkpoint_batches_v1", status: "unavailable", complete: false } };
+            }
+            const backup = response.dropbox_coverage;
+            if (backup?.protocol !== "checkpoint_batches_v1") throw new Error("Invalid Dropbox checkpoint response");
+            if (backup.status === "unavailable") {
+              if (backup.restart_required && restarts++ < 1) {
+                params = new URLSearchParams({ source: "dropbox" });
+                collection = checkpoint = totalShards = null;
+                checkedShards = 0;
+                continue;
+              }
+              return { ...data, dropbox_coverage: backup, dropbox_backup_state_error: backup.error || "Dropbox checkpoint collection unavailable",
+                storage_coverage_independent_sources: { ...data.storage_coverage_independent_sources,
+                  backup_status: "unavailable", backup_error: backup.error || "Dropbox checkpoint collection unavailable" } };
+            }
+            if (backup.complete) {
+              if (!["ok", "partial"].includes(backup.status) || !Array.isArray(backup.days)
+                  || (checkpoint && backup.checkpoint_id !== checkpoint)
+                  || (totalShards !== null && backup.total_shards !== totalShards)
+                  || !Number.isInteger(backup.total_shards) || backup.total_shards < 0
+                  || backup.checked_shards !== backup.total_shards || backup.remaining_shards !== 0
+                  || typeof backup.checkpoint_complete !== "boolean"
+                  || !Number.isFinite(Date.parse(backup.checked_at_utc || ""))) throw new Error("Incomplete Dropbox checkpoint response");
+              const days = new Set(backup.days);
+              if (days.size !== backup.days.length || backup.days.some(day => {
+                const date = parseUtcDateKey(day);
+                return typeof day !== "string" || !date || toUtcDateKey(date) !== day;
+              })) throw new Error("Invalid Dropbox checkpoint dates");
+              if (data.ingest_coverage?.status === "ok" && Date.parse(data.ingest_coverage.expires_at_utc || "") <= Date.now()) {
+                // A slow cold collection must not finish with expired database
+                // evidence. This is another lightweight invocation, not another
+                // checkpoint scan or an unbounded combined request.
+                const freshData = await fetchStorageCoverageJson(new URLSearchParams({ t: String(Date.now()) }));
+                if (!isCurrent()) return null;
+                if (!Array.isArray(freshData.storage_coverage_days)) throw new Error("Invalid refreshed database coverage response");
+                data = freshData;
+                if (data.r2_history_read_version?.version !== version) throw new Error("History generation changed; refresh the calendar again");
+              }
+              return { ...data,
+                storage_coverage_days: data.storage_coverage_days.map(row => ({ ...row,
+                  dropbox_observs: days.has(row.date) ? true : backup.checkpoint_complete ? false : null })),
+                dropbox_coverage: { ...backup, days: undefined }, dropbox_backup_state_error: null,
+                storage_coverage_independent_sources: { ...data.storage_coverage_independent_sources,
+                  backup_status: backup.status, backup_error: null, backup_stale: false,
+                  backup_checked_at_utc: backup.checked_at_utc },
+              };
+            }
+            if (backup.status !== "pending" || !backup.collection_id || !Number.isInteger(backup.cursor)
+                || backup.cursor <= checkedShards || backup.cursor > checkedShards + 8
+                || backup.cursor !== backup.checked_shards || backup.remaining_shards <= 0
+                || (collection && backup.collection_id !== collection)
+                || (checkpoint && backup.checkpoint_id !== checkpoint)
+                || (totalShards !== null && backup.total_shards !== totalShards)) {
+              throw new Error("Invalid Dropbox checkpoint continuation");
+            }
+            collection = backup.collection_id;
+            checkpoint = backup.checkpoint_id;
+            checkedShards = backup.checked_shards;
+            totalShards = backup.total_shards;
+            // Update progress without rebuilding the calendar or re-requesting
+            // its connector counts. The rows remain the previous/unknown snapshot.
+            const hadRetained = latestStorageCoveragePayload?.dropbox_coverage?.retained_complete;
+            const progressData = retainIncompleteDropboxEvidence({
+              ...latestStorageCoveragePayload, dropbox_coverage: backup,
+            });
+            if (hadRetained && !progressData.dropbox_coverage.retained_complete) {
+              applyStorageCoveragePayload({ ...progressData,
+                dropbox_coverage: { ...progressData.dropbox_coverage, evidence_expired: true } });
+            } else {
+              latestStorageCoveragePayload = progressData;
+              scheduleRetainedDropboxExpiry();
+            }
+            document.querySelectorAll('[data-panel="storage-coverage"] [data-role="coverage-diagnostics"]')
+              .forEach(node => { node.innerHTML = renderCoverageDiagnostics(); });
+            params = new URLSearchParams({ source: "dropbox", collection_id: backup.collection_id, cursor: String(backup.cursor) });
+          }
+          return null;
+        } catch (error) {
+          if (!isCurrent()) return null;
+          const message = error?.message || "Dropbox checkpoint collection failed";
+          return { ...data, dropbox_coverage: { ...data.dropbox_coverage, status: "unavailable", complete: false, error: message },
+            dropbox_backup_state_error: message,
+            storage_coverage_independent_sources: { ...data.storage_coverage_independent_sources,
+              backup_status: "unavailable", backup_error: message } };
+        }
+      }
+
       function preserveNewerCoverageEvidence(incoming) {
         const previous = latestStorageCoveragePayload;
-        if (!previous || !incoming.storage_coverage_days.length) return incoming;
+        if (!previous) return incoming;
         const version = String(incoming.r2_history_read_version?.version || "");
         const previousVersion = String(previous.r2_history_read_version?.version || "");
         if (version !== previousVersion) {
           storageCoverageSourceWatermarks.clear();
           return incoming;
         }
+        if (!incoming.storage_coverage_days.length) return incoming;
         const incomingTime = coveragePayloadTime(incoming);
         const previousTime = coveragePayloadTime(previous);
         const incomingDates = new Set(incoming.storage_coverage_days.map((row) => row.date));
@@ -5593,7 +5804,8 @@
           ingest: incoming.ingest_coverage?.checked_at_utc || incoming.ingest_coverage_diagnostics_updated_at || incomingTime,
           obs_aqi_observs: incoming.obs_aqidb_coverage_generated_at || incomingTime,
           r2_observs: incoming.storage_coverage_independent_sources?.r2_checked_at_utc || incoming.storage_coverage_independent_sources?.generated_at || incomingTime,
-          dropbox_observs: incoming.storage_coverage_independent_sources?.backup_checked_at_utc || incoming.storage_coverage_independent_sources?.generated_at || incomingTime,
+          dropbox_observs: incoming.dropbox_coverage?.protocol === "checkpoint_batches_v1" && !incoming.dropbox_coverage.complete
+            ? null : incoming.storage_coverage_independent_sources?.backup_checked_at_utc || incoming.storage_coverage_independent_sources?.generated_at || incomingTime,
         };
         const retained = [];
         COVERAGE_SOURCES.forEach((source) => {
@@ -5625,6 +5837,10 @@
               [prefix + "_stale"]: true,
               [prefix + "_checked_at_utc"]: previous.storage_coverage_independent_sources?.[prefix + "_checked_at_utc"],
             };
+            if (prefix === "backup" && payload.dropbox_coverage?.protocol === "checkpoint_batches_v1") {
+              payload.dropbox_coverage = { ...payload.dropbox_coverage, status: "unavailable", complete: false,
+                retained_complete: true, error: "Older Dropbox evidence ignored; previous verified snapshot retained" };
+            }
           }
         });
         payload.storage_coverage_days = [...rows.values()].sort((a, b) => String(a.date).localeCompare(String(b.date)));
@@ -5637,7 +5853,8 @@
           ingest: payload.ingest_coverage?.checked_at_utc || payload.ingest_coverage_diagnostics_updated_at || coveragePayloadTime(payload),
           obs_aqi_observs: payload.obs_aqidb_coverage_generated_at || coveragePayloadTime(payload),
           r2_observs: payload.storage_coverage_independent_sources?.r2_checked_at_utc || payload.storage_coverage_independent_sources?.generated_at || coveragePayloadTime(payload),
-          dropbox_observs: payload.storage_coverage_independent_sources?.backup_checked_at_utc || payload.storage_coverage_independent_sources?.generated_at || coveragePayloadTime(payload),
+          dropbox_observs: payload.dropbox_coverage?.protocol === "checkpoint_batches_v1" && !payload.dropbox_coverage.complete
+            ? null : payload.storage_coverage_independent_sources?.backup_checked_at_utc || payload.storage_coverage_independent_sources?.generated_at || coveragePayloadTime(payload),
         };
         Object.entries(sourceTimes).forEach(([key, value]) => {
           const timestamp = typeof value === "number" ? value : Date.parse(value || "");
@@ -5646,8 +5863,18 @@
       }
 
       function applyStorageCoveragePayload(incoming) {
-        const data = preserveNewerCoverageEvidence(incoming);
+        if (latestCompleteDropboxCoverage?.generation !== incoming.r2_history_read_version?.version) latestCompleteDropboxCoverage = null;
+        const data = preserveNewerCoverageEvidence(retainIncompleteDropboxEvidence(incoming));
         latestStorageCoveragePayload = data;
+        if (data.dropbox_coverage?.complete && data.dropbox_coverage.checkpoint_complete
+            && !data.storage_coverage_independent_sources?.backup_stale) {
+          latestCompleteDropboxCoverage = {
+            generation: data.r2_history_read_version?.version,
+            checked: data.storage_coverage_independent_sources?.backup_checked_at_utc,
+            days: new Map(data.storage_coverage_days.map(row => [row.date, row.dropbox_observs])),
+          };
+        }
+        scheduleRetainedDropboxExpiry();
         recordCoverageSourceWatermarks(data);
         const coverageRows = Array.isArray(data.storage_coverage_days)
           ? data.storage_coverage_days
@@ -5674,6 +5901,7 @@
         }
         storageCoverageLoadSequence += 1;
         manualStorageCoverageRefresh = { requestId: null, startedAtMs: Date.now() };
+        const manualSession = manualStorageCoverageRefresh;
         syncManualStorageCoverageRefreshControls();
         setError("");
         try {
@@ -5684,8 +5912,12 @@
           const requestId = String(initiation.refresh_request_id || "");
           if (!requestId) {
             if (Array.isArray(initiation.storage_coverage_days)) {
-              manualStorageCoverageRefresh = null;
               applyStorageCoveragePayload(initiation);
+              const completed = await collectHostedDropboxCoverage(initiation, () => manualStorageCoverageRefresh === manualSession);
+              if (!completed || manualStorageCoverageRefresh !== manualSession) return;
+              manualStorageCoverageRefresh = null;
+              applyStorageCoveragePayload(completed);
+              syncManualStorageCoverageRefreshControls();
               return;
             }
             throw new Error("Storage coverage refresh was not acknowledged");

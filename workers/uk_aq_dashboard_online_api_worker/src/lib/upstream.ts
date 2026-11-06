@@ -1,4 +1,5 @@
 import type { HistoryResolution } from "./history_generation";
+import type { CoverageRequestBudget } from "./coverage_request_budget";
 import { errorEnvelope, withCorsAndCacheControl, withCorsAndNoStore } from "./http";
 
 export type WorkerEnv = {
@@ -10,6 +11,8 @@ export type WorkerEnv = {
   UK_AQ_MEDIA_D1_WARNING_PERCENT?: string;
   UK_AQ_MEDIA_D1_CRITICAL_PERCENT?: string;
   historyResolution?: HistoryResolution;
+  // Internal request state, never an environment setting or shared isolate cache.
+  coverageRequestBudget?: CoverageRequestBudget;
   DASHBOARD_UPSTREAM_BASE_URL?: string;
   DASHBOARD_UPSTREAM_BEARER_TOKEN?: string;
   UKAQ_PROXY_ROUTE_PREFIX?: string;
@@ -161,7 +164,8 @@ export async function proxyToUpstream(
   const cacheKey = new Request(cacheKeyUrl.toString(), { method: "GET" });
 
   if (useEdgeCache && !bypassCache) {
-    const cached = await defaultEdgeCache().match(cacheKey);
+    const cached = env.coverageRequestBudget
+      ? await env.coverageRequestBudget.match(defaultEdgeCache(), cacheKey) : await defaultEdgeCache().match(cacheKey);
     if (cached && (!cacheOptions?.validateCachedResponse || await cacheOptions.validateCachedResponse(cached.clone()))) {
       const hit = withCorsAndCacheControl(cached, cacheControl);
       hit.headers.set("X-UKAQ-Worker-Cache", "HIT");
@@ -176,13 +180,13 @@ export async function proxyToUpstream(
 
   let upstreamResp: Response;
   try {
-    upstreamResp = await fetch(upstreamUrl, {
-      method,
-      headers,
-      body,
-    });
+    const init: RequestInit = { method, headers, body };
+    upstreamResp = env.coverageRequestBudget
+      ? await env.coverageRequestBudget.fetch(upstreamUrl, init) : await fetch(upstreamUrl, init);
   } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
+    const detail = env.coverageRequestBudget
+      ? (err instanceof Error && /subrequest.*budget/i.test(err.message) ? "subrequest budget exhausted" : "source unavailable")
+      : err instanceof Error ? err.message : String(err);
     return errorEnvelope("UPSTREAM_UNREACHABLE", `Failed to reach upstream API: ${detail}`, 502);
   }
 
@@ -200,7 +204,8 @@ export async function proxyToUpstream(
   missResponse.headers.set("X-UKAQ-Worker-Cache", bypassCache ? "BYPASS" : "MISS");
 
   if (!bypassCache && upstreamResp.ok && responseTtl > 0) {
-    await defaultEdgeCache().put(cacheKey, missResponse.clone());
+    if (env.coverageRequestBudget) await env.coverageRequestBudget.put(defaultEdgeCache(), cacheKey, missResponse.clone());
+    else await defaultEdgeCache().put(cacheKey, missResponse.clone());
   }
   return missResponse;
 }
