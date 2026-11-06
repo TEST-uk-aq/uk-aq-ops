@@ -2291,6 +2291,15 @@ def _latest_oldest_day_by_schema(
     }
 
 
+def _storage_coverage_start_day(now: datetime, r2_history_days: Optional[Dict[str, Set[date]]]) -> date:
+    # Direct physical verification may constrain presence, never the API boundary.
+    days = (r2_history_days or {}).get("committed_observations", (r2_history_days or {}).get("observations"))
+    today_utc = now.astimezone(timezone.utc).date()
+    if not isinstance(days, set) or not days or any(type(day) is not date or day > today_utc for day in days):
+        raise RuntimeError("Storage calendar range unavailable: selected-generation R2 history has no valid committed observation days")
+    return min(days)
+
+
 def _build_live_storage_coverage_days(
     now: datetime,
     db_size_metrics: Optional[List[Dict[str, Any]]],
@@ -2307,21 +2316,9 @@ def _build_live_storage_coverage_days(
     r2_days = (r2_history_days or {}).get("observations")
     dropbox_days = (dropbox_backup_days or {}).get("observations")
 
-    # Oldest metrics establish the display/check range only. Day presence always
-    # comes from explicit source evidence, independently of every other source.
-    oldest_by_label = _latest_oldest_day_by_label(db_size_metrics)
-    lower_bounds = [
-        oldest_by_label.get("ingestdb"),
-        _latest_oldest_day_by_schema(schema_size_metrics).get("uk_aq_observs"),
-        oldest_by_label.get("obs_aqidb"),
-    ]
-    evidence_days = set()
-    for days in (ingest_days, observs_days, r2_days, dropbox_days):
-        if isinstance(days, set):
-            evidence_days.update(days)
-    lower_bounds.extend(evidence_days)
-    start_day = min((day for day in lower_bounds if day is not None), default=today_utc)
-    end_day = max(evidence_days | {today_utc})
+    # This boundary selects dates only; it never supplies database presence.
+    start_day = _storage_coverage_start_day(now, r2_history_days)
+    end_day = today_utc
 
     rows: List[Dict[str, Any]] = []
     cursor = start_day
@@ -2380,15 +2377,18 @@ def _get_storage_coverage_days_cached(
     dropbox_state_error: Optional[str] = None,
     dropbox_state_info: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
+    start_day = _storage_coverage_start_day(now, r2_history_days)
     cached_rows = _get_cached_storage_coverage_days(now)
-    if isinstance(cached_rows, list):
+    if (isinstance(cached_rows, list) and cached_rows
+            and cached_rows[0].get("date") == start_day.isoformat()
+            and cached_rows[-1].get("date") == now.astimezone(timezone.utc).date().isoformat()):
         return cached_rows
 
     now_utc = now.astimezone(timezone.utc)
     day_sets = _fetch_storage_day_sets(
         base_url=base_url,
         service_role_key=service_role_key,
-        db_size_metrics=db_size_metrics,
+        from_day=start_day,
         now=now_utc,
     )
     rows = _build_live_storage_coverage_days(
@@ -2418,19 +2418,15 @@ def _get_storage_coverage_days_cached(
 def _fetch_ingest_observation_days(
     base_url: str,
     service_role_key: str,
-    db_size_metrics: Optional[List[Dict[str, Any]]],
+    from_day: date,
     now: datetime,
 ) -> Optional[Set[date]]:
     if not base_url or not service_role_key:
         return None
 
-    oldest_day = _latest_oldest_day_by_label(db_size_metrics).get("ingestdb")
-    if oldest_day is None:
-        return set()
-
     today_utc = now.astimezone(timezone.utc).date()
-    if oldest_day > today_utc:
-        return set()
+    if type(from_day) is not date or from_day > today_utc:
+        return None
 
     try:
         safe_base_url = _ensure_allowed_base_url(base_url)
@@ -2441,7 +2437,7 @@ def _fetch_ingest_observation_days(
     headers = _postgrest_headers(service_role_key, schema=PUBLIC_SCHEMA)
 
     days_with_rows: Set[date] = set()
-    cursor = oldest_day
+    cursor = from_day
     while cursor <= today_utc:
         next_day_utc = cursor + timedelta(days=1)
         try:
@@ -2478,26 +2474,26 @@ def _fetch_storage_day_sets(
     *,
     base_url: str,
     service_role_key: str,
-    db_size_metrics: Optional[List[Dict[str, Any]]],
+    from_day: date,
     now: datetime,
 ) -> Dict[str, Set[date]]:
     day_sets: Dict[str, Set[date]] = {}
     ingest_days = _fetch_ingest_observation_days(
         base_url=base_url,
         service_role_key=service_role_key,
-        db_size_metrics=db_size_metrics,
+        from_day=from_day,
         now=now,
     )
     if ingest_days is not None:
         day_sets["ingestdb"] = ingest_days
 
-    observs_days = _fetch_obs_aqi_observs_row_days()
+    observs_days = _fetch_obs_aqi_observs_row_days(from_day, now.astimezone(timezone.utc).date())
     if observs_days is not None:
         day_sets["obs_aqidb"] = observs_days
     return day_sets
 
 
-def _fetch_obs_aqidb_day_count_rows(dataset: str) -> Optional[List[Dict[str, Any]]]:
+def _fetch_obs_aqidb_day_count_rows(dataset: str, from_day: date, to_day: date) -> Optional[List[Dict[str, Any]]]:
     if not OBS_AQIDB_SUPABASE_URL or not OBS_AQIDB_SECRET_KEY:
         return None
 
@@ -2518,7 +2514,7 @@ def _fetch_obs_aqidb_day_count_rows(dataset: str) -> Optional[List[Dict[str, Any
     rows: List[Dict[str, Any]] = []
     limit = 200
     offset = 0
-    max_pages = 10
+    max_pages = (to_day - from_day).days // limit + 2
     for _ in range(max_pages):
         try:
             batch = _fetch_json(
@@ -2526,6 +2522,7 @@ def _fetch_obs_aqidb_day_count_rows(dataset: str) -> Optional[List[Dict[str, Any
                 headers,
                 {
                     "dataset": f"eq.{dataset_value}",
+                    "and": f"(day_utc.gte.{from_day.isoformat()},day_utc.lte.{to_day.isoformat()})",
                     "select": "day_utc,row_count",
                     "order": "day_utc.asc",
                     "limit": str(limit),
@@ -2542,6 +2539,7 @@ def _fetch_obs_aqidb_day_count_rows(dataset: str) -> Optional[List[Dict[str, Any
             if (
                 not isinstance(row, dict)
                 or _parse_iso_day(row.get("day_utc")) is None
+                or not from_day <= _parse_iso_day(row.get("day_utc")) <= to_day
                 or isinstance(row.get("row_count"), bool)
                 or not str(row.get("row_count")).isdigit()
             ):
@@ -2549,6 +2547,9 @@ def _fetch_obs_aqidb_day_count_rows(dataset: str) -> Optional[List[Dict[str, Any
             rows.append(row)
 
         if len(batch) < limit:
+            days = [_parse_iso_day(row["day_utc"]) for row in rows]
+            if len(days) != (to_day - from_day).days + 1 or len(set(days)) != len(days):
+                return None  # Incomplete summary: use the existing fingerprint fallback.
             return rows
         offset += limit
 
@@ -2556,7 +2557,7 @@ def _fetch_obs_aqidb_day_count_rows(dataset: str) -> Optional[List[Dict[str, Any
     return None
 
 
-def _fetch_obs_aqi_observs_partition_days() -> Optional[Set[date]]:
+def _fetch_obs_aqi_observs_partition_days(from_day: date, to_day: date) -> Optional[Set[date]]:
     if not OBS_AQIDB_SUPABASE_URL or not OBS_AQIDB_SECRET_KEY:
         return None
 
@@ -2568,7 +2569,7 @@ def _fetch_obs_aqi_observs_partition_days() -> Optional[Set[date]]:
         return None
     url = f"{obs_aqidb_base_url}/rpc/uk_aq_rpc_observs_drop_candidates"
     headers = _postgrest_headers(OBS_AQIDB_SECRET_KEY, schema=PUBLIC_SCHEMA)
-    cutoff_utc = f"{(datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()}T00:00:00Z"
+    cutoff_utc = f"{(to_day + timedelta(days=1)).isoformat()}T00:00:00Z"
 
     days: Set[date] = set()
     limit = 1000
@@ -2581,6 +2582,7 @@ def _fetch_obs_aqi_observs_partition_days() -> Optional[Set[date]]:
                 headers,
                 {
                     "cutoff_utc": cutoff_utc,
+                    "and": f"(partition_day_utc.gte.{from_day.isoformat()},partition_day_utc.lte.{to_day.isoformat()})",
                     "select": "partition_day_utc",
                     "order": "partition_day_utc.asc",
                     "limit": str(limit),
@@ -2598,6 +2600,8 @@ def _fetch_obs_aqi_observs_partition_days() -> Optional[Set[date]]:
             parsed_day = _parse_iso_day(row.get("partition_day_utc"))
             if parsed_day is None:
                 return None
+            if not from_day <= parsed_day <= to_day:
+                return None
             days.add(parsed_day)
 
         if len(batch) < limit:
@@ -2607,8 +2611,8 @@ def _fetch_obs_aqi_observs_partition_days() -> Optional[Set[date]]:
     return None
 
 
-def _fetch_obs_aqi_observs_row_days() -> Optional[Set[date]]:
-    count_rows = _fetch_obs_aqidb_day_count_rows("observs")
+def _fetch_obs_aqi_observs_row_days(from_day: date, to_day: date) -> Optional[Set[date]]:
+    count_rows = _fetch_obs_aqidb_day_count_rows("observs", from_day, to_day)
     if count_rows is not None:
         days_with_rows: Set[date] = set()
         for row in count_rows:
@@ -2626,7 +2630,7 @@ def _fetch_obs_aqi_observs_row_days() -> Optional[Set[date]]:
     if not OBS_AQIDB_SUPABASE_URL or not OBS_AQIDB_SECRET_KEY:
         return None
 
-    partition_days = _fetch_obs_aqi_observs_partition_days()
+    partition_days = _fetch_obs_aqi_observs_partition_days(from_day, to_day)
     if partition_days is None:
         return None
     if not partition_days:
@@ -2728,6 +2732,9 @@ def _fetch_r2_history_days_from_external_api(
     raw_domains = payload.get("domains")
     if not isinstance(raw_domains, dict):
         return None, None, None, "R2 history-days API payload missing domains object"
+    raw_observations = raw_domains.get("observations")
+    if not isinstance(raw_observations, dict) or not isinstance(raw_observations.get("days"), list):
+        return None, None, None, "R2 history-days API missing authoritative observation-day array"
 
     day_sets: Dict[str, Set[date]] = {
         "observations": set(),
@@ -2742,6 +2749,12 @@ def _fetch_r2_history_days_from_external_api(
             continue
         for day_text in raw_days:
             parsed_day = _parse_iso_day(day_text)
+            if domain_name == "observations" and (
+                not isinstance(day_text, str) or parsed_day is None
+                or day_text != parsed_day.isoformat() or parsed_day in day_sets[domain_name]
+                or parsed_day > datetime.now(timezone.utc).date()
+            ):
+                return None, None, None, "R2 history-days API contains invalid or duplicate observation dates"
             if parsed_day is not None:
                 day_sets[domain_name].add(parsed_day)
 

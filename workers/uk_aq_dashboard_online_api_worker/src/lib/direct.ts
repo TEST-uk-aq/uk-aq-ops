@@ -4,7 +4,7 @@ import { buildJsonResponse, errorEnvelope } from "./http";
 import type { WorkerEnv } from "./upstream";
 import { recordDashboardSupabaseResponse } from "./service_egress_metrics";
 import { billingConfigurationKey, billingConfigurationValid, billingPeriodError, billingTimestamp, fetchR2BillingPeriod, guardR2Usage } from "./r2_billing_period";
-import { applyIngestDayPresence, coverageDay, type IngestCoverageMetadata } from "./storage_day_presence";
+import { applyIngestDayPresence, coverageDay, CoverageEvidenceError, coverageFailureReason, type IngestCoverageMetadata } from "./storage_day_presence";
 
 type JsonObject = Record<string, unknown>;
 
@@ -189,7 +189,7 @@ let r2HistoryDaysCacheVersionKey: string | null = null;
 let storageCoverageCacheVersionKey: string | null = null;
 let dropboxMtimeCache: CacheEntry<{ payload: JsonObject; error: string | null }> | null = null;
 
-let obsObservationCache: { key: string; expires: number; counts: Map<string, boolean>; checked: string | null } | null = null;
+let obsObservationCache: { key: string; expires: number; counts: Map<string, boolean>; checked: string | null; error: string | null } | null = null;
 let coverageRefreshRevision = 0;
 
 function clearStorageCoverageCaches(): void {
@@ -636,6 +636,7 @@ async function fetchAllRows(
   pageSize = 1000,
   metricEnv?: WorkerEnv,
   maxRows = Number.POSITIVE_INFINITY,
+  signal?: AbortSignal,
 ): Promise<JsonObject[]> {
   const rows: JsonObject[] = [];
   let offset = 0;
@@ -647,7 +648,7 @@ async function fetchAllRows(
     };
     const batch = await fetchJsonArray(
       buildUrl(restBase, tableOrView, query),
-      { headers, method: "GET" },
+      { headers, method: "GET", signal },
       `Failed to fetch ${tableOrView}`,
       metricEnv,
     );
@@ -1684,21 +1685,18 @@ function filterDropboxBackupDaysForReadVersion(
 }
 
 function buildStorageCoverageRows(
-  dbRows: unknown[],
   r2Days: R2DaySets | null,
   dropboxDays: R2DaySets,
   dropboxAvailable: boolean,
 ): unknown[] {
-  // Boundaries choose the dates to inspect; they never establish positive presence.
-  const oldest = ["ingestdb", "obs_aqidb"].map(label => latestOldestDay(
-    dbRows, row => String(row.database_label || "").trim().toLowerCase() === label,
-  ));
-  const candidates = [...oldest, ...Array.from(r2Days?.observations || []), ...dropboxDays.observations]
-    .flatMap(day => { const parsed = parseIsoDay(day); return parsed ? [parsed.getTime()] : []; });
+  // Only committed, generation-selected R2 observations choose the query range.
+  // Presence within it still requires independent evidence from each source.
   const today = new Date();
   const todayUtc = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
-  const defaultStart = addUtcDays(todayUtc, -90);
-  const start = new Date(Math.min(defaultStart.getTime(), ...candidates));
+  const days = Array.from(r2Days?.observations || []);
+  if (!days.length || days.some(day => !coverageDay(day) || day > toIsoDay(todayUtc))) return [];
+  days.sort();
+  const start = parseIsoDay(days[0])!;
   const rows: unknown[] = [];
   for (let cursor = start; cursor <= todayUtc; cursor = addUtcDays(cursor, 1)) {
     const day = toIsoDay(cursor);
@@ -1725,33 +1723,40 @@ async function addObsObservationCoverage(env: WorkerEnv, rows: unknown[], forceR
     const key = obsRestBase(env) + "|" + defaultPublicSchema(env) + "|" + dates[0] + "|" + dates[dates.length - 1];
     if (!forceRefresh && obsObservationCache?.key === key && Date.now() < obsObservationCache.expires) {
       for (const value of rows) (value as JsonObject).obs_aqi_observs = obsObservationCache.counts.get(String((value as JsonObject).date)) ?? null;
-      return { error: null, checked: obsObservationCache.checked };
+      return { error: obsObservationCache.error, checked: obsObservationCache.checked };
     }
     const counts = await fetchAllRows(obsRestBase(env), "uk_aq_obs_aqidb_day_counts_current", headers, {
       dataset: "eq.observs", select: "day_utc,row_count,recorded_at",
       and: `(day_utc.gte.${dates[0]},day_utc.lte.${dates[dates.length - 1]})`, order: "day_utc.asc",
-    }, 1000, env, dates.length + 1);
+    }, 1000, env, dates.length + 1, AbortSignal.timeout(15000));
     const byDay = new Map<string, boolean>();
     for (const row of counts) {
       const day = coverageDay(row.day_utc);
       const count = row.row_count;
-      if (!day || byDay.has(day) || !(typeof count === "number" && Number.isSafeInteger(count) && count >= 0
-        || typeof count === "string" && /^[0-9]+$/.test(count))) throw new Error("Invalid observation summary");
+      if (!day || day < dates[0] || day > dates[dates.length - 1] || byDay.has(day)
+        || !(typeof count === "number" && Number.isSafeInteger(count) && count >= 0
+        || typeof count === "string" && /^[0-9]+$/.test(count))) throw new CoverageEvidenceError("invalid observation summary response");
       byDay.set(day, Number(count) > 0);
     }
     const timestamps = counts.map(row => Date.parse(String(row.recorded_at || "")));
-    if (!counts.length || timestamps.some(ms => !Number.isFinite(ms) || ms < Date.now() - 3 * 3600000)) {
-      throw new Error("Observation summary has no fresh source timestamp");
+    if (!counts.length) throw new CoverageEvidenceError("missing observation summary source dates");
+    if (timestamps.some(ms => !Number.isFinite(ms) || ms > Date.now() + 60000)) {
+      throw new CoverageEvidenceError("invalid observation summary source timestamp");
     }
+    // The current producer refreshes recorded_at on every retained row. This
+    // checks snapshot evidence, never the age of the historical day_utc itself.
+    if (timestamps.some(ms => ms < Date.now() - 3 * 3600000)) throw new CoverageEvidenceError("stale authoritative observation summary");
     const checked = new Date(Math.min(...timestamps)).toISOString();
-    if (revision === coverageRefreshRevision) obsObservationCache = { key, expires: Date.now() + STORAGE_COVERAGE_TTL_MS, counts: byDay, checked };
+    const missing = dates.filter(day => !byDay.has(day)).length;
+    const error = missing ? `ObsAQIDB observation summary incomplete: ${missing} calendar date(s) unavailable; absence is not confirmed` : null;
+    if (revision === coverageRefreshRevision) obsObservationCache = { key, expires: Date.now() + STORAGE_COVERAGE_TTL_MS, counts: byDay, checked, error };
     for (const value of rows) {
       const row = value as JsonObject;
       // Missing summary dates are unknown, not proven zeroes (e.g. today's unrefreshed product).
       row.obs_aqi_observs = byDay.get(String(row.date)) ?? null;
     }
-    return { error: null, checked };
-  } catch { return { error: "Authoritative ObsAQIDB observation-day summary is unavailable or invalid", checked: null }; }
+    return { error, checked };
+  } catch (err) { return { error: `Authoritative ObsAQIDB observation-day summary unavailable: ${coverageFailureReason(err)}`, checked: null }; }
 }
 
 async function fetchServiceEgressMetrics(env: WorkerEnv): Promise<{ rows: unknown[]; error: string | null }> {
@@ -2096,19 +2101,21 @@ async function fetchDashboardBaseData(
     }
     if (options.includeStorageCoverage) {
       storage_coverage_days = buildStorageCoverageRows(
-        dbMetrics.dbRows,
         r2History.daySets,
         dropboxDays,
         Boolean(dropboxState.path && !dropboxState.error && r2History.daySets),
       );
+      if (!storage_coverage_days.length) {
+        r2_history_days_error ||= "Storage calendar range unavailable: selected-generation R2 history has no valid committed observation days";
+      }
       const obsCoverage = await addObsObservationCoverage(env, storage_coverage_days, options.forceRefresh);
       obs_aqidb_coverage_error = obsCoverage.error;
       obs_aqidb_coverage_generated_at = obsCoverage.checked;
       storage_coverage_independent_sources = {
         generated_at: now.toISOString(),
-        r2_status: r2History.daySets ? "ok" : "unavailable",
+        r2_status: storage_coverage_days.length ? "ok" : "unavailable",
         r2_checked_at_utc: r2History.checkedAt || null,
-        r2_error: r2History.error,
+        r2_error: r2_history_days_error,
         backup_status: dropboxState.path && !dropboxState.error && r2History.daySets ? "ok" : "unavailable",
         backup_checked_at_utc: dropboxState.path ? now.toISOString() : null,
         backup_error: dropboxState.error || (dropboxState.path ? null : "Dropbox checkpoint is unavailable"),

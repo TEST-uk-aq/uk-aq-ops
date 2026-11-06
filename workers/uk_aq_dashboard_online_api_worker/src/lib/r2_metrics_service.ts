@@ -162,6 +162,9 @@ export async function enrichStorageCoverageFromMetrics(
 
   const object = payload as JsonObject;
   if (!Array.isArray(object.storage_coverage_days)) return response;
+  // No committed range: preserve its unavailable diagnostic, do not enrich it
+  // into an apparently successful (but empty) calendar.
+  if (!object.storage_coverage_days.length) return response;
 
   const version = historyResolution(env).version;
   const historyParams = new URLSearchParams();

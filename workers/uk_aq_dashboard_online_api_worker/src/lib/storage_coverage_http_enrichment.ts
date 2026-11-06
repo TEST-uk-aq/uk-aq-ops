@@ -549,7 +549,11 @@ export async function enrichStorageCoverageResponse(
     return response;
   }
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return response;
-  if (!Array.isArray((payload as JsonObject).storage_coverage_days)) return response;
+  const coverageDays = (payload as JsonObject).storage_coverage_days;
+  if (!Array.isArray(coverageDays)) return response;
+  // Range authority failed before day checks; enrichment cannot invent a range
+  // or clear the unavailable diagnostic merely because a later lookup succeeds.
+  if (!coverageDays.length) return response;
   // A successfully published local snapshot already includes its configured
   // physical intersection and checkpoint checks. Do not undo those constraints
   // using an unconstrained HTTP listing; IngestDB is still rechecked by the

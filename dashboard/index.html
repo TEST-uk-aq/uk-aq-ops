@@ -5040,6 +5040,12 @@
       }
 
       function renderStorageCoverageCalendarPanel(serverCoverageRows, options = {}) {
+        if (!Array.isArray(serverCoverageRows) || !serverCoverageRows.length) {
+          return renderStorageCoverageErrorPanel(
+            latestStorageCoveragePayload?.r2_history_days_error
+              || "Calendar range unavailable: no committed observation days from the selected R2 generation.",
+          );
+        }
         const forceConnectorCountsRefresh = Boolean(options.forceConnectorCountsRefresh);
         const monthStartUtc = storageCoverageMonthCursor || startOfUtcMonth(new Date());
         const resolved = resolveCoverageRowsForMonth(monthStartUtc, serverCoverageRows);
@@ -5566,7 +5572,7 @@
 
       function preserveNewerCoverageEvidence(incoming) {
         const previous = latestStorageCoveragePayload;
-        if (!previous) return incoming;
+        if (!previous || !incoming.storage_coverage_days.length) return incoming;
         const version = String(incoming.r2_history_read_version?.version || "");
         const previousVersion = String(previous.r2_history_read_version?.version || "");
         if (version !== previousVersion) {
@@ -5597,7 +5603,8 @@
           if (!Number.isFinite(timestamp) || !Number.isFinite(watermark) || timestamp >= watermark) return;
           retained.push(source.label);
           previousRows.forEach((oldRow, date) => {
-            if (!rows.has(date)) rows.set(date, { date });
+            // Retain newer evidence only within the authoritative incoming range.
+            if (!rows.has(date)) return;
             const row = rows.get(date);
             row[source.rawField] = normalizeCoveragePresence(oldRow, source.rawField, source.alias);
           });

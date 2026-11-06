@@ -209,6 +209,9 @@ def _get_r2_history_days_cached(
     if not isinstance(normal_days, dict) or normal_error:
         return None, r2_window, bucket, _merge_errors(normal_error, direct_error)
     committed = {name: set(normal_days.get(name) or set()) for name in ("observations", "aqilevels")}
+    # Retain the API's complete committed set solely for calendar/query bounds.
+    # A physical scan can remove a presence marker, but cannot move that boundary.
+    committed["committed_observations"] = set(committed["observations"])
     if isinstance(direct_days, dict) and not direct_error:
         committed["observations"].intersection_update(direct_days.get("observations") or set())
     return committed, r2_window, bucket, _merge_errors(normal_error, direct_error)

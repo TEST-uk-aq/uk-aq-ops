@@ -28,6 +28,20 @@ const DAY_MS = 86400000;
 const TTL_MS = 300000;
 const RPC = "uk_aq_rpc_observation_day_presence_v1";
 
+export class CoverageEvidenceError extends Error {}
+
+// Only emit bounded categories, never provider messages, bodies or connection details.
+export function coverageFailureReason(error: unknown): string {
+  if (error instanceof CoverageEvidenceError) return error.message;
+  if (error instanceof Error) {
+    if (["TimeoutError", "AbortError"].includes(error.name)) return "request timed out";
+    const status = /^(?:IngestDB daily presence|Failed to fetch uk_aq_obs_aqidb_day_counts_current) \(([1-5][0-9]{2})\)/.exec(error.message)?.[1];
+    if (status) return ["401", "403"].includes(status) ? `authentication failed (HTTP ${status})` : `request failed (HTTP ${status})`;
+    if (/returned non-(?:object|array) JSON payload/.test(error.message)) return "invalid response";
+  }
+  return "request failed or connection unavailable";
+}
+
 export function coverageDay(value: unknown): string | null {
   if (typeof value !== "string" || !/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(value) || value < "0001-01-01") return null;
   const ms = Date.parse(value + "T00:00:00Z");
@@ -52,18 +66,18 @@ function validateChunk(value: unknown, from: string, to: string): { days: Map<st
     || payload.from_day_utc !== from || payload.to_day_utc_exclusive !== to
     || payload.checked_day_count !== count || !Array.isArray(payload.days) || payload.days.length !== count
     || !timestamp(payload.checked_at_utc)
-    || Date.parse(payload.checked_at_utc) > Date.now() + 60000
-    || Date.parse(payload.checked_at_utc) < Date.now() - TTL_MS
     || payload.current_day_utc !== payload.checked_at_utc.slice(0, 10)
     || to > addDays(String(payload.current_day_utc), 1)) {
-    throw new Error("IngestDB daily presence response failed validation");
+    throw new CoverageEvidenceError("invalid RPC response");
   }
+  if (Date.parse(payload.checked_at_utc) > Date.now() + 60000) throw new CoverageEvidenceError("invalid RPC source timestamp");
+  if (Date.parse(payload.checked_at_utc) < Date.now() - TTL_MS) throw new CoverageEvidenceError("stale RPC source timestamp");
   const days = new Map<string, boolean>();
   for (let i = 0; i < count; i++) {
     const row = object(payload.days[i]);
     const expected = addDays(from, i);
     if (!row || row.day_utc !== expected || typeof row.present !== "boolean" || days.has(expected)) {
-      throw new Error("IngestDB daily presence dates are incomplete or invalid");
+      throw new CoverageEvidenceError("incomplete or invalid RPC source dates");
     }
     days.set(expected, row.present);
   }
@@ -99,9 +113,9 @@ async function load(connection: PresenceConnection, from: string, to: string, fo
       checked.push(chunk.checked);
       cursor = end;
     }
-  } catch {
+  } catch (err) {
     // Bounded diagnostic; no provider body, URL or credentials in public errors.
-    error = "Authoritative IngestDB daily presence is unavailable or invalid";
+    error = `Authoritative IngestDB daily presence unavailable: ${coverageFailureReason(err)}`;
   }
   if (revision !== currentSource.revision) return load(connection, from, to, false);
   checked.sort((a, b) => Date.parse(a) - Date.parse(b));

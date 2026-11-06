@@ -12,7 +12,7 @@ from __future__ import annotations
 import inspect
 import os
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 
 import uk_aq_dashboard_api as dashboard
@@ -66,7 +66,7 @@ def _get_ingest_coverage_diagnostics() -> Dict[str, Any]:
 def _fetch_ingest_observation_days(
     base_url: str,
     service_role_key: str,
-    db_size_metrics: Optional[List[Dict[str, Any]]],
+    from_day: date,
     now: datetime,
 ) -> Set[Any]:
     """Return only positively confirmed IngestDB days.
@@ -86,21 +86,12 @@ def _fetch_ingest_observation_days(
         )
         return set()
 
-    oldest_day = dashboard._latest_oldest_day_by_label(db_size_metrics).get("ingestdb")
-    if oldest_day is None:
-        _set_ingest_coverage_diagnostics(
-            checked_day_count=0,
-            failed_days=[],
-            warning="IngestDB coverage unavailable: oldest observation boundary is missing.",
-        )
-        return set()
-
     today_utc = now.astimezone(timezone.utc).date()
-    if oldest_day > today_utc:
+    if type(from_day) is not date or from_day > today_utc:
         _set_ingest_coverage_diagnostics(
             checked_day_count=0,
             failed_days=[],
-            warning="IngestDB coverage unavailable: oldest observation boundary is in the future.",
+            warning="IngestDB coverage unavailable: committed R2 calendar boundary is invalid.",
         )
         return set()
 
@@ -124,7 +115,7 @@ def _fetch_ingest_observation_days(
     days_with_rows: Set[Any] = set()
     failed_days: List[Dict[str, str]] = []
     checked_day_count = 0
-    cursor = oldest_day
+    cursor = from_day
 
     while cursor <= today_utc:
         next_day_utc = cursor + timedelta(days=1)
@@ -256,7 +247,7 @@ def _build_storage_coverage_payload(*args: Any, **kwargs: Any) -> Dict[str, Any]
         # v3 and do not determine observation calendar presence.
         source_errors.pop("r2_domain_size_metrics_error", None)
     payload["storage_coverage_complete"] = (
-        isinstance(rows, list)
+        isinstance(rows, list) and bool(rows)
         and not diagnostics.get("warning")
         and not diagnostics.get("failed_days")
         and not source_errors
