@@ -73,15 +73,6 @@ window.UKAQ_OPS_CONFIG = {
 })();
 
 
-
-
-
-
-
-
-
-
-
 (() => {
   const STYLE_ID = "ukaq-freshness-table-layout-patch";
   if (document.getElementById(STYLE_ID)) return;

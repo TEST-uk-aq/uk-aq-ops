@@ -762,7 +762,7 @@
         flex: 1 1 auto;
         min-height: 0;
         display: grid;
-        grid-template-rows: repeat(4, minmax(0, 1fr));
+        grid-template-rows: repeat(3, minmax(0, 1fr));
         gap: 6px;
       }
 
@@ -773,6 +773,7 @@
       }
 
       .coverage-bar {
+        position: relative;
         display: flex;
         align-items: center;
         width: 100%;
@@ -832,6 +833,41 @@
         white-space: nowrap;
       }
 
+      .coverage-bar-label-secondary {
+        display: inline-flex;
+        align-items: center;
+        gap: 3px;
+        margin-top: 1px;
+        font-size: 12px;
+        font-weight: 700;
+        line-height: 1;
+        white-space: nowrap;
+        opacity: 0.95;
+      }
+
+      .coverage-bar-label-secondary-icon {
+        width: 12px;
+        height: 12px;
+        display: inline-block;
+      }
+
+      .coverage-bar-label-secondary-icon.is-dropbox-blue {
+        filter: none !important;
+        opacity: 1;
+      }
+
+      .coverage-unknown-badge {
+        position: absolute;
+        top: 1px;
+        right: 1px;
+        border-radius: 2px;
+        padding: 0 2px;
+        background: #eeeeee;
+        color: #4b443a;
+        font-size: 10px;
+        line-height: 1;
+      }
+
       .coverage-bar-ingest {
         background: var(--color-ingest-db);
       }
@@ -842,16 +878,6 @@
 
       .coverage-bar-obsaqi-observs {
         background: var(--color-obsaqi-observs);
-      }
-
-      .coverage-bar-dropbox-observs {
-        background: #ffffff;
-        border: 2px solid var(--color-r2-observs);
-      }
-
-      .coverage-bar-dropbox-observs .coverage-bar-label {
-        color: #1f1c16;
-        text-shadow: none;
       }
 
       .coverage-bar.is-unknown,
@@ -1048,6 +1074,7 @@
       }
 
       .coverage-square {
+        position: relative;
         border-radius: 3px;
         min-height: 0;
       }
@@ -4352,12 +4379,12 @@
         return panel;
       }
 
-      // Fixed source positions preserve every independently checked storage layer.
+      // Four independent source states; R2 and Dropbox share one visual position.
       const COVERAGE_SOURCES = [
         { field: "ingest", rawField: "ingest", label: "IngestDB", className: "coverage-bar-ingest" },
         { field: "obsAqiObservs", rawField: "obs_aqi_observs", alias: "observs", label: "ObsAQIDB observations", className: "coverage-bar-obsaqi-observs" },
         { field: "r2Observs", rawField: "r2_observs", alias: "r2", label: "R2 observations", className: "coverage-bar-r2-observs" },
-        { field: "dropboxObservs", rawField: "dropbox_observs", label: "Dropbox observations", className: "coverage-bar-dropbox-observs", dropbox: true },
+        { field: "dropboxObservs", rawField: "dropbox_observs", label: "Dropbox observations" },
       ];
 
       function normalizeCoveragePresence(row, field, alias) {
@@ -4425,7 +4452,7 @@
       }
 
       function resolveCoverageBarLayers(coverage) {
-        return COVERAGE_SOURCES.map((source) => {
+        const layers = COVERAGE_SOURCES.slice(0, 2).map((source) => {
           if (coverage.excluded || coverage[source.field] === false) return null;
           const unknown = coverage[source.field] !== true;
           return {
@@ -4434,6 +4461,22 @@
             className: unknown ? "is-unknown" : source.className,
           };
         });
+        const r2 = coverage.r2Observs;
+        const backup = coverage.dropboxObservs;
+        const present = r2 === true || backup === true;
+        const uncertain = typeof r2 !== "boolean" || typeof backup !== "boolean";
+        const stateLabel = (value) => value === true ? "present" : value === false ? "absent" : "unknown/unavailable";
+        const orange = coverage.excluded || (!present && !uncertain) ? null : {
+          label: r2 === true ? "R2 observations" : backup === true ? "Dropbox backup" : "R2 / Dropbox unknown",
+          title: `R2 observations: ${stateLabel(r2)} • Dropbox backup: ${stateLabel(backup)}`,
+          className: present ? "coverage-bar-r2-observs" : "is-unknown",
+          unknown: !present,
+          unknownPartial: present && uncertain,
+          dropbox: backup === true,
+          primaryDropboxIcon: backup === true && r2 !== true,
+          backupBadge: backup === true && r2 === true,
+        };
+        return [...layers, orange];
       }
 
       function resolveCoverageSquareLayers(coverage) {
@@ -4462,11 +4505,12 @@
           const dayMarkup = monthCells.map((cell) => {
             const outsideClass = cell.isInMonth ? "" : " is-outside";
             const todayClass = cell.coverage.isToday ? " is-today" : "";
-            const layers = cell.isInMonth ? resolveCoverageSquareLayers(cell.coverage) : [null, null, null, null];
+            const layers = cell.isInMonth ? resolveCoverageSquareLayers(cell.coverage) : [null, null, null];
             const squares = layers.map((layer) => {
               if (!layer) return '<span class="coverage-square is-empty" aria-hidden="true"></span>';
               const iconClass = layer.dropbox && !layer.unknown ? " has-backup-icon" : "";
-              return `<span class="coverage-square ${layer.className}${iconClass}" title="${escapeHtml(layer.label)}" aria-hidden="true">${layer.unknown ? "?" : ""}</span>`;
+              const uncertainty = layer.unknownPartial ? '<span class="coverage-unknown-badge">?</span>' : "";
+              return `<span class="coverage-square ${layer.className}${iconClass}" title="${escapeHtml(layer.title || layer.label)}" aria-hidden="true">${layer.unknown ? "?" : uncertainty}</span>`;
             }).join("");
             const tooltip = escapeHtml(formatCoverageDayTooltip(cell));
             return `<div class="coverage-year-day${outsideClass}${todayClass}" title="${tooltip}"${cell.isInMonth ? ` tabindex="0" role="img" aria-label="${tooltip}"` : ' aria-hidden="true"'}><div class="coverage-square-grid">${squares}</div></div>`;
@@ -5020,7 +5064,7 @@
         if (isYearMode) {
           const yearStartUtc = new Date(Date.UTC(monthStartUtc.getUTCFullYear(), 0, 1, 0, 0, 0, 0));
           bodyMarkup = renderCoverageYearGrid(yearStartUtc, resolved.rows);
-          footnoteText = "Complete days only (today excluded). Fixed squares: IngestDB top-left (red), ObsAQIDB observations top-right (blue), R2 observations bottom-left (orange), Dropbox observations bottom-right (orange outline and Dropbox icon). ? means unknown/unavailable; empty means confirmed absent.";
+          footnoteText = "Complete days only (today excluded). Three squares: IngestDB top-left (red), ObsAQIDB observations top-right (blue), R2 observations / Dropbox backup bottom-left (orange). A Dropbox icon marks confirmed backup, including backup-only days. ? marks unknown source evidence; tooltips list each source independently. The orange position is empty only when both R2 and Dropbox are confirmed absent.";
         } else {
           const calendarCells = buildCoverageCalendarCells(monthStartUtc, resolved.rows, true);
           const cellsMarkup = calendarCells
@@ -5035,12 +5079,16 @@
                 const isToday = cell.coverage.isToday;
                 const halfClass = isToday ? " is-half" : "";
                 const label = layer.unknown ? "?" : layer.label;
-                const icon = layer.dropbox && !layer.unknown
+                const icon = layer.primaryDropboxIcon
                   ? `<img class="coverage-bar-label-primary-icon" src="${DASHBOARD_DROPBOX_ICON_PATH}" alt="" aria-hidden="true">`
                   : "";
-                const labelMarkup = isToday ? (layer.unknown ? "?" : "")
-                  : `<span class="coverage-bar-label"><span class="coverage-bar-label-primary${icon ? " with-icon" : ""}">${icon}<span class="coverage-bar-label-primary-text">${escapeHtml(label)}</span></span></span>`;
-                return `<span class="coverage-bar ${layer.className}${halfClass}" title="${escapeHtml(layer.label)}" aria-hidden="true">${labelMarkup}</span>`;
+                const backupBadge = layer.backupBadge
+                  ? `<span class="coverage-bar-label-secondary is-dropbox-badge"><img class="coverage-bar-label-secondary-icon is-dropbox-blue" src="${DASHBOARD_DROPBOX_ICON_PATH}" alt="" aria-hidden="true">Backup</span>`
+                  : "";
+                const labelMarkup = layer.unknown ? "?" : isToday ? ""
+                  : `<span class="coverage-bar-label${layer.backupBadge ? " has-secondary" : ""}"><span class="coverage-bar-label-primary${icon ? " with-icon" : ""}">${icon}<span class="coverage-bar-label-primary-text">${escapeHtml(label)}</span></span>${backupBadge}</span>`;
+                const uncertainty = layer.unknownPartial ? '<span class="coverage-unknown-badge">?</span>' : "";
+                return `<span class="coverage-bar ${layer.className}${halfClass}" title="${escapeHtml(layer.title || layer.label)}" aria-hidden="true">${labelMarkup}${uncertainty}</span>`;
               };
 
               return `
@@ -5057,7 +5105,7 @@
             })
             .join("");
           bodyMarkup = `<div class="coverage-calendar-grid">${cellsMarkup}</div>`;
-          footnoteText = "Fixed rows: IngestDB (red), ObsAQIDB observations (blue), R2 observations (orange), Dropbox observations (orange outline and Dropbox icon). Each source is independent. ? means unknown/unavailable; empty means confirmed absent. Today shows half-width bars without labels.";
+          footnoteText = "Three fixed rows: IngestDB (red), ObsAQIDB observations (blue), R2 observations / Dropbox backup (orange). A small Dropbox icon marks confirmed backup; backup-only days use the same orange row. ? marks unknown source evidence; tooltips list each source independently. The orange row is empty only when both R2 and Dropbox are confirmed absent. Today shows half-width bars without labels.";
         }
 
         panel.innerHTML = `
