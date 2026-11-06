@@ -636,9 +636,13 @@ export function buildObservationHistoryV3SteadyStatePartition({
   backedUpAtUtc,
   observationsPrefix = DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
   indexRoot = OBSERVATION_HISTORY_V3_INDEX_ROOT,
+  [DORMANT_PRUNE_EXACT_ONLY]: dormantExactOnly = null,
 }) {
   assertObservationHistoryGenerationPrefixes(getObservationHistoryGeneration("v3"), { observationsPrefix, indexRoot });
   const normalizedSource = normalizeSource(source);
+  if (dormantExactOnly && normalizedSource !== OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily) {
+    throw new Error('Dormant exact-only partition construction is Prune-specific');
+  }
   const writerGitSha = String(targetWriterGitSha || "").trim().toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(writerGitSha)) {
     throw new TypeError("targetWriterGitSha must be a full lower-case Git SHA");
@@ -713,8 +717,12 @@ export function buildObservationHistoryV3SteadyStatePartition({
   });
   const hierarchy = buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
     metadata: target.metadata,
-    canonicalManifest: canonicalManifestDescriptor(manifestArtifact),
+    canonicalManifest: dormantExactOnly
+      ? { ...canonicalManifestDescriptor(manifestArtifact),
+        observation_content_hash_version: exactCanonicalHashVersionV3(manifestArtifact.payload) }
+      : canonicalManifestDescriptor(manifestArtifact),
     indexRoot: normalizedIndexRoot,
+    ...(dormantExactOnly ? { exactSchemaVersion: 2 } : {}),
   });
   return Object.freeze({
     source: normalizedSource,
@@ -763,6 +771,7 @@ function prepareRunPartitions({
   observationsPrefix,
   indexRoot,
   diagnosticLog,
+  dormantOwner = null,
 }) {
   const prepared = [];
   for (const partition of normalizePartitionInputs(partitions)) {
@@ -788,6 +797,7 @@ function prepareRunPartitions({
         backedUpAtUtc: partition.backed_up_at_utc ?? backedUpAtUtc,
         observationsPrefix,
         indexRoot,
+        ...(dormantOwner ? { [DORMANT_PRUNE_EXACT_ONLY]: dormantOwner } : {}),
       });
     } catch (error) {
       emitV3PublicationDiagnostic(diagnosticLog, "partition_prepare_failed", {
@@ -1389,18 +1399,8 @@ export async function runObservationHistoryV3ConnectorPublication({
     observationsPrefix,
     indexRoot,
     diagnosticLog,
+    dormantOwner,
   });
-  if (dormantOwner) {
-    for (let i = 0; i < prepared.length; i++) {
-      const partition = prepared[i], manifest = partition.canonical_pollutant_manifest;
-      prepared[i] = Object.freeze({ ...partition,
-        v3_hierarchy: buildObservationHistoryExactLeafIndexV3ScopedHierarchy({
-          metadata: partition.target_metadata, exactSchemaVersion: 2,
-          canonicalManifest: { ...canonicalManifestDescriptor(manifest),
-            observation_content_hash_version: exactCanonicalHashVersionV3(manifest.payload) },
-        }) });
-    }
-  }
   assertReplacementRemovalDisjoint(prepared, normalizedRemovedScopes);
   const canonicalObservationsPrefix = normalizePrefix(
     observationsPrefix,
