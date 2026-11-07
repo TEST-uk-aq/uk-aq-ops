@@ -8,6 +8,7 @@ import { billingConfigurationKey, billingConfigurationValid, billingPeriodError,
 import { applyIngestDayPresence, coverageDay, CoverageEvidenceError, coverageFailureReason, type IngestCoverageMetadata } from "./storage_day_presence";
 
 type JsonObject = Record<string, unknown>;
+type RowRangeProof = { valid: boolean; received: number; total: number | null };
 
 type DashboardPayload = {
   project_ref: string | null;
@@ -475,6 +476,7 @@ async function fetchJsonArray(
   errLabel?: string,
   metricEnv?: WorkerEnv,
   metricQueryName = "dashboard_read",
+  rangeProof?: RowRangeProof,
 ): Promise<unknown[]> {
   const startedAt = Date.now();
   const response = metricEnv?.coverageRequestBudget
@@ -498,6 +500,19 @@ async function fetchJsonArray(
   }
   if (!Array.isArray(parsed)) {
     throw new Error(`${errLabel || "Request failed"} returned non-array JSON payload.`);
+  }
+  if (rangeProof) {
+    // Optional proof for the full-scan summary consumer, using this same GET.
+    // A short page alone cannot distinguish exhaustion from a server row cap.
+    const range = /^(?:(\d+)-(\d+)|\*)\/(\d+)$/.exec(response.headers.get("content-range") || "");
+    const total = range ? Number(range[3]) : NaN;
+    rangeProof.valid &&= response.headers.get("range-unit") === "items" && Number.isSafeInteger(total) && total >= 0
+      && (rangeProof.total === null || rangeProof.total === total)
+      && (parsed.length ? Number(range?.[1]) === rangeProof.received
+        && Number(range?.[2]) === rangeProof.received + parsed.length - 1
+        && Number(range?.[2]) < total : range?.[1] === undefined && rangeProof.received === total);
+    if (Number.isSafeInteger(total)) rangeProof.total = total;
+    rangeProof.received += parsed.length;
   }
   return parsed;
 }
@@ -631,6 +646,7 @@ async function fetchAllRows(
   metricEnv?: WorkerEnv,
   maxRows = Number.POSITIVE_INFINITY,
   signal?: AbortSignal,
+  rangeProof?: RowRangeProof,
 ): Promise<JsonObject[]> {
   const rows: JsonObject[] = [];
   let offset = 0;
@@ -645,12 +661,15 @@ async function fetchAllRows(
       { headers, method: "GET", signal },
       `Failed to fetch ${tableOrView}`,
       metricEnv,
+      undefined,
+      rangeProof,
     );
     const safeBatch = batch.filter((row): row is JsonObject => !!row && typeof row === "object" && !Array.isArray(row));
     rows.push(...safeBatch);
     if (rows.length >= maxRows) {
       return rows.slice(0, maxRows);
     }
+    if (rangeProof?.valid && rangeProof.received === rangeProof.total) break;
     if (safeBatch.length < pageSize) {
       break;
     }
@@ -1474,16 +1493,18 @@ async function addObsObservationCoverage(env: WorkerEnv, rows: unknown[], forceR
   const dates = rows.map(row => coverageDay((row as JsonObject).date)).filter((day): day is string => Boolean(day));
   try {
     const headers = postgrestHeaders(requireObsServiceKey(env), defaultPublicSchema(env));
+    headers.set("Prefer", "count=exact");
     const revision = coverageRefreshRevision;
     const key = obsRestBase(env) + "|" + defaultPublicSchema(env) + "|" + dates[0] + "|" + dates[dates.length - 1];
     if (!forceRefresh && obsObservationCache?.key === key && Date.now() < obsObservationCache.expires) {
       for (const value of rows) (value as JsonObject).obs_aqi_observs = obsObservationCache.counts.get(String((value as JsonObject).date)) ?? null;
       return { error: obsObservationCache.error, checked: obsObservationCache.checked };
     }
+    const rangeProof: RowRangeProof = { valid: true, received: 0, total: null };
     const counts = await fetchAllRows(obsRestBase(env), "uk_aq_obs_aqidb_day_counts_current", headers, {
       dataset: "eq.observs", select: "day_utc,row_count,recorded_at",
       and: `(day_utc.gte.${dates[0]},day_utc.lte.${dates[dates.length - 1]})`, order: "day_utc.asc",
-    }, 1000, env, dates.length + 1, AbortSignal.timeout(15000));
+    }, 1000, env, dates.length + 1, AbortSignal.timeout(15000), rangeProof);
     const byDay = new Map<string, boolean>();
     for (const row of counts) {
       const day = coverageDay(row.day_utc);
@@ -1502,12 +1523,34 @@ async function addObsObservationCoverage(env: WorkerEnv, rows: unknown[], forceR
     // checks snapshot evidence, never the age of the historical day_utc itself.
     if (timestamps.some(ms => ms < Date.now() - 3 * 3600000)) throw new CoverageEvidenceError("stale authoritative observation summary");
     const checked = new Date(Math.min(...timestamps)).toISOString();
+    const sourceDays = [...byDay.keys()];
+    const continuous = sourceDays.every((day, index) => index === 0
+      || Date.parse(day) - Date.parse(sourceDays[index - 1]) === 86400000);
+    const completeResult = rangeProof.valid && rangeProof.received === counts.length && rangeProof.total === counts.length;
+    const sameSnapshot = new Set(counts.map(row => row.recorded_at)).size === 1;
+    const first = sourceDays[0];
+    const problems: string[] = [];
+    if (!completeResult) problems.push("complete result count/range is unverified");
+    if (!continuous) problems.push("internal summary dates are missing or unordered");
+    if (!sameSnapshot) problems.push("producer snapshot timestamps differ");
+    if (first > dates[0] && byDay.get(first) !== true) problems.push("first observation boundary is unverified");
+    // The canonical producer scans actual observations, inserts every day from
+    // min through max (including zeroes), then removes obsolete dates in the
+    // same transaction. Matching fresh recorded_at values prove published
+    // producer evidence, not merely a successful HTTP read. Only a complete,
+    // coherent interval can establish absence before its first observation.
+    if (!problems.length) {
+      for (const day of dates) if (day < first) byDay.set(day, false);
+    }
     const missing = dates.filter(day => !byDay.has(day)).length;
-    const error = missing ? `ObsAQIDB observation summary incomplete: ${missing} calendar date(s) unavailable; absence is not confirmed` : null;
-    if (revision === coverageRefreshRevision) obsObservationCache = { key, expires: Date.now() + STORAGE_COVERAGE_TTL_MS, counts: byDay, checked, error };
+    if (missing) problems.push(`${missing} calendar date(s) unavailable; absence is not confirmed`);
+    const error = problems.length ? `ObsAQIDB observation summary incomplete: ${problems.join("; ")}` : null;
+    if (revision === coverageRefreshRevision) obsObservationCache = { key,
+      expires: Math.min(Date.now() + STORAGE_COVERAGE_TTL_MS, Date.parse(checked) + 3 * 3600000), counts: byDay, checked, error };
     for (const value of rows) {
       const row = value as JsonObject;
-      // Missing summary dates are unknown, not proven zeroes (e.g. today's unrefreshed product).
+      // Gaps and dates AFTER the last summary row remain unknown (including
+      // today's unrefreshed product). Valid explicit daily evidence is retained.
       row.obs_aqi_observs = byDay.get(String(row.date)) ?? null;
     }
     return { error, checked };
@@ -1985,7 +2028,9 @@ export async function getDirectDashboardPayload(
     payload.r2_domain_size_metrics_error = "Historical domain byte metrics have no generation identity; unavailable for v3";
   }
   const freshUntil = billingTimestamp(payload.r2_usage?.billing_period_fresh_until_utc);
-  if (revision === coverageRefreshRevision) dashboardCache.set(cacheKey, { value: payload, expiresAt: Math.min(Date.now() + DASHBOARD_TTL_MS, Number.isFinite(freshUntil) ? freshUntil : Infinity) });
+  const obsFreshUntil = Date.parse(payload.obs_aqidb_coverage_generated_at || "") + 3 * 3600000;
+  if (revision === coverageRefreshRevision) dashboardCache.set(cacheKey, { value: payload, expiresAt: Math.min(Date.now() + DASHBOARD_TTL_MS,
+    Number.isFinite(freshUntil) ? freshUntil : Infinity, Number.isFinite(obsFreshUntil) ? obsFreshUntil : Infinity) });
   payload.r2_usage = guardR2Usage(payload.r2_usage, env);
   return payload;
 }
@@ -2073,7 +2118,9 @@ export async function getDirectStorageCoveragePayload(
   };
   if (revision === coverageRefreshRevision) {
     storageCoverageCacheVersionKey = cacheKey;
-    storageCoverageCache = { value: response, expiresAt: Date.now() + STORAGE_COVERAGE_TTL_MS };
+    const obsFreshUntil = Date.parse(response.obs_aqidb_coverage_generated_at || "") + 3 * 3600000;
+    storageCoverageCache = { value: response, expiresAt: Math.min(Date.now() + STORAGE_COVERAGE_TTL_MS,
+      Number.isFinite(obsFreshUntil) ? obsFreshUntil : Infinity) };
   }
   return response;
 }
