@@ -103,15 +103,40 @@ def clock(value: object) -> str:
 
 def label_time(row: dict) -> str:
     return clock(row.get("started_at") or row.get("finished_at")
-                 or row.get("failed_at") or row.get("scheduled_at_utc"))
+                 or row.get("failed_at"))
 
 
-def run_time(row: dict, *, use_scheduled_fallback: bool) -> datetime | None:
+def run_time(row: dict) -> datetime | None:
+    # A scheduled timestamp alone is not evidence of an actual run.
     for name in ("started_at", "finished_at", "failed_at"):
         moment = utc_timestamp(row.get(name))
         if moment is not None:
             return moment
-    return utc_timestamp(row.get("scheduled_at_utc")) if use_scheduled_fallback else None
+    return None
+
+
+def fetch_actual_runs(start: datetime, end: datetime) -> list[dict]:
+    """Fetch all actual attempts by execution time, irrespective of scheduled day.
+
+    A missing start timestamp may fall back to a terminal timestamp. Once a
+    start exists, it owns the reporting window even if completion is later.
+    """
+    low = start.isoformat().replace("+00:00", "Z")
+    high = end.isoformat().replace("+00:00", "Z")
+
+    def between(column: str) -> str:
+        return f"{column}.gte.{low},{column}.lt.{high}"
+
+    filters = (
+        f"and({between('started_at')})",
+        f"and(started_at.is.null,{between('finished_at')})",
+        f"and(started_at.is.null,finished_at.is.null,{between('failed_at')})",
+    )
+    return fetch_rows("daily_task_runs_dashboard", {
+        "select": "run_id,task_key,task_name,platform,scheduled_for_date,raw_status,started_at,finished_at,failed_at,summary,error_message,log_url,attempt",
+        "or": f"({','.join(filters)})",
+        "order": "started_at.asc.nullslast,updated_at.asc",
+    })
 
 
 def clean(value: object, limit: int = 200) -> str:
@@ -237,15 +262,13 @@ def build_period(day: date, start_hour: int, end_hour: int, rows: list[dict],
         task_key = row.get("task_key")
         if task_key not in definitions:
             continue
-        instant = run_time(row, use_scheduled_fallback=check_missing)
+        instant = run_time(row)
         if instant is not None and start <= instant < end:
             selected.append((instant, make_entry(row), task_key))
     selected.sort(key=lambda item: (item[0], item[1]["task"].lower()))
     groups = {"failed": [], "warnings": [], "finished": []}
-    seen = set()
     for instant, entry, task_key in selected:
         groups[entry["group"]].append(entry)
-        seen.add(task_key)
 
     if check_missing:
         # WHO has two canonical dispatch slots but one database task definition.
@@ -255,8 +278,14 @@ def build_period(day: date, start_hour: int, end_hour: int, rows: list[dict],
             slot_at = datetime.combine(day, slot, tzinfo=UTC)
             if not start <= slot_at < end:
                 continue
-            if any(task_key == WHO_TASK_KEY and slot_at <= instant < end
-                   for instant, _, task_key in selected):
+            # A replay of another scheduled day must not satisfy today's slot.
+            if any(
+                row.get("task_key") == WHO_TASK_KEY
+                and row.get("scheduled_for_date") == day.isoformat()
+                and (started := utc_timestamp(row.get("started_at"))) is not None
+                and slot_at <= started < end
+                for row in rows
+            ):
                 continue
             groups["failed"].append({
                 "group": "failed", "status": "Missing",
@@ -270,7 +299,7 @@ def build_period(day: date, start_hour: int, end_hour: int, rows: list[dict],
         # Other tasks use the existing per-task due threshold. A later period
         # cannot mark an earlier period's completed run as missing.
         for task_key, definition in definitions.items():
-            if task_key == WHO_TASK_KEY or task_key in seen:
+            if task_key == WHO_TASK_KEY:
                 continue
             if not definition.get("include_in_daily_check"):
                 continue
@@ -283,7 +312,8 @@ def build_period(day: date, start_hour: int, end_hour: int, rows: list[dict],
             # it belongs in its own reporting window and is not repeated here.
             if any(
                 row.get("task_key") == task_key
-                and (started := run_time(row, use_scheduled_fallback=True)) is not None
+                and row.get("scheduled_for_date") == day.isoformat()
+                and (started := run_time(row)) is not None
                 and datetime.combine(day, time(0, 0), tzinfo=UTC) <= started < end
                 for row in rows
             ):
@@ -293,8 +323,8 @@ def build_period(day: date, start_hour: int, end_hour: int, rows: list[dict],
                 "task": task_display_name(definition.get("task_name"), task_key,
                                           definition.get("platform")),
                 "time": f"due {due.strftime('%H:%M')} UTC",
-                "detail": (f"No recorded run in the {start_hour:02d}:00–"
-                           f"{end_hour:02d}:00 UTC window"),
+                "detail": (f"No qualifying run for this scheduled UTC day "
+                           f"recorded by {end_hour:02d}:00 UTC"),
                 "link": None, "run_id": "",
             })
     for group in groups:
@@ -478,24 +508,25 @@ def main() -> int:
         raise RuntimeError("WHO 2021 daily task is not configured for email and daily health checking")
     who_slots = expected_who_slots()
 
-    query = {
-        "select": "run_id,task_key,task_name,platform,scheduled_for_date,scheduled_at_utc,raw_status,started_at,finished_at,failed_at,summary,error_message,log_url,attempt",
-        "order": "started_at.asc.nullslast,updated_at.asc",
-    }
-    today_rows = fetch_rows("daily_task_runs_dashboard", {
-        **query, "scheduled_for_date": f"eq.{report_day.isoformat()}"
-    })
     periods = []
     if args.report_type == "morning":
-        yesterday_rows = fetch_rows("daily_task_runs_dashboard", {
-            **query, "scheduled_for_date": f"eq.{previous_day.isoformat()}"
-        })
-        periods.append(build_period(report_day, 0, 7, today_rows, definitions,
+        # Yesterday 07:00 through today 07:00 covers both email sections.
+        rows = fetch_actual_runs(
+            datetime.combine(previous_day, time(7, 0), tzinfo=UTC),
+            datetime.combine(report_day, time(7, 0), tzinfo=UTC),
+        )
+        periods.append(build_period(report_day, 0, 7, rows, definitions,
                                     who_slots, check_missing=True, label="Today"))
-        periods.append(build_period(previous_day, 7, 24, yesterday_rows, definitions,
+        periods.append(build_period(previous_day, 7, 24, rows, definitions,
                                     who_slots, check_missing=False, label="Yesterday"))
     else:
-        periods.append(build_period(report_day, 7, 10, today_rows, definitions,
+        # Include earlier today in the read so it can satisfy a later due time,
+        # without repeating that earlier run in the supplement's display.
+        rows = fetch_actual_runs(
+            datetime.combine(report_day, time(0, 0), tzinfo=UTC),
+            datetime.combine(report_day, time(10, 0), tzinfo=UTC),
+        )
+        periods.append(build_period(report_day, 7, 10, rows, definitions,
                                     who_slots, check_missing=True, label="Today"))
 
     subject, plain, body = render(report_day, periods, args.report_type)
