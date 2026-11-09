@@ -4,6 +4,9 @@ import {
   buildAtomicConnectorDayDeletionPlan,
   classifyObsAqidbRpcWriteWindow,
   compareBuckets,
+  fetchPruneFingerprintWindow,
+  fetchRequiredObsAqidbFingerprints,
+  recheckCompleteConnectorDays,
   repairableWithinObsAqidbWriteWindow,
   upsertObservsRowsChunk,
 } from "../workers/uk_aq_prune_daily/server.mjs";
@@ -21,6 +24,96 @@ function bucket(hour, connector = "7", fingerprint = "source") {
     fingerprint,
   };
 }
+
+function rpcClient(rows, calls, error = null) {
+  return {
+    schema() {
+      return { rpc(name, { window_start, window_end }) {
+        calls.push({ name, window_start, window_end });
+        if (error) return { data: null, error: { message: error } };
+        return { data: rows.filter((row) => row.hour_start >= window_start && row.hour_start < window_end)
+          .map((row) => ({ ...row, observation_count: row.observation_count.toString() })), error: null };
+      } };
+    },
+  };
+}
+
+test("expired connector-day uses zero ObsAQIDB fingerprint RPCs at initial and complete recheck", async () => {
+  const expired = bucket("2026-11-05T23:00:00.000Z");
+  const ingestCalls = [];
+  const observsCalls = [];
+  const ingest = rpcClient([expired], ingestCalls);
+  const observs = rpcClient([], observsCalls, "ObsAQIDB unavailable");
+  const initial = await fetchPruneFingerprintWindow(
+    ingest, observs, "2026-11-05T23:00:00.000Z", "2026-11-06T00:00:00.000Z", null, () => NOW,
+  );
+  const final = await recheckCompleteConnectorDays(ingest, observs, initial.ingestBuckets, null, () => NOW);
+  assert.equal(ingestCalls.length, 2);
+  assert.equal(observsCalls.length, 0);
+  assert.equal(final.finalIngestBuckets.length, 1);
+  assert.equal(final.mismatches.length, 0);
+  assert.equal(final.deletableBuckets[0].comparison_status, "comparison_exempt_expired");
+  assert.equal(buildAtomicConnectorDayDeletionPlan({
+    currentBuckets: final.finalIngestBuckets, eligibleBuckets: final.deletableBuckets,
+  }).plannedBuckets.length, 1);
+  assert.equal(buildAtomicConnectorDayDeletionPlan({
+    currentBuckets: final.finalIngestBuckets, eligibleBuckets: final.deletableBuckets,
+    gateBlockedBuckets: [expired],
+  }).plannedBuckets.length, 0);
+});
+
+test("mixed processing window queries only the required hour and required failure blocks", async () => {
+  // Valid UTC hours in a single connector-day share one write-window class;
+  // this bounded processing window spans the UTC boundary between two days.
+  const expired = bucket("2026-11-05T23:00:00.000Z");
+  const required = bucket("2026-11-06T00:00:00.000Z");
+  const calls = [];
+  const rows = await fetchRequiredObsAqidbFingerprints(
+    rpcClient([required], calls), [expired, required], "observs", null, () => NOW,
+  );
+  assert.deepEqual(calls.map(({ window_start, window_end }) => [window_start, window_end]), [
+    [required.hour_start, "2026-11-06T01:00:00.000Z"],
+  ]);
+  assert.equal(rows.length, 1);
+  const failedCalls = [];
+  await assert.rejects(fetchRequiredObsAqidbFingerprints(
+    rpcClient([], failedCalls, "required hour unavailable"), [expired, required], "observs", null, () => NOW,
+  ), /required hour unavailable/);
+  assert.equal(failedCalls.length, 1);
+  await assert.rejects(fetchPruneFingerprintWindow(
+    rpcClient([required], []), rpcClient([], [], "required hour unavailable"),
+    required.hour_start, "2026-11-06T01:00:00.000Z", null, () => NOW,
+  ), /required hour unavailable/);
+  await assert.rejects(recheckCompleteConnectorDays(
+    rpcClient([required], []), rpcClient([], [], "required hour unavailable"),
+    [required], null, () => NOW,
+  ), /required hour unavailable/);
+});
+
+test("midnight expiry suppresses a pending ObsAQIDB read and uncertain hours stay blocked", async () => {
+  const firstRequired = bucket("2026-11-06T00:00:00.000Z");
+  const calls = [];
+  const times = ["2026-11-09T23:59:59.999Z", "2026-11-10T00:00:00.000Z"];
+  const rows = await fetchRequiredObsAqidbFingerprints(
+    rpcClient([], calls, "unavailable"), [firstRequired], "observs", null,
+    () => times.shift() ?? "2026-11-10T00:00:00.000Z",
+  );
+  assert.deepEqual(rows, []);
+  assert.equal(calls.length, 0);
+  const failedCalls = [];
+  const timesDuringFailure = [
+    "2026-11-09T23:59:59.999Z", "2026-11-09T23:59:59.999Z", "2026-11-10T00:00:00.000Z",
+  ];
+  assert.deepEqual(await fetchRequiredObsAqidbFingerprints(
+    rpcClient([], failedCalls, "expired during RPC"), [firstRequired], "observs", null,
+    () => timesDuringFailure.shift() ?? "2026-11-10T00:00:00.000Z",
+  ), []);
+  assert.equal(failedCalls.length, 1);
+  const uncertain = { ...firstRequired, max_observed_at: "invalid" };
+  assert.equal(compareBuckets([uncertain], [], NOW).blockedUncertainBuckets.length, 1);
+  await fetchRequiredObsAqidbFingerprints(rpcClient([], calls), [uncertain], "observs", null, () => NOW);
+  assert.equal(calls.length, 0);
+});
 
 test("RPC comparison uses UTC calendar midnights and reclassifies at midnight", () => {
   const lastExpired = bucket("2026-11-05T23:00:00.000Z");

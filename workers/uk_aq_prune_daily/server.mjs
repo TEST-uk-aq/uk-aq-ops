@@ -991,6 +991,59 @@ export function classifyObsAqidbRpcWriteWindow(bucket, now = new Date()) {
   return "blocked_uncertain";
 }
 
+function requiredObsAqidbHourWindows(buckets, now) {
+  const requiredHours = [...new Set(buckets
+    .filter((bucket) => classifyObsAqidbRpcWriteWindow(bucket, now) === "comparison_required")
+    .map((bucket) => bucket.hour_start))].sort();
+  const windows = [];
+  for (const hour of requiredHours) {
+    const prior = windows.at(-1);
+    // Do not span UTC dates: a midnight boundary can expire only the older date.
+    if (prior?.window_end === hour && prior.window_start.slice(0, 10) === hour.slice(0, 10)) {
+      prior.window_end = new Date(Date.parse(hour) + HOUR_MS).toISOString();
+    } else {
+      windows.push({ window_start: hour, window_end: new Date(Date.parse(hour) + HOUR_MS).toISOString() });
+    }
+  }
+  return windows;
+}
+
+export async function fetchRequiredObsAqidbFingerprints(
+  observsClient, ingestBuckets, sourceName, pollutantCodes = null, currentTime = () => new Date(),
+) {
+  const plannedWindows = requiredObsAqidbHourWindows(ingestBuckets, currentTime());
+  const observsRows = [];
+  for (const planned of plannedWindows) {
+    const currentBuckets = ingestBuckets.filter((bucket) => (
+      bucket.hour_start >= planned.window_start && bucket.hour_start < planned.window_end
+    ));
+    for (const window of requiredObsAqidbHourWindows(currentBuckets, currentTime())) {
+      try {
+        observsRows.push(...await fetchHourlyFingerprints(
+          observsClient, window.window_start, window.window_end, sourceName, pollutantCodes,
+        ));
+      } catch (error) {
+        if (requiredObsAqidbHourWindows(currentBuckets, currentTime()).length === 0) continue;
+        throw error;
+      }
+    }
+  }
+  return observsRows;
+}
+
+export async function fetchPruneFingerprintWindow(
+  ingestClient, observsClient, windowStart, windowEnd, pollutantCodes = null,
+  currentTime = () => new Date(),
+) {
+  const ingestBuckets = await fetchHourlyFingerprints(
+    ingestClient, windowStart, windowEnd, "ingest", pollutantCodes,
+  );
+  const observsBuckets = await fetchRequiredObsAqidbFingerprints(
+    observsClient, ingestBuckets, "observs", pollutantCodes, currentTime,
+  );
+  return { ingestBuckets, observsBuckets };
+}
+
 export function compareBuckets(ingestBuckets, observsBuckets, now = new Date()) {
   const ingestByKey = new Map(ingestBuckets.map((row) => [row.key, row]));
   const observsByKey = new Map(observsBuckets.map((row) => [row.key, row]));
@@ -1440,20 +1493,29 @@ async function replayObservationsForRepairBucket(mainClient, observsClient, mism
 
 async function recheckSingleBucket(ingestClient, observsClient, mismatch, pollutantCodes = null) {
   const bucketWindow = buildBucketWindow(mismatch.hour_start);
-  const [ingestRows, observsRows] = await Promise.all([
-    fetchHourlyFingerprints(ingestClient, bucketWindow.window_start, bucketWindow.window_end, "ingest_recheck", pollutantCodes),
-    fetchHourlyFingerprints(observsClient, bucketWindow.window_start, bucketWindow.window_end, "observs_recheck", pollutantCodes),
-  ]);
+  const ingestRows = await fetchHourlyFingerprints(
+    ingestClient, bucketWindow.window_start, bucketWindow.window_end, "ingest_recheck", pollutantCodes,
+  );
+  const observsRows = await fetchRequiredObsAqidbFingerprints(
+    observsClient, ingestRows, "observs_recheck", pollutantCodes,
+  );
 
   const ingestMap = new Map(ingestRows.map((row) => [row.key, row]));
   const observsMap = new Map(observsRows.map((row) => [row.key, row]));
   const key = buildBucketKey(mismatch.connector_id, mismatch.hour_start);
-  const bucketMismatch = determineBucketMismatch(ingestMap.get(key), observsMap.get(key));
+  const ingestBucket = ingestMap.get(key);
+  const comparisonStatus = classifyObsAqidbRpcWriteWindow(ingestBucket);
+  const bucketMismatch = comparisonStatus === "comparison_required"
+    ? determineBucketMismatch(ingestBucket, observsMap.get(key))
+    : comparisonStatus === "blocked_uncertain"
+      ? { connector_id: mismatch.connector_id, hour_start: mismatch.hour_start, reason: "obs_aqidb_write_window_uncertain" }
+      : null;
 
   return {
     connector_id: mismatch.connector_id,
     hour_start: mismatch.hour_start,
-    verified: bucketMismatch === null,
+    verified: comparisonStatus === "comparison_required" && bucketMismatch === null,
+    comparison_status: comparisonStatus,
     mismatch: bucketMismatch,
     ingest_bucket_found: ingestMap.has(key),
     observs_bucket_found: observsMap.has(key),
@@ -1485,22 +1547,12 @@ async function recheckMismatchBuckets(
     let ingestRows;
     let observsRows;
     try {
-      [ingestRows, observsRows] = await Promise.all([
-        fetchHourlyFingerprints(
-          ingestClient,
-          group.window_start,
-          group.window_end,
-          "ingest_recheck",
-          pollutantCodes,
-        ),
-        fetchHourlyFingerprints(
-          observsClient,
-          group.window_start,
-          group.window_end,
-          "observs_recheck",
-          pollutantCodes,
-        ),
-      ]);
+      ingestRows = await fetchHourlyFingerprints(
+        ingestClient, group.window_start, group.window_end, "ingest_recheck", pollutantCodes,
+      );
+      observsRows = await fetchRequiredObsAqidbFingerprints(
+        observsClient, ingestRows, "observs_recheck", pollutantCodes,
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(
@@ -1523,7 +1575,11 @@ async function recheckMismatchBuckets(
       const key = buildBucketKey(mismatch.connector_id, mismatch.hour_start);
       const ingestBucket = ingestMap.get(key);
       const observsBucket = observsMap.get(key);
-      const nextMismatch = determineBucketMismatch(ingestBucket, observsBucket);
+      const comparisonStatus = classifyObsAqidbRpcWriteWindow(ingestBucket);
+      if (comparisonStatus === "comparison_exempt_expired") continue;
+      const nextMismatch = comparisonStatus === "blocked_uncertain"
+        ? { connector_id: mismatch.connector_id, hour_start: mismatch.hour_start, reason: "obs_aqidb_write_window_uncertain" }
+        : determineBucketMismatch(ingestBucket, observsBucket);
 
       if (nextMismatch) {
         stillMismatched.push(nextMismatch);
@@ -1589,11 +1645,12 @@ export function claimConnectorDaysForParentRun(buckets, processedConnectorDays =
   };
 }
 
-async function recheckCompleteConnectorDays(
+export async function recheckCompleteConnectorDays(
   ingestClient,
   observsClient,
   initialIngestBuckets,
   pollutantCodes = null,
+  currentTime = () => new Date(),
 ) {
   const connectorIdsByDay = new Map();
   for (const bucket of initialIngestBuckets) {
@@ -1607,30 +1664,21 @@ async function recheckCompleteConnectorDays(
   for (const [dayUtc, connectorIds] of Array.from(connectorIdsByDay.entries()).sort()) {
     const windowStart = `${dayUtc}T00:00:00.000Z`;
     const windowEnd = new Date(Date.parse(windowStart) + DAY_MS).toISOString();
-    const [ingestRows, observsRows] = await Promise.all([
-      fetchHourlyFingerprints(
-        ingestClient,
-        windowStart,
-        windowEnd,
-        "ingest_final_connector_day_recheck",
-        pollutantCodes,
-      ),
-      fetchHourlyFingerprints(
-        observsClient,
-        windowStart,
-        windowEnd,
-        "observs_final_connector_day_recheck",
-        pollutantCodes,
-      ),
-    ]);
-    finalIngestBuckets.push(...ingestRows.filter((row) => connectorIds.has(Number(row.connector_id))));
+    const ingestRows = await fetchHourlyFingerprints(
+      ingestClient, windowStart, windowEnd, "ingest_final_connector_day_recheck", pollutantCodes,
+    );
+    const scopedIngestRows = ingestRows.filter((row) => connectorIds.has(Number(row.connector_id)));
+    const observsRows = await fetchRequiredObsAqidbFingerprints(
+      observsClient, scopedIngestRows, "observs_final_connector_day_recheck", pollutantCodes, currentTime,
+    );
+    finalIngestBuckets.push(...scopedIngestRows);
     finalObservsBuckets.push(...observsRows.filter((row) => connectorIds.has(Number(row.connector_id))));
   }
 
   return {
     finalIngestBuckets,
     finalObservsBuckets,
-    ...compareBuckets(finalIngestBuckets, finalObservsBuckets),
+    ...compareBuckets(finalIngestBuckets, finalObservsBuckets, currentTime()),
   };
 }
 
@@ -2027,10 +2075,9 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
     phase: repairOnlyMode ? "phase_a_recent" : "prune",
   });
 
-  let [ingestBuckets, observsBuckets] = await Promise.all([
-    fetchHourlyFingerprints(ingestClient, windowStart, windowEnd, "ingest", deleteEligiblePollutantCodes),
-    fetchHourlyFingerprints(observsClient, windowStart, windowEnd, "observs", deleteEligiblePollutantCodes),
-  ]);
+  let { ingestBuckets, observsBuckets } = await fetchPruneFingerprintWindow(
+    ingestClient, observsClient, windowStart, windowEnd, deleteEligiblePollutantCodes,
+  );
 
   let duplicateConnectorDaysSkipped = [];
   if (!repairOnlyMode && !dryRunMode) {
