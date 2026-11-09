@@ -8,7 +8,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -96,11 +95,6 @@ def run_sync_scope_step(
 class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
     def setUp(self) -> None:
         self.jobs_file = ROOT / "cloudflare/scheduler/jobs.toml"
-        # The GitHub Actions sync always supplies this; local checks use a
-        # deterministic repository without depending on an operator's shell.
-        repository_env = patch.dict(os.environ, {"GITHUB_REPOSITORY": "fixture-org/fixture-ops"})
-        repository_env.start()
-        self.addCleanup(repository_env.stop)
 
     def test_jobs_toml_generates_expected_rows(self) -> None:
         manifest = sync_jobs.validate_jobs_config(sync_jobs.load_jobs_config(self.jobs_file))
@@ -155,7 +149,12 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
             self.assertEqual(email_job["enabled"], 1)
             self.assertEqual(email_job["dry_run"], 0)
             self.assertEqual(email_job["cron_expr"], cron_expr)
-            self.assertEqual(email_job["github_repo"], "fixture-org/fixture-ops")
+            # Environment-specific TOML is authoritative; sync must preserve
+            # the configured repository name without interpolation.
+            configured_repo = sync_jobs.load_jobs_config(self.jobs_file)["jobs"][
+                email_job["job_key"]
+            ]["github_repo"]
+            self.assertEqual(email_job["github_repo"], configured_repo)
             self.assertEqual(email_job["github_workflow_file"], "uk_aq_daily_task_health_email.yml")
             self.assertEqual(
                 json.loads(email_job["github_inputs_json"]),
