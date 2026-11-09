@@ -185,7 +185,7 @@ def _compact_integrity_backup_readiness(value: Any) -> Any:
 
 
 def _compact_daily_task_summary(task_key: str, value: Any) -> Any:
-    """Bound only the known Integrity diagnostic branch in the derived cache."""
+    """Keep the existing Integrity-only diagnostic compaction."""
     if task_key != "ops.history_integrity" or not isinstance(value, dict):
         return value
     compact = dict(value)
@@ -194,6 +194,44 @@ def _compact_daily_task_summary(task_key: str, value: Any) -> Any:
             compact.get("backup_readiness")
         )
     return compact
+
+
+# MySQL TEXT permits 65,535 bytes (not characters). Keep the authoritative
+# ObsAQIDB JSON untouched; store a readable first-part preview only if the
+# derived local copy cannot fit.
+DAILY_TASK_SUMMARY_TEXT_MAX_BYTES = 65_535
+
+
+def _local_daily_task_summary_json(task_key: str, value: Any) -> Optional[str]:
+    compact = _compact_daily_task_summary(task_key, value)
+    original = _json(compact)
+    if original is None:
+        return None
+    original_bytes = len(original.encode("utf-8"))
+    if original_bytes <= DAILY_TASK_SUMMARY_TEXT_MAX_BYTES:
+        return original
+
+    preview = json.dumps(compact, ensure_ascii=False, indent=2, allow_nan=False)
+    envelope = {
+        "_local_cache_truncated": True,
+        "_original_bytes": original_bytes,
+        "_note": "Local MySQL summary preview only; full source remains in ObsAQIDB.",
+        "_preview": "",
+    }
+    low, high = 0, len(preview)
+    best = None
+    while low <= high:
+        mid = (low + high) // 2
+        envelope["_preview"] = preview[:mid]
+        encoded = _json(envelope)
+        if len(encoded.encode("utf-8")) <= DAILY_TASK_SUMMARY_TEXT_MAX_BYTES:
+            best = encoded
+            low = mid + 1
+        else:
+            high = mid - 1
+    if best is None:
+        raise ValueError("Unable to bound local daily-task summary")
+    return best
 
 
 def _retention_start(now: Optional[datetime] = None) -> datetime:
@@ -303,7 +341,7 @@ def _upsert_daily_task(cursor, row: Dict[str, Any]) -> bool:
         scheduled_day = date.fromisoformat(day_text[:10])
     except ValueError:
         return False
-    compact_summary = _compact_daily_task_summary(task_key, row.get("summary"))
+    local_summary_json = _local_daily_task_summary_json(task_key, row.get("summary"))
     cursor.execute(
         """
         INSERT INTO daily_task_runs
@@ -328,7 +366,7 @@ def _upsert_daily_task(cursor, row: Dict[str, Any]) -> bool:
             row.get("scheduled_time_utc"), _parse_ts(row.get("scheduled_at_utc")), _int(row.get("attempt")),
             row.get("raw_status"), _parse_ts(row.get("started_at")), _parse_ts(row.get("finished_at")),
             _parse_ts(row.get("failed_at")), _parse_ts(row.get("updated_at")), _int(row.get("duration_seconds")),
-            _json(compact_summary), row.get("error_message"), row.get("log_url"), row.get("effective_status"),
+            local_summary_json, row.get("error_message"), row.get("log_url"), row.get("effective_status"),
             _parse_ts(row.get("scheduled_or_started_at")), _parse_ts(row.get("finished_or_failed_at")),
             _bool(row.get("is_failed")), _bool(row.get("is_overdue")), _bool(row.get("is_not_started")),
             _int(row.get("task_day_rank")),
