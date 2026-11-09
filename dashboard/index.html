@@ -724,6 +724,7 @@
         display: flex;
         flex-direction: column;
         gap: 6px;
+        min-width: 0;
       }
 
       .coverage-day-cell.is-outside {
@@ -761,13 +762,19 @@
         margin-top: 0;
         flex: 1 1 auto;
         min-height: 0;
-        display: grid;
-        grid-template-rows: repeat(3, minmax(0, 1fr));
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        justify-content: flex-start;
         gap: 6px;
       }
 
       .coverage-bar-slot {
+        flex: 0 0 32px;
         min-height: 0;
+        min-width: 0;
+        width: 100%;
         display: flex;
         align-items: center;
       }
@@ -777,6 +784,8 @@
         display: flex;
         align-items: center;
         width: 100%;
+        max-width: 100%;
+        min-width: 0;
         height: 100%;
         min-height: 12px;
         box-sizing: border-box;
@@ -794,7 +803,9 @@
         justify-content: center;
         align-items: flex-start;
         width: 100%;
+        min-width: 0;
         height: 100%;
+        box-sizing: border-box;
         padding: 2px 8px;
         color: #ffffff;
         font-size: 12px;
@@ -808,6 +819,7 @@
       .coverage-bar-label-primary {
         display: block;
         width: 100%;
+        min-width: 0;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -841,6 +853,10 @@
         font-size: 12px;
         font-weight: 700;
         line-height: 1;
+        min-width: 0;
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
         white-space: nowrap;
         opacity: 0.95;
       }
@@ -5127,14 +5143,14 @@
                     <span class="coverage-day-weekday">${escapeHtml(cell.weekdayLabel)}</span>
                   </div>
                   <div class="coverage-bars">
-                    ${layers.map((layer) => `<div class="coverage-bar-slot">${renderBar(layer)}</div>`).join("")}
+                    ${layers.filter(Boolean).map((layer) => `<div class="coverage-bar-slot">${renderBar(layer)}</div>`).join("")}
                   </div>
                 </div>
               `;
             })
             .join("");
           bodyMarkup = `<div class="coverage-calendar-grid">${cellsMarkup}</div>`;
-          footnoteText = "Three fixed rows: IngestDB (red), ObsAQIDB observations (blue), R2 observations / Dropbox backup (orange). A small Dropbox icon marks confirmed backup; backup-only days use the same orange row. ? marks unknown source evidence; tooltips list each source independently. The orange row is empty only when both R2 and Dropbox are confirmed absent. Today shows half-width bars without labels.";
+          footnoteText = "Up to three compact rows, without gaps for absent sources: IngestDB (red), ObsAQIDB observations (blue), R2 observations / Dropbox backup (orange). A small Dropbox icon marks confirmed backup; backup-only days use the same orange row. ? marks unknown source evidence; tooltips list each source independently. The orange row is empty only when both R2 and Dropbox are confirmed absent. Today shows half-width bars without labels.";
         }
 
         panel.innerHTML = `
