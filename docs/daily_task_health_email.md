@@ -81,7 +81,7 @@ The TEST sender and recipient are deployment-specific values only. No source fil
 - Activity selection now searches the full actual UTC report period, irrespective of `scheduled_for_date`, with terminal-timestamp fallback only if no start exists. Scheduled-only records cannot masquerade as real attempts.
 - Due-time-based Missing expectations still require a qualifying run for the *same scheduled UTC date*. WHO 2021's two independent start-based slot checks remain unchanged in principle; a recovery run scheduled for another date cannot satisfy today's slot.
 - The 10:00 supplement reads 00:00–10:00 for earlier due-time satisfaction, but displays only 07:00–10:00 activity.
-- Fresh TEST structural validation and both preview-only operational runs are required before scheduling. No automatic dispatch was enabled and LIVE is untouched.
+- TEST Python syntax and both WHO UTC slot checks passed in [GitHub Actions structural run 42649247606](https://github.com/TEST-uk-aq/uk-aq-ops/actions/runs/42649247606). Real TEST morning and supplement previews of the new actual-time query are still required before scheduling. No automatic dispatch was enabled and LIVE is untouched.
 
 ## Scheduler and acceptance (not activated)
 
