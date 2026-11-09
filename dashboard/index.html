@@ -6531,7 +6531,7 @@
           if (localTaskCache && (localTaskCache.state === "refresh_timeout" || localTaskCache.last_error_code)) {
             const contentEl = panel.querySelector("#daily-task-runs-content");
             if (contentEl) {
-              contentEl.insertAdjacentHTML("afterbegin", '<div class="daily-task-state is-error" role="status">Daily Tasks could not refresh from ObsAQIDB. Showing last cached results. Check the local TEST dashboard cache refresher.</div>');
+              contentEl.insertAdjacentHTML("afterbegin", '<div class="daily-task-state is-error" role="status">Daily Tasks could not refresh from ObsAQIDB. Showing last cached results. Check the local dashboard cache refresher.</div>');
             }
           }
         } catch (err) {
