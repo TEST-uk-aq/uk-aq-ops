@@ -106,7 +106,6 @@ github_ref = "main"
 dry_run = false
 notes = "Dropbox raw-data pruning"
 
-# The sync workflow resolves this repository from its own GITHUB_REPOSITORY.
 # Both email sends are explicitly enabled; the Actions variable must also be true.
 [jobs.uk_aq_daily_task_health_email_morning]
 enabled = true
