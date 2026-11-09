@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -95,18 +96,25 @@ def run_sync_scope_step(
 class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
     def setUp(self) -> None:
         self.jobs_file = ROOT / "cloudflare/scheduler/jobs.toml"
+        # The GitHub Actions sync always supplies this; local checks use a
+        # deterministic repository without depending on an operator's shell.
+        repository_env = patch.dict(os.environ, {"GITHUB_REPOSITORY": "fixture-org/fixture-ops"})
+        repository_env.start()
+        self.addCleanup(repository_env.stop)
 
     def test_jobs_toml_generates_expected_rows(self) -> None:
         manifest = sync_jobs.validate_jobs_config(sync_jobs.load_jobs_config(self.jobs_file))
 
         self.assertEqual(manifest["config_version"], 1)
         self.assertEqual(manifest["scheduler_name"], "uk-aq-cron-scheduler-ops")
-        self.assertEqual(manifest["job_count"], 13)
+        self.assertEqual(manifest["job_count"], 15)
         self.assertEqual(
             [job["job_key"] for job in manifest["jobs"]],
             [
                 "uk_aq_blog_refresh",
                 "uk_aq_chart_metrics",
+                "uk_aq_daily_task_health_email_morning",
+                "uk_aq_daily_task_health_email_supplement",
                 "uk_aq_dropbox_prune_raw",
                 "uk_aq_media_discovery",
                 "uk_aq_media_gdelt",
@@ -132,13 +140,27 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
         # HTTP jobs already existed; retain the null-target checks for GitHub jobs.
         github_jobs = [job for job in manifest["jobs"] if job["target_type"] == "github_workflow"]
         news = next(job for job in manifest["jobs"] if job["job_key"] == "uk_aq_media_news_email")
-        self.assertEqual(news["enabled"], 0)
+        self.assertEqual(news["enabled"], 1)
         self.assertEqual(news["cron_expr"], "*/5 * * * *")
         self.assertEqual(news["target_type"], "worker_http")
         self.assertEqual(news["worker_http_secret_binding"], "UK_AQ_MEDIA_EMAIL_WORKER_HTTP_SECRET")
         self.assertTrue(all(job["worker_http_url"] is None for job in github_jobs))
         self.assertTrue(all(job["worker_http_secret_binding"] is None for job in github_jobs))
         self.assertTrue(all(job["worker_http_body_json"] is None for job in github_jobs))
+        for report_type, cron_expr in (("morning", "0 7 * * *"), ("supplement", "0 10 * * *")):
+            email_job = next(
+                job for job in manifest["jobs"]
+                if job["job_key"] == f"uk_aq_daily_task_health_email_{report_type}"
+            )
+            self.assertEqual(email_job["enabled"], 1)
+            self.assertEqual(email_job["dry_run"], 0)
+            self.assertEqual(email_job["cron_expr"], cron_expr)
+            self.assertEqual(email_job["github_repo"], "fixture-org/fixture-ops")
+            self.assertEqual(email_job["github_workflow_file"], "uk_aq_daily_task_health_email.yml")
+            self.assertEqual(
+                json.loads(email_job["github_inputs_json"]),
+                {"send_email": "true", "report_type": report_type, "trigger_mode": "scheduler"},
+            )
 
     def test_github_workflow_jobs_default_cloud_run_method_to_post(self) -> None:
         job = sync_jobs.validate_job(
@@ -197,8 +219,8 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
             self.assertTrue(json_path.exists())
 
             manifest = json.loads(json_path.read_text(encoding="utf-8"))
-            self.assertEqual(manifest["job_count"], 13)
-            self.assertEqual(len(manifest["jobs"]), 13)
+            self.assertEqual(manifest["job_count"], 15)
+            self.assertEqual(len(manifest["jobs"]), 15)
             self.assertEqual(
                 set(manifest["scheduler_jobs_required_columns"]),
                 set(sync_jobs.SQL_COLUMNS + ["updated_at"]),
