@@ -26,13 +26,11 @@ without mutating D1. Before a remote sync, the config workflow waits briefly
 for the remote table to contain every column required by the generated job
 manifest. Scheduler migrations remain owned by the deployment workflow.
 
-For a GitHub workflow hosted in the scheduler's own Ops repository, set
-`github_repo = "${GITHUB_REPOSITORY}"` in `jobs.toml`. The sync generator
-resolves that placeholder from the current GitHub Actions repository, and
-fails rather than substituting a TEST or LIVE repository if the environment
-value is absent or malformed. When generating the SQL manually, supply the
-target repository explicitly as `GITHUB_REPOSITORY=owner/repo`. Do not
-commit environment-specific repository names for new shared jobs.
+For GitHub workflow jobs, set the full `github_repo = "owner/repository"`
+directly in the environment's `jobs.toml`. The sync generator copies the
+configured value into scheduler D1 without environment-variable substitution.
+TEST and LIVE may use different repository owners in their environment-specific
+TOML files; application code and shared configuration templates remain identical.
 
 The Daily Task Health email has two active TEST GitHub-workflow jobs at
 07:00 UTC and 10:00 UTC. Both submit `send_email="true"` and
