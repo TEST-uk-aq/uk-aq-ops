@@ -4534,9 +4534,8 @@
           const dayMarkup = monthCells.map((cell) => {
             const outsideClass = cell.isInMonth ? "" : " is-outside";
             const todayClass = cell.coverage.isToday ? " is-today" : "";
-            const layers = cell.isInMonth ? resolveCoverageSquareLayers(cell.coverage) : [null, null, null];
+            const layers = cell.isInMonth ? resolveCoverageSquareLayers(cell.coverage).filter(Boolean) : [];
             const squares = layers.map((layer) => {
-              if (!layer) return '<span class="coverage-square is-empty" aria-hidden="true"></span>';
               const iconClass = layer.dropbox && !layer.unknown ? " has-backup-icon" : "";
               const uncertainty = layer.unknownPartial ? '<span class="coverage-unknown-badge">?</span>' : "";
               return `<span class="coverage-square ${layer.className}${iconClass}" title="${escapeHtml(layer.title || layer.label)}" aria-hidden="true">${layer.unknown ? "?" : uncertainty}</span>`;
@@ -5109,7 +5108,7 @@
         if (isYearMode) {
           const yearStartUtc = new Date(Date.UTC(monthStartUtc.getUTCFullYear(), 0, 1, 0, 0, 0, 0));
           bodyMarkup = renderCoverageYearGrid(yearStartUtc, resolved.rows);
-          footnoteText = "Complete days only (today excluded). Three squares: IngestDB top-left (red), ObsAQIDB observations top-right (blue), R2 observations / Dropbox backup bottom-left (orange). A Dropbox icon marks confirmed backup, including backup-only days. ? marks unknown source evidence; tooltips list each source independently. The orange position is empty only when both R2 and Dropbox are confirmed absent.";
+          footnoteText = "Complete days only (today excluded). Visible source squares pack left-to-right, then top-to-bottom, without gaps for absent sources: IngestDB (red), ObsAQIDB observations (blue), R2 observations / Dropbox backup (orange). A Dropbox icon marks confirmed backup, including backup-only days. ? marks unknown source evidence; tooltips list each source independently. The orange indicator appears only when R2 or Dropbox evidence is present or uncertain.";
         } else {
           const calendarCells = buildCoverageCalendarCells(monthStartUtc, resolved.rows, true);
           const cellsMarkup = calendarCells
