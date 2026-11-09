@@ -57,9 +57,22 @@ export function compactDbDumpHealthSummary(report = {}) {
   };
 }
 
-export function buildDbDumpHealthInput({ triggerMode, requestedDatabases }) {
+export function buildDbDumpHealthInput({ triggerMode, requestedDatabases }, env = process.env) {
+  // The GitHub Actions runner provides the real run identity. Preserve it in
+  // task health so private digest recipients can open the original job logs.
+  const repository = String(env.GITHUB_REPOSITORY || "").trim();
+  const runId = String(env.GITHUB_RUN_ID || "").trim();
+  const serverUrl = String(env.GITHUB_SERVER_URL || "https://github.com").replace(/\/+$/, "");
+  const logUrl = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)
+    && /^\d+$/.test(runId)
+    && /^https:\/\/[^/\s]+$/.test(serverUrl)
+    ? `${serverUrl}/${repository}/actions/runs/${runId}`
+    : null;
+
   return {
     task_key: DB_DUMP_HEALTH_TASK_KEY,
+    platform_run_id: logUrl ? runId : null,
+    log_url: logUrl,
     source_repo: DB_DUMP_HEALTH_SOURCE_REPO,
     source_worker: DB_DUMP_HEALTH_SOURCE_WORKER,
     summary: {
