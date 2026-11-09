@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -22,6 +23,8 @@ DEFAULT_CLOUD_RUN_METHOD = "POST"
 DEPLOYMENT_PENDING_CLOUD_RUN_URL = "https://deployment-pending.invalid/run"
 DEPLOYMENT_PENDING_WORKER_HTTP_URL = "https://deployment-pending.invalid/scheduler/run"
 WORKER_HTTP_SECRET_BINDING_PATTERN = re.compile(r"^UK_AQ_[A-Z0-9_]*WORKER_HTTP_SECRET$")
+CURRENT_GITHUB_REPOSITORY = "${GITHUB_REPOSITORY}"
+GITHUB_REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 MONTH_NAME_TO_NUMBER = {
     "JAN": 1,
@@ -102,6 +105,21 @@ def require_bool(value: Any, field_name: str) -> int:
     if not isinstance(value, bool):
         raise JobsConfigError(f"Invalid {field_name}: expected true or false")
     return 1 if value else 0
+
+
+def require_github_repository(value: Any, job_key: str) -> str:
+    repository = require_string(value, f"scheduler_jobs.github_repo for {job_key}")
+    if repository != CURRENT_GITHUB_REPOSITORY:
+        return repository
+    # Resolve only from the current sync environment; never carry a TEST/LIVE
+    # target through shared source or silently fall back to another account.
+    repository = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    if not GITHUB_REPOSITORY_PATTERN.fullmatch(repository):
+        raise JobsConfigError(
+            f"Invalid scheduler_jobs.github_repo for {job_key}: "
+            "GITHUB_REPOSITORY must identify the current owner/repository"
+        )
+    return repository
 
 
 def require_timezone(value: Any) -> str:
@@ -339,7 +357,7 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
             joined = ", ".join(sorted(forbidden))
             raise JobsConfigError(f"Invalid scheduler job {job_key}: github_workflow does not use {joined}")
 
-        job["github_repo"] = require_string(raw_job.get("github_repo"), f"scheduler_jobs.github_repo for {job_key}")
+        job["github_repo"] = require_github_repository(raw_job.get("github_repo"), job_key)
         job["github_workflow_file"] = require_string(
             raw_job.get("github_workflow_file"),
             f"scheduler_jobs.github_workflow_file for {job_key}",
