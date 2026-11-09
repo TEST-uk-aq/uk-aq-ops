@@ -137,10 +137,19 @@ def warning_reasons(summary: dict) -> list[str]:
     return details
 
 
+def task_display_name(name: object, task_key: object, platform: object) -> str:
+    base = clean(name or task_key or "Unknown task", 120)
+    raw_platform = clean(platform, 40)
+    location = {"github": "GitHub", "gcp": "GCP", "mbpro": "MBPro"}.get(
+        raw_platform.lower(), raw_platform,
+    )
+    return f"{base} - {location}" if location else base
+
+
 def make_entry(row: dict) -> dict:
     summary = summary_object(row.get("summary"))
     status = clean(row.get("raw_status"), 40).lower()
-    name = clean(row.get("task_name") or row.get("task_key") or "Unknown task", 120)
+    name = task_display_name(row.get("task_name"), row.get("task_key"), row.get("platform"))
     details = warning_reasons(summary)
     failed_count = 0
     if clean(row.get("task_key")) == "ops.history_integrity":
@@ -251,7 +260,8 @@ def build_period(day: date, start_hour: int, end_hour: int, rows: list[dict],
                 continue
             groups["failed"].append({
                 "group": "failed", "status": "Missing",
-                "task": clean(definitions[WHO_TASK_KEY].get("task_name") or WHO_TASK_KEY, 120),
+                "task": task_display_name(definitions[WHO_TASK_KEY].get("task_name"), WHO_TASK_KEY,
+                                          definitions[WHO_TASK_KEY].get("platform")),
                 "time": f"expected {slot.strftime('%H:%M')} UTC",
                 "detail": "No recorded WHO 2021 run starting after this scheduled dispatch and before the report cutoff",
                 "link": None, "run_id": "",
@@ -280,7 +290,8 @@ def build_period(day: date, start_hour: int, end_hour: int, rows: list[dict],
                 continue
             groups["failed"].append({
                 "group": "failed", "status": "Missing",
-                "task": clean(definition.get("task_name") or task_key, 120),
+                "task": task_display_name(definition.get("task_name"), task_key,
+                                          definition.get("platform")),
                 "time": f"due {due.strftime('%H:%M')} UTC",
                 "detail": (f"No recorded run in the {start_hour:02d}:00–"
                            f"{end_hour:02d}:00 UTC window"),
@@ -457,7 +468,7 @@ def main() -> int:
 
     previous_day = report_day - timedelta(days=1)
     definitions_rows = fetch_rows("daily_task_definitions", {
-        "select": "task_key,task_name,is_active,include_in_email,include_in_daily_check,due_time_utc,scheduled_time_utc",
+        "select": "task_key,task_name,platform,is_active,include_in_email,include_in_daily_check,due_time_utc,scheduled_time_utc",
         "is_active": "eq.true", "include_in_email": "eq.true",
     })
     definitions = {row["task_key"]: row for row in definitions_rows if isinstance(row.get("task_key"), str)}
@@ -468,7 +479,7 @@ def main() -> int:
     who_slots = expected_who_slots()
 
     query = {
-        "select": "run_id,task_key,task_name,scheduled_for_date,scheduled_at_utc,raw_status,started_at,finished_at,failed_at,summary,error_message,log_url,attempt",
+        "select": "run_id,task_key,task_name,platform,scheduled_for_date,scheduled_at_utc,raw_status,started_at,finished_at,failed_at,summary,error_message,log_url,attempt",
         "order": "started_at.asc.nullslast,updated_at.asc",
     }
     today_rows = fetch_rows("daily_task_runs_dashboard", {
