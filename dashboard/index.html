@@ -1291,7 +1291,12 @@
       .daily-task-status-pills {
         display: inline-flex;
         align-items: center;
+        flex-wrap: wrap;
         gap: 6px;
+      }
+
+      .daily-task-github-link {
+        font-size: 12px;
         white-space: nowrap;
       }
 
@@ -6143,6 +6148,12 @@
       }
 
       function formatDailyTaskSummary(summaryValue) {
+        if (summaryValue && typeof summaryValue === "object" && !Array.isArray(summaryValue)
+            && summaryValue._local_cache_truncated === true && typeof summaryValue._preview === "string") {
+          const originalBytes = Number(summaryValue._original_bytes);
+          const size = Number.isFinite(originalBytes) ? ` (${originalBytes.toLocaleString()} original bytes)` : "";
+          return `${summaryValue._preview}\n\n[Local MySQL preview truncated${size}; full summary remains in ObsAQIDB.]`;
+        }
         if (summaryValue === null || summaryValue === undefined) {
           return "No summary";
         }
@@ -6164,6 +6175,19 @@
           }
         }
         return String(summaryValue);
+      }
+
+      function validDailyTaskGitHubRunUrl(value) {
+        if (typeof value !== "string" || !value.trim()) return "";
+        try {
+          const url = new URL(value);
+          if (url.protocol !== "https:" || url.hostname !== "github.com"
+              || url.username || url.password || url.search || url.hash) return "";
+          if (!/^\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/actions\/runs\/[0-9]+\/?$/.test(url.pathname)) return "";
+          return url.href;
+        } catch (_err) {
+          return "";
+        }
       }
 
       function sortDailyTaskRunsRows(rows, mode, nowMs) {
@@ -6288,7 +6312,13 @@
               ? formatTime(row.failed_at)
               : (meta.finishedAtMs !== null ? formatTime(row.finished_at) : "—");
             const durationValue = meta.durationSeconds === null ? "n/a" : (formatDurationSeconds(meta.durationSeconds) || "n/a");
-            const summaryText = formatDailyTaskSummary(row.summary);
+            const failureText = meta.statusLabel === "Failed" && row.error_message
+              ? `Failure: ${String(row.error_message)}\n\n` : "";
+            const summaryText = failureText + formatDailyTaskSummary(row.summary);
+            const githubUrl = meta.statusLabel === "Failed" ? validDailyTaskGitHubRunUrl(row.log_url) : "";
+            const githubLink = githubUrl
+              ? `<a class="daily-task-github-link" href="${escapeHtml(githubUrl)}" target="_blank" rel="noopener noreferrer" title="View failed run on GitHub">GitHub run</a>`
+              : "";
             const taskSummary = parseDailyTaskSummaryObject(row.summary);
             const warningPill = meta.statusLabel === "Finished" && Array.isArray(taskSummary && taskSummary.warnings) && taskSummary.warnings.length > 0
               ? '<span class="status-pill warning">WARNING</span>'
@@ -6306,7 +6336,7 @@
                   </div>
                 </td>
                 <td class="daily-task-platform">${escapeHtml(platformLabel)}</td>
-                <td><span class="daily-task-status-pills"><span class="status-pill ${escapeHtml(meta.statusClass)}">${escapeHtml(meta.statusLabel)}</span>${warningPill}${dryRunPill}</span></td>
+                <td><span class="daily-task-status-pills"><span class="status-pill ${escapeHtml(meta.statusClass)}">${escapeHtml(meta.statusLabel)}</span>${warningPill}${dryRunPill}${githubLink}</span></td>
                 <td>${escapeHtml(scheduledValue)}</td>
                 <td>${escapeHtml(finishedValue)}</td>
                 <td>${escapeHtml(durationValue)}</td>
@@ -6497,6 +6527,13 @@
             updatedEl.textContent = `Updated: ${dailyTaskRunsLastUpdatedText}`;
           }
           renderDailyTaskRunsCardContent(panel, dailyTaskRunsRows);
+          const localTaskCache = payload && payload.local_cache && payload.local_cache.daily_task_runs;
+          if (localTaskCache && (localTaskCache.state === "refresh_timeout" || localTaskCache.last_error_code)) {
+            const contentEl = panel.querySelector("#daily-task-runs-content");
+            if (contentEl) {
+              contentEl.insertAdjacentHTML("afterbegin", '<div class="daily-task-state is-error" role="status">Daily Tasks could not refresh from ObsAQIDB. Showing last cached results. Check the local TEST dashboard cache refresher.</div>');
+            }
+          }
         } catch (err) {
           if (requestId !== dailyTaskRunsLoadSequence) {
             return;
