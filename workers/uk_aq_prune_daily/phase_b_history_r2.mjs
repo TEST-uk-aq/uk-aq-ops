@@ -86,6 +86,7 @@ import {
   canonicalObservationConnectorManifestKey,
   connectorDayGateKey,
   isValidConnectorHistoryGateEvidence,
+  normalizeConnectorDayPair,
   setConnectorDayGateComplete,
   setConnectorDayGateIncomplete,
 } from "../shared/uk_aq_connector_day_gate.mjs";
@@ -2587,6 +2588,17 @@ where day_utc = $1::date
 
 function completedCandidateHistoryGeneration(candidate) {
   if (candidate?.status !== "complete") return null;
+  // Retired v1 is recognised only as exact candidate bookkeeping. It is not a
+  // selectable writer generation or valid connector-day deletion gate.
+  try {
+    const pair = normalizeConnectorDayPair(candidate.day_utc, candidate.connector_id);
+    if (candidate.manifest_key ===
+      `history/v1/observations/day_utc=${pair.day_utc}/connector_id=${pair.connector_id}/manifest.json`) {
+      return "v1";
+    }
+  } catch (_error) {
+    return null;
+  }
   for (const generation of ["v2", "v3"]) {
     try {
       if (candidate.manifest_key === canonicalObservationConnectorManifestKey(

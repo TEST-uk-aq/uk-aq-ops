@@ -825,7 +825,7 @@ test("v3 rediscovery reports a completed deletion when identical historical rows
   assert.equal(candidate.last_error, marker);
 });
 
-test("v3 day finalization excludes only exact historical v2 completions", () => {
+test("selected day finalization excludes exact retired v1 and historical v2 completions", () => {
   const dayUtc = "2026-08-31";
   const currentComplete = {
     day_utc: dayUtc,
@@ -839,14 +839,20 @@ test("v3 day finalization excludes only exact historical v2 completions", () => 
     status: "complete",
     manifest_key: canonicalObservationConnectorManifestKey(dayUtc, 2, "v2"),
   };
+  const retiredComplete = {
+    day_utc: dayUtc,
+    connector_id: 1,
+    status: "complete",
+    manifest_key: `history/v1/observations/day_utc=${dayUtc}/connector_id=1/manifest.json`,
+  };
   const currentOnly = filterDayCandidatesForSelectedGeneration(
-    [historicalComplete, currentComplete],
+    [retiredComplete, historicalComplete, currentComplete],
     "v3",
   );
   assert.deepEqual(currentOnly.map(({ connector_id }) => connector_id), [8]);
   assert.equal(computeDayGateState(currentOnly).all_complete, true);
   assert.deepEqual(
-    filterDayCandidatesForSelectedGeneration([historicalComplete, currentComplete], "v2")
+    filterDayCandidatesForSelectedGeneration([retiredComplete, historicalComplete, currentComplete], "v2")
       .map(({ connector_id }) => connector_id),
     [2],
     "the rule is symmetric and selected-generation based",
@@ -863,7 +869,7 @@ test("v3 day finalization excludes only exact historical v2 completions", () => 
     { day_utc: dayUtc, connector_id: 5, status: "in_progress", manifest_key: null },
   ];
   const withIncomplete = filterDayCandidatesForSelectedGeneration(
-    [historicalComplete, currentComplete, ...incomplete],
+    [retiredComplete, historicalComplete, currentComplete, ...incomplete],
     "v3",
   );
   assert.deepEqual(withIncomplete.map(({ connector_id }) => connector_id), [8, 3, 4, 5]);
@@ -887,6 +893,25 @@ test("v3 day finalization excludes only exact historical v2 completions", () => 
     [malformedComplete],
     "unrecognised completion evidence must remain visible and fail closed later",
   );
+
+  const unsafeRetired = [
+    { ...retiredComplete, status: "pending" },
+    { ...retiredComplete, status: "failed" },
+    { ...retiredComplete, status: "in_progress" },
+    { ...retiredComplete, connector_id: 9 },
+    { ...retiredComplete, day_utc: "2026-09-01" },
+    { ...retiredComplete, manifest_key: `history/v1/observations/day_utc=${dayUtc}/connector_id=1/other.json` },
+    { ...retiredComplete, manifest_key: `history/v4/observations/day_utc=${dayUtc}/connector_id=1/manifest.json` },
+  ];
+  assert.deepEqual(filterDayCandidatesForSelectedGeneration(unsafeRetired, "v3"), unsafeRetired);
+  assert.equal(computeDayGateState(filterDayCandidatesForSelectedGeneration(
+    [retiredComplete, currentComplete, unsafeRetired[0]], "v3",
+  )).all_complete, false);
+  assert.throws(() => filterDayCandidatesForSelectedGeneration([retiredComplete], "v1"));
+  assert.equal(isValidConnectorHistoryGateEvidence({
+    day_utc: dayUtc, connector_id: 1, history_done: true,
+    history_manifest_key: retiredComplete.manifest_key,
+  }), false, "retired candidate bookkeeping cannot supply deletion-gate authority");
 });
 
 test("insufficient Phase B budget prevents AQI and Dropbox adapters and reports a controlled stop", async () => {
