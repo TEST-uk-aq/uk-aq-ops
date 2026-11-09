@@ -89,10 +89,10 @@ Two independent central Cloudflare scheduler jobs were enabled in TEST on 9 Nove
 `uk_aq_daily_task_health_email_morning` at `07:00 UTC` (`report_type=morning`),
 and `uk_aq_daily_task_health_email_supplement` at `10:00 UTC`
 (`report_type=supplement`). Each has `enabled=true`, `dry_run=false`,
-`send_email="true"` and `trigger_mode="scheduler"`. The sync generator
-resolves the current Ops `github_repo` from `GITHUB_REPOSITORY`, failing
-closed when it is missing or malformed. This avoids adding an environment-specific
-TEST or LIVE repository identifier to the shared configuration.
+`send_email="true"` and `trigger_mode="scheduler"`. The environment's
+`jobs.toml` supplies the full GitHub repository name directly, and the
+sync generator writes that value into the scheduler's D1 record unchanged.
+TEST and LIVE scheduler configuration files may contain different repository owners.
 
 TEST Actions run logs 42650823850 and 42650925317 showed
 `UK_AQ_HEALTH_EMAIL_SEND_ENABLED=true` and successful SMTP submissions.
