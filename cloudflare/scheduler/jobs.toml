@@ -106,6 +106,38 @@ github_ref = "main"
 dry_run = false
 notes = "Dropbox raw-data pruning"
 
+# The sync workflow resolves this repository from its own GITHUB_REPOSITORY.
+# Both email sends are explicitly enabled; the Actions variable must also be true.
+[jobs.uk_aq_daily_task_health_email_morning]
+enabled = true
+cron_expr = "0 7 * * *"
+target_type = "github_workflow"
+github_repo = "${GITHUB_REPOSITORY}"
+github_workflow_file = "uk_aq_daily_task_health_email.yml"
+github_ref = "main"
+dry_run = false
+notes = "07:00 UTC Daily Task Health morning email"
+
+[jobs.uk_aq_daily_task_health_email_morning.github_inputs]
+send_email = "true"
+report_type = "morning"
+trigger_mode = "scheduler"
+
+[jobs.uk_aq_daily_task_health_email_supplement]
+enabled = true
+cron_expr = "0 10 * * *"
+target_type = "github_workflow"
+github_repo = "${GITHUB_REPOSITORY}"
+github_workflow_file = "uk_aq_daily_task_health_email.yml"
+github_ref = "main"
+dry_run = false
+notes = "10:00 UTC Daily Task Health supplement email"
+
+[jobs.uk_aq_daily_task_health_email_supplement.github_inputs]
+send_email = "true"
+report_type = "supplement"
+trigger_mode = "scheduler"
+
 [jobs.uk_aq_media_discovery]
 enabled = true
 cron_expr = "0 */2 * * *"
