@@ -83,11 +83,24 @@ The TEST sender and recipient are deployment-specific values only. No source fil
 - The 10:00 supplement reads 00:00–10:00 for earlier due-time satisfaction, but displays only 07:00–10:00 activity.
 - TEST Python syntax and both WHO UTC slot checks passed in [GitHub Actions structural run 42649247606](https://github.com/TEST-uk-aq/uk-aq-ops/actions/runs/42649247606). Real TEST morning and supplement previews of the new actual-time query are still required before scheduling. No automatic dispatch was enabled and LIVE is untouched.
 
-## Scheduler and acceptance (not activated)
+## Scheduler and acceptance (TEST active configuration)
 
-Desired **two independent central Cloudflare scheduler dispatches** at `07:00 UTC` (`report_type=morning`) and `10:00 UTC` (`report_type=supplement`), each with `send_email=true` and `trigger_mode=scheduler`. The current canonical scheduler manifest uses environment-specific repository names. Resolve that pre-existing configuration mechanism by injecting the execution environment's repository target rather than committing another hard-coded TEST/LIVE name.
+Two independent central Cloudflare scheduler jobs were enabled in TEST on 9 November 2026:
+`uk_aq_daily_task_health_email_morning` at `07:00 UTC` (`report_type=morning`),
+and `uk_aq_daily_task_health_email_supplement` at `10:00 UTC`
+(`report_type=supplement`). Each has `enabled=true`, `dry_run=false`,
+`send_email="true"` and `trigger_mode="scheduler"`. The sync generator
+resolves the current Ops `github_repo` from `GITHUB_REPOSITORY`, failing
+closed when it is missing or malformed. This avoids adding an environment-specific
+TEST or LIVE repository identifier to the shared configuration.
 
-Do not modify cloudflare/scheduler/jobs.toml without separate authorisation for the resulting automatic remote D1 sync. No cloud scheduler, GitHub secrets/variables or SMTP settings were changed by code-only staging.
+TEST Actions run logs 42650823850 and 42650925317 showed
+`UK_AQ_HEALTH_EMAIL_SEND_ENABLED=true` and successful SMTP submissions.
+The user confirmed receipt of both messages. The
+[TEST scheduler sync run 42652642603](https://github.com/TEST-uk-aq/uk-aq-ops/actions/runs/42652642603)
+validated 15 jobs, applied them to remote D1, and verified D1 against the
+canonical manifest. First real automatic dispatches are still pending
+operational observation. No LIVE changes, promotion or deployment occurred.
 
 After normal structural checks, execute a real TEST preview, inspect the generated artefacts against actual daily runs and check the warning/original status distinction. After TEST OAuth credentials and sender settings are provisioned and separately approved, carry out a genuine TEST send and inspect its arrival. Only then activate the 07:00 UTC and 10:00 UTC schedules. Promotion is complete approved TEST files only; the user commits and deploys LIVE. No LIVE archive files.
 
