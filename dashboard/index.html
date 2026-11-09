@@ -1715,11 +1715,6 @@
           display: none;
         }
 
-        .coverage-bar-label {
-          padding: 2px 3px;
-          font-size: 10px;
-        }
-
         .coverage-year-grid {
           grid-template-columns: 1fr;
         }
@@ -5122,7 +5117,14 @@
                 if (!layer) return "";
                 const isToday = cell.coverage.isToday;
                 const halfClass = isToday ? " is-half" : "";
-                const label = layer.unknown ? "?" : layer.label;
+                const shortLabel = layer.primaryDropboxIcon
+                  ? "Backup - Obs"
+                  : layer.field === "obsAqiObservs"
+                    ? "ObsAQIDB - Obs"
+                    : layer.className === "coverage-bar-r2-observs"
+                      ? "R2 History - Obs"
+                      : layer.label;
+                const label = layer.unknown ? "?" : shortLabel;
                 const icon = layer.primaryDropboxIcon
                   ? `<img class="coverage-bar-label-primary-icon" src="${DASHBOARD_DROPBOX_ICON_PATH}" alt="" aria-hidden="true">`
                   : "";
@@ -5149,7 +5151,7 @@
             })
             .join("");
           bodyMarkup = `<div class="coverage-calendar-grid">${cellsMarkup}</div>`;
-          footnoteText = "Up to three compact rows, without gaps for absent sources: IngestDB (red), ObsAQIDB observations (blue), R2 observations / Dropbox backup (orange). A small Dropbox icon marks confirmed backup; backup-only days use the same orange row. ? marks unknown source evidence; tooltips list each source independently. The orange row is empty only when both R2 and Dropbox are confirmed absent. Today shows half-width bars without labels.";
+          footnoteText = "Up to three compact rows, without gaps for absent sources: IngestDB (red), ObsAQIDB - Obs (blue), R2 History - Obs / Backup - Obs (orange). A small Dropbox icon marks confirmed backup; backup-only days use the same orange row. ? marks unknown source evidence; tooltips list each source independently. The orange row is empty only when both R2 and Dropbox are confirmed absent. Today shows half-width bars without labels.";
         }
 
         panel.innerHTML = `
