@@ -26,6 +26,21 @@ without mutating D1. Before a remote sync, the config workflow waits briefly
 for the remote table to contain every column required by the generated job
 manifest. Scheduler migrations remain owned by the deployment workflow.
 
+For a GitHub workflow hosted in the scheduler's own Ops repository, set
+`github_repo = "${GITHUB_REPOSITORY}"` in `jobs.toml`. The sync generator
+resolves that placeholder from the current GitHub Actions repository, and
+fails rather than substituting a TEST or LIVE repository if the environment
+value is absent or malformed. When generating the SQL manually, supply the
+target repository explicitly as `GITHUB_REPOSITORY=owner/repo`. Do not
+commit environment-specific repository names for new shared jobs.
+
+The Daily Task Health email has two active TEST GitHub-workflow jobs at
+07:00 UTC and 10:00 UTC. Both submit `send_email="true"` and
+`trigger_mode="scheduler"`; the GitHub Actions setting
+`UK_AQ_HEALTH_EMAIL_SEND_ENABLED=true` must also be configured in
+each intended environment. The central scheduler dispatches GitHub Actions;
+it does not send SMTP mail itself.
+
 ## Worker name
 
 - `uk-aq-cron-scheduler-ops`
