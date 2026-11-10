@@ -45,6 +45,7 @@ jobs:
       OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
       OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
       UK_AQ_OPS_SCHEMA: ${{ vars.UK_AQ_OPS_SCHEMA || 'uk_aq_ops' }}
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
       UK_AQ_HEALTH_EMAIL_TO: ${{ vars.UK_AQ_HEALTH_EMAIL_TO }}
       UK_AQ_HEALTH_EMAIL_FROM: ${{ vars.UK_AQ_HEALTH_EMAIL_FROM }}
       UK_AQ_HEALTH_EMAIL_SEND_ENABLED: ${{ vars.UK_AQ_HEALTH_EMAIL_SEND_ENABLED || 'false' }}
