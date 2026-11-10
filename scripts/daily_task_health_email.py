@@ -268,6 +268,7 @@ def build_period(day: date, start_hour: int, end_hour: int, rows: list[dict],
     selected.sort(key=lambda item: (item[0], item[1]["task"].lower()))
     groups = {"failed": [], "warnings": [], "finished": []}
     for instant, entry, task_key in selected:
+        entry["_sort_at"] = instant
         groups[entry["group"]].append(entry)
 
     if check_missing:
@@ -291,6 +292,7 @@ def build_period(day: date, start_hour: int, end_hour: int, rows: list[dict],
                 "group": "failed", "status": "Missing",
                 "task": task_display_name(definitions[WHO_TASK_KEY].get("task_name"), WHO_TASK_KEY,
                                           definitions[WHO_TASK_KEY].get("platform")),
+                "_sort_at": slot_at,
                 "time": f"expected {slot.strftime('%H:%M')} UTC",
                 "detail": "No recorded WHO 2021 run starting after this scheduled dispatch and before the report cutoff",
                 "link": None, "run_id": "",
@@ -322,13 +324,18 @@ def build_period(day: date, start_hour: int, end_hour: int, rows: list[dict],
                 "group": "failed", "status": "Missing",
                 "task": task_display_name(definition.get("task_name"), task_key,
                                           definition.get("platform")),
+                "_sort_at": datetime.combine(day, due, tzinfo=UTC),
                 "time": f"due {due.strftime('%H:%M')} UTC",
                 "detail": (f"No qualifying run for this scheduled UTC day "
                            f"recorded by {end_hour:02d}:00 UTC"),
                 "link": None, "run_id": "",
             })
+    # Display each status group in chronological order, with Missing tasks
+    # positioned by their scheduled due time rather than task name.
     for group in groups:
-        groups[group].sort(key=lambda entry: (entry["task"].lower(), entry["time"]))
+        groups[group].sort(key=lambda entry: (entry["_sort_at"], entry["task"].lower(), entry["run_id"]))
+        for entry in groups[group]:
+            del entry["_sort_at"]
     return {"day": day, "start": start_hour, "end": end_hour,
             "groups": groups, "label": label}
 
