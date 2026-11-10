@@ -401,18 +401,23 @@ def counts(period: dict) -> tuple[int, int, int]:
     return tuple(len(period["groups"][group]) for group in ("failed", "warnings", "finished"))
 
 
-def render(report_day: date, periods: list[dict], report_type: str) -> tuple[str, str, str]:
+def render(report_day: date, periods: list[dict], report_type: str,
+           environment: str) -> tuple[str, str, str]:
+    if environment not in {"TEST", "LIVE"}:
+        raise ValueError("UK_AQ_ENV_NAME must be explicitly TEST or LIVE")
     failures, warnings, finished = counts(periods[0])
     dispatch_hour = "07:00" if report_type == "morning" else "10:00"
-    subject = (f"UK AQ Daily Health | {format_date(report_day)} {dispatch_hour} UTC | "
+    subject = (f"[{environment}] UK AQ Daily Health | {format_date(report_day)} "
+               f"{dispatch_hour} UTC | "
                f"{failures} failed, {warnings} warnings, {finished} finished")
-    header = "UK AQ Daily Task Health\nAll dates and times UTC.\n"
+    header = f"UK AQ Daily Task Health\nEnvironment: {environment}\nAll dates and times UTC.\n"
     plain = header + "\n\n" + "\n\n".join(plain_period(p) for p in periods)
     body = (
         '<!doctype html><html><body style="margin:0;padding:18px;background:#f5f5f5;'
         'font-family:Arial,Helvetica,sans-serif;color:#111827">'
         '<main style="max-width:680px;margin:auto;background:#fff;padding:22px">'
         '<h1 style="font-size:24px;margin:0 0 6px">UK AQ Daily Task Health</h1>'
+        f'<p style="color:#374151;margin:0 0 6px"><strong>Environment: {environment}</strong></p>'
         '<p style="color:#4b5563;margin:0">All dates and times UTC.</p>'
         + "".join(html_period(p) for p in periods)
         + '<p style="font-size:12px;color:#6b7280">Generated from UK AQ Daily Task Health records.</p>'
@@ -495,6 +500,11 @@ def main() -> int:
                         default="morning", help="07:00 digest or 10:00 supplement")
     parser.add_argument("--send", action="store_true", help="Send via authenticated Google Workspace SMTP")
     args = parser.parse_args()
+    # Environment identity is explicit configuration, never inferred from
+    # repository, server URL, sender address, or other deployment metadata.
+    environment = require_env("UK_AQ_ENV_NAME")
+    if environment not in {"TEST", "LIVE"}:
+        raise ValueError("UK_AQ_ENV_NAME must be explicitly TEST or LIVE")
     now = datetime.now(UTC)
     report_day = date.fromisoformat(args.report_day) if args.report_day else now.date()
     dispatch_hour = 7 if args.report_type == "morning" else 10
@@ -536,7 +546,7 @@ def main() -> int:
         periods.append(build_period(report_day, 7, 10, rows, definitions,
                                     who_slots, check_missing=True, label="Today"))
 
-    subject, plain, body = render(report_day, periods, args.report_type)
+    subject, plain, body = render(report_day, periods, args.report_type, environment)
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     (REPORT_DIR / "report.txt").write_text(plain + "\n", encoding="utf-8")
     (REPORT_DIR / "report.html").write_text(body + "\n", encoding="utf-8")
