@@ -293,6 +293,7 @@ COMMON_EXCLUDES=(
   --exclude='workers/worker_error_logs/'
   --exclude='scripts/R2_v2_implementation/tmp_r2_manifest_rebuild_*/'
   --exclude='scripts/aqi_gaps/r2_aqi_gap_check_*/'
+  --exclude='scripts/aqe/'
 
   # Legacy documentation is retained in TEST only.
   --exclude='system_docs_legacy/'
