@@ -19,9 +19,7 @@ concurrency:
 jobs:
   prune-daily:
     runs-on: ubuntu-latest
-    # Temporary TEST-only backlog catch-up envelope. Revert to 70/60m/3540
-    # once Prune Daily has returned to normal daily steady state.
-    timeout-minutes: 190
+    timeout-minutes: 70
     env:
       # Optional JSONgen handover only; canonical Prune behaviour is unchanged.
       UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
@@ -61,7 +59,7 @@ jobs:
       UK_AQ_R2_HISTORY_CURSOR_FETCH_ROWS: ${{ vars.UK_AQ_R2_HISTORY_CURSOR_FETCH_ROWS || '20000' }}
       UK_AQ_R2_HISTORY_ROW_GROUP_SIZE: ${{ vars.UK_AQ_R2_HISTORY_ROW_GROUP_SIZE || '100000' }}
       UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN: ${{ vars.UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN || '500' }}
-      UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN: '10740'
+      UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN: '3540'
       UK_AQ_PRUNE_DAILY_PHASE_B_STOP_BEFORE_TIMEOUT_SECONDS: ${{ vars.UK_AQ_PRUNE_DAILY_PHASE_B_STOP_BEFORE_TIMEOUT_SECONDS || '60' }}
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
       UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX: ${{ vars.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX || 'history/v2/aqilevels/hourly/data' }}
@@ -143,7 +141,7 @@ jobs:
           exit "${missing}"
 
       - name: Run Prune Daily
-        run: timeout --kill-after=30s 180m node workers/uk_aq_prune_daily/job.mjs
+        run: timeout --kill-after=30s 60m node workers/uk_aq_prune_daily/job.mjs
 
       - name: Upload Prune Daily report
         if: always()
