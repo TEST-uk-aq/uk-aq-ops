@@ -11,6 +11,8 @@ import {
 import { connectorDayGateKey } from "../shared/uk_aq_connector_day_gate.mjs";
 import { groupFingerprintRechecksByHour } from "./fingerprint_recheck.mjs";
 import { deletePruneBucketsWithSourceIdentity } from "./source_identity_deletion.mjs";
+import { openLateArrivalProgress } from "./late_arrival_progress.mjs";
+import { createLateArrivalReader, discoverAndProcessLateArrivals } from "./late_arrival_discovery.mjs";
 import { withDailyTaskRun } from "../shared/daily_task_health.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -40,9 +42,6 @@ const DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH = 4;
 const DEFAULT_REPAIR_FETCH_PAGE_SIZE = 1_000;
 const MAX_REPAIR_FETCH_PAGES = 500;
 const PREVIEW_LIMIT = 25;
-const LATE_ARRIVAL_DISCOVERY_PAGE_SIZE = 1000;
-const MAX_LATE_ARRIVAL_DISCOVERY_PAGES = 100;
-const MAX_LATE_ARRIVAL_WINDOWS_PER_RUN = 14;
 const RPC_SCHEMA = "uk_aq_public";
 const REPAIR_RECEIPT_SEMANTICS = "sync_attempt_audit_not_applied_row_evidence";
 const REPAIR_OPERATOR_RECOVERY_MESSAGE =
@@ -213,6 +212,21 @@ function compactPruneHealthSummary(summary = {}) {
     late_arrival: summary.late_arrival
       ? {
         enabled: summary.late_arrival.enabled,
+        status: summary.late_arrival.status,
+        attention_required: summary.late_arrival.attention_required,
+        stop_reason: summary.late_arrival.stop_reason,
+        next_day_utc: summary.late_arrival.next_day_utc,
+        cutoff_window_start: summary.late_arrival.cutoff_window_start,
+        deferred_day_count: summary.late_arrival.deferred_day_count,
+        remaining_calendar_day_count: summary.late_arrival.remaining_calendar_day_count,
+        blocked_day_count: summary.late_arrival.blocked_day_count,
+        failed_day_count: summary.late_arrival.failed_day_count,
+        examined_day_count: summary.late_arrival.examined_day_count,
+        absent_day_count: summary.late_arrival.absent_day_count,
+        discovery_request_count: summary.late_arrival.discovery_request_count,
+        scanned_page_count: summary.late_arrival.scanned_page_count,
+        wraparound: summary.late_arrival.wraparound,
+        progress_persisted: summary.late_arrival.progress_persisted,
         skipped: summary.late_arrival.skipped,
         discovered_day_count: summary.late_arrival.discovered_day_count,
         target_day_count: summary.late_arrival.target_day_count,
@@ -2624,56 +2638,6 @@ async function runPhaseARecent(config) {
   return aggregateSummary;
 }
 
-async function discoverLateArrivalDays(ingestClient, overallWindow) {
-  const cutoffWindowStart = toIso(overallWindow.window_start, "late_arrival.window_start");
-  const distinctDaySet = new Set();
-  let scannedRowCount = 0;
-  let scannedPageCount = 0;
-  let truncatedByPageLimit = false;
-
-  for (let page = 0; page < MAX_LATE_ARRIVAL_DISCOVERY_PAGES; page += 1) {
-    const start = page * LATE_ARRIVAL_DISCOVERY_PAGE_SIZE;
-    const end = start + LATE_ARRIVAL_DISCOVERY_PAGE_SIZE - 1;
-    const { data, error } = await ingestClient
-      .schema(RPC_SCHEMA)
-      .from("observations")
-      .select("observed_at")
-      .lt("observed_at", cutoffWindowStart)
-      .order("observed_at", { ascending: true })
-      .range(start, end);
-
-    if (error) {
-      throw new Error(`late-arrival discovery query failed: ${error.message}`);
-    }
-
-    const rows = Array.isArray(data) ? data : [];
-    scannedPageCount += 1;
-    scannedRowCount += rows.length;
-    for (const row of rows) {
-      const observedAtIso = toIso(row.observed_at, "late_arrival.observed_at");
-      distinctDaySet.add(toObservedDay(observedAtIso));
-    }
-
-    if (rows.length < LATE_ARRIVAL_DISCOVERY_PAGE_SIZE) {
-      break;
-    }
-    if (page + 1 === MAX_LATE_ARRIVAL_DISCOVERY_PAGES) {
-      truncatedByPageLimit = true;
-    }
-  }
-
-  const discoveredDays = Array.from(distinctDaySet).sort();
-  return {
-    cutoff_window_start: cutoffWindowStart,
-    discovered_day_count: discoveredDays.length,
-    discovered_day_preview: sampleRows(discoveredDays),
-    discovered_days: discoveredDays,
-    scanned_row_count: scannedRowCount,
-    scanned_page_count: scannedPageCount,
-    truncated_by_page_limit: truncatedByPageLimit,
-  };
-}
-
 async function runLateArrivalDirectDeleteDay(
   config,
   ingestClient,
@@ -2858,147 +2822,52 @@ async function runLateArrivalDirectDeleteDay(
   return summary;
 }
 
-async function runLateArrivalCleanup(config, overallWindow, runContext = {}) {
+export async function runLateArrivalCleanup(config, overallWindow, runContext = {}, adapters = {}) {
   const runId = randomUUID();
-  const ingestClient = createClient(config.supabaseUrl, config.ingestSecretKey, {
-    auth: { persistSession: false, autoRefreshToken: false },
-    db: { schema: RPC_SCHEMA },
+  const ingestClient = adapters.ingestClient || createClient(config.supabaseUrl, config.ingestSecretKey, {
+    auth: { persistSession: false, autoRefreshToken: false }, db: { schema: RPC_SCHEMA },
   });
-  const discovery = await discoverLateArrivalDays(ingestClient, overallWindow);
-  const { discovered_days: discoveredDays, ...discoverySummary } = discovery;
   const obsAqidbCutoffDayUtc = buildRetentionCutoffDayUtc(config.obsAqidbObservsRetentionDays);
-  const directDeleteDayWindows = [];
-  const repairEligibleDayWindows = [];
-  for (const dayUtc of discoveredDays) {
-    const dayWindow = buildUtcDayWindow(dayUtc);
-    if (dayWindow.day_utc < obsAqidbCutoffDayUtc) {
-      directDeleteDayWindows.push(dayWindow);
-      continue;
-    }
-    repairEligibleDayWindows.push(dayWindow);
-  }
-  const repairDayWindows = repairEligibleDayWindows.slice(0, MAX_LATE_ARRIVAL_WINDOWS_PER_RUN);
-  const droppedDayCount = Math.max(0, repairEligibleDayWindows.length - repairDayWindows.length);
-  const dayWindows = [...directDeleteDayWindows, ...repairDayWindows];
-  logStructured("INFO", "ingestdb_late_arrival_discovery_summary", {
-    run_id: runId,
-    mode: config.dryRun ? "dry-run" : "delete",
-    ...discoverySummary,
-  });
-
-  if (discoveredDays.length === 0) {
-    return {
-      enabled: true,
-      skipped: true,
-      reason: "no_late_arrival_days_detected",
-      run_id: runId,
-      ...discoverySummary,
-      obs_aqidb_retention_days: config.obsAqidbObservsRetentionDays,
-      obs_aqidb_cutoff_day_utc: obsAqidbCutoffDayUtc,
-      target_day_count: 0,
-      direct_delete_day_count: 0,
-      repair_day_count: 0,
-      dropped_day_count: 0,
-      processed_day_count: 0,
-      delete_error_count: 0,
-      mismatch_after_repair_count: 0,
-      connector_history_gate_blocked_bucket_count: 0,
-      connector_history_gate_blocked_after_repair_bucket_count: 0,
-      total_deleted_rows: "0",
-      total_deleted_after_repair_rows: "0",
-      alert_condition_count: 0,
-      duplicate_connector_day_skipped_count: 0,
-      duplicate_connector_day_skipped_preview: [],
-      connector_day_atomic_delete_planned_count: 0,
-      connector_day_atomic_delete_committed_count: 0,
-      connector_day_atomic_delete_rolled_back_count: 0,
-      connector_day_atomic_delete_blocked_bucket_count: 0,
-      connector_day_atomic_delete_plan_preview: [],
-      connector_day_atomic_delete_result_preview: [],
-      batch_summaries_preview: [],
-    };
-  }
-
-  logStructured("INFO", "ingestdb_late_arrival_cleanup_plan", {
-    run_id: runId,
-    mode: config.dryRun ? "dry-run" : "delete",
-    target_day_count: dayWindows.length,
-    obs_aqidb_retention_days: config.obsAqidbObservsRetentionDays,
-    obs_aqidb_cutoff_day_utc: obsAqidbCutoffDayUtc,
-    direct_delete_day_count: directDeleteDayWindows.length,
-    repair_day_count: repairDayWindows.length,
-    dropped_day_count: droppedDayCount,
-    target_day_preview: sampleRows(dayWindows.map((entry) => entry.day_utc)),
-    direct_delete_day_preview: sampleRows(directDeleteDayWindows.map((entry) => entry.day_utc)),
-    repair_day_preview: sampleRows(repairDayWindows.map((entry) => entry.day_utc)),
-  });
-
-  const batchSummaries = [];
   const processedConnectorDays = runContext.processed_connector_days instanceof Set
-    ? runContext.processed_connector_days
-    : new Set();
-  for (const dayWindow of directDeleteDayWindows) {
-    try {
-      const summary = await runLateArrivalDirectDeleteDay(
-        config,
-        ingestClient,
-        dayWindow,
-        runId,
-        batchSummaries.length + 1,
-        dayWindows.length,
-        processedConnectorDays,
-      );
-      batchSummaries.push(summary);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logStructured("ERROR", "ingestdb_late_arrival_direct_delete_day_error", {
-        run_id: runId,
-        day_utc: dayWindow.day_utc,
-        error: message,
-      });
-      batchSummaries.push({
-        day_utc: dayWindow.day_utc,
-        run_id: null,
-        mode: config.dryRun ? "dry-run" : "delete",
-        phase: "late_arrival_direct_delete",
-        window_start: dayWindow.window_start,
-        window_end: dayWindow.window_end,
-        delete_error_count: 1,
-        alert_condition_count: 1,
-        error: message,
-      });
+    ? runContext.processed_connector_days : new Set();
+  let progress;
+  let result;
+  try {
+    progress = await (adapters.openProgress || openLateArrivalProgress)({
+      databaseUrl: config.phaseB?.supabase_db_url, dryRun: config.dryRun,
+    });
+    result = await discoverAndProcessLateArrivals({
+      cutoff: toIso(overallWindow.window_start, "late_arrival.window_start"),
+      dryRun: config.dryRun, progress, runId,
+      reader: adapters.reader || createLateArrivalReader(ingestClient),
+      classifyDay: (dayUtc) => dayUtc < obsAqidbCutoffDayUtc ? "direct_delete" : "repair",
+      processDay: async (dayUtc, route, index) => {
+        const dayWindow = buildUtcDayWindow(dayUtc);
+        if (route === "direct_delete") {
+          return (adapters.directDeleteDay || runLateArrivalDirectDeleteDay)(
+            config, ingestClient, dayWindow, runId, index, 1, processedConnectorDays,
+          );
+        }
+        return (adapters.pruneSingleWindow || runPruneSingleWindow)(config, dayWindow, {
+          parent_run_id: runId, batch_index: index,
+          processed_connector_days: processedConnectorDays,
+        });
+      },
+    });
+  } catch (error) {
+    result = { report: { enabled: true, run_id: runId, status: "failed", attention_required: true,
+      error_count: 1, error: String(error.message || error).slice(0, 1000), stop_reason: "progress_failure" }, batchSummaries: [] };
+  } finally {
+    if (progress) {
+      try { await progress.close(); } catch (error) {
+        result.report.status = "failed";
+        result.report.attention_required = true;
+        result.report.error_count = (result.report.error_count || 0) + 1;
+        result.report.close_error = String(error.message || error).slice(0, 1000);
+      }
     }
   }
-
-  for (const dayWindow of repairDayWindows) {
-    try {
-      const summary = await runPruneSingleWindow(config, dayWindow, {
-        parent_run_id: runId,
-        batch_index: batchSummaries.length + 1,
-        batch_count: dayWindows.length,
-        processed_connector_days: processedConnectorDays,
-      });
-      batchSummaries.push(summary);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logStructured("ERROR", "ingestdb_late_arrival_cleanup_day_error", {
-        run_id: runId,
-        day_utc: dayWindow.day_utc,
-        error: message,
-      });
-      batchSummaries.push({
-        day_utc: dayWindow.day_utc,
-        run_id: null,
-        mode: config.dryRun ? "dry-run" : "delete",
-        window_start: dayWindow.window_start,
-        window_end: dayWindow.window_end,
-        delete_error_count: 1,
-        alert_condition_count: 1,
-        error: message,
-      });
-    }
-  }
-
+  const { report: discoverySummary, batchSummaries } = result;
   const summary = {
     enabled: true,
     skipped: false,
@@ -3006,11 +2875,6 @@ async function runLateArrivalCleanup(config, overallWindow, runContext = {}) {
     ...discoverySummary,
     obs_aqidb_retention_days: config.obsAqidbObservsRetentionDays,
     obs_aqidb_cutoff_day_utc: obsAqidbCutoffDayUtc,
-    target_day_count: dayWindows.length,
-    direct_delete_day_count: directDeleteDayWindows.length,
-    repair_day_count: repairDayWindows.length,
-    processed_day_count: dayWindows.length,
-    dropped_day_count: droppedDayCount,
     delete_error_count:
       sumIntField(batchSummaries, "delete_error_count") +
       sumIntField(batchSummaries, "delete_after_repair_error_count"),
@@ -3024,7 +2888,8 @@ async function runLateArrivalCleanup(config, overallWindow, runContext = {}) {
     ),
     total_deleted_rows: sumBigIntField(batchSummaries, "total_deleted_rows").toString(),
     total_deleted_after_repair_rows: sumBigIntField(batchSummaries, "total_deleted_after_repair_rows").toString(),
-    alert_condition_count: sumIntField(batchSummaries, "alert_condition_count"),
+    alert_condition_count: sumIntField(batchSummaries, "alert_condition_count")
+      + Number(discoverySummary.error_count || 0) + (discoverySummary.status === "deferred" ? 1 : 0),
     duplicate_connector_day_skipped_count: sumIntField(
       batchSummaries,
       "duplicate_connector_day_skipped_count",
@@ -3190,6 +3055,9 @@ async function runPrune(config, adapters = {}) {
     lateArrivalSummary = {
       enabled: true,
       skipped: false,
+      status: "failed",
+      attention_required: true,
+      error_count: 1,
       error: message,
     };
     logStructured("WARNING", "ingestdb_late_arrival_cleanup_failed", {
@@ -3226,6 +3094,12 @@ async function runPrune(config, adapters = {}) {
     combinedSummary.alert_condition_count = toSafeInt(combinedSummary.alert_condition_count)
       + phaseBHistorySummary.blocked_scope_count;
   }
+  if (lateArrivalSummary.attention_required || lateArrivalSummary.error) {
+    combinedSummary.status = "partial_attention_required";
+    combinedSummary.attention_required = true;
+    combinedSummary.alert_condition_count = toSafeInt(combinedSummary.alert_condition_count)
+      + Math.max(1, toSafeInt(lateArrivalSummary.alert_condition_count));
+  }
   if (batches.length > 1) {
     logStructured(
       "INFO",
@@ -3241,7 +3115,7 @@ async function runPrune(config, adapters = {}) {
       normal_deletion_attempted: Boolean(pruneWindowSummary.deletion_attempted),
       late_arrival_enabled: lateArrivalSummary.enabled === true,
     });
-    const error = new Error(`Prune Daily partially completed: ${combinedSummary.blocked_scope_count} historical connector/day scopes require attention`);
+    const error = new Error(`Prune Daily partially completed: ${Number(combinedSummary.blocked_scope_count || 0)} historical connector/day scopes; late-arrival ${lateArrivalSummary.status || "complete"} requires attention`);
     error.code = "UK_AQ_PRUNE_PARTIAL_ATTENTION_REQUIRED";
     error.prune_summary = combinedSummary;
     throw error;
