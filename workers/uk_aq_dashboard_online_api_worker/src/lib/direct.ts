@@ -506,7 +506,8 @@ async function fetchJsonArray(
     // A short page alone cannot distinguish exhaustion from a server row cap.
     const range = /^(?:(\d+)-(\d+)|\*)\/(\d+)$/.exec(response.headers.get("content-range") || "");
     const total = range ? Number(range[3]) : NaN;
-    rangeProof.valid &&= response.headers.get("range-unit") === "items" && Number.isSafeInteger(total) && total >= 0
+    const rangeUnit = response.headers.get("range-unit");
+    rangeProof.valid &&= (rangeUnit === null || rangeUnit === "items") && Number.isSafeInteger(total) && total >= 0
       && (rangeProof.total === null || rangeProof.total === total)
       && (parsed.length ? Number(range?.[1]) === rangeProof.received
         && Number(range?.[2]) === rangeProof.received + parsed.length - 1
