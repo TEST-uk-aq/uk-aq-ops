@@ -140,6 +140,38 @@ function pickCount(summary, names) {
   return undefined;
 }
 
+function recentObsAqidbMismatchWarning(phaseARecent) {
+  const unresolved = Number(
+    phaseARecent?.repair_mismatch_remaining_after_attempt_count
+      ?? phaseARecent?.mismatch_after_repair_count
+      ?? 0,
+  );
+  if (!Number.isSafeInteger(unresolved) || unresolved <= 0) {
+    return null;
+  }
+
+  const preview = Array.isArray(phaseARecent?.mismatches_after_repair_preview)
+    ? phaseARecent.mismatches_after_repair_preview
+    : [];
+  const first = preview[0];
+  const example = first && first.connector_id != null && typeof first.hour_start === "string"
+    ? ` Connector ${first.connector_id}, ${first.hour_start}: IngestDB ${first.ingest_count ?? "unknown"}, ObsAQIDB ${first.observs_count ?? "unknown"}.`
+    : "";
+
+  return {
+    code: "prune_recent_obs_aqidb_mismatch_after_repair",
+    reason: `Recent ObsAQIDB reconciliation: ${unresolved} hourly bucket${unresolved === 1 ? "" : "s"} ${unresolved === 1 ? "remains" : "remain"} mismatched after repair.${example}`,
+    mismatch_count: unresolved,
+    mismatches_preview: preview.slice(0, 3).map((mismatch) => ({
+      connector_id: mismatch.connector_id,
+      hour_start: mismatch.hour_start,
+      reason: mismatch.reason,
+      ingest_count: mismatch.ingest_count,
+      observs_count: mismatch.observs_count,
+    })),
+  };
+}
+
 function compactPruneHealthSummary(summary = {}) {
   return {
     mode: summary.mode,
@@ -250,6 +282,7 @@ function compactPruneHealthSummary(summary = {}) {
       }
       : undefined,
     warnings: [
+      recentObsAqidbMismatchWarning(summary.phase_a_recent),
       summary.phase_b_history?.status === "stopped_budget"
         ? "Phase B stopped at its controlled internal budget; downstream prune work was skipped"
         : null,
