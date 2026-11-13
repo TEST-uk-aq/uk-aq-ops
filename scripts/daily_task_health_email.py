@@ -115,6 +115,22 @@ def run_time(row: dict) -> datetime | None:
     return None
 
 
+def run_duration(row: dict) -> str:
+    """Use recorded start and terminal times, never a scheduled time."""
+    started = utc_timestamp(row.get("started_at"))
+    ended = utc_timestamp(row.get("failed_at") or row.get("finished_at"))
+    if started is None or ended is None or ended < started:
+        return "unavailable"
+    total_seconds = int((ended - started).total_seconds())
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {seconds:02d}s"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
+
+
 def fetch_actual_runs(start: datetime, end: datetime) -> list[dict]:
     """Fetch all actual attempts by execution time, irrespective of scheduled day.
 
@@ -208,6 +224,7 @@ def make_entry(row: dict) -> dict:
     return {
         "group": group, "status": state, "task": name, "time": label_time(row),
         "detail": detail, "link": link, "run_id": clean(row.get("run_id"), 90),
+        "duration": run_duration(row),
     }
 
 
@@ -357,7 +374,8 @@ def plain_period(period: dict) -> str:
         if not entries:
             lines.append("None")
         for entry in entries:
-            lines.append(f"- {entry['task']} | {entry['status']} | {entry['time']}")
+            duration = f" | Duration: {entry['duration']}" if entry.get("duration") else ""
+            lines.append(f"- {entry['task']} | {entry['status']} | {entry['time']}{duration}")
             if entry["detail"]:
                 lines.append(f"  {entry['detail']}")
             if entry["link"]:
@@ -382,6 +400,8 @@ def html_period(period: dict) -> str:
         for entry in entries:
             task = html.escape(entry["task"])
             stamp = html.escape(entry["time"])
+            duration = (f" | Duration: {html.escape(entry['duration'])}"
+                        if entry.get("duration") else "")
             state = html.escape(entry["status"])
             detail = html.escape(entry["detail"])
             anchor = (f' <a href="{html.escape(entry["link"], quote=True)}" '
@@ -389,7 +409,7 @@ def html_period(period: dict) -> str:
             result.append(
                 f'<tr><td style="border-top:1px solid #e5e7eb;padding:10px 13px;'
                 f'font-size:14px;line-height:1.5"><strong>{task}</strong>'
-                f'<div style="color:#374151">{state} | {stamp}{anchor}</div>'
+                f'<div style="color:#374151">{state} | {stamp}{duration}{anchor}</div>'
                 + (f'<div style="color:#4b5563">{detail}</div>' if detail else "")
                 + "</td></tr>"
             )
