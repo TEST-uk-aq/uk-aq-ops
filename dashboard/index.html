@@ -4942,185 +4942,141 @@
         }
       }
 
-      function renderServiceEgressPanel(rows, sourceError) {
+      let serviceEgressHistoryDays = 28;
+      let serviceEgressBreakdown = "today";
+
+      function renderServiceEgressPanel(minuteRows, sourceError, dailyRows, statusRows, overviewRows) {
         const panel = document.createElement("section");
         panel.className = "panel";
         panel.dataset.panel = "service-egress";
-
-        const normalizedRows = Array.isArray(rows) ? rows : [];
+        const today = new Date().toISOString().slice(0, 10);
+        const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
         const nowMs = Date.now();
-        const hourCutoffMs = nowMs - (60 * 60 * 1000);
-        const sixHourCutoffMs = nowMs - (6 * 60 * 60 * 1000);
-        const dayCutoffMs = nowMs - (24 * 60 * 60 * 1000);
-        const latestSnapshotRows = normalizedRows.filter((row) => {
-          if (!row) return false;
-          const bucketMs = new Date(row.bucket_minute || "").getTime();
-          return Number.isFinite(bucketMs) && bucketMs >= dayCutoffMs;
-        });
-
-        function numeric(row, field) {
-          const value = Number(row && row[field]);
+        const hourCutoff = nowMs - 3600000;
+        const minutes = (Array.isArray(minuteRows) ? minuteRows : []).filter(row =>
+          row && String(row.bucket_minute || "").slice(0, 10) === today);
+        const daily = (Array.isArray(dailyRows) ? dailyRows : []).filter(row => row && String(row.day_utc || "") < today);
+        const statuses = new Map((Array.isArray(statusRows) ? statusRows : []).map(row => [String(row.day_utc || ""), row]));
+        const overview = new Map((Array.isArray(overviewRows) ? overviewRows : []).map(row => [String(row.day_utc || ""), row]));
+        const verified = day => ["verified", "finalized"].includes(String(statuses.get(day)?.state || ""))
+          && (Number(statuses.get(day)?.aggregate_rows || 0) === 0 || overview.has(day));
+        const numeric = (row, field) => {
+          const value = Number(row?.[field]);
           return Number.isFinite(value) && value >= 0 ? value : 0;
+        };
+        const sum = (rows, field) => rows.reduce((total, row) => total + numeric(row, field), 0);
+        const todayBytes = sum(minutes, "response_bytes_est");
+        const yesterdayBytes = verified(yesterday) ? numeric(overview.get(yesterday), "response_bytes_est") : null;
+        const hourRows = minutes.filter(row => new Date(row.bucket_minute || "").getTime() >= hourCutoff);
+        const fullHour = !sourceError && new Date().getUTCHours() >= 1 && minutes.length > 0;
+        const historyStart = new Date();
+        if (serviceEgressHistoryDays === 365) {
+          const day = historyStart.getUTCDate();
+          historyStart.setUTCDate(1);
+          historyStart.setUTCMonth(historyStart.getUTCMonth() - 12);
+          historyStart.setUTCDate(Math.min(day, new Date(Date.UTC(historyStart.getUTCFullYear(), historyStart.getUTCMonth() + 1, 0)).getUTCDate()));
+        } else {
+          historyStart.setUTCDate(historyStart.getUTCDate() - serviceEgressHistoryDays);
         }
-
-        const totals = latestSnapshotRows.reduce((acc, row) => {
-          const bucketMs = new Date(row.bucket_minute || "").getTime();
-          const bytes = numeric(row, "response_bytes_est");
-          acc.dayBytes += bytes;
-          acc.dayRequests += numeric(row, "request_count");
-          acc.dayErrors += numeric(row, "error_count");
-          if (bucketMs >= sixHourCutoffMs) acc.sixHourBytes += bytes;
-          if (bucketMs >= hourCutoffMs) acc.hourBytes += bytes;
-          return acc;
-        }, { hourBytes: 0, sixHourBytes: 0, dayBytes: 0, dayRequests: 0, dayErrors: 0 });
-
-        const serviceGroups = new Map();
-        const projectGroups = new Map();
-        const routeGroups = new Map();
-        latestSnapshotRows.forEach((row) => {
-          const bucketMs = new Date(row.bucket_minute || "").getTime();
-          const serviceName = String(row.service_name || "unknown");
-          const sourceName = String(row.source_name || "unknown");
-          const projectRef = String(row.project_ref || "");
-          const sourceType = String(row.source_type || "other");
-          const bytes = numeric(row, "response_bytes_est");
-          const requests = numeric(row, "request_count");
-          const errors = numeric(row, "error_count");
-
-          const serviceKey = [serviceName, sourceName, projectRef].join("|");
-          const service = serviceGroups.get(serviceKey) || {
-            service_name: serviceName,
-            source_name: sourceName,
-            project_ref: projectRef,
-            hour_bytes: 0,
-            day_bytes: 0,
-            request_count: 0,
-            error_count: 0,
-          };
-          service.day_bytes += bytes;
-          service.request_count += requests;
-          service.error_count += errors;
-          if (bucketMs >= hourCutoffMs) service.hour_bytes += bytes;
-          serviceGroups.set(serviceKey, service);
-
-          const projectKey = [sourceName, projectRef].join("|");
-          const project = projectGroups.get(projectKey) || {
-            source_name: sourceName,
-            project_ref: projectRef,
-            day_bytes: 0,
-            request_count: 0,
-          };
-          project.day_bytes += bytes;
-          project.request_count += requests;
-          projectGroups.set(projectKey, project);
-
-          const routeKey = [serviceName, sourceName, projectRef, sourceType, String(row.route_name || ""), String(row.query_name || "")].join("|");
-          const route = routeGroups.get(routeKey) || {
-            service_name: serviceName,
-            source_name: sourceName,
-            source_type: sourceType,
-            route_name: String(row.route_name || ""),
-            query_name: String(row.query_name || ""),
-            day_bytes: 0,
-            request_count: 0,
-            error_count: 0,
-          };
-          route.day_bytes += bytes;
-          route.request_count += requests;
-          route.error_count += errors;
-          routeGroups.set(routeKey, route);
-        });
-
-        const share = (bytes) => totals.dayBytes > 0 ? `${((bytes / totals.dayBytes) * 100).toFixed(1)}%` : "0.0%";
-        const serviceRows = Array.from(serviceGroups.values()).sort((a, b) => b.day_bytes - a.day_bytes);
-        const serviceMarkup = serviceRows.length
-          ? serviceRows.map((row) => `
-              <tr>
-                <td>${escapeHtml(row.service_name)}</td>
-                <td>${escapeHtml(row.source_name)}${row.project_ref ? `<br><span class="mono">${escapeHtml(row.project_ref)}</span>` : ""}</td>
-                <td>${formatBytesBestFit(row.hour_bytes)}</td>
-                <td>${formatBytesBestFit(row.day_bytes)}</td>
-                <td>${share(row.day_bytes)}</td>
-                <td>${formatCount(row.request_count)}</td>
-                <td>${formatCount(row.error_count)}</td>
-              </tr>
-            `).join("")
-          : `<tr><td colspan="7">No measured service egress rows in the last 24h.</td></tr>`;
-
-        const projectMarkup = Array.from(projectGroups.values())
-          .sort((a, b) => b.day_bytes - a.day_bytes)
-          .map((row) => `
-            <tr>
-              <td>${escapeHtml(row.source_name)}</td>
-              <td class="mono">${escapeHtml(row.project_ref || "unknown")}</td>
-              <td>${formatBytesBestFit(row.day_bytes)}</td>
-              <td>${share(row.day_bytes)}</td>
-              <td>${formatCount(row.request_count)}</td>
-            </tr>
-          `).join("") || `<tr><td colspan="5">No project/source rows in the last 24h.</td></tr>`;
-
-        const routeMarkup = Array.from(routeGroups.values())
-          .sort((a, b) => b.day_bytes - a.day_bytes)
-          .map((row) => `
-            <tr>
-              <td>${escapeHtml(row.service_name)}</td>
-              <td>${escapeHtml(row.source_name)}</td>
-              <td>${escapeHtml(row.source_type)}</td>
-              <td class="egress-wrap">${escapeHtml(row.route_name)}</td>
-              <td class="egress-query">${escapeHtml(row.query_name)}</td>
-              <td>${formatBytesBestFit(row.day_bytes)}</td>
-              <td>${share(row.day_bytes)}</td>
-              <td>${formatCount(row.request_count)}</td>
-              <td>${formatCount(row.error_count)}</td>
-            </tr>
-          `).join("") || `<tr><td colspan="9">No route/query rows in the last 24h.</td></tr>`;
-
-        const warningLine = sourceError
-          ? `<div class="footnote">Metrics source warning: ${escapeHtml(String(sourceError))}</div>`
-          : "";
-
+        const firstDay = historyStart.toISOString().slice(0, 10);
+        const days = [];
+        for (let cursor = new Date(`${firstDay}T00:00:00Z`); cursor.toISOString().slice(0,10) < today; cursor.setUTCDate(cursor.getUTCDate() + 1)) {
+          days.push(cursor.toISOString().slice(0, 10));
+        }
+        const unknownDays = days.filter(day => !verified(day));
+        const historicalBytes = days.filter(verified).reduce((total, day) => total + numeric(overview.get(day), "response_bytes_est"), 0);
+        const historicalRequests = days.filter(verified).reduce((total, day) => total + numeric(overview.get(day), "request_count"), 0);
+        const historyComplete = !sourceError && unknownDays.length === 0;
+        const breakdownDays = serviceEgressBreakdown === "week" ? 7 : serviceEgressBreakdown === "month" ? 28 : 0;
+        const breakdownStart = breakdownDays ? new Date(Date.now() - breakdownDays * 86400000).toISOString().slice(0,10) : "";
+        const selectedRows = serviceEgressBreakdown === "today" ? minutes
+          : serviceEgressBreakdown === "yesterday" ? (verified(yesterday) ? daily.filter(row => row.day_utc === yesterday) : [])
+          : daily.filter(row => String(row.day_utc || "") >= breakdownStart && verified(String(row.day_utc || "")));
+        const selectedLabel = { today: "Today (UTC)", yesterday: "Yesterday (UTC)", week: "last 7 completed days", month: "last 28 completed days" }[serviceEgressBreakdown];
+        const selectedDays = [];
+        if (breakdownDays) {
+          for (let cursor = new Date(`${breakdownStart}T00:00:00Z`); cursor.toISOString().slice(0,10) < today; cursor.setUTCDate(cursor.getUTCDate() + 1)) {
+            selectedDays.push(cursor.toISOString().slice(0, 10));
+          }
+        } else if (serviceEgressBreakdown === "yesterday") {
+          selectedDays.push(yesterday);
+        }
+        const selectedIncomplete = !!sourceError || (serviceEgressBreakdown === "today" && !minutes.length)
+          || selectedDays.some(day => !verified(day));
+        const selectedTotal = sum(selectedRows, "response_bytes_est");
+        const share = bytes => selectedTotal > 0 ? `${((bytes / selectedTotal) * 100).toFixed(1)}%` : "—";
+        const groups = (keys) => {
+          const map = new Map();
+          selectedRows.forEach(row => {
+            const values = keys.map(key => String(row?.[key] || ""));
+            const identity = JSON.stringify(values);
+            const item = map.get(identity) || { values, bytes: 0, requests: 0, errors: 0 };
+            item.bytes += numeric(row, "response_bytes_est");
+            item.requests += numeric(row, "request_count");
+            item.errors += numeric(row, "error_count");
+            map.set(identity, item);
+          });
+          return [...map.values()].sort((a,b) => b.bytes - a.bytes);
+        };
+        const tableRows = (keys) => groups(keys).map(item => `<tr>${item.values.map(value => `<td class="egress-wrap">${escapeHtml(value || "unknown")}</td>`).join("")}
+          <td>${formatBytesBestFit(item.bytes)}</td><td>${share(item.bytes)}</td><td>${formatCount(item.requests)}</td><td>${formatCount(item.errors)}</td></tr>`).join("");
+        const serviceMarkup = tableRows(["service_name","source_name","project_ref"])
+          || `<tr><td colspan="7">${selectedIncomplete ? "Selected period incomplete or unavailable." : "No measured rows in the selected period."}</td></tr>`;
+        const projectMarkup = tableRows(["source_name","project_ref"])
+          || `<tr><td colspan="6">${selectedIncomplete ? "Selected period incomplete or unavailable." : "No measured rows in the selected period."}</td></tr>`;
+        const routeMarkup = tableRows(["service_name","source_name","source_type","route_name","query_name"])
+          || `<tr><td colspan="9">${selectedIncomplete ? "Selected period incomplete or unavailable." : "No measured rows in the selected period."}</td></tr>`;
+        const historyMarkup = days.slice().reverse().map(day => {
+          const state = statuses.get(day);
+          const isVerified = verified(day);
+          const label = isVerified ? formatBytesBestFit(numeric(overview.get(day), "response_bytes_est")) : "Unavailable";
+          return `<tr><td>${escapeHtml(day)}</td><td>${label}</td><td>${isVerified ? formatCount(numeric(overview.get(day), "request_count")) : "—"}</td>
+            <td>${isVerified ? "Verified" : escapeHtml(state?.state === "dirty" ? `Incomplete${state.last_error ? ": " + state.last_error : ""}` : "Awaiting consolidation")}</td></tr>`;
+        }).join("");
         panel.innerHTML = `
           <h2>Measured Supabase Egress <span class="chip">beta</span></h2>
           <div class="meta-note">Application-attributed Supabase response measurements. Useful for attribution; not Supabase billed egress totals.</div>
           <div class="egress-summary">
-            <div class="egress-summary-card"><div class="egress-summary-label">Last 1 hour</div><div class="egress-summary-value">${formatBytesBestFit(totals.hourBytes)}</div></div>
-            <div class="egress-summary-card"><div class="egress-summary-label">Last 24 hours</div><div class="egress-summary-value">${formatBytesBestFit(totals.dayBytes)}</div></div>
-            <div class="egress-summary-card"><div class="egress-summary-label">Projected MB/day</div><div class="egress-summary-value">${((totals.sixHourBytes * 4) / (1024 * 1024)).toFixed(2)} MB/day</div><div class="footnote">Rolling 6h measured rate × 4</div></div>
+            <div class="egress-summary-card"><div class="egress-summary-label">Today (UTC)</div><div class="egress-summary-value">${sourceError || !minutes.length ? "Unavailable" : formatBytesBestFit(todayBytes)}</div>
+              <div class="footnote">${minutes.length ? `${formatCount(sum(minutes,"request_count"))} requests · ${formatCount(sum(minutes,"error_count"))} errors` : "No current-day measurements yet"}</div></div>
+            <div class="egress-summary-card"><div class="egress-summary-label">Yesterday (UTC)</div><div class="egress-summary-value">${yesterdayBytes === null || sourceError ? "Unavailable" : formatBytesBestFit(yesterdayBytes)}</div>
+              <div class="footnote">${verified(yesterday) ? "Verified daily aggregate" : "Awaiting verified daily aggregate"}</div></div>
+            <div class="egress-summary-card"><div class="egress-summary-label">Last 1 hour</div><div class="egress-summary-value">${fullHour ? formatBytesBestFit(sum(hourRows,"response_bytes_est")) : "Unavailable"}</div>
+              <div class="footnote">${new Date().getUTCHours() < 1 ? "Incomplete current-day window before 01:00 UTC" : "Exact only with a complete current-day source read"}</div></div>
           </div>
-          <div class="meta-note">24h requests ${formatCount(totals.dayRequests)} · errors ${formatCount(totals.dayErrors)}</div>
-          <h3 class="egress-subheading">By service</h3>
-          <div class="table-scroll table-scroll-egress">
-            <table class="egress-table">
-              <thead>
-                <tr>
-                  <th>Service</th><th>Database / project</th><th>Last 1h</th><th>Last 24h</th><th>Share of measured 24h</th><th>Requests</th><th>Errors</th>
-                </tr>
-              </thead>
-              <tbody>${serviceMarkup}</tbody>
-            </table>
+          <div class="meta-note">Historical completed UTC days:
+            <select data-egress-history-days aria-label="Historical egress range"><option value="7" ${serviceEgressHistoryDays === 7 ? "selected" : ""}>7 days</option>
+              <option value="28" ${serviceEgressHistoryDays === 28 ? "selected" : ""}>28 days</option>
+              <option value="365" ${serviceEgressHistoryDays === 365 ? "selected" : ""}>12 months</option></select>
+            ${historyComplete ? `${formatBytesBestFit(historicalBytes)} · ${formatCount(historicalRequests)} requests` : `${formatBytesBestFit(historicalBytes)} measured across ${days.length - unknownDays.length}/${days.length} verified days; total incomplete`}
           </div>
-          <h3 class="egress-subheading">By database / project</h3>
-          <div class="table-scroll table-scroll-egress">
-            <table class="egress-table">
-              <thead><tr><th>Database</th><th>Project</th><th>Last 24h</th><th>Share of measured 24h</th><th>Requests</th></tr></thead>
-              <tbody>${projectMarkup}</tbody>
-            </table>
-          </div>
-          <h3 class="egress-subheading">By route / query</h3>
-          <div class="table-scroll table-scroll-egress">
-            <table class="egress-table">
-              <thead>
-                <tr><th>Service</th><th>Database</th><th>Transport</th><th class="egress-wrap">Route</th><th class="egress-query-head">Query</th><th>Last 24h</th><th>Share</th><th>Requests</th>
-                  <th>Errors</th>
-                </tr>
-              </thead>
-              <tbody>${routeMarkup}</tbody>
-            </table>
-          </div>
-          <div class="footnote">Aggregate source: uk_aq_public.uk_aq_service_egress_metrics_minute. Totals use response_bytes_est only. Projection is a recent measured run-rate, not a billing forecast.</div>
-          ${warningLine}
+          <div class="table-scroll table-scroll-egress"><table class="egress-table"><thead><tr><th>UTC day</th><th>Measured response</th><th>Requests</th><th>Status</th></tr></thead>
+            <tbody>${historyMarkup || `<tr><td colspan="4">Historical daily summaries unavailable.</td></tr>`}</tbody></table></div>
+          <h3 class="egress-subheading">Breakdown · ${escapeHtml(selectedLabel)}</h3>
+          <div class="meta-note">Period <select data-egress-breakdown aria-label="Egress breakdown period">
+            <option value="today" ${serviceEgressBreakdown === "today" ? "selected" : ""}>Today</option>
+            <option value="yesterday" ${serviceEgressBreakdown === "yesterday" ? "selected" : ""}>Yesterday</option>
+            <option value="week" ${serviceEgressBreakdown === "week" ? "selected" : ""}>Last 7 completed days</option>
+            <option value="month" ${serviceEgressBreakdown === "month" ? "selected" : ""}>Last 28 completed days</option></select>
+            · ${selectedIncomplete ? "Incomplete; shares apply to available verified rows only" : `${formatBytesBestFit(selectedTotal)} measured`}</div>
+          <h3 class="egress-subheading">By service</h3><div class="table-scroll table-scroll-egress"><table class="egress-table">
+            <thead><tr><th>Service</th><th>Database</th><th>Project</th><th>Measured</th><th>Share</th><th>Requests</th><th>Errors</th></tr></thead><tbody>${serviceMarkup}</tbody></table></div>
+          <h3 class="egress-subheading">By database / project</h3><div class="table-scroll table-scroll-egress"><table class="egress-table">
+            <thead><tr><th>Database</th><th>Project</th><th>Measured</th><th>Share</th><th>Requests</th><th>Errors</th></tr></thead><tbody>${projectMarkup}</tbody></table></div>
+          <h3 class="egress-subheading">By route / query</h3><div class="table-scroll table-scroll-egress"><table class="egress-table">
+            <thead><tr><th>Service</th><th>Database</th><th>Transport</th><th>Route</th><th>Query</th><th>Measured</th><th>Share</th><th>Requests</th><th>Errors</th></tr></thead><tbody>${routeMarkup}</tbody></table></div>
+          <div class="footnote">Today reads minute metrics; completed dates read verified persistent daily metrics. Totals use response_bytes_est only. Per-minute diagnostics are unavailable after consolidation.</div>
+          ${sourceError ? `<div class="footnote">Metrics source warning: ${escapeHtml(String(sourceError))}</div>` : ""}
         `;
-
+        panel.querySelector("[data-egress-history-days]")?.addEventListener("change", event => {
+          serviceEgressHistoryDays = Number(event.target.value) === 365 ? 365 : Number(event.target.value) === 7 ? 7 : 28;
+          void loadOperationsDashboard({ forceRefresh: false });
+        });
+        panel.querySelector("[data-egress-breakdown]")?.addEventListener("change", event => {
+          serviceEgressBreakdown = String(event.target.value || "today");
+          const replacement = renderServiceEgressPanel(minuteRows, sourceError, dailyRows, statusRows, overviewRows);
+          panel.replaceWith(replacement);
+        });
         return panel;
       }
 
@@ -6831,6 +6787,7 @@
           const params = new URLSearchParams();
           params.set("include_storage_coverage", "0");
           params.set("include_metric_context", "1");
+          params.set("egress_history_days", serviceEgressHistoryDays === 365 ? "365" : "28");
           params.set("include_ingest_context", "0");
           if (forceRefresh) {
             params.set("force", "1");
@@ -6880,6 +6837,9 @@
             renderServiceEgressPanel(
               data.service_egress_metrics,
               data.service_egress_metrics_error,
+              data.service_egress_daily_metrics,
+              data.service_egress_daily_status,
+              data.service_egress_daily_overview,
             ),
           ];
           operationsContainer.replaceChildren(...nextPanels);

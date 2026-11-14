@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import calendar
 import json
 import uk_aq_dashboard_r2_billing as r2_billing
 from datetime import date, datetime, timedelta, timezone
@@ -496,67 +497,145 @@ def _egress_dimension_hash(row: Dict[str, Any]) -> bytes:
     return hashlib.sha256("\0".join(parts).encode("utf-8")).digest()
 
 
+def _egress_retention_day(today: date) -> date:
+    prior_year = today.year - 1
+    return date(prior_year, today.month, min(today.day, calendar.monthrange(prior_year, today.month)[1]))
+
+
 def sync_service_egress(core) -> Dict[str, Any]:
-    dataset = "service_egress_metrics_minute"
     if not core.OBS_AQIDB_SUPABASE_URL or not core.OBS_AQIDB_SECRET_KEY:
         raise RuntimeError("ObsAQIDB egress source is not configured")
     now = _utcnow()
-    state = _state(dataset)
+    today = now.date()
+    state = _state("service_egress_metrics_minute")
     watermark = _parse_ts((state or {}).get("watermark_at"))
-    since = _retention_start(now)
-    if watermark is not None:
-        since = max(since, watermark.replace(tzinfo=timezone.utc) - EGRESS_OVERLAP)
+    since = datetime.combine(today, datetime.min.time())
+    if watermark and watermark.date() == today:
+        since = max(since, watermark - EGRESS_OVERLAP)
     base = _source_base(core, core.OBS_AQIDB_SUPABASE_URL)
     headers = core._postgrest_headers(core.OBS_AQIDB_SECRET_KEY, schema=core.PUBLIC_SCHEMA)
-    params = {
-        "select": EGRESS_SELECT,
-        "bucket_minute": f"gte.{core._to_postgrest_ts(since)}",
-        "env_name": f"eq.{str(core.os.getenv('UK_AQ_ENV_NAME') or 'TEST').strip() or 'TEST'}",
-        "order": "bucket_minute.asc",
-    }
-    rows = core._fetch_all(base, headers, core.SERVICE_EGRESS_MINUTE_VIEW, params, limit=1000)
+    env_name = str(core.os.getenv("UK_AQ_ENV_NAME") or "").strip()
+    if env_name not in {"TEST", "LIVE"}:
+        raise RuntimeError("UK_AQ_ENV_NAME must explicitly identify TEST or LIVE for egress sync")
+    environment = f"eq.{env_name}"
+    rows, truncated = core._fetch_all_limited(base, headers, core.SERVICE_EGRESS_MINUTE_VIEW, {
+        "select": EGRESS_SELECT, "bucket_minute": f"gte.{core._to_postgrest_ts(since)}",
+        "env_name": environment, "order": "bucket_minute.asc",
+    }, page_size=1000, max_rows=10000)
+    if truncated:
+        raise RuntimeError("current-day egress sync reached 10000-row bound")
     cache = _cache_module()
-    cutoff = _naive_utc(_retention_start(now))
-    max_bucket = watermark
+    max_bucket = watermark if watermark and watermark.date() == today else None
     with cache.connect("writer") as connection:
         with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM service_egress_metrics_minute WHERE bucket_minute < %s", (datetime.combine(today, datetime.min.time()),))
             for row in rows:
                 bucket = _parse_ts(row.get("bucket_minute"))
-                if bucket is None:
+                if bucket is None or bucket.date() != today:
                     continue
                 max_bucket = bucket if max_bucket is None or bucket > max_bucket else max_bucket
-                cursor.execute(
-                    """
+                cursor.execute("""
                     INSERT INTO service_egress_metrics_minute
                         (bucket_minute,dimension_hash,env_name,project_ref,service_name,source_type,source_name,
                          route_name,query_name,window_label,status,request_count,response_rows,response_bytes_est,
                          upstream_bytes_est,duration_ms,error_count,notes)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON DUPLICATE KEY UPDATE
-                        env_name=VALUES(env_name),project_ref=VALUES(project_ref),service_name=VALUES(service_name),
-                        source_type=VALUES(source_type),source_name=VALUES(source_name),route_name=VALUES(route_name),
-                        query_name=VALUES(query_name),window_label=VALUES(window_label),status=VALUES(status),
                         request_count=VALUES(request_count),response_rows=VALUES(response_rows),
                         response_bytes_est=VALUES(response_bytes_est),upstream_bytes_est=VALUES(upstream_bytes_est),
                         duration_ms=VALUES(duration_ms),error_count=VALUES(error_count),notes=VALUES(notes)
-                    """,
-                    (
-                        bucket, _egress_dimension_hash(row), str(row.get("env_name") or "unknown"),
-                        str(row.get("project_ref") or ""), str(row.get("service_name") or "unknown"),
-                        str(row.get("source_type") or "other"), str(row.get("source_name") or ""),
-                        str(row.get("route_name") or ""), str(row.get("query_name") or ""),
-                        str(row.get("window_label") or ""), str(row.get("status") or "ok"),
-                        max(0, _int(row.get("request_count")) or 0), max(0, _int(row.get("response_rows")) or 0),
-                        max(0, _int(row.get("response_bytes_est")) or 0), max(0, _int(row.get("upstream_bytes_est")) or 0),
-                        max(0, _int(row.get("duration_ms")) or 0), max(0, _int(row.get("error_count")) or 0),
-                        _json(row.get("notes")) if isinstance(row.get("notes"), dict) else None,
-                    ),
-                )
-            cursor.execute("DELETE FROM service_egress_metrics_minute WHERE bucket_minute < %s", (cutoff,))
-            _state_success(cursor, dataset, watermark_at=max_bucket, source_window_start=_naive_utc(since),
-                           source_window_end=_naive_utc(now), source_row_count=len(rows))
+                """, (
+                    bucket,_egress_dimension_hash(row),str(row.get("env_name") or "unknown"),
+                    str(row.get("project_ref") or ""),str(row.get("service_name") or "unknown"),
+                    str(row.get("source_type") or "other"),str(row.get("source_name") or ""),
+                    str(row.get("route_name") or ""),str(row.get("query_name") or ""),
+                    str(row.get("window_label") or ""),str(row.get("status") or "ok"),
+                    max(0,_int(row.get("request_count")) or 0),max(0,_int(row.get("response_rows")) or 0),
+                    max(0,_int(row.get("response_bytes_est")) or 0),max(0,_int(row.get("upstream_bytes_est")) or 0),
+                    max(0,_int(row.get("duration_ms")) or 0),max(0,_int(row.get("error_count")) or 0),
+                    _json(row.get("notes")) if isinstance(row.get("notes"),dict) else None))
+            _state_success(cursor,"service_egress_metrics_minute",watermark_at=max_bucket,
+                           source_window_start=since,source_window_end=_naive_utc(now),source_row_count=len(rows))
         connection.commit()
+    sync_service_egress_daily(core, base=base, headers=headers, environment=environment)
     return {"source_rows": len(rows)}
+
+
+def sync_service_egress_daily(core, *, base: str, headers: Dict[str, str], environment: str) -> None:
+    today = _utcnow().date()
+    cutoff = _egress_retention_day(today)
+    state = _state("service_egress_metrics_daily") or {}
+    last_oldest = state.get("last_full_reconcile_day")
+    if isinstance(last_oldest, datetime):
+        last_oldest = last_oldest.date()
+    if last_oldest and last_oldest > cutoff:
+        end = last_oldest - timedelta(days=1)
+        start = max(cutoff, end - timedelta(days=27))
+    else:
+        end = today - timedelta(days=1)
+        start = max(cutoff, end - timedelta(days=27))
+    # Reconcile a mutable three-day overlap every tick, and one older 28-day
+    # hydration window. Each successful window replaces local rows atomically.
+    windows = [(max(cutoff,today-timedelta(days=3)),today- timedelta(days=1))]
+    if (start,end) != windows[0]:
+        windows.append((start,end))
+    cache = _cache_module()
+    for window_start,window_end in windows:
+        if window_start > window_end:
+            continue
+        day_filter = f"(day_utc.gte.{window_start.isoformat()},day_utc.lte.{window_end.isoformat()})"
+        statuses, status_bound = core._fetch_all_limited(base,headers,"uk_aq_service_egress_daily_status",{
+            "select":"day_utc,state,source_rows,aggregate_rows,deleted_minute_rows,late_direct_rows,verified_at,updated_at,last_error",
+            "and":day_filter,"order":"day_utc.asc"},page_size=400,max_rows=400)
+        daily, daily_bound = core._fetch_all_limited(base,headers,core.SERVICE_EGRESS_DAILY_VIEW,{
+            "select":"day_utc,env_name,project_ref,service_name,source_type,source_name,route_name,query_name,window_label,status,request_count,response_rows,response_bytes_est,upstream_bytes_est,cache_hit_count,cache_miss_count,objects_written_count,objects_written_bytes,duration_ms,error_count,recorded_at",
+            "and":day_filter,"env_name":environment,"order":"day_utc.asc"},page_size=1000,max_rows=10000)
+        if status_bound or daily_bound:
+            raise RuntimeError("daily egress sync reached bounded read limit")
+        status_check, check_bound = core._fetch_all_limited(base,headers,"uk_aq_service_egress_daily_status",{
+            "select":"day_utc,state,source_rows,aggregate_rows,deleted_minute_rows,late_direct_rows,verified_at,updated_at,last_error",
+            "and":day_filter,"order":"day_utc.asc"},page_size=400,max_rows=400)
+        if check_bound or status_check != statuses:
+            raise RuntimeError("daily egress day changed during local source sync")
+        with cache.connect("writer") as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("DELETE FROM service_egress_metrics_daily WHERE day_utc BETWEEN %s AND %s",(window_start,window_end))
+                cursor.execute("DELETE FROM service_egress_daily_status WHERE day_utc BETWEEN %s AND %s",(window_start,window_end))
+                for row in statuses:
+                    day = row.get("day_utc")
+                    cursor.execute("""INSERT INTO service_egress_daily_status
+                        (day_utc,state,source_rows,aggregate_rows,deleted_minute_rows,late_direct_rows,verified_at,updated_at,last_error)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",(
+                        day,row.get("state") or "dirty",_int(row.get("source_rows")) or 0,
+                        _int(row.get("aggregate_rows")) or 0,_int(row.get("deleted_minute_rows")) or 0,
+                        _int(row.get("late_direct_rows")) or 0,_parse_ts(row.get("verified_at")),
+                        _parse_ts(row.get("updated_at")),str(row.get("last_error") or "")[:500] or None))
+                verified = {str(row.get("day_utc")) for row in statuses if row.get("state") in {"verified","finalized"}}
+                for row in daily:
+                    if str(row.get("day_utc")) not in verified:
+                        continue
+                    cursor.execute("""INSERT INTO service_egress_metrics_daily
+                        (day_utc,dimension_hash,env_name,project_ref,service_name,source_type,source_name,
+                         route_name,query_name,window_label,status,request_count,response_rows,response_bytes_est,
+                         upstream_bytes_est,cache_hit_count,cache_miss_count,objects_written_count,
+                         objects_written_bytes,duration_ms,error_count,recorded_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",(
+                        row.get("day_utc"),_egress_dimension_hash(row),str(row.get("env_name") or "unknown"),
+                        str(row.get("project_ref") or ""),str(row.get("service_name") or "unknown"),
+                        str(row.get("source_type") or "other"),str(row.get("source_name") or ""),
+                        str(row.get("route_name") or ""),str(row.get("query_name") or ""),
+                        str(row.get("window_label") or ""),str(row.get("status") or "ok"),
+                        *[max(0,_int(row.get(field)) or 0) for field in (
+                            "request_count","response_rows","response_bytes_est","upstream_bytes_est",
+                            "cache_hit_count","cache_miss_count","objects_written_count","objects_written_bytes",
+                            "duration_ms","error_count")],_parse_ts(row.get("recorded_at"))))
+                cursor.execute("DELETE FROM service_egress_metrics_daily WHERE day_utc < %s",(cutoff,))
+                cursor.execute("DELETE FROM service_egress_daily_status WHERE day_utc < %s",(cutoff,))
+                _state_success(cursor,"service_egress_metrics_daily",watermark_at=None,
+                               source_window_start=datetime.combine(window_start,datetime.min.time()),
+                               source_window_end=datetime.combine(window_end,datetime.min.time()),
+                               source_row_count=len(daily),full_reconcile_day=window_start if (window_start,window_end)==(start,end) else None)
+            connection.commit()
 
 
 def _size_sync_due(dataset: str) -> bool:
@@ -681,7 +760,7 @@ def read_schema_size_metrics(role: str = "writer", lookback_days: int = 30) -> L
 
 def read_service_egress(role: str = "writer", lookback_hours: int = 24) -> List[Dict[str, Any]]:
     cache = _cache_module()
-    since = _naive_utc(_utcnow() - timedelta(hours=lookback_hours))
+    since = datetime.combine(_utcnow().date(), datetime.min.time())
     with cache.connect(role) as connection:
         with connection.cursor() as cursor:
             cursor.execute("SELECT * FROM service_egress_metrics_minute WHERE bucket_minute >= %s ORDER BY bucket_minute ASC", (since,))
@@ -700,6 +779,40 @@ def read_service_egress(role: str = "writer", lookback_hours: int = 24) -> List[
             "error_count": row.get("error_count") or 0, "notes": _decode_json(row.get("notes")),
         })
     return result
+
+
+def read_service_egress_daily(role: str = "writer", days: int = 28) -> List[Dict[str, Any]]:
+    cutoff = _egress_retention_day(_utcnow().date()) if days == 365 else _utcnow().date() - timedelta(days=min(max(days,1),28))
+    with _cache_module().connect(role) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT * FROM service_egress_metrics_daily WHERE day_utc >= %s ORDER BY day_utc",(cutoff,))
+            rows = cursor.fetchall() or []
+    return [{**row,"day_utc":_iso(row.get("day_utc")),"recorded_at":_iso(row.get("recorded_at")),
+             "dimension_hash":None} for row in rows]
+
+
+def read_service_egress_status(role: str = "writer", days: int = 28) -> List[Dict[str, Any]]:
+    cutoff = _egress_retention_day(_utcnow().date()) if days == 365 else _utcnow().date() - timedelta(days=min(max(days,1),28))
+    with _cache_module().connect(role) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT * FROM service_egress_daily_status WHERE day_utc >= %s ORDER BY day_utc",(cutoff,))
+            rows = cursor.fetchall() or []
+    return [{**row,"day_utc":_iso(row.get("day_utc")),"verified_at":_iso(row.get("verified_at")),
+             "updated_at":_iso(row.get("updated_at"))} for row in rows]
+
+
+def read_service_egress_overview(role: str = "writer", days: int = 28) -> List[Dict[str, Any]]:
+    cutoff = _egress_retention_day(_utcnow().date()) if days == 365 else _utcnow().date() - timedelta(days=min(max(days,1),28))
+    with _cache_module().connect(role) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("""SELECT day_utc,SUM(request_count) AS request_count,
+                SUM(response_bytes_est) AS response_bytes_est,SUM(error_count) AS error_count
+                FROM service_egress_metrics_daily WHERE day_utc >= %s GROUP BY day_utc ORDER BY day_utc""",(cutoff,))
+            rows = cursor.fetchall() or []
+    return [{**row,"day_utc":_iso(row.get("day_utc")),
+             "request_count":int(row.get("request_count") or 0),
+             "response_bytes_est":int(row.get("response_bytes_est") or 0),
+             "error_count":int(row.get("error_count") or 0)} for row in rows]
 
 
 def store_r2_usage(usage: Optional[Dict[str, Any]]) -> None:

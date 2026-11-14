@@ -458,12 +458,14 @@ def _record_dashboard_supabase_response(
         str(status_code),
     )
     response_bytes = len(response.content or b"")
+    if str(os.getenv("UK_AQ_ENV_NAME") or "").strip() not in {"TEST", "LIVE"}:
+        return
     with SERVICE_EGRESS_METRICS_LOCK:
         row = SERVICE_EGRESS_METRICS_STATE.get(key)
         if row is None:
             row = {
                 "bucket_minute": bucket_minute,
-                "env_name": str(os.getenv("UK_AQ_ENV_NAME") or "TEST").strip() or "TEST",
+                "env_name": str(os.getenv("UK_AQ_ENV_NAME") or "").strip(),
                 "project_ref": identity["project_ref"],
                 "service_name": "dashboard.dev",
                 "source_type": "supabase_postgrest",
@@ -1765,40 +1767,49 @@ def _fetch_size_metrics(
     return db_rows, schema_rows, r2_rows, db_warning, schema_warning, r2_warning
 
 
-def _fetch_service_egress_metrics() -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def _fetch_service_egress_metrics(history_days: int = 28) -> Dict[str, Any]:
+    result = {"minute": [], "daily": [], "status": [], "overview": [], "error": None}
     if not OBS_AQIDB_SUPABASE_URL or not OBS_AQIDB_SECRET_KEY:
-        return [], "obs_aqidb: missing OBS_AQIDB_SUPABASE_URL or OBS_AQIDB_SECRET_KEY"
-
+        result["error"] = "obs_aqidb: missing OBS_AQIDB_SUPABASE_URL or OBS_AQIDB_SECRET_KEY"
+        return result
     try:
         now = datetime.now(timezone.utc)
-        base_url = _ensure_allowed_base_url(
-            f"{OBS_AQIDB_SUPABASE_URL.rstrip('/')}/rest/v1"
-        )
-        rows, truncated = _fetch_all_limited(
-            base_url,
-            _postgrest_headers(OBS_AQIDB_SECRET_KEY, schema=PUBLIC_SCHEMA),
-            SERVICE_EGRESS_MINUTE_VIEW,
-            {
-                "select": (
-                    "bucket_minute,env_name,project_ref,service_name,source_type,source_name,"
-                    "route_name,query_name,window_label,status,request_count,response_rows,"
-                    "response_bytes_est,upstream_bytes_est,duration_ms,error_count,notes"
-                ),
-                "bucket_minute": f"gte.{_to_postgrest_ts(now - timedelta(hours=24))}",
-                "env_name": f"eq.{str(os.getenv('UK_AQ_ENV_NAME') or 'TEST').strip() or 'TEST'}",
-                "order": "bucket_minute.asc",
-            },
-            page_size=METRICS_VIEW_PAGE_SIZE,
-            max_rows=SERVICE_EGRESS_MAX_ROWS,
-        )
+        today = now.date()
+        start = today - timedelta(days=min(max(history_days, 1), 365))
+        if history_days == 365:
+            import calendar
+            start = date(today.year - 1, today.month, min(today.day, calendar.monthrange(today.year - 1, today.month)[1]))
+        recent = today - timedelta(days=28)
+        base_url = _ensure_allowed_base_url(f"{OBS_AQIDB_SUPABASE_URL.rstrip('/')}/rest/v1")
+        headers = _postgrest_headers(OBS_AQIDB_SECRET_KEY, schema=PUBLIC_SCHEMA)
+        env_name = str(os.getenv("UK_AQ_ENV_NAME") or "").strip()
+        if env_name not in {"TEST", "LIVE"}:
+            raise RuntimeError("UK_AQ_ENV_NAME must explicitly identify TEST or LIVE for egress reads")
+        environment = f"eq.{env_name}"
+        minute, minute_bound = _fetch_all_limited(base_url, headers, SERVICE_EGRESS_MINUTE_VIEW, {
+            "select": "bucket_minute,env_name,project_ref,service_name,source_type,source_name,route_name,query_name,window_label,status,request_count,response_rows,response_bytes_est,upstream_bytes_est,duration_ms,error_count,notes",
+            "bucket_minute": f"gte.{today.isoformat()}T00:00:00Z", "env_name": environment,
+            "order": "bucket_minute.asc",
+        }, page_size=METRICS_VIEW_PAGE_SIZE, max_rows=SERVICE_EGRESS_MAX_ROWS)
+        daily, daily_bound = _fetch_all_limited(base_url, headers, SERVICE_EGRESS_DAILY_VIEW, {
+            "select": "day_utc,env_name,project_ref,service_name,source_type,source_name,route_name,query_name,window_label,status,request_count,response_rows,response_bytes_est,upstream_bytes_est,duration_ms,error_count,completeness",
+            "day_utc": f"gte.{recent.isoformat()}", "env_name": environment, "order": "day_utc.asc",
+        }, page_size=METRICS_VIEW_PAGE_SIZE, max_rows=SERVICE_EGRESS_MAX_ROWS)
+        status, status_bound = _fetch_all_limited(base_url, headers, "uk_aq_service_egress_daily_status", {
+            "select": "day_utc,state,source_rows,aggregate_rows,deleted_minute_rows,late_direct_rows,verified_at,updated_at,last_error",
+            "day_utc": f"gte.{start.isoformat()}", "order": "day_utc.asc",
+        }, page_size=400, max_rows=400)
+        overview, overview_bound = _fetch_all_limited(base_url, headers, "uk_aq_service_egress_daily_overview", {
+            "select": "day_utc,env_name,request_count,response_bytes_est,error_count", "env_name": environment,
+            "day_utc": f"gte.{start.isoformat()}", "order": "day_utc.asc",
+        }, page_size=400, max_rows=400)
+        result.update(minute=_normalize_service_egress_metrics_rows(minute), daily=daily,
+                      status=status, overview=overview)
+        if minute_bound or daily_bound or status_bound or overview_bound:
+            result["error"] = "Egress detail reached a bounded read limit; selected period is incomplete"
     except Exception as exc:
-        return [], str(exc)
-    warning = (
-        f"Service egress minute view reached the {SERVICE_EGRESS_MAX_ROWS}-row dashboard bound"
-        if truncated
-        else None
-    )
-    return _normalize_service_egress_metrics_rows(rows), warning
+        result["error"] = str(exc)
+    return result
 
 
 def _normalize_iso_date(value: Any) -> Optional[str]:
@@ -4015,6 +4026,9 @@ def _build_dashboard(
     r2_usage_error: Optional[str] = None
     service_egress_metrics: List[Dict[str, Any]] = []
     service_egress_metrics_error: Optional[str] = None
+    service_egress_daily_metrics: List[Dict[str, Any]] = []
+    service_egress_daily_status: List[Dict[str, Any]] = []
+    service_egress_daily_overview: List[Dict[str, Any]] = []
     if include_metric_context:
         with ThreadPoolExecutor(max_workers=3) as executor:
             coverage_future = executor.submit(
@@ -4029,7 +4043,12 @@ def _build_dashboard(
             )
             coverage_context = coverage_future.result()
             r2_usage, r2_usage_error = r2_usage_future.result()
-            service_egress_metrics, service_egress_metrics_error = service_egress_future.result()
+            egress = service_egress_future.result()
+            service_egress_metrics = egress["minute"]
+            service_egress_daily_metrics = egress["daily"]
+            service_egress_daily_status = egress["status"]
+            service_egress_daily_overview = egress["overview"]
+            service_egress_metrics_error = egress["error"]
     else:
         coverage_context = _empty_storage_coverage_context()
     db_size_metrics = coverage_context["db_size_metrics"]
@@ -4196,6 +4215,10 @@ def _build_dashboard(
         "r2_usage": r2_usage,
         "r2_usage_error": r2_usage_error,
         "service_egress_metrics": service_egress_metrics,
+        "service_egress_daily_metrics": service_egress_daily_metrics,
+        "service_egress_daily_status": service_egress_daily_status,
+        "service_egress_daily_overview": service_egress_daily_overview,
+        "service_egress_history_days": 28,
         "service_egress_metrics_error": service_egress_metrics_error,
         "r2_backup_window": r2_backup_window,
         "r2_backup_window_error": r2_backup_window_error,
@@ -4575,6 +4598,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 include_metric_context=include_metric_context,
                 include_ingest_context=include_ingest_context,
             )
+            history_days = 365 if (query.get("egress_history_days") or [""])[0] == "365" else 28
+            if include_metric_context and history_days == 365:
+                if os.getenv("UK_AQ_DASHBOARD_MYSQL_ENABLED", "false").lower() == "true":
+                    import uk_aq_dashboard_rolling_cache as rolling
+                    data["service_egress_daily_status"] = rolling.read_service_egress_status(role="reader", days=365)
+                    data["service_egress_daily_overview"] = rolling.read_service_egress_overview(role="reader", days=365)
+                else:
+                    history = _fetch_service_egress_metrics(365)
+                    data["service_egress_daily_status"] = history["status"]
+                    data["service_egress_daily_overview"] = history["overview"]
+                    data["service_egress_metrics_error"] = _join_error_messages(data.get("service_egress_metrics_error"), history["error"])
+                data["service_egress_history_days"] = 365
         except Exception as exc:
             payload = json.dumps({"error": str(exc)}, indent=2)
             self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)

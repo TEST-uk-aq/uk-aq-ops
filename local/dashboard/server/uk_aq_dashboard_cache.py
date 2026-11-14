@@ -18,7 +18,8 @@ STORAGE_COVERAGE_REQUEST_RETENTION_SECONDS = 86400
 _STORAGE_COVERAGE_REQUEST_ID = re.compile(r"^[0-9a-f]{32}$")
 METRIC_KEYS = ("db_size_metrics", "schema_size_metrics", "r2_domain_size_metrics",
                "db_size_metrics_error", "schema_size_metrics_error", "r2_domain_size_metrics_error",
-               "r2_usage", "r2_usage_error", "service_egress_metrics", "service_egress_metrics_error",
+               "r2_usage", "r2_usage_error", "service_egress_metrics", "service_egress_daily_metrics", "service_egress_daily_status",
+               "service_egress_daily_overview", "service_egress_history_days", "service_egress_metrics_error",
                "r2_backup_window", "r2_backup_window_error", "r2_history_days_bucket", "r2_history_days_error",
                "r2_history_read_version", "r2_history_read_version_effective")
 _WRITER = False
@@ -316,7 +317,11 @@ def _build_local_metric_context(core):
         "r2_domain_size_metrics_error": None,
         "r2_usage": r2_usage,
         "r2_usage_error": r2_payload.get("r2_usage_error"),
-        "service_egress_metrics": rolling.read_service_egress(role="writer", lookback_hours=24),
+        "service_egress_metrics": rolling.read_service_egress(role="writer"),
+        "service_egress_daily_metrics": rolling.read_service_egress_daily(role="writer", days=28),
+        "service_egress_daily_status": rolling.read_service_egress_status(role="writer", days=28),
+        "service_egress_daily_overview": rolling.read_service_egress_overview(role="writer", days=28),
+        "service_egress_history_days": 28,
         "service_egress_metrics_error": None,
         "r2_backup_window": r2_payload.get("r2_backup_window"),
         "r2_backup_window_error": r2_payload.get("r2_backup_window_error"),
@@ -489,6 +494,22 @@ def serve_cached_request(handler, parsed):
             payload["r2_domain_size_metrics"] = []
             payload["r2_domain_size_metrics_error"] = None
             payload["r2_domain_size_metrics_warning"] = "Historical domain byte metrics have no generation identity; unavailable for v3. Account usage remains account-wide."
+        if parsed.path == "/api/dashboard" and "metric_context" in products:
+            import uk_aq_dashboard_rolling_cache as rolling
+            if (query.get("egress_history_days") or [""])[0] == "365":
+                payload["service_egress_daily_status"] = rolling.read_service_egress_status(role="reader", days=365)
+                payload["service_egress_daily_overview"] = rolling.read_service_egress_overview(role="reader", days=365)
+                payload["service_egress_history_days"] = 365
+            egress_state = rolling._state("service_egress_metrics_daily", role="reader") or {}
+            minute_state = rolling._state("service_egress_metrics_minute", role="reader") or {}
+            now = utcnow()
+            stale = (metadata.get("metric_context") or {}).get("state") != "fresh"
+            for state in (egress_state, minute_state):
+                success = state.get("last_success_at")
+                if not success or (now - success).total_seconds() > 900 or state.get("last_error_code"):
+                    stale = True
+            if stale:
+                payload["service_egress_metrics_error"] = "Local egress source sync is stale or incomplete; showing last-known data"
         if parsed.path == "/api/dashboard" and not flag("include_ingest_context"):
             payload["pollutants"] = []; payload["connectors_settings"] = []
         if "r2_usage" in payload:

@@ -31,13 +31,16 @@ const BYPASS_HEADER = "x-ukaq-egress-bypass";
 const EXCLUDED_ROUTES = new Set([
   "table/uk_aq_service_egress_metrics_minute",
   "table/uk_aq_service_egress_metrics_daily",
+  "table/uk_aq_service_egress_daily_status",
+  "table/uk_aq_service_egress_daily_overview",
   `rpc/${METRICS_RPC}`,
 ]);
 const aggregate = new Map<string, MetricRow>();
 
 function enabled(env: WorkerEnv): boolean {
   const normalized = String(env.UK_AQ_SERVICE_EGRESS_METRICS_ENABLED || "").trim().toLowerCase();
-  return normalized !== "" && !["0", "false", "no", "n", "off"].includes(normalized);
+  return normalized !== "" && !["0", "false", "no", "n", "off"].includes(normalized)
+    && ["TEST", "LIVE"].includes(String(env.UK_AQ_ENV_NAME || "").trim());
 }
 
 function projectRef(urlValue: string): string {
@@ -129,7 +132,7 @@ export function recordDashboardSupabaseResponse(
     ].join("\u001f");
     const current = aggregate.get(key) || {
       bucket_minute: bucketMinute,
-      env_name: String(env.UK_AQ_ENV_NAME || "TEST").trim() || "TEST",
+      env_name: String(env.UK_AQ_ENV_NAME || "").trim(),
       project_ref: identity.project_ref,
       service_name: SERVICE_NAME,
       source_type: "supabase_postgrest",
