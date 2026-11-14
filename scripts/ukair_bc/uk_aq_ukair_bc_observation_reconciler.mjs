@@ -56,7 +56,7 @@ function usage() {
     "Execution:",
     "  --dry-run                  Acquire, pin, parse and report without R2 access (default)",
     "  --apply                    Enter the shared global lock and reconcile canonical R2",
-    "  --environment TEST         Required TEST identity (default: TEST)",
+    "  --environment <TEST|LIVE>  Required target identity; must match UK_AQ_ENV_NAME",
     "  --run-id <id>              Optional stable run identity",
     "  --evidence-root <path>     Parent directory for run evidence (default: tmp/...)",
     "  --download-concurrency <n> Bounded annual-file downloads (default: 4)",
@@ -124,7 +124,7 @@ export function parseReconcilerArgs(argv, { now = new Date() } = {}) {
     properties: [],
     apply: false,
     sawDryRun: false,
-    environment: "TEST",
+    environment: "",
     runId: "",
     evidenceRoot: path.join(REPOSITORY_ROOT, "tmp/ukair_bc_observation_reconciler"),
     downloadConcurrency: DEFAULT_DOWNLOAD_CONCURRENCY,
@@ -145,7 +145,10 @@ export function parseReconcilerArgs(argv, { now = new Date() } = {}) {
     else if (flag === "--property") addCsvValues(args.properties, requireValue(argv, index++, flag));
     else if (flag === "--apply") args.apply = true;
     else if (flag === "--dry-run") args.sawDryRun = true;
-    else if (flag === "--environment") args.environment = requireValue(argv, index++, flag).toUpperCase();
+    else if (flag === "--environment") {
+      if (args.environment) throw new Error("--environment may be supplied only once");
+      args.environment = requireValue(argv, index++, flag).trim().toUpperCase();
+    }
     else if (flag === "--run-id") args.runId = requireValue(argv, index++, flag);
     else if (flag === "--evidence-root") args.evidenceRoot = path.resolve(requireValue(argv, index++, flag));
     else if (flag === "--download-concurrency") {
@@ -159,7 +162,9 @@ export function parseReconcilerArgs(argv, { now = new Date() } = {}) {
   if (!args.mode || !["selected", "range", "year", "backfill", "daily"].includes(args.mode)) {
     throw new Error("--mode must be selected, range, year, backfill or daily");
   }
-  if (args.environment !== "TEST") throw new Error("This reconciler permits only --environment TEST");
+  if (!["TEST", "LIVE"].includes(args.environment)) {
+    throw new Error("--environment must explicitly be TEST or LIVE");
+  }
   if (args.apply && args.sawDryRun) throw new Error("Use either --apply or --dry-run, not both");
   args.stationRefs = [...new Set(args.stationRefs.map((value) => normalizeUkaRef(value)))].sort();
   args.properties = args.properties.length
@@ -238,8 +243,23 @@ export function buildBackfillYearRanges(toDay) {
 }
 
 function requiredDatabaseUrl(env) {
-  const value = String(env.SUPABASE_DB_URL || env.UK_AQ_INGEST_DATABASE_URL || "").trim();
-  if (!value) throw new Error("SUPABASE_DB_URL (or UK_AQ_INGEST_DATABASE_URL) is required");
+  const value = String(env.SUPABASE_DB_URL || "").trim();
+  if (!value) throw new Error("SUPABASE_DB_URL is required");
+  if (env.UK_AQ_INGEST_DATABASE_URL && String(env.UK_AQ_INGEST_DATABASE_URL).trim() !== value) {
+    throw new Error("Conflicting ingest database URLs");
+  }
+  if (env.DATABASE_URL && String(env.DATABASE_URL).trim() !== value) {
+    throw new Error("Conflicting database URLs");
+  }
+  const supabaseUrl = new URL(String(env.SUPABASE_URL || "").trim());
+  const projectRef = /^([a-z0-9]+)\.supabase\.co$/.exec(supabaseUrl.hostname)?.[1];
+  const database = new URL(value);
+  if (!projectRef || supabaseUrl.protocol !== "https:" ||
+      !["postgres:", "postgresql:"].includes(database.protocol) ||
+      !(database.username === `postgres.${projectRef}` ||
+        database.hostname === `db.${projectRef}.supabase.co`)) {
+    throw new Error("SUPABASE_DB_URL does not match the configured SUPABASE_URL project");
+  }
   return value;
 }
 
@@ -524,7 +544,7 @@ async function acquireAndParseSources({ requests, args, runDir, fetchImpl = fetc
         fetchImpl,
         timeoutMs: args.downloadTimeoutMs,
         retries: args.downloadRetries,
-        userAgent: "UK-AQ-TEST-ukair-bc-observation-reconciler/1",
+        userAgent: `UK-AQ-${args.environment}-ukair-bc-observation-reconciler/1`,
       });
       const pinned = await pinSourceBytes(runDir, request, acquired);
       let parsed = null;
@@ -812,7 +832,7 @@ function backfillChildArgv(args, range, yearsRoot) {
     "--mode", "range",
     "--from", range.from_day,
     "--to", range.to_day,
-    "--environment", "TEST",
+    "--environment", args.environment,
     "--run-id", `year-${range.year}`,
     "--evidence-root", yearsRoot,
     "--download-concurrency", String(args.downloadConcurrency),
@@ -905,7 +925,7 @@ export async function runBackfillReconciliation({
   const report = {
     schema_version: 1,
     kind: "uk_aq_ukair_bc_observation_backfill_report",
-    environment: "TEST",
+    environment: args.environment,
     mode: "backfill",
     execution: args.apply ? "apply" : "dry_run",
     run_id: args.runId,
@@ -966,11 +986,12 @@ export async function runBackfillReconciliation({
       outcome = { code: null, report: null, report_read_error: null };
     }
     const childReport = outcome?.report || null;
-    if (!report.selected_stations.length && Array.isArray(childReport?.selected_stations)) {
-      report.selected_stations = [...childReport.selected_stations];
-    }
-    const completed = outcome?.code === 0 && childReport?.ok === true;
+    const completed = outcome?.code === 0 && childReport?.ok === true &&
+      childReport?.environment === args.environment;
     if (completed) {
+      if (!report.selected_stations.length && Array.isArray(childReport.selected_stations)) {
+        report.selected_stations = [...childReport.selected_stations];
+      }
       report.years_completed.push(range.year);
       report.per_year_results[index] = summarizeBackfillYearResult({
         range,
@@ -984,6 +1005,8 @@ export async function runBackfillReconciliation({
     }
 
     const error = childError || outcome?.report_read_error ||
+      (childReport && childReport.environment !== args.environment
+        ? "yearly report environment differs from parent selection" : null) ||
       `yearly reconciliation exited with code ${String(outcome?.code)}`;
     report.years_failed.push(range.year);
     report.per_year_results[index] = summarizeBackfillYearResult({
@@ -1063,9 +1086,12 @@ export async function runBlackCarbonObservationReconciler({
 } = {}) {
   const args = parseReconcilerArgs(argv, { now });
   if (args.help) return Object.freeze({ help: true, text: usage() });
-  const configuredEnvironment = String(env.UK_AQ_ENV_NAME || "TEST")
+  const configuredEnvironment = String(env.UK_AQ_ENV_NAME || "")
     .trim().toUpperCase();
-  if (configuredEnvironment !== "TEST") throw new Error("Configured environment must be TEST");
+  if (configuredEnvironment !== args.environment) {
+    throw new Error("UK_AQ_ENV_NAME must match explicit --environment");
+  }
+  requiredDatabaseUrl(env);
   if (args.mode === "backfill") {
     return await runBackfillReconciliation({
       args,
@@ -1141,7 +1167,7 @@ export async function runBlackCarbonObservationReconciler({
   const report = {
     schema_version: 1,
     kind: "uk_aq_ukair_bc_observation_reconciliation_report",
-    environment: "TEST",
+    environment: args.environment,
     mode: args.mode,
     execution: args.apply ? "apply" : "dry_run",
     run_id: args.runId,
@@ -1193,7 +1219,7 @@ export async function runBlackCarbonObservationReconciler({
   const plan = {
     schema_version: 1,
     kind: "uk_aq_ukair_bc_observation_reconciliation_plan",
-    environment: "TEST",
+    environment: args.environment,
     run_id: args.runId,
     target_writer_git_sha: targetWriterGitSha,
     selected: {

@@ -98,7 +98,7 @@ async function loadProtectedPlan(args) {
   if (
     plan?.schema_version !== 1 ||
     plan?.kind !== "uk_aq_ukair_bc_observation_reconciliation_plan" ||
-    plan?.environment !== "TEST" ||
+    !["TEST", "LIVE"].includes(plan?.environment) ||
     !String(plan?.run_id || "").trim() ||
     !/^[0-9a-f]{40}$/.test(String(plan?.target_writer_git_sha || "")) ||
     !Array.isArray(plan?.source_evidence) ||
@@ -928,25 +928,51 @@ export async function runProtectedBlackCarbonReconciliation({
     const verifiedSources = await verifyPinnedSourceEvidence(plan);
     const configuredEnvironment = String(env.UK_AQ_ENV_NAME || "")
       .trim().toUpperCase();
-    if (configuredEnvironment !== "TEST") {
-      throw new Error("Protected Black Carbon reconciliation permits only TEST");
+    if (configuredEnvironment !== plan.environment) {
+      throw new Error("Protected plan environment differs from UK_AQ_ENV_NAME");
     }
     if (String(env.UK_AQ_R2_HISTORY_VERSION || "").trim() !== "v3") {
       throw new Error("Protected Black Carbon reconciliation requires UK_AQ_R2_HISTORY_VERSION=v3");
     }
-    const lockDatabaseUrl = String(env.SUPABASE_DB_URL || env.DATABASE_URL || "").trim();
-    if (!lockDatabaseUrl) throw new Error("SUPABASE_DB_URL (or DATABASE_URL) is required");
-    const config = resolveR2HistoryIndexConfig(env);
-    if (
-      !config.r2.endpoint || !config.r2.bucket || !config.r2.access_key_id ||
-      !config.r2.secret_access_key
-    ) {
-      throw new Error("Complete TEST R2 configuration is required");
+    const lockDatabaseUrl = String(env.SUPABASE_DB_URL || "").trim();
+    if (!lockDatabaseUrl) throw new Error("SUPABASE_DB_URL is required");
+    if ((env.DATABASE_URL && String(env.DATABASE_URL).trim() !== lockDatabaseUrl) ||
+        (env.UK_AQ_INGEST_DATABASE_URL &&
+          String(env.UK_AQ_INGEST_DATABASE_URL).trim() !== lockDatabaseUrl)) {
+      throw new Error("Conflicting ingest database URLs");
     }
-    if (config.r2.bucket !== "uk-aq-history-cic-test") {
-      throw new Error(
-        `Protected Black Carbon reconciliation requires TEST R2 bucket uk-aq-history-cic-test, got ${config.r2.bucket}`,
-      );
+    const supabaseUrl = new URL(String(env.SUPABASE_URL || "").trim());
+    const projectRef = /^([a-z0-9]+)\.supabase\.co$/.exec(supabaseUrl.hostname)?.[1];
+    const database = new URL(lockDatabaseUrl);
+    if (!projectRef || supabaseUrl.protocol !== "https:" ||
+        !["postgres:", "postgresql:"].includes(database.protocol) ||
+        !(database.username === `postgres.${projectRef}` ||
+          database.hostname === `db.${projectRef}.supabase.co`)) {
+      throw new Error("SUPABASE_DB_URL does not match the configured SUPABASE_URL project");
+    }
+    const config = resolveR2HistoryIndexConfig(env);
+    const accountId = String(env.CLOUDFLARE_ACCOUNT_ID || "").trim();
+    const endpoint = String(env.CFLARE_R2_ENDPOINT || "").trim();
+    const bucket = String(env.CFLARE_R2_BUCKET || "").trim();
+    if (
+      !/^[a-f0-9]{32}$/.test(accountId) || !endpoint || !bucket ||
+      !String(env.CFLARE_R2_ACCESS_KEY_ID || "").trim() ||
+      !String(env.CFLARE_R2_SECRET_ACCESS_KEY || "").trim()
+    ) {
+      throw new Error("Complete environment-specific R2 configuration is required");
+    }
+    if (endpoint !== `https://${accountId}.r2.cloudflarestorage.com` ||
+        !bucket.endsWith(`-${plan.environment.toLowerCase()}`) ||
+        config.r2.endpoint !== endpoint || config.r2.bucket !== bucket ||
+        config.r2.access_key_id !== String(env.CFLARE_R2_ACCESS_KEY_ID).trim() ||
+        config.r2.secret_access_key !== String(env.CFLARE_R2_SECRET_ACCESS_KEY).trim() ||
+        (env.R2_ENDPOINT && String(env.R2_ENDPOINT).trim() !== endpoint) ||
+        (env.R2_BUCKET && String(env.R2_BUCKET).trim() !== bucket) ||
+        (env.R2_ACCESS_KEY_ID &&
+          String(env.R2_ACCESS_KEY_ID).trim() !== config.r2.access_key_id) ||
+        (env.R2_SECRET_ACCESS_KEY &&
+          String(env.R2_SECRET_ACCESS_KEY).trim() !== config.r2.secret_access_key)) {
+      throw new Error("R2 endpoint, account, bucket or credential configuration contradicts target environment");
     }
     const generation = getObservationHistoryGeneration("v3");
     const diagnostics = [];
@@ -969,7 +995,7 @@ export async function runProtectedBlackCarbonReconciliation({
             indexRoot: generation.observations_timeseries_index_prefix,
             latestKey: generation.observations_timeseries_latest_key,
             r2: config.r2,
-            diagnosticEnvironment: "TEST",
+            diagnosticEnvironment: plan.environment,
             diagnostics,
             expectedObservationsGlobalOperationLockOwner: LOCK_OWNER,
             expectedObservationsGlobalOperationLockRunId: plan.run_id,

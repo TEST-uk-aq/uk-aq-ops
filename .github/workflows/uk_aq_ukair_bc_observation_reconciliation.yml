@@ -3,6 +3,13 @@ name: UK AQ UK-AIR Black Carbon Observation Reconciliation
 on:
   workflow_dispatch:
     inputs:
+      environment:
+        description: "Explicit target environment; must match UK_AQ_ENV_NAME"
+        required: true
+        type: choice
+        options:
+          - TEST
+          - LIVE
       mode:
         description: "Reconciliation selection mode"
         required: true
@@ -59,14 +66,17 @@ jobs:
     timeout-minutes: 360
     env:
       UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
+      SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT || '' }}
       CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET || '' }}
       CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
       CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
       CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
       INPUT_MODE: ${{ inputs.mode }}
+      INPUT_ENVIRONMENT: ${{ inputs.environment }}
       INPUT_FROM_DAY: ${{ inputs.from_day }}
       INPUT_TO_DAY: ${{ inputs.to_day }}
       INPUT_YEAR: ${{ inputs.year }}
@@ -87,20 +97,25 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
-      - name: Validate TEST configuration
+      - name: Validate target environment configuration
         run: |
           set -euo pipefail
-          if [ "${UK_AQ_ENV_NAME^^}" != "TEST" ]; then
-            echo "Refusing Black Carbon reconciliation outside TEST" >&2
+          case "${UK_AQ_ENV_NAME}" in
+            TEST|LIVE) ;;
+            *) echo "UK_AQ_ENV_NAME must explicitly be TEST or LIVE" >&2; exit 1 ;;
+          esac
+          if [ "${INPUT_ENVIRONMENT}" != "${UK_AQ_ENV_NAME}" ]; then
+            echo "Selected environment must match UK_AQ_ENV_NAME" >&2
             exit 1
           fi
-          if [ -z "${SUPABASE_DB_URL:-}" ]; then
-            echo "SUPABASE_DB_URL is required for canonical metadata resolution" >&2
+          if [ -z "${SUPABASE_URL:-}" ] || [ -z "${SUPABASE_DB_URL:-}" ]; then
+            echo "SUPABASE_URL and SUPABASE_DB_URL are required for canonical metadata resolution" >&2
             exit 1
           fi
           if [ "${INPUT_APPLY}" = "true" ]; then
             required=(
               UK_AQ_R2_HISTORY_VERSION
+              CLOUDFLARE_ACCOUNT_ID
               CFLARE_R2_ENDPOINT
               CFLARE_R2_BUCKET
               CFLARE_R2_ACCESS_KEY_ID
@@ -116,8 +131,12 @@ jobs:
               echo "Apply requires UK_AQ_R2_HISTORY_VERSION=v3" >&2
               exit 1
             fi
-            if [ "${CFLARE_R2_BUCKET}" != "uk-aq-history-cic-test" ]; then
-              echo "Apply requires the TEST R2 bucket uk-aq-history-cic-test" >&2
+            if [ "${CFLARE_R2_ENDPOINT}" != "https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com" ]; then
+              echo "R2 endpoint does not match the configured R2 account" >&2
+              exit 1
+            fi
+            if [[ "${CFLARE_R2_BUCKET}" != *-"${UK_AQ_ENV_NAME,,}" ]]; then
+              echo "R2 bucket does not match the target environment" >&2
               exit 1
             fi
           fi
@@ -127,7 +146,7 @@ jobs:
           set -euo pipefail
           args=(
             --mode "${INPUT_MODE}"
-            --environment TEST
+            --environment "${INPUT_ENVIRONMENT}"
             --horizon-days "${INPUT_HORIZON_DAYS}"
             --property "${INPUT_PROPERTIES}"
             --run-id "ukair-bc-gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
