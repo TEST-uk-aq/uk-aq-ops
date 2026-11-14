@@ -2094,12 +2094,16 @@
         { value: 672, label: "28 days" },
       ];
       const DB_SIZE_PERIOD_STORAGE_KEY = "uk_aq_db_size_period_hours";
-      const DB_LINE_CHART_Y_MAX_MB = 500;
       const COLOR_INGEST_DB = "#FE2E2E";
       const COLOR_R2_OBSERVS = "#F48021";
       const COLOR_R2_AQILEVELS = "#F4C04B";
       const COLOR_OBSAQI_OBSERVS = "#3C82F5";
       const COLOR_OBSAQI_AQILEVELS = "#61D836";
+      const COLOR_OBSAQI_OPS = "#9B59B6";
+      const COLOR_OBSAQI_CORE = "#17A398";
+      const COLOR_OBSAQI_RAW = "#B86F36";
+      const COLOR_OBSAQI_PUBLIC = "#D8659F";
+      const COLOR_OBSAQI_OTHER = "#8D939B";
       const DASHBOARD_DROPBOX_ICON_PATH = "assets/dropbox-icon.svg";
       const STORAGE_COVERAGE_MONTH_STORAGE_KEY = "uk_aq_storage_coverage_month";
       const STORAGE_COVERAGE_MODE_STORAGE_KEY = "uk_aq_storage_coverage_mode";
@@ -3469,27 +3473,29 @@
         if (!Array.isArray(points) || points.length === 0) {
           return "";
         }
-        const topPoints = points.map((point) => {
-          const priorSum = priorKeys.reduce((sum, priorKey) => sum + Number(point[priorKey] || 0), 0);
-          const value = Number(point[key] || 0);
-          return {
+        const segments = [];
+        let segment = [];
+        points.forEach((point) => {
+          const keys = [key, ...priorKeys];
+          if (keys.some((seriesKey) => point[seriesKey] === null || point[seriesKey] === undefined)) {
+            if (segment.length) segments.push(segment);
+            segment = [];
+            return;
+          }
+          const priorSum = priorKeys.reduce((sum, priorKey) => sum + Number(point[priorKey]), 0);
+          segment.push({
             x: xFor(point.ms),
-            top: yFor(priorSum + value),
+            top: yFor(priorSum + Number(point[key])),
             bottom: yFor(priorSum),
-          };
+          });
         });
-        const hasVisible = topPoints.some((point) => Math.abs(point.top - point.bottom) > 0.1);
-        if (!hasVisible) {
-          return "";
-        }
-        const upper = topPoints
-          .map((point, index) => `${index === 0 ? "M" : "L"}${point.x.toFixed(2)},${point.top.toFixed(2)}`)
-          .join(" ");
-        const lower = [...topPoints]
-          .reverse()
-          .map((point) => `L${point.x.toFixed(2)},${point.bottom.toFixed(2)}`)
-          .join(" ");
-        return `${upper} ${lower} Z`;
+        if (segment.length) segments.push(segment);
+        return segments.filter((run) => run.length > 1 && run.some((point) => Math.abs(point.top - point.bottom) > 0.1))
+          .map((run) => {
+            const upper = run.map((point, index) => `${index === 0 ? "M" : "L"}${point.x.toFixed(2)},${point.top.toFixed(2)}`).join(" ");
+            const lower = [...run].reverse().map((point) => `L${point.x.toFixed(2)},${point.bottom.toFixed(2)}`).join(" ");
+            return `${upper} ${lower} Z`;
+          }).join(" ");
       }
 
       function buildStackedMetricPoints(rows, dimensionKey, allowedKeys, cutoffMs) {
@@ -3547,10 +3553,13 @@
             const width = Math.max(1, rightBound - leftBound);
             const bucketLabel = formatTime(point.ms);
             const seriesPayload = seriesDefs.map((series) => {
-              const value = Number(point[series.key] || 0);
+              const rawValue = point[series.key];
+              const absent = Array.isArray(point.absentSchemas) && point.absentSchemas.includes(series.key);
+              const available = rawValue !== null && rawValue !== undefined && Number.isFinite(Number(rawValue));
+              const value = available ? Number(rawValue) : null;
               return {
                 label: series.label,
-                size: `${formatMegabytes(value)} MB`,
+                size: absent ? "Schema absent" : available ? `${formatMegabytes(value)} MB` : "Unavailable",
                 value_mb: value,
               };
             });
@@ -3699,13 +3708,15 @@
               })
               .join("");
             const totalMb = rows.reduce((sum, row) => {
+              if (row && row.value_mb === null) return sum;
               const value = Number(row && row.value_mb);
               if (!Number.isFinite(value)) {
                 return sum;
               }
               return sum + value;
             }, 0);
-            tooltip.innerHTML = `<div>Bucket: ${escapeHtml(bucket)}</div>${rowMarkup}<div>Total: ${escapeHtml(`${formatMegabytes(totalMb)} MB`)}</div>`;
+            const totalLabel = rows.some((row) => row && row.value_mb === null) ? "Measured subtotal" : "Total";
+            tooltip.innerHTML = `<div>Bucket: ${escapeHtml(bucket)}</div>${rowMarkup}<div>${totalLabel}: ${escapeHtml(`${formatMegabytes(totalMb)} MB`)}</div>`;
             tooltip.classList.add("visible");
             positionTooltip(event.clientX, event.clientY);
           }
@@ -3919,7 +3930,7 @@
           const obsAqi = point.obs_aqidb === null ? 0 : Number(point.obs_aqidb);
           return Math.max(max, ingest, obsAqi);
         }, 0);
-        const yAxisMaxMb = DB_LINE_CHART_Y_MAX_MB;
+        const yAxisMaxMb = computeAxisMax(maxObservedMb * 1.05);
 
         let chartMarkup = `<div class="db-size-empty">No DB size samples in the selected period.</div>`;
         if (points.length > 0) {
@@ -3994,9 +4005,7 @@
           `;
         }
 
-        const maxNote = maxObservedMb > yAxisMaxMb
-          ? `Line chart fixed at ${formatMegabytes(yAxisMaxMb)} MB (max observed ${formatMegabytes(maxObservedMb)} MB).`
-          : `Line chart fixed at ${formatMegabytes(yAxisMaxMb)} MB.`;
+        const maxNote = `Line chart scales to ${formatMegabytes(yAxisMaxMb)} MB for the selected period.`;
 
         const renderStackedChart = ({
           title,
@@ -4118,23 +4127,58 @@
           `;
         };
 
-        const schemaPoints = buildStackedMetricPoints(
-          schemaRows,
-          "schema_name",
-          ["uk_aq_observs", "uk_aq_aqilevels"],
-          cutoffMs,
-        );
+        const schemaSeriesDefs = [
+          { key: "uk_aq_ops", label: "uk_aq_ops", color: COLOR_OBSAQI_OPS },
+          { key: "uk_aq_core", label: "uk_aq_core", color: COLOR_OBSAQI_CORE },
+          { key: "uk_aq_raw", label: "uk_aq_raw", color: COLOR_OBSAQI_RAW },
+          { key: "uk_aq_observs", label: "uk_aq_observs", color: COLOR_OBSAQI_OBSERVS },
+          { key: "uk_aq_aqilevels", label: "uk_aq_aqilevels", color: COLOR_OBSAQI_AQILEVELS },
+          { key: "public", label: "public", color: COLOR_OBSAQI_PUBLIC },
+        ];
+        const schemaPointMap = new Map();
+        (Array.isArray(schemaRows) ? schemaRows : []).forEach((row) => {
+          const schemaName = String(row?.schema_name || "").toLowerCase().trim();
+          if (row?.database_label !== "obs_aqidb" || ![...schemaSeriesDefs.map((series) => series.key), "other_system"].includes(schemaName)) return;
+          const ms = new Date(row.bucket_hour || row.recorded_at || "").getTime();
+          const sizeBytes = asNumber(row.size_bytes);
+          if (!Number.isFinite(ms) || ms < cutoffMs || sizeBytes === null || sizeBytes < 0) return;
+          const point = schemaPointMap.get(ms) || { ms };
+          point[schemaName] = sizeBytes / 1000000;
+          schemaPointMap.set(ms, point);
+        });
+        const schemaPoints = Array.from(schemaPointMap.values()).sort((a, b) => a.ms - b.ms);
+        let unavailableResidualBuckets = 0;
+        schemaPoints.forEach((point) => {
+          point.absentSchemas = [];
+          if (point.other_system === undefined) {
+            unavailableResidualBuckets += 1;
+            point.other_system = null;
+          } else {
+            schemaSeriesDefs.forEach((series) => {
+              if (point[series.key] === undefined) {
+                point.absentSchemas.push(series.key);
+                point[series.key] = 0;
+              }
+            });
+          }
+        });
+        const latestSchemaPoint = schemaPoints[schemaPoints.length - 1];
+        const latestAbsentSchemas = latestSchemaPoint?.absentSchemas || [];
+        const latestUnavailableSchemas = latestSchemaPoint && latestSchemaPoint.other_system === null
+          ? schemaSeriesDefs.filter((series) => latestSchemaPoint[series.key] === undefined).map((series) => series.key)
+          : latestSchemaPoint ? [] : schemaSeriesDefs.map((series) => series.key);
+        const schemaAvailabilityNote = [
+          latestAbsentSchemas.length ? `Absent in the latest successfully reconciled bucket: ${latestAbsentSchemas.join(", ")}.` : "",
+          latestUnavailableSchemas.length ? `No measurement in the latest bucket: ${latestUnavailableSchemas.join(", ")}. Their sizes are unavailable, not zero.` : "",
+        ].filter(Boolean).join(" ");
+        const schemaReconciliationNote = `Other/system is the stored hourly database size minus all present measured application schemas; it includes system schemas and database overhead. ${unavailableResidualBuckets ? `Unavailable for ${unavailableResidualBuckets} older or non-reconciling bucket(s).` : ""}`;
         const schemaChartMarkup = renderStackedChart({
-          title: "obs_aqidb schema sizes (MB)",
+          title: "ObsAQIDB schema sizes and Other/system (MB)",
           points: schemaPoints,
-          ariaLabel: "obs_aqidb schema size stacked area chart",
+          ariaLabel: "ObsAQIDB schema and Other/system size stacked area chart",
           emptyLabel: "No schema size samples in the selected period.",
-          seriesDefs: [
-            { key: "uk_aq_observs", label: "uk_aq_observs", color: COLOR_OBSAQI_OBSERVS },
-            { key: "uk_aq_aqilevels", label: "uk_aq_aqilevels", color: COLOR_OBSAQI_AQILEVELS },
-          ],
-          stackOrderKeys: ["uk_aq_aqilevels", "uk_aq_observs"],
-          yMaxOverride: 500,
+          seriesDefs: [...schemaSeriesDefs, { key: "other_system", label: "Other/system", color: COLOR_OBSAQI_OTHER }],
+          stackOrderKeys: ["uk_aq_aqilevels", "uk_aq_observs", "uk_aq_raw", "uk_aq_core", "uk_aq_ops", "public", "other_system"],
         });
 
         const r2DomainPoints = buildStackedMetricPoints(
@@ -4351,14 +4395,17 @@
               <span class="db-size-item-min">${escapeHtml(ingestOldestDayLabel)}</span>
             </span>
             <span class="db-size-item">
-              <span class="db-size-item-title"><span class="db-size-swatch" style="background:${COLOR_OBSAQI_OBSERVS}"></span>Observs &amp; AQI DB</span>
+              <span class="db-size-item-title"><span class="db-size-swatch" style="background:${COLOR_OBSAQI_OBSERVS}"></span>ObsAQIDB total</span>
               <span class="db-size-item-min">uk_aq_observs ${escapeHtml(observsOldestDayLabel)}&nbsp;&nbsp;&nbsp;uk_aq_aqilevels ${escapeHtml(aqilevelsOldestDayLabel)}</span>
             </span>
             </div>
             <strong class="db-size-timezone-note">Times in UTC</strong>
           </div>
           <div class="db-size-chart-wrap">${chartMarkup}<div class="db-size-hover-tooltip" aria-hidden="true"></div></div>
+          <div class="footnote">${escapeHtml(maxNote)}</div>
           ${schemaChartMarkup}
+          <div class="footnote">${escapeHtml(schemaReconciliationNote)}</div>
+          ${schemaAvailabilityNote ? `<div class="footnote">${escapeHtml(schemaAvailabilityNote)}</div>` : ""}
           ${r2DomainChartMarkup}
           ${r2UsageMarkup}
           ${sourceWarningMarkup}

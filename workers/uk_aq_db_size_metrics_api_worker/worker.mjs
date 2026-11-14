@@ -1125,7 +1125,7 @@ function normalizeSchemaSizeRows(rows) {
     if (label !== "obs_aqidb") {
       continue;
     }
-    if (schemaName !== "uk_aq_observs" && schemaName !== "uk_aq_aqilevels") {
+    if (!["uk_aq_ops", "uk_aq_core", "uk_aq_raw", "uk_aq_observs", "uk_aq_aqilevels", "public", "other_system"].includes(schemaName)) {
       continue;
     }
 

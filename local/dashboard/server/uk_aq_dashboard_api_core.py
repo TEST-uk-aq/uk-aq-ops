@@ -1156,7 +1156,7 @@ def _normalize_schema_size_metrics_rows(rows: List[Dict[str, Any]]) -> List[Dict
         schema_name = str(row.get("schema_name") or "").strip().lower()
         if database_label != "obs_aqidb":
             continue
-        if schema_name not in {"uk_aq_observs", "uk_aq_aqilevels"}:
+        if schema_name not in {"uk_aq_ops", "uk_aq_core", "uk_aq_raw", "uk_aq_observs", "uk_aq_aqilevels", "public", "other_system"}:
             continue
         bucket_hour = _parse_timestamp(row.get("bucket_hour"))
         recorded_at = _parse_timestamp(row.get("recorded_at"))
