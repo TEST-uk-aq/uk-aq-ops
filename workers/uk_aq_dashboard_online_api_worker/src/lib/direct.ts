@@ -25,6 +25,10 @@ type DashboardPayload = {
   r2_usage: JsonObject | null;
   r2_usage_error: string | null;
   service_egress_metrics: unknown[];
+  service_egress_daily_metrics: unknown[];
+  service_egress_daily_status: unknown[];
+  service_egress_daily_overview: unknown[];
+  service_egress_history_days: number;
   service_egress_metrics_error: string | null;
   r2_backup_window: JsonObject | null;
   r2_backup_window_error: string | null;
@@ -1558,33 +1562,59 @@ async function addObsObservationCoverage(env: WorkerEnv, rows: unknown[], forceR
   } catch (err) { return { error: `Authoritative ObsAQIDB observation-day summary unavailable: ${coverageFailureReason(err)}`, checked: null }; }
 }
 
-async function fetchServiceEgressMetrics(env: WorkerEnv): Promise<{ rows: unknown[]; error: string | null }> {
+async function fetchServiceEgressMetrics(env: WorkerEnv, historyDays: number): Promise<{
+  rows: unknown[]; daily: unknown[]; status: unknown[]; overview: unknown[]; error: string | null;
+}> {
+  const empty = { rows: [], daily: [], status: [], overview: [] };
   try {
     const restBase = obsRestBase(env);
     const key = requireObsServiceKey(env);
-    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const rows = await fetchAllRows(
-      restBase,
-      "uk_aq_service_egress_metrics_minute",
-      postgrestHeaders(key, defaultPublicSchema(env)),
-      {
-        select: "bucket_minute,env_name,project_ref,service_name,source_type,source_name,route_name,query_name,window_label,status,request_count,response_rows,response_bytes_est,upstream_bytes_est,duration_ms,error_count,notes",
-        bucket_minute: `gte.${toPostgrestTimestamp(since)}`,
-        env_name: `eq.${String(env.UK_AQ_ENV_NAME || "TEST").trim() || "TEST"}`,
-        order: "bucket_minute.asc",
-      },
-      1000,
-      env,
-      10_000,
-    );
-    return {
-      rows,
-      error: rows.length >= 10_000
-        ? "Service egress minute view reached the 10000-row dashboard bound"
-        : null,
-    };
+    const headers = postgrestHeaders(key, defaultPublicSchema(env));
+    const today = new Date().toISOString().slice(0, 10);
+    const startDate = new Date();
+    if (historyDays === 365) {
+      const day = startDate.getUTCDate();
+      startDate.setUTCDate(1);
+      startDate.setUTCMonth(startDate.getUTCMonth() - 12);
+      const monthEnd = new Date(Date.UTC(startDate.getUTCFullYear(), startDate.getUTCMonth() + 1, 0)).getUTCDate();
+      startDate.setUTCDate(Math.min(day, monthEnd));
+    } else {
+      startDate.setUTCDate(startDate.getUTCDate() - historyDays);
+    }
+    const start = startDate.toISOString().slice(0, 10);
+    const recent = new Date(Date.now() - 28 * 86400000).toISOString().slice(0, 10);
+    const envName = String(env.UK_AQ_ENV_NAME || "").trim();
+    if (!["TEST", "LIVE"].includes(envName)) throw new Error("UK_AQ_ENV_NAME must explicitly identify TEST or LIVE for egress reads");
+    const common = { env_name: `eq.${envName}` };
+    const [rows, daily, status, overview] = await Promise.all([
+      fetchAllRows(restBase, "uk_aq_service_egress_metrics_minute", headers, {
+        ...common, select: "bucket_minute,env_name,project_ref,service_name,source_type,source_name,route_name,query_name,window_label,status,request_count,response_rows,response_bytes_est,upstream_bytes_est,duration_ms,error_count,notes",
+        bucket_minute: `gte.${today}T00:00:00Z`, order: "bucket_minute.asc",
+      }, 1000, env, 10_001),
+      fetchAllRows(restBase, "uk_aq_service_egress_metrics_daily", headers, {
+        ...common, select: "day_utc,env_name,project_ref,service_name,source_type,source_name,route_name,query_name,window_label,status,request_count,response_rows,response_bytes_est,upstream_bytes_est,duration_ms,error_count,completeness",
+        day_utc: `gte.${recent}`, order: "day_utc.asc",
+      }, 1000, env, 10_001),
+      fetchAllRows(restBase, "uk_aq_service_egress_daily_status", headers, {
+        select: "day_utc,state,source_rows,aggregate_rows,deleted_minute_rows,late_direct_rows,verified_at,updated_at,last_error",
+        day_utc: `gte.${start}`, order: "day_utc.asc",
+      }, 1000, env, 400),
+      fetchAllRows(restBase, "uk_aq_service_egress_daily_overview", headers, {
+        select: "day_utc,env_name,request_count,response_bytes_est,error_count",
+        env_name: common.env_name, day_utc: `gte.${start}`, order: "day_utc.asc",
+      }, 1000, env, 400),
+    ]);
+    const recheckedStatus = await fetchAllRows(restBase, "uk_aq_service_egress_daily_status", headers, {
+      select: "day_utc,state,source_rows,aggregate_rows,deleted_minute_rows,late_direct_rows,verified_at,updated_at,last_error",
+      day_utc: `gte.${start}`, order: "day_utc.asc",
+    }, 1000, env, 400);
+    const changedDuringRead = JSON.stringify(status) !== JSON.stringify(recheckedStatus);
+    const truncated = rows.length > 10_000 || daily.length > 10_000 || status.length >= 400 || overview.length >= 400;
+    return { rows: rows.slice(0, 10_000), daily: daily.slice(0, 10_000), status, overview,
+      error: changedDuringRead ? "Egress day changed during dashboard read; refresh to reconcile" :
+        truncated ? "Egress detail reached a bounded read limit; selected period is incomplete" : null };
   } catch (err) {
-    return { rows: [], error: err instanceof Error ? err.message : String(err) };
+    return { ...empty, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
@@ -1596,6 +1626,7 @@ async function fetchDashboardBaseData(
     includeStorageCoverage: boolean;
     dispatchCursor: Date | null;
     forceRefresh: boolean;
+    egressHistoryDays: number;
   },
 ): Promise<DashboardPayload> {
   const now = new Date();
@@ -1818,6 +1849,9 @@ async function fetchDashboardBaseData(
   let r2_usage: JsonObject | null = null;
   let r2_usage_error: string | null = null;
   let service_egress_metrics: unknown[] = [];
+  let service_egress_daily_metrics: unknown[] = [];
+  let service_egress_daily_status: unknown[] = [];
+  let service_egress_daily_overview: unknown[] = [];
   let service_egress_metrics_error: string | null = null;
   let r2_backup_window: JsonObject | null = null;
   let r2_backup_window_error: string | null = null;
@@ -1846,7 +1880,7 @@ async function fetchDashboardBaseData(
       }),
       options.includeMetricContext ? fetchR2Usage(env, options.forceRefresh) : Promise.resolve({ usage: null, error: null }),
       fetchR2HistoryDays(env, options.forceRefresh),
-      options.includeMetricContext ? fetchServiceEgressMetrics(env) : Promise.resolve({ rows: [], error: null }),
+      options.includeMetricContext ? fetchServiceEgressMetrics(env, options.egressHistoryDays) : Promise.resolve({ rows: [], daily: [], status: [], overview: [], error: null }),
     ]);
     const dropboxState = {
       days: { observations: new Set<string>(), aqilevels: new Set<string>() },
@@ -1862,6 +1896,9 @@ async function fetchDashboardBaseData(
     r2_usage = r2Usage.usage;
     r2_usage_error = r2Usage.error;
     service_egress_metrics = egress.rows;
+    service_egress_daily_metrics = egress.daily;
+    service_egress_daily_status = egress.status;
+    service_egress_daily_overview = egress.overview;
     service_egress_metrics_error = egress.error;
     r2_history_days_bucket = r2History.bucket;
     r2_history_days_error = r2History.error;
@@ -1960,6 +1997,10 @@ async function fetchDashboardBaseData(
     r2_usage,
     r2_usage_error,
     service_egress_metrics,
+    service_egress_daily_metrics,
+    service_egress_daily_status,
+    service_egress_daily_overview,
+    service_egress_history_days: options.egressHistoryDays,
     service_egress_metrics_error,
     r2_backup_window,
     r2_backup_window_error,
@@ -1994,9 +2035,10 @@ async function fetchDashboardBaseData(
 function dashboardCacheKey(search: URLSearchParams, env: WorkerEnv): string {
   const includeStorage = asBoolFlag(search.get("include_storage_coverage"), true) ? "1" : "0";
   const includeMetric = asBoolFlag(search.get("include_metric_context"), true) ? "1" : "0";
+  const egressDays = search.get("egress_history_days") === "365" ? 365 : 28;
   const includeIngest = asBoolFlag(search.get("include_ingest_context"), true) ? "1" : "0";
   const storageKey = includeStorage === "1" ? storageCoverageCacheKey(env) : "storage_coverage:disabled";
-  return `${r2HistoryReadVersionCacheKey(env)}|${billingConfigurationKey(env)}|storage=${includeStorage}|metric=${includeMetric}|ingest=${includeIngest}|${storageKey}`;
+  return `${r2HistoryReadVersionCacheKey(env)}|${billingConfigurationKey(env)}|storage=${includeStorage}|metric=${includeMetric}|egress=${egressDays}|ingest=${includeIngest}|${storageKey}`;
 }
 
 export async function getDirectDashboardPayload(
@@ -2023,6 +2065,7 @@ export async function getDirectDashboardPayload(
     includeIngestContext: asBoolFlag(search.get("include_ingest_context"), true),
     dispatchCursor: null,
     forceRefresh,
+    egressHistoryDays: search.get("egress_history_days") === "365" ? 365 : 28,
   });
   if (historyResolution(env).version === "v3") {
     payload.r2_domain_size_metrics = [];
@@ -2089,6 +2132,7 @@ export async function getDirectStorageCoveragePayload(
     includeIngestContext: false,
     dispatchCursor: null,
     forceRefresh,
+    egressHistoryDays: 28,
   });
   const response = {
     generated_at: nowIso(),
