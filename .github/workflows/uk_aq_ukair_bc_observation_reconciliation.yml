@@ -66,6 +66,7 @@ jobs:
     timeout-minutes: 360
     env:
       UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
+      UK_AQ_GITHUB_REPO: ${{ vars.UK_AQ_GITHUB_REPO }}
       SUPABASE_URL: ${{ vars.SUPABASE_URL }}
       UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION || '' }}
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
@@ -100,6 +101,11 @@ jobs:
       - name: Validate target environment configuration
         run: |
           set -euo pipefail
+          if [ -z "${UK_AQ_GITHUB_REPO:-}" ] || [ -z "${GITHUB_REPOSITORY:-}" ] ||
+             [ "${UK_AQ_GITHUB_REPO}" != "${GITHUB_REPOSITORY}" ]; then
+            echo "UK_AQ_GITHUB_REPO must match the executing GITHUB_REPOSITORY" >&2
+            exit 1
+          fi
           case "${UK_AQ_ENV_NAME}" in
             TEST|LIVE) ;;
             *) echo "UK_AQ_ENV_NAME must explicitly be TEST or LIVE" >&2; exit 1 ;;

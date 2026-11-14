@@ -1347,6 +1347,7 @@ test("apply wiring enters the existing global-lock coordinator and protected chi
 test("daily CLI derives a configurable recent horizon without selecting the full backfill", () => {
   const args = parseReconcilerArgs([
     "--mode", "daily",
+    "--environment", "TEST",
     "--horizon-days", "3",
     "--property", "bc,uv370",
   ], { now: new Date("2026-09-23T12:00:00.000Z") });
@@ -1354,6 +1355,9 @@ test("daily CLI derives a configurable recent horizon without selecting the full
   assert.equal(args.toDay, "2026-09-22");
   assert.deepEqual(args.properties, ["bc", "uv370"]);
   assert.equal(args.apply, false);
+  assert.equal(args.environment, "TEST");
+  assert.throws(() => parseReconcilerArgs(["--mode", "daily"]),
+    /--environment must explicitly be TEST or LIVE/);
 });
 
 test("backfill year selection starts at 2020 and bounds a partial final year", () => {
@@ -1375,6 +1379,7 @@ test("backfill year selection starts at 2020 and bounds a partial final year", (
 function successfulBackfillChildReport(reportPath, overrides = {}) {
   return {
     ok: true,
+    environment: "TEST",
     report_path: reportPath,
     selected_stations: ["UKA00001"],
     source_files_successfully_pinned: 2,
@@ -1388,6 +1393,12 @@ function successfulBackfillChildReport(reportPath, overrides = {}) {
   };
 }
 
+const TEST_RECONCILER_ENV = Object.freeze({
+  UK_AQ_ENV_NAME: "TEST",
+  SUPABASE_URL: "https://testproject.supabase.co",
+  SUPABASE_DB_URL: "postgresql://postgres.testproject:unused@aws-1-eu-west-1.pooler.supabase.com:5432/postgres",
+});
+
 test("backfill dry-run processes bounded years sequentially with identical narrowing", async (t) => {
   const evidenceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "uk-aq-bc-backfill-dry-"));
   t.after(async () => await fs.rm(evidenceRoot, { recursive: true, force: true }));
@@ -1397,6 +1408,7 @@ test("backfill dry-run processes bounded years sequentially with identical narro
   const result = await runBlackCarbonObservationReconciler({
     argv: [
       "--mode", "backfill",
+      "--environment", "TEST",
       "--to", "2022-06-30",
       "--station", "UKA00001",
       "--property", "uv370,bc",
@@ -1407,7 +1419,7 @@ test("backfill dry-run processes bounded years sequentially with identical narro
       "--run-id", "backfill-dry-test",
       "--evidence-root", evidenceRoot,
     ],
-    env: { UK_AQ_ENV_NAME: "TEST" },
+    env: TEST_RECONCILER_ENV,
     now: new Date("2022-07-01T12:00:00.000Z"),
     clock: () => new Date("2022-07-01T12:01:00.000Z"),
     runBackfillYear: async (input) => {
@@ -1434,6 +1446,7 @@ test("backfill dry-run processes bounded years sequentially with identical narro
     assert.deepEqual(call.childArgv.slice(0, 6), [
       "--mode", "range", "--from", call.range.from_day, "--to", call.range.to_day,
     ]);
+    assert.equal(call.childArgv[call.childArgv.indexOf("--environment") + 1], "TEST");
     assert.ok(call.childArgv.includes("--dry-run"));
     assert.equal(call.childArgv[call.childArgv.indexOf("--station") + 1], "UKA00001");
     assert.equal(call.childArgv[call.childArgv.indexOf("--property") + 1], "bc,uv370");
@@ -1455,12 +1468,13 @@ test("backfill apply starts one independently protected range child per year", a
   const result = await runBlackCarbonObservationReconciler({
     argv: [
       "--mode", "backfill",
+      "--environment", "TEST",
       "--to", "2021-12-31",
       "--apply",
       "--run-id", "backfill-apply-test",
       "--evidence-root", evidenceRoot,
     ],
-    env: { UK_AQ_ENV_NAME: "TEST" },
+    env: TEST_RECONCILER_ENV,
     now: new Date("2022-01-01T12:00:00.000Z"),
     runBackfillYear: async (input) => {
       calls.push(input);
@@ -1490,12 +1504,13 @@ test("backfill failure stops later years and records completed, failed and unatt
   const result = await runBlackCarbonObservationReconciler({
     argv: [
       "--mode", "backfill",
+      "--environment", "TEST",
       "--to", "2022-12-31",
       "--dry-run",
       "--run-id", "backfill-failure-test",
       "--evidence-root", evidenceRoot,
     ],
-    env: { UK_AQ_ENV_NAME: "TEST" },
+    env: TEST_RECONCILER_ENV,
     now: new Date("2023-01-01T12:00:00.000Z"),
     runBackfillYear: async (input) => {
       attempted.push(input.year);
@@ -1542,12 +1557,13 @@ test("a new backfill run still attempts an already canonical year and preserves 
     const result = await runBlackCarbonObservationReconciler({
       argv: [
         "--mode", "backfill",
+        "--environment", "TEST",
         "--to", "2020-12-31",
         "--apply",
         "--run-id", runId,
         "--evidence-root", evidenceRoot,
       ],
-      env: { UK_AQ_ENV_NAME: "TEST" },
+      env: TEST_RECONCILER_ENV,
       now: new Date("2021-01-01T12:00:00.000Z"),
       runBackfillYear: async (input) => {
         attempted.push({ runId, year: input.year });
