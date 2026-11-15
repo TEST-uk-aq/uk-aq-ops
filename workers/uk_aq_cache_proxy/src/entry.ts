@@ -16,8 +16,9 @@ import {
   WHO_DAILY_SERIES_API_PATH,
   type WhoDailySeriesProxyEnv,
 } from "./who_daily_series_route.ts";
+import { handleBcUvDiurnalProxyRequest, BC_UV_DIURNAL_API_PATH, type BcUvDiurnalEnv } from "./bc_uv_diurnal_route.ts";
 
-type Env = CacheProxyEnv & MediaPublicRouteEnv & WhoSummaryProxyEnv & WhoDailySeriesProxyEnv;
+type Env = CacheProxyEnv & MediaPublicRouteEnv & WhoSummaryProxyEnv & WhoDailySeriesProxyEnv & BcUvDiurnalEnv;
 
 type ExecutionContext = {
   waitUntil(promise: Promise<unknown>): void;
@@ -36,6 +37,9 @@ export default {
     }
     if (url.pathname === WHO_DAILY_SERIES_API_PATH) {
       return handleWhoDailySeriesProxyRequest(request, env, ctx);
+    }
+    if (url.pathname === BC_UV_DIURNAL_API_PATH) {
+      return handleBcUvDiurnalProxyRequest(request, env);
     }
     return cacheProxy.fetch(request, env, ctx);
   },

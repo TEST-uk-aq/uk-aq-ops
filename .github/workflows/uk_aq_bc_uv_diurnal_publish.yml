@@ -1,0 +1,69 @@
+name: Publish TEST BC/UV Diurnal Product
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Explicit environment identity"
+        required: true
+        type: choice
+        options:
+          - TEST
+      from_day:
+        description: "First source month, YYYY-MM-01 (default 2024-01-01)"
+        required: true
+        default: "2024-01-01"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-bc-uv-diurnal-publish-test
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    environment: TEST
+    env:
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
+      UK_AQ_GITHUB_REPO: ${{ vars.UK_AQ_GITHUB_REPO }}
+      UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION }}
+      SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET }}
+      CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
+      CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
+      CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
+      INPUT_ENVIRONMENT: ${{ inputs.environment }}
+      INPUT_FROM_DAY: ${{ inputs.from_day }}
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24.22.1"
+      - run: npm ci --ignore-scripts
+      - name: Validate TEST target
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REPOSITORY}" = "TEST-uk-aq/uk-aq-ops"
+          test "${UK_AQ_GITHUB_REPO}" = "${GITHUB_REPOSITORY}"
+          test "${INPUT_ENVIRONMENT}" = "TEST"
+          test "${UK_AQ_ENV_NAME}" = "TEST"
+          test "${UK_AQ_R2_HISTORY_VERSION}" = "v3"
+          test -n "${SUPABASE_URL}"
+          test -n "${SUPABASE_DB_URL}"
+          test -n "${CLOUDFLARE_ACCOUNT_ID}"
+          test -n "${CFLARE_R2_ENDPOINT}"
+          test -n "${CFLARE_R2_BUCKET}"
+          test -n "${CFLARE_R2_ACCESS_KEY_ID}"
+          test -n "${CFLARE_R2_SECRET_ACCESS_KEY}"
+          test "${CFLARE_R2_ENDPOINT}" = "https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          [[ "${CFLARE_R2_BUCKET}" == *-test ]]
+      - name: Build, validate and atomically publish latest
+        run: node scripts/ukair_bc/build_bc_uv_diurnal.mjs --environment TEST --from "${INPUT_FROM_DAY}" --publish
