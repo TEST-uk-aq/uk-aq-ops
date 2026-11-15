@@ -61,6 +61,38 @@ async function json(r2, key) {
   return { payload: JSON.parse(body.toString("utf8")), body };
 }
 
+export function selectPublicStations(stationRows, seriesRows) {
+  if (!stationRows.length) throw new Error("No current public Black Carbon stations");
+  const byStation = new Map(stationRows.map((row) => [Number(row.station_id), {
+    station_id: Number(row.station_id), station_ref: row.station_ref, name: row.name,
+    latitude: row.latitude == null ? NaN : Number(row.latitude),
+    longitude: row.longitude == null ? NaN : Number(row.longitude),
+    timeseries_ids: { bc: null, uv370: null },
+  }]));
+  for (const row of seriesRows) {
+    const station = byStation.get(Number(row.station_id));
+    if (!station) continue;
+    const timeseriesId = Number(row.timeseries_id);
+    if (!Object.hasOwn(station.timeseries_ids, row.property) || station.timeseries_ids[row.property] !== null ||
+        row.timeseries_ref !== `${station.station_ref}:${row.property}` || row.service_ref !== "ukair_bc" ||
+        row.uom !== "ug/m3" || !Number.isSafeInteger(timeseriesId) || timeseriesId <= 0) {
+      throw new Error("Contradictory Black Carbon timeseries identity");
+    }
+    station.timeseries_ids[row.property] = timeseriesId;
+  }
+  const stations = [...byStation.values()].filter((station) =>
+    Object.values(station.timeseries_ids).some((id) => id !== null));
+  if (!stations.length) throw new Error("No eligible public Black Carbon stations with BC/UV370 timeseries");
+  for (const station of stations) {
+    if (!Number.isSafeInteger(station.station_id) || station.station_id <= 0 ||
+        !Number.isFinite(station.latitude) || !Number.isFinite(station.longitude) || !station.name ||
+        !/^[A-Z0-9]+$/.test(station.station_ref)) {
+      throw new Error(`Incomplete public station metadata: ${station.station_ref}`);
+    }
+  }
+  return stations;
+}
+
 async function metadata(databaseUrl) {
   const client = new Client({ connectionString: databaseUrl });
   await client.connect();
@@ -77,7 +109,6 @@ async function metadata(databaseUrl) {
       where s.connector_id = $1 and s.service_ref = 'ukair_bc'
         and s.removed_at is null and n.network_code = 'black_carbon' and n.public_display_enabled is true
       order by s.station_ref, s.id`, [connectorId]);
-    if (!stations.rows.length) throw new Error("No current public Black Carbon stations");
     const series = await client.query(`
       select t.id as timeseries_id, t.station_id::bigint::text as station_id,
         t.timeseries_ref, t.service_ref, t.uom, lower(btrim(op.code)) as property
@@ -85,25 +116,7 @@ async function metadata(databaseUrl) {
       join uk_aq_core.phenomena p on p.id = t.phenomenon_id
       join uk_aq_core.observed_properties op on op.id = p.observed_property_id
       where t.connector_id = $1 and lower(btrim(op.code)) in ('bc', 'uv370')`, [connectorId]);
-    const byStation = new Map(stations.rows.map((row) => [Number(row.station_id), {
-      station_id: Number(row.station_id), station_ref: row.station_ref, name: row.name,
-      latitude: Number(row.latitude), longitude: Number(row.longitude), timeseries_ids: { bc: null, uv370: null },
-    }]));
-    for (const row of series.rows) {
-      const station = byStation.get(Number(row.station_id));
-      if (!station) continue;
-      if (station.timeseries_ids[row.property] !== null || row.timeseries_ref !== `${station.station_ref}:${row.property}` ||
-          row.service_ref !== "ukair_bc" || row.uom !== "ug/m3") throw new Error("Contradictory Black Carbon timeseries identity");
-      station.timeseries_ids[row.property] = Number(row.timeseries_id);
-    }
-    for (const station of byStation.values()) {
-      if (!Number.isFinite(station.latitude) || !Number.isFinite(station.longitude) || !station.name ||
-          !/^[A-Z0-9]+$/.test(station.station_ref) ||
-          !Object.values(station.timeseries_ids).some((id) => Number.isSafeInteger(id) && id > 0)) {
-        throw new Error(`Incomplete public station metadata: ${station.station_ref}`);
-      }
-    }
-    return { connectorId, stations: [...byStation.values()] };
+    return { connectorId, stations: selectPublicStations(stations.rows, series.rows) };
   } finally { await client.end(); }
 }
 
