@@ -1,0 +1,10 @@
+{
+  "environment": "TEST",
+  "collected_at_utc": "20261115T132000Z",
+  "window_start_utc": "2026-11-14T14:20:00Z",
+  "window_end_utc": "2026-11-15T13:20:00Z",
+  "ingestdb_project": "zztjgmdiftqtdcrlfpvc",
+  "obs_aqidb_project": "waytarxkjprweyifffvq",
+  "measurement": "estimated serialized log bytes",
+  "exact_billed_bytes": false
+}

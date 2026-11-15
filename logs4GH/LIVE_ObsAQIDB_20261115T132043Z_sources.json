@@ -1,0 +1,1 @@
+{"result":[{"estimated_mb":2.32,"events":1278,"source":"edge_logs"},{"estimated_mb":0.2,"events":285,"source":"postgres_logs"},{"estimated_mb":0.02,"events":61,"source":"postgrest_logs"},{"estimated_mb":0.02,"events":20,"source":"supavisor_logs"}]}
