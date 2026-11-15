@@ -58,10 +58,6 @@ export function createAccumulator(stations, firstMonth) {
     const seen = [new Map(), new Map()];
     for (const [index, [property, rows]] of [["bc", bcRows], ["uv370", uvRows]].entries()) {
       for (const row of rows) {
-        const canonicalDay = sourceSlot(row.observed_at_utc).source_day;
-        if (canonicalDay.slice(0, 7) >= firstMonth && (!sourceThroughDay || canonicalDay > sourceThroughDay)) {
-          sourceThroughDay = canonicalDay;
-        }
         const series = bySeries.get(row.timeseries_id);
         if (!series || series.property !== property || series.station_id !== row.station_id || row.pollutant_code !== property) {
           // Historical or non-public stations are valid canonical rows, but a selected

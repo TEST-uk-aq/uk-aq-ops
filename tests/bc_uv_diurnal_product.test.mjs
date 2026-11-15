@@ -45,3 +45,19 @@ test("ambiguous exact source identity fails generation", () => {
     row(11, "bc", "2024-01-02T01:00:00.000Z", 2),
   ], []), /Ambiguous exact observation pair/);
 });
+
+test("excluded newer station cannot advance public source-through day", () => {
+  const second = { ...station, station_id: 2, station_ref: "UKA00002", timeseries_ids: { bc: 21, uv370: 22 } };
+  const builder = createAccumulator([station, second], "2024-01");
+  builder.addCanonicalDay([row(11, "bc", "2024-01-02T01:00:00.000Z", 1)], []);
+  builder.addCanonicalDay([{ ...row(21, "bc", "2024-01-01T01:00:00.000Z", 2), station_id: 2 }], []);
+  builder.addCanonicalDay([{ ...row(31, "bc", "2024-02-10T01:00:00.000Z", 3), station_id: 3 }], [
+    { ...row(32, "uv370", "2024-02-10T01:00:00.000Z", 4), station_id: 3 },
+  ]);
+  const product = builder.finish("2024-02-11T00:00:00.000Z");
+  assert.equal(product.source_through_day, "2024-01-02");
+  assert.deepEqual(product.months.map(({ month }) => month), ["2024-01"]);
+  assert.equal(product.sensors[0].profiles.bc[0].observed_source_days, 1);
+  assert.equal(product.sensors[1].profiles.bc[0].observed_source_days, 1);
+  assert.equal(product.sensors[1].profiles.bc[0].points[0].mean_ugm3, 2);
+});

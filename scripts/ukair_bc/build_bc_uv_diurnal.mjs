@@ -16,28 +16,43 @@ import { createAccumulator, validateProduct } from "./bc_uv_diurnal_product.mjs"
 
 export const LATEST_KEY = "derived/bc_uv_diurnal/v1/latest.json";
 
-function requireEnvironment(env, requested) {
-  if (requested !== "TEST" || env.UK_AQ_ENV_NAME !== requested || env.UK_AQ_R2_HISTORY_VERSION !== "v3") {
-    throw new Error("This workflow requires explicit TEST identity and canonical v3 history");
+export function requireEnvironment(env, requested) {
+  if (!["TEST", "LIVE"].includes(requested) || env.UK_AQ_ENV_NAME !== requested) {
+    throw new Error("Requested environment must explicitly match UK_AQ_ENV_NAME");
   }
-  if (env.UK_AQ_GITHUB_REPO && env.UK_AQ_GITHUB_REPO !== "TEST-uk-aq/uk-aq-ops") {
-    throw new Error("Unexpected repository identity");
+  if (String(env.UK_AQ_GITHUB_REPO || "").trim() === "" ||
+      String(env.GITHUB_REPOSITORY || "").trim() !== String(env.UK_AQ_GITHUB_REPO).trim()) {
+    throw new Error("Executing repository must match UK_AQ_GITHUB_REPO");
   }
-  const account = String(env.CLOUDFLARE_ACCOUNT_ID || "");
-  const endpoint = String(env.CFLARE_R2_ENDPOINT || "");
-  const bucket = String(env.CFLARE_R2_BUCKET || "");
+  if (env.UK_AQ_R2_HISTORY_VERSION !== "v3") {
+    throw new Error("BC/UV derivation requires canonical v3 history");
+  }
+  const account = String(env.CLOUDFLARE_ACCOUNT_ID || "").trim();
+  const endpoint = String(env.CFLARE_R2_ENDPOINT || "").trim();
+  const bucket = String(env.CFLARE_R2_BUCKET || "").trim();
+  const accessKeyId = String(env.CFLARE_R2_ACCESS_KEY_ID || "").trim();
+  const secretAccessKey = String(env.CFLARE_R2_SECRET_ACCESS_KEY || "").trim();
   if (!/^[0-9a-f]{32}$/.test(account) || endpoint !== `https://${account}.r2.cloudflarestorage.com` ||
-      !bucket.endsWith("-test") || !env.CFLARE_R2_ACCESS_KEY_ID || !env.CFLARE_R2_SECRET_ACCESS_KEY) {
-    throw new Error("Complete TEST R2 configuration is required");
+      !bucket.endsWith(`-${requested.toLowerCase()}`) || !accessKeyId || !secretAccessKey) {
+    throw new Error("Complete environment-matched R2 configuration is required");
   }
   const supabase = new URL(String(env.SUPABASE_URL || ""));
   const database = new URL(String(env.SUPABASE_DB_URL || ""));
   const ref = /^([a-z0-9]+)\.supabase\.co$/.exec(supabase.hostname)?.[1];
   if (supabase.protocol !== "https:" || !ref || !["postgres:", "postgresql:"].includes(database.protocol) ||
       !(database.username === `postgres.${ref}` || database.hostname === `db.${ref}.supabase.co`)) {
-    throw new Error("Metadata database does not match configured TEST Supabase project");
+    throw new Error("Metadata database does not match configured Supabase project");
   }
-  return resolveR2HistoryIndexConfig(env).r2;
+  const r2 = resolveR2HistoryIndexConfig(env).r2;
+  if (r2.endpoint !== endpoint || r2.bucket !== bucket || r2.access_key_id !== accessKeyId ||
+      r2.secret_access_key !== secretAccessKey ||
+      (env.R2_ENDPOINT && String(env.R2_ENDPOINT).trim() !== endpoint) ||
+      (env.R2_BUCKET && String(env.R2_BUCKET).trim() !== bucket) ||
+      (env.R2_ACCESS_KEY_ID && String(env.R2_ACCESS_KEY_ID).trim() !== accessKeyId) ||
+      (env.R2_SECRET_ACCESS_KEY && String(env.R2_SECRET_ACCESS_KEY).trim() !== secretAccessKey)) {
+    throw new Error("R2 configuration contradicts selected environment");
+  }
+  return r2;
 }
 
 async function json(r2, key) {
@@ -116,7 +131,7 @@ async function selectedDays(r2, prefix, firstMonth) {
 }
 
 export async function buildBcUvDiurnal({ env = process.env, fromDay = "2024-01-01", publish = false,
-  requestedEnvironment = "TEST", now = new Date() } = {}) {
+  requestedEnvironment, now = new Date() } = {}) {
   if (!/^\d{4}-\d{2}-01$/.test(fromDay) || !Number.isFinite(Date.parse(`${fromDay}T00:00:00Z`)) ||
       new Date(`${fromDay}T00:00:00Z`).toISOString().slice(0, 10) !== fromDay) {
     throw new Error("--from must be the first day of a valid UTC month");
@@ -170,7 +185,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const known = new Set(["--environment", "--from", "--publish"]);
   if (args.some((arg, i) => arg.startsWith("--") && !known.has(arg)) ||
       !value("--environment") || (args.includes("--from") && !value("--from"))) {
-    process.stderr.write("Usage: node scripts/ukair_bc/build_bc_uv_diurnal.mjs --environment TEST [--from YYYY-MM-01] [--publish]\n");
+    process.stderr.write("Usage: node scripts/ukair_bc/build_bc_uv_diurnal.mjs --environment TEST|LIVE [--from YYYY-MM-01] [--publish]\n");
     process.exitCode = 2;
   } else {
     buildBcUvDiurnal({ requestedEnvironment: value("--environment"), fromDay: value("--from") || "2024-01-01", publish: args.includes("--publish") })

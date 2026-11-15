@@ -1,4 +1,4 @@
-name: Publish TEST BC/UV Diurnal Product
+name: Publish BC/UV Diurnal Product
 
 on:
   workflow_dispatch:
@@ -9,6 +9,7 @@ on:
         type: choice
         options:
           - TEST
+          - LIVE
       from_day:
         description: "First source month, YYYY-MM-01 (default 2024-01-01)"
         required: true
@@ -19,14 +20,16 @@ permissions:
   contents: read
 
 concurrency:
-  group: uk-aq-bc-uv-diurnal-publish-test
+  group: uk-aq-bc-uv-diurnal-publish-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    environment: TEST
+    # Select the repository's configured environment, not an input-selected
+    # GitHub environment that could expose another target's secrets.
+    environment: ${{ vars.UK_AQ_ENV_NAME }}
     env:
       UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
       UK_AQ_GITHUB_REPO: ${{ vars.UK_AQ_GITHUB_REPO }}
@@ -48,13 +51,14 @@ jobs:
         with:
           node-version: "24.22.1"
       - run: npm ci --ignore-scripts
-      - name: Validate TEST target
+      - name: Validate configured target
         run: |
           set -euo pipefail
-          test "${GITHUB_REPOSITORY}" = "TEST-uk-aq/uk-aq-ops"
+          test -n "${GITHUB_REPOSITORY}"
+          test -n "${UK_AQ_GITHUB_REPO}"
           test "${UK_AQ_GITHUB_REPO}" = "${GITHUB_REPOSITORY}"
-          test "${INPUT_ENVIRONMENT}" = "TEST"
-          test "${UK_AQ_ENV_NAME}" = "TEST"
+          case "${UK_AQ_ENV_NAME}" in TEST|LIVE) ;; *) exit 1 ;; esac
+          test "${INPUT_ENVIRONMENT}" = "${UK_AQ_ENV_NAME}"
           test "${UK_AQ_R2_HISTORY_VERSION}" = "v3"
           test -n "${SUPABASE_URL}"
           test -n "${SUPABASE_DB_URL}"
@@ -64,6 +68,6 @@ jobs:
           test -n "${CFLARE_R2_ACCESS_KEY_ID}"
           test -n "${CFLARE_R2_SECRET_ACCESS_KEY}"
           test "${CFLARE_R2_ENDPOINT}" = "https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          [[ "${CFLARE_R2_BUCKET}" == *-test ]]
+          [[ "${CFLARE_R2_BUCKET}" == *-"${UK_AQ_ENV_NAME,,}" ]]
       - name: Build, validate and atomically publish latest
-        run: node scripts/ukair_bc/build_bc_uv_diurnal.mjs --environment TEST --from "${INPUT_FROM_DAY}" --publish
+        run: node scripts/ukair_bc/build_bc_uv_diurnal.mjs --environment "${INPUT_ENVIRONMENT}" --from "${INPUT_FROM_DAY}" --publish
