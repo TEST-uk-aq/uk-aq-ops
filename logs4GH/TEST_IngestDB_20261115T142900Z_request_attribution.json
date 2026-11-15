@@ -1,0 +1,1746 @@
+{
+  "environment": "TEST",
+  "project": "IngestDB",
+  "window_start_utc": "2026-11-14T15:29:00Z",
+  "window_end_utc": "2026-11-15T14:29:00Z",
+  "measurement": "estimated serialized event-message plus log-attribute bytes; not billed bytes",
+  "field_presence": {
+    "matched_events": 115266,
+    "method_events": 115266,
+    "status_events": 115266,
+    "user_agent_events": 115266,
+    "x_client_info_events": 388
+  },
+  "result": [
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 9735,
+      "hour_utc": "2026-11-14T15:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 2,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 774807,
+      "hour_utc": "2026-11-14T15:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 447,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 9779,
+      "hour_utc": "2026-11-14T15:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 2,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 1585077,
+      "hour_utc": "2026-11-14T15:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 894,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 495325,
+      "hour_utc": "2026-11-14T15:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 298,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 504154,
+      "hour_utc": "2026-11-14T15:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 298,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 16058,
+      "hour_utc": "2026-11-14T15:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 8,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 21260,
+      "hour_utc": "2026-11-14T16:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1768273,
+      "hour_utc": "2026-11-14T16:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1020,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 21347,
+      "hour_utc": "2026-11-14T16:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3617450,
+      "hour_utc": "2026-11-14T16:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2040,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1130462,
+      "hour_utc": "2026-11-14T16:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 680,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1150604,
+      "hour_utc": "2026-11-14T16:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 680,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 32112,
+      "hour_utc": "2026-11-14T16:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 16,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 21226,
+      "hour_utc": "2026-11-14T17:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1763836,
+      "hour_utc": "2026-11-14T17:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1017,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 21314,
+      "hour_utc": "2026-11-14T17:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3608333,
+      "hour_utc": "2026-11-14T17:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2034,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1127642,
+      "hour_utc": "2026-11-14T17:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 678,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1147712,
+      "hour_utc": "2026-11-14T17:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 678,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 32109,
+      "hour_utc": "2026-11-14T17:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 16,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 21600,
+      "hour_utc": "2026-11-14T18:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1805463,
+      "hour_utc": "2026-11-14T18:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1041,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 21686,
+      "hour_utc": "2026-11-14T18:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3693493,
+      "hour_utc": "2026-11-14T18:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2082,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1154243,
+      "hour_utc": "2026-11-14T18:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 694,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_hourly_fingerprint",
+      "estimated_serialized_bytes": 5379796,
+      "hour_utc": "2026-11-14T18:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 2508,
+      "user_agent_class": "python-requests"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1174827,
+      "hour_utc": "2026-11-14T18:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 694,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 32111,
+      "hour_utc": "2026-11-14T18:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 16,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 21301,
+      "hour_utc": "2026-11-14T19:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1751694,
+      "hour_utc": "2026-11-14T19:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1010,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 21389,
+      "hour_utc": "2026-11-14T19:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3590611,
+      "hour_utc": "2026-11-14T19:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2024,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1114344,
+      "hour_utc": "2026-11-14T19:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 670,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1134185,
+      "hour_utc": "2026-11-14T19:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 670,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 30202,
+      "hour_utc": "2026-11-14T19:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 15,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 21266,
+      "hour_utc": "2026-11-14T20:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1763837,
+      "hour_utc": "2026-11-14T20:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1017,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 21353,
+      "hour_utc": "2026-11-14T20:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3601251,
+      "hour_utc": "2026-11-14T20:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2030,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1127644,
+      "hour_utc": "2026-11-14T20:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 678,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1140995,
+      "hour_utc": "2026-11-14T20:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 674,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 32114,
+      "hour_utc": "2026-11-14T20:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 16,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 21185,
+      "hour_utc": "2026-11-14T21:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1749511,
+      "hour_utc": "2026-11-14T21:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1009,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 21273,
+      "hour_utc": "2026-11-14T21:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3579037,
+      "hour_utc": "2026-11-14T21:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2018,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1109042,
+      "hour_utc": "2026-11-14T21:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 667,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1125463,
+      "hour_utc": "2026-11-14T21:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 665,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 30199,
+      "hour_utc": "2026-11-14T21:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 15,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 20784,
+      "hour_utc": "2026-11-14T22:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1705617,
+      "hour_utc": "2026-11-14T22:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 984,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 20872,
+      "hour_utc": "2026-11-14T22:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3489288,
+      "hour_utc": "2026-11-14T22:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1968,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1090407,
+      "hour_utc": "2026-11-14T22:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 656,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1109859,
+      "hour_utc": "2026-11-14T22:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 656,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 32113,
+      "hour_utc": "2026-11-14T22:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 16,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 21076,
+      "hour_utc": "2026-11-14T23:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1728177,
+      "hour_utc": "2026-11-14T23:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 997,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 21163,
+      "hour_utc": "2026-11-14T23:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3554924,
+      "hour_utc": "2026-11-14T23:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2005,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1103721,
+      "hour_utc": "2026-11-14T23:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 664,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1130193,
+      "hour_utc": "2026-11-14T23:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 668,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 30196,
+      "hour_utc": "2026-11-14T23:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 15,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 21471,
+      "hour_utc": "2026-11-15T00:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1804426,
+      "hour_utc": "2026-11-15T00:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1041,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 21559,
+      "hour_utc": "2026-11-15T00:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3689648,
+      "hour_utc": "2026-11-15T00:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2081,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1153528,
+      "hour_utc": "2026-11-15T00:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 694,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_hourly_fingerprint",
+      "estimated_serialized_bytes": 5386220,
+      "hour_utc": "2026-11-15T00:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 2511,
+      "user_agent_class": "python-requests"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1174178,
+      "hour_utc": "2026-11-15T00:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 694,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 25992,
+      "hour_utc": "2026-11-15T00:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 13,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 21706,
+      "hour_utc": "2026-11-15T01:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1825226,
+      "hour_utc": "2026-11-15T01:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1053,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 21793,
+      "hour_utc": "2026-11-15T01:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3726882,
+      "hour_utc": "2026-11-15T01:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2102,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1160195,
+      "hour_utc": "2026-11-15T01:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 698,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1184296,
+      "hour_utc": "2026-11-15T01:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 700,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 19890,
+      "hour_utc": "2026-11-15T01:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 10,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 22822,
+      "hour_utc": "2026-11-15T02:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1967362,
+      "hour_utc": "2026-11-15T02:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1135,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 22909,
+      "hour_utc": "2026-11-15T02:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 4022985,
+      "hour_utc": "2026-11-15T02:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2269,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1251611,
+      "hour_utc": "2026-11-15T02:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 753,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-js",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_hourly_fingerprint",
+      "estimated_serialized_bytes": 57905,
+      "hour_utc": "2026-11-15T02:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 33,
+      "user_agent_class": "node"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1270585,
+      "hour_utc": "2026-11-15T02:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 751,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 30199,
+      "hour_utc": "2026-11-15T02:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 15,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 21243,
+      "hour_utc": "2026-11-15T03:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1764576,
+      "hour_utc": "2026-11-15T03:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1018,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 21331,
+      "hour_utc": "2026-11-15T03:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3608106,
+      "hour_utc": "2026-11-15T03:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2035,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1126990,
+      "hour_utc": "2026-11-15T03:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 678,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1147118,
+      "hour_utc": "2026-11-15T03:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 678,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 32107,
+      "hour_utc": "2026-11-15T03:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 16,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 22636,
+      "hour_utc": "2026-11-15T04:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1948305,
+      "hour_utc": "2026-11-15T04:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1124,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 22723,
+      "hour_utc": "2026-11-15T04:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3987538,
+      "hour_utc": "2026-11-15T04:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2249,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1244996,
+      "hour_utc": "2026-11-15T04:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 749,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1268910,
+      "hour_utc": "2026-11-15T04:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 750,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 32104,
+      "hour_utc": "2026-11-15T04:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 16,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 22393,
+      "hour_utc": "2026-11-15T05:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1912684,
+      "hour_utc": "2026-11-15T05:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1103,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 22480,
+      "hour_utc": "2026-11-15T05:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3914642,
+      "hour_utc": "2026-11-15T05:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2207,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1223936,
+      "hour_utc": "2026-11-15T05:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 736,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1245766,
+      "hour_utc": "2026-11-15T05:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 736,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 32104,
+      "hour_utc": "2026-11-15T05:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 16,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 23162,
+      "hour_utc": "2026-11-15T06:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 2013577,
+      "hour_utc": "2026-11-15T06:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1161,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 23249,
+      "hour_utc": "2026-11-15T06:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 4119243,
+      "hour_utc": "2026-11-15T06:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2322,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1287264,
+      "hour_utc": "2026-11-15T06:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 774,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_hourly_fingerprint",
+      "estimated_serialized_bytes": 5379789,
+      "hour_utc": "2026-11-15T06:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 2508,
+      "user_agent_class": "python-requests"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1310283,
+      "hour_utc": "2026-11-15T06:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 774,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 32102,
+      "hour_utc": "2026-11-15T06:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 16,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 21784,
+      "hour_utc": "2026-11-15T07:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1826281,
+      "hour_utc": "2026-11-15T07:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1053,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 21872,
+      "hour_utc": "2026-11-15T07:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3732528,
+      "hour_utc": "2026-11-15T07:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2104,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1164242,
+      "hour_utc": "2026-11-15T07:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 700,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1185033,
+      "hour_utc": "2026-11-15T07:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 700,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 32102,
+      "hour_utc": "2026-11-15T07:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 16,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 21251,
+      "hour_utc": "2026-11-15T08:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1758659,
+      "hour_utc": "2026-11-15T08:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1014,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 21338,
+      "hour_utc": "2026-11-15T08:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3594174,
+      "hour_utc": "2026-11-15T08:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2026,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1121014,
+      "hour_utc": "2026-11-15T08:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 674,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1140994,
+      "hour_utc": "2026-11-15T08:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 674,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 32104,
+      "hour_utc": "2026-11-15T08:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 16,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 21362,
+      "hour_utc": "2026-11-15T09:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1779459,
+      "hour_utc": "2026-11-15T09:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1026,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 21449,
+      "hour_utc": "2026-11-15T09:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3626105,
+      "hour_utc": "2026-11-15T09:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2044,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1124308,
+      "hour_utc": "2026-11-15T09:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 676,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1144366,
+      "hour_utc": "2026-11-15T09:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 676,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 32105,
+      "hour_utc": "2026-11-15T09:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 16,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 21592,
+      "hour_utc": "2026-11-15T10:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1821074,
+      "hour_utc": "2026-11-15T10:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1050,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 21680,
+      "hour_utc": "2026-11-15T10:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3725437,
+      "hour_utc": "2026-11-15T10:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2100,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1164243,
+      "hour_utc": "2026-11-15T10:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 700,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1185026,
+      "hour_utc": "2026-11-15T10:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 700,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 32106,
+      "hour_utc": "2026-11-15T10:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 16,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 22547,
+      "hour_utc": "2026-11-15T11:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1928595,
+      "hour_utc": "2026-11-15T11:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1112,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 22634,
+      "hour_utc": "2026-11-15T11:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3943633,
+      "hour_utc": "2026-11-15T11:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2223,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1234059,
+      "hour_utc": "2026-11-15T11:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 742,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1256137,
+      "hour_utc": "2026-11-15T11:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 742,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 32106,
+      "hour_utc": "2026-11-15T11:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 16,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 22379,
+      "hour_utc": "2026-11-15T12:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1904330,
+      "hour_utc": "2026-11-15T12:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1098,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 22466,
+      "hour_utc": "2026-11-15T12:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3895739,
+      "hour_utc": "2026-11-15T12:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2196,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1217447,
+      "hour_utc": "2026-11-15T12:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 732,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_hourly_fingerprint",
+      "estimated_serialized_bytes": 5381921,
+      "hour_utc": "2026-11-15T12:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 2509,
+      "user_agent_class": "python-requests"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1239184,
+      "hour_utc": "2026-11-15T12:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 732,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 32105,
+      "hour_utc": "2026-11-15T12:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 16,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 22139,
+      "hour_utc": "2026-11-15T13:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 1859227,
+      "hour_utc": "2026-11-15T13:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1072,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 22226,
+      "hour_utc": "2026-11-15T13:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 4,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 3807035,
+      "hour_utc": "2026-11-15T13:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 2146,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 1192507,
+      "hour_utc": "2026-11-15T13:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 717,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 1213783,
+      "hour_utc": "2026-11-15T13:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 717,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 32107,
+      "hour_utc": "2026-11-15T13:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 16,
+      "user_agent_class": "python-httpx"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 11400,
+      "hour_utc": "2026-11-15T14:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 2,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "estimated_serialized_bytes": 978185,
+      "hour_utc": "2026-11-15T14:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 564,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 11443,
+      "hour_utc": "2026-11-15T14:00:00Z",
+      "http_status": 200,
+      "method": "GET",
+      "requests": 2,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "estimated_serialized_bytes": 1997537,
+      "hour_utc": "2026-11-15T14:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 1126,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 625368,
+      "hour_utc": "2026-11-15T14:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 376,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "missing",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 636531,
+      "hour_utc": "2026-11-15T14:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 376,
+      "user_agent_class": "deno"
+    },
+    {
+      "client_info_class": "supabase-py",
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "estimated_serialized_bytes": 16052,
+      "hour_utc": "2026-11-15T14:00:00Z",
+      "http_status": 200,
+      "method": "POST",
+      "requests": 8,
+      "user_agent_class": "python-httpx"
+    }
+  ]
+}
