@@ -1,0 +1,73 @@
+name: Publish BC/UV Diurnal Product
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Explicit environment identity"
+        required: true
+        type: choice
+        options:
+          - TEST
+          - LIVE
+      from_day:
+        description: "First source month, YYYY-MM-01 (default 2024-01-01)"
+        required: true
+        default: "2024-01-01"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-bc-uv-diurnal-publish-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    # Select the repository's configured environment, not an input-selected
+    # GitHub environment that could expose another target's secrets.
+    environment: ${{ vars.UK_AQ_ENV_NAME }}
+    env:
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
+      UK_AQ_GITHUB_REPO: ${{ vars.UK_AQ_GITHUB_REPO }}
+      UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION }}
+      SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET }}
+      CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
+      CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
+      CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
+      INPUT_ENVIRONMENT: ${{ inputs.environment }}
+      INPUT_FROM_DAY: ${{ inputs.from_day }}
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24.22.1"
+      - run: npm ci --ignore-scripts
+      - name: Validate configured target
+        run: |
+          set -euo pipefail
+          test -n "${GITHUB_REPOSITORY}"
+          test -n "${UK_AQ_GITHUB_REPO}"
+          test "${UK_AQ_GITHUB_REPO}" = "${GITHUB_REPOSITORY}"
+          case "${UK_AQ_ENV_NAME}" in TEST|LIVE) ;; *) exit 1 ;; esac
+          test "${INPUT_ENVIRONMENT}" = "${UK_AQ_ENV_NAME}"
+          test "${UK_AQ_R2_HISTORY_VERSION}" = "v3"
+          test -n "${SUPABASE_URL}"
+          test -n "${SUPABASE_DB_URL}"
+          test -n "${CLOUDFLARE_ACCOUNT_ID}"
+          test -n "${CFLARE_R2_ENDPOINT}"
+          test -n "${CFLARE_R2_BUCKET}"
+          test -n "${CFLARE_R2_ACCESS_KEY_ID}"
+          test -n "${CFLARE_R2_SECRET_ACCESS_KEY}"
+          test "${CFLARE_R2_ENDPOINT}" = "https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          [[ "${CFLARE_R2_BUCKET}" == *-"${UK_AQ_ENV_NAME,,}" ]]
+      - name: Build, validate and atomically publish latest
+        run: node scripts/ukair_bc/build_bc_uv_diurnal.mjs --environment "${INPUT_ENVIRONMENT}" --from "${INPUT_FROM_DAY}" --publish
