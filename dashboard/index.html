@@ -872,6 +872,34 @@
         opacity: 1;
       }
 
+      .coverage-bar.has-black-carbon-only .coverage-bar-label {
+        padding-right: min(88px, 52%);
+      }
+
+      .coverage-bar-black-carbon-only {
+        position: absolute;
+        top: 3px;
+        right: 3px;
+        bottom: 3px;
+        width: 78px;
+        max-width: 51%;
+        box-sizing: border-box;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 2px 4px;
+        border-radius: 6px;
+        background: #000000;
+        color: #ffffff;
+        font-size: 10px;
+        font-weight: 700;
+        line-height: 1.05;
+        text-align: center;
+        text-shadow: none;
+        white-space: normal;
+        pointer-events: none;
+      }
+
       .coverage-unknown-badge {
         position: absolute;
         top: 1px;
@@ -4686,6 +4714,71 @@
         return payload.connectors.find((entry) => Number(entry.connector_id) === Number(connectorId)) || null;
       }
 
+      // The counts endpoint derives these from the selected, verified R2 history index.
+      // A positive connector 8 count alone is insufficient if another connector also
+      // has observation rows on the same day.
+      function blackCarbonOnlyR2Days(payload, request) {
+        if (!payload || payload.error || payload.source !== "cloudflare_r2_history_index"
+            || payload.read_version !== latestR2HistoryReadVersion.version
+            || payload.from_day_utc !== request.fromDay || payload.to_day_utc !== request.toDay
+            || payload.grain !== "day" || !Array.isArray(payload.connectors)
+            || payload.domains?.observations?.connector_row_counts_found !== true
+            || (Array.isArray(payload.warnings) && payload.warnings.length > 0)) {
+          return new Set();
+        }
+        const perDay = new Map();
+        for (const connector of payload.connectors) {
+          const connectorId = Number(connector?.connector_id);
+          if (!Number.isSafeInteger(connectorId) || connectorId <= 0 || !Array.isArray(connector.buckets)) {
+            return new Set();
+          }
+          for (const bucket of connector.buckets) {
+            const day = String(bucket?.bucket_key || "");
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || day < request.fromDay || day > request.toDay) continue;
+            const rows = bucket.observations_rows;
+            if (!Number.isSafeInteger(rows) || rows < 0) return new Set();
+            if (rows === 0) continue;
+            const state = perDay.get(day) || { blackCarbon: false, other: false };
+            if (connectorId === 8) state.blackCarbon = true;
+            else state.other = true;
+            perDay.set(day, state);
+          }
+        }
+        return new Set([...perDay].filter(([, state]) => state.blackCarbon && !state.other)
+          .map(([day]) => day));
+      }
+
+      function updateBlackCarbonOnlyCalendarBadges(container, payload, request) {
+        const panel = container.closest('[data-panel="storage-coverage"]');
+        if (!panel) return;
+        const matchingDays = blackCarbonOnlyR2Days(payload, request);
+        panel.querySelectorAll(".coverage-day-cell[data-coverage-day]").forEach((cell) => {
+          const bar = cell.querySelector(".coverage-bar.coverage-bar-r2-observs");
+          if (!bar) return;
+          bar.querySelector(".coverage-bar-black-carbon-only")?.remove();
+          bar.classList.remove("has-black-carbon-only");
+          const baseTooltip = cell.dataset.coverageTooltip || "";
+          cell.title = baseTooltip;
+          cell.setAttribute("aria-label", baseTooltip);
+          if (bar.dataset.originalCoverageTitle === undefined) {
+            bar.dataset.originalCoverageTitle = bar.title;
+          }
+          bar.title = bar.dataset.originalCoverageTitle;
+          if (cell.dataset.r2HistoryPresent !== "true" || cell.classList.contains("is-today")
+              || cell.classList.contains("is-outside")
+              || !matchingDays.has(cell.dataset.coverageDay)) return;
+          const badge = document.createElement("span");
+          badge.className = "coverage-bar-black-carbon-only";
+          badge.textContent = "Black Carbon Only";
+          bar.appendChild(badge);
+          bar.classList.add("has-black-carbon-only");
+          bar.title = `${bar.dataset.originalCoverageTitle} • Black Carbon Only`;
+          const annotatedTooltip = `${baseTooltip} • R2 history: Black Carbon Only`;
+          cell.title = annotatedTooltip;
+          cell.setAttribute("aria-label", annotatedTooltip);
+        });
+      }
+
       function resolveR2ConnectorChartConfigs(payload) {
         const seen = new Set();
         const resolved = [];
@@ -4891,6 +4984,7 @@
           : null;
         if (cached) {
           renderR2ConnectorCountsBody(container, request, isYearMode, cached);
+          updateBlackCarbonOnlyCalendarBadges(container, cached, request);
           return;
         }
 
@@ -4926,6 +5020,7 @@
             fetchedAtMs: Date.now(),
           };
           renderR2ConnectorCountsBody(container, request, isYearMode, payload);
+          updateBlackCarbonOnlyCalendarBadges(container, payload, request);
           if (String(errorEl.textContent || "").startsWith(R2_CONNECTOR_COUNTS_ERROR_PREFIX)) {
             setError("");
           }
@@ -5146,7 +5241,7 @@
               };
 
               return `
-                <div class="coverage-day-cell${outsideClass}${todayClass}" title="${escapeHtml(dayTooltip)}" tabindex="0" role="img" aria-label="${escapeHtml(dayTooltip)}">
+                <div class="coverage-day-cell${outsideClass}${todayClass}" data-coverage-day="${cell.dateKey}" data-r2-history-present="${cell.coverage.r2Observs === true}" data-coverage-tooltip="${escapeHtml(dayTooltip)}" title="${escapeHtml(dayTooltip)}" tabindex="0" role="img" aria-label="${escapeHtml(dayTooltip)}">
                   <div class="coverage-day-title">
                     <span class="coverage-day-number">${cell.dayNumber}</span>
                     <span class="coverage-day-weekday">${escapeHtml(cell.weekdayLabel)}</span>
@@ -5159,7 +5254,7 @@
             })
             .join("");
           bodyMarkup = `<div class="coverage-calendar-grid">${cellsMarkup}</div>`;
-          footnoteText = "Up to three compact rows, without gaps for absent sources: IngestDB (red), ObsAQIDB - Obs (blue), R2 History - Obs / Backup - Obs (orange). A small Dropbox icon marks confirmed backup; backup-only days use the same orange row. ? marks unknown source evidence; tooltips list each source independently. The orange row is empty only when both R2 and Dropbox are confirmed absent. Today shows half-width bars without labels.";
+          footnoteText = "Up to three compact rows, without gaps for absent sources: IngestDB (red), ObsAQIDB - Obs (blue), R2 History - Obs / Backup - Obs (orange). A small Dropbox icon marks confirmed backup; backup-only days use the same orange row. ? marks unknown source evidence; tooltips list each source independently. The orange row is empty only when both R2 and Dropbox are confirmed absent. A black 'Black Carbon Only' badge identifies dates when connector 8 is the only connector represented in R2 observations. Today shows half-width bars without labels.";
         }
 
         panel.innerHTML = `
