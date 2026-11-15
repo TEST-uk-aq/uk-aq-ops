@@ -2200,6 +2200,12 @@
           observsColor: "#000000",
         },
         {
+          connectorId: 8,
+          title: "Black Carbon",
+          chartTitle: "Black Carbon - Connector 8",
+          observsColor: "#4B443A",
+        },
+        {
           connectorId: 9,
           title: "WAQN",
           observsColor: "#4B443A",
@@ -4919,7 +4925,7 @@
         } else if (!isLoading) {
           const cardsMarkup = chartConfigs.map((config) => {
             const entry = findR2ConnectorCountsEntry(payload, config.connectorId);
-            const chartTitle = `${config.title} - Connector Id ${config.connectorId}`;
+            const chartTitle = config.chartTitle || `${config.title} - Connector Id ${config.connectorId}`;
             const svgMarkup = buildR2ConnectorChartSvg({
               connectorConfig: config,
               entry,
