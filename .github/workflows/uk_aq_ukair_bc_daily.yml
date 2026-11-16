@@ -1,6 +1,10 @@
 name: UK AQ UK-AIR Black Carbon Daily Pipeline
 
 on:
+  # One-time safe registration: a workflow-file push runs only the no-op job below.
+  push:
+    branches: [main]
+    paths: [.github/workflows/uk_aq_ukair_bc_daily.yml]
   workflow_dispatch:
     inputs:
       environment:
@@ -21,7 +25,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  register:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Registering the BC daily pipeline with GitHub Actions; no data operations."
+
   reconcile:
+    if: github.event_name == 'workflow_dispatch'
     uses: ./.github/workflows/uk_aq_ukair_bc_observation_reconciliation.yml
     with:
       environment: ${{ inputs.environment }}
