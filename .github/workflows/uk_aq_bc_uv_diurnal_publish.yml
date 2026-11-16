@@ -9,6 +9,9 @@ on:
       from_day:
         type: string
         default: "2024-01-01"
+      full_rebuild:
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       environment:
@@ -19,10 +22,14 @@ on:
           - TEST
           - LIVE
       from_day:
-        description: "First source month, YYYY-MM-01 (default 2024-01-01)"
+        description: "Historical start; must remain 2024-01-01"
         required: true
         default: "2024-01-01"
         type: string
+      full_rebuild:
+        description: "Recompute all history from canonical observations (recovery/reprocessing)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -52,6 +59,7 @@ jobs:
       CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
       INPUT_ENVIRONMENT: ${{ inputs.environment }}
       INPUT_FROM_DAY: ${{ inputs.from_day }}
+      INPUT_FULL_REBUILD: ${{ inputs.full_rebuild }}
 
     steps:
       - uses: actions/checkout@v5
@@ -78,4 +86,8 @@ jobs:
           test "${CFLARE_R2_ENDPOINT}" = "https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com"
           [[ "${CFLARE_R2_BUCKET}" == *-"${UK_AQ_ENV_NAME,,}" ]]
       - name: Build, validate and atomically publish latest
-        run: node scripts/ukair_bc/build_bc_uv_diurnal.mjs --environment "${INPUT_ENVIRONMENT}" --from "${INPUT_FROM_DAY}" --publish
+        run: |
+          set -euo pipefail
+          args=(--environment "${INPUT_ENVIRONMENT}" --from "${INPUT_FROM_DAY}" --publish)
+          if [[ "${INPUT_FULL_REBUILD}" == "true" ]]; then args+=(--full-rebuild); fi
+          node scripts/ukair_bc/build_bc_uv_diurnal.mjs "${args[@]}"
