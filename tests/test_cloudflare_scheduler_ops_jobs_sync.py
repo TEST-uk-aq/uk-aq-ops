@@ -101,7 +101,7 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
 
         self.assertEqual(manifest["config_version"], 1)
         self.assertEqual(manifest["scheduler_name"], "uk-aq-cron-scheduler-ops")
-        self.assertEqual(manifest["job_count"], 15)
+        self.assertEqual(manifest["job_count"], 16)
         self.assertEqual(
             [job["job_key"] for job in manifest["jobs"]],
             [
@@ -119,6 +119,7 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
                 "uk_aq_r2_history_dropbox_backup",
                 "uk_aq_r2_history_dropbox_backup_force_prune_recheck",
                 "uk_aq_supabase_db_dump_backup",
+                "uk_aq_ukair_bc_daily",
                 "uk_aq_who_2021_daily",
             ],
         )
@@ -131,6 +132,14 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
             job for job in manifest["jobs"] if job["job_key"] == "uk_aq_r2_history_dropbox_backup"
         )
         self.assertEqual(daily_backup["github_inputs_json"], "{}")
+        bc_daily = next(job for job in manifest["jobs"] if job["job_key"] == "uk_aq_ukair_bc_daily")
+        self.assertEqual(bc_daily["github_inputs_json"], "{}")
+        self.assertEqual(bc_daily["github_workflow_file"], "uk_aq_ukair_bc_daily.yml")
+        self.assertEqual(bc_daily["github_repo"], "TEST-uk-aq/uk-aq-ops")
+        self.assertEqual(bc_daily["github_ref"], "main")
+        self.assertEqual(bc_daily["cron_expr"], "0 8 * * *")
+        self.assertEqual(bc_daily["enabled"], 1)
+        self.assertEqual(bc_daily["dry_run"], 0)
         # HTTP jobs already existed; retain the null-target checks for GitHub jobs.
         github_jobs = [job for job in manifest["jobs"] if job["target_type"] == "github_workflow"]
         news = next(job for job in manifest["jobs"] if job["job_key"] == "uk_aq_media_news_email")
@@ -218,8 +227,8 @@ class CloudflareSchedulerOpsJobsSyncTests(unittest.TestCase):
             self.assertTrue(json_path.exists())
 
             manifest = json.loads(json_path.read_text(encoding="utf-8"))
-            self.assertEqual(manifest["job_count"], 15)
-            self.assertEqual(len(manifest["jobs"]), 15)
+            self.assertEqual(manifest["job_count"], 16)
+            self.assertEqual(len(manifest["jobs"]), 16)
             self.assertEqual(
                 set(manifest["scheduler_jobs_required_columns"]),
                 set(sync_jobs.SQL_COLUMNS + ["updated_at"]),

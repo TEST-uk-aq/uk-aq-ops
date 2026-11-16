@@ -2,14 +2,6 @@ name: UK AQ UK-AIR Black Carbon Daily Pipeline
 
 on:
   workflow_dispatch:
-    inputs:
-      environment:
-        description: "Explicit environment; must match the executing repository configuration"
-        required: true
-        type: choice
-        options:
-          - TEST
-          - LIVE
 
 permissions:
   contents: read
@@ -20,11 +12,13 @@ concurrency:
   group: uk-aq-ukair-bc-daily-pipeline-${{ github.repository }}
   cancel-in-progress: false
 
+# Reusable workflows validate this repository-configured environment and its
+# repository/R2 target before writing; no caller-selected target is accepted.
 jobs:
   reconcile:
     uses: ./.github/workflows/uk_aq_ukair_bc_observation_reconciliation.yml
     with:
-      environment: ${{ inputs.environment }}
+      environment: ${{ vars.UK_AQ_ENV_NAME }}
       mode: daily
       horizon_days: "14"
       properties: "bc,uv370"
@@ -35,6 +29,6 @@ jobs:
     needs: reconcile
     uses: ./.github/workflows/uk_aq_bc_uv_diurnal_publish.yml
     with:
-      environment: ${{ inputs.environment }}
+      environment: ${{ vars.UK_AQ_ENV_NAME }}
       from_day: "2024-01-01"
     secrets: inherit

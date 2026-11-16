@@ -192,6 +192,3 @@ github_workflow_file = "uk_aq_ukair_bc_daily.yml"
 github_ref = "main"
 dry_run = false
 notes = "08:00 UTC BC/UV370 14-day R2 reconciliation followed by 2024-onwards diurnal publication"
-
-[jobs.uk_aq_ukair_bc_daily.github_inputs]
-environment = "TEST"
