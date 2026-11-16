@@ -2137,6 +2137,7 @@
       const STORAGE_COVERAGE_MODE_STORAGE_KEY = "uk_aq_storage_coverage_mode";
       const STORAGE_COVERAGE_MODE_VALUES = new Set(["month", "year"]);
       const R2_CONNECTOR_COUNTS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+      const R2_CONNECTOR_COUNTS_CURRENT_MONTH_CACHE_TTL_MS = 5 * 60 * 1000;
       const STORAGE_COVERAGE_MANUAL_TIMEOUT_MS = 3 * 60 * 1000;
       const STORAGE_COVERAGE_STATUS_POLL_MS = 1000;
       const STORAGE_COVERAGE_ERROR_PREFIX = "Storage coverage calendar failed to load:";
@@ -4981,11 +4982,14 @@
         const requestId = ++r2ConnectorCountsLoadSequence;
         const request = buildR2ConnectorCountsRequest(monthStartUtc, isYearMode);
         container.dataset.requestKey = request.requestKey;
+        const cacheTtlMs = !isYearMode && sameUtcMonth(monthStartUtc, startOfUtcMonth(new Date()))
+          ? R2_CONNECTOR_COUNTS_CURRENT_MONTH_CACHE_TTL_MS
+          : R2_CONNECTOR_COUNTS_CACHE_TTL_MS;
         const cached = !forceRefresh
           && latestR2ConnectorCounts
           && latestR2ConnectorCounts.requestKey === request.requestKey
           && Number.isFinite(Number(latestR2ConnectorCounts.fetchedAtMs))
-          && (Date.now() - Number(latestR2ConnectorCounts.fetchedAtMs)) < R2_CONNECTOR_COUNTS_CACHE_TTL_MS
+          && (Date.now() - Number(latestR2ConnectorCounts.fetchedAtMs)) < cacheTtlMs
           ? latestR2ConnectorCounts.payload
           : null;
         if (cached) {
