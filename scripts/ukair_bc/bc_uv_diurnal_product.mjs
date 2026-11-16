@@ -217,7 +217,7 @@ export function validateProduct(product) {
       if (reporting.station_ids.length) throw new Error("Stations reported on an absent BC source day");
     } else {
       const day = reporting.source_day;
-      if (typeof day !== "string" || !/^\\d{4}-\\d{2}-\\d{2}$/.test(day) ||
+      if (typeof day !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(day) ||
           !Number.isFinite(Date.parse(`${day}T00:00:00Z`)) ||
           new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day ||
           day > product.source_through_day || !reporting.station_ids.length) {
