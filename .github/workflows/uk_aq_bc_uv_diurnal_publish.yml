@@ -2,6 +2,10 @@ name: Publish BC/UV Diurnal Product
 
 on:
   workflow_call:
+    outputs:
+      publication_summary:
+        description: "Compact verified publisher diagnostics, without product or observation data"
+        value: ${{ jobs.publish.outputs.publication_summary }}
     inputs:
       environment:
         type: string
@@ -41,6 +45,8 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    outputs:
+      publication_summary: ${{ steps.build.outputs.publication_summary }}
     timeout-minutes: 360
     # Select the repository's configured environment, not an input-selected
     # GitHub environment that could expose another target's secrets.
@@ -86,8 +92,20 @@ jobs:
           test "${CFLARE_R2_ENDPOINT}" = "https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com"
           [[ "${CFLARE_R2_BUCKET}" == *-"${UK_AQ_ENV_NAME,,}" ]]
       - name: Build, validate and atomically publish latest
+        id: build
         run: |
           set -euo pipefail
           args=(--environment "${INPUT_ENVIRONMENT}" --from "${INPUT_FROM_DAY}" --publish)
           if [[ "${INPUT_FULL_REBUILD}" == "true" ]]; then args+=(--full-rebuild); fi
-          node scripts/ukair_bc/build_bc_uv_diurnal.mjs "${args[@]}"
+          node scripts/ukair_bc/build_bc_uv_diurnal.mjs "${args[@]}" | tee "${RUNNER_TEMP}/bc_uv_publish_result.jsonl"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          result = json.loads((Path(os.environ["RUNNER_TEMP"]) / "bc_uv_publish_result.jsonl").read_text().splitlines()[-1])
+          keys = ("mode", "rebuild_reason", "months_rebuilt", "months_reused", "canonical_days",
+                  "published", "result", "source_through_day")
+          summary = {key: result[key] for key in keys}
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("publication_summary=" + json.dumps(summary, separators=(",", ":")) + "\n")
+          PY
