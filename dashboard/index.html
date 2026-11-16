@@ -5988,7 +5988,7 @@
         });
       }
 
-      function applyStorageCoveragePayload(incoming) {
+      function applyStorageCoveragePayload(incoming, { forceConnectorCountsRefresh = false } = {}) {
         if (latestCompleteDropboxCoverage?.generation !== incoming.r2_history_read_version?.version) latestCompleteDropboxCoverage = null;
         const data = preserveNewerCoverageEvidence(retainIncompleteDropboxEvidence(incoming));
         latestStorageCoveragePayload = data;
@@ -6015,7 +6015,7 @@
         latestR2HistoryReadVersion = data.r2_history_read_version || latestR2HistoryReadVersion;
         upsertStorageCoveragePanel(
           renderStorageCoverageCalendarPanel(coverageRows, {
-            forceConnectorCountsRefresh: false,
+            forceConnectorCountsRefresh,
             r2HistoryReadVersion: latestR2HistoryReadVersion,
           }),
         );
@@ -6042,7 +6042,7 @@
               const completed = await collectHostedDropboxCoverage(initiation, () => manualStorageCoverageRefresh === manualSession);
               if (!completed || manualStorageCoverageRefresh !== manualSession) return;
               manualStorageCoverageRefresh = null;
-              applyStorageCoveragePayload(completed);
+              applyStorageCoveragePayload(completed, { forceConnectorCountsRefresh: true });
               syncManualStorageCoverageRefreshControls();
               return;
             }
@@ -6078,7 +6078,7 @@
               return;
             }
             manualStorageCoverageRefresh = null;
-            applyStorageCoveragePayload(data);
+            applyStorageCoveragePayload(data, { forceConnectorCountsRefresh: true });
             if (String(errorEl.textContent || "").startsWith(STORAGE_COVERAGE_ERROR_PREFIX)) {
               setError("");
             }
