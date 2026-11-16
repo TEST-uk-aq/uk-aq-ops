@@ -1,6 +1,14 @@
 name: Publish BC/UV Diurnal Product
 
 on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      from_day:
+        type: string
+        default: "2024-01-01"
   workflow_dispatch:
     inputs:
       environment:

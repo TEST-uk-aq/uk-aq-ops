@@ -180,3 +180,18 @@ worker_http_url_managed_by_deploy = true
 worker_http_secret_binding = "UK_AQ_MEDIA_EMAIL_WORKER_HTTP_SECRET"
 dry_run = false
 notes = "AQ NEWS Daily/recovery; separate credential; Media owns due selection and bounded Queue work"
+
+# UK-AIR annual CSVs are reconciled before rebuilding the public profile.
+# This is TEST-owned operational configuration; do not copy jobs.toml to LIVE.
+[jobs.uk_aq_ukair_bc_daily]
+enabled = true
+cron_expr = "0 8 * * *"
+target_type = "github_workflow"
+github_repo = "TEST-uk-aq/uk-aq-ops"
+github_workflow_file = "uk_aq_ukair_bc_daily.yml"
+github_ref = "main"
+dry_run = false
+notes = "08:00 UTC BC/UV370 14-day R2 reconciliation followed by 2024-onwards diurnal publication"
+
+[jobs.uk_aq_ukair_bc_daily.github_inputs]
+environment = "TEST"

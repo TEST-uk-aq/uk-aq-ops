@@ -1,6 +1,35 @@
 name: UK AQ UK-AIR Black Carbon Observation Reconciliation
 
 on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      mode:
+        type: string
+        required: true
+      from_day:
+        type: string
+        default: ""
+      to_day:
+        type: string
+        default: ""
+      year:
+        type: string
+        default: ""
+      horizon_days:
+        type: string
+        default: "14"
+      stations:
+        type: string
+        default: ""
+      properties:
+        type: string
+        default: "bc,uv370"
+      apply:
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       environment:
