@@ -14,6 +14,7 @@ import {
 import { buildHistoryV2DayManifestKey, validateCanonicalHistoryV2Manifest } from "../../workers/shared/uk_aq_r2_history_canonical.mjs";
 import { readCurrentPollutantState } from "./uk_aq_ukair_bc_observation_reconciler_locked.mjs";
 import { FROM_DAY, derivationIdentity, fingerprint, validatePrevious, deriveMonthlyProduct } from "./bc_uv_diurnal_incremental.mjs";
+import { sourceSlot, validateProduct as validateBcUvProduct } from "./bc_uv_diurnal_product.mjs";
 
 export const LATEST_KEY = "derived/bc_uv_diurnal/v1/latest.json";
 
@@ -194,6 +195,37 @@ async function previousProduct(r2) {
   return latest.payload;
 }
 
+// Read the most recent canonical days in reverse. The 00:00 UTC endpoint belongs
+// to the preceding GMT source day, so include the UTC day matching the final BC
+// source day before deciding which eligible stations reported on that day.
+export async function latestBcReporting(days, stations, readDay, sourceThroughDay) {
+  const eligibleSeries = new Map(stations.filter((station) => station.timeseries_ids.bc !== null)
+    .map((station) => [station.station_id, station.timeseries_ids.bc]));
+  let latestDay = null;
+  const stationIds = new Set();
+  if (!eligibleSeries.size) return { source_day: null, station_ids: [] };
+  for (let index = days.length - 1; index >= 0; index--) {
+    const day = days[index];
+    const { bcRows } = await readDay(day);
+    for (const row of bcRows) {
+      const stationId = Number(row.station_id);
+      if (!eligibleSeries.has(stationId) ||
+          eligibleSeries.get(stationId) !== Number(row.timeseries_id) ||
+          row.pollutant_code !== "bc" || !Number.isFinite(row.value) ||
+          !["P", "R"].includes(row.verification_status)) continue;
+      const sourceDay = sourceSlot(row.observed_at_utc).source_day;
+      if (sourceDay > sourceThroughDay) throw new Error("BC reporting day exceeds published source coverage");
+      if (latestDay === null || sourceDay > latestDay) {
+        latestDay = sourceDay;
+        stationIds.clear();
+      }
+      if (sourceDay === latestDay) stationIds.add(stationId);
+    }
+    if (latestDay !== null && day.day_utc <= latestDay) break;
+  }
+  return { source_day: latestDay, station_ids: [...stationIds].sort((a, b) => a - b) };
+}
+
 export async function buildBcUvDiurnal({ env = process.env, fromDay = FROM_DAY, publish = false,
   requestedEnvironment, now = new Date(), fullRebuild = false } = {}) {
   const started = performance.now();
@@ -234,6 +266,18 @@ export async function buildBcUvDiurnal({ env = process.env, fromDay = FROM_DAY, 
   };
   const result = await deriveMonthlyProduct({ days: selected.days, previous, derivation, stations, readDay,
     generatedAt: now.toISOString(), fullRebuild });
+  const latestReporting = await latestBcReporting(selected.days, stations, readDay, result.product.source_through_day);
+  const locationCount = new Set(stations.map((station) => JSON.stringify([station.latitude, station.longitude]))).size;
+  if (result.unchanged) {
+    if (fingerprint(result.product.latest_bc_reporting) !== fingerprint(latestReporting) ||
+        result.product.monitoring_location_count !== locationCount) {
+      throw new Error("Unchanged canonical inputs contradict previously published BC/UV summary");
+    }
+  } else {
+    result.product.latest_bc_reporting = latestReporting;
+    result.product.monitoring_location_count = locationCount;
+  }
+  validateBcUvProduct(result.product);
   const body = Buffer.from(JSON.stringify(result.product));
   const verifySource = async () => {
     // Re-walk aggregates as well as rechecking the root: an in-progress writer
