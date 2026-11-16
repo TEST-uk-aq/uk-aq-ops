@@ -1,0 +1,68 @@
+{
+  "result": [
+    {
+      "average_query_characters": 230.0,
+      "endpoint": "/rest/v1/uk_aq_service_egress_daily_status",
+      "estimated_serialized_bytes": 271967,
+      "maximum_query_characters": 230,
+      "method": "GET",
+      "requests": 117
+    },
+    {
+      "average_query_characters": 0.0,
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_service_egress_metrics_batch_upsert",
+      "estimated_serialized_bytes": 215985,
+      "maximum_query_characters": 0,
+      "method": "POST",
+      "requests": 121
+    },
+    {
+      "average_query_characters": 447.1,
+      "endpoint": "/rest/v1/uk_aq_service_egress_metrics_daily",
+      "estimated_serialized_bytes": 184785,
+      "maximum_query_characters": 450,
+      "method": "GET",
+      "requests": 62
+    },
+    {
+      "average_query_characters": 0.0,
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observs_observations_compact_upsert_v1",
+      "estimated_serialized_bytes": 150475,
+      "maximum_query_characters": 0,
+      "method": "POST",
+      "requests": 83
+    },
+    {
+      "average_query_characters": 514.0,
+      "endpoint": "/rest/v1/daily_task_runs_dashboard",
+      "estimated_serialized_bytes": 84814,
+      "maximum_query_characters": 514,
+      "method": "GET",
+      "requests": 27
+    },
+    {
+      "average_query_characters": 353.0,
+      "endpoint": "/rest/v1/uk_aq_service_egress_metrics_minute",
+      "estimated_serialized_bytes": 77988,
+      "maximum_query_characters": 353,
+      "method": "GET",
+      "requests": 29
+    },
+    {
+      "average_query_characters": 181.0,
+      "endpoint": "/rest/v1/uk_aq_schema_size_metrics_hourly",
+      "estimated_serialized_bytes": 4326,
+      "maximum_query_characters": 181,
+      "method": "GET",
+      "requests": 2
+    },
+    {
+      "average_query_characters": 183.0,
+      "endpoint": "/rest/v1/uk_aq_db_size_metrics_hourly",
+      "estimated_serialized_bytes": 4312,
+      "maximum_query_characters": 183,
+      "method": "GET",
+      "requests": 2
+    }
+  ]
+}

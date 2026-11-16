@@ -1,0 +1,21 @@
+{
+  "environment": "TEST",
+  "collected_at_utc": "2026-11-16T13:51:31Z",
+  "window_start_utc": "2026-11-16T11:30:00Z",
+  "window_end_utc": "2026-11-16T13:51:31Z",
+  "projects": {
+    "IngestDB": "zztjgmdiftqtdcrlfpvc",
+    "ObsAQIDB": "waytarxkjprweyifffvq"
+  },
+  "measurement": "estimated serialized log bytes",
+  "exact_billed_bytes": false,
+  "raw_request_queries_exported": false,
+  "query_names": [
+    "sources",
+    "hourly",
+    "endpoints",
+    "request_attribution",
+    "query_lengths",
+    "error_summary"
+  ]
+}

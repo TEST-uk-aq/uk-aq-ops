@@ -1,0 +1,34 @@
+{
+  "result": [
+    {
+      "estimated_serialized_bytes": 3360988,
+      "events": 1160,
+      "source": "edge_logs"
+    },
+    {
+      "estimated_serialized_bytes": 111525,
+      "events": 127,
+      "source": "supavisor_logs"
+    },
+    {
+      "estimated_serialized_bytes": 38042,
+      "events": 114,
+      "source": "postgrest_logs"
+    },
+    {
+      "estimated_serialized_bytes": 26625,
+      "events": 40,
+      "source": "postgres_logs"
+    },
+    {
+      "estimated_serialized_bytes": 8018,
+      "events": 12,
+      "source": "function_logs"
+    },
+    {
+      "estimated_serialized_bytes": 7015,
+      "events": 3,
+      "source": "function_edge_logs"
+    }
+  ]
+}

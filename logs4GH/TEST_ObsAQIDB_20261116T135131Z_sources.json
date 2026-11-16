@@ -1,0 +1,19 @@
+{
+  "result": [
+    {
+      "estimated_serialized_bytes": 994652,
+      "events": 443,
+      "source": "edge_logs"
+    },
+    {
+      "estimated_serialized_bytes": 46274,
+      "events": 69,
+      "source": "postgres_logs"
+    },
+    {
+      "estimated_serialized_bytes": 29136,
+      "events": 87,
+      "source": "postgrest_logs"
+    }
+  ]
+}

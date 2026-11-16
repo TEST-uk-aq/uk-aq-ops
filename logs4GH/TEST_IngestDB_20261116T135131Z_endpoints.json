@@ -1,0 +1,242 @@
+{
+  "result": [
+    {
+      "endpoint": "/rest/v1/timeseries",
+      "errors": 0,
+      "estimated_serialized_bytes": 1085487,
+      "method": "GET",
+      "requests": 132
+    },
+    {
+      "endpoint": "/rest/v1/connectors",
+      "errors": 0,
+      "estimated_serialized_bytes": 329715,
+      "method": "GET",
+      "requests": 149
+    },
+    {
+      "endpoint": "/rest/v1/stations",
+      "errors": 0,
+      "estimated_serialized_bytes": 145319,
+      "method": "GET",
+      "requests": 50
+    },
+    {
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observations_compact_upsert_v2",
+      "errors": 0,
+      "estimated_serialized_bytes": 142744,
+      "method": "POST",
+      "requests": 71
+    },
+    {
+      "endpoint": "/rest/v1/connectors",
+      "errors": 0,
+      "estimated_serialized_bytes": 137521,
+      "method": "PATCH",
+      "requests": 79
+    },
+    {
+      "endpoint": "/rest/v1/uk_aq_ingest_runs",
+      "errors": 0,
+      "estimated_serialized_bytes": 107385,
+      "method": "POST",
+      "requests": 60
+    },
+    {
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_dispatch_claim",
+      "errors": 0,
+      "estimated_serialized_bytes": 105504,
+      "method": "POST",
+      "requests": 59
+    },
+    {
+      "endpoint": "/rest/v1/observations",
+      "errors": 0,
+      "estimated_serialized_bytes": 103250,
+      "method": "GET",
+      "requests": 34
+    },
+    {
+      "endpoint": "/rest/v1/sos_timeseries_checkpoints",
+      "errors": 0,
+      "estimated_serialized_bytes": 101437,
+      "method": "GET",
+      "requests": 10
+    },
+    {
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_ingest_retention_boundaries",
+      "errors": 0,
+      "estimated_serialized_bytes": 101305,
+      "method": "POST",
+      "requests": 60
+    },
+    {
+      "endpoint": "/rest/v1/rpc/uk_aq_news_email_service",
+      "errors": 0,
+      "estimated_serialized_bytes": 97610,
+      "method": "POST",
+      "requests": 67
+    },
+    {
+      "endpoint": "/rest/v1/uk_aq_ingest_runs",
+      "errors": 0,
+      "estimated_serialized_bytes": 89163,
+      "method": "GET",
+      "requests": 37
+    },
+    {
+      "endpoint": "/rest/v1/sos_station_checkpoints",
+      "errors": 0,
+      "estimated_serialized_bytes": 88812,
+      "method": "GET",
+      "requests": 9
+    },
+    {
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_observs_sync_receipt_daily_upsert",
+      "errors": 0,
+      "estimated_serialized_bytes": 81000,
+      "method": "POST",
+      "requests": 48
+    },
+    {
+      "endpoint": "/rest/v1/rpc/uk_aq_news_email_retention",
+      "errors": 0,
+      "estimated_serialized_bytes": 78591,
+      "method": "POST",
+      "requests": 53
+    },
+    {
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_timeseries_last_values_compact_update_v1",
+      "errors": 0,
+      "estimated_serialized_bytes": 78243,
+      "method": "POST",
+      "requests": 39
+    },
+    {
+      "endpoint": "/rest/v1/blondon_nodes_station_checkpoints",
+      "errors": 0,
+      "estimated_serialized_bytes": 61705,
+      "method": "GET",
+      "requests": 9
+    },
+    {
+      "endpoint": "/rest/v1/observed_properties",
+      "errors": 0,
+      "estimated_serialized_bytes": 56127,
+      "method": "GET",
+      "requests": 28
+    },
+    {
+      "endpoint": "/rest/v1/blondon_communities_timeseries_checkpoints",
+      "errors": 0,
+      "estimated_serialized_bytes": 54253,
+      "method": "GET",
+      "requests": 10
+    },
+    {
+      "endpoint": "/rest/v1/blondon_communities_station_checkpoints",
+      "errors": 0,
+      "estimated_serialized_bytes": 54033,
+      "method": "GET",
+      "requests": 10
+    },
+    {
+      "endpoint": "/rest/v1/dispatcher_settings",
+      "errors": 0,
+      "estimated_serialized_bytes": 52388,
+      "method": "GET",
+      "requests": 28
+    },
+    {
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_dashboard_ingest_summary_v1",
+      "errors": 0,
+      "estimated_serialized_bytes": 44772,
+      "method": "POST",
+      "requests": 26
+    },
+    {
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_phenomena_upsert",
+      "errors": 0,
+      "estimated_serialized_bytes": 32059,
+      "method": "POST",
+      "requests": 19
+    },
+    {
+      "endpoint": "/rest/v1/sos_timeseries_checkpoints",
+      "errors": 0,
+      "estimated_serialized_bytes": 27314,
+      "method": "POST",
+      "requests": 16
+    },
+    {
+      "endpoint": "/rest/v1/blondon_nodes_station_checkpoints",
+      "errors": 0,
+      "estimated_serialized_bytes": 26280,
+      "method": "POST",
+      "requests": 10
+    },
+    {
+      "endpoint": "/rest/v1/sos_station_checkpoints",
+      "errors": 0,
+      "estimated_serialized_bytes": 17024,
+      "method": "POST",
+      "requests": 10
+    },
+    {
+      "endpoint": "/rest/v1/rpc/blondon_communities_select_station_refs",
+      "errors": 0,
+      "estimated_serialized_bytes": 16354,
+      "method": "POST",
+      "requests": 10
+    },
+    {
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_sos_selected_work_v1",
+      "errors": 0,
+      "estimated_serialized_bytes": 16103,
+      "method": "POST",
+      "requests": 10
+    },
+    {
+      "endpoint": "/rest/v1/rpc/uk_aq_rpc_sos_uk_air_flat_file_mappings",
+      "errors": 0,
+      "estimated_serialized_bytes": 14731,
+      "method": "POST",
+      "requests": 9
+    },
+    {
+      "endpoint": "/rest/v1/rpc/uk_aq_record_endpoint_metric",
+      "errors": 0,
+      "estimated_serialized_bytes": 4990,
+      "method": "POST",
+      "requests": 3
+    },
+    {
+      "endpoint": "/rest/v1/uk_aq_db_size_metrics_hourly",
+      "errors": 0,
+      "estimated_serialized_bytes": 4316,
+      "method": "GET",
+      "requests": 2
+    },
+    {
+      "endpoint": "/rest/v1/networks",
+      "errors": 0,
+      "estimated_serialized_bytes": 2052,
+      "method": "GET",
+      "requests": 1
+    },
+    {
+      "endpoint": "/rest/v1/rpc/uk_aq_pcon_hex_rpc",
+      "errors": 0,
+      "estimated_serialized_bytes": 1702,
+      "method": "POST",
+      "requests": 1
+    },
+    {
+      "endpoint": "/rest/v1/rpc/uk_aq_la_hex_rpc",
+      "errors": 0,
+      "estimated_serialized_bytes": 1699,
+      "method": "POST",
+      "requests": 1
+    }
+  ]
+}

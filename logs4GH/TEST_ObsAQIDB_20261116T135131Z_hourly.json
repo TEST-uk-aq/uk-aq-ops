@@ -1,0 +1,58 @@
+{
+  "result": [
+    {
+      "estimated_serialized_bytes": 175758,
+      "events": 75,
+      "hour_utc": "2026-11-16T11:00:00",
+      "source": "edge_logs"
+    },
+    {
+      "estimated_serialized_bytes": 9279,
+      "events": 14,
+      "hour_utc": "2026-11-16T11:00:00",
+      "source": "postgres_logs"
+    },
+    {
+      "estimated_serialized_bytes": 5342,
+      "events": 16,
+      "hour_utc": "2026-11-16T11:00:00",
+      "source": "postgrest_logs"
+    },
+    {
+      "estimated_serialized_bytes": 432312,
+      "events": 193,
+      "hour_utc": "2026-11-16T12:00:00",
+      "source": "edge_logs"
+    },
+    {
+      "estimated_serialized_bytes": 21111,
+      "events": 31,
+      "hour_utc": "2026-11-16T12:00:00",
+      "source": "postgres_logs"
+    },
+    {
+      "estimated_serialized_bytes": 10763,
+      "events": 32,
+      "hour_utc": "2026-11-16T12:00:00",
+      "source": "postgrest_logs"
+    },
+    {
+      "estimated_serialized_bytes": 386582,
+      "events": 175,
+      "hour_utc": "2026-11-16T13:00:00",
+      "source": "edge_logs"
+    },
+    {
+      "estimated_serialized_bytes": 15884,
+      "events": 24,
+      "hour_utc": "2026-11-16T13:00:00",
+      "source": "postgres_logs"
+    },
+    {
+      "estimated_serialized_bytes": 13031,
+      "events": 39,
+      "hour_utc": "2026-11-16T13:00:00",
+      "source": "postgrest_logs"
+    }
+  ]
+}
