@@ -1,8 +1,14 @@
 # Black Carbon Daily Task Health: TEST release and acceptance
 
 This is an implementation handover, not an authoritative system contract.
-No migration, deployment, reconciliation, publication or email was run during
-implementation. All commands below are for the operator after source review.
+No migration, deployment, reconciliation, publication or email was run by the
+coding agent. All commands below are for the operator after source review.
+
+The operator confirmed Schema PR #27 is merged and its TEST ObsAQIDB migration
+is applied: task identity, all four flags, 08:00 schedule, 08:30 threshold and
+GitHub-attempt Started deduplication were verified. No additional schema change
+or migration is required. Ops PR #200 remains unmerged pending review; steps
+1–3 below document the completed prerequisite, not an instruction to reapply it.
 
 ## Registration and release order
 
@@ -57,6 +63,16 @@ implementation. All commands below are for the operator after source review.
   the new attempt's timestamp. Fresh manual dispatches use their own creation
   date. The database's task/day attempt counter and `github_run_attempt` are
   separate counters; neither is overwritten or assumed equal.
+  The helper reads original `created_at` from `GET /actions/runs/{run_id}` and
+  current-attempt `created_at`/`run_started_at` from the separate
+  `GET /actions/runs/{run_id}/attempts/{attempt}` endpoint. Summary fields
+  `workflow_created_at`, `workflow_attempt_created_at` and
+  `workflow_attempt_started_at` distinguish these facts. Both responses must
+  identify the executing repository/run, the attempt response must match the
+  current attempt, and all three UTC timestamps must be valid and ordered
+  original creation <= attempt creation <= attempt start. Invalid/missing
+  metadata fails reporting visibly before health writes; there is no invented
+  timestamp or fallback to a previous attempt's UUID.
 - Finished requires both reusable jobs' results to be `success`. Failure,
   cancellation or a mandatory skip produces Failed if finalisation can run.
   The final job explicitly fails when either stage did not succeed. Reporting
@@ -81,7 +97,8 @@ implementation. All commands below are for the operator after source review.
   it is not a new count of every auxiliary R2 read. Rebuilt-month IDs, generation
   key, bytes, elapsed time and detailed failures stay in Actions logs. Failure
   before a publisher summary exists leaves only stage outcomes in health.
-- Normal overhead is two GitHub attempt GETs and four small ObsAQIDB RPCs per
+- Normal overhead is four GitHub GETs (one original-run and one attempt lookup
+  in each reporting job) and four small ObsAQIDB RPCs per
   combined run (Started, Started replay, terminal, recompute). Existing bounded
   retries allow at most sixteen RPC HTTP attempts per execution if all calls
   encounter transient errors. No polling or per-observation monitoring is added.
@@ -119,6 +136,11 @@ change canonical data to simulate an outcome.
    started_at with the GitHub attempt metadata, scheduled date with original
    dispatch creation, and summary/URL with the real workflow and attempt.
    Confirm reconciliation/publication outcomes and compact publisher fields.
+   In particular, compare `scheduled_for_date`/`summary.workflow_created_at`
+   with the original-run endpoint's `created_at`, and `started_at`/
+   `summary.workflow_attempt_started_at` with the current-attempt endpoint's
+   `run_started_at`. `summary.workflow_attempt_created_at` may differ from
+   original creation and must not determine the scheduled date.
 3. Open the TEST Operations dashboard's Daily Tasks view for that UTC date and
    inspect **UK-AIR Black Carbon daily** and its summary/log link. Confirm Started
    during execution and Finished afterward. No new dashboard deployment is needed.

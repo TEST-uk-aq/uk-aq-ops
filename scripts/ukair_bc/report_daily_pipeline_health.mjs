@@ -21,27 +21,53 @@ function required(name) {
 const repository = required("GITHUB_REPOSITORY");
 const runId = required("GITHUB_RUN_ID");
 const attempt = required("GITHUB_RUN_ATTEMPT");
-const response = await fetch(
-  `${required("GITHUB_API_URL")}/repos/${repository}/actions/runs/${runId}/attempts/${attempt}`,
-  {
+const runUrl = `${required("GITHUB_API_URL")}/repos/${repository}/actions/runs/${runId}`;
+async function getRunMetadata(suffix, label) {
+  const response = await fetch(`${runUrl}${suffix}`, {
     headers: {
       Authorization: `Bearer ${required("GH_TOKEN")}`,
       Accept: "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
     },
     signal: AbortSignal.timeout(15_000),
-  },
-);
-if (!response.ok) throw new Error(`GitHub run attempt lookup failed (${response.status})`);
-const run = await response.json();
-if (String(run.id) !== runId || String(run.run_attempt) !== attempt) {
+  });
+  if (!response.ok) throw new Error(`GitHub ${label} lookup failed (${response.status})`);
+  const metadata = await response.json();
+  if (String(metadata.id) !== runId || metadata.repository?.full_name !== repository) {
+    throw new Error(`GitHub ${label} identity mismatch`);
+  }
+  return metadata;
+}
+
+// Attempt created_at changes on rerun. Only the original workflow-run endpoint
+// supplies the dispatch creation date; do not require its latest run_attempt to
+// equal ours, since it can advance independently of this attempt-specific read.
+const [workflow, run] = await Promise.all([
+  getRunMetadata("", "workflow run"),
+  getRunMetadata(`/attempts/${attempt}`, "run attempt"),
+]);
+if (String(run.run_attempt) !== attempt) {
   throw new Error("GitHub run attempt identity mismatch");
 }
-const started = new Date(run.run_started_at);
-const created = new Date(run.created_at);
-if (!run.run_started_at || !run.created_at ||
-    !Number.isFinite(started.getTime()) || !Number.isFinite(created.getTime())) {
-  throw new Error("GitHub run attempt lacks execution timestamps");
+
+function timestamp(value, label) {
+  if (typeof value !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(value)) {
+    throw new Error(`Missing or invalid GitHub ${label}`);
+  }
+  const parsed = new Date(value);
+  const normalized = value.replace(/(?:\.(\d{1,3}))?Z$/, (_, fraction = "") => `.${fraction.padEnd(3, "0")}Z`);
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString() !== normalized) {
+    throw new Error(`Invalid GitHub ${label}`);
+  }
+  return parsed;
+}
+
+const created = timestamp(workflow.created_at, "workflow creation timestamp");
+const attemptCreated = timestamp(run.created_at, "attempt creation timestamp");
+const started = timestamp(run.run_started_at, "attempt start timestamp");
+if (attemptCreated < created || started < attemptCreated) {
+  throw new Error("Inconsistent GitHub workflow/attempt timestamp order");
 }
 
 const summary = {
@@ -50,6 +76,7 @@ const summary = {
   dispatch_event: run.event,
   triggering_actor: run.triggering_actor?.login || null,
   workflow_created_at: created.toISOString(),
+  workflow_attempt_created_at: attemptCreated.toISOString(),
   workflow_attempt_started_at: started.toISOString(),
 };
 let jobStatus;
