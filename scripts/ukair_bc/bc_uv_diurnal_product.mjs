@@ -196,6 +196,35 @@ export function validateProduct(product) {
       }
     }
   }
+  const hasReporting = Object.hasOwn(product, "latest_bc_reporting");
+  const hasLocations = Object.hasOwn(product, "monitoring_location_count");
+  if (hasReporting !== hasLocations) throw new Error("Partial BC/UV network summary");
+  if (hasReporting) {
+    const locations = new Set(product.sensors.map((station) => JSON.stringify([station.latitude, station.longitude])));
+    if (!Number.isSafeInteger(product.monitoring_location_count) ||
+        product.monitoring_location_count !== locations.size) {
+      throw new Error("Invalid BC/UV monitoring location count");
+    }
+    const reporting = product.latest_bc_reporting;
+    if (!reporting || !Array.isArray(reporting.station_ids) ||
+        !reporting.station_ids.every((id) => Number.isSafeInteger(id)) ||
+        !reporting.station_ids.every((id, index) => !index || reporting.station_ids[index - 1] < id) ||
+        reporting.station_ids.some((id) => !stationIds.has(id) ||
+          product.sensors.find((station) => station.station_id === id)?.timeseries_ids.bc == null)) {
+      throw new Error("Invalid BC/UV latest reporting station IDs");
+    }
+    if (reporting.source_day === null) {
+      if (reporting.station_ids.length) throw new Error("Stations reported on an absent BC source day");
+    } else {
+      const day = reporting.source_day;
+      if (typeof day !== "string" || !/^\\d{4}-\\d{2}-\\d{2}$/.test(day) ||
+          !Number.isFinite(Date.parse(`${day}T00:00:00Z`)) ||
+          new Date(`${day}T00:00:00Z`).toISOString().slice(0, 10) !== day ||
+          day > product.source_through_day || !reporting.station_ids.length) {
+        throw new Error("Invalid latest BC source day");
+      }
+    }
+  }
   if (JSON.stringify(product).length > 64_000_000) throw new Error("BC/UV product exceeds browser response budget");
   return product;
 }
