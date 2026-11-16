@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Apply storage-coverage accuracy fixes to the local dashboard backend.
 
-This wrapper keeps the existing local per-day fingerprint adapter and exposes
-failed checks as unavailable alongside confirmed independent source evidence.
+The local IngestDB adapter checks bounded ranges of explicit UTC dates and
+exposes failed checks as unavailable alongside independent source evidence.
 Incomplete candidates remain diagnostic responses, never successful MySQL
 calendar publications.
 """
@@ -11,14 +11,20 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
 import threading
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 
+import requests
 import uk_aq_dashboard_api as dashboard
 
 
 _DIAGNOSTICS_LOCK = threading.Lock()
+_MAX_PRESENCE_DAYS = 366
+_UTC_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z"
+)
 _INGEST_COVERAGE_DIAGNOSTICS: Dict[str, Any] = {
     "checked_day_count": 0,
     "failed_days": [],
@@ -63,19 +69,73 @@ def _get_ingest_coverage_diagnostics() -> Dict[str, Any]:
         }
 
 
+def _fetch_day_presence_object(
+    url: str, headers: Dict[str, str], params: Dict[str, str],
+) -> Dict[str, Any]:
+    """Keep the existing GET accounting without _fetch_json's list fallback."""
+    started_at = datetime.now(timezone.utc)
+    response = requests.get(url, headers=headers, params=params, timeout=60)
+    dashboard._record_dashboard_supabase_response(
+        response.url or url,
+        response,
+        int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000),
+    )
+    if not response.ok:
+        raise RuntimeError(
+            f"PostgREST GET error {response.status_code} at {dashboard._request_path(url)} "
+            f"(params_keys={sorted(params)}): {dashboard._safe_response_text(response)}"
+        )
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid IngestDB day-presence JSON object")
+    return payload
+
+
+def _validated_presence_days(
+    payload: Dict[str, Any], first_day: date, exclusive_end: date,
+) -> Set[date]:
+    expected_count = (exclusive_end - first_day).days
+    if (type(payload.get("schema_version")) is not int or payload["schema_version"] != 1
+            or payload.get("complete") is not True
+            or payload.get("from_day_utc") != first_day.isoformat()
+            or payload.get("to_day_utc_exclusive") != exclusive_end.isoformat()
+            or type(payload.get("checked_day_count")) is not int
+            or payload["checked_day_count"] != expected_count):
+        raise ValueError("Inconsistent IngestDB day-presence metadata")
+
+    checked_at = payload.get("checked_at_utc")
+    current_day = payload.get("current_day_utc")
+    if not isinstance(checked_at, str) or not _UTC_TIMESTAMP.fullmatch(checked_at):
+        raise ValueError("Invalid IngestDB day-presence check timestamp")
+    try:
+        checked_datetime = datetime.strptime(checked_at, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError as exc:
+        raise ValueError("Invalid IngestDB day-presence check timestamp") from exc
+    if current_day != checked_datetime.date().isoformat():
+        raise ValueError("Inconsistent IngestDB day-presence current UTC day")
+
+    rows = payload.get("days")
+    if not isinstance(rows, list) or len(rows) != expected_count:
+        raise ValueError("Incomplete IngestDB day-presence dates")
+    present_days: Set[date] = set()
+    for offset, row in enumerate(rows):
+        expected_day = first_day + timedelta(days=offset)
+        if (not isinstance(row, dict)
+                or row.get("day_utc") != expected_day.isoformat()
+                or type(row.get("present")) is not bool):
+            raise ValueError("Invalid or unordered IngestDB day-presence date")
+        if row["present"]:
+            present_days.add(expected_day)
+    return present_days
+
+
 def _fetch_ingest_observation_days(
     base_url: str,
     service_role_key: str,
     from_day: date,
     now: datetime,
 ) -> Set[Any]:
-    """Return only positively confirmed IngestDB days.
-
-    A failed daily RPC no longer returns ``None`` because that made the existing
-    calendar fallback infer that every day from the oldest metric through today
-    contained observations. Successful day checks are retained and failures are
-    reported separately.
-    """
+    """Return only confirmed positive days; leave failed chunks unavailable."""
 
     if not base_url or not service_role_key:
         warning = "IngestDB coverage unavailable: dashboard database credentials are missing."
@@ -106,7 +166,7 @@ def _fetch_ingest_observation_days(
         )
         return set()
 
-    url = f"{safe_base_url}/rpc/uk_aq_rpc_observations_hourly_fingerprint"
+    url = f"{safe_base_url}/rpc/uk_aq_rpc_observation_day_presence_v1"
     headers = dashboard._postgrest_headers(
         service_role_key,
         schema=dashboard.PUBLIC_SCHEMA,
@@ -116,49 +176,35 @@ def _fetch_ingest_observation_days(
     failed_days: List[Dict[str, str]] = []
     checked_day_count = 0
     cursor = from_day
+    end_exclusive = today_utc + timedelta(days=1)
 
-    while cursor <= today_utc:
-        next_day_utc = cursor + timedelta(days=1)
+    while cursor < end_exclusive:
+        next_day_utc = min(cursor + timedelta(days=_MAX_PRESENCE_DAYS), end_exclusive)
         try:
-            batch = dashboard._fetch_json(
+            payload = _fetch_day_presence_object(
                 url,
                 headers,
                 {
-                    "window_start": f"{cursor.isoformat()}T00:00:00Z",
-                    "window_end": f"{next_day_utc.isoformat()}T00:00:00Z",
-                    "select": "hour_start,observation_count",
-                    "order": "hour_start.asc",
-                    "limit": "1",
-                    "offset": "0",
+                    "p_from_day_utc": cursor.isoformat(),
+                    "p_to_day_utc_exclusive": next_day_utc.isoformat(),
                 },
             )
-            if not isinstance(batch, list) or len(batch) > 1:
-                raise ValueError("Invalid IngestDB daily fingerprint response")
-            observation_count = 0
-            if batch:
-                first_row = batch[0]
-                if not isinstance(first_row, dict):
-                    raise ValueError("Invalid IngestDB daily fingerprint row")
-                raw_count = first_row.get("observation_count")
-                if isinstance(raw_count, bool) or not str(raw_count).isdigit():
-                    raise ValueError("Invalid IngestDB daily observation count")
-                observation_count = int(raw_count)
-            checked_day_count += 1
+            confirmed_days = _validated_presence_days(payload, cursor, next_day_utc)
+            days_with_rows.update(confirmed_days)
+            checked_day_count += (next_day_utc - cursor).days
         except Exception as exc:  # noqa: BLE001
             error_text = str(exc).strip().replace("\n", " ")
             if len(error_text) > 300:
                 error_text = error_text[:297] + "..."
-            failed_days.append(
-                {
-                    "day_utc": cursor.isoformat(),
-                    "error": error_text or exc.__class__.__name__,
-                }
-            )
-            cursor = next_day_utc
-            continue
-
-        if observation_count > 0:
-            days_with_rows.add(cursor)
+            failed_cursor = cursor
+            while failed_cursor < next_day_utc:
+                failed_days.append(
+                    {
+                        "day_utc": failed_cursor.isoformat(),
+                        "error": error_text or exc.__class__.__name__,
+                    }
+                )
+                failed_cursor += timedelta(days=1)
 
         cursor = next_day_utc
 
