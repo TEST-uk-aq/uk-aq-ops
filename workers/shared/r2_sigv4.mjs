@@ -304,6 +304,15 @@ export function isRetryableR2Status(status) {
   return R2_RETRYABLE_STATUS_CODES.has(status);
 }
 
+// Cloudflare can return an HTML Error 1001 DNS page as HTTP 409 for a
+// transient R2 GET. Do not retry genuine 409 conflicts or any write request.
+function isCloudflareR2Dns1001(response, errorText) {
+  return response.status === 409
+    && /^text\/html(?:\s*;|$)/i.test(response.headers.get("content-type") || "")
+    && /DNS resolution error/i.test(errorText || "")
+    && /<span>\s*1001\s*<\/span>/i.test(errorText || "");
+}
+
 function r2RequestErrorField(error, field) {
   try {
     const value = error?.[field];
@@ -407,12 +416,14 @@ async function fetchR2WithRetry({
             cancelResponseBody(response);
             return { retry: true, value: null };
           }
-          return {
-            retry: false,
-            value: typeof consumeResponse === "function"
-              ? await consumeResponse(response)
-              : response,
-          };
+          const value = typeof consumeResponse === "function"
+            ? await consumeResponse(response)
+            : response;
+          if (method === "GET" && attempt < boundedMaxAttempts
+              && isCloudflareR2Dns1001(response, value?.errorText)) {
+            return { retry: true, value: null };
+          }
+          return { retry: false, value };
         },
       );
     } catch (error) {
@@ -791,7 +802,10 @@ export async function r2GetObject({
   });
 
   if (!response.ok) {
-    const error = new Error(`R2 GET failed (${response.status}) key=${key}: ${errorText}`);
+    const detail = isCloudflareR2Dns1001(response, errorText)
+      ? "Cloudflare DNS resolution error (1001)"
+      : errorText;
+    const error = new Error(`R2 GET failed (${response.status}) key=${key}: ${detail}`);
     error.status = response.status;
     error.code = `HTTP_${response.status}`;
     throw error;
