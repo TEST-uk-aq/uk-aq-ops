@@ -38,7 +38,6 @@ jobs:
     if: ${{ !cancelled() }}
     uses: ./.github/workflows/uk_aq_ukair_bc_observation_reconciliation.yml
     with:
-      environment: ${{ vars.UK_AQ_ENV_NAME }}
       mode: daily
       horizon_days: "14"
       properties: "bc,uv370"
@@ -50,7 +49,6 @@ jobs:
     if: ${{ !cancelled() && needs.reconcile.result == 'success' }}
     uses: ./.github/workflows/uk_aq_bc_uv_diurnal_publish.yml
     with:
-      environment: ${{ vars.UK_AQ_ENV_NAME }}
       from_day: "2024-01-01"
     secrets: inherit
 
