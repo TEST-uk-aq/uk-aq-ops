@@ -127,7 +127,7 @@ async function metadata(databaseUrl) {
       from uk_aq_core.stations s
       join uk_aq_core.networks n on n.id = s.network_id
       where s.connector_id = $1 and s.service_ref = 'ukair_bc'
-        and s.removed_at is null and n.network_code = 'black_carbon' and n.public_display_enabled is true
+        and s.removed_at is null and n.network_code = 'black_carbon'
       order by s.station_ref, s.id`, [connectorId]);
     const series = await client.query(`
       select t.id as timeseries_id, t.station_id::bigint::text as station_id,
