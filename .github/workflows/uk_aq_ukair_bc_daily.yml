@@ -5,6 +5,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 # Serialise complete daily pipelines; existing called workflows also keep their
 # own reconciliation/publication concurrency and canonical R2 locking.
@@ -15,7 +16,26 @@ concurrency:
 # Reusable workflows validate this repository-configured environment and its
 # repository/R2 target before writing; no caller-selected target is accepted.
 jobs:
+  health-started:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: ${{ vars.UK_AQ_ENV_NAME }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24.22.1"
+      - name: Report pipeline Started
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
+        run: node scripts/ukair_bc/report_daily_pipeline_health.mjs started
+
   reconcile:
+    needs: health-started
+    # A health transport failure stays visible but must not stop canonical work.
+    if: ${{ !cancelled() }}
     uses: ./.github/workflows/uk_aq_ukair_bc_observation_reconciliation.yml
     with:
       environment: ${{ vars.UK_AQ_ENV_NAME }}
@@ -27,8 +47,40 @@ jobs:
 
   publish:
     needs: reconcile
+    if: ${{ !cancelled() && needs.reconcile.result == 'success' }}
     uses: ./.github/workflows/uk_aq_bc_uv_diurnal_publish.yml
     with:
       environment: ${{ vars.UK_AQ_ENV_NAME }}
       from_day: "2024-01-01"
     secrets: inherit
+
+  health-final:
+    needs: [health-started, reconcile, publish]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: ${{ vars.UK_AQ_ENV_NAME }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24.22.1"
+      - name: Report pipeline terminal state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
+          RECONCILIATION_RESULT: ${{ needs.reconcile.result }}
+          PUBLICATION_RESULT: ${{ needs.publish.result }}
+          PUBLICATION_SUMMARY: ${{ needs.publish.outputs.publication_summary }}
+        run: node scripts/ukair_bc/report_daily_pipeline_health.mjs final
+      # Reusable workflow failures/skips must never become green merely because
+      # the final reporting RPC succeeded. Also executes after reporter failure.
+      - name: Preserve mandatory pipeline outcome
+        if: ${{ always() }}
+        env:
+          RECONCILIATION_RESULT: ${{ needs.reconcile.result }}
+          PUBLICATION_RESULT: ${{ needs.publish.result }}
+        run: |
+          test "${RECONCILIATION_RESULT}" = "success"
+          test "${PUBLICATION_RESULT}" = "success"

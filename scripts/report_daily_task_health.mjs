@@ -379,7 +379,7 @@ export async function main(options = {}) {
     const buildStartedPayload = () => stripUndefined({
       task_key: taskKey,
       scheduled_for_date: scheduledForDate,
-      started_at: now,
+      started_at: optionalEnv("DAILY_TASK_STARTED_AT", env) || now,
       summary: buildSummary("started", env),
       source_repo: sourceRepo,
       source_worker: sourceWorker,
@@ -404,7 +404,7 @@ export async function main(options = {}) {
       console.log(
         `Reported daily task health STARTED: task_key=${taskKey}, date=${scheduledForDate}, run_id=${healthRunId || '<none>'}`,
       );
-      return;
+      return healthRunId;
     }
 
     const jobStatus = requiredEnv("JOB_STATUS", env);
