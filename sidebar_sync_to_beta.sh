@@ -23,7 +23,7 @@ DST="${LIVE_BASE}/LIVE-beta-uk-aq"
 # images or code, or uncomment TEST entries that are already disabled.
 COPY_SENSORS=false
 COPY_WHO_GUIDELINES=false
-COPY_WOOD_BURNING=false
+COPY_WOOD_BURNING=true
 COPY_NAEI_DATA=false
 COPY_RESEARCH=false
 COPY_BLOG=true
