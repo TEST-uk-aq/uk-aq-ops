@@ -7,9 +7,6 @@ on:
         description: "Compact verified publisher diagnostics, without product or observation data"
         value: ${{ jobs.publish.outputs.publication_summary }}
     inputs:
-      environment:
-        type: string
-        required: true
       from_day:
         type: string
         default: "2024-01-01"
@@ -18,13 +15,6 @@ on:
         default: false
   workflow_dispatch:
     inputs:
-      environment:
-        description: "Explicit environment identity"
-        required: true
-        type: choice
-        options:
-          - TEST
-          - LIVE
       from_day:
         description: "Historical start; must remain 2024-01-01"
         required: true
@@ -63,7 +53,6 @@ jobs:
       CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
       CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
       CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
-      INPUT_ENVIRONMENT: ${{ inputs.environment }}
       INPUT_FROM_DAY: ${{ inputs.from_day }}
       INPUT_FULL_REBUILD: ${{ inputs.full_rebuild }}
 
@@ -80,7 +69,6 @@ jobs:
           test -n "${UK_AQ_GITHUB_REPO}"
           test "${UK_AQ_GITHUB_REPO}" = "${GITHUB_REPOSITORY}"
           case "${UK_AQ_ENV_NAME}" in TEST|LIVE) ;; *) exit 1 ;; esac
-          test "${INPUT_ENVIRONMENT}" = "${UK_AQ_ENV_NAME}"
           test "${UK_AQ_R2_HISTORY_VERSION}" = "v3"
           test -n "${SUPABASE_URL}"
           test -n "${SUPABASE_DB_URL}"
@@ -95,7 +83,7 @@ jobs:
         id: build
         run: |
           set -euo pipefail
-          args=(--environment "${INPUT_ENVIRONMENT}" --from "${INPUT_FROM_DAY}" --publish)
+          args=(--environment "${UK_AQ_ENV_NAME}" --from "${INPUT_FROM_DAY}" --publish)
           if [[ "${INPUT_FULL_REBUILD}" == "true" ]]; then args+=(--full-rebuild); fi
           node scripts/ukair_bc/build_bc_uv_diurnal.mjs "${args[@]}" | tee "${RUNNER_TEMP}/bc_uv_publish_result.jsonl"
           python3 - <<'PY'
