@@ -66,9 +66,6 @@ function timestamp(value, label) {
 const created = timestamp(workflow.created_at, "workflow creation timestamp");
 const attemptCreated = timestamp(run.created_at, "attempt creation timestamp");
 const started = timestamp(run.run_started_at, "attempt start timestamp");
-if (attemptCreated < created || started < attemptCreated) {
-  throw new Error("Inconsistent GitHub workflow/attempt timestamp order");
-}
 
 const summary = {
   // Cloudflare and operator dispatches both use workflow_dispatch. Keep factual

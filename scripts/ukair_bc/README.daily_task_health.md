@@ -69,10 +69,11 @@ or migration is required. Ops PR #200 remains unmerged pending review; steps
   `workflow_created_at`, `workflow_attempt_created_at` and
   `workflow_attempt_started_at` distinguish these facts. Both responses must
   identify the executing repository/run, the attempt response must match the
-  current attempt, and all three UTC timestamps must be valid and ordered
-  original creation <= attempt creation <= attempt start. Invalid/missing
-  metadata fails reporting visibly before health writes; there is no invented
-  timestamp or fallback to a previous attempt's UUID.
+  current attempt, and all three UTC timestamps must be valid. GitHub can report
+  an attempt start one second before that attempt's creation timestamp, so their
+  order is not a reporting gate. Invalid/missing metadata fails reporting visibly
+  before health writes; there is no invented timestamp or fallback to a previous
+  attempt's UUID.
 - Finished requires both reusable jobs' results to be `success`. Failure,
   cancellation or a mandatory skip produces Failed if finalisation can run.
   The final job explicitly fails when either stage did not succeed. Reporting
