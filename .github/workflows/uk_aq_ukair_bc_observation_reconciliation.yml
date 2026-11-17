@@ -3,9 +3,6 @@ name: UK AQ UK-AIR Black Carbon Observation Reconciliation
 on:
   workflow_call:
     inputs:
-      environment:
-        type: string
-        required: true
       mode:
         type: string
         required: true
@@ -32,13 +29,6 @@ on:
         default: false
   workflow_dispatch:
     inputs:
-      environment:
-        description: "Explicit target environment; must match UK_AQ_ENV_NAME"
-        required: true
-        type: choice
-        options:
-          - TEST
-          - LIVE
       mode:
         description: "Reconciliation selection mode"
         required: true
@@ -106,7 +96,6 @@ jobs:
       CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
       CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
       INPUT_MODE: ${{ inputs.mode }}
-      INPUT_ENVIRONMENT: ${{ inputs.environment }}
       INPUT_FROM_DAY: ${{ inputs.from_day }}
       INPUT_TO_DAY: ${{ inputs.to_day }}
       INPUT_YEAR: ${{ inputs.year }}
@@ -139,10 +128,6 @@ jobs:
             TEST|LIVE) ;;
             *) echo "UK_AQ_ENV_NAME must explicitly be TEST or LIVE" >&2; exit 1 ;;
           esac
-          if [ "${INPUT_ENVIRONMENT}" != "${UK_AQ_ENV_NAME}" ]; then
-            echo "Selected environment must match UK_AQ_ENV_NAME" >&2
-            exit 1
-          fi
           if [ -z "${SUPABASE_URL:-}" ] || [ -z "${SUPABASE_DB_URL:-}" ]; then
             echo "SUPABASE_URL and SUPABASE_DB_URL are required for canonical metadata resolution" >&2
             exit 1
@@ -181,7 +166,7 @@ jobs:
           set -euo pipefail
           args=(
             --mode "${INPUT_MODE}"
-            --environment "${INPUT_ENVIRONMENT}"
+            --environment "${UK_AQ_ENV_NAME}"
             --horizon-days "${INPUT_HORIZON_DAYS}"
             --property "${INPUT_PROPERTIES}"
             --run-id "ukair-bc-gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
