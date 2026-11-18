@@ -4725,7 +4725,13 @@
       // A positive connector 8 count alone is insufficient if another connector also
       // has observation rows on the same day.
       function blackCarbonOnlyR2Days(payload, request) {
-        if (!payload || payload.error || payload.source !== "cloudflare_r2_history_index"
+        const validSource = payload?.source === "cloudflare_r2_history_index"
+          || (
+            payload?.source === "cloudflare_r2_history_index_partial"
+            && payload?.domains?.aqilevels?.available === false
+            && payload?.domains?.aqilevels?.index_missing === true
+          );
+        if (!payload || payload.error || !validSource
             || payload.read_version !== latestR2HistoryReadVersion.version
             || payload.from_day_utc !== request.fromDay || payload.to_day_utc !== request.toDay
             || payload.grain !== "day" || !Array.isArray(payload.connectors)
