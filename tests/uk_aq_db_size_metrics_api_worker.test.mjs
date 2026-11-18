@@ -189,7 +189,7 @@ test("R2 history calendar resolver honours explicit v2 env defaults and query la
   assert.equal(buildR2HistoryReadIndexKey(layout, "aqilevels"), "custom/_index_v2/aqilevels_hourly_data_timeseries_latest.json");
 });
 
-test("R2 history calendar resolver maps v3 observations and retained v2 AQI separately", () => {
+test("R2 history calendar resolver maps v3 observations without legacy AQI", () => {
   const layout = resolveR2HistoryLayoutConfig({
     UK_AQ_R2_HISTORY_VERSION: "v3",
     UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX: "wrong/v1/observations",
@@ -198,11 +198,10 @@ test("R2 history calendar resolver maps v3 observations and retained v2 AQI sepa
   assert.equal(layout.observations.version, "v3");
   assert.equal(layout.observationsPrefix, "history/v3/observations");
   assert.equal(layout.observations.indexPrefix, "history/_index_v3");
-  assert.equal(layout.aqilevels.version, "v2");
-  assert.equal(layout.aqilevels.status, "retired_legacy_optional");
-  assert.equal(layout.aqilevelsPrefix, "history/v2/aqilevels/hourly/data");
+  assert.equal(layout.aqilevels, undefined);
+  assert.equal(layout.aqilevelsPrefix, undefined);
   assert.equal(buildR2HistoryReadIndexKey(layout, "observations"), "history/_index_v3/observations_timeseries_latest.json");
-  assert.equal(buildR2HistoryReadIndexKey(layout, "aqilevels"), "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json");
+  assert.throws(() => buildR2HistoryReadIndexKey(layout, "aqilevels"));
 });
 
 test("read_version=v3 uses the same canonical observation generation as runtime v3", () => {
@@ -252,7 +251,9 @@ test("calendar day compaction detects v2-only days from day_summaries even witho
 
 test("v3 metrics adapter sums pollutant-scoped roots into connector summaries", () => {
   const normalized = normalizeObservationHistoryV3MetricsDomain({
+    schema_version: 3,
     domain: "observations",
+    days: ["2026-06-12"],
     day_summaries: [
       {
         day_utc: "2026-06-12",
@@ -278,14 +279,18 @@ test("deployment validation accepts v3 without injecting generic v1 prefixes", (
     new URL("../.github/workflows/uk_aq_db_r2_metrics_api_worker_deploy.yml", import.meta.url),
     "utf8",
   );
-  assert.match(workflow, /v1\|v2\|v3\) ;;/);
-  assert.match(workflow, /expected v1, v2, or v3/);
+  const admission = readFileSync(
+    new URL("../scripts/deploy/validate_db_r2_metrics_target.py", import.meta.url),
+    "utf8",
+  );
+  assert.match(admission, /\{"v1", "v2", "v3"\}/);
   assert.doesNotMatch(workflow, /--arg UK_AQ_R2_HISTORY_OBSERVATIONS_PREFIX/);
   assert.doesNotMatch(workflow, /--arg UK_AQ_R2_HISTORY_AQILEVELS_PREFIX/);
 });
 
 function installFakeR2GetObjects(objectsByKey) {
   const originalFetch = globalThis.fetch;
+  const requests = [];
   function keyFromUrl(url) {
     const parsed = new URL(url);
     const path = decodeURIComponent(parsed.pathname).replace(/^\/+/, "");
@@ -295,6 +300,7 @@ function installFakeR2GetObjects(objectsByKey) {
   globalThis.fetch = async (url, init = {}) => {
     const method = String(init.method || "GET").toUpperCase();
     const key = keyFromUrl(String(url));
+    requests.push({ method, key });
     if (method !== "GET") {
       return new Response("unsupported", { status: 405 });
     }
@@ -307,6 +313,7 @@ function installFakeR2GetObjects(objectsByKey) {
     });
   };
   return {
+    requests,
     restore() {
       globalThis.fetch = originalFetch;
     },
@@ -329,7 +336,7 @@ async function fetchCountsJson(search, objectsByKey, env = {}) {
       { ...r2Env, ...env },
     );
     const payload = await response.json();
-    return { status: response.status, payload };
+    return { status: response.status, payload, requests: fakeFetch.requests };
   } finally {
     fakeFetch.restore();
   }
@@ -343,7 +350,7 @@ async function fetchHistoryDaysJson(search, objectsByKey, env = {}) {
       { ...r2Env, ...env },
     );
     const payload = await response.json();
-    return { status: response.status, payload };
+    return { status: response.status, payload, requests: fakeFetch.requests };
   } finally {
     fakeFetch.restore();
   }
@@ -483,7 +490,7 @@ test("v2 counts API aggregates connector rows from v2 latest index connector sum
   assert.equal(payload.connectors[2].aqilevels_total_rows, 29);
 });
 
-test("v3 counts API adapts observation scoped roots and reads optional AQI from v2", async () => {
+test("v3 counts API adapts observation scoped roots without retired AQI reads", async () => {
   const objects = {
     "history/_index_v3/observations_timeseries_latest.json": {
       schema_version: 3,
@@ -508,16 +515,9 @@ test("v3 counts API adapts observation scoped roots and reads optional AQI from 
         },
       ],
     },
-    "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json": latestIndexPayload("aqilevels", [
-      {
-        day_utc: "2026-06-12",
-        connectors: [{ connector_id: 1, row_count: 4 }],
-        total_rows: 4,
-      },
-    ]),
   };
 
-  const { status, payload } = await fetchCountsJson(
+  const { status, payload, requests } = await fetchCountsJson(
     "?from_day=2026-06-12&to_day=2026-06-12&grain=day",
     objects,
     { UK_AQ_R2_HISTORY_VERSION: "v3" },
@@ -525,20 +525,20 @@ test("v3 counts API adapts observation scoped roots and reads optional AQI from 
 
   assert.equal(status, 200);
   assert.equal(payload.read_version, "v3");
-  assert.deepEqual(payload.domain_versions, { observations: "v3", aqilevels: "v2" });
+  assert.deepEqual(payload.domain_versions, { observations: "v3" });
   assert.equal(payload.index_prefix, "history/_index_v3");
-  assert.deepEqual(payload.index_prefixes, {
-    observations: "history/_index_v3",
-    aqilevels: "history/_index_v2",
-  });
+  assert.deepEqual(payload.index_prefixes, { observations: "history/_index_v3" });
   assert.equal(payload.index_keys.observations, "history/_index_v3/observations_timeseries_latest.json");
-  assert.equal(payload.index_keys.aqilevels, "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json");
+  assert.equal(payload.index_keys.aqilevels, undefined);
+  assert.deepEqual(requests.map((entry) => entry.key), ["history/_index_v3/observations_timeseries_latest.json"]);
+  assert.equal(payload.source, "cloudflare_r2_history_index");
+  assert.equal(payload.connector_evidence_complete, true);
   assert.equal(payload.domains.observations.total_rows, 25);
   assert.equal(payload.domains.observations.connector_row_counts_found, true);
   assert.equal(payload.connectors[0].observations_total_rows, 22);
-  assert.equal(payload.connectors[0].aqilevels_total_rows, 4);
+  assert.equal(payload.connectors[0].aqilevels_total_rows, undefined);
   assert.equal(payload.connectors[1].observations_total_rows, 3);
-  assert.equal(payload.connectors[1].aqilevels_total_rows, 0);
+  assert.equal(payload.connectors[1].aqilevels_total_rows, undefined);
 });
 
 test("v3 history-days API reads the v3 observation index without cross-generation fallback", async () => {
@@ -560,12 +560,9 @@ test("v3 history-days API reads the v3 observation index without cross-generatio
         scoped_roots: [{ connector_id: 1, pollutant_code: "no2", row_count: 10 }],
       }],
     },
-    "history/_index_v2/aqilevels_hourly_data_timeseries_latest.json": latestIndexPayload("aqilevels", [
-      { day_utc: "2026-06-12", connectors: [], total_rows: 0 },
-    ]),
   };
 
-  const { status, payload } = await fetchHistoryDaysJson(
+  const { status, payload, requests } = await fetchHistoryDaysJson(
     "?max_days=0",
     objects,
     { UK_AQ_R2_HISTORY_VERSION: "v3" },
@@ -575,8 +572,55 @@ test("v3 history-days API reads the v3 observation index without cross-generatio
   assert.equal(payload.read_version, "v3");
   assert.equal(payload.prefixes.observations, "history/v3/observations");
   assert.equal(payload.index_keys.observations, "history/_index_v3/observations_timeseries_latest.json");
+  assert.equal(payload.index_keys.aqilevels, undefined);
+  assert.deepEqual(requests.map((entry) => entry.key), ["history/_index_v3/observations_timeseries_latest.json"]);
   assert.deepEqual(payload.domains.observations.days, ["2026-06-12"]);
   assert.deepEqual(payload.warnings, []);
+});
+
+test("v3 missing observation authority stays unavailable", async () => {
+  const env = { UK_AQ_R2_HISTORY_VERSION: "v3" };
+  const counts = await fetchCountsJson(
+    "?from_day=2026-06-12&to_day=2026-06-12&grain=day", {}, env,
+  );
+  assert.equal(counts.payload.source, "cloudflare_r2_history_index_unavailable");
+  assert.ok(counts.payload.error);
+  assert.equal(counts.payload.connector_evidence_complete, false);
+  assert.deepEqual(counts.requests.map((entry) => entry.key), [
+    "history/_index_v3/observations_timeseries_latest.json",
+  ]);
+
+  const days = await fetchHistoryDaysJson("?max_days=0", {}, env);
+  assert.equal(days.status, 500);
+  assert.ok(days.payload.error);
+  assert.deepEqual(days.requests.map((entry) => entry.key), [
+    "history/_index_v3/observations_timeseries_latest.json",
+  ]);
+});
+
+test("v3 mismatched observation authority cannot confirm connector counts", async () => {
+  const objects = {
+    "history/_index_v3/observations_timeseries_latest.json": {
+      schema_version: 3,
+      kind: "observation_history_index_v3_latest_global",
+      index_generation: "v2",
+      history_version: "v2",
+      domain: "observations",
+      days: ["2026-06-12"],
+      day_summaries: [{
+        day_utc: "2026-06-12",
+        row_count: 1,
+        scoped_roots: [{ connector_id: 8, pollutant_code: "bc", row_count: 1 }],
+      }],
+    },
+  };
+  const { payload } = await fetchCountsJson(
+    "?from_day=2026-06-12&to_day=2026-06-12", objects,
+    { UK_AQ_R2_HISTORY_VERSION: "v3" },
+  );
+  assert.equal(payload.source, "cloudflare_r2_history_index_unavailable");
+  assert.equal(payload.connector_evidence_complete, false);
+  assert.match(payload.error, /invalid generation or kind/);
 });
 
 test("v2 counts API supports month grain and connector_ids filtering", async () => {

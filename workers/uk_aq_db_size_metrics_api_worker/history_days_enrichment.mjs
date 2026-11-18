@@ -224,12 +224,12 @@ async function readBackupInventory(r2, version) {
         max_day_utc: days.observations[days.observations.length - 1] || null,
         day_count: days.observations.length,
       },
-      aqilevels: {
-        days: days.aqilevels,
-        min_day_utc: days.aqilevels[0] || null,
-        max_day_utc: days.aqilevels[days.aqilevels.length - 1] || null,
-        day_count: days.aqilevels.length,
-      },
+      ...(version === "v3" ? {} : { aqilevels: {
+          days: days.aqilevels,
+          min_day_utc: days.aqilevels[0] || null,
+          max_day_utc: days.aqilevels[days.aqilevels.length - 1] || null,
+          day_count: days.aqilevels.length,
+      } }),
     },
   };
   inventoryCache = {
@@ -255,6 +255,7 @@ export async function enrichR2HistoryDaysResponse(response, env) {
 
   const version = String(payload.read_version || "").trim().toLowerCase();
   if (version !== "v1" && version !== "v2" && version !== "v3") return response;
+  const observationOnly = version === "v3";
   const bucket = String(payload.bucket || "").trim();
   const r2 = resolveR2Config(env, bucket);
   if (!hasRequiredR2Config(r2)) return response;
@@ -273,7 +274,7 @@ export async function enrichR2HistoryDaysResponse(response, env) {
       maxKeys,
       maxDays,
     }),
-    listDomainDays({
+    observationOnly ? Promise.resolve(null) : listDomainDays({
       r2,
       prefix: prefixes.aqilevels,
       maxKeys,
@@ -295,7 +296,7 @@ export async function enrichR2HistoryDaysResponse(response, env) {
   if (observationsResult.status === "rejected") {
     warnings.push(`Direct R2 observations day scan failed: ${observationsResult.reason instanceof Error ? observationsResult.reason.message : String(observationsResult.reason)}`);
   }
-  if (aqilevelsResult.status === "rejected") {
+  if (!observationOnly && aqilevelsResult.status === "rejected") {
     warnings.push(`Direct R2 AQI day scan failed: ${aqilevelsResult.reason instanceof Error ? aqilevelsResult.reason.message : String(aqilevelsResult.reason)}`);
   }
 
@@ -305,20 +306,20 @@ export async function enrichR2HistoryDaysResponse(response, env) {
       directObservations,
       observationsResult.status === "fulfilled",
     ),
-    aqilevels: domainSummary(
+    ...(observationOnly ? {} : { aqilevels: domainSummary(
       domains.aqilevels,
       directAqilevels,
       aqilevelsResult.status === "fulfilled",
-    ),
+    ) }),
   };
   const sources = {
     ...(payload.sources && typeof payload.sources === "object" ? payload.sources : {}),
     observations: observationsResult.status === "fulfilled"
       ? "cloudflare_r2_history_index+prefix_scan"
       : payload.sources?.observations || payload.source || null,
-    aqilevels: aqilevelsResult.status === "fulfilled"
+    ...(observationOnly ? {} : { aqilevels: aqilevelsResult.status === "fulfilled"
       ? "cloudflare_r2_history_index+prefix_scan"
-      : payload.sources?.aqilevels || payload.source || null,
+      : payload.sources?.aqilevels || payload.source || null }),
   };
 
   let backupInventory;
@@ -335,7 +336,7 @@ export async function enrichR2HistoryDaysResponse(response, env) {
       error: message,
       domains: {
         observations: { days: [], min_day_utc: null, max_day_utc: null, day_count: 0 },
-        aqilevels: { days: [], min_day_utc: null, max_day_utc: null, day_count: 0 },
+        ...(observationOnly ? {} : { aqilevels: { days: [], min_day_utc: null, max_day_utc: null, day_count: 0 } }),
       },
     };
   }
@@ -343,7 +344,8 @@ export async function enrichR2HistoryDaysResponse(response, env) {
   const normalised = {
     ...payload,
     domains: enrichedDomains,
-    source: sources.observations === sources.aqilevels ? sources.observations : "mixed",
+    source: observationOnly ? sources.observations
+      : sources.observations === sources.aqilevels ? sources.observations : "mixed",
     sources,
     backup_inventory: backupInventory,
     warnings,

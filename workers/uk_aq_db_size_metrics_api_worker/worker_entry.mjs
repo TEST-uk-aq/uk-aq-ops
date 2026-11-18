@@ -27,6 +27,9 @@ async function normaliseR2HistoryCountsResponse(response) {
     return response;
   }
 
+  if (payload?.read_version === "v3") {
+    return response;
+  }
   const normalised = normaliseOptionalAqilevelsCountsPayload(payload);
   if (normalised === payload) {
     return response;
