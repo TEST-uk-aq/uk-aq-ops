@@ -452,6 +452,24 @@
     return `<section class="media-review" data-ai-id="${article.id}" data-publisher-title="${esc(article.title)}" data-ai-published="${published ? "true" : "false"}"><div class="media-review__layout"><div class="media-preview-stack"><div class="media-site-preview-wrap"><div class="media-site-preview" aria-label="Website image article card preview"><span class="media-site-preview__fallback">No permitted preview</span>${image}<div class="media-site-preview__gradient" aria-hidden="true"></div><div class="media-site-preview__overlay"><div class="media-site-preview__source-row">${sourceRow}</div><div class="media-site-preview__title" data-ai-preview-title>${esc(displayTitleWrapping(currentTitle))}</div></div></div></div><div class="media-homepage-mobile-preview-wrap"><div class="media-homepage-mobile-preview__label">Homepage mobile · 360px</div><div class="media-homepage-mobile-preview" aria-label="Homepage non-image article card at a 360 pixel viewport"><div class="media-homepage-mobile-preview__container"><div class="media-homepage-mobile-preview__card">${externalLinkIcon}<p class="media-homepage-mobile-preview__source">${homepageSourceRow}</p><h5 class="media-homepage-mobile-preview__headline"><span data-ai-preview-title>${esc(displayTitleWrapping(currentTitle))}</span></h5></div></div></div></div></div><div class="media-review__controls"><span class="media-subtext">${provenance}</span><div class="media-review__titles"><div class="media-review__title"><span>Publisher original</span>${esc(article.title)}</div><div class="media-review__title"><span>Current display title</span>${esc(currentTitle)}</div><div class="media-review__title"><span>Title origin / status</span>${esc(article.display_title_origin || "original")} · ${esc(titleStatus(article)[1])}</div><div class="media-review__title"><span>${esc(aiSuggestionLabel(article))}</span>${esc(article.ai_title_suggestion || "—")}</div></div><div class="media-actions"><button class="media-button" data-ai-action="generate">${generateLabel}</button>${pendingActions}<label class="media-field media-field--grow"><span>Edit as human title</span><input data-ai-edit value="${esc(article.display_title || "")}" maxlength="500"></label><button class="media-button" data-ai-action="edit">Save human title</button>${article.display_title ? `<button class="media-button" data-ai-action="clear">Clear display title</button>` : ""}</div><div data-ai-message>${savedMessage ? message(savedMessage.text, savedMessage.kind) : ""}</div></div></div></section>`;
   }
 
+  function reviewEvidenceHtml(article) {
+    const evidence = article.relevance_evidence;
+    if (article.status !== "pending" || evidence?.classification !== "ambiguous") return "";
+    const labels = { verified: "Verified article text", partial: "Partial excerpt",
+      queued: "Checking", not_checked: "Not checked", not_permitted: "Not permitted" };
+    let label = labels[evidence.status] || "Unavailable";
+    let counts = "";
+    if (evidence.status === "verified" || evidence.status === "partial") {
+      const terms = ["Air", "Quality", "Pollution", "Health"];
+      if (terms.every(term => Number.isSafeInteger(evidence[term.toLowerCase()]) && evidence[term.toLowerCase()] >= 0)) {
+        counts = " · " + terms.map(term => `${term} ${evidence[term.toLowerCase()]}`).join(" · ");
+      } else {
+        label = "Unavailable";
+      }
+    }
+    return `<span class="media-subtext">${esc(label)}${counts}</span>`;
+  }
+
   function articleRow(article) {
     const title = article.display_title || article.title;
     const [titleState, titleLabel] = titleStatus(article);
@@ -465,7 +483,7 @@
       ? `<span class="media-possible-duplicate">Possible duplicate</span><span class="media-subtext">${esc(possibleDuplicateReasonLabel(article.possible_duplicate_reason_code))}</span>`
       : "";
     return `<tr data-article-id="${article.id}"><td class="media-select-cell"><input type="checkbox" data-select-article aria-label="Select ${esc(title)}"${state.selectedArticleIds.has(String(article.id)) ? " checked" : ""}></td><td>${thumb}<span class="media-image-state media-image-state--${esc(imageState[0])}">${esc(imageState[1])}</span></td>
-      <td class="media-title-cell"><button type="button" class="media-title-button" data-open-article>${esc(displayTitleWrapping(title))}</button>${article.display_title ? `<span class="media-subtext">Original: ${esc(article.title)}</span>` : ""}${possibleDuplicate}</td>
+      <td class="media-title-cell"><button type="button" class="media-title-button" data-open-article>${esc(displayTitleWrapping(title))}</button>${reviewEvidenceHtml(article)}${article.display_title ? `<span class="media-subtext">Original: ${esc(article.title)}</span>` : ""}${possibleDuplicate}</td>
       <td>${esc(article.publisher)}</td><td>${esc(article.author || "—")}</td>
       <td>${esc(formatPublishedDateTime(article.published_at, false))}</td><td>${esc(formatUtcDateTime(article.approved_at, false))}</td>
       <td><span class="media-title-status media-title-status--${esc(titleState)}">${esc(titleLabel)}</span><button type="button" class="media-ai-disclosure" data-toggle-ai aria-expanded="${isExpanded}">${isExpanded ? "▴ Title" : "▾ Title"}</button></td><td>${statusControl(article)}</td></tr>${isExpanded ? `<tr class="media-ai-expanded"><td colspan="9">${inlineAiReview(article)}</td></tr>` : ""}`;
