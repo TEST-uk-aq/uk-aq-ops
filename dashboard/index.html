@@ -4725,29 +4725,34 @@
       // A positive connector 8 count alone is insufficient if another connector also
       // has observation rows on the same day.
       function blackCarbonOnlyR2Days(payload, request) {
-        const validSource = payload?.source === "cloudflare_r2_history_index"
-          || (
-            payload?.source === "cloudflare_r2_history_index_partial"
-            && payload?.domains?.aqilevels?.available === false
-            && payload?.domains?.aqilevels?.index_missing === true
-          );
-        if (!payload || payload.error || !validSource
+        if (!payload || payload.error || payload.source !== "cloudflare_r2_history_index"
             || payload.read_version !== latestR2HistoryReadVersion.version
             || payload.from_day_utc !== request.fromDay || payload.to_day_utc !== request.toDay
             || payload.grain !== "day" || !Array.isArray(payload.connectors)
+            || payload.connector_evidence_complete !== true
+            || !Array.isArray(payload.connector_ids_requested)
+            || payload.connector_ids_requested.length !== 0
+            || !Number.isSafeInteger(payload.bucket_count) || payload.bucket_count <= 0
             || payload.domains?.observations?.connector_row_counts_found !== true
-            || (Array.isArray(payload.warnings) && payload.warnings.length > 0)) {
+            || !Array.isArray(payload.warnings) || payload.warnings.length > 0) {
           return new Set();
         }
         const perDay = new Map();
+        const seenConnectors = new Set();
         for (const connector of payload.connectors) {
           const connectorId = Number(connector?.connector_id);
-          if (!Number.isSafeInteger(connectorId) || connectorId <= 0 || !Array.isArray(connector.buckets)) {
+          if (!Number.isSafeInteger(connectorId) || connectorId <= 0
+              || seenConnectors.has(connectorId) || !Array.isArray(connector.buckets)
+              || connector.buckets.length !== payload.bucket_count) {
             return new Set();
           }
+          seenConnectors.add(connectorId);
+          const seenDays = new Set();
           for (const bucket of connector.buckets) {
             const day = String(bucket?.bucket_key || "");
-            if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || day < request.fromDay || day > request.toDay) continue;
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || day < request.fromDay
+                || day > request.toDay || seenDays.has(day)) return new Set();
+            seenDays.add(day);
             const rows = bucket.observations_rows;
             if (!Number.isSafeInteger(rows) || rows < 0) return new Set();
             if (rows === 0) continue;

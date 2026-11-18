@@ -46,9 +46,9 @@ R2 history-days response shape:
 - `max_keys`
 - `strict_manifests`
 - `prefixes.observations`
-- `prefixes.aqilevels`
+- `prefixes.aqilevels` (v1/v2 only)
 - `domains.observations.days` (`YYYY-MM-DD` day list from R2 domain day prefixes)
-- `domains.aqilevels.days`
+- `domains.aqilevels.days` (v1/v2 only)
 - `domains.<domain>.min_day_utc`
 - `domains.<domain>.max_day_utc`
 - `domains.<domain>.day_count`
@@ -78,10 +78,10 @@ R2 history-counts response shape:
 - `index_prefix`
 - `domain_versions` / `domain_version_labels`
 - `domain_status` (`canonical`, `legacy_manual`, or `retired_legacy_optional`)
-- `index_prefixes.observations` / `index_prefixes.aqilevels`
+- `index_prefixes.observations` / `index_prefixes.aqilevels` (AQI field in v1/v2 only)
 - `index_keys.observations`
-- `index_keys.aqilevels`
-- `domains.observations` / `domains.aqilevels`
+- `index_keys.aqilevels` (v1/v2 only)
+- `domains.observations` / `domains.aqilevels` (AQI field in v1/v2 only)
   - `generated_at`
   - `min_day_utc`
   - `max_day_utc`
@@ -89,10 +89,11 @@ R2 history-counts response shape:
   - `total_rows`
   - `first_day_summary_fields`
   - `connector_row_counts_found`
+- `connector_evidence_complete` (v3; true only for unfiltered, validated observation counts)
 - `connectors[]`
   - `connector_id`
   - `observations_total_rows`
-  - `aqilevels_total_rows`
+  - `aqilevels_total_rows` (v1/v2 only)
   - `total_rows`
   - `buckets[]`
     - `bucket_key`
@@ -102,9 +103,9 @@ R2 history-counts response shape:
     - `observations_rows`
     - `observations_present_days`
     - `observations_avg_rows_per_day`
-    - `aqilevels_rows`
-    - `aqilevels_present_days`
-    - `aqilevels_avg_rows_per_day`
+    - `aqilevels_rows` (v1/v2 only)
+    - `aqilevels_present_days` (v1/v2 only)
+    - `aqilevels_avg_rows_per_day` (v1/v2 only)
     - `total_rows`
     - `total_avg_rows_per_day`
 
@@ -137,7 +138,7 @@ Behavior:
   - `history/_index_v3/observations_timeseries_latest.json`
   - `history/v3/observations/day_utc=YYYY-MM-DD/`
   - the Worker does not accept a separate v3 observation-prefix override and does not fall back to v2 or v1 observations.
-  - calculated AQI/aqilevel R2 is not a v3 product. For dashboard compatibility it remains an optional retired v2 diagnostic at `history/_index_v2/aqilevels_hourly_data_timeseries_latest.json` and `history/v2/aqilevels/hourly/data/`.
+  - calculated AQI/aqilevel R2 is not a v3 product. V3 dashboard metrics do not read the retired v2 AQI index or scan its data prefix. Their responses omit AQI-only fields; v1/v2 retain their legacy diagnostics.
 - For `/v1/r2-history-counts`, reads the same version-selected derived R2 history index files and aggregates
   connector row counts by day or month entirely in-memory.
 - In `read_version=v2`, connector counts come from
@@ -148,9 +149,10 @@ Behavior:
 - In `read_version=v3`, an API-boundary adapter sums canonical
   `day_summaries[].scoped_roots[].row_count` entries by connector into the
   existing dashboard connector-count response shape. It does not alter the v3 index format.
-- If an index file is missing or invalid for a domain, falls back to low-subrequest domain day-prefix scan for that same resolved domain only (no cross-generation observation fallback):
+- For v1/v2, if an index file is missing or invalid for a domain, falls back to a domain day-prefix scan for that same resolved domain only:
   - lists `day_utc=YYYY-MM-DD/` common prefixes under the domain;
   - filters by `max_days` and excludes future dates.
+- V3 requires the selected canonical observation index and reports missing or invalid authority as an error. The history-days enrichment adapter can still verify v3 observation day presence with a physical observation-prefix scan.
 - Optional strict mode (`strict_manifests=true`):
   - verifies `<prefix>/day_utc=YYYY-MM-DD/manifest.json` exists via `HEAD` per day;
   - use for diagnostics when you need strict committed-manifest confirmation.

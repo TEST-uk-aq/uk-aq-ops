@@ -1,6 +1,7 @@
 import {
   hasRequiredR2Config,
   normalizePrefix,
+  r2GetObject,
   r2ListAllCommonPrefixes,
   r2HeadObject,
 } from "../shared/r2_sigv4.mjs";
@@ -14,6 +15,7 @@ import {
   buildR2HistoryIndexKey,
   buildR2HistoryV2AqilevelsHourlyDataTimeseriesLatestKey,
   buildR2HistoryV2ObservationsTimeseriesLatestKey,
+  normalizeR2HistoryIndexDomain,
   readR2HistoryIndex,
   resolveR2HistoryIndexConfig,
 } from "../shared/uk_aq_r2_history_index.mjs";
@@ -282,9 +284,46 @@ export function compactHistoryIndexDomain(domainPayload) {
   };
 }
 
-export function normalizeObservationHistoryV3MetricsDomain(domainPayload) {
-  const daySummaries = Array.isArray(domainPayload?.day_summaries)
-    ? domainPayload.day_summaries.map((summary) => {
+export function normalizeObservationHistoryV3MetricsDomain(domainPayload, maxLookbackDays = 0) {
+  const days = domainPayload?.days;
+  const rawSummaries = domainPayload?.day_summaries;
+  if (domainPayload?.schema_version !== 3
+      || !Array.isArray(days) || days.length === 0 || !Array.isArray(rawSummaries)
+      || rawSummaries.length !== days.length) {
+    throw new Error("V3 observations index has missing or mismatched day summaries");
+  }
+  for (let index = 0; index < days.length; index += 1) {
+    const summary = rawSummaries[index];
+    if (summary?.day_utc !== days[index] || !Array.isArray(summary.scoped_roots)
+        || summary.scoped_roots.length === 0) {
+      throw new Error(`V3 observations index has incomplete scoped roots for ${days[index]}`);
+    }
+    const scopes = new Set();
+    let rowTotal = 0;
+    for (const root of summary.scoped_roots) {
+      const connectorId = root?.connector_id;
+      const rowCount = root?.row_count;
+      const pollutantCode = root?.pollutant_code;
+      if (!Number.isSafeInteger(connectorId) || connectorId <= 0
+          || !Number.isSafeInteger(rowCount) || rowCount <= 0
+          || typeof pollutantCode !== "string" || !pollutantCode) {
+        throw new Error(`V3 observations index has invalid scoped root for ${days[index]}`);
+      }
+      const scope = `${connectorId}:${pollutantCode}`;
+      if (scopes.has(scope)) {
+        throw new Error(`V3 observations index has duplicate scoped root for ${days[index]}`);
+      }
+      scopes.add(scope);
+      rowTotal += rowCount;
+    }
+    if (!Number.isSafeInteger(summary.row_count) || summary.row_count !== rowTotal) {
+      throw new Error(`V3 observations index row count mismatch for ${days[index]}`);
+    }
+  }
+  const cutoff = buildDayCutoff(maxLookbackDays);
+  const daySummaries = rawSummaries
+    .filter((summary) => !cutoff || summary.day_utc >= cutoff)
+    .map((summary) => {
         if (!summary || typeof summary !== "object" || Array.isArray(summary)) {
           return summary;
         }
@@ -309,8 +348,7 @@ export function normalizeObservationHistoryV3MetricsDomain(domainPayload) {
           total_rows: parseNonNegativeInt(summary.row_count, connectorRowTotal),
           connectors,
         };
-      })
-    : [];
+      });
   const summaryRowTotal = daySummaries.reduce(
     (sum, summary) => sum + (parseNonNegativeInt(summary?.total_rows, 0) || 0),
     0,
@@ -320,6 +358,10 @@ export function normalizeObservationHistoryV3MetricsDomain(domainPayload) {
       ? domainPayload
       : {}),
     total_rows: summaryRowTotal,
+    days: daySummaries.map((summary) => summary.day_utc),
+    min_day_utc: daySummaries[0]?.day_utc || null,
+    max_day_utc: daySummaries[daySummaries.length - 1]?.day_utc || null,
+    day_count: daySummaries.length,
     day_summaries: daySummaries,
   };
 }
@@ -428,7 +470,7 @@ export function buildR2HistoryCountBuckets(fromDay, toDay, grain) {
   };
 }
 
-function cloneR2HistoryCountBucket(meta) {
+function cloneR2HistoryCountBucket(meta, includeAqilevels = true) {
   return {
     bucket_key: meta.bucket_key,
     bucket_start_day_utc: meta.bucket_start_day_utc,
@@ -437,9 +479,11 @@ function cloneR2HistoryCountBucket(meta) {
     observations_rows: 0,
     observations_present_days: 0,
     observations_avg_rows_per_day: 0,
-    aqilevels_rows: 0,
-    aqilevels_present_days: 0,
-    aqilevels_avg_rows_per_day: 0,
+    ...(includeAqilevels ? {
+      aqilevels_rows: 0,
+      aqilevels_present_days: 0,
+      aqilevels_avg_rows_per_day: 0,
+    } : {}),
     total_rows: 0,
     total_avg_rows_per_day: 0,
   };
@@ -453,6 +497,7 @@ export function aggregateR2HistoryConnectorCounts({
   grain,
   connectorIds = [],
 }) {
+  const includeAqilevels = aqilevelsDomain != null;
   const normalizedFrom = parseIsoDay(fromDay);
   const normalizedTo = parseIsoDay(toDay);
   if (!normalizedFrom || !normalizedTo || normalizedFrom > normalizedTo) {
@@ -478,12 +523,12 @@ export function aggregateR2HistoryConnectorCounts({
         connector_id: connectorId,
         bucket_count: orderedBucketKeys.length,
         observations_total_rows: 0,
-        aqilevels_total_rows: 0,
+        ...(includeAqilevels ? { aqilevels_total_rows: 0 } : {}),
         total_rows: 0,
         buckets_by_key: new Map(
           orderedBucketKeys.map((bucketKey) => [
             bucketKey,
-            cloneR2HistoryCountBucket(bucketMetaByKey.get(bucketKey)),
+            cloneR2HistoryCountBucket(bucketMetaByKey.get(bucketKey), includeAqilevels),
           ]),
         ),
       };
@@ -535,7 +580,7 @@ export function aggregateR2HistoryConnectorCounts({
   };
 
   applyDomain(observationsDomain, "observations");
-  applyDomain(aqilevelsDomain, "aqilevels");
+  if (includeAqilevels) applyDomain(aqilevelsDomain, "aqilevels");
 
   for (const connectorId of connectorFilter) {
     ensureConnectorEntry(connectorId);
@@ -546,26 +591,28 @@ export function aggregateR2HistoryConnectorCounts({
     .map((entry) => {
       const buckets = orderedBucketKeys.map((bucketKey) => {
         const bucket = entry.buckets_by_key.get(bucketKey) || cloneR2HistoryCountBucket(
-          bucketMetaByKey.get(bucketKey),
+          bucketMetaByKey.get(bucketKey), includeAqilevels,
         );
         bucket.observations_avg_rows_per_day = bucket.calendar_day_count > 0
           ? bucket.observations_rows / bucket.calendar_day_count
           : 0;
-        bucket.aqilevels_avg_rows_per_day = bucket.calendar_day_count > 0
-          ? bucket.aqilevels_rows / bucket.calendar_day_count
-          : 0;
-        bucket.total_rows = bucket.observations_rows + bucket.aqilevels_rows;
+        if (includeAqilevels) {
+          bucket.aqilevels_avg_rows_per_day = bucket.calendar_day_count > 0
+            ? bucket.aqilevels_rows / bucket.calendar_day_count
+            : 0;
+        }
+        bucket.total_rows = bucket.observations_rows + (includeAqilevels ? bucket.aqilevels_rows : 0);
         bucket.total_avg_rows_per_day = bucket.calendar_day_count > 0
           ? bucket.total_rows / bucket.calendar_day_count
           : 0;
         return bucket;
       });
-      const totalRows = entry.observations_total_rows + entry.aqilevels_total_rows;
+      const totalRows = entry.observations_total_rows + (includeAqilevels ? entry.aqilevels_total_rows : 0);
       return {
         connector_id: entry.connector_id,
         bucket_count: orderedBucketKeys.length,
         observations_total_rows: entry.observations_total_rows,
-        aqilevels_total_rows: entry.aqilevels_total_rows,
+        ...(includeAqilevels ? { aqilevels_total_rows: entry.aqilevels_total_rows } : {}),
         total_rows: totalRows,
         buckets,
       };
@@ -674,14 +721,14 @@ function parseR2HistoryMetricsVersion(raw, varName) {
   return value;
 }
 
-function buildLegacyV2AqilevelsLayout(env, { mixedWithV3Observations = false } = {}) {
+function buildLegacyV2AqilevelsLayout(env) {
   const v2Generation = getObservationHistoryGeneration("v2");
   const indexPrefix = normalizePrefix(
     env.UK_AQ_R2_HISTORY_INDEX_V2_PREFIX || v2Generation.index_root_prefix,
   );
   return {
     version: "v2",
-    label: mixedWithV3Observations ? "R2_v2_legacy_optional" : "R2_v2",
+    label: "R2_v2",
     prefix: normalizePrefix(
       env.UK_AQ_R2_HISTORY_V2_AQILEVELS_HOURLY_DATA_PREFIX
         || "history/v2/aqilevels/hourly/data",
@@ -705,15 +752,10 @@ export function resolveR2HistoryLayoutConfig(env, url) {
       payloadShape: "observation_history_v3_scoped_roots",
       status: "canonical",
     };
-    const aqilevels = buildLegacyV2AqilevelsLayout(env, {
-      mixedWithV3Observations: true,
-    });
     return {
       readVersion,
       observations,
-      aqilevels,
       observationsPrefix: observations.prefix,
-      aqilevelsPrefix: aqilevels.prefix,
       indexPrefix: observations.indexPrefix,
     };
   }
@@ -793,11 +835,44 @@ export function buildR2HistoryReadIndexKey(layoutConfig, domain) {
   throw new Error(`Invalid R2 history read version for index key: ${String(layoutConfig?.readVersion?.version || "")}`);
 }
 
-function normalizeR2HistoryMetricsIndex(layoutConfig, domain, payload) {
+function normalizeR2HistoryMetricsIndex(layoutConfig, domain, payload, maxLookbackDays = 0) {
   if (domain === "observations" && layoutConfig?.observations?.version === "v3") {
-    return normalizeObservationHistoryV3MetricsDomain(payload);
+    return normalizeObservationHistoryV3MetricsDomain(payload, maxLookbackDays);
   }
   return payload;
+}
+
+async function readSelectedObservationMetricsIndex({ r2, layoutConfig, maxLookbackDays, todayDay }) {
+  const indexKey = buildR2HistoryReadIndexKey(layoutConfig, "observations");
+  if (layoutConfig.readVersion.version !== "v3") {
+    return readR2HistoryIndex({ r2, indexKey, domain: "observations", maxLookbackDays, todayDay });
+  }
+  const object = await r2GetObject({ r2, key: indexKey });
+  let payload;
+  try {
+    payload = JSON.parse(object.body.toString("utf8"));
+  } catch (_error) {
+    throw new Error(`V3 observations index ${indexKey} returned invalid JSON`);
+  }
+  if (payload?.schema_version !== 3 || payload?.domain !== "observations"
+      || payload?.index_generation !== "v3" || payload?.history_version !== "v2"
+      || !["observation_timeseries_latest_global", "observation_history_index_v3_latest_global"].includes(payload?.kind)) {
+    throw new Error(`V3 observations index ${indexKey} has invalid generation or kind`);
+  }
+  if (!Array.isArray(payload.days) || !Array.isArray(payload.day_summaries)
+      || payload.days.length === 0 || payload.day_count !== payload.days.length
+      || payload.day_summaries.length !== payload.days.length
+      || payload.min_day_utc !== payload.days[0]
+      || payload.max_day_utc !== payload.days[payload.days.length - 1]
+      || payload.day_summaries.some((summary, index) => summary?.day_utc !== payload.days[index])
+      || payload.total_rows !== payload.day_summaries.reduce(
+        (sum, summary) => sum + (Number.isSafeInteger(summary?.row_count) ? summary.row_count : 0), 0,
+      )) {
+    throw new Error(`V3 observations index ${indexKey} has mismatched day coverage`);
+  }
+  return normalizeR2HistoryIndexDomain(payload, {
+    expectedDomain: "observations", maxLookbackDays: 0, todayDay,
+  });
 }
 
 async function fetchR2HistoryDays(env, url) {
@@ -824,12 +899,13 @@ async function fetchR2HistoryDays(env, url) {
   }
 
   const layoutConfig = resolveR2HistoryLayoutConfig(env, url);
+  const observationOnly = layoutConfig.readVersion.version === "v3";
   const observationsPrefix = layoutConfig.observationsPrefix;
   const aqilevelsPrefix = layoutConfig.aqilevelsPrefix;
   const indexPrefix = layoutConfig.indexPrefix;
   const indexKeys = {
     observations: buildR2HistoryReadIndexKey(layoutConfig, "observations"),
-    aqilevels: buildR2HistoryReadIndexKey(layoutConfig, "aqilevels"),
+    ...(observationOnly ? {} : { aqilevels: buildR2HistoryReadIndexKey(layoutConfig, "aqilevels") }),
   };
   const todayDay = new Date().toISOString().slice(0, 10);
   const domainSources = {};
@@ -841,16 +917,12 @@ async function fetchR2HistoryDays(env, url) {
     observations = compactHistoryIndexDomain(normalizeR2HistoryMetricsIndex(
       layoutConfig,
       "observations",
-      await readR2HistoryIndex({
-        r2,
-        indexKey: indexKeys.observations,
-        domain: "observations",
-        maxLookbackDays,
-        todayDay,
-      }),
+      await readSelectedObservationMetricsIndex({ r2, layoutConfig, maxLookbackDays, todayDay }),
+      maxLookbackDays,
     ));
     domainSources.observations = "cloudflare_r2_history_index";
   } catch (error) {
+    if (observationOnly) throw error;
     const message = error instanceof Error ? error.message : String(error);
     warnings.push(`observations index unavailable for ${layoutConfig.observations.label}: attempted ${indexKeys.observations}; ${message}; scanning ${observationsPrefix} only (no cross-generation fallback).`);
     observations = await listCommittedDaysForDomain({
@@ -863,33 +935,35 @@ async function fetchR2HistoryDays(env, url) {
     domainSources.observations = "cloudflare_r2_manifest_scan";
   }
 
-  try {
-    aqilevels = compactHistoryIndexDomain(normalizeR2HistoryMetricsIndex(
-      layoutConfig,
-      "aqilevels",
-      await readR2HistoryIndex({
+  if (!observationOnly) {
+    try {
+      aqilevels = compactHistoryIndexDomain(normalizeR2HistoryMetricsIndex(
+        layoutConfig,
+        "aqilevels",
+        await readR2HistoryIndex({
+          r2,
+          indexKey: indexKeys.aqilevels,
+          domain: "aqilevels",
+          maxLookbackDays,
+          todayDay,
+        }),
+      ));
+      domainSources.aqilevels = "cloudflare_r2_history_index";
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      warnings.push(`aqilevels index unavailable for ${layoutConfig.aqilevels.label}: attempted ${indexKeys.aqilevels}; ${message}; scanning ${aqilevelsPrefix} only (no cross-generation fallback).`);
+      aqilevels = await listCommittedDaysForDomain({
         r2,
-        indexKey: indexKeys.aqilevels,
-        domain: "aqilevels",
+        domainPrefix: aqilevelsPrefix,
+        maxKeys,
         maxLookbackDays,
-        todayDay,
-      }),
-    ));
-    domainSources.aqilevels = "cloudflare_r2_history_index";
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    warnings.push(`aqilevels index unavailable for ${layoutConfig.aqilevels.label}: attempted ${indexKeys.aqilevels}; ${message}; scanning ${aqilevelsPrefix} only (no cross-generation fallback).`);
-    aqilevels = await listCommittedDaysForDomain({
-      r2,
-      domainPrefix: aqilevelsPrefix,
-      maxKeys,
-      maxLookbackDays,
-      strictManifests,
-    });
-    domainSources.aqilevels = "cloudflare_r2_manifest_scan";
+        strictManifests,
+      });
+      domainSources.aqilevels = "cloudflare_r2_manifest_scan";
+    }
   }
 
-  const source = domainSources.observations === domainSources.aqilevels
+  const source = observationOnly ? domainSources.observations : domainSources.observations === domainSources.aqilevels
     ? domainSources.observations
     : "mixed";
 
@@ -899,11 +973,11 @@ async function fetchR2HistoryDays(env, url) {
     max_days: maxLookbackDays,
     prefixes: {
       observations: observationsPrefix,
-      aqilevels: aqilevelsPrefix,
+      ...(observationOnly ? {} : { aqilevels: aqilevelsPrefix }),
     },
     domains: {
       observations,
-      aqilevels,
+      ...(observationOnly ? {} : { aqilevels }),
     },
     source,
     sources: domainSources,
@@ -914,19 +988,19 @@ async function fetchR2HistoryDays(env, url) {
     index_prefix: indexPrefix,
     domain_versions: {
       observations: layoutConfig.observations.version,
-      aqilevels: layoutConfig.aqilevels.version,
+      ...(observationOnly ? {} : { aqilevels: layoutConfig.aqilevels.version }),
     },
     domain_version_labels: {
       observations: layoutConfig.observations.label,
-      aqilevels: layoutConfig.aqilevels.label,
+      ...(observationOnly ? {} : { aqilevels: layoutConfig.aqilevels.label }),
     },
     domain_status: {
       observations: layoutConfig.observations.status,
-      aqilevels: layoutConfig.aqilevels.status,
+      ...(observationOnly ? {} : { aqilevels: layoutConfig.aqilevels.status }),
     },
     index_prefixes: {
       observations: layoutConfig.observations.indexPrefix,
-      aqilevels: layoutConfig.aqilevels.indexPrefix,
+      ...(observationOnly ? {} : { aqilevels: layoutConfig.aqilevels.indexPrefix }),
     },
     index_keys: indexKeys,
     warnings,
@@ -963,55 +1037,52 @@ async function fetchR2HistoryCounts(env, url) {
   }
 
   const layoutConfig = resolveR2HistoryLayoutConfig(env, url);
+  const observationOnly = layoutConfig.readVersion.version === "v3";
   const indexPrefix = layoutConfig.indexPrefix;
   const indexKeys = {
     observations: buildR2HistoryReadIndexKey(layoutConfig, "observations"),
-    aqilevels: buildR2HistoryReadIndexKey(layoutConfig, "aqilevels"),
+    ...(observationOnly ? {} : { aqilevels: buildR2HistoryReadIndexKey(layoutConfig, "aqilevels") }),
   };
   const warnings = [];
   let observations = compactHistoryIndexDomain(null);
-  let aqilevels = compactHistoryIndexDomain(null);
+  let aqilevels = observationOnly ? null : compactHistoryIndexDomain(null);
   let indexError = null;
   try {
     observations = compactHistoryIndexDomain(normalizeR2HistoryMetricsIndex(
       layoutConfig,
       "observations",
-      await readR2HistoryIndex({
-        r2,
-        indexKey: indexKeys.observations,
-        domain: "observations",
-        maxLookbackDays: 0,
-        todayDay,
-      }),
+      await readSelectedObservationMetricsIndex({ r2, layoutConfig, maxLookbackDays: 0, todayDay }),
     ));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     indexError = indexError || message;
     warnings.push(`observations index unavailable for ${layoutConfig.observations.label}: ${message}`);
   }
-  try {
-    aqilevels = compactHistoryIndexDomain(normalizeR2HistoryMetricsIndex(
-      layoutConfig,
-      "aqilevels",
-      await readR2HistoryIndex({
-        r2,
-        indexKey: indexKeys.aqilevels,
-        domain: "aqilevels",
-        maxLookbackDays: 0,
-        todayDay,
-      }),
-    ));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    indexError = indexError || message;
-    warnings.push(`aqilevels index unavailable for ${layoutConfig.aqilevels.label}: ${message}`);
+  if (!observationOnly) {
+    try {
+      aqilevels = compactHistoryIndexDomain(normalizeR2HistoryMetricsIndex(
+        layoutConfig,
+        "aqilevels",
+        await readR2HistoryIndex({
+          r2,
+          indexKey: indexKeys.aqilevels,
+          domain: "aqilevels",
+          maxLookbackDays: 0,
+          todayDay,
+        }),
+      ));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      indexError = indexError || message;
+      warnings.push(`aqilevels index unavailable for ${layoutConfig.aqilevels.label}: ${message}`);
+    }
   }
 
   const observationsDiagnostics = {
     first_day_summary_fields: firstDaySummaryFieldNames(observations, fromDay, toDay),
     ...connectorRowCountDiagnostics(observations, fromDay, toDay),
   };
-  const aqilevelsDiagnostics = {
+  const aqilevelsDiagnostics = observationOnly ? null : {
     first_day_summary_fields: firstDaySummaryFieldNames(aqilevels, fromDay, toDay),
     ...connectorRowCountDiagnostics(aqilevels, fromDay, toDay),
   };
@@ -1027,7 +1098,7 @@ async function fetchR2HistoryCounts(env, url) {
     }
   }
   if (
-    layoutConfig.aqilevels.version === "v2"
+    !observationOnly && layoutConfig.aqilevels.version === "v2"
     && aqilevelsDiagnostics.day_summary_count_in_range > 0
     && aqilevelsDiagnostics.connector_array_day_count === 0
   ) {
@@ -1054,6 +1125,9 @@ async function fetchR2HistoryCounts(env, url) {
     source: indexError ? "cloudflare_r2_history_index_unavailable" : "cloudflare_r2_history_index",
     error: indexError,
     warnings,
+    ...(observationOnly ? {
+      connector_evidence_complete: !indexError && connectorIds.length === 0,
+    } : {}),
     read_version: layoutConfig.readVersion.version,
     read_version_label: layoutConfig.readVersion.label,
     read_version_source: layoutConfig.readVersion.source,
@@ -1061,19 +1135,19 @@ async function fetchR2HistoryCounts(env, url) {
     index_prefix: indexPrefix,
     domain_versions: {
       observations: layoutConfig.observations.version,
-      aqilevels: layoutConfig.aqilevels.version,
+      ...(observationOnly ? {} : { aqilevels: layoutConfig.aqilevels.version }),
     },
     domain_version_labels: {
       observations: layoutConfig.observations.label,
-      aqilevels: layoutConfig.aqilevels.label,
+      ...(observationOnly ? {} : { aqilevels: layoutConfig.aqilevels.label }),
     },
     domain_status: {
       observations: layoutConfig.observations.status,
-      aqilevels: layoutConfig.aqilevels.status,
+      ...(observationOnly ? {} : { aqilevels: layoutConfig.aqilevels.status }),
     },
     index_prefixes: {
       observations: layoutConfig.observations.indexPrefix,
-      aqilevels: layoutConfig.aqilevels.indexPrefix,
+      ...(observationOnly ? {} : { aqilevels: layoutConfig.aqilevels.indexPrefix }),
     },
     index_keys: indexKeys,
     domains: {
@@ -1085,14 +1159,14 @@ async function fetchR2HistoryCounts(env, url) {
         total_rows: observations.total_rows,
         ...observationsDiagnostics,
       },
-      aqilevels: {
+      ...(observationOnly ? {} : { aqilevels: {
         generated_at: aqilevels.generated_at,
         min_day_utc: aqilevels.min_day_utc,
         max_day_utc: aqilevels.max_day_utc,
         day_count: aqilevels.day_count,
         total_rows: aqilevels.total_rows,
         ...aqilevelsDiagnostics,
-      },
+      } }),
     },
     ...aggregated,
   };
