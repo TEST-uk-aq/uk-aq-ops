@@ -3965,7 +3965,9 @@
           const obsAqi = point.obs_aqidb === null ? 0 : Number(point.obs_aqidb);
           return Math.max(max, ingest, obsAqi);
         }, 0);
-        const yAxisMaxMb = computeAxisMax(maxObservedMb * 1.05);
+        const yAxisMaxMb = maxObservedMb > 500
+          ? computeAxisMax(maxObservedMb * 1.05)
+          : 500;
 
         let chartMarkup = `<div class="db-size-empty">No DB size samples in the selected period.</div>`;
         if (points.length > 0) {
@@ -4214,6 +4216,7 @@
           emptyLabel: "No schema size samples in the selected period.",
           seriesDefs: [...schemaSeriesDefs, { key: "other_system", label: "Other/system", color: COLOR_OBSAQI_OTHER }],
           stackOrderKeys: ["uk_aq_aqilevels", "uk_aq_observs", "uk_aq_raw", "uk_aq_core", "uk_aq_ops", "public", "other_system"],
+          yMaxOverride: yAxisMaxMb,
         });
 
         const r2DomainPoints = buildStackedMetricPoints(
