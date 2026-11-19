@@ -5064,7 +5064,9 @@
       let serviceEgressHistoryDays = 28;
       let serviceEgressBreakdown = "today";
 
-      function renderServiceEgressPanel(minuteRows, sourceError, dailyRows, statusRows, overviewRows) {
+      function renderServiceEgressPanel(minuteRows, sourceError, dailyRows, statusRows, overviewRows, freshness = {}) {
+        const minuteError = freshness.minute !== undefined ? freshness.minute : sourceError;
+        const dailyError = freshness.daily !== undefined ? freshness.daily : sourceError;
         const panel = document.createElement("section");
         panel.className = "panel";
         panel.dataset.panel = "service-egress";
@@ -5087,7 +5089,7 @@
         const todayBytes = sum(minutes, "response_bytes_est");
         const yesterdayBytes = verified(yesterday) ? numeric(overview.get(yesterday), "response_bytes_est") : null;
         const hourRows = minutes.filter(row => new Date(row.bucket_minute || "").getTime() >= hourCutoff);
-        const fullHour = !sourceError && new Date().getUTCHours() >= 1 && minutes.length > 0;
+        const fullHour = !minuteError && new Date().getUTCHours() >= 1 && minutes.length > 0;
         const historyStart = new Date();
         if (serviceEgressHistoryDays === 365) {
           const day = historyStart.getUTCDate();
@@ -5105,7 +5107,7 @@
         const unknownDays = days.filter(day => !verified(day));
         const historicalBytes = days.filter(verified).reduce((total, day) => total + numeric(overview.get(day), "response_bytes_est"), 0);
         const historicalRequests = days.filter(verified).reduce((total, day) => total + numeric(overview.get(day), "request_count"), 0);
-        const historyComplete = !sourceError && unknownDays.length === 0;
+        const historyComplete = !dailyError && unknownDays.length === 0;
         const breakdownDays = serviceEgressBreakdown === "week" ? 7 : serviceEgressBreakdown === "month" ? 28 : 0;
         const breakdownStart = breakdownDays ? new Date(Date.now() - breakdownDays * 86400000).toISOString().slice(0,10) : "";
         const selectedRows = serviceEgressBreakdown === "today" ? minutes
@@ -5120,7 +5122,8 @@
         } else if (serviceEgressBreakdown === "yesterday") {
           selectedDays.push(yesterday);
         }
-        const selectedIncomplete = !!sourceError || (serviceEgressBreakdown === "today" && !minutes.length)
+        const selectedIncomplete = (serviceEgressBreakdown === "today" ? !!minuteError : !!dailyError)
+          || (serviceEgressBreakdown === "today" && !minutes.length)
           || selectedDays.some(day => !verified(day));
         const selectedTotal = sum(selectedRows, "response_bytes_est");
         const share = bytes => selectedTotal > 0 ? `${((bytes / selectedTotal) * 100).toFixed(1)}%` : "—";
@@ -5156,9 +5159,9 @@
           <h2>Measured Supabase Egress <span class="chip">beta</span></h2>
           <div class="meta-note">Application-attributed Supabase response measurements. Useful for attribution; not Supabase billed egress totals.</div>
           <div class="egress-summary">
-            <div class="egress-summary-card"><div class="egress-summary-label">Today (UTC)</div><div class="egress-summary-value">${sourceError || !minutes.length ? "Unavailable" : formatBytesBestFit(todayBytes)}</div>
+            <div class="egress-summary-card"><div class="egress-summary-label">Today (UTC)</div><div class="egress-summary-value">${minuteError || !minutes.length ? "Unavailable" : formatBytesBestFit(todayBytes)}</div>
               <div class="footnote">${minutes.length ? `${formatCount(sum(minutes,"request_count"))} requests · ${formatCount(sum(minutes,"error_count"))} errors` : "No current-day measurements yet"}</div></div>
-            <div class="egress-summary-card"><div class="egress-summary-label">Yesterday (UTC)</div><div class="egress-summary-value">${yesterdayBytes === null || sourceError ? "Unavailable" : formatBytesBestFit(yesterdayBytes)}</div>
+            <div class="egress-summary-card"><div class="egress-summary-label">Yesterday (UTC)</div><div class="egress-summary-value">${yesterdayBytes === null || dailyError ? "Unavailable" : formatBytesBestFit(yesterdayBytes)}</div>
               <div class="footnote">${verified(yesterday) ? "Verified daily aggregate" : "Awaiting verified daily aggregate"}</div></div>
             <div class="egress-summary-card"><div class="egress-summary-label">Last 1 hour</div><div class="egress-summary-value">${fullHour ? formatBytesBestFit(sum(hourRows,"response_bytes_est")) : "Unavailable"}</div>
               <div class="footnote">${new Date().getUTCHours() < 1 ? "Incomplete current-day window before 01:00 UTC" : "Exact only with a complete current-day source read"}</div></div>
@@ -5193,7 +5196,7 @@
         });
         panel.querySelector("[data-egress-breakdown]")?.addEventListener("change", event => {
           serviceEgressBreakdown = String(event.target.value || "today");
-          const replacement = renderServiceEgressPanel(minuteRows, sourceError, dailyRows, statusRows, overviewRows);
+          const replacement = renderServiceEgressPanel(minuteRows, sourceError, dailyRows, statusRows, overviewRows, freshness);
           panel.replaceWith(replacement);
         });
         return panel;
@@ -6959,6 +6962,7 @@
               data.service_egress_daily_metrics,
               data.service_egress_daily_status,
               data.service_egress_daily_overview,
+              { minute: data.service_egress_minute_error, daily: data.service_egress_daily_error },
             ),
           ];
           operationsContainer.replaceChildren(...nextPanels);

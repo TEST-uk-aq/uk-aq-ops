@@ -20,6 +20,7 @@ METRIC_KEYS = ("db_size_metrics", "schema_size_metrics", "r2_domain_size_metrics
                "db_size_metrics_error", "schema_size_metrics_error", "r2_domain_size_metrics_error",
                "r2_usage", "r2_usage_error", "service_egress_metrics", "service_egress_daily_metrics", "service_egress_daily_status",
                "service_egress_daily_overview", "service_egress_history_days", "service_egress_metrics_error",
+               "service_egress_minute_error", "service_egress_daily_error",
                "r2_backup_window", "r2_backup_window_error", "r2_history_days_bucket", "r2_history_days_error",
                "r2_history_read_version", "r2_history_read_version_effective")
 _WRITER = False
@@ -135,7 +136,8 @@ def read_product(product, version, role="reader"):
     if product in {"r2_metrics", "metric_context"} and isinstance(payload.get("r2_usage"), dict):
         usage = payload["r2_usage"]
         if r2_billing.operations_error(usage):
-            stale = True
+            if product == "r2_metrics":
+                stale = True
             # Do not keep moving the acceptance time while a slow collection is
             # already pending. Invalid static configuration requires correction.
             if not _WRITER and r2_billing.configuration_valid():
@@ -496,20 +498,49 @@ def serve_cached_request(handler, parsed):
             payload["r2_domain_size_metrics_warning"] = "Historical domain byte metrics have no generation identity; unavailable for v3. Account usage remains account-wide."
         if parsed.path == "/api/dashboard" and "metric_context" in products:
             import uk_aq_dashboard_rolling_cache as rolling
-            if (query.get("egress_history_days") or [""])[0] == "365":
-                payload["service_egress_daily_status"] = rolling.read_service_egress_status(role="reader", days=365)
-                payload["service_egress_daily_overview"] = rolling.read_service_egress_overview(role="reader", days=365)
-                payload["service_egress_history_days"] = 365
-            egress_state = rolling._state("service_egress_metrics_daily", role="reader") or {}
-            minute_state = rolling._state("service_egress_metrics_minute", role="reader") or {}
+            metric_meta = metadata.get("metric_context") or {}
+            snapshot_fresh = metric_meta.get("state") == "fresh"
+            local_snapshot = metric_meta.get("source") == "local_mysql"
+            snapshot_time = rolling._parse_ts(metric_meta.get("refreshed_at"))
+            history_days = 365 if (query.get("egress_history_days") or [""])[0] == "365" else 28
             now = utcnow()
-            stale = (metadata.get("metric_context") or {}).get("state") != "fresh"
-            for state in (egress_state, minute_state):
-                success = state.get("last_success_at")
-                if not success or (now - success).total_seconds() > 900 or state.get("last_error_code"):
-                    stale = True
-            if stale:
-                payload["service_egress_metrics_error"] = "Local egress source sync is stale or incomplete; showing last-known data"
+            def egress_error(dataset):
+                warning = f"Local {dataset} egress source sync is stale or incomplete; showing last-known data"
+                try:
+                    state = rolling._state(f"service_egress_metrics_{dataset}", role="reader") or {}
+                    success = state.get("last_success_at")
+                    if not success or (now - success).total_seconds() > 900 or state.get("last_error_code"):
+                        return warning
+                    needs_read = not snapshot_fresh or not snapshot_time or success > snapshot_time
+                    if needs_read and not local_snapshot:
+                        return warning
+                    # A failed product attempt preserves its old payload; a
+                    # newer dataset sync can also precede product publication.
+                    # In either case, read only the healthy dataset's local rows.
+                    reads = []
+                    if dataset == "minute" and needs_read:
+                        reads.append(("service_egress_metrics", lambda: rolling.read_service_egress(role="reader")))
+                    if dataset == "daily":
+                        if needs_read:
+                            reads.append(("service_egress_daily_metrics", lambda: rolling.read_service_egress_daily(role="reader", days=28)))
+                        if needs_read or history_days == 365:
+                            reads.extend([
+                                ("service_egress_daily_status", lambda: rolling.read_service_egress_status(role="reader", days=history_days)),
+                                ("service_egress_daily_overview", lambda: rolling.read_service_egress_overview(role="reader", days=history_days)),
+                                ("service_egress_history_days", lambda: history_days),
+                            ])
+                    refreshed = {key: read() for key, read in reads}
+                    payload.update(refreshed)
+                    return None
+                except Exception:
+                    return warning
+
+            source_error = payload.get("service_egress_metrics_error")
+            payload["service_egress_minute_error"] = source_error or egress_error("minute")
+            payload["service_egress_daily_error"] = source_error or egress_error("daily")
+            payload["service_egress_metrics_error"] = source_error or "; ".join(
+                error for error in (payload["service_egress_minute_error"], payload["service_egress_daily_error"]) if error
+            ) or None
         if parsed.path == "/api/dashboard" and not flag("include_ingest_context"):
             payload["pollutants"] = []; payload["connectors_settings"] = []
         if "r2_usage" in payload:
