@@ -20,6 +20,7 @@ METRIC_KEYS = ("db_size_metrics", "schema_size_metrics", "r2_domain_size_metrics
                "db_size_metrics_error", "schema_size_metrics_error", "r2_domain_size_metrics_error",
                "r2_usage", "r2_usage_error", "service_egress_metrics", "service_egress_daily_metrics", "service_egress_daily_status",
                "service_egress_daily_overview", "service_egress_history_days", "service_egress_metrics_error",
+               "service_egress_minute_error", "service_egress_daily_error",
                "r2_backup_window", "r2_backup_window_error", "r2_history_days_bucket", "r2_history_days_error",
                "r2_history_read_version", "r2_history_read_version_effective")
 _WRITER = False
@@ -135,7 +136,8 @@ def read_product(product, version, role="reader"):
     if product in {"r2_metrics", "metric_context"} and isinstance(payload.get("r2_usage"), dict):
         usage = payload["r2_usage"]
         if r2_billing.operations_error(usage):
-            stale = True
+            if product == "r2_metrics":
+                stale = True
             # Do not keep moving the acceptance time while a slow collection is
             # already pending. Invalid static configuration requires correction.
             if not _WRITER and r2_billing.configuration_valid():
@@ -503,13 +505,20 @@ def serve_cached_request(handler, parsed):
             egress_state = rolling._state("service_egress_metrics_daily", role="reader") or {}
             minute_state = rolling._state("service_egress_metrics_minute", role="reader") or {}
             now = utcnow()
-            stale = (metadata.get("metric_context") or {}).get("state") != "fresh"
-            for state in (egress_state, minute_state):
+            cache_stale = (metadata.get("metric_context") or {}).get("state") != "fresh"
+            def sync_stale(state):
                 success = state.get("last_success_at")
-                if not success or (now - success).total_seconds() > 900 or state.get("last_error_code"):
-                    stale = True
-            if stale:
-                payload["service_egress_metrics_error"] = "Local egress source sync is stale or incomplete; showing last-known data"
+                return not success or (now - success).total_seconds() > 900 or bool(state.get("last_error_code"))
+            source_error = payload.get("service_egress_metrics_error")
+            payload["service_egress_minute_error"] = source_error or (
+                "Local minute egress source sync is stale or incomplete; showing last-known data"
+                if cache_stale or sync_stale(minute_state) else None)
+            payload["service_egress_daily_error"] = source_error or (
+                "Local daily egress source sync is stale or incomplete; showing last-known data"
+                if cache_stale or sync_stale(egress_state) else None)
+            payload["service_egress_metrics_error"] = source_error or "; ".join(
+                error for error in (payload["service_egress_minute_error"], payload["service_egress_daily_error"]) if error
+            ) or None
         if parsed.path == "/api/dashboard" and not flag("include_ingest_context"):
             payload["pollutants"] = []; payload["connectors_settings"] = []
         if "r2_usage" in payload:

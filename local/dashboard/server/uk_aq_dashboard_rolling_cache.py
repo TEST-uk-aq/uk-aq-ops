@@ -502,6 +502,10 @@ def _egress_retention_day(today: date) -> date:
     return date(prior_year, today.month, min(today.day, calendar.monthrange(prior_year, today.month)[1]))
 
 
+class DailyEgressSyncError(RuntimeError):
+    """The minute sync succeeded, but the daily sync failed."""
+
+
 def sync_service_egress(core) -> Dict[str, Any]:
     if not core.OBS_AQIDB_SUPABASE_URL or not core.OBS_AQIDB_SECRET_KEY:
         raise RuntimeError("ObsAQIDB egress source is not configured")
@@ -557,7 +561,11 @@ def sync_service_egress(core) -> Dict[str, Any]:
             _state_success(cursor,"service_egress_metrics_minute",watermark_at=max_bucket,
                            source_window_start=since,source_window_end=_naive_utc(now),source_row_count=len(rows))
         connection.commit()
-    sync_service_egress_daily(core, base=base, headers=headers, environment=environment)
+    try:
+        sync_service_egress_daily(core, base=base, headers=headers, environment=environment)
+    except Exception as exc:
+        record_sync_failure("service_egress_metrics_daily")
+        raise DailyEgressSyncError("daily egress source sync failed") from exc
     return {"source_rows": len(rows)}
 
 

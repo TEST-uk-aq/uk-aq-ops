@@ -73,6 +73,8 @@ def main():
             elif product == "metric_context":
                 try:
                     rolling.sync_service_egress(core)
+                except rolling.DailyEgressSyncError:
+                    raise
                 except Exception:
                     rolling.record_sync_failure("service_egress_metrics_minute")
                     raise
@@ -91,11 +93,12 @@ def main():
                 expires = core._next_storage_coverage_refresh(datetime.now(timezone.utc)).replace(tzinfo=None)
             if product in {"r2_metrics", "metric_context"}:
                 payload["r2_usage"] = r2_billing.guard_usage(payload.get("r2_usage"))
-                fresh_until = r2_billing.timestamp((payload.get("r2_usage") or {}).get("billing_period_fresh_until_utc"))
-                if fresh_until and fresh_until > datetime.now(timezone.utc):
-                    expires = min(expires, fresh_until.replace(tzinfo=None))
-                if product == "r2_metrics" and r2_billing.configuration_valid() and r2_billing.operations_error(payload.get("r2_usage")):
-                    expires = min(expires, cache.utcnow() + timedelta(seconds=60))
+                if product == "r2_metrics":
+                    fresh_until = r2_billing.timestamp((payload.get("r2_usage") or {}).get("billing_period_fresh_until_utc"))
+                    if fresh_until and fresh_until > datetime.now(timezone.utc):
+                        expires = min(expires, fresh_until.replace(tzinfo=None))
+                    if r2_billing.configuration_valid() and r2_billing.operations_error(payload.get("r2_usage")):
+                        expires = min(expires, cache.utcnow() + timedelta(seconds=60))
             payload["r2_history_read_version"] = resolution
             if product == "r2_metrics":
                 try:
