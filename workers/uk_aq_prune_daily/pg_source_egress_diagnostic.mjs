@@ -102,6 +102,11 @@ function bucketMinuteIso(value = new Date()) {
   return bucket.toISOString();
 }
 
+function metricEnvironment(env) {
+  const name = String(env.UK_AQ_ENV_NAME || "").trim();
+  return ["TEST", "LIVE"].includes(name) ? name : null;
+}
+
 function registerServiceMetric({
   client,
   responseBytes,
@@ -112,6 +117,7 @@ function registerServiceMetric({
 }) {
   try {
     const identity = sourceIdentity(client);
+    const envName = metricEnvironment(process.env);
     const bucketMinute = bucketMinuteIso();
     const semanticStatus = status === "error"
       ? "error"
@@ -120,13 +126,14 @@ function registerServiceMetric({
         : "partial";
     const key = [
       bucketMinute,
+      envName,
       identity.project_ref,
       identity.source_name,
       semanticStatus,
     ].join("\u001f");
     const current = serviceMetrics.get(key) || {
       bucket_minute: bucketMinute,
-      env_name: String(process.env.UK_AQ_ENV_NAME || "").trim().toLowerCase(),
+      env_name: envName,
       project_ref: identity.project_ref,
       service_name: SERVICE_NAME,
       source_type: SOURCE_TYPE,
@@ -490,15 +497,15 @@ export async function flushPhaseBServiceEgressMetrics({ env = process.env, fetch
     return { enabled: true, rows: 0, error: "metrics_destination_not_configured" };
   }
 
-  const canonicalEnvName = String(env.UK_AQ_ENV_NAME || "").trim();
-  if (!["TEST", "LIVE"].includes(canonicalEnvName)) {
+  const envName = metricEnvironment(env);
+  const rows = Array.from(serviceMetrics.values());
+  if (!envName || rows.some((row) => row.env_name !== envName)) {
     emitInfo("phase_b_history_service_egress_metrics_warning", {
       reason: "metrics_environment_invalid",
+      detail: "Each metric must match the configured UK_AQ_ENV_NAME (TEST or LIVE).",
     });
     return { enabled: true, rows: 0, error: "metrics_environment_invalid" };
   }
-  const envName = canonicalEnvName.toLowerCase();
-  const rows = Array.from(serviceMetrics.values(), (row) => ({ ...row, env_name: envName }));
   serviceMetrics.clear();
   try {
     const response = await fetchImpl(
