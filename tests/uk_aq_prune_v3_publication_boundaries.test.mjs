@@ -68,32 +68,102 @@ test("approved repair preserves all existing scopes and sends only a conditional
   assert.deepEqual(writes.map(({ key, if_match }) => [key, if_match]), [[latestKey, '"original"'], [latestKey, '"original"']]);
 });
 
-test("v3 preparation reaches complete batch admission before the first parent PUT", async () => {
+function parentPublicationFixture({ unchanged = false, loseLock = false } = {}) {
   const parentKeys = ["day", "month", "year", "root"];
-  let remainingRequestAllowance = 13;
   const stored = new Map([...parentKeys, latestKey].map(key => [key, Buffer.from(`old ${key}`)]));
-  const verifiedKeys = [];
   const writes = [];
+  const reads = [];
+  const verifiedKeys = [];
+  const budgets = [];
   const put = async ({ key, body }) => { writes.push(key); stored.set(key, body); };
+  let allowance = Infinity;
   const batch = createV3ParentPublicationBatch({ parentKeys, latestKey,
-    getObject: async ({ key }) => ({ key, body: stored.get(key) }), putIfChanged: put, putObject: put,
-    assertOwned: async () => {},
-    admit: count => {
-      assert.equal(count, 14);
-      if (count > remainingRequestAllowance) throw new Error("stopped_budget");
+    getObject: async ({ key }) => { reads.push(key); return { key, body: stored.get(key) }; },
+    putIfChanged: async object => {
+      await put(object);
+      return { key: object.key, byte_size: object.byte_size, sha256: object.sha256,
+        status: "succeeded", verified: true, post_put_get_verified: true };
+    },
+    putObject: put,
+    assertOwned: async () => { if (loseLock && writes.length) throw new Error("original lock lost"); },
+    admit: (requests, locks) => {
+      budgets.push([requests, locks]);
+      if (requests > allowance) throw new Error("stopped_budget");
     },
     log: (event, fields) => { if (event === "parent_verified") verifiedKeys.push(fields.key); },
   });
-  for (const key of [...parentKeys, latestKey]) await batch.getObject({ key });
-  await batch.putIfChanged({ key: "day", body: Buffer.from("new day") });
-  for (const key of parentKeys.slice(1)) await batch.putObject({ key, body: Buffer.from(`new ${key}`) });
-  for (const key of parentKeys) assert.equal((await batch.getObject({ key })).body.toString(), `new ${key}`);
-  await assert.rejects(batch.publishParents({ key: latestKey }), /stopped_budget/);
-  assert.deepEqual(writes, []);
-  assert.deepEqual(parentKeys.map(key => stored.get(key).toString()), parentKeys.map(key => `old ${key}`));
-  remainingRequestAllowance = 14;
-  await batch.publishParents({ key: latestKey });
-  await batch.putIfChanged({ key: latestKey, body: Buffer.from("new latest") });
-  assert.deepEqual(writes, [...parentKeys, latestKey]);
-  assert.deepEqual(verifiedKeys, parentKeys);
+  const artifact = key => {
+    const body = Buffer.from(`${unchanged ? "old" : "new"} ${key}`);
+    return { key, body, byte_size: body.length, sha256: sha256Hex(body) };
+  };
+  const prepare = async () => {
+    for (const key of [...parentKeys, latestKey]) await batch.getObject({ key });
+    await batch.putIfChanged(artifact("day"));
+    // Unchanged aggregates are already suppressed by the hierarchy planner.
+    if (!unchanged) for (const key of parentKeys.slice(1)) await batch.putObject(artifact(key));
+    for (const key of parentKeys) assert.deepEqual((await batch.getObject({ key })).body, artifact(key).body);
+  };
+  return { batch, artifact, prepare, parentKeys, stored, writes, reads, verifiedKeys, budgets,
+    setAllowance: value => { allowance = value; } };
+}
+
+test("v3 preparation reaches complete batch admission before the first parent PUT", async () => {
+  const f = parentPublicationFixture();
+  await f.prepare();
+  f.setAllowance(12);
+  await assert.rejects(f.batch.publishParents(f.artifact(latestKey)), /stopped_budget/);
+  assert.deepEqual(f.budgets, [[13, 5]]);
+  assert.deepEqual(f.writes, []);
+  assert.deepEqual(f.verifiedKeys, []);
+  assert.deepEqual(f.parentKeys.map(key => f.stored.get(key).toString()), f.parentKeys.map(key => `old ${key}`));
+
+  f.setAllowance(13);
+  f.reads.length = 0;
+  await f.batch.publishParents(f.artifact(latestKey));
+  assert.deepEqual(f.reads, [...f.parentKeys, latestKey, "month", "year", "root"]);
+  const result = await f.batch.putIfChanged(f.artifact(latestKey));
+  await f.batch.finishLatest({ ok: true, objects: [{ ...result, durable: true }] });
+  assert.deepEqual(f.writes, [...f.parentKeys, latestKey]);
+  assert.deepEqual(f.verifiedKeys, f.parentKeys);
+  assert.equal(f.batch.lastVerified, latestKey);
+});
+
+test("exact unchanged parents and latest avoid PUT and keep live latest verification", async () => {
+  const f = parentPublicationFixture({ unchanged: true });
+  await f.prepare();
+  f.reads.length = 0;
+  await f.batch.publishParents(f.artifact(latestKey));
+  const result = await f.batch.putIfChanged(f.artifact(latestKey));
+  assert.equal(result.status, "skipped_unchanged");
+  assert.equal(result.post_put_get_verified, true);
+  // The real finaliser performs this independent durability GET after the
+  // adapter has verified the unchanged latest on the origin.
+  await f.batch.getObject({ key: latestKey });
+  await f.batch.finishLatest({ ok: true, objects: [{ ...result, durable: true }] });
+  assert.deepEqual(f.budgets, [[2, 1]]);
+  assert.deepEqual(f.reads, [...f.parentKeys, latestKey, latestKey, latestKey]);
+  assert.deepEqual(f.writes, []);
+});
+
+test("v3 batch fails closed on a changed predecessor or original lock loss between writes", async () => {
+  const drifted = parentPublicationFixture();
+  await drifted.prepare();
+  drifted.stored.set("month", Buffer.from("changed month"));
+  await assert.rejects(drifted.batch.publishParents(drifted.artifact(latestKey)), /predecessor changed/);
+  assert.deepEqual(drifted.writes, []);
+
+  const inconsistent = parentPublicationFixture();
+  await inconsistent.batch.getObject({ key: "month" });
+  inconsistent.stored.set("month", Buffer.from("transiently changed month"));
+  await assert.rejects(inconsistent.batch.getObject({ key: "month" }), /changed during preparation/);
+  inconsistent.stored.set("month", Buffer.from("old month"));
+  await assert.rejects(inconsistent.batch.publishParents(inconsistent.artifact(latestKey)), /changed during preparation/);
+  assert.deepEqual(inconsistent.writes, []);
+
+  const interrupted = parentPublicationFixture({ loseLock: true });
+  await interrupted.prepare();
+  await assert.rejects(interrupted.batch.publishParents(interrupted.artifact(latestKey)), /original lock lost/);
+  assert.deepEqual(interrupted.writes, ["day"]);
+  assert.equal(interrupted.batch.lastVerified, "day");
+  await assert.rejects(interrupted.batch.putIfChanged(interrupted.artifact(latestKey)), /outside the admitted/);
 });

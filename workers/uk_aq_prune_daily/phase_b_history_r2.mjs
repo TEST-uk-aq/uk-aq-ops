@@ -11,7 +11,7 @@ import {
   runOperationalPruneDailyObservationHistoryV3RunFinalization,
   createOperationalPruneDailyExactOnlyWriterV3,
 } from "../shared/uk_aq_observation_history_operational_writer_v3.mjs";
-import { OBSERVATION_HISTORY_EXACT_ONLY_PUBLICATION_ACTIVE_V3 }
+import { finalizeObservationHistoryIndexV3Publication, OBSERVATION_HISTORY_EXACT_ONLY_PUBLICATION_ACTIVE_V3 }
   from '../shared/uk_aq_observation_history_index_v3.mjs';
 import {
   createPruneDailyObservationHistoryV3RunLocalEvidenceCache,
@@ -26,7 +26,7 @@ import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
 import { randomUUID } from "node:crypto";
-import { originalOperationError, isOriginalOperationError }
+import { ORIGINAL_OPERATION_ASSERTION_MAX_MS, originalOperationError, isOriginalOperationError }
   from '../../scripts/operations/lib/uk_aq_prune_original_operation.mjs';
 import { uploadPrunePendingSource, uploadPruneEvidenceBundle, resolvePruneSignerConfig,
   PRUNE_SIGNED_UPLOAD_DEADLINE_MS, PRUNE_EVIDENCE_BUNDLE_UPLOAD_DEADLINE_MS,
@@ -185,7 +185,7 @@ const DEFAULT_ROW_GROUP_SIZE = 100_000;
 const DEFAULT_OBSERVATIONS_ROW_GROUP_SIZE = 50_000;
 const DEFAULT_AQILEVELS_ROW_GROUP_SIZE = DEFAULT_ROW_GROUP_SIZE;
 const DEFAULT_MAX_CANDIDATES_PER_RUN = 500;
-const DEFAULT_MAX_SECONDS_PER_RUN = 3_540;
+const DEFAULT_MAX_SECONDS_PER_RUN = 10_740;
 const DEFAULT_STOP_BEFORE_TIMEOUT_SECONDS = 60;
 const PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS = 600_000;
 const PHASE_B_PG_CONNECTION_TIMEOUT_MAX_MS = 15_000;
@@ -4138,12 +4138,12 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
     affected_days_utc: affectedDays,
   };
   let finalizationStage = "run_finalization";
-  const assertFinalizationRequestBudget = (operation, requestCount, fields = {}) => {
+  const assertFinalizationRequestBudget = (operation, requestCount, fields = {}, additionalMs = 0) => {
     assertBudget(runtime, operation, {
       ...finalizationFields,
       publication_stage: finalizationStage,
       ...fields,
-    }, (requestCount * R2_REQUEST_WORST_CASE_DURATION_MS) + R2_PUBLICATION_SAFETY_MARGIN_MS);
+    }, (requestCount * R2_REQUEST_WORST_CASE_DURATION_MS) + additionalMs + R2_PUBLICATION_SAFETY_MARGIN_MS);
   };
   const finalizationGetObject = async ({ r2, key, onR2GetAdmitted = null }) => {
     assertFinalizationRequestBudget("v3_run_finalization_r2_read", 1, { key });
@@ -4217,7 +4217,8 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
     putIfChanged: finalizationPutIfChanged,
     putObject: finalizationPutObject,
     assertOwned: () => assertPruneOriginalOperation(runtime, "batch_finalization", true),
-    admit: requestCount => {
+    recordReused: object => metadataCapture?.recordPublishedObject(object),
+    admit: (requestCount, lockChecks) => {
       const operation = "v3_parent_batch_admission";
       if (!Number.isSafeInteger(requestCount) || requestCount < 1) {
         throw new PhaseBHistoryBudgetExhaustedError("Cannot establish v3 parent/latest batch allowance", operation);
@@ -4226,8 +4227,9 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
       // reserve. Keep the R2 publication safety margin inside that deadline.
       assertFinalizationRequestBudget(operation, requestCount, {
         remaining_r2_request_bound: requestCount,
+        remaining_lock_check_bound: lockChecks,
         controlled_shutdown_reserve_ms: runtime.run_budget?.stop_before_timeout_ms,
-      });
+      }, lockChecks * ORIGINAL_OPERATION_ASSERTION_MAX_MS);
     },
     log: (event, fields) => logPhaseB(runtime, "INFO", `phase_b_history_v3_parent_batch_${event}`, {
       ...finalizationFields, ...fields,
@@ -4260,6 +4262,11 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
         putIfChanged: parentBatch.putIfChanged,
         putObject: parentBatch.putObject,
         beforeLatestPublication: parentBatch.publishParents,
+        finalizeV3Publication: async options => {
+          const publication = await finalizeObservationHistoryIndexV3Publication(options);
+          await parentBatch.finishLatest(publication);
+          return publication;
+        },
         listAllCommonPrefixes: finalizationListAllCommonPrefixes,
         diagnosticLog,
         beforePublicationStage,
@@ -7649,7 +7656,11 @@ export async function runPhaseBBackup({
       if (boundaryFinalization.finalized && boundaryFinalization.can_continue !== true) {
         break;
       }
-      if (!hasBudgetFor(runtime, phaseBCandidateStartMinimumMs(runtime.history_write_version))) {
+      const candidateMinimum = phaseBCandidateStartMinimumMs(runtime.history_write_version);
+      if (runtime.history_write_version === "v3" && hasBudgetFor(runtime, candidateMinimum)) {
+        await assertPruneOriginalOperation(runtime, "publication", true);
+      }
+      if (!hasBudgetFor(runtime, candidateMinimum)) {
         logPhaseB(runtime, "WARNING", "phase_b_history_budget_exhausted", {
           operation: "candidate_start",
           day_utc: candidate.day_utc,
@@ -7662,7 +7673,6 @@ export async function runPhaseBBackup({
       }
       summary.processed_candidates += 1;
 
-      if (runtime.history_write_version === "v3") await assertPruneOriginalOperation(runtime, "publication", true);
       const claimed = await markCandidateInProgress(controlClient, candidate.day_utc, candidate.connector_id, runId);
       if (!claimed) {
         logPhaseB(runtime, "INFO", "phase_b_history_candidate_skipped", {

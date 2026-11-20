@@ -1551,6 +1551,8 @@ test("v3 run-finalization admission exhaustion propagates before connector gatin
     committed_prefix: "history/v3/observations",
     r2: {},
     environment: "TEST",
+    run_id: "v3-budget-finalization",
+    original_operation: { run_id: "v3-budget-finalization", assertHeld: async () => {} },
   };
   nowMs = runtime.run_budget.deadline_ms - 125_000;
   const published = publishedCandidateForFinalizationTest();
