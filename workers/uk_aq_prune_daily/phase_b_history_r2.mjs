@@ -1,3 +1,8 @@
+import { createV3ParentPublicationBatch } from "./v3_parent_publication_batch.mjs";
+import {
+  buildR2HistoryV2ObservationsMonthManifestKey,
+  buildR2HistoryV2ObservationsYearManifestKey,
+} from "../shared/uk_aq_r2_observations_manifest_hierarchy.mjs";
 import { validatePhaseBV3RunFinalizationResult } from '../shared/uk_aq_prune_batch_finalization_v3.mjs';
 import { preparePruneExactOnlyBatchCompletionV3 }
   from '../shared/uk_aq_observation_history_exact_only_publication_v3.mjs';
@@ -4120,7 +4125,10 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
   if (runtime.history_write_version === "v2") {
     return finalizeObservationV2Run({ client, runtime, publishedCandidates, diagnostics });
   }
-  resolvePruneHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version });
+  const generation = getObservationHistoryGeneration(
+    resolvePruneHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version }),
+  );
+  await assertPruneOriginalOperation(runtime, "batch_finalization", true);
   const metadataCapture = optionalJsongenMetadataCapture(runtime);
   const affectedDays = uniqueSorted(
     publishedCandidates.map(({ candidate }) => candidate.day_utc),
@@ -4195,32 +4203,84 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
       left.localeCompare(right)
     );
   };
+  const months = uniqueSorted(affectedDays.map(day => day.slice(0, 7)));
+  const years = uniqueSorted(months.map(month => month.slice(0, 4)));
+  const parentBatch = createV3ParentPublicationBatch({
+    parentKeys: [
+      ...affectedDays.map(day => buildCanonicalHistoryV2DayManifestKey(runtime.committed_prefix, day)),
+      ...months.map(month => buildR2HistoryV2ObservationsMonthManifestKey(runtime.committed_prefix, month.slice(0, 4), month.slice(5))),
+      ...years.map(year => buildR2HistoryV2ObservationsYearManifestKey(runtime.committed_prefix, year)),
+      generation.observations_root_key,
+    ],
+    latestKey: generation.observations_timeseries_latest_key,
+    getObject: finalizationGetObject,
+    putIfChanged: finalizationPutIfChanged,
+    putObject: finalizationPutObject,
+    assertOwned: () => assertPruneOriginalOperation(runtime, "batch_finalization", true),
+    admit: requestCount => {
+      const operation = "v3_parent_batch_admission";
+      if (!Number.isSafeInteger(requestCount) || requestCount < 1) {
+        throw new PhaseBHistoryBudgetExhaustedError("Cannot establish v3 parent/latest batch allowance", operation);
+      }
+      // The effective deadline already excludes the existing controlled stop
+      // reserve. Keep the R2 publication safety margin inside that deadline.
+      assertFinalizationRequestBudget(operation, requestCount, {
+        remaining_r2_request_bound: requestCount,
+        controlled_shutdown_reserve_ms: runtime.run_budget?.stop_before_timeout_ms,
+      });
+    },
+    log: (event, fields) => logPhaseB(runtime, "INFO", `phase_b_history_v3_parent_batch_${event}`, {
+      ...finalizationFields, ...fields,
+    }),
+  });
   const diagnosticLog = (event, fields = {}) => {
+    // The established writer calculates and validates these parent bodies
+    // against a local overlay until the complete batch has been admitted.
+    const reportedEvent = /^canonical_(day|aggregate)_finalization_/.test(event)
+      ? event.replace("_finalization_", "_preparation_") : event;
     const severity = event.endsWith("_failed") ? "ERROR" : "INFO";
-    logPhaseB(runtime, severity, `phase_b_history_v3_${event}`, fields);
+    logPhaseB(runtime, severity, `phase_b_history_v3_${reportedEvent}`, fields);
   };
   const beforePublicationStage = ({ stage, ...fields }) => {
     finalizationStage = stage;
     assertFinalizationRequestBudget(`v3_${stage}_start`, 1, fields);
   };
-  const result = runtime.prune_exact_only_writer
-    ? await runtime.prune_exact_only_writer.finalizeBatch()
-    : await runOperationalPruneDailyObservationHistoryV3RunFinalization({
-      env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
-      client, r2: runtime.r2, observationsPrefix: runtime.committed_prefix,
-      targetWriterGitSha: runtime.writer_git_sha,
-      connectorPublications: publishedCandidates.map(({ exportResult }) => exportResult.v3_connector_publication),
-      diagnostics, diagnosticEnvironment: runtime.environment,
-      lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
-      getObject: finalizationGetObject,
-      putIfChanged: finalizationPutIfChanged,
-      putObject: finalizationPutObject,
-      listAllCommonPrefixes: finalizationListAllCommonPrefixes,
-      diagnosticLog,
-      beforePublicationStage,
-      runLocalReferenceEvidenceCache: runtime.v3_run_local_evidence_cache,
-      globalOperationLockContext: runtime.global_operation_lock_context,
+  let result;
+  try {
+    result = runtime.prune_exact_only_writer
+      ? await runtime.prune_exact_only_writer.finalizeBatch()
+      : await runOperationalPruneDailyObservationHistoryV3RunFinalization({
+        env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
+        client, r2: runtime.r2, observationsPrefix: runtime.committed_prefix,
+        targetWriterGitSha: runtime.writer_git_sha,
+        connectorPublications: publishedCandidates.map(({ exportResult }) => exportResult.v3_connector_publication),
+        diagnostics, diagnosticEnvironment: runtime.environment,
+        lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+        getObject: parentBatch.getObject,
+        putIfChanged: parentBatch.putIfChanged,
+        putObject: parentBatch.putObject,
+        beforeLatestPublication: parentBatch.publishParents,
+        listAllCommonPrefixes: finalizationListAllCommonPrefixes,
+        diagnosticLog,
+        beforePublicationStage,
+        runLocalReferenceEvidenceCache: runtime.v3_run_local_evidence_cache,
+        globalOperationLockContext: runtime.global_operation_lock_context,
+      });
+  } catch (error) {
+    if (!parentBatch.attemptedKey) throw error;
+    const message = `Interrupted v3 parent/latest publication at ${parentBatch.attemptedKey}; ` +
+      `last verified: ${parentBatch.lastVerified ?? "none"}; ${error.message}`;
+    logPhaseB(runtime, "ERROR", "phase_b_history_v3_parent_batch_interrupted", {
+      ...finalizationFields, attempted_key: parentBatch.attemptedKey, last_verified_key: parentBatch.lastVerified,
+      next_action: "authenticate_current_parent_and_latest_authority",
+      connector_attempts: publishedCandidates.map(({ candidate, exportResult }) => ({
+        day_utc: candidate.day_utc, connector_id: candidate.connector_id,
+        source_content_hash: exportResult.source_identity?.source_content_hash,
+      })),
+      ...errorLogFields(error),
     });
+    throw Object.assign(new Error(message, { cause: error }), { code: "PRUNE_V3_PARENT_BATCH_INTERRUPTED" });
+  }
   return validatePhaseBV3RunFinalizationResult({
     result,
     expectedDays: affectedDays,
@@ -5101,7 +5161,8 @@ async function finalizeAndRecordPublishedPhaseBBatch({
           connector_id: candidate.connector_id,
           run_id: runId,
           error: message,
-          next_action: "retry_run_finalization",
+          next_action: error.code === "PRUNE_V3_PARENT_BATCH_INTERRUPTED"
+            ? "authenticate_current_parent_and_latest_authority" : "retry_run_finalization",
         });
       }
       await blockDayGate(client, candidate.day_utc);
@@ -7601,6 +7662,7 @@ export async function runPhaseBBackup({
       }
       summary.processed_candidates += 1;
 
+      if (runtime.history_write_version === "v3") await assertPruneOriginalOperation(runtime, "publication", true);
       const claimed = await markCandidateInProgress(controlClient, candidate.day_utc, candidate.connector_id, runId);
       if (!claimed) {
         logPhaseB(runtime, "INFO", "phase_b_history_candidate_skipped", {
