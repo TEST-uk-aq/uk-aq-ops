@@ -1,0 +1,82 @@
+name: TEST observation history v3 latest recovery acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Prepare the fixture, generate a locked plan, or apply a reviewed plan
+        required: true
+        type: choice
+        options: [prepare, plan, apply]
+      bucket:
+        description: New uk-aq-history-cic-test-v3-recovery- bucket name (up to 55 characters)
+        required: true
+        type: string
+      test_r2_account_id:
+        description: Independently confirmed TEST Cloudflare R2 account ID
+        required: true
+        type: string
+      test_db_project_ref:
+        description: Independently confirmed TEST IngestDB Supabase project reference
+        required: true
+        type: string
+      precreated_buckets:
+        description: Prepare using the two newly provisioned, empty TEST buckets
+        type: boolean
+        default: false
+      approved_plan_sha256:
+        description: Reviewed plan digest (required for apply)
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Prune and the recovery CLI also share the TEST PostgreSQL global lock.
+  group: uk-aq-v3-latest-recovery-acceptance
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    if: github.repository == 'TEST-uk-aq/uk-aq-ops' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout TEST main
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24.22.1'
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
+      - name: Run the selected TEST acceptance stage
+        env:
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_BUCKET: ${{ inputs.bucket }}
+          INPUT_TEST_R2_ACCOUNT_ID: ${{ inputs.test_r2_account_id }}
+          INPUT_TEST_DB_PROJECT_REF: ${{ inputs.test_db_project_ref }}
+          INPUT_PRECREATED_BUCKETS: ${{ inputs.precreated_buckets }}
+          INPUT_APPROVED_PLAN_SHA256: ${{ inputs.approved_plan_sha256 }}
+          UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
+          UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION }}
+          UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID: ${{ vars.UK_AQ_R2_CLOUDFLARE_ACCOUNT_ID }}
+          CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT }}
+          CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET }}
+          CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
+          CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
+          CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
+          SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          UK_AQ_R2_CLOUDFLARE_API_TOKEN: ${{ inputs.mode == 'prepare' && !inputs.precreated_buckets && secrets.UK_AQ_R2_CLOUDFLARE_API_TOKEN || '' }}
+        run: node scripts/operations/uk_aq_accept_observation_history_v3_latest.mjs
+      - name: Retain acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: test-v3-latest-recovery-${{ inputs.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/v3-latest-recovery-acceptance/
+          if-no-files-found: warn
+          retention-days: 30
