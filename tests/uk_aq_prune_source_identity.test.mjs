@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { createWorkerBudget } from "../workers/uk_aq_prune_daily/worker_budget.mjs";
 import {
   computePruneConnectorSourceIdentity,
   comparePruneConnectorSourceIdentities,
@@ -646,6 +647,39 @@ test("source mismatch blocks only its connector-day while another connector comm
   assert.equal(results[1].ok, true);
   assert.match(clients[0].queries.at(-1), /commit/i);
   assert.match(clients[1].queries.at(-1), /commit/i);
+});
+
+test("worker cutoff admits a verified deletion transaction and defers the next before touching READY", async () => {
+  const firstRows = [row()];
+  const clients = [
+    transactionClient({ evidenceRows: transactionEvidence(firstRows), currentRows: firstRows,
+      deleteCounts: [1], remainingCounts: [0, 0] }),
+    transactionClient({ evidenceRows: transactionEvidence([row({ connector_id: 8 })]) }),
+  ];
+  let clock = 1_000;
+  const workerBudget = createWorkerBudget(clock, () => clock);
+  let opened = 0, lockChecks = 0;
+  const result = await deletePruneBucketsWithSourceIdentity({
+    databaseUrl: "postgres://unused",
+    buckets: [7, 8].map((connector_id) => ({
+      connector_id, hour_start: "2026-07-21T01:00:00.000Z", observation_count: 1n,
+    })),
+    deleteBatchSize: 50_000, maxDeleteBatchesPerHour: 1, workerBudget,
+    assertOriginalLock: async () => { lockChecks += 1; },
+    withClient: async (_databaseUrl, callback, bounded) => {
+      assert.equal(bounded, true);
+      const transaction = await callback(clients[opened++]);
+      clock = workerBudget.deadlineMs - 200_000;
+      return transaction;
+    },
+  });
+  assert.equal(opened, 1);
+  assert.equal(lockChecks, 1);
+  assert.equal(result[0].diagnostics.connector_day_atomic_delete_committed, true);
+  assert.match(clients[0].queries.at(-1), /commit/i);
+  assert.deepEqual(clients[1].queries, []);
+  assert.equal(workerBudget.report().deletion_attempted, true);
+  assert.equal(workerBudget.report().deferred.stage, "normal_prune_delete");
 });
 
 test("non-day-aligned parent batches claim a connector-day once and retain atomic top-level health reporting", async () => {

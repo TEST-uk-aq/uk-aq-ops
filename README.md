@@ -126,8 +126,8 @@ Primary controls:
 - `UK_AQ_R2_HISTORY_OBSERVATIONS_ROW_GROUP_SIZE` (default `50000`; observations override, falls back to `UK_AQ_R2_HISTORY_ROW_GROUP_SIZE`)
 - `UK_AQ_R2_HISTORY_AQILEVELS_ROW_GROUP_SIZE` (default shared fallback above)
 - `UK_AQ_R2_HISTORY_MAX_CANDIDATES_PER_RUN` (default `500`)
-- `UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN` (default `3540`; Phase B internal maximum)
-- `UK_AQ_PRUNE_DAILY_PHASE_B_STOP_BEFORE_TIMEOUT_SECONDS` (default `60`; gives a 3480-second effective Phase B deadline)
+- `UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN` (default `10740`; Phase B internal maximum)
+- `UK_AQ_PRUNE_DAILY_PHASE_B_STOP_BEFORE_TIMEOUT_SECONDS` (default `60`; gives a 10,680-second effective Phase B deadline)
 - `UK_AQ_R2_HISTORY_ADOPT_EXISTING_MANIFEST_ENABLED` (default `true`; when committed connector manifest already exists, Phase B adopts it instead of rewriting connector parquet/manifest)
 - `UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_ENABLED` (default `false`; optional prune-vs-adopted comparison export to Dropbox for adopted connectors)
 - `UK_AQ_R2_HISTORY_PRUNE_CHECK_DROPBOX_REQUIRED` (default `false`; when `true`, adoption fails if comparison upload fails)
@@ -136,7 +136,7 @@ Primary controls:
 - `UK_AQ_R2_HISTORY_AQILEVELS_PREFIX` (default `history/v1/aqilevels/hourly`)
 - `UK_AQ_R2_HISTORY_RUNS_PREFIX` (default `history/v1/_ops/observations/runs`)
 - `UK_AQ_DEPLOY_ENV` (`dev|stage|prod`, default `dev`)
-- The active GitHub Actions path uses a 30-minute worker guard and a 40-minute job timeout; see [`system_docs/r2_history/prune_daily_runtime_budget.md`](system_docs/r2_history/prune_daily_runtime_budget.md).
+- The GitHub Actions path uses `timeout --kill-after=30s 180m` and a 190-minute job timeout. Enable the approved profile by leaving the two Phase B budget repository variables unset or setting them to `10740` and `60` in the existing TEST configuration. The workflow rejects other override values before starting the worker. [Runtime budget contract](https://github.com/TEST-uk-aq/uk-aq-system-docs/blob/main/system_docs/r2_history/prune_daily_runtime_budget.md)
 - Observation deletion requires source-identity contract v1 evidence on both the completed candidate and Prune-owned connector-day gate. Prune recomputes the exact canonical connector-day identity and deletes selected buckets in the same direct-PostgreSQL `REPEATABLE READ` transaction; legacy null evidence and mismatches fail closed.
 
 `ops_vars.txt` is a historical informational export captured on 5 July 2026, not a current settings snapshot. Its two retired observation-staging entries were removed; the remaining values have not been refreshed from GitHub.

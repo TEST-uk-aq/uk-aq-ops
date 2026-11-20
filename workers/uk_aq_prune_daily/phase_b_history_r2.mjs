@@ -1,3 +1,8 @@
+import { createV3ParentPublicationBatch } from "./v3_parent_publication_batch.mjs";
+import {
+  buildR2HistoryV2ObservationsMonthManifestKey,
+  buildR2HistoryV2ObservationsYearManifestKey,
+} from "../shared/uk_aq_r2_observations_manifest_hierarchy.mjs";
 import { validatePhaseBV3RunFinalizationResult } from '../shared/uk_aq_prune_batch_finalization_v3.mjs';
 import { preparePruneExactOnlyBatchCompletionV3 }
   from '../shared/uk_aq_observation_history_exact_only_publication_v3.mjs';
@@ -6,7 +11,7 @@ import {
   runOperationalPruneDailyObservationHistoryV3RunFinalization,
   createOperationalPruneDailyExactOnlyWriterV3,
 } from "../shared/uk_aq_observation_history_operational_writer_v3.mjs";
-import { OBSERVATION_HISTORY_EXACT_ONLY_PUBLICATION_ACTIVE_V3 }
+import { finalizeObservationHistoryIndexV3Publication, OBSERVATION_HISTORY_EXACT_ONLY_PUBLICATION_ACTIVE_V3 }
   from '../shared/uk_aq_observation_history_index_v3.mjs';
 import {
   createPruneDailyObservationHistoryV3RunLocalEvidenceCache,
@@ -21,7 +26,7 @@ import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
 import { randomUUID } from "node:crypto";
-import { originalOperationError, isOriginalOperationError }
+import { ORIGINAL_OPERATION_ASSERTION_MAX_MS, originalOperationError, isOriginalOperationError }
   from '../../scripts/operations/lib/uk_aq_prune_original_operation.mjs';
 import { uploadPrunePendingSource, uploadPruneEvidenceBundle, resolvePruneSignerConfig,
   PRUNE_SIGNED_UPLOAD_DEADLINE_MS, PRUNE_EVIDENCE_BUNDLE_UPLOAD_DEADLINE_MS,
@@ -180,11 +185,17 @@ const DEFAULT_ROW_GROUP_SIZE = 100_000;
 const DEFAULT_OBSERVATIONS_ROW_GROUP_SIZE = 50_000;
 const DEFAULT_AQILEVELS_ROW_GROUP_SIZE = DEFAULT_ROW_GROUP_SIZE;
 const DEFAULT_MAX_CANDIDATES_PER_RUN = 500;
-const DEFAULT_MAX_SECONDS_PER_RUN = 3_540;
+const DEFAULT_MAX_SECONDS_PER_RUN = 10_740;
 const DEFAULT_STOP_BEFORE_TIMEOUT_SECONDS = 60;
 const PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS = 600_000;
 const PHASE_B_PG_CONNECTION_TIMEOUT_MAX_MS = 15_000;
 const PHASE_B_PG_DEADLINE_GUARD_MS = 1_000;
+const PHASE_B_GATE_QUERY_MS = 20_000;
+// BEGIN, SET LOCAL, candidate and gate updates, optional outbox savepoint,
+// insert, rollback/release, and COMMIT/ROLLBACK. Include the three original
+// session assertions and a local preparation/verification margin.
+const PHASE_B_GATE_TRANSACTION_MS = 10 * PHASE_B_GATE_QUERY_MS
+  + 3 * ORIGINAL_OPERATION_ASSERTION_MAX_MS + 5_000;
 const PHASE_B_STAGE_MIN_MS = Object.freeze({
   candidate_start: 60_000 + 120_000 + 120_000,
   observation_segment: 60_000,
@@ -350,15 +361,21 @@ export function createPhaseBRunBudgetForTest({
   startedAtMs = nowMs(),
   maxSecondsPerRun = DEFAULT_MAX_SECONDS_PER_RUN,
   stopBeforeTimeoutSeconds = DEFAULT_STOP_BEFORE_TIMEOUT_SECONDS,
+  workerBudget = null,
 } = {}) {
   const maxMs = Math.max(1, Math.trunc(Number(maxSecondsPerRun) || DEFAULT_MAX_SECONDS_PER_RUN)) * 1000;
   const stopBeforeMs = Math.max(0, Math.trunc(Number(stopBeforeTimeoutSeconds) || 0)) * 1000;
   const usableMs = Math.max(1, maxMs - stopBeforeMs);
+  const localDeadlineMs = startedAtMs + usableMs;
+  const workerDeadlineMs = workerBudget?.deadlineMs ?? Infinity;
   return {
     started_at_ms: startedAtMs,
     max_ms: maxMs,
     stop_before_timeout_ms: stopBeforeMs,
-    deadline_ms: startedAtMs + usableMs,
+    local_deadline_ms: localDeadlineMs,
+    deadline_ms: Math.min(localDeadlineMs, workerDeadlineMs),
+    limiting_clock: workerDeadlineMs <= localDeadlineMs ? "worker_wide" : "phase_b_local",
+    elapsed_worker_before_phase_b_ms: workerBudget ? startedAtMs - workerBudget.originMs : null,
     now_ms: nowMs,
   };
 }
@@ -447,6 +464,7 @@ function assertBudget(runtime, operation, fields = {}, minMs = 0) {
 
 function rethrowIfBudgetDeadlineReached(runtime, error, operation, fields = {}) {
   if (error instanceof PhaseBHistoryBudgetExhaustedError) throw error;
+  if (runtime.supervised_worker_deadline && operation === "dropbox_comparison") return;
   if (!hasBudgetFor(runtime, 2_000)) {
     logPhaseB(runtime, "WARNING", "phase_b_history_budget_exhausted", {
       operation,
@@ -928,11 +946,11 @@ export function defaultHistoryV2PrefixesForTest() {
   };
 }
 
-function toPgConnectionConfig(connectionString, connectionTimeoutMs) {
+function toPgConnectionConfig(connectionString, connectionTimeoutMs, queryTimeoutMs, statementTimeoutMs) {
   return {
     connectionString,
-    statement_timeout: 0,
-    query_timeout: 0,
+    statement_timeout: statementTimeoutMs,
+    query_timeout: queryTimeoutMs,
     connectionTimeoutMillis: connectionTimeoutMs,
     application_name: "uk_aq_prune_daily_phase_b_history",
   };
@@ -968,6 +986,7 @@ async function withPgClient(
   {
     statementTimeoutMs = PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS,
     connectionTimeoutMs = PHASE_B_PG_CONNECTION_TIMEOUT_MAX_MS,
+    queryTimeoutMs = 0,
     createClient = (config) => new Client(config),
   } = {},
 ) {
@@ -975,15 +994,21 @@ async function withPgClient(
     1,
     Math.min(PHASE_B_PG_CONNECTION_TIMEOUT_MAX_MS, Math.trunc(Number(connectionTimeoutMs) || PHASE_B_PG_CONNECTION_TIMEOUT_MAX_MS)),
   );
-  const client = createClient(toPgConnectionConfig(connectionString, boundedConnectionTimeoutMs));
+  const client = createClient(toPgConnectionConfig(
+    connectionString, boundedConnectionTimeoutMs, queryTimeoutMs, queryTimeoutMs ? statementTimeoutMs : 0,
+  ));
   await client.connect();
   try {
-    await client.query("set timezone = 'UTC'");
-    const boundedStatementTimeoutMs = Math.max(
-      1,
-      Math.min(PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS, Math.trunc(Number(statementTimeoutMs) || PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS)),
-    );
-    await client.query(`set statement_timeout = '${boundedStatementTimeoutMs}ms'`);
+    if (queryTimeoutMs) {
+      await client.query({ text: "set timezone = 'UTC'", query_timeout: 20_000 });
+    } else {
+      await client.query("set timezone = 'UTC'");
+      const boundedStatementTimeoutMs = Math.max(
+        1,
+        Math.min(PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS, Math.trunc(Number(statementTimeoutMs) || PHASE_B_PG_STATEMENT_TIMEOUT_MAX_MS)),
+      );
+      await client.query(`set statement_timeout = '${boundedStatementTimeoutMs}ms'`);
+    }
     return await fn(client);
   } finally {
     await client.end();
@@ -1595,7 +1620,13 @@ export async function revalidateCompleteCandidateSourceIdentityForTest(client, c
 
 
 async function populateBackupCandidates(client, latestEligibleWindowEndIso, runtime = {}) {
+  const admitStatement = () => {
+    if (runtime.discovery_query_allowance_ms) {
+      assertBudget(runtime, "candidate_discovery", {}, runtime.discovery_query_allowance_ms);
+    }
+  };
   if (["v2", "v3"].includes(runtime.history_write_version)) {
+    admitStatement();
     const invalidCodes = await client.query(`
 select distinct op.code
 from uk_aq_core.observations o
@@ -1923,6 +1954,7 @@ left join invalidated_connector_gates ig
 order by u.day_utc, u.connector_id
 `;
 
+    admitStatement();
     const result = await client.query(sql, [latestEligibleWindowEndIso]);
     const candidates = result.rows.map((row) => {
       const candidate = toConnectorDayRow(row);
@@ -2118,6 +2150,7 @@ from upserted
 order by day_utc, connector_id
 `;
 
+  admitStatement();
   const result = await client.query(sql, [latestEligibleWindowEndIso]);
   return result.rows.map(toConnectorDayRow);
 }
@@ -2383,11 +2416,19 @@ async function markCandidateAndConnectorGateComplete(client, {
   writerGitSha,
   outbox = null,
   assertOriginalOperationHeld = null,
+  bounded = false,
 }) {
+  if (bounded) {
+    const controlClient = client;
+    client = {
+      query: (text, values) => controlClient.query({ text, values, query_timeout: PHASE_B_GATE_QUERY_MS }),
+    };
+  }
   await assertOriginalOperationHeld?.('gate_begin');
   await client.query("begin");
   let commitStarted = false;
   try {
+    if (bounded) await client.query("set local statement_timeout = '15000ms'");
     const expected = {
       dayUtc, connectorId, runId, manifestKey, manifestHash,
       historyRowCount, historyFileCount, historyTotalBytes, sourceIdentity,
@@ -4120,7 +4161,10 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
   if (runtime.history_write_version === "v2") {
     return finalizeObservationV2Run({ client, runtime, publishedCandidates, diagnostics });
   }
-  resolvePruneHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version });
+  const generation = getObservationHistoryGeneration(
+    resolvePruneHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version }),
+  );
+  await assertPruneOriginalOperation(runtime, "batch_finalization", true);
   const metadataCapture = optionalJsongenMetadataCapture(runtime);
   const affectedDays = uniqueSorted(
     publishedCandidates.map(({ candidate }) => candidate.day_utc),
@@ -4130,12 +4174,12 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
     affected_days_utc: affectedDays,
   };
   let finalizationStage = "run_finalization";
-  const assertFinalizationRequestBudget = (operation, requestCount, fields = {}) => {
+  const assertFinalizationRequestBudget = (operation, requestCount, fields = {}, additionalMs = 0) => {
     assertBudget(runtime, operation, {
       ...finalizationFields,
       publication_stage: finalizationStage,
       ...fields,
-    }, (requestCount * R2_REQUEST_WORST_CASE_DURATION_MS) + R2_PUBLICATION_SAFETY_MARGIN_MS);
+    }, (requestCount * R2_REQUEST_WORST_CASE_DURATION_MS) + additionalMs + R2_PUBLICATION_SAFETY_MARGIN_MS);
   };
   const finalizationGetObject = async ({ r2, key, onR2GetAdmitted = null }) => {
     assertFinalizationRequestBudget("v3_run_finalization_r2_read", 1, { key });
@@ -4195,32 +4239,103 @@ async function finalizeSelectedObservationRun({ client, runtime, publishedCandid
       left.localeCompare(right)
     );
   };
+  const months = uniqueSorted(affectedDays.map(day => day.slice(0, 7)));
+  const years = uniqueSorted(months.map(month => month.slice(0, 4)));
+  const parentBatch = createV3ParentPublicationBatch({
+    parentKeys: [
+      ...affectedDays.map(day => buildCanonicalHistoryV2DayManifestKey(runtime.committed_prefix, day)),
+      ...months.map(month => buildR2HistoryV2ObservationsMonthManifestKey(runtime.committed_prefix, month.slice(0, 4), month.slice(5))),
+      ...years.map(year => buildR2HistoryV2ObservationsYearManifestKey(runtime.committed_prefix, year)),
+      generation.observations_root_key,
+    ],
+    latestKey: generation.observations_timeseries_latest_key,
+    getObject: finalizationGetObject,
+    putIfChanged: finalizationPutIfChanged,
+    putObject: finalizationPutObject,
+    assertOwned: () => assertPruneOriginalOperation(runtime, "batch_finalization", true),
+    recordReused: object => metadataCapture?.recordPublishedObject(object),
+    admit: (requestCount, lockChecks) => {
+      const operation = "v3_parent_batch_admission";
+      if (!Number.isSafeInteger(requestCount) || requestCount < 1) {
+        throw new PhaseBHistoryBudgetExhaustedError("Cannot establish v3 parent/latest batch allowance", operation);
+      }
+      // The effective deadline already excludes the existing controlled stop
+      // reserve. Keep the R2 publication safety margin inside that deadline.
+      assertFinalizationRequestBudget(operation, requestCount, {
+        remaining_r2_request_bound: requestCount,
+        remaining_lock_check_bound: lockChecks,
+        controlled_shutdown_reserve_ms: runtime.run_budget?.stop_before_timeout_ms,
+      }, lockChecks * ORIGINAL_OPERATION_ASSERTION_MAX_MS);
+      if (runtime.supervised_worker_deadline) {
+        assertFinalizationRequestBudget(operation, requestCount, {
+          remaining_r2_request_bound: requestCount,
+          remaining_lock_check_bound: lockChecks,
+          connector_gate_allowance_ms: publishedCandidates.length * PHASE_B_GATE_TRANSACTION_MS,
+        }, lockChecks * ORIGINAL_OPERATION_ASSERTION_MAX_MS
+          + publishedCandidates.length * PHASE_B_GATE_TRANSACTION_MS);
+      }
+    },
+    log: (event, fields) => logPhaseB(runtime, "INFO", `phase_b_history_v3_parent_batch_${event}`, {
+      ...finalizationFields, ...fields,
+    }),
+  });
   const diagnosticLog = (event, fields = {}) => {
+    // The established writer calculates and validates these parent bodies
+    // against a local overlay until the complete batch has been admitted.
+    const reportedEvent = /^canonical_(day|aggregate)_finalization_/.test(event)
+      ? event.replace("_finalization_", "_preparation_") : event;
     const severity = event.endsWith("_failed") ? "ERROR" : "INFO";
-    logPhaseB(runtime, severity, `phase_b_history_v3_${event}`, fields);
+    logPhaseB(runtime, severity, `phase_b_history_v3_${reportedEvent}`, fields);
   };
   const beforePublicationStage = ({ stage, ...fields }) => {
     finalizationStage = stage;
     assertFinalizationRequestBudget(`v3_${stage}_start`, 1, fields);
   };
-  const result = runtime.prune_exact_only_writer
-    ? await runtime.prune_exact_only_writer.finalizeBatch()
-    : await runOperationalPruneDailyObservationHistoryV3RunFinalization({
-      env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
-      client, r2: runtime.r2, observationsPrefix: runtime.committed_prefix,
-      targetWriterGitSha: runtime.writer_git_sha,
-      connectorPublications: publishedCandidates.map(({ exportResult }) => exportResult.v3_connector_publication),
-      diagnostics, diagnosticEnvironment: runtime.environment,
-      lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
-      getObject: finalizationGetObject,
-      putIfChanged: finalizationPutIfChanged,
-      putObject: finalizationPutObject,
-      listAllCommonPrefixes: finalizationListAllCommonPrefixes,
-      diagnosticLog,
-      beforePublicationStage,
-      runLocalReferenceEvidenceCache: runtime.v3_run_local_evidence_cache,
-      globalOperationLockContext: runtime.global_operation_lock_context,
+  let result;
+  try {
+    result = runtime.prune_exact_only_writer
+      ? await runtime.prune_exact_only_writer.finalizeBatch()
+      : await runOperationalPruneDailyObservationHistoryV3RunFinalization({
+        env: { UK_AQ_R2_HISTORY_VERSION: runtime.history_write_version },
+        client, r2: runtime.r2, observationsPrefix: runtime.committed_prefix,
+        targetWriterGitSha: runtime.writer_git_sha,
+        connectorPublications: publishedCandidates.map(({ exportResult }) => exportResult.v3_connector_publication),
+        diagnostics, diagnosticEnvironment: runtime.environment,
+        lockTimeoutMs: Math.min(15_000, Math.max(1, remainingBudgetMs(runtime) ?? 15_000)),
+        getObject: parentBatch.getObject,
+        putIfChanged: parentBatch.putIfChanged,
+        putObject: parentBatch.putObject,
+        beforeLatestPublication: parentBatch.publishParents,
+        finalizeV3Publication: async options => {
+          const publication = await finalizeObservationHistoryIndexV3Publication(options);
+          await parentBatch.finishLatest(publication);
+          return publication;
+        },
+        listAllCommonPrefixes: finalizationListAllCommonPrefixes,
+        diagnosticLog,
+        beforePublicationStage,
+        runLocalReferenceEvidenceCache: runtime.v3_run_local_evidence_cache,
+        globalOperationLockContext: runtime.global_operation_lock_context,
+      });
+  } catch (error) {
+    if (!parentBatch.attemptedKey) throw error;
+    const message = `Interrupted v3 parent/latest publication at ${parentBatch.attemptedKey}; ` +
+      `last verified: ${parentBatch.lastVerified ?? "none"}; ${error.message}`;
+    logPhaseB(runtime, "ERROR", "phase_b_history_v3_parent_batch_interrupted", {
+      ...finalizationFields, attempted_key: parentBatch.attemptedKey, last_verified_key: parentBatch.lastVerified,
+      next_action: "authenticate_current_parent_and_latest_authority",
+      connector_attempts: publishedCandidates.map(({ candidate, exportResult }) => ({
+        day_utc: candidate.day_utc, connector_id: candidate.connector_id,
+        source_content_hash: exportResult.source_identity?.source_content_hash,
+      })),
+      ...errorLogFields(error),
     });
+    throw Object.assign(new Error(message, { cause: error }), {
+      code: "PRUNE_V3_PARENT_BATCH_INTERRUPTED",
+      last_verified_key: parentBatch.lastVerified,
+      attempted_key: parentBatch.attemptedKey,
+    });
+  }
   return validatePhaseBV3RunFinalizationResult({
     result,
     expectedDays: affectedDays,
@@ -4698,14 +4813,20 @@ async function finalizePublishedPhaseBConnectors({
   // optional bundle-retention window for this run, never one new reserve per
   // connector/day and never part of the protected PostgreSQL gate transaction.
   const evidenceBundleDeadlineAtMs = Date.now() + PRUNE_EVIDENCE_BUNDLE_UPLOAD_DEADLINE_MS;
-  for (const published of publishedCandidates) {
+  for (const [gateIndex, published] of publishedCandidates.entries()) {
     const { candidate, exportResult, connectorGateEvidence } = published;
     try {
       let outbox = null;
+      const remainingGateMs = runtime.supervised_worker_deadline
+        ? (publishedCandidates.length - gateIndex) * PHASE_B_GATE_TRANSACTION_MS : 0;
       if (runtime.history_write_version === 'v3' && runtime.jsongen_pending_source?.enabled === true
         && isPrunePendingSourceConnector(candidate.connector_id)) {
         if (exportResult.jsongen_pending_source?.state === 'put_acknowledged_unverified') {
           try {
+            if (remainingGateMs && !hasBudgetFor(runtime, remainingGateMs + 5 * ORIGINAL_OPERATION_ASSERTION_MAX_MS)) {
+              throw Object.assign(new Error('gate_completion_headroom_required'),
+                { original_authority_code: 'gate_completion_headroom_required' });
+            }
             await assertPruneOriginalOperation(runtime, 'preparation');
             // Future schema-2 producer supplies the original operation-local
             // preparations, never serialized flags. Operational rejection and
@@ -4724,7 +4845,7 @@ async function finalizePublishedPhaseBConnectors({
                 expectedDays, expectedConnectorPublicationCount: publishedCandidates.length,
                 getObject: async ({ key }) => {
                   assertBudget(runtime, 'jsongen_original_batch_identity', { key },
-                    R2_REQUEST_WORST_CASE_DURATION_MS + R2_PUBLICATION_SAFETY_MARGIN_MS);
+                    R2_REQUEST_WORST_CASE_DURATION_MS + R2_PUBLICATION_SAFETY_MARGIN_MS + remainingGateMs);
                   return { ...await r2GetObject({ r2: runtime.r2, key }), key };
                 },
               });
@@ -4757,7 +4878,7 @@ async function finalizePublishedPhaseBConnectors({
               ? await preparePruneOriginalFinalEvidenceWithExactOnlyCompletion(preparationArgs)
               : prepareJsonGenFinalEvidence(preparationArgs);
             const finalPreparation = published.jsongen_final_evidence_preparation;
-            if (!hasBudgetFor(runtime, PRUNE_EVIDENCE_BUNDLE_UPLOAD_DEADLINE_MS)
+            if (!hasBudgetFor(runtime, PRUNE_EVIDENCE_BUNDLE_UPLOAD_DEADLINE_MS + remainingGateMs)
               || Date.now() >= evidenceBundleDeadlineAtMs) {
               throw Object.assign(new Error('bundle_retention_headroom_unavailable'),
                 { original_authority_code: 'bundle_retention_headroom_unavailable' });
@@ -4825,6 +4946,9 @@ async function finalizePublishedPhaseBConnectors({
           outbox = { unavailable_reason: 'evidence_payload_unavailable' };
         }
       }
+      if (runtime.supervised_worker_deadline && !hasBudgetFor(runtime, PHASE_B_GATE_TRANSACTION_MS)) {
+        throw new Error("After verified Phase B publication, the original gate transaction allowance was exhausted");
+      }
       const gateOutcome = await completeCandidateAndGate(client, {
         dayUtc: candidate.day_utc,
         connectorId: candidate.connector_id,
@@ -4836,6 +4960,7 @@ async function finalizePublishedPhaseBConnectors({
         historyTotalBytes: connectorGateEvidence.history_total_bytes,
         sourceIdentity: exportResult.source_identity,
         writerGitSha: runtime.writer_git_sha,
+        ...(runtime.supervised_worker_deadline ? { bounded: true } : {}),
         outbox,
         ...(runtime.original_operation ? {
           assertOriginalOperationHeld: stage => assertPruneOriginalOperation(runtime, stage),
@@ -5101,7 +5226,12 @@ async function finalizeAndRecordPublishedPhaseBBatch({
           connector_id: candidate.connector_id,
           run_id: runId,
           error: message,
-          next_action: "retry_run_finalization",
+          ...(error.code === "PRUNE_V3_PARENT_BATCH_INTERRUPTED" ? {
+            last_verified_key: error.last_verified_key,
+            attempted_key: error.attempted_key,
+          } : {}),
+          next_action: error.code === "PRUNE_V3_PARENT_BATCH_INTERRUPTED"
+            ? "authenticate_current_parent_and_latest_authority" : "retry_run_finalization",
         });
       }
       await blockDayGate(client, candidate.day_utc);
@@ -7306,6 +7436,7 @@ export async function runPhaseBBackup({
   nowMs = Date.now,
   createPgClient = (config) => new Client(config),
   originalOperation = null,
+  workerBudget = null,
 }) {
   const runtime = {
     ...phaseB,
@@ -7313,13 +7444,15 @@ export async function runPhaseBBackup({
     now_utc: nowUtc,
     logStructured,
     run_budget: createPhaseBRunBudgetForTest({
-      nowMs,
+      nowMs: workerBudget?.nowMs ?? nowMs,
       maxSecondsPerRun: phaseB.max_seconds_per_run,
       stopBeforeTimeoutSeconds: phaseB.stop_before_timeout_seconds,
+      workerBudget,
     }),
     global_operation_lock_context: null,
     v3_run_local_evidence_cache: null,
     original_operation: originalOperation,
+    supervised_worker_deadline: Boolean(workerBudget),
   };
 
   if (!runtime.enabled) {
@@ -7327,6 +7460,7 @@ export async function runPhaseBBackup({
       enabled: false,
       run_id: runId,
       reason: "phase_b_disabled",
+      timing: { clock: workerBudget ? "linux_proc_uptime" : "no_supervised_worker_deadline" },
     };
   }
 
@@ -7354,10 +7488,19 @@ export async function runPhaseBBackup({
   }
 
   const window = dayWindowFromNow(nowUtc, ingestRetentionDays);
+  const budget = runtime.run_budget;
+  const timing = {
+    clock: workerBudget ? "linux_proc_uptime" : "no_supervised_worker_deadline",
+    elapsed_worker_before_phase_b_ms: budget.elapsed_worker_before_phase_b_ms,
+    local_deadline_ms: budget.local_deadline_ms,
+    effective_deadline_ms: budget.deadline_ms,
+    limiting_clock: budget.limiting_clock,
+  };
   const summary = {
     enabled: true,
     status: "completed",
     stopped_for_budget: false,
+    timing,
     run_id: runId,
     now_utc: window.now_utc,
     ingest_retention_days: window.ingest_retention_days,
@@ -7399,6 +7542,7 @@ export async function runPhaseBBackup({
   logStructured("INFO", "phase_b_history_run_start", {
     run_id: runId,
     dry_run: dryRun,
+    timing,
     now_utc: window.now_utc,
     ingest_retention_days: window.ingest_retention_days,
     phase_b_eligible_age_days: window.phase_b_eligible_age_days,
@@ -7432,11 +7576,27 @@ export async function runPhaseBBackup({
   let totalWrittenRows = 0n;
   let totalWrittenBytes = 0n;
 
+  if (workerBudget && !hasBudgetFor(runtime, PHASE_B_STAGE_MIN_MS.candidate_start)) {
+    stopPhaseBForBudget(summary, runtime, { operation: "candidate_discovery" });
+    logStructured("INFO", "phase_b_history_run_summary", summary);
+    return summary;
+  }
   const controlPgTimeouts = derivePhaseBPgTimeoutsForTest(runtime);
+  const controlQueryTimeoutMs = workerBudget ? controlPgTimeouts.statement_timeout_ms + 5_000 : 0;
+  if (workerBudget) {
+    runtime.discovery_query_allowance_ms = controlQueryTimeoutMs + 1_000;
+    const controlStartAllowance = controlPgTimeouts.connection_timeout_ms + 20_000
+      + ORIGINAL_OPERATION_ASSERTION_MAX_MS + runtime.discovery_query_allowance_ms;
+    if (!hasBudgetFor(runtime, controlStartAllowance)) {
+      stopPhaseBForBudget(summary, runtime, { operation: "control_database_connection" });
+      logStructured("INFO", "phase_b_history_run_summary", summary);
+      return summary;
+    }
+  }
   try {
     await withPgClient(runtime.supabase_db_url, async (controlClient) => {
     if (!dryRun) await assertPruneOriginalOperation(runtime, 'publication');
-    if (!hasBudgetFor(runtime, PHASE_B_STAGE_MIN_MS.candidate_start)) {
+    if (!hasBudgetFor(runtime, Math.max(PHASE_B_STAGE_MIN_MS.candidate_start, runtime.discovery_query_allowance_ms ?? 0))) {
       stopPhaseBForBudget(summary, runtime, { operation: "candidate_discovery" });
       return;
     }
@@ -7488,12 +7648,13 @@ export async function runPhaseBBackup({
       });
     }
 
-    if (!hasBudgetFor(runtime, PHASE_B_STAGE_MIN_MS.candidate_start)) {
+    if (!hasBudgetFor(runtime, Math.max(PHASE_B_STAGE_MIN_MS.candidate_start, runtime.discovery_query_allowance_ms ?? 0))) {
       stopPhaseBForBudget(summary, runtime, { operation: "active_scope_gate_preparation" });
       return;
     }
     await markActiveIncompleteDaysAsBackupBlocked(controlClient, upsertedCandidates);
 
+    if (workerBudget) assertBudget(runtime, "active_scope_pending_read", {}, runtime.discovery_query_allowance_ms);
     const pendingCandidates = await fetchPendingCandidates(
       controlClient,
       upsertedCandidates,
@@ -7588,7 +7749,11 @@ export async function runPhaseBBackup({
       if (boundaryFinalization.finalized && boundaryFinalization.can_continue !== true) {
         break;
       }
-      if (!hasBudgetFor(runtime, phaseBCandidateStartMinimumMs(runtime.history_write_version))) {
+      const candidateMinimum = phaseBCandidateStartMinimumMs(runtime.history_write_version);
+      if (runtime.history_write_version === "v3" && hasBudgetFor(runtime, candidateMinimum)) {
+        await assertPruneOriginalOperation(runtime, "publication", true);
+      }
+      if (!hasBudgetFor(runtime, candidateMinimum)) {
         logPhaseB(runtime, "WARNING", "phase_b_history_budget_exhausted", {
           operation: "candidate_start",
           day_utc: candidate.day_utc,
@@ -7833,13 +7998,14 @@ export async function runPhaseBBackup({
     }, {
       statementTimeoutMs: controlPgTimeouts.statement_timeout_ms,
       connectionTimeoutMs: controlPgTimeouts.connection_timeout_ms,
+      queryTimeoutMs: controlQueryTimeoutMs,
       createClient: createPgClient,
     });
   } catch (error) {
     runtime.v3_run_local_evidence_cache?.clear?.();
     if (
       (error instanceof PhaseBHistoryBudgetExhaustedError)
-      || (isPgStatementTimeoutError(error) && !hasBudgetFor(runtime, 2_000))
+      || (!workerBudget && isPgStatementTimeoutError(error) && !hasBudgetFor(runtime, 2_000))
     ) {
       stopPhaseBForBudget(summary, runtime, {
         operation: error.operation || "control_database_statement",
@@ -7879,7 +8045,24 @@ export async function runPhaseBBackup({
     summary.run_manifest_key = null;
     summary.run_manifest = { skipped: true, reason: "reserved_for_final_reporting" };
   } else {
-    summary.run_manifest_key = await writeRunManifest({ runtime, runSummary: summary });
+    const allowance = (2 * R2_REQUEST_WORST_CASE_DURATION_MS) + R2_PUBLICATION_SAFETY_MARGIN_MS;
+    try {
+      const admitted = !workerBudget || (workerBudget.admit(
+        "phase_b_run_manifest_put_head", allowance + ORIGINAL_OPERATION_ASSERTION_MAX_MS,
+      ) && hasBudgetFor(runtime, allowance + ORIGINAL_OPERATION_ASSERTION_MAX_MS));
+      if (workerBudget && admitted) {
+        await assertPruneOriginalOperation(runtime, "publication", true);
+      }
+      if (!admitted || (workerBudget && !hasBudgetFor(runtime, allowance))) {
+        summary.run_manifest_key = null;
+        summary.run_manifest = { skipped: true, status: "deferred_budget", reason: "run_manifest_put_head" };
+      } else {
+        summary.run_manifest_key = await writeRunManifest({ runtime, runSummary: summary });
+      }
+    } catch (error) {
+      error.prune_summary = { phase_b_history: summary, deletion_attempted: false };
+      throw error;
+    }
   }
 
   if (runtime.prune_check_dropbox?.enabled) {
@@ -7937,7 +8120,7 @@ export function buildPhaseBAqilevelsSummaryForTest(args) {
   return buildPhaseBAqilevelsSummary(args);
 }
 
-export async function fetchBackupDoneConnectorDays({ supabaseDbUrl, connectorDays }) {
+export async function fetchBackupDoneConnectorDays({ supabaseDbUrl, connectorDays, bounded = false }) {
   if (!Array.isArray(connectorDays) || connectorDays.length === 0) {
     return new Map();
   }
@@ -7994,5 +8177,5 @@ join requested r
       }
     }
     return map;
-  });
+  }, bounded ? { queryTimeoutMs: 20_000, statementTimeoutMs: 15_000 } : {});
 }

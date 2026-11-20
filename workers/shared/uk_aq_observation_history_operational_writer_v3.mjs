@@ -427,6 +427,128 @@ async function verifyRebuiltExactV3PublicationObjects({
   });
 }
 
+// Reconstruct from canonical bytes before looking at any selected index object.
+// The caller authenticates the connector that supplied the pollutant descriptor.
+async function verifyCanonicalSchema1Partition({
+  getObject, observationsPrefix, indexRoot, scope, descriptor, writerLimits,
+}) {
+  const pollutantKey = buildHistoryV2PollutantManifestKey(
+    observationsPrefix,
+    scope.day_utc,
+    scope.connector_id,
+    scope.pollutant_code,
+  );
+  if (descriptor.manifest_key !== pollutantKey) {
+    throw new Error(`Current canonical pollutant descriptor key disagrees: ${pollutantKey}`);
+  }
+  const pollutantObject = await getObject({ key: pollutantKey });
+  if (!pollutantObject || pollutantObject.exists === false) {
+    throw new Error(`Current canonical pollutant manifest is missing: ${pollutantKey}`);
+  }
+  const pollutantBody = exactBody(pollutantObject.body, pollutantKey);
+  const pollutantManifest = parseCanonicalManifest({
+    body: pollutantBody,
+    key: pollutantKey,
+    manifestKind: "pollutant",
+    scope,
+  });
+  assertCurrentPollutantDescriptor(descriptor, pollutantManifest);
+
+  const files = Array.isArray(pollutantManifest.files)
+    ? pollutantManifest.files
+    : [];
+  if (files.length === 0 || files.length !== Number(pollutantManifest.file_count)) {
+    throw new Error(`Current canonical pollutant Parquet evidence is incomplete: ${pollutantKey}`);
+  }
+  const canonicalBodies = [];
+  const canonicalRows = [];
+  const externalReferences = [{
+    key: pollutantKey,
+    byte_size: pollutantBody.byteLength,
+    sha256: sha256Hex(pollutantBody),
+    verified: true,
+    durable: true,
+  }];
+  for (const file of files) {
+    const key = String(file?.key || "").trim();
+    const expectedBytes = Number(file?.bytes);
+    const expectedSha256 = String(file?.etag_or_hash || "").trim().toLowerCase();
+    if (
+      !key || !Number.isSafeInteger(expectedBytes) || expectedBytes <= 0 ||
+      !/^[0-9a-f]{64}$/.test(expectedSha256)
+    ) {
+      throw new Error(`Current canonical pollutant Parquet evidence is invalid: ${pollutantKey}`);
+    }
+    const object = await getObject({ key });
+    if (!object || object.exists === false) {
+      throw new Error(`Current canonical Parquet is missing: ${key}`);
+    }
+    const body = exactBody(object.body, key);
+    if (body.byteLength !== expectedBytes || sha256Hex(body) !== expectedSha256) {
+      throw new Error(`Current canonical Parquet identity disagrees: ${key}`);
+    }
+    canonicalBodies.push({ key, body });
+    canonicalRows.push(...decodeAcceptedCanonicalObservationRows(body, key));
+    externalReferences.push({
+      key,
+      byte_size: expectedBytes,
+      sha256: expectedSha256,
+      verified: true,
+      durable: true,
+    });
+  }
+  const rebuilt = buildObservationHistoryV3SteadyStatePartition({
+    source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily,
+    rows: canonicalRows,
+    writerLimits,
+    targetWriterGitSha: pollutantManifest.writer_git_sha,
+    backedUpAtUtc: pollutantManifest.backed_up_at_utc,
+    observationsPrefix,
+    indexRoot,
+  });
+  if (
+    rebuilt.file_intents.length !== canonicalBodies.length ||
+    rebuilt.file_intents.some((entry, index) =>
+      entry.key !== canonicalBodies[index].key ||
+      !exactBody(entry.body, entry.key).equals(canonicalBodies[index].body)
+    ) ||
+    !exactBody(
+      rebuilt.canonical_pollutant_manifest.body,
+      pollutantKey,
+    ).equals(pollutantBody)
+  ) {
+    throw new Error(
+      `Current canonical pollutant scope does not match the accepted deterministic writer: ${pollutantKey}`,
+    );
+  }
+  const hierarchy = rebuilt.v3_hierarchy;
+  buildObservationHistoryIndexV3PublicationPlan({
+    objects: hierarchy.publication_objects,
+    externalReferences,
+  });
+  return { hierarchy, canonicalManifest: pollutantManifest };
+}
+
+export async function verifyObservationHistoryV3UnlistedScope({
+  getObject, observationsPrefix, indexRoot, scope, descriptor,
+}) {
+  assertObservationHistoryGenerationPrefixes(getObservationHistoryGeneration("v3"), { observationsPrefix, indexRoot });
+  const { hierarchy, canonicalManifest } = await verifyCanonicalSchema1Partition({
+    getObject, observationsPrefix, indexRoot, scope, descriptor,
+    writerLimits: ACCEPTED_OBSERVATION_HISTORY_WRITER_LIMITS_V3,
+  });
+  if (hierarchy.scoped_manifest.payload.schema_version !== 1) {
+    throw new Error("Missing-scope recovery requires schema-1 exact-v3 artifacts");
+  }
+  const verification = await verifyRebuiltExactV3PublicationObjects({
+    getObject, artifacts: hierarchy.publication_objects,
+    concurrency: normalizeLatestRecoveryVerificationConcurrency(
+      DEFAULT_OBSERVATION_HISTORY_EXACT_V3_PUBLICATION_CONCURRENCY,
+    ),
+  });
+  return { artifact: hierarchy.scoped_manifest, canonical_manifest: canonicalManifest, ...verification };
+}
+
 export function createObservationHistoryV3LatestScopedReferenceRecovery({
   getObject,
   observationsPrefix = DEFAULT_OBSERVATION_HISTORY_V3_STEADY_STATE_PREFIX,
@@ -517,99 +639,8 @@ export function createObservationHistoryV3LatestScopedReferenceRecovery({
       );
     }
     const descriptor = matches[0];
-    const pollutantKey = buildHistoryV2PollutantManifestKey(
-      observationsPrefix,
-      scope.day_utc,
-      scope.connector_id,
-      scope.pollutant_code,
-    );
-    if (descriptor.manifest_key !== pollutantKey) {
-      throw new Error(`Current canonical pollutant descriptor key disagrees: ${connectorKey}`);
-    }
-    const pollutantObject = await getObject({ key: pollutantKey });
-    if (!pollutantObject || pollutantObject.exists === false) {
-      throw new Error(`Current canonical pollutant manifest is missing: ${pollutantKey}`);
-    }
-    const pollutantBody = exactBody(pollutantObject.body, pollutantKey);
-    const pollutantManifest = parseCanonicalManifest({
-      body: pollutantBody,
-      key: pollutantKey,
-      manifestKind: "pollutant",
-      scope,
-    });
-    assertCurrentPollutantDescriptor(descriptor, pollutantManifest);
-
-    const files = Array.isArray(pollutantManifest.files)
-      ? pollutantManifest.files
-      : [];
-    if (files.length === 0 || files.length !== Number(pollutantManifest.file_count)) {
-      throw new Error(`Current canonical pollutant Parquet evidence is incomplete: ${pollutantKey}`);
-    }
-    const canonicalBodies = [];
-    const canonicalRows = [];
-    const externalReferences = [{
-      key: pollutantKey,
-      byte_size: pollutantBody.byteLength,
-      sha256: sha256Hex(pollutantBody),
-      verified: true,
-      durable: true,
-    }];
-    for (const file of files) {
-      const key = String(file?.key || "").trim();
-      const expectedBytes = Number(file?.bytes);
-      const expectedSha256 = String(file?.etag_or_hash || "").trim().toLowerCase();
-      if (
-        !key || !Number.isSafeInteger(expectedBytes) || expectedBytes <= 0 ||
-        !/^[0-9a-f]{64}$/.test(expectedSha256)
-      ) {
-        throw new Error(`Current canonical pollutant Parquet evidence is invalid: ${pollutantKey}`);
-      }
-      const object = await getObject({ key });
-      if (!object || object.exists === false) {
-        throw new Error(`Current canonical Parquet is missing: ${key}`);
-      }
-      const body = exactBody(object.body, key);
-      if (body.byteLength !== expectedBytes || sha256Hex(body) !== expectedSha256) {
-        throw new Error(`Current canonical Parquet identity disagrees: ${key}`);
-      }
-      canonicalBodies.push({ key, body });
-      canonicalRows.push(...decodeAcceptedCanonicalObservationRows(body, key));
-      externalReferences.push({
-        key,
-        byte_size: expectedBytes,
-        sha256: expectedSha256,
-        verified: true,
-        durable: true,
-      });
-    }
-    const rebuilt = buildObservationHistoryV3SteadyStatePartition({
-      source: OBSERVATION_HISTORY_V3_STEADY_STATE_SOURCES.pruneDaily,
-      rows: canonicalRows,
-      writerLimits: acceptedLimits,
-      targetWriterGitSha: pollutantManifest.writer_git_sha,
-      backedUpAtUtc: pollutantManifest.backed_up_at_utc,
-      observationsPrefix,
-      indexRoot,
-    });
-    if (
-      rebuilt.file_intents.length !== canonicalBodies.length ||
-      rebuilt.file_intents.some((entry, index) =>
-        entry.key !== canonicalBodies[index].key ||
-        !exactBody(entry.body, entry.key).equals(canonicalBodies[index].body)
-      ) ||
-      !exactBody(
-        rebuilt.canonical_pollutant_manifest.body,
-        pollutantKey,
-      ).equals(pollutantBody)
-    ) {
-      throw new Error(
-        `Current canonical pollutant scope does not match the accepted deterministic writer: ${pollutantKey}`,
-      );
-    }
-    const hierarchy = rebuilt.v3_hierarchy;
-    buildObservationHistoryIndexV3PublicationPlan({
-      objects: hierarchy.publication_objects,
-      externalReferences,
+    const { hierarchy } = await verifyCanonicalSchema1Partition({
+      getObject, observationsPrefix, indexRoot, scope, descriptor, writerLimits: acceptedLimits,
     });
     if (
       hierarchy.scoped_manifest.key !== reference.key ||

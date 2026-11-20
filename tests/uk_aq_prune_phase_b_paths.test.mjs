@@ -30,9 +30,11 @@ import {
   OBSERVATION_PROPERTY_CODE_SQL_PATTERN,
 } from "../workers/shared/uk_aq_observation_property_code.mjs";
 import { computePruneConnectorSourceIdentity } from "../workers/shared/uk_aq_prune_connector_source_identity.mjs";
+import { FIRST_DELETE_READY } from "../workers/uk_aq_prune_daily/deletion_attempt_state.mjs";
 
 const DAY = "2026-06-14";
 const RUN_ID = "test-run";
+const INVALID_HISTORY_GENERATION = /Observation history generation must be exactly v2 or v3/;
 const PHASE_B_SOURCE = readFileSync(
   "workers/uk_aq_prune_daily/phase_b_history_r2.mjs",
   "utf8",
@@ -50,27 +52,37 @@ function runManifestKey(prefix, runId = RUN_ID) {
   return `${prefix}/run_id=${runId}/run_manifest.json`;
 }
 
-test("Prune generation dispatch admits only v2 and rejects v3 before any database or history work", async () => {
-  for (const index of [undefined, "v2", "v3", "invalid"]) {
-    const env = { UK_AQ_R2_HISTORY_VERSION: "v2", UK_AQ_R2_HISTORY_INDEX_VERSION: index };
+test("Prune selects complete v2 or v3 history and rejects invalid generations before I/O", async (t) => {
+  const fetch = t.mock.method(globalThis, "fetch", () => assert.fail("unexpected history I/O"));
+  for (const version of ["v2", "v3"]) {
+    const env = { UK_AQ_R2_HISTORY_VERSION: version };
     const config = resolvePhaseBRuntimeConfig(env);
-    assert.equal(config.history_write_version, "v2");
-    assert.equal(config.committed_prefix, "history/v2/observations");
-    assert.equal(Object.hasOwn(config, "observation_history_index_version"), false);
+    assert.equal(resolvePruneHistoryGeneration(env), version);
+    assert.equal(config.history_write_version, version);
+    assert.equal(config.committed_prefix, `history/${version}/observations`);
+    assert.equal(config.runs_prefix, `history/${version}/_ops/observations/runs`);
+    for (const retiredIndex of ["v2", "v3", "invalid"]) {
+      assert.deepEqual(
+        resolvePhaseBRuntimeConfig({ ...env, UK_AQ_R2_HISTORY_INDEX_VERSION: retiredIndex }),
+        config,
+      );
+    }
+    const otherVersion = version === "v2" ? "v3" : "v2";
+    assert.throws(() => resolvePhaseBRuntimeConfig({
+      ...env, UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: `history/_index_${otherVersion}`,
+    }), new RegExp(`Prune ${version} requires UK_AQ_R2_HISTORY_INDEX_V2_PREFIX=history/_index_${version}`));
   }
-  for (const version of [undefined, "", "v1", "V2", " v2", "v4", "v3"]) {
-    const pattern = version === "v3" ? /v3 side-by-side Prune history writer is not yet implemented/ : /missing or unsupported history generation/;
-    assert.throws(() => resolvePruneHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: version }), pattern);
-    assert.throws(() => resolvePhaseBRuntimeConfig({ UK_AQ_R2_HISTORY_VERSION: version }), pattern);
+  for (const version of [undefined, "", "v1", "V2", " v2", "v4"]) {
+    assert.throws(() => resolvePruneHistoryGeneration({ UK_AQ_R2_HISTORY_VERSION: version }), INVALID_HISTORY_GENERATION);
+    assert.throws(() => resolvePhaseBRuntimeConfig({ UK_AQ_R2_HISTORY_VERSION: version }), INVALID_HISTORY_GENERATION);
     let connections = 0;
     await assert.rejects(runPhaseBBackup({
       dryRun: false, phaseB: { enabled: true, history_write_version: version }, logStructured: () => {},
       createPgClient: () => { connections++; throw new Error("unexpected database work"); },
-    }), pattern);
+    }), INVALID_HISTORY_GENERATION);
     assert.equal(connections, 0);
   }
-  assert.doesNotMatch(PHASE_B_SOURCE, /UK_AQ_R2_HISTORY_INDEX_VERSION|runOperationalPruneDailyObservationHistoryV3|resolveObservationHistoryIndexV3BuildConfig/);
-  assert.throws(() => resolvePhaseBRuntimeConfig({ UK_AQ_R2_HISTORY_VERSION: "v2", UK_AQ_R2_HISTORY_INDEX_V2_PREFIX: "history/_index_v3" }), /Prune v2 requires/);
+  assert.equal(fetch.mock.callCount(), 0);
 });
 
 test("Phase B accepts the verified canonical v2 day authority and rejects a non-canonical connector key", () => {
@@ -450,7 +462,7 @@ test("Phase B v2 still rejects blank and unsafe observation property paths", asy
   );
 });
 
-test("Phase B v2 SQL uses set-based aggregation and preserves complete candidates", async () => {
+test("Phase B v2 SQL uses set-based aggregation and preserves matching READY candidates", async () => {
   const queries = [];
   const canonicalRows = Array.from({ length: 100 }, (_, index) => ({
     connector_id: 7,
@@ -470,9 +482,10 @@ test("Phase B v2 SQL uses set-based aggregation and preserves complete candidate
     excluded_row_count: "0",
     excluded_pollutant_counts: {},
     min_observed_at: `${DAY}T00:00:00.000Z`,
-    max_observed_at: `${DAY}T23:59:59.999Z`,
+    max_observed_at: `${DAY}T23:00:00.000Z`,
     status: "complete",
     run_id: "previous-run",
+    last_error: FIRST_DELETE_READY,
     manifest_key: "history/v2/observations/day_utc=2026-06-14/connector_id=7/manifest.json",
     history_row_count: 100,
     history_file_count: 1,
@@ -488,7 +501,10 @@ test("Phase B v2 SQL uses set-based aggregation and preserves complete candidate
       }
       if (sql.includes("uk_aq_phase_b_history_rows_v2")) return { rows: canonicalRows };
       if (/^begin isolation level repeatable read$|^commit$|^rollback$/i.test(sql.trim())) return { rows: [] };
-      return { rows: [completedRow] };
+      if (sql.includes("source_aggregates") || /from uk_aq_ops\.history_candidates[\s\S]+for update/i.test(sql)) {
+        return { rows: [completedRow] };
+      }
+      assert.fail(`Unexpected query while retaining the original READY candidate: ${sql.trim().slice(0, 90)}`);
     },
   };
 
@@ -521,6 +537,10 @@ test("Phase B v2 SQL uses set-based aggregation and preserves complete candidate
   assert.equal(candidates[0].status, "complete");
   assert.equal(candidates[0].run_id, "previous-run");
   assert.equal(candidates[0].manifest_key, "history/v2/observations/day_utc=2026-06-14/connector_id=7/manifest.json");
+  assert.equal(candidates[0].last_error, FIRST_DELETE_READY);
+  assert.equal(candidates[0].source_identity_match, true);
+  assert.equal(candidates[0].source_changed_connector_gate_invalidated, false);
+  assert.match(queries.at(-1), /^commit$/i);
 });
 
 test("Phase B deploy workflow and env catalogs retire the observations history allow-list", () => {
@@ -540,20 +560,23 @@ test("Phase B deploy workflow and env catalogs retire the observations history a
   );
 });
 
-test("Prune Daily timeout hierarchy matches the temporary TEST catch-up window", () => {
+test("Prune Daily timeout hierarchy matches the approved three-hour profile", () => {
   const workflow = readFileSync(".github/workflows/uk_aq_prune_daily.yml", "utf8");
   const targets = readFileSync("config/uk_aq_github_env_targets.csv", "utf8");
   const resolved = resolvePhaseBRuntimeConfig({ UK_AQ_R2_HISTORY_VERSION: "v2" });
 
   assert.match(workflow, /timeout-minutes:\s*190/);
   assert.match(workflow, /timeout --kill-after=30s 180m node workers\/uk_aq_prune_daily\/job\.mjs/);
-  assert.match(workflow, /UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN:\s*'10740'/);
+  assert.match(workflow, /UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN:\s*\$\{\{ vars\.UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN \|\| '10740' \}\}/);
   assert.match(workflow, /UK_AQ_PRUNE_DAILY_PHASE_B_STOP_BEFORE_TIMEOUT_SECONDS:.*'60'/);
   assert.match(workflow, /Upload Prune Daily report\s+if: always\(\)/);
   assert.match(targets, /^UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN,variable$/m);
   assert.match(targets, /^UK_AQ_PRUNE_DAILY_PHASE_B_STOP_BEFORE_TIMEOUT_SECONDS,variable$/m);
-  assert.equal(resolved.max_seconds_per_run, 3_540);
+  assert.equal(resolved.max_seconds_per_run, 10_740);
   assert.equal(resolved.stop_before_timeout_seconds, 60);
+  assert.equal(resolved.max_seconds_per_run - resolved.stop_before_timeout_seconds, 10_680);
+  assert.match(workflow, /\[ "\$\{UK_AQ_PRUNE_DAILY_PHASE_B_MAX_SECONDS_PER_RUN\}" != "10740" \]/);
+  assert.match(workflow, /\[ "\$\{UK_AQ_PRUNE_DAILY_PHASE_B_STOP_BEFORE_TIMEOUT_SECONDS\}" != "60" \]/);
   assert.equal(resolvePhaseBRuntimeConfig({
     UK_AQ_R2_HISTORY_VERSION: "v2",
     DATABASE_URL: "postgresql://retired-fallback.invalid/db",
@@ -627,7 +650,7 @@ test("Phase B v2 resolves run manifests to the v2 ops prefix even when legacy ru
 test("Phase B fails closed instead of resolving a v1 AQI writer", () => {
   assert.throws(
     () => resolvePhaseBHistoryWritePrefixes({ UK_AQ_R2_HISTORY_VERSION: "v1" }),
-    /missing or unsupported history generation/,
+    INVALID_HISTORY_GENERATION,
   );
 });
 
@@ -993,17 +1016,28 @@ test("Phase B run summaries distinguish AQI disablement from budget exhaustion",
 });
 
 test("Phase B observation-only mode adds no environment selector or fallback AQI writer", () => {
-  const implementation = readFileSync("workers/uk_aq_prune_daily/phase_b_history_r2.mjs", "utf8");
   const workflow = readFileSync(".github/workflows/uk_aq_prune_daily.yml", "utf8");
   const targets = readFileSync("config/uk_aq_github_env_targets.csv", "utf8");
-  for (const content of [implementation, workflow, targets]) {
+  for (const content of [PHASE_B_SOURCE, workflow, targets]) {
     assert.doesNotMatch(content, /UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED/);
     assert.doesNotMatch(content, /UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED/);
     assert.doesNotMatch(content, /runAqilevelsBackup/);
   }
-  assert.match(implementation, /connectorPublisher\s*=\s*publishFrozenV2Observations/);
-  assert.match(implementation, /runFinalizer\s*=\s*finalizeObservationV2Run/);
-  assert.doesNotMatch(implementation, /resolveObservationHistoryIndexV3BuildConfig/);
+  for (const version of ["v2", "v3"]) {
+    const env = { UK_AQ_R2_HISTORY_VERSION: version };
+    assert.deepEqual(resolvePhaseBRuntimeConfig({
+      ...env,
+      UK_AQ_PHASE_B_CALCULATE_AQI_FROM_OBSERVATIONS_ENABLED: "true",
+      UK_AQ_PHASE_B_LEGACY_AQI_RPC_EXPORT_ENABLED: "true",
+    }), resolvePhaseBRuntimeConfig(env));
+  }
+  const observationPublication = sourceSection(
+    "async function finalizeSelectedObservationRun(",
+    "export async function writeFrozenCandidateObservationsToV2ForTest(",
+  );
+  assert.doesNotMatch(observationPublication,
+    /\b(?:runCandidateAqilevelsStage|exportCandidateAqiFromFrozenSource|exportAqilevelConnectorRowsToR2|writeAqilevelDayManifestFromConnectorOutputs|writeEmptyAqilevelConnectorManifests|buildAqilevelDayIndexes)\s*\(/);
+  assert.doesNotMatch(PHASE_B_SOURCE, /resolveObservationHistoryIndexV3BuildConfig/);
   assert.doesNotMatch(
     sourceSection("async function updateFinalizedHistoryIndexes(", "export async function updateFinalizedHistoryIndexesForTest("),
     /domains:\s*\["aqilevels"\]/,

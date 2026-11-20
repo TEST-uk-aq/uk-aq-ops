@@ -7,6 +7,7 @@ import {
   createObservationHistoryV3CanonicalAggregatePublisher,
   createObservationHistoryV3CanonicalDayPublisher,
   createObservationHistoryV3LatestScopedReferenceRecovery,
+  verifyObservationHistoryV3UnlistedScope,
   runDisconnectedPruneDailyObservationHistoryV3Writer,
   runDisconnectedSelectedScopeReconciliationObservationHistoryV3Writer,
   runOperationalPruneDailyObservationHistoryV3ConnectorPublication,
@@ -257,6 +258,24 @@ test("Prune latest recovery independently rebuilds and verifies the current exac
     artifact.key === current.v3_hierarchy.scoped_manifest.key ||
     reads.includes(artifact.key)
   ));
+});
+
+test("unlisted scope recovery verifies the entire independently rebuilt schema-1 graph", async () => {
+  const partition = buildObservationHistoryV3SteadyStatePartition({
+    source: "prune_daily", rows: rows("no2", 101), targetWriterGitSha: TARGET_GIT_SHA,
+    backedUpAtUtc: "2026-08-22T00:00:00.000Z",
+  });
+  const connector = currentConnectorFromPartitions([partition]);
+  const objects = recoveryObjects(partition, connector);
+  const options = { observationsPrefix: OBSERVATIONS_PREFIX, indexRoot: EXACT_INDEX_ROOT,
+    scope: partition.scope, descriptor: connector.pollutant_manifests[0],
+    getObject: async ({ key }) => objects.has(key) ? { key, body: objects.get(key) } : { exists: false },
+  };
+  const verified = await verifyObservationHistoryV3UnlistedScope(options);
+  assert.equal(verified.artifact.sha256, partition.v3_hierarchy.scoped_manifest.sha256);
+  assert.equal(verified.verification_object_count, partition.v3_hierarchy.publication_objects.length);
+  objects.delete(partition.v3_hierarchy.exact_leaves[0].key);
+  await assert.rejects(verifyObservationHistoryV3UnlistedScope(options), /dependency is missing/);
 });
 
 test("Prune latest recovery verifies rebuilt exact-v3 artifacts with bounded concurrency", async () => {

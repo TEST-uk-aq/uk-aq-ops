@@ -523,6 +523,8 @@ async function verifiedExternalReference(reference, getObject, {
   });
 }
 
+export { verifyExternalReferencesBounded as verifyObservationHistoryV3ExternalReferences };
+
 async function verifyExternalReferencesBounded({
   references,
   getObject,
@@ -1839,6 +1841,7 @@ export async function runObservationHistoryV3RunFinalization({
   diagnosticEnvironment,
   diagnosticLog,
   beforePublicationStage,
+  beforeLatestPublication,
   lockTimeoutMs,
   recoverLatestScopedReference = null,
   selectedScopeRemovalAuthority = null,
@@ -2300,6 +2303,7 @@ export async function runObservationHistoryV3RunFinalization({
             objects: [updatedLatest],
             externalReferences: [...latestExternalByKey.values()],
           });
+          await beforeLatestPublication?.(updatedLatest);
           const latestPublication = await finalizeV3Publication({
             plan: latestPlan,
             putIfChanged,

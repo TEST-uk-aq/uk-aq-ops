@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 
 export const ORIGINAL_OPERATION_REQUEST = 'uk_aq_prune_original_operation_assert';
 export const ORIGINAL_OPERATION_REPLY = 'uk_aq_prune_original_operation_reply';
+export const ORIGINAL_OPERATION_ASSERTION_MAX_MS = 5_000;
 const STAGES = new Set(['publication', 'batch_finalization', 'preparation', 'gate_begin', 'gate_commit', 'gate_committed']);
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 export function originalOperationError(reason) {
@@ -70,7 +71,7 @@ export function relayOriginalOperationAssertions({ coordinator, child, onFailure
 
 // Worker end: no cached success is reusable. Timeout, disconnect, a stale reply,
 // changed session or local close permanently invalidates this capability.
-export function createPruneOriginalOperation({ channel = process, runId, nonce, timeoutMs = 5000 }) {
+export function createPruneOriginalOperation({ channel = process, runId, nonce, timeoutMs = ORIGINAL_OPERATION_ASSERTION_MAX_MS }) {
   let sequence = 0, sessionPid = null, pending = null, failure = null;
   const fail = reason => {
     failure ||= originalOperationError(reason);
@@ -94,7 +95,7 @@ export function createPruneOriginalOperation({ channel = process, runId, nonce, 
       if (pending || !STAGES.has(stage)) { fail('overlapping or invalid assertion'); throw failure; }
       await new Promise((resolve, reject) => {
         const challenge = randomUUID();
-        const timer = setTimeout(() => fail('assertion timed out'), Math.min(5000, Math.max(1, timeoutMs)));
+        const timer = setTimeout(() => fail('assertion timed out'), Math.min(ORIGINAL_OPERATION_ASSERTION_MAX_MS, Math.max(1, timeoutMs)));
         pending = { resolve, reject, timer, challenge, sequence: ++sequence };
         send(channel, { type: ORIGINAL_OPERATION_REQUEST, run_id: runId, nonce,
           sequence, challenge, stage }, () => fail('IPC send failed'));
