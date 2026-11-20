@@ -146,7 +146,9 @@ jobs:
           exit "${missing}"
 
       - name: Run Prune Daily
-        run: timeout --kill-after=30s 180m node workers/uk_aq_prune_daily/job.mjs
+        run: |
+          read -r origin _ < /proc/uptime || origin=""
+          exec timeout --kill-after=30s 180m node workers/uk_aq_prune_daily/job.mjs --actions-worker-origin "${origin}"
 
       - name: Upload Prune Daily report
         if: always()

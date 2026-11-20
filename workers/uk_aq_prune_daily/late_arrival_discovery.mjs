@@ -1,4 +1,7 @@
+import { PruneWorkBudgetDeferred, requirePruneWork } from "./worker_budget.mjs";
+
 const DAY_MS = 86_400_000;
+const PROGRESS_QUERY_MS = 20_000;
 export const MAX_LATE_ARRIVAL_WINDOWS_PER_RUN = 14;
 export const MAX_LATE_ARRIVAL_DIRECT_DELETE_DAYS_PER_RUN = 14;
 export const LATE_ARRIVAL_LIMITS = Object.freeze({
@@ -89,6 +92,7 @@ function validateState(state, now) {
 export async function discoverAndProcessLateArrivals({
   cutoff, dryRun, progress, reader, processDay, classifyDay, runId,
   now = Date.now, limits = LATE_ARRIVAL_LIMITS,
+  workerBudget = null,
 }) {
   const started = now();
   const deadline = started + limits.maxMilliseconds;
@@ -121,6 +125,7 @@ export async function discoverAndProcessLateArrivals({
   async function checkpoint() {
     position();
     if (!dryRun) {
+      requirePruneWork(workerBudget, "late_arrival_checkpoint", 2 * PROGRESS_QUERY_MS + 1_000);
       try {
         await progress.save(cursor, { ...report, progress_persisted: true, persisted_next_day_utc: cursor.next_day_utc });
       } catch (error) {
@@ -141,6 +146,7 @@ export async function discoverAndProcessLateArrivals({
   async function request(callback) {
     const reason = budgetReason();
     if (reason) throw new Error(`Discovery request attempted after ${reason}`);
+    requirePruneWork(workerBudget, "late_arrival_discovery", PROGRESS_QUERY_MS + limits.requestMilliseconds + 1_000);
     await progress.assertOwned();
     const remaining = deadline - now();
     if (remaining <= 0) throw new Error("Discovery deadline expired before request");
@@ -191,6 +197,7 @@ export async function discoverAndProcessLateArrivals({
       report.discovered_day_count += knownPositiveDays.length;
       for (const entry of days) {
         if (now() >= deadline) { report.stop_reason = "runtime_budget"; break; }
+        requirePruneWork(workerBudget, "late_arrival_day", 3 * PROGRESS_QUERY_MS + 1_000);
         await progress.assertOwned();
         if (entry.present) {
           const route = classifyDay(entry.day_utc);
@@ -203,6 +210,7 @@ export async function discoverAndProcessLateArrivals({
           try {
             result = await processDay(entry.day_utc, route, report.direct_delete_day_count + report.repair_day_count);
           } catch (error) {
+            if (error instanceof PruneWorkBudgetDeferred) throw error;
             report.failed_day_count++;
             report.outcomes.push({ day_utc: entry.day_utc, route, outcome: "failed", error: String(error.message || error).slice(0, 500) });
             throw error;
@@ -216,7 +224,7 @@ export async function discoverAndProcessLateArrivals({
             || Number(result.connector_history_gate_blocked_after_repair_bucket_count || 0) > 0
             || Number(result.source_identity_blocked_bucket_count || 0) > 0;
           report.outcomes.push({ day_utc: entry.day_utc, route, run_id: result.run_id ?? null,
-            outcome: errors ? "failed" : blocked ? "blocked" : "processed",
+            outcome: errors ? "failed" : result.status === "deferred_budget" ? "deferred_budget" : blocked ? "blocked" : "processed",
             gate_blocked_bucket_count: Number(result.connector_history_gate_blocked_bucket_count || 0),
             alert_condition_count: Number(result.alert_condition_count || 0),
             blocked_preview: (result.connector_history_gate_blocked_buckets_preview || result.source_identity_blocked_buckets_preview || [])
@@ -226,6 +234,7 @@ export async function discoverAndProcessLateArrivals({
             report.failed_day_count++;
             throw new Error(`Ambiguous/failed late-arrival processing for ${entry.day_utc}; cursor retained`);
           }
+          if (result.status === "deferred_budget") throw new PruneWorkBudgetDeferred();
           report.processed_day_count++;
           if (blocked) report.blocked_day_count++;
           knownPositiveDays = knownPositiveDays.filter((value) => value !== entry.day_utc);
@@ -245,11 +254,18 @@ export async function discoverAndProcessLateArrivals({
     report.attention_required = report.status === "deferred" || report.blocked_day_count > 0;
     if (cursor) await checkpoint();
   } catch (error) {
-    report.status = "failed";
-    report.attention_required = true;
-    report.error_count = 1;
-    report.error = String(error.message || error).slice(0, 1000);
-    report.stop_reason = "failure";
+    if (error instanceof PruneWorkBudgetDeferred) {
+      cursor = lastAcknowledgedCursor;
+      report.status = "deferred_budget";
+      report.attention_required = report.blocked_day_count > 0;
+      report.stop_reason = "worker_cutoff";
+    } else {
+      report.status = "failed";
+      report.attention_required = true;
+      report.error_count = 1;
+      report.error = String(error.message || error).slice(0, 1000);
+      report.stop_reason = "failure";
+    }
     report.deferred_day_count = knownPositiveDays.length;
     // Never retry an ambiguous checkpoint or advance on RPC/processing failure.
     // last successful checkpoint remains durable; failure is in the run report.

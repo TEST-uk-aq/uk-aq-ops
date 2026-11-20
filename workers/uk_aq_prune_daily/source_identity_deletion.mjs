@@ -824,12 +824,18 @@ export async function runPruneConnectorDayDeletionTransaction({
   }
 }
 
-async function withDeletionClient(databaseUrl, callback) {
+const DELETE_CONNECT_MS = 15_000;
+const DELETE_QUERY_MS = 20_000;
+const DELETE_STATEMENT_MS = 15_000;
+const DELETE_LOCAL_MARGIN_MS = 5_000;
+
+async function withDeletionClient(databaseUrl, callback, bounded = false) {
   const connectionString = String(databaseUrl || "").trim();
   if (!connectionString) throw new Error("Source-identity deletion requires SUPABASE_DB_URL");
   const client = new Client({
     connectionString,
-    connectionTimeoutMillis: 15_000,
+    connectionTimeoutMillis: DELETE_CONNECT_MS,
+    ...(bounded ? { statement_timeout: DELETE_STATEMENT_MS, query_timeout: DELETE_QUERY_MS } : {}),
     application_name: "uk-aq-prune-source-identity-delete",
   });
   await client.connect();
@@ -847,11 +853,25 @@ export async function deletePruneBucketsWithSourceIdentity({
   maxDeleteBatchesPerHour,
   pollutantCodes = null,
   withClient = withDeletionClient,
+  workerBudget = null,
+  budgetStage = "normal_prune_delete",
+  assertOriginalLock,
 }) {
   const results = [];
   for (const group of groupBucketsByConnectorDay(buckets)) {
-    results.push(await withClient(databaseUrl, async (client) => (
-      await runPruneConnectorDayDeletionTransaction({
+    // BEGIN, two locked evidence reads, canonical/raw snapshots, final
+    // canonical/raw counts, two evidence updates, COMMIT and possible ROLLBACK.
+    // Each eligible hour can take its entire DELETE cap plus a drain check.
+    const allowance = DELETE_CONNECT_MS + DELETE_LOCAL_MARGIN_MS
+      + (11 + group.buckets.length * (maxDeleteBatchesPerHour + 1)) * DELETE_QUERY_MS;
+    if (workerBudget) {
+      if (!workerBudget.admit(budgetStage, allowance + 5_000)) break;
+      await assertOriginalLock();
+      if (!workerBudget.admit(budgetStage, allowance)) break;
+    }
+    results.push(await withClient(databaseUrl, async (client) => {
+      workerBudget?.markDeletionAttempted();
+      return await runPruneConnectorDayDeletionTransaction({
         client,
         dayUtc: group.dayUtc,
         connectorId: group.connectorId,
@@ -859,8 +879,8 @@ export async function deletePruneBucketsWithSourceIdentity({
         deleteBatchSize,
         maxDeleteBatchesPerHour,
         pollutantCodes,
-      })
-    )));
+      });
+    }, Boolean(workerBudget)));
   }
   return results;
 }

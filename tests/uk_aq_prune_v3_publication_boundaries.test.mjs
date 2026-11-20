@@ -9,6 +9,10 @@ import {
   validateObservationHistoryExactLeafIndexV3LatestRegistry,
 } from "../workers/shared/uk_aq_observation_history_exact_leaf_index_v3.mjs";
 import { createV3ParentPublicationBatch } from "../workers/uk_aq_prune_daily/v3_parent_publication_batch.mjs";
+import { createPhaseBRunBudgetForTest } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
+import { createWorkerBudget } from "../workers/uk_aq_prune_daily/worker_budget.mjs";
+import { ORIGINAL_OPERATION_ASSERTION_MAX_MS } from "../scripts/operations/lib/uk_aq_prune_original_operation.mjs";
+import { R2_PUBLICATION_SAFETY_MARGIN_MS, R2_REQUEST_WORST_CASE_DURATION_MS } from "../workers/shared/r2_sigv4.mjs";
 
 const dayUtc = "2026-06-01";
 function scope(connectorId, day = dayUtc) {
@@ -68,7 +72,7 @@ test("approved repair preserves all existing scopes and sends only a conditional
   assert.deepEqual(writes.map(({ key, if_match }) => [key, if_match]), [[latestKey, '"original"'], [latestKey, '"original"']]);
 });
 
-function parentPublicationFixture({ unchanged = false, loseLock = false } = {}) {
+function parentPublicationFixture({ unchanged = false, loseLock = false, phaseBudget } = {}) {
   const parentKeys = ["day", "month", "year", "root"];
   const stored = new Map([...parentKeys, latestKey].map(key => [key, Buffer.from(`old ${key}`)]));
   const writes = [];
@@ -88,6 +92,10 @@ function parentPublicationFixture({ unchanged = false, loseLock = false } = {}) 
     assertOwned: async () => { if (loseLock && writes.length) throw new Error("original lock lost"); },
     admit: (requests, locks) => {
       budgets.push([requests, locks]);
+      if (phaseBudget && phaseBudget.now_ms() + requests * R2_REQUEST_WORST_CASE_DURATION_MS
+        + locks * ORIGINAL_OPERATION_ASSERTION_MAX_MS + R2_PUBLICATION_SAFETY_MARGIN_MS >= phaseBudget.deadline_ms) {
+        throw new Error("stopped_budget");
+      }
       if (requests > allowance) throw new Error("stopped_budget");
     },
     log: (event, fields) => { if (event === "parent_verified") verifiedKeys.push(fields.key); },
@@ -106,6 +114,23 @@ function parentPublicationFixture({ unchanged = false, loseLock = false } = {}) 
   return { batch, artifact, prepare, parentKeys, stored, writes, reads, verifiedKeys, budgets,
     setAllowance: value => { allowance = value; } };
 }
+
+test("startup and Phase A consume the all-changed parent/latest allowance before the first parent PUT", async () => {
+  const launch = 100_000;
+  let now = launch + 300_000;
+  const workerBudget = createWorkerBudget(launch, () => now);
+  const phaseBudget = createPhaseBRunBudgetForTest({ nowMs: workerBudget.nowMs, workerBudget });
+  assert.equal(phaseBudget.limiting_clock, "worker_wide");
+  assert.equal(phaseBudget.elapsed_worker_before_phase_b_ms, 300_010);
+  assert.equal(phaseBudget.local_deadline_ms - phaseBudget.deadline_ms, 300_010);
+  const fixture = parentPublicationFixture({ phaseBudget });
+  await fixture.prepare();
+  now = workerBudget.deadlineMs - 1_635_500 - 10;
+  await assert.rejects(fixture.batch.publishParents(fixture.artifact(latestKey)), /stopped_budget/);
+  assert.deepEqual(fixture.writes, []);
+  assert.deepEqual(fixture.budgets, [[13, 5]]);
+  assert.equal(fixture.batch.lastVerified, null);
+});
 
 test("v3 preparation reaches complete batch admission before the first parent PUT", async () => {
   const f = parentPublicationFixture();

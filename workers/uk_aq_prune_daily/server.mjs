@@ -12,8 +12,9 @@ import { connectorDayGateKey } from "../shared/uk_aq_connector_day_gate.mjs";
 import { groupFingerprintRechecksByHour } from "./fingerprint_recheck.mjs";
 import { deletePruneBucketsWithSourceIdentity } from "./source_identity_deletion.mjs";
 import { openLateArrivalProgress } from "./late_arrival_progress.mjs";
-import { createLateArrivalReader, discoverAndProcessLateArrivals } from "./late_arrival_discovery.mjs";
+import { createLateArrivalReader, discoverAndProcessLateArrivals, LATE_ARRIVAL_LIMITS } from "./late_arrival_discovery.mjs";
 import { withDailyTaskRun } from "../shared/daily_task_health.mjs";
+import { PruneWorkBudgetDeferred, requirePruneWork } from "./worker_budget.mjs";
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -41,6 +42,12 @@ const DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MIN_ROWS = 32;
 const DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH = 4;
 const DEFAULT_REPAIR_FETCH_PAGE_SIZE = 1_000;
 const MAX_REPAIR_FETCH_PAGES = 500;
+const PRUNE_RPC_MS = LATE_ARRIVAL_LIMITS.requestMilliseconds;
+const FINGERPRINT_ALLOWANCE_MS = (1 + DEFAULT_FINGERPRINT_RPC_RETRIES) * PRUNE_RPC_MS
+  + DEFAULT_FINGERPRINT_RPC_RETRY_BASE_MS * DEFAULT_FINGERPRINT_RPC_RETRIES
+    * (DEFAULT_FINGERPRINT_RPC_RETRIES + 1) / 2 + 1_000;
+const GATE_LOOKUP_ALLOWANCE_MS = 15_000 + 3 * 20_000 + 5_000;
+const PROGRESS_OPEN_ALLOWANCE_MS = 15_000 + 7 * 20_000 + 5_000;
 const PREVIEW_LIMIT = 25;
 const RPC_SCHEMA = "uk_aq_public";
 const REPAIR_RECEIPT_SEMANTICS = "sync_attempt_audit_not_applied_row_evidence";
@@ -175,6 +182,9 @@ function recentObsAqidbMismatchWarning(phaseARecent) {
 function compactPruneHealthSummary(summary = {}) {
   return {
     mode: summary.mode,
+    status: summary.status,
+    budget_deferred: summary.budget_deferred,
+    deletion_attempted: summary.deletion_attempted,
     dry_run: summary.mode === "dry-run" || undefined,
     window_start_utc: summary.window_start,
     window_end_utc: summary.window_end,
@@ -235,6 +245,8 @@ function compactPruneHealthSummary(summary = {}) {
         ok: summary.phase_b_history.ok,
         run_id: summary.phase_b_history.run_id,
         status: summary.phase_b_history.status,
+        timing: summary.phase_b_history.timing,
+        run_manifest: summary.phase_b_history.run_manifest,
         stopped_for_budget: summary.phase_b_history.stopped_for_budget,
         error_count: summary.phase_b_history.error_count,
         blocked_scope_count: summary.phase_b_history.blocked_scope_count,
@@ -976,15 +988,21 @@ function observationPollutantCodesForPrune(config, repairOnlyMode) {
   return codes.length > 0 ? codes : null;
 }
 
-async function fetchHourlyFingerprints(client, windowStart, windowEnd, sourceName, pollutantCodes = null) {
+function pruneRpc(client, rpc, params, work) {
+  const request = client.schema(RPC_SCHEMA).rpc(rpc, params);
+  return work?.budget ? request.abortSignal(AbortSignal.timeout(PRUNE_RPC_MS)) : request;
+}
+
+async function fetchHourlyFingerprints(client, windowStart, windowEnd, sourceName, pollutantCodes = null, work) {
+  requirePruneWork(work?.budget, work?.stage, FINGERPRINT_ALLOWANCE_MS);
   let retryCount = 0;
 
   while (true) {
-    const { data, error } = await client.schema(RPC_SCHEMA).rpc(RPC_HOURLY_FINGERPRINT, {
+    const { data, error } = await pruneRpc(client, RPC_HOURLY_FINGERPRINT, {
       window_start: windowStart,
       window_end: windowEnd,
       p_pollutant_codes: pollutantCodes,
-    });
+    }, work);
 
     if (!error) {
       const rows = Array.isArray(data) ? data : [];
@@ -1056,7 +1074,7 @@ function requiredObsAqidbHourWindows(buckets, now) {
 }
 
 export async function fetchRequiredObsAqidbFingerprints(
-  observsClient, ingestBuckets, sourceName, pollutantCodes = null, currentTime = () => new Date(),
+  observsClient, ingestBuckets, sourceName, pollutantCodes = null, currentTime = () => new Date(), work,
 ) {
   const plannedWindows = requiredObsAqidbHourWindows(ingestBuckets, currentTime());
   const observsRows = [];
@@ -1067,9 +1085,10 @@ export async function fetchRequiredObsAqidbFingerprints(
     for (const window of requiredObsAqidbHourWindows(currentBuckets, currentTime())) {
       try {
         observsRows.push(...await fetchHourlyFingerprints(
-          observsClient, window.window_start, window.window_end, sourceName, pollutantCodes,
+          observsClient, window.window_start, window.window_end, sourceName, pollutantCodes, work,
         ));
       } catch (error) {
+        if (error instanceof PruneWorkBudgetDeferred) throw error;
         if (requiredObsAqidbHourWindows(currentBuckets, currentTime()).length === 0) continue;
         throw error;
       }
@@ -1080,13 +1099,13 @@ export async function fetchRequiredObsAqidbFingerprints(
 
 export async function fetchPruneFingerprintWindow(
   ingestClient, observsClient, windowStart, windowEnd, pollutantCodes = null,
-  currentTime = () => new Date(),
+  currentTime = () => new Date(), work,
 ) {
   const ingestBuckets = await fetchHourlyFingerprints(
-    ingestClient, windowStart, windowEnd, "ingest", pollutantCodes,
+    ingestClient, windowStart, windowEnd, "ingest", pollutantCodes, work,
   );
   const observsBuckets = await fetchRequiredObsAqidbFingerprints(
-    observsClient, ingestBuckets, "observs", pollutantCodes, currentTime,
+    observsClient, ingestBuckets, "observs", pollutantCodes, currentTime, work,
   );
   return { ingestBuckets, observsBuckets };
 }
@@ -1385,7 +1404,7 @@ function buildReceiptRows(observsRows) {
   return Array.from(deduped.values());
 }
 
-export async function upsertObservsRowsChunk(observsClient, rows, now = new Date()) {
+export async function upsertObservsRowsChunk(observsClient, rows, now = new Date(), work) {
   if (rows.some((row) => classifyObsAqidbRpcWriteWindow({
     hour_start: new Date(Math.floor(Date.parse(row.observed_at) / HOUR_MS) * HOUR_MS).toISOString(),
     min_observed_at: row.observed_at,
@@ -1393,11 +1412,13 @@ export async function upsertObservsRowsChunk(observsClient, rows, now = new Date
   }, now) !== "comparison_required")) {
     throw new Error("ObsAQIDB RPC write window expired or uncertain before repair upsert");
   }
-  const upsertResult = await observsClient.schema(RPC_SCHEMA).rpc(RPC_OBSERVS_UPSERT, {
+  const upsertResult = await pruneRpc(observsClient, RPC_OBSERVS_UPSERT, {
     rows,
-  });
+  }, work);
   if (upsertResult.error) {
-    throw new Error(upsertResult.error.message || "unknown_observs_upsert_error");
+    const error = new Error(upsertResult.error.message || "unknown_observs_upsert_error");
+    if (work?.budget && upsertResult.status === 0) error.code = "UK_AQ_PRUNE_AMBIGUOUS_REPAIR_RPC";
+    throw error;
   }
   const upsertRow = Array.isArray(upsertResult.data) ? upsertResult.data[0] : upsertResult.data;
   return toIntField(
@@ -1406,13 +1427,14 @@ export async function upsertObservsRowsChunk(observsClient, rows, now = new Date
   );
 }
 
-async function upsertObservsRowsWithFallback(observsClient, rows, splitDepth = 0) {
+async function upsertObservsRowsWithFallback(observsClient, rows, splitDepth = 0, work) {
   let lastMessage = "unknown_observs_upsert_error";
 
   for (let attempt = 1; attempt <= DEFAULT_OBSERVS_UPSERT_RPC_RETRIES; attempt += 1) {
     try {
-      return await upsertObservsRowsChunk(observsClient, rows);
+      return await upsertObservsRowsChunk(observsClient, rows, undefined, work);
     } catch (error) {
+      if (error.code === "UK_AQ_PRUNE_AMBIGUOUS_REPAIR_RPC") throw error;
       lastMessage = observsUpsertErrorMessage(error);
       if (
         attempt < DEFAULT_OBSERVS_UPSERT_RPC_RETRIES
@@ -1440,11 +1462,13 @@ async function upsertObservsRowsWithFallback(observsClient, rows, splitDepth = 0
       observsClient,
       leftRows,
       splitDepth + 1,
+      work,
     );
     const rightUpserted = await upsertObservsRowsWithFallback(
       observsClient,
       rightRows,
       splitDepth + 1,
+      work,
     );
     return leftUpserted + rightUpserted;
   }
@@ -1452,7 +1476,7 @@ async function upsertObservsRowsWithFallback(observsClient, rows, splitDepth = 0
   throw new Error(`observs upsert failed: ${lastMessage}`);
 }
 
-async function fetchObservationsForRepairBucket(client, mismatch) {
+async function fetchObservationsForRepairBucket(client, mismatch, work) {
   const connectorId = toIntField(mismatch.connector_id, "mismatch.connector_id");
   const pageSize = DEFAULT_REPAIR_FETCH_PAGE_SIZE;
   const rows = [];
@@ -1460,13 +1484,14 @@ async function fetchObservationsForRepairBucket(client, mismatch) {
   let reachedEnd = false;
 
   for (let pageIndex = 0; pageIndex < MAX_REPAIR_FETCH_PAGES; pageIndex += 1) {
+    requirePruneWork(work?.budget, work?.stage, PRUNE_RPC_MS);
     const pageOffset = pageIndex * pageSize;
-    const { data, error } = await client.schema(RPC_SCHEMA).rpc(RPC_REPAIR_FETCH_HOUR_BUCKET, {
+    const { data, error } = await pruneRpc(client, RPC_REPAIR_FETCH_HOUR_BUCKET, {
       p_connector_id: connectorId,
       p_hour_start: mismatch.hour_start,
       p_page_size: pageSize,
       p_page_offset: pageOffset,
-    });
+    }, work);
 
     if (error) {
       throw new Error(`repair fetch RPC failed: ${error.message}`);
@@ -1496,19 +1521,27 @@ async function fetchObservationsForRepairBucket(client, mismatch) {
   return { rows, pagesFetched };
 }
 
-async function replayObservationsForRepairBucket(mainClient, observsClient, mismatch) {
-  const { rows: rawRows, pagesFetched } = await fetchObservationsForRepairBucket(mainClient, mismatch);
+async function replayObservationsForRepairBucket(mainClient, observsClient, mismatch, work) {
+  const { rows: rawRows, pagesFetched } = await fetchObservationsForRepairBucket(mainClient, mismatch, work);
   const observsRows = normalizeObservsRows(rawRows);
 
   let rowsReplayed = 0;
   let receiptsUpserted = 0;
   if (observsRows.length > 0) {
-    rowsReplayed = await upsertObservsRowsWithFallback(observsClient, observsRows);
     const receiptRows = buildReceiptRows(observsRows);
+    // Admit the entire retry/split tree and receipt RPC before the first upsert.
+    const splitDepth = Math.max(0, Math.min(DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MAX_DEPTH,
+      Math.ceil(Math.log2(observsRows.length / DEFAULT_OBSERVS_UPSERT_TIMEOUT_SPLIT_MIN_ROWS))));
+    const attemptsPerNodeMs = DEFAULT_OBSERVS_UPSERT_RPC_RETRIES * PRUNE_RPC_MS
+      + DEFAULT_OBSERVS_UPSERT_RETRY_BASE_MS * DEFAULT_OBSERVS_UPSERT_RPC_RETRIES
+        * (DEFAULT_OBSERVS_UPSERT_RPC_RETRIES - 1) / 2;
+    const mutationAllowanceMs = (2 ** (splitDepth + 1) - 1) * attemptsPerNodeMs + PRUNE_RPC_MS;
+    requirePruneWork(work?.budget, work?.stage, mutationAllowanceMs + 2 * FINGERPRINT_ALLOWANCE_MS + 5_000);
+    rowsReplayed = await upsertObservsRowsWithFallback(observsClient, observsRows, 0, work);
     if (receiptRows.length > 0) {
-      const receiptResult = await mainClient.schema(RPC_SCHEMA).rpc(RPC_OBSERVS_RECEIPTS_UPSERT, {
+      const receiptResult = await pruneRpc(mainClient, RPC_OBSERVS_RECEIPTS_UPSERT, {
         rows: receiptRows,
-      });
+      }, work);
       if (receiptResult.error) {
         throw new Error(`observs receipts upsert failed: ${receiptResult.error.message}`);
       }
@@ -1538,13 +1571,13 @@ async function replayObservationsForRepairBucket(mainClient, observsClient, mism
   };
 }
 
-async function recheckSingleBucket(ingestClient, observsClient, mismatch, pollutantCodes = null) {
+async function recheckSingleBucket(ingestClient, observsClient, mismatch, pollutantCodes = null, work) {
   const bucketWindow = buildBucketWindow(mismatch.hour_start);
   const ingestRows = await fetchHourlyFingerprints(
-    ingestClient, bucketWindow.window_start, bucketWindow.window_end, "ingest_recheck", pollutantCodes,
+    ingestClient, bucketWindow.window_start, bucketWindow.window_end, "ingest_recheck", pollutantCodes, work,
   );
   const observsRows = await fetchRequiredObsAqidbFingerprints(
-    observsClient, ingestRows, "observs_recheck", pollutantCodes,
+    observsClient, ingestRows, "observs_recheck", pollutantCodes, undefined, work,
   );
 
   const ingestMap = new Map(ingestRows.map((row) => [row.key, row]));
@@ -1574,6 +1607,7 @@ async function recheckMismatchBuckets(
   observsClient,
   initialMismatches,
   pollutantCodes = null,
+  work,
 ) {
   const nowDeletableBuckets = [];
   const stillMismatched = [];
@@ -1595,12 +1629,13 @@ async function recheckMismatchBuckets(
     let observsRows;
     try {
       ingestRows = await fetchHourlyFingerprints(
-        ingestClient, group.window_start, group.window_end, "ingest_recheck", pollutantCodes,
+        ingestClient, group.window_start, group.window_end, "ingest_recheck", pollutantCodes, work,
       );
       observsRows = await fetchRequiredObsAqidbFingerprints(
-        observsClient, ingestRows, "observs_recheck", pollutantCodes,
+        observsClient, ingestRows, "observs_recheck", pollutantCodes, undefined, work,
       );
     } catch (error) {
+      if (error instanceof PruneWorkBudgetDeferred) throw error;
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(
         `Fingerprint recheck failed for ${group.window_start} to ${group.window_end}: ${message}`,
@@ -1698,6 +1733,7 @@ export async function recheckCompleteConnectorDays(
   initialIngestBuckets,
   pollutantCodes = null,
   currentTime = () => new Date(),
+  work,
 ) {
   const connectorIdsByDay = new Map();
   for (const bucket of initialIngestBuckets) {
@@ -1712,11 +1748,11 @@ export async function recheckCompleteConnectorDays(
     const windowStart = `${dayUtc}T00:00:00.000Z`;
     const windowEnd = new Date(Date.parse(windowStart) + DAY_MS).toISOString();
     const ingestRows = await fetchHourlyFingerprints(
-      ingestClient, windowStart, windowEnd, "ingest_final_connector_day_recheck", pollutantCodes,
+      ingestClient, windowStart, windowEnd, "ingest_final_connector_day_recheck", pollutantCodes, work,
     );
     const scopedIngestRows = ingestRows.filter((row) => connectorIds.has(Number(row.connector_id)));
     const observsRows = await fetchRequiredObsAqidbFingerprints(
-      observsClient, scopedIngestRows, "observs_final_connector_day_recheck", pollutantCodes, currentTime,
+      observsClient, scopedIngestRows, "observs_final_connector_day_recheck", pollutantCodes, currentTime, work,
     );
     finalIngestBuckets.push(...scopedIngestRows);
     finalObservsBuckets.push(...observsRows.filter((row) => connectorIds.has(Number(row.connector_id))));
@@ -1968,8 +2004,10 @@ async function applyConnectorHistoryGateFilter(config, runId, buckets, gateStage
     };
   }
 
+  requirePruneWork(config.workerBudget, gateStage, GATE_LOOKUP_ALLOWANCE_MS);
   const connectorGateMap = await fetchBackupDoneConnectorDays({
     supabaseDbUrl: config.phaseB.supabase_db_url,
+    bounded: Boolean(config.workerBudget),
     connectorDays: buckets.map((bucket) => ({
       day_utc: toBucketDayUtc(bucket),
       connector_id: bucket.connector_id,
@@ -2023,6 +2061,9 @@ async function deleteBucketsWithConnectorSourceIdentity(
     deleteBatchSize: config.deleteBatchSize,
     maxDeleteBatchesPerHour: config.maxDeleteBatchesPerHour,
     pollutantCodes,
+    workerBudget: config.workerBudget,
+    budgetStage: deleteStage,
+    assertOriginalLock: () => config.originalOperation.assertHeld("publication"),
   });
   for (const transactionResult of transactionResults) {
     logStructured(
@@ -2084,6 +2125,8 @@ async function deleteBucketsWithConnectorSourceIdentity(
 }
 
 async function runPruneSingleWindow(config, window, runContext = {}) {
+  const work = { budget: config.workerBudget,
+    stage: runContext.budget_stage ?? (runContext.repair_only ? "phase_a_recent" : "normal_prune") };
   const runId = randomUUID();
   const ingestClient = createClient(config.supabaseUrl, config.ingestSecretKey, {
     auth: { persistSession: false, autoRefreshToken: false },
@@ -2123,7 +2166,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
   });
 
   let { ingestBuckets, observsBuckets } = await fetchPruneFingerprintWindow(
-    ingestClient, observsClient, windowStart, windowEnd, deleteEligiblePollutantCodes,
+    ingestClient, observsClient, windowStart, windowEnd, deleteEligiblePollutantCodes, undefined, work,
   );
 
   let duplicateConnectorDaysSkipped = [];
@@ -2141,6 +2184,8 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
         observsClient,
         claimed.claimedBuckets,
         deleteEligiblePollutantCodes,
+        undefined,
+        work,
       );
       ingestBuckets = completeInitialState.finalIngestBuckets;
       observsBuckets = completeInitialState.finalObservsBuckets;
@@ -2253,12 +2298,14 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
             ingestClient,
             observsClient,
             repairCandidate,
+            work,
           );
           const recheck = await recheckSingleBucket(
             ingestClient,
             observsClient,
             repairCandidate,
             deleteEligiblePollutantCodes,
+            work,
           );
           const [repairOutcome] = attachRepairPostRecheckOutcomes(
             [replayResult],
@@ -2277,6 +2324,8 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
             ...repairPilot,
           });
         } catch (error) {
+          if (error instanceof PruneWorkBudgetDeferred) throw error;
+          work.budget?.recordFailure(error);
           const message = error instanceof Error ? error.message : String(error);
           repairPilot = {
             attempted: true,
@@ -2329,6 +2378,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
           ingestClient,
           observsClient,
           mismatch,
+          work,
         );
         repairReplayResults.push(replayResult);
         logStructured(
@@ -2350,6 +2400,8 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
           },
         );
       } catch (error) {
+        if (error instanceof PruneWorkBudgetDeferred) throw error;
+        work.budget?.recordFailure(error);
         const message = error instanceof Error ? error.message : String(error);
         const errorPayload = {
           connector_id: mismatch.connector_id,
@@ -2378,6 +2430,7 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
       observsClient,
       repairableWithinObsAqidbWriteWindow(mismatches, ingestBuckets),
       deleteEligiblePollutantCodes,
+      work,
     );
     repairedNowDeletableBuckets = recheckResult.nowDeletableBuckets;
     mismatchesAfterRepair = recheckResult.stillMismatched;
@@ -2387,6 +2440,8 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
       observsClient,
       ingestBuckets,
       deleteEligiblePollutantCodes,
+      undefined,
+      work,
     );
     finalCurrentBuckets = finalRecheck.finalIngestBuckets;
     finalEligibleBuckets = finalRecheck.deletableBuckets;
@@ -2529,6 +2584,8 @@ async function runPruneSingleWindow(config, window, runContext = {}) {
 
   const runSummary = {
     ...summaryBase,
+    ...(work.budget ? { deletion_attempted: finalDeletion.transactionResults.length > 0,
+      ...(work.budget.report().deferred ? { status: "deferred_budget", budget_deferred: work.budget.report().deferred } : {}) } : {}),
     repairable_mismatch_bucket_count: repairableMismatches.length,
     repair_replay_attempt_count: repairOutcomeCounts.attempt_count,
     repair_replay_applied_count: repairOutcomeCounts.applied_count,
@@ -2651,13 +2708,18 @@ async function runPhaseARecent(config) {
 
   const batchSummaries = [];
   for (const batch of batches) {
-    const summary = await runPruneSingleWindow(config, batch, {
-      parent_run_id: parentRunId,
-      batch_index: batch.batch_index,
-      batch_count: batches.length,
-      repair_only: true,
-    });
-    batchSummaries.push(summary);
+    try {
+      const summary = await runPruneSingleWindow(config, batch, {
+        parent_run_id: parentRunId,
+        batch_index: batch.batch_index,
+        batch_count: batches.length,
+        repair_only: true,
+      });
+      batchSummaries.push(summary);
+    } catch (error) {
+      if (!(error instanceof PruneWorkBudgetDeferred)) throw error;
+      break;
+    }
   }
 
   const aggregateSummary = aggregatePhaseARecentSummary(
@@ -2667,6 +2729,10 @@ async function runPhaseARecent(config) {
     parentRunId,
     config.phaseARecentDays,
   );
+  if (config.workerBudget?.report().deferred) {
+    aggregateSummary.status = "deferred_budget";
+    aggregateSummary.budget_deferred = config.workerBudget.report().deferred;
+  }
   logStructured("INFO", "ingestdb_phase_a_recent_check_summary", aggregateSummary);
   return aggregateSummary;
 }
@@ -2687,6 +2753,7 @@ async function runLateArrivalDirectDeleteDay(
     dayWindow.window_end,
     "ingest",
     deleteEligiblePollutantCodes,
+    { budget: config.workerBudget, stage: "late_arrival_discovery" },
   );
   const claimed = claimConnectorDaysForParentRun(
     discoveredIngestBuckets,
@@ -2798,6 +2865,8 @@ async function runLateArrivalDirectDeleteDay(
     ...batchSummaryMeta,
     mode: config.dryRun ? "dry-run" : "delete",
     phase: "late_arrival_direct_delete",
+    ...(config.workerBudget?.report().deferred
+      ? { status: "deferred_budget", budget_deferred: config.workerBudget.report().deferred } : {}),
     day_utc: dayWindow.day_utc,
     window_start: dayWindow.window_start,
     window_end: dayWindow.window_end,
@@ -2866,6 +2935,7 @@ export async function runLateArrivalCleanup(config, overallWindow, runContext = 
   let progress;
   let result;
   try {
+    requirePruneWork(config.workerBudget, "late_arrival_open_progress", PROGRESS_OPEN_ALLOWANCE_MS);
     progress = await (adapters.openProgress || openLateArrivalProgress)({
       databaseUrl: config.phaseB?.supabase_db_url, dryRun: config.dryRun,
     });
@@ -2873,6 +2943,7 @@ export async function runLateArrivalCleanup(config, overallWindow, runContext = 
       cutoff: toIso(overallWindow.window_start, "late_arrival.window_start"),
       dryRun: config.dryRun, progress, runId,
       reader: adapters.reader || createLateArrivalReader(ingestClient),
+      workerBudget: config.workerBudget,
       classifyDay: (dayUtc) => dayUtc < obsAqidbCutoffDayUtc ? "direct_delete" : "repair",
       processDay: async (dayUtc, route, index) => {
         const dayWindow = buildUtcDayWindow(dayUtc);
@@ -2883,13 +2954,17 @@ export async function runLateArrivalCleanup(config, overallWindow, runContext = 
         }
         return (adapters.pruneSingleWindow || runPruneSingleWindow)(config, dayWindow, {
           parent_run_id: runId, batch_index: index,
+          budget_stage: "late_arrival_reconciliation",
           processed_connector_days: processedConnectorDays,
         });
       },
     });
   } catch (error) {
-    result = { report: { enabled: true, run_id: runId, status: "failed", attention_required: true,
-      error_count: 1, error: String(error.message || error).slice(0, 1000), stop_reason: "progress_failure" }, batchSummaries: [] };
+    const report = error instanceof PruneWorkBudgetDeferred
+      ? { status: "deferred_budget", stop_reason: "worker_cutoff" }
+      : { status: "failed", attention_required: true, error_count: 1,
+        error: String(error.message || error).slice(0, 1000), stop_reason: "progress_failure" };
+    result = { report: { enabled: true, run_id: runId, ...report }, batchSummaries: [] };
   } finally {
     if (progress) {
       try { await progress.close(); } catch (error) {
@@ -2943,18 +3018,31 @@ async function runPrune(config, adapters = {}) {
   const runPhaseBBackupAdapter = adapters.runPhaseBBackup || runPhaseBBackup;
   const runPruneSingleWindowAdapter = adapters.runPruneSingleWindow || runPruneSingleWindow;
   const runLateArrivalCleanupAdapter = adapters.runLateArrivalCleanup || runLateArrivalCleanup;
-
-  const phaseARecentSummary = await runPhaseARecentAdapter(config);
+  const workerBudget = adapters.workerBudget;
+  if (workerBudget) config = { ...config, workerBudget, originalOperation: adapters.originalOperation };
+  const canStartPhaseA = !workerBudget || !config.phaseAEnabled
+    || workerBudget.admit("phase_a_recent", FINGERPRINT_ALLOWANCE_MS);
+  const phaseARecentSummary = canStartPhaseA ? await runPhaseARecentAdapter(config)
+    : { enabled: true, skipped: true, status: "deferred_budget", budget_deferred: workerBudget.report().deferred };
 
   const phaseBRunId = resolvePrunePhaseBRunId();
-  const phaseBHistorySummary = await runPhaseBBackupAdapter({
+  const phaseBHistorySummary = phaseARecentSummary.status === "deferred_budget"
+    ? { enabled: Boolean(config.phaseB?.enabled), status: "stopped_budget", stopped_for_budget: true,
+      budget_stop: { operation: "before_phase_b", worker_stage: workerBudget.report().deferred.stage } }
+    : await runPhaseBBackupAdapter({
     dryRun: config.dryRun,
     phaseB: config.phaseB,
     ingestRetentionDays: config.ingestDbRetentionDays,
     logStructured,
     runId: phaseBRunId,
+    ...(workerBudget ? { workerBudget } : {}),
     ...(adapters.originalOperation ? { originalOperation: adapters.originalOperation } : {}),
   });
+  if (phaseARecentSummary.status === "deferred_budget" && workerBudget?.failure()) {
+    const error = workerBudget.failure();
+    error.prune_summary = { phase_a_recent: phaseARecentSummary, phase_b_history: phaseBHistorySummary, deletion_attempted: false };
+    throw error;
+  }
   // Budget exhaustion never erases failures recorded earlier in Phase B.
   const phaseBFailed = Number(phaseBHistorySummary?.failed_candidates || 0) > 0
     || (phaseBHistorySummary?.failures?.length || 0) > 0
@@ -2981,7 +3069,7 @@ async function runPrune(config, adapters = {}) {
     logStructured("ERROR", "ingestdb_prune_stopped_after_phase_b_failure", error.prune_summary);
     throw error;
   }
-  if (phaseBHistorySummary?.enabled === true && phaseBHistorySummary?.status === "stopped_budget") {
+  if (phaseBHistorySummary?.status === "stopped_budget") {
     const overallWindow = buildWindow(
       config.maxHoursPerRun,
       config.ingestDbRetentionDays,
@@ -2994,6 +3082,7 @@ async function runPrune(config, adapters = {}) {
     });
     const summary = {
       mode: config.dryRun ? "dry-run" : "delete",
+      status: "stopped_budget",
       window_start: overallWindow.window_start,
       window_end: overallWindow.window_end,
       skipped: true,
@@ -3032,10 +3121,26 @@ async function runPrune(config, adapters = {}) {
     DEFAULT_MAX_HOURS_PER_BATCH,
   );
   const processedConnectorDays = new Set();
+  const manifestDeferred = phaseBHistorySummary?.run_manifest?.status === "deferred_budget";
+  const budgetDeferredSummary = () => ({
+    status: "deferred_budget", skipped: true, reason: "worker_cutoff",
+    budget_deferred: workerBudget?.report().deferred,
+  });
+  async function runNormalBatch(batch, context) {
+    if (workerBudget && !workerBudget.admit("normal_prune", FINGERPRINT_ALLOWANCE_MS)) {
+      return budgetDeferredSummary();
+    }
+    try {
+      return await runPruneSingleWindowAdapter(config, batch, context);
+    } catch (error) {
+      if (!(error instanceof PruneWorkBudgetDeferred)) throw error;
+      return budgetDeferredSummary();
+    }
+  }
 
   let pruneWindowSummary;
   if (batches.length <= 1) {
-    pruneWindowSummary = await runPruneSingleWindowAdapter(config, batches[0] ?? overallWindow, {
+    pruneWindowSummary = await runNormalBatch(batches[0] ?? overallWindow, {
       processed_connector_days: processedConnectorDays,
     });
   } else {
@@ -3056,13 +3161,14 @@ async function runPrune(config, adapters = {}) {
 
     const batchSummaries = [];
     for (const batch of batches) {
-      const summary = await runPruneSingleWindowAdapter(config, batch, {
+      const summary = await runNormalBatch(batch, {
         parent_run_id: parentRunId,
         batch_index: batch.batch_index,
         batch_count: batches.length,
         processed_connector_days: processedConnectorDays,
       });
       batchSummaries.push(summary);
+      if (summary.status === "deferred_budget") break;
     }
 
     pruneWindowSummary = aggregateBatchSummary(
@@ -3072,6 +3178,10 @@ async function runPrune(config, adapters = {}) {
       batchSummaries,
       parentRunId,
     );
+    if (batchSummaries.some((row) => row.status === "deferred_budget")) {
+      pruneWindowSummary.status = "deferred_budget";
+      pruneWindowSummary.budget_deferred = workerBudget?.report().deferred;
+    }
   }
 
   let lateArrivalSummary = {
@@ -3080,9 +3190,10 @@ async function runPrune(config, adapters = {}) {
     reason: "not_started",
   };
   try {
-    lateArrivalSummary = await runLateArrivalCleanupAdapter(config, overallWindow, {
-      processed_connector_days: processedConnectorDays,
-    });
+    lateArrivalSummary = pruneWindowSummary.status === "deferred_budget"
+      || (workerBudget && !workerBudget.admit("late_arrival_open_progress", PROGRESS_OPEN_ALLOWANCE_MS))
+      ? budgetDeferredSummary()
+      : await runLateArrivalCleanupAdapter(config, overallWindow, { processed_connector_days: processedConnectorDays });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     lateArrivalSummary = {
@@ -3118,7 +3229,26 @@ async function runPrune(config, adapters = {}) {
     phase_a_recent: phaseARecentSummary,
     phase_b_history: phaseBHistorySummary,
     late_arrival: lateArrivalSummary,
+    ...(workerBudget ? { deletion_attempted: workerBudget.report().deletion_attempted } : {}),
   };
+  if (manifestDeferred || pruneWindowSummary.status === "deferred_budget" || lateArrivalSummary.status === "deferred_budget") {
+    combinedSummary.status = "deferred_budget";
+    combinedSummary.budget_deferred = workerBudget?.report().deferred
+      ?? phaseBHistorySummary?.run_manifest;
+    combinedSummary.normal_prune = {
+      status: pruneWindowSummary.status ?? "completed",
+      deletion_attempted: Boolean(pruneWindowSummary.deletion_attempted
+        || pruneWindowSummary.connector_day_atomic_delete_committed_count
+        || pruneWindowSummary.connector_day_atomic_delete_rolled_back_count),
+    };
+    const operationError = workerBudget?.failure();
+    if (operationError || toSafeInt(pruneWindowSummary.delete_error_count) > 0) {
+      const error = operationError ?? new Error("Prune Daily recorded source-deletion errors before budget deferral");
+      combinedSummary.status = "failed";
+      error.prune_summary = combinedSummary;
+      throw error;
+    }
+  }
   if (Number(phaseBHistorySummary?.blocked_scope_count || 0) > 0) {
     combinedSummary.status = "partial_attention_required";
     combinedSummary.attention_required = true;

@@ -29,6 +29,7 @@ import {
   runPruneDailyJob,
   runPruneDailyJobWithGlobalLock,
 } from "../workers/uk_aq_prune_daily/job.mjs";
+import { createWorkerBudget } from "../workers/uk_aq_prune_daily/worker_budget.mjs";
 import {
   OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV,
   observationsGlobalOperationLockIdentity,
@@ -2349,4 +2350,86 @@ test("Prune Daily locked child executes the preserved job path without reacquiri
   assert.deepEqual(result, { ok: true });
   assert.equal(jobCalls, 1);
   assert.equal(lockCalls, 0);
+});
+
+test("supervised Prune rejects missing, invalid and future timing before invoking the lock or job", async () => {
+  const env = { GITHUB_ACTIONS: "true", GITHUB_WORKFLOW: "UK AQ Prune Daily" };
+  for (const argv of [[], ["--actions-worker-origin", "garbage"], ["--actions-worker-origin", "9999999999.00"]]) {
+    await assert.rejects(runPruneDailyJobWithGlobalLock({
+      env, argv,
+      runLockedCommand: () => assert.fail("invalid timing must precede lock acquisition"),
+      runJob: () => assert.fail("invalid timing must precede job execution"),
+    }), { code: "UK_AQ_PRUNE_WORKER_TIMING_AUTHORITY_INVALID" });
+  }
+});
+
+test("late successful Phase B defers the unfunded run manifest and leaves downstream adapters idle", async (t) => {
+  t.mock.method(globalThis, "fetch", () => assert.fail("unfunded manifest must not use R2"));
+  let clock = 1_000_000;
+  const workerBudget = createWorkerBudget(clock, () => clock);
+  const phaseB = phaseBConfig();
+  phaseB.max_seconds_per_run = 10_740;
+  const phaseBSummary = await runPhaseBBackup({
+    dryRun: false, phaseB, workerBudget, logStructured: () => {},
+    createPgClient: () => ({
+      connect: async () => {},
+      query: async () => ({ rows: [] }),
+      end: async () => { clock = workerBudget.deadlineMs - 20_000; },
+    }),
+  });
+  assert.equal(phaseBSummary.status, "completed");
+  assert.equal(phaseBSummary.run_manifest.status, "deferred_budget");
+  assert.equal(phaseBSummary.run_manifest_key, null);
+  const published = { ...phaseBSummary, completed_candidates: 1 };
+  const summary = await runPruneForTest({ dryRun: false, maxHoursPerRun: 24, ingestDbRetentionDays: 5, phaseB }, {
+    workerBudget,
+    runPhaseARecent: async () => ({ skipped: true }),
+    runPhaseBBackup: async () => published,
+    runPruneSingleWindow: () => assert.fail("unfunded deletion cannot start"),
+    runLateArrivalCleanup: () => assert.fail("unfunded late-arrival work cannot start"),
+  });
+  assert.equal(summary.status, "deferred_budget");
+  assert.equal(summary.deletion_attempted, false);
+  assert.equal(summary.phase_b_history, published);
+  assert.equal(summary.phase_b_history.completed_candidates, 1);
+  assert.equal(summary.late_arrival.status, "deferred_budget");
+});
+
+test("the supervised job saves the local report before optional bounded terminal health", async () => {
+  const identity = observationsGlobalOperationLockIdentity();
+  const env = {
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.held]: "true",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.owner]: "prune_daily",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.runId]: "original-test-run",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.logicalIdentity]: identity.logical_identity,
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.classId]: String(identity.class_id),
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.objectId]: String(identity.object_id),
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.nonce]: "test-nonce",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.acquired]: "true",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.waitMs]: "0",
+    [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.outcome]: "held",
+  };
+  const calls = [];
+  const workerBudget = createWorkerBudget(100, () => 200);
+  const result = await runPruneDailyJob({
+    env, workerBudget,
+    createOriginalOperationAdapter: () => ({
+      assertHeld: async () => { calls.push("lock"); }, close() { calls.push("close"); },
+    }),
+    createHealthClientAdapter: ({ requestTimeoutMs }) => {
+      assert.equal(requestTimeoutMs, 10_000);
+      return {
+        dailyTaskStarted: async () => { calls.push("start"); return "health-id"; },
+        dailyTaskFinished: async () => { calls.push("finish"); throw new Error("reporting unavailable"); },
+      };
+    },
+    buildRunConfigAdapter: () => ({}),
+    executePruneDailyAdapter: (_, { withDailyTaskRun }) => withDailyTaskRun({
+      buildFinishedSummary: (summary) => summary,
+    }, async () => ({ status: "deferred_budget" })),
+    writeReportAdapter: async () => { calls.push("local"); },
+    setExitCode: () => assert.fail("optional reporting must preserve the saved outcome"),
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, ["lock", "start", "local", "finish", "close"]);
 });
