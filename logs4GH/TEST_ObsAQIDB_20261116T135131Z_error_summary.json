@@ -1,9 +1,0 @@
-{
-  "result": [
-    {
-      "event_class": "postgrest_warp_timeout",
-      "events": 87,
-      "source": "postgrest_logs"
-    }
-  ]
-}

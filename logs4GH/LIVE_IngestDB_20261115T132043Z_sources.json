@@ -1,1 +1,0 @@
-{"result":[{"estimated_mb":259.35,"events":138983,"source":"edge_logs"},{"estimated_mb":2.74,"events":3044,"source":"supavisor_logs"},{"estimated_mb":0.44,"events":1304,"source":"postgrest_logs"},{"estimated_mb":0.4,"events":594,"source":"postgres_logs"},{"estimated_mb":0.05,"events":21,"source":"function_edge_logs"},{"estimated_mb":0.05,"events":75,"source":"function_logs"}]}
