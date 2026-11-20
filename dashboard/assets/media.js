@@ -2457,7 +2457,7 @@
     state.root = container;
     state.apiBase = String(options.apiBaseUrl || "/api").replace(/\/+$/, "");
     if (!container.querySelector(".media-dashboard")) {
-      container.innerHTML = `<div class="media-dashboard"><section class="media-header"><h2>Media</h2><p>Editorial administration for authoritative UK AQ Media D1.</p><nav class="media-mini-nav" role="tablist" aria-label="Media sections">${TABS.map(tab => `<button type="button" data-media-tab="${tab}" role="tab" aria-selected="${tab === state.tab}" class="${tab === state.tab ? "is-active" : ""}">${TAB_LABELS[tab]}</button>`).join("")}</nav></section><div data-media-health aria-live="polite"></div><div data-media-view></div></div>`;
+      container.innerHTML = `<div class="media-dashboard"><section class="media-header"><h2>Media</h2><p>Editorial administration for authoritative UK AQ Media D1.</p><p>Daily and Immediate emails only include articles published within 7 days of approval.</p><nav class="media-mini-nav" role="tablist" aria-label="Media sections">${TABS.map(tab => `<button type="button" data-media-tab="${tab}" role="tab" aria-selected="${tab === state.tab}" class="${tab === state.tab ? "is-active" : ""}">${TAB_LABELS[tab]}</button>`).join("")}</nav></section><div data-media-health aria-live="polite"></div><div data-media-view></div></div>`;
       container.querySelectorAll("[data-media-tab]").forEach(button => button.addEventListener("click", () => setTab(button.dataset.mediaTab)));
     }
     setTab(state.tab);
