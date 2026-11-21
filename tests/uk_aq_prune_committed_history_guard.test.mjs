@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from "node:test";
+import { gunzipSync } from 'node:zlib';
 import { admitPruneFrozenConnectorSnapshot, PruneCommittedHistoryGuardError } from "../workers/uk_aq_prune_daily/committed_history_guard.mjs";
 import { writeFrozenCandidateObservationsToV2ForTest, createPhaseBRunBudgetForTest } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
 import { computeObservationContentHash } from "../workers/shared/uk_aq_observation_content_hash.mjs";
@@ -191,12 +192,39 @@ test("first publication ignores unreferenced connector objects and can reach wri
 
 // Small metadata-only fixture for the existing real admission and bounded GET
 // seams. No signer, Parquet, database or network is involved.
+function freezeSource(t, rows) {
+  const tempDir = mkdtempSync(join(tmpdir(), 'prune-frozen-source-'));
+  t.after(() => rmSync(tempDir, { recursive: true, force: true }));
+  const ndjsonPath = join(tempDir, 'source.ndjson');
+  const source = Buffer.from(rows.map(row => `${JSON.stringify(row)}\n`).join(''));
+  writeFileSync(ndjsonPath, source);
+  return { temp: { ndjsonPath }, counts: {
+    frozen_source_row_count: rows.length, frozen_source_bytes: source.length,
+  }, sourceIdentity: computePruneConnectorSourceIdentity(rows) };
+}
+
+function acknowledgePendingSource({ prepared, runId, dayUtc, connectorId }) {
+  const source = { bucket: BUCKET,
+    key: `managed/jsongen/v1/pending/unverified/prune_daily_v3/connector_id=${connectorId}/day_utc=${dayUtc}`
+      + `/invocation=${runId}/compressed_sha256=${prepared.compressed_sha256}/uncompressed_sha256=${prepared.uncompressed_sha256}.ndjson.gz`,
+    sha256: prepared.compressed_sha256, byte_size: prepared.compressed_byte_size,
+    json_sha256: prepared.uncompressed_sha256, json_byte_size: prepared.uncompressed_byte_size };
+  const intentId = 'b'.repeat(64);
+  const state = 'put_acknowledged_unverified';
+  const pendingEvidence = { ...prepared.evidence, signed_upload: { intent_id: intentId, object: source,
+    disposition: state } };
+  return { state, source, intent_id: intentId, pending_evidence: pendingEvidence,
+    source_evidence_sha256: sha256Hex(canonicalJson(prepared.evidence)),
+    preparation_sha256: sha256Hex(canonicalJson(pendingEvidence)) };
+}
+
 async function originalAuthorityPublication(t, bindingFailure = null, scopeCount = 1) {
   const prior = history([{ ...row('pm25', 801), connector_id: 8 }], 8);
   const objects = prior.objects;
   const frozenRows = Array.from({ length: scopeCount }, (_, i) => ({ ...row('pm25', 102 + i), connector_id: 1 }));
   const frozenRow = frozenRows[0];
-  const sourceIdentity = computePruneConnectorSourceIdentity(frozenRows);
+  const frozen = freezeSource(t, frozenRows);
+  const { sourceIdentity } = frozen;
   const scopes = frozenRows.map(r => ({ timeseries_id: r.timeseries_id, station_id: r.station_id, pollutant_code: r.pollutant_code, day_utc: dayUtc, row_count: 1 }));
   const bindingPrefix = 'history/_index_v3/timeseries_binding';
   const bindingKey = `${bindingPrefix}/timeseries_id=102.json`;
@@ -230,11 +258,6 @@ async function originalAuthorityPublication(t, bindingFailure = null, scopeCount
   let inFlight = 0; let maxInFlight = 0;
   const beforeBytes = (await getObjectFrom(objects)({ key: prior.rootKey })).body;
   const runId = 'ca2a2ad8-c46c-4d65-9ee0-7147f03684eb';
-  const tempDir = mkdtempSync(join(tmpdir(), 'prune-original-authority-'));
-  t.after(() => rmSync(tempDir, { recursive: true, force: true }));
-  const ndjsonPath = join(tempDir, 'source.ndjson');
-  const sourceBytes = Buffer.from(frozenRows.map(r => `${JSON.stringify(r)}\n`).join(''));
-  writeFileSync(ndjsonPath, sourceBytes);
   const result = await writeFrozenCandidateObservationsToV2ForTest({
     candidate: { day_utc: dayUtc, connector_id: 1, expected_row_count: BigInt(scopeCount) },
     runtime: { run_id: runId, environment: 'TEST', writer_git_sha: 'a'.repeat(40),
@@ -250,27 +273,14 @@ async function originalAuthorityPublication(t, bindingFailure = null, scopeCount
           return { ...object, bytes: object.body.length };
         } finally { inFlight--; }
       } } } },
-    streamClient: {}, frozen: { temp: { ndjsonPath }, counts: {
-      frozen_source_row_count: frozenRows.length, frozen_source_bytes: sourceBytes.length,
-    }, sourceIdentity },
+    streamClient: {}, frozen,
     originalAuthorityLockEnv: originalLockEnv(runId),
     admitSnapshot: args => admitPruneFrozenConnectorSnapshot({ ...args,
       ...(bindingFailure === 'before' ? { onOriginalAuthority: undefined } : {}) }),
     readAdmissionObject: async args => { calls.push(args.key); return getObjectFrom(objects)(args); },
-    uploadPendingSource: async ({ prepared }) => {
+    uploadPendingSource: async args => {
       calls.push('upload');
-      const source = { bucket: BUCKET,
-        key: `managed/jsongen/v1/pending/unverified/prune_daily_v3/connector_id=1/day_utc=${dayUtc}`
-          + `/invocation=${runId}/compressed_sha256=${prepared.compressed_sha256}/uncompressed_sha256=${prepared.uncompressed_sha256}.ndjson.gz`,
-        sha256: prepared.compressed_sha256, byte_size: prepared.compressed_byte_size,
-        json_sha256: prepared.uncompressed_sha256, json_byte_size: prepared.uncompressed_byte_size };
-      const intentId = 'b'.repeat(64);
-      const state = 'put_acknowledged_unverified';
-      const pendingEvidence = { ...prepared.evidence, signed_upload: { intent_id: intentId, object: source,
-        disposition: state } };
-      return { state, source, intent_id: intentId, pending_evidence: pendingEvidence,
-        source_evidence_sha256: sha256Hex(canonicalJson(prepared.evidence)),
-        preparation_sha256: sha256Hex(canonicalJson(pendingEvidence)) };
+      return acknowledgePendingSource(args);
     },
     connectorPublisher: async () => { calls.push('publish'); objects.set(prior.rootKey, Buffer.from('{"new":"root"}'));
       return { file_count: 1, total_bytes: 100n }; }, cleanupFrozenSource: () => {},
@@ -452,88 +462,185 @@ test('original capture capacity protects final bytes and requires the same valid
   capture.recordBeforeObject({ key, body: old });
   manager.recordPublishedObject({ key, body: final });
   assert.deepEqual(Buffer.from(capture.snapshot().objects[0].bytes_base64, 'base64'), old);
+
+  const mib = 1024 ** 2;
+  const perObjectLimit = 8 * mib;
+  const optionalLimit = 16 * mib;
+  const aggregateLimit = 32 * mib;
+  // Use views of one valid JSON body to exercise the byte limits.
+  const oversized = Buffer.alloc(perObjectLimit + 1, ' ');
+  oversized[0] = 0x30;
+  const maxBody = oversized.subarray(0, perObjectLimit);
+  const overLegacyLimit = oversized.subarray(0, mib + 1);
+  manager.recordPublishedObject({ key, body: overLegacyLimit });
+  assert.equal(manager.body(key)?.length, overLegacyLimit.length);
+  assert.equal(sha256Hex(manager.body(key)), sha256Hex(overLegacyLimit));
+
   const accounting = manager.statistics();
-  manager.recordPublishedObject({ key, body: Buffer.alloc(1024 ** 2 + 1) });
-  assert.equal(manager.body(key), null); assert.deepEqual(manager.statistics(), accounting);
+  manager.recordPublishedObject({ key, body: oversized });
+  assert.equal(manager.body(key)?.length ?? null, null);
+  assert.equal(manager.inspectFinalObject(key, overLegacyLimit.length, sha256Hex(overLegacyLimit)).reason,
+    'capture_resource_limit_exhaustion');
+  assert.deepEqual(manager.statistics(), { ...accounting, final_capture_failure_counts: { per_object_limit: 1 } });
+  assert.deepEqual(Buffer.from(capture.snapshot().objects[0].bytes_base64, 'base64'), old);
   manager.recordPublishedObject({ key, body: final });
-  const mib = Buffer.from('"' + 'x'.repeat(1024 ** 2 - 2) + '"');
-  for (let i = 0; i < 5; i++) capture.recordBeforeObject({ key: `${prefix}/original-${i}.json`, body: mib });
-  assert.ok(manager.statistics().optional_bytes <= 4 * 1024 ** 2);
-  for (let i = 0; i < 7; i++) manager.recordPublishedObject({ key: `${prefix}/final-${i}.json`, body: mib });
-  assert.deepEqual(manager.statistics(), { retained_bytes: 7 * 1024 ** 2 + final.length, retained_objects: 8,
-    optional_bytes: 0, optional_objects: 0 });
-  assert.equal(capture.snapshot().completeness, 'oversized');
-  assert.equal(capture.snapshot().binding.reason, 'final_metadata_capacity_priority_limit');
-  assert.deepEqual(manager.body(key), final);
+
+  capture.recordBeforeObject({ key: `${prefix}/original-full.json`, body: maxBody });
+  capture.recordBeforeObject({ key: `${prefix}/original-remainder.json`, body: maxBody.subarray(0, perObjectLimit - old.length) });
+  const fullOptional = manager.statistics();
+  assert.deepEqual(fullOptional, { retained_bytes: optionalLimit + final.length, retained_objects: 4,
+    optional_bytes: optionalLimit, optional_objects: 3, final_capture_failure_counts: {} });
+  const extraCapture = manager.beginOriginalAuthority(identity, originalLockEnv(f.runId));
+  extraCapture.recordBeforeObject({ key: `${prefix}/original-overflow.json`, body: old });
+  assert.deepEqual(manager.statistics(), fullOptional);
+  assert.equal(extraCapture.diagnostics().before_membership_reason, 'original_metadata_capture_limit');
+
+  const maxKey = `${prefix}/final-full.json`;
+  const remainderKey = `${prefix}/final-remainder.json`;
+  const remainder = maxBody.subarray(0, perObjectLimit - final.length);
+  manager.recordPublishedObject({ key: maxKey, body: maxBody });
+  manager.recordPublishedObject({ key: remainderKey, body: remainder });
+  assert.deepEqual(manager.statistics(), { retained_bytes: aggregateLimit, retained_objects: 6,
+    optional_bytes: optionalLimit, optional_objects: 3, final_capture_failure_counts: {} });
+
+  const priorityKey = `${prefix}/final-priority.json`;
+  manager.recordPublishedObject({ key: priorityKey, body: final });
+  assert.deepEqual(manager.statistics(), { retained_bytes: optionalLimit + final.length, retained_objects: 4,
+    optional_bytes: 0, optional_objects: 0, final_capture_failure_counts: {} });
+  const revoked = capture.snapshot();
+  assert.equal(revoked.completeness, 'oversized');
+  assert.equal(revoked.binding.reason, 'final_metadata_capacity_priority_limit');
+  assert.equal(revoked.objects.length, 0);
+  assert.equal(manager.body(key)?.length, final.length);
+  assert.equal(manager.body(key)?.toString(), final.toString());
+  assert.equal(manager.body(priorityKey)?.length, final.length);
+  assert.equal(manager.body(priorityKey)?.toString(), final.toString());
+  assert.equal(manager.body(maxKey)?.length, perObjectLimit);
+  assert.equal(sha256Hex(manager.body(maxKey)), sha256Hex(maxBody));
+  assert.equal(manager.body(remainderKey)?.length, remainder.length);
+  assert.equal(sha256Hex(manager.body(remainderKey)), sha256Hex(remainder));
+
+  manager.recordPublishedObject({ key: `${prefix}/more-final-full.json`, body: maxBody });
+  manager.recordPublishedObject({ key: `${prefix}/more-final-remainder.json`, body: remainder });
+  const fullFinal = manager.statistics();
+  assert.deepEqual(fullFinal, { retained_bytes: aggregateLimit, retained_objects: 6,
+    optional_bytes: 0, optional_objects: 0, final_capture_failure_counts: {} });
+  const overflowKey = `${prefix}/final-overflow.json`;
+  manager.recordPublishedObject({ key: overflowKey, body: final });
+  assert.equal(manager.body(overflowKey)?.length ?? null, null);
+  assert.deepEqual(manager.statistics(), { ...fullFinal, final_capture_failure_counts: { byte_limit: 1 } });
+
+  const countManager = createPruneOriginalMetadataCapture();
+  const countCapture = countManager.beginOriginalAuthority(identity, originalLockEnv(f.runId));
+  for (let i = 0; i < 4096; i++) countCapture.recordBeforeObject({ key: `${prefix}/optional-count-${i}.json`, body: old });
+  countCapture.recordBeforeObject({ key: `${prefix}/optional-count-overflow.json`, body: old });
+  assert.equal(countCapture.diagnostics().before_membership_reason, 'original_metadata_capture_limit');
+  assert.deepEqual(countManager.statistics(), { retained_bytes: 4096 * old.length, retained_objects: 4096,
+    optional_bytes: 4096 * old.length, optional_objects: 4096, final_capture_failure_counts: {} });
+  for (let i = 0; i < 8192; i++) countManager.recordPublishedObject({ key: `${prefix}/final-count-${i}.json`, body: final });
+  countManager.recordPublishedObject({ key: overflowKey, body: final });
+  assert.equal(countManager.body(overflowKey)?.length ?? null, null);
+  assert.deepEqual(countManager.statistics(), { retained_bytes: 8192 * final.length, retained_objects: 8192,
+    optional_bytes: 0, optional_objects: 0, final_capture_failure_counts: { object_count_limit: 1 } });
 });
 
-test("v3 signed source upload precedes publication and remains unverified", async () => {
+function pendingSourceFixture(t) {
+  const rows = [{ ...row("pm25", 102), connector_id: 1 }];
+  return {
+    candidate: { day_utc: dayUtc, connector_id: 1, expected_row_count: BigInt(rows.length) },
+    runId: "c771948f-9d20-4bd5-ac1d-6cef0a4f106a",
+    rows,
+    frozen: freezeSource(t, rows),
+  };
+}
+
+test("v3 signed source upload precedes publication and remains unverified", async t => {
   const calls = [];
-  const frozenRow = row("pm25", 102);
-  const sourceIdentity = computePruneConnectorSourceIdentity([frozenRow]);
+  const { candidate, runId, rows, frozen } = pendingSourceFixture(t);
+  let uploaded;
   const result = await writeFrozenCandidateObservationsToV2ForTest({
-    candidate: { day_utc: dayUtc, connector_id: connectorId, expected_row_count: 1n },
+    candidate,
     runtime: {
       run_budget: createPhaseBRunBudgetForTest({ nowMs: () => 0, startedAtMs: 0, maxSecondsPerRun: 1740, stopBeforeTimeoutSeconds: 60 }),
       history_write_version: "v3", committed_prefix: prefix, r2: {}, environment: "TEST", writer_git_sha: "a".repeat(40),
-      run_id: "c771948f-9d20-4bd5-ac1d-6cef0a4f106a",
+      run_id: runId,
       jsongen_pending_source: { enabled: true, signer: { endpoint: "https://signer.test.example/v1/upload-intents" } },
     },
-    streamClient: {}, frozen: { temp: { ndjsonPath: "unused" }, counts: {}, sourceIdentity },
-    readFrozenRows: async function* () { yield frozenRow; },
+    streamClient: {}, frozen,
     admitSnapshot: async () => ({ admission: "first_publication" }),
-    uploadPendingSource: async () => { calls.push("upload"); return { state: "put_acknowledged_unverified", intent_id: "a".repeat(64), source: { key: "private/pending" } }; },
+    uploadPendingSource: async args => {
+      calls.push("upload");
+      uploaded = args.prepared;
+      return acknowledgePendingSource(args);
+    },
     connectorPublisher: async () => { calls.push("publish"); return { file_count: 1, total_bytes: 100n }; },
     cleanupFrozenSource: () => { calls.push("cleanup"); },
   });
   assert.deepEqual(calls, ["upload", "publish"]);
-  assert.equal(result.jsongen_pending_source.state, "put_acknowledged_unverified");
+  assert.equal(result.file_count, 1);
+  assert.equal(gunzipSync(uploaded.body).toString(), `${JSON.stringify(rows[0])}\n`);
+  const pending = result.jsongen_pending_source;
+  assert.equal(pending.state, "put_acknowledged_unverified");
+  assert.equal(pending.pending_evidence.signed_upload.disposition, "put_acknowledged_unverified");
+  assert.equal(pending.pending_evidence.connector_id, candidate.connector_id);
+  assert.equal(pending.pending_evidence.day_utc, candidate.day_utc);
+  assert.equal(pending.pending_evidence.original_ndjson.row_count, frozen.counts.frozen_source_row_count);
+  assert.equal(pending.pending_evidence.original_ndjson.byte_size, frozen.counts.frozen_source_bytes);
+  assert.deepEqual(pending.pending_evidence.source_identity, frozen.sourceIdentity);
+  assert.equal(pending.pending_evidence.final_publication.state, "outstanding");
 });
 
-test("v3 pending source failure cannot block canonical publication", async () => {
+test("v3 pending source failure cannot block canonical publication", async t => {
   const calls = [];
-  const frozenRow = row("pm25", 102);
+  const { candidate, runId, frozen } = pendingSourceFixture(t);
   const result = await writeFrozenCandidateObservationsToV2ForTest({
-    candidate: { day_utc: dayUtc, connector_id: connectorId, expected_row_count: 1n },
+    candidate,
     runtime: {
       run_budget: createPhaseBRunBudgetForTest({ nowMs: () => 0, startedAtMs: 0, maxSecondsPerRun: 1740, stopBeforeTimeoutSeconds: 60 }),
       history_write_version: "v3", committed_prefix: prefix, r2: {}, environment: "TEST", writer_git_sha: "a".repeat(40),
+      run_id: runId,
       jsongen_pending_source: { enabled: true, signer: {} }, logStructured: () => {},
     },
-    streamClient: {}, frozen: { temp: { ndjsonPath: "unused" }, counts: {}, sourceIdentity: {} },
-    readFrozenRows: async function* () { yield frozenRow; },
+    streamClient: {}, frozen,
     admitSnapshot: async () => ({ admission: "first_publication" }),
     uploadPendingSource: async () => { calls.push("upload"); throw new Error("derived unavailable"); },
     connectorPublisher: async () => { calls.push("publish"); return { file_count: 1, total_bytes: 100n }; },
     cleanupFrozenSource: () => { calls.push("cleanup"); },
   });
   assert.deepEqual(calls, ["upload", "publish"]);
+  assert.equal(result.file_count, 1);
   assert.equal(result.jsongen_pending_source.state, "no_intent");
+  assert.equal(result.jsongen_pending_source.failure_code, "handover_failed");
   assert.equal(result.jsongen_pending_source.intent_id, null);
   assert.equal(result.jsongen_pending_source.source, null);
 });
 
-test("insufficient optional headroom skips signer while canonical connector publication continues", async () => {
+test("insufficient optional headroom skips signer while canonical connector publication continues", async t => {
   const calls = [];
-  const frozenRow = row("pm25", 102);
+  const { candidate, runId, frozen } = pendingSourceFixture(t);
   const result = await writeFrozenCandidateObservationsToV2ForTest({
-    candidate: { day_utc: dayUtc, connector_id: connectorId, expected_row_count: 1n },
+    candidate,
     runtime: {
       run_budget: createPhaseBRunBudgetForTest({ nowMs: () => 0, startedAtMs: 0,
         maxSecondsPerRun: 600, stopBeforeTimeoutSeconds: 60 }),
       history_write_version: "v3", committed_prefix: prefix, r2: {}, environment: "TEST",
       writer_git_sha: "a".repeat(40),
+      run_id: runId,
       jsongen_pending_source: { enabled: true, signer: {} },
     },
-    streamClient: {}, frozen: { temp: { ndjsonPath: "unused" }, counts: {}, sourceIdentity: {} },
-    readFrozenRows: async function* () { yield frozenRow; },
+    streamClient: {}, frozen,
     admitSnapshot: async () => ({ admission: "first_publication" }),
     uploadPendingSource: async () => { calls.push("signer"); },
     connectorPublisher: async () => { calls.push("publish"); return { file_count: 1, total_bytes: 100n }; },
     cleanupFrozenSource: () => { calls.push("cleanup"); },
   });
   assert.deepEqual(calls, ["publish"]);
-  assert.deepEqual(result.jsongen_pending_source, { state: "not_attempted" });
+  assert.equal(result.file_count, 1);
+  assert.deepEqual(result.jsongen_pending_source, {
+    state: "not_attempted",
+    failure_code: "insufficient_headroom",
+    transport: { handover_attempted: false, signer_intent_state: "not_attempted", put_state: "not_attempted" },
+  });
 });
 
 test("a prior committed 100-row connector blocks a one-row late snapshot before writer invocation", async () => {
