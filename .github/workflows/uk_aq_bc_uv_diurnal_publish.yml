@@ -92,7 +92,10 @@ jobs:
           from pathlib import Path
           result = json.loads((Path(os.environ["RUNNER_TEMP"]) / "bc_uv_publish_result.jsonl").read_text().splitlines()[-1])
           keys = ("mode", "rebuild_reason", "months_rebuilt", "months_reused", "canonical_days",
-                  "published", "result", "source_through_day")
+                  "published", "result", "source_through_day", "sensor_count", "station_months_rebuilt", "station_months_reused",
+                  "station_months_built_from_absence", "newly_eligible_stations", "retired_stations", "fallback_reasons",
+                  "canonical_day_reads", "canonical_observation_object_reads", "elapsed_ms",
+                  "source_state_sha256", "product_content_sha256")
           summary = {key: result[key] for key in keys}
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write("publication_summary=" + json.dumps(summary, separators=(",", ":")) + "\n")
