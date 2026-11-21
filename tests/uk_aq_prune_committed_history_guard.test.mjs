@@ -1,4 +1,8 @@
+import './jsongen_test_environment.mjs';
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from "node:test";
 import { admitPruneFrozenConnectorSnapshot, PruneCommittedHistoryGuardError } from "../workers/uk_aq_prune_daily/committed_history_guard.mjs";
 import { writeFrozenCandidateObservationsToV2ForTest, createPhaseBRunBudgetForTest } from "../workers/uk_aq_prune_daily/phase_b_history_r2.mjs";
@@ -13,10 +17,8 @@ import { OBSERVATION_HISTORY_SCHEMA_VERSION_V3, OBSERVATION_HISTORY_WRITER_VERSI
 import { OBSERVATION_HISTORY_PHYSICAL_LAYOUT_VERSION, OBSERVATION_HISTORY_ALIGNED_ROW_CAP, OBSERVATION_HISTORY_EXACT_LEAF_INDEX_VERSION } from "../workers/shared/uk_aq_observation_history_target_writer.mjs";
 import { sha256Hex } from "../workers/shared/r2_sigv4.mjs";
 import { canonicalJson, BUCKET } from '../scripts/jsongen/schema.mjs';
-import { gzipSync } from 'node:zlib';
 import { preparePruneOriginalAuthorityExtension, createPruneOriginalMetadataCapture,
   preparePruneOriginalMetadataSnapshot } from '../scripts/jsongen/prune-original-metadata.mjs';
-import { describePrunePendingSource } from '../scripts/jsongen/prune-evidence.mjs';
 import { preparePruneOriginalFinalEvidence } from '../scripts/jsongen/prune-final-evidence.mjs';
 import { describePruneGateOutboxEvidence } from '../scripts/jsongen/prune-outbox.mjs';
 import { decodePruneMetadataEvidence, compactPruneMetadataEvidence } from '../scripts/jsongen/prune-metadata-codec.mjs';
@@ -189,7 +191,7 @@ test("first publication ignores unreferenced connector objects and can reach wri
 
 // Small metadata-only fixture for the existing real admission and bounded GET
 // seams. No signer, Parquet, database or network is involved.
-async function originalAuthorityPublication(bindingFailure = null, scopeCount = 1) {
+async function originalAuthorityPublication(t, bindingFailure = null, scopeCount = 1) {
   const prior = history([{ ...row('pm25', 801), connector_id: 8 }], 8);
   const objects = prior.objects;
   const frozenRows = Array.from({ length: scopeCount }, (_, i) => ({ ...row('pm25', 102 + i), connector_id: 1 }));
@@ -220,7 +222,7 @@ async function originalAuthorityPublication(bindingFailure = null, scopeCount = 
     kind: TIMESERIES_BINDING_SOURCE_REFRESH_STATE_KIND, history_version: 'v2', source_prefix: bindingPrefix,
     source_root_hash: root.source_root_hash, source_fingerprint: source.source_fingerprint }));
   if (bindingFailure === 'missing') objects.delete(bindingRootKey);
-  if (bindingFailure === 'oversized') objects.set(bindingRootKey, Buffer.alloc(1024 ** 2 + 1));
+  if (bindingFailure === 'oversized') objects.set(bindingRootKey, Buffer.alloc(8 * 1024 ** 2 + 1));
   if (bindingFailure === 'core') objects.set(`${bindingPrefix}/_manifests/_refresh_state.json`, canonicalJson({ schema_version: 1,
     kind: TIMESERIES_BINDING_SOURCE_REFRESH_STATE_KIND, history_version: 'v2', source_prefix: bindingPrefix,
     source_root_hash: root.source_root_hash, source_fingerprint: '0'.repeat(64) }));
@@ -228,6 +230,11 @@ async function originalAuthorityPublication(bindingFailure = null, scopeCount = 
   let inFlight = 0; let maxInFlight = 0;
   const beforeBytes = (await getObjectFrom(objects)({ key: prior.rootKey })).body;
   const runId = 'ca2a2ad8-c46c-4d65-9ee0-7147f03684eb';
+  const tempDir = mkdtempSync(join(tmpdir(), 'prune-original-authority-'));
+  t.after(() => rmSync(tempDir, { recursive: true, force: true }));
+  const ndjsonPath = join(tempDir, 'source.ndjson');
+  const sourceBytes = Buffer.from(frozenRows.map(r => `${JSON.stringify(r)}\n`).join(''));
+  writeFileSync(ndjsonPath, sourceBytes);
   const result = await writeFrozenCandidateObservationsToV2ForTest({
     candidate: { day_utc: dayUtc, connector_id: 1, expected_row_count: BigInt(scopeCount) },
     runtime: { run_id: runId, environment: 'TEST', writer_git_sha: 'a'.repeat(40),
@@ -243,22 +250,36 @@ async function originalAuthorityPublication(bindingFailure = null, scopeCount = 
           return { ...object, bytes: object.body.length };
         } finally { inFlight--; }
       } } } },
-    streamClient: {}, frozen: { temp: { ndjsonPath: 'unused' }, counts: {}, sourceIdentity },
+    streamClient: {}, frozen: { temp: { ndjsonPath }, counts: {
+      frozen_source_row_count: frozenRows.length, frozen_source_bytes: sourceBytes.length,
+    }, sourceIdentity },
     originalAuthorityLockEnv: originalLockEnv(runId),
     admitSnapshot: args => admitPruneFrozenConnectorSnapshot({ ...args,
       ...(bindingFailure === 'before' ? { onOriginalAuthority: undefined } : {}) }),
     readAdmissionObject: async args => { calls.push(args.key); return getObjectFrom(objects)(args); },
-    readFrozenRows: async function* () { yield* frozenRows; },
-    uploadPendingSource: async () => { calls.push('upload'); return { state: 'put_acknowledged_unverified',
-      pending_evidence: { scope: { physical_timeseries_days: scopes } } }; },
+    uploadPendingSource: async ({ prepared }) => {
+      calls.push('upload');
+      const source = { bucket: BUCKET,
+        key: `managed/jsongen/v1/pending/unverified/prune_daily_v3/connector_id=1/day_utc=${dayUtc}`
+          + `/invocation=${runId}/compressed_sha256=${prepared.compressed_sha256}/uncompressed_sha256=${prepared.uncompressed_sha256}.ndjson.gz`,
+        sha256: prepared.compressed_sha256, byte_size: prepared.compressed_byte_size,
+        json_sha256: prepared.uncompressed_sha256, json_byte_size: prepared.uncompressed_byte_size };
+      const intentId = 'b'.repeat(64);
+      const state = 'put_acknowledged_unverified';
+      const pendingEvidence = { ...prepared.evidence, signed_upload: { intent_id: intentId, object: source,
+        disposition: state } };
+      return { state, source, intent_id: intentId, pending_evidence: pendingEvidence,
+        source_evidence_sha256: sha256Hex(canonicalJson(prepared.evidence)),
+        preparation_sha256: sha256Hex(canonicalJson(pendingEvidence)) };
+    },
     connectorPublisher: async () => { calls.push('publish'); objects.set(prior.rootKey, Buffer.from('{"new":"root"}'));
       return { file_count: 1, total_bytes: 100n }; }, cleanupFrozenSource: () => {},
   });
-  return { result, calls, beforeBytes, runId, scopes, sourceIdentity, frozenRow, frozenRows, bindingKey, bindingRootKey, rootKey: prior.rootKey, objects, maxInFlight };
+  return { result, calls, beforeBytes, runId, scopes, sourceIdentity, frozenRow, bindingKey, bindingRootKey, rootKey: prior.rootKey, objects, maxInFlight };
 }
 
-test('original authority captures admitted absence and selected-v3 Core closure before replacement', async () => {
-  const f = await originalAuthorityPublication();
+test('original authority captures admitted absence and selected-v3 Core closure before replacement', async t => {
+  const f = await originalAuthorityPublication(t);
   const original = f.result.jsongen_original_authority.snapshot();
   assert.equal(original.completeness, 'captured');
   assert.equal(original.before.admission, 'first_publication');
@@ -271,11 +292,13 @@ test('original authority captures admitted absence and selected-v3 Core closure 
   assert.equal(original.binding.root.key, f.bindingRootKey);
   assert.equal(f.calls.filter(key => key === f.bindingRootKey).length, 1);
   assert.equal(f.calls.some(key => key.includes('.parquet') || key.includes('_index_v2')), false);
-  assert.ok(f.calls.indexOf('upload') < f.calls.indexOf(f.bindingRootKey));
+  assert.ok(f.calls.indexOf(f.bindingRootKey) < f.calls.indexOf('upload'));
   assert.equal(f.calls.at(-1), 'publish');
-  const args = { capture: f.result.jsongen_original_authority,
-    pending: { preparation_sha256: 'b'.repeat(64), source_evidence_sha256: 'c'.repeat(64),
-      pending_evidence: { scope: { physical_timeseries_days: f.scopes } } },
+  const pending = f.result.jsongen_pending_source;
+  assert.equal(pending.state, 'put_acknowledged_unverified');
+  assert.equal(pending.pending_evidence.original_ndjson.row_count, 1);
+  assert.deepEqual(pending.pending_evidence.source_identity, f.sourceIdentity);
+  const args = { capture: f.result.jsongen_original_authority, pending,
     connector: { connector_manifest: { bucket: 'canonical-test' } }, finalBatch: { original: 'validated-batch' },
     runId: f.runId, dayUtc, connectorId: 1, writerGitSha: 'a'.repeat(40), sourceIdentity: f.sourceIdentity };
   const extension = preparePruneOriginalAuthorityExtension(args);
@@ -288,19 +311,6 @@ test('original authority captures admitted absence and selected-v3 Core closure 
 
   // Use that same real original capture in the existing final-preparation and
   // immutable-outbox byte selection, after the mocked canonical finalizer.
-  const sourceBytes = Buffer.from(`${JSON.stringify(f.frozenRow)}\n`);
-  const compressed = gzipSync(sourceBytes);
-  const sourceEvidence = describePrunePendingSource({ source: sourceBytes, compressed, rows: [f.frozenRow],
-    runId: f.runId, dayUtc, connectorId: 1, sourceIdentity: f.sourceIdentity });
-  const source = { bucket: BUCKET,
-    key: `managed/jsongen/v1/pending/unverified/prune_daily_v3/connector_id=1/day_utc=${dayUtc}`
-      + `/invocation=${f.runId}/compressed_sha256=${sha256Hex(compressed)}/uncompressed_sha256=${sha256Hex(sourceBytes)}.ndjson.gz`,
-    sha256: sha256Hex(compressed), byte_size: compressed.length,
-    json_sha256: sha256Hex(sourceBytes), json_byte_size: sourceBytes.length };
-  const pendingEvidence = { ...sourceEvidence, signed_upload: { intent_id: 'b'.repeat(64), object: source,
-    disposition: 'put_acknowledged_unverified' } };
-  const pending = { state: 'put_acknowledged_unverified', source, intent_id: 'b'.repeat(64), pending_evidence: pendingEvidence,
-    source_evidence_sha256: sha256Hex(canonicalJson(sourceEvidence)), preparation_sha256: sha256Hex(canonicalJson(pendingEvidence)) };
   const metadataCapture = createPruneOriginalMetadataCapture();
   const refs = ['connector', 'pollutant', 'exact', 'day', 'aggregate', 'latest'].map(role => {
     const key = `${prefix}/${role}.json`; const body = canonicalJson({ role });
@@ -313,8 +323,8 @@ test('original authority captures admitted absence and selected-v3 Core closure 
     affectedDaysUtc: [dayUtc], aggregateReferences: [refs[4]], latestReferences: [refs[5]] });
   const connector = { run_id: f.runId, day_utc: dayUtc, connector_id: 1,
     manifest_key: refs[0].key, manifest_hash: 'e'.repeat(64), connector_manifest: { bucket: 'canonical-test', ...refs[0] },
-    pollutant_manifests: sourceEvidence.scope.pollutant_partitions.map(p => ({ ...p, manifest: refs[1] })), scoped_roots: [] };
-  const finalArgs = { ...args, pending, connector, originalMetadataSnapshot: snapshot,
+    pollutant_manifests: pending.pending_evidence.scope.pollutant_partitions.map(p => ({ ...p, manifest: refs[1] })), scoped_roots: [] };
+  const finalArgs = { ...args, connector, originalMetadataSnapshot: snapshot,
     originalAuthorityCapture: f.result.jsongen_original_authority,
     finalization: { ok: true, affected_days_utc: [dayUtc],
       canonical_aggregate_result: { canonical_aggregate_authority_verified: true,
@@ -338,9 +348,9 @@ test('original authority captures admitted absence and selected-v3 Core closure 
   assert.ok(oversized.byte_size <= 1024 ** 2);
 });
 
-test('unavailable contradictory and oversized original authority evidence preserve canonical publication', async () => {
+test('unavailable contradictory and oversized original authority evidence preserve canonical publication', async t => {
   for (const [failure, state] of [['missing', 'unavailable'], ['identity', 'contradictory'], ['core', 'contradictory'], ['oversized', 'oversized'], ['before', 'unavailable'], ['deadline', 'unavailable']]) {
-    const f = await originalAuthorityPublication(failure);
+    const f = await originalAuthorityPublication(t, failure);
     const original = f.result.jsongen_original_authority.snapshot();
     assert.equal(f.calls.at(-1), 'publish');
     assert.equal(f.result.jsongen_pending_source.state, 'put_acknowledged_unverified');
@@ -352,10 +362,11 @@ test('unavailable contradictory and oversized original authority evidence preser
 });
 
 test('bounded concurrent original capture covers 433 scopes and lossless inline metadata capacity', async t => {
-  const f = await originalAuthorityPublication('concurrent', 433);
+  const f = await originalAuthorityPublication(t, 'concurrent', 433);
   const original = f.result.jsongen_original_authority.snapshot();
   assert.equal(original.completeness, 'captured');
   assert.equal(original.binding.bindings.length, 433);
+  assert.equal(f.result.jsongen_pending_source.pending_evidence.original_ndjson.row_count, 433);
   assert.ok(f.maxInFlight > 1 && f.maxInFlight <= 8);
   const bindingCalls = f.calls.filter(key => key.startsWith('history/_index_v3/timeseries_binding/'));
   assert.equal(bindingCalls.length, 433 + 4);
@@ -390,8 +401,8 @@ test('bounded concurrent original capture covers 433 scopes and lossless inline 
     compact_inline_bytes: compact.length, maximum_concurrency: f.maxInFlight }));
 });
 
-test('original capture deadline aborts in-flight reads and late responses cannot mutate evidence', async () => {
-  const f = await originalAuthorityPublication('concurrent', 40);
+test('original capture deadline aborts in-flight reads and late responses cannot mutate evidence', async t => {
+  const f = await originalAuthorityPublication(t, 'concurrent', 40);
   const manager = createPruneOriginalMetadataCapture();
   const capture = manager.beginOriginalAuthority(f.result.jsongen_original_authority.snapshot().identity, originalLockEnv(f.runId));
   const late = []; let aborted = 0;
@@ -414,8 +425,8 @@ test('original capture deadline aborts in-flight reads and late responses cannot
   assert.equal(accounting.retained_bytes, 0);
 });
 
-test('original capture capacity protects final bytes and requires the same validated lock invocation', async () => {
-  const f = await originalAuthorityPublication();
+test('original capture capacity protects final bytes and requires the same validated lock invocation', async t => {
+  const f = await originalAuthorityPublication(t);
   const identity = f.result.jsongen_original_authority.snapshot().identity;
   for (const env of [{ valid: true, owner: 'prune_daily', run_id: f.runId }, originalLockEnv('another-run'),
     { ...originalLockEnv(f.runId), [OBSERVATIONS_GLOBAL_OPERATION_LOCK_ENV.held]: 'false' }]) {
