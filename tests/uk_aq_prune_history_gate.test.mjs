@@ -567,7 +567,7 @@ function completeCandidate(dayUtc, connectorId, expectedRowCount, minObservedAt,
     status: "complete",
     run_id: "previous-run",
     last_error: "PRUNE_FIRST_DELETE_READY:v1",
-    manifest_key: canonicalObservationConnectorManifestKey(dayUtc, connectorId),
+    manifest_key: canonicalObservationConnectorManifestKey(dayUtc, connectorId, "v2"),
     history_row_count: String(expectedRowCount),
     history_file_count: 1,
     history_total_bytes: "100",
@@ -580,9 +580,10 @@ function completeCandidate(dayUtc, connectorId, expectedRowCount, minObservedAt,
   };
 }
 
-function candidatePopulationClient({ candidates, gates, sourceRows, afterPopulation = null }) {
+function candidatePopulationClient({ candidates, gates, sourceRows, canonicalRowsByConnectorDay = new Map() }) {
   return {
     async query(sql, params = []) {
+      const normalized = sql.trim().replace(/\s+/g, " ");
       if (/select distinct op\.code/i.test(sql)) return { rows: [] };
       if (/^begin isolation level repeatable read$/i.test(sql.trim()) || /^(commit|rollback)$/i.test(sql.trim())) {
         return { rows: [] };
@@ -592,11 +593,43 @@ function candidatePopulationClient({ candidates, gates, sourceRows, afterPopulat
         return { rows: [candidates.get(connectorDayGateKey(params[0], params[1]))] };
       }
       if (/uk_aq_phase_b_history_rows_v2/i.test(sql)) {
-        return { rows: canonicalCandidateRows(String(params[1]).slice(0, 10), Number(params[0]), Number(candidates.get(connectorDayGateKey(String(params[1]).slice(0, 10), params[0])).expected_row_count)) };
+        const key = connectorDayGateKey(params[1].slice(0, 10), params[0]);
+        assert.ok(canonicalRowsByConnectorDay.has(key), `Unexpected canonical source query for ${key}`);
+        return { rows: canonicalRowsByConnectorDay.get(key) };
       }
-      if (/^update uk_aq_ops\.(history_candidates|prune_connector_day_gates)/im.test(sql)) {
+      if (/^update uk_aq_ops\.history_candidates set status = 'pending', run_id = null, last_error = \$3,/i.test(normalized)) {
+        assert.match(normalized, /where day_utc = \$1::date and connector_id = \$2::integer and status = 'complete'$/i);
+        const key = connectorDayGateKey(params[0], params[1]);
+        const previous = candidates.get(key);
+        assert.equal(previous?.status, "complete");
+        candidates.set(key, {
+          ...previous,
+          status: "pending",
+          run_id: null,
+          last_error: params[2],
+          manifest_key: null,
+          history_row_count: null,
+          history_file_count: null,
+          history_total_bytes: null,
+          history_completed_at: null,
+          source_content_hash: null,
+          source_content_hash_contract_version: null,
+          source_content_hash_row_count: null,
+          resume_last_timeseries_id: null,
+          resume_last_observed_at: null,
+          resume_part_index: 0,
+          resume_exported_row_count: "0",
+          resume_parts_json: [],
+        });
         return { rows: [], rowCount: 1 };
       }
+      if (/^insert into uk_aq_ops\.prune_connector_day_gates \( day_utc, connector_id, history_done, updated_at \)/i.test(normalized)) {
+        assert.match(normalized, /values \(\$1::date, \$2::integer, false, now\(\)\) on conflict \(day_utc, connector_id\) do update set history_done = false,/i);
+        assert.equal(params.length, 2);
+        gates.set(connectorDayGateKey(params[0], params[1]), false);
+        return { rows: [], rowCount: 1 };
+      }
+      assert.match(normalized, /^with source_aggregates as \(/i);
       assert.match(sql, /source_changes as materialized/i);
       assert.match(sql, /invalidated_connector_gates as/i);
       assert.match(sql, /on conflict \(day_utc, connector_id\)/i);
@@ -637,7 +670,6 @@ function candidatePopulationClient({ candidates, gates, sourceRows, afterPopulat
           current_max_observed_at: source.max_observed_at,
         };
       });
-      afterPopulation?.();
       return { rows };
     },
   };
@@ -645,33 +677,59 @@ function candidatePopulationClient({ candidates, gates, sourceRows, afterPopulat
 
 test("real candidate population invalidates only the connector gate whose completed source identity changed", async () => {
   const dayUtc = "2026-07-21";
+  const unrelatedDayUtc = "2026-07-20";
+  const changedKey = connectorDayGateKey(dayUtc, 1);
+  const unchangedKey = connectorDayGateKey(dayUtc, 2);
+  const unrelatedKey = connectorDayGateKey(unrelatedDayUtc, 1);
+  const changed = completeCandidate(dayUtc, 1, 10, `${dayUtc}T00:00:00.000Z`, `${dayUtc}T09:00:00.000Z`);
+  const unchanged = completeCandidate(dayUtc, 2, 20, `${dayUtc}T00:00:00.000Z`, `${dayUtc}T19:00:00.000Z`);
+  const unrelated = completeCandidate(unrelatedDayUtc, 1, 1, `${unrelatedDayUtc}T00:00:00.000Z`, `${unrelatedDayUtc}T00:00:00.000Z`);
   const candidates = new Map([
-    [connectorDayGateKey(dayUtc, 1), completeCandidate(dayUtc, 1, 10, `${dayUtc}T00:00:00.000Z`, `${dayUtc}T23:00:00.000Z`)],
-    [connectorDayGateKey(dayUtc, 2), completeCandidate(dayUtc, 2, 20, `${dayUtc}T00:05:00.000Z`, `${dayUtc}T23:05:00.000Z`)],
+    [changedKey, { ...changed }],
+    [unchangedKey, { ...unchanged }],
+    [unrelatedKey, { ...unrelated }],
   ]);
   const gates = new Map([
-    [connectorDayGateKey(dayUtc, 1), true],
-    [connectorDayGateKey(dayUtc, 2), true],
+    [changedKey, true],
+    [unchangedKey, true],
+    [unrelatedKey, true],
   ]);
-  const sourceRows = [
-    { day_utc: dayUtc, connector_id: 1, expected_row_count: "11", min_observed_at: `${dayUtc}T00:00:00.000Z`, max_observed_at: `${dayUtc}T23:30:00.000Z` },
-    { day_utc: dayUtc, connector_id: 2, expected_row_count: "20", min_observed_at: `${dayUtc}T00:05:00.000Z`, max_observed_at: `${dayUtc}T23:05:00.000Z` },
-  ];
+  const sourceRows = [changed, unchanged].map(({
+    day_utc, connector_id, expected_row_count, min_observed_at, max_observed_at,
+  }) => ({ day_utc, connector_id, expected_row_count, min_observed_at, max_observed_at }));
+  // A value-only change leaves the population query's counts and time bounds unchanged.
+  const changedRows = canonicalCandidateRows(dayUtc, 1, 10);
+  changedRows[0].value += 1;
+  const canonicalRowsByConnectorDay = new Map([
+    [changedKey, changedRows],
+    [unchangedKey, canonicalCandidateRows(dayUtc, 2, 20)],
+  ]);
 
-  const populated = await populateBackupCandidatesForTest({
-    client: candidatePopulationClient({ candidates, gates, sourceRows }),
+  const [invalidated, preserved] = await populateBackupCandidatesForTest({
+    client: candidatePopulationClient({ candidates, gates, sourceRows, canonicalRowsByConnectorDay }),
     latestEligibleWindowEndIso: "2026-07-22T00:00:00.000Z",
     runtime: { history_write_version: "v2" },
   });
 
-  assert.equal(candidates.get(connectorDayGateKey(dayUtc, 1)).status, "pending");
-  assert.equal(gates.get(connectorDayGateKey(dayUtc, 1)), false);
-  assert.equal(candidates.get(connectorDayGateKey(dayUtc, 2)).status, "complete");
-  assert.equal(gates.get(connectorDayGateKey(dayUtc, 2)), true);
-  assert.equal(populated[0].source_changed_connector_gate_invalidated, true);
-  assert.equal(populated[1].source_changed_connector_gate_invalidated, false);
-  assert.equal(new Map([[dayUtc, true]]).get(dayUtc), true, "aggregate truth exists but cannot restore the exact connector gate");
-  assert.equal(gates.get(connectorDayGateKey(dayUtc, 1)), false);
+  assert.equal(candidates.get(changedKey).status, "pending");
+  assert.equal(candidates.get(changedKey).last_error, "source_identity_mismatch");
+  assert.equal(candidates.get(changedKey).manifest_key, null);
+  assert.equal(candidates.get(changedKey).source_content_hash, null);
+  assert.deepEqual(candidates.get(unchangedKey), unchanged);
+  assert.deepEqual(candidates.get(unrelatedKey), unrelated);
+  assert.deepEqual(gates, new Map([[changedKey, false], [unchangedKey, true], [unrelatedKey, true]]));
+  assert.equal(invalidated.source_changed_connector_gate_invalidated, true);
+  assert.equal(invalidated.source_identity_failure_reason, "source_identity_mismatch");
+  assert.equal(preserved.source_changed_connector_gate_invalidated, false);
+  assert.equal(preserved.source_identity_match, true);
+
+  const { allowedBuckets, blockedBuckets } = filterBucketsByConnectorHistoryGate(
+    [1, 2].map(connector_id => ({ connector_id, hour_start: `${dayUtc}T00:00:00.000Z`, observation_count: 1n })),
+    new Map([...gates, [dayUtc, true]]),
+  );
+  assert.deepEqual(allowedBuckets.map(bucket => bucket.connector_id), [2]);
+  assert.deepEqual(blockedBuckets.map(bucket => bucket.connector_id), [1]);
+  assert.equal(blockedBuckets[0].reason, "history_not_complete_for_connector_day");
 });
 
 test("identical legacy completed source is blocked when first-deletion state is unknown", async () => {
