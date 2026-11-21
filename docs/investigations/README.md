@@ -1,24 +1,21 @@
-# TEST Ops technical investigations
+# TEST Ops implementation investigations
 
-This directory holds **dated, point-in-time investigations, audits and architectural assessments** spanning UK AQ components and repositories. Preserve evidence and the reasoning behind proposals so that a later review can start from known findings without assuming old conclusions still describe today's deployment.
+This public directory contains dated, **publication-safe** investigations directly associated with the Ops implementation, such as specific service diagnostics, code behaviour, performance measurements and operating evidence.
 
-## Status and authority
+**These reports are historical, non-authoritative evidence.** Active architecture and behaviour are specified only by the appropriate contracts in TEST System Docs. Investigations do not authorise deployments, migrations, data changes or LIVE work.
 
-- Reports here are **non-authoritative evidence**, not current runtime contracts, approved implementation plans, live configuration, migrations or deployment authorisation.
-- Authoritative requirements live in [TEST System Docs](https://github.com/TEST-uk-aq/uk-aq-system-docs/tree/main/system_docs), beginning with [SYSTEM_OVERVIEW.md](https://github.com/TEST-uk-aq/uk-aq-system-docs/blob/main/system_docs/SYSTEM_OVERVIEW.md). If a report conflicts with a current contract, the contract prevails and the conflict must be reported.
-- Proposed implementation decisions and their status belong in the relevant [System Docs plans](https://github.com/TEST-uk-aq/uk-aq-system-docs/tree/main/plans); an accepted future behaviour belongs in the appropriate active system contract and, where useful, an architecture decision record.
-- Do not delete or silently rewrite older evidence when findings change. Date and link a new review, and add a supersession notice or follow-up link where useful. Git history tracks report revisions.
+## What belongs here
 
-## Recommended report metadata
+- Narrow Ops implementation reviews and technical diagnostics that are suitable for a **public** repository.
+- Reports with date, source commit(s), observed runtime evidence and clearly labelled assumptions, outcomes and unresolved questions.
+- Follow-up or supersession references where an earlier report is no longer current.
 
-Record the **date**, scope/TEST environment, status (investigation, superseded, follow-up, accepted evidence), source revision or deployed configuration evidence, and links to relevant contracts. Distinguish **confirmed code facts**, **observed real operations**, **user-supplied evidence**, **assumptions/estimates**, **proposals** and **unresolved decisions**. Include cost-source dates and credit/discount treatment where applicable. Never treat repository schedule defaults as proof of active D1 settings.
+**Do not put cross-repository strategy, private GCP billing screenshots, sensitive infrastructure details, credentials or non-public operational/security assessments in this repository.** Cross-repository investigations, research alternatives and cost evidence belong in the private System Docs investigations archive. A private repository, however, is still not a place to store secrets.
 
-Use clear dated filenames such as `YYYY-MM-DD-topic-review.md`. Cross-repository research can be archived here without duplicating the active contract prose. Keep credentials, raw secrets and private account data out of Git.
+Existing public reports remain available for their original context. Do not copy them into active contract locations or treat them as production authority.
 
-## Ingestion cost and alternative hosting (21 November 2026)
+## Historical public Git records
 
-- [Ingestion architecture and MacBook/GCP failover review](2026-11-21-ingest-hosting-cost-review.md): full original first Codex review, pinned to the four TEST revisions, including per-connector feasibility, unsafe naive staggered failover and the safer completion-aware option.
-- [November GCP billing screenshot evidence](2026-11-21-ingest-billing-evidence.md): gross versus selected-savings subtotals, the 30-minute change, comparability limitations and measurements still needed.
-- [System Docs investigation index and decision gates](https://github.com/TEST-uk-aq/uk-aq-system-docs/blob/main/plans/2026-11-21%20GCP%20Ingestion%20Cost%20Reduction/README.md): open decisions and future cross-platform review.
+On 21 November 2026, two ingestion hosting and billing reports were mistakenly committed to this public directory. Their **current-tree copies were relocated to the private System Docs investigations archive**. Deleting a file from `main` does **not** remove earlier Git objects or commits, and those historical copies may remain publicly retrievable.
 
-**Still pending:** a broader independent comparison of Cloudflare Workers, Cloudflare Containers, GitHub Actions, Supabase, VPS and other providers. No results for that second investigation are archived yet. Do not create a placeholder report that could be mistaken for completed evidence.
+Please review publication suitability before committing future investigations. Use the top-level private System Docs archive for cross-repository or sensitive work.
