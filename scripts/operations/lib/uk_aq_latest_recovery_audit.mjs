@@ -21,6 +21,35 @@ const ownership = "select pg_backend_pid() as session_pid, " +
   "and objsubid = 2 and mode = 'ExclusiveLock' and granted) as held";
 const write = event => appendFileSync(env.RECOVERY_AUDIT_FILE, `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`);
 
+const connectionErrorCodes = new Set([
+  "EAI_AGAIN", "ENOTFOUND", "ENETUNREACH", "EHOSTUNREACH", "ETIMEDOUT", "ECONNREFUSED", "ECONNRESET", "EPIPE",
+  "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "CERT_NOT_YET_VALID", "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_GET_ISSUER_CERT", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY", "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+]);
+
+function recordPostgresFailure(event, error) {
+  const { code, message } = error;
+  // Keep protocol error codes and fixed messages. Driver error text can contain credentials or provider data.
+  if (connectionErrorCodes.has(code) || (error instanceof pg.DatabaseError && /^[0-9A-Z]{5}$/.test(code))) {
+    write({ event, code });
+    return;
+  }
+  const summary = event === "db_session_setup_failed" ? "PostgreSQL read-only session setup failed"
+    : message === "timeout expired" || message === "Connection terminated due to connection timeout" ? "PostgreSQL connection timed out"
+      : "PostgreSQL connection failed";
+  write({ event, message: summary });
+}
+
+const originalConnect = pg.Client.prototype.connect;
+pg.Client.prototype.connect = async function (...args) {
+  try {
+    return await originalConnect.apply(this, args);
+  } catch (error) {
+    recordPostgresFailure("db_connection_failed", error);
+    throw error;
+  }
+};
+
 const originalQuery = pg.Client.prototype.query;
 let client, held = false, pid, attempts = 0;
 pg.Client.prototype.query = async function (sql, parameters) {
@@ -37,9 +66,14 @@ pg.Client.prototype.query = async function (sql, parameters) {
     client = this;
     pid = undefined;
     attempts = 0;
-    await originalQuery.call(this, "SET default_transaction_read_only = on");
-    const result = await originalQuery.call(this, "SHOW transaction_read_only");
-    assert.equal(result.rows[0]?.transaction_read_only, "on");
+    try {
+      await originalQuery.call(this, "SET default_transaction_read_only = on");
+      const result = await originalQuery.call(this, "SHOW transaction_read_only");
+      assert.equal(result.rows[0]?.transaction_read_only, "on");
+    } catch (error) {
+      recordPostgresFailure("db_session_setup_failed", error);
+      throw error;
+    }
     write({ event: "db_session_read_only", ...identity });
   }
   assert(client === this && (query === acquire || held), "Query outside the original database session");
