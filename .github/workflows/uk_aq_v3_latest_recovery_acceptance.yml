@@ -52,6 +52,24 @@ jobs:
           node-version: '24.22.1'
       - name: Install locked dependencies
         run: npm ci --ignore-scripts
+      - name: Configure approved Supabase CA for strict Node TLS
+        env:
+          APPROVED_CA_PEM: ${{ secrets.UK_AQ_JSONGEN_SUPABASE_CA_PEM || '' }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$APPROVED_CA_PEM" ]]; then
+            echo 'Missing required TEST Actions secret UK_AQ_JSONGEN_SUPABASE_CA_PEM.' >&2
+            exit 1
+          fi
+          ca_file="$RUNNER_TEMP/uk-aq-supabase-ca.pem"
+          umask 077
+          printf '%s\n' "$APPROVED_CA_PEM" > "$ca_file"
+          chmod 600 "$ca_file"
+          if ! openssl x509 -in "$ca_file" -noout >/dev/null 2>&1; then
+            echo 'Configured Supabase CA is not a readable PEM certificate.' >&2
+            exit 1
+          fi
+          printf 'NODE_EXTRA_CA_CERTS=%s\n' "$ca_file" >> "$GITHUB_ENV"
       - name: Run the selected TEST acceptance stage
         env:
           INPUT_MODE: ${{ inputs.mode }}
