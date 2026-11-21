@@ -56,6 +56,44 @@ export function validateSettings(env) {
   return { mode, approved, precreated, account, project, database, r2, bucket, invalidBucket: `${bucket}-invalid` };
 }
 
+export function describeUtilityFailure(result, events, reason) {
+  const exit = { exit_status: result.status, signal: result.signal };
+  const stage = events.some(item => item.event.startsWith("r2_")) ? "r2"
+    : events.some(item => item.event === "db_session_read_only") ? "global_lock" : "before_lock_evidence";
+  if (result.error) {
+    const code = result.error.code;
+    if (code === "ETIMEDOUT" || code === "ENOBUFS") {
+      return { ...exit, stage, category: code === "ETIMEDOUT" ? "child_timeout" : "child_output_limit", code };
+    }
+    return { ...exit, stage: "child_launch", category: "spawn_failed", code };
+  }
+  if (result.signal) return { ...exit, stage, category: "child_signalled", message: "Child terminated by signal" };
+
+  if (stage === "before_lock_evidence") {
+    const connectionFailure = events.find(item => item.event === "db_connection_failed" || item.event === "db_session_setup_failed");
+    if (connectionFailure) {
+      const { event, code, message } = connectionFailure;
+      return { ...exit, stage: event === "db_connection_failed" ? "postgres_connect" : "postgres_session_setup",
+        category: event, code, message };
+    }
+    // The CLI prints messages for configuration errors. Node prints codes for most loader failures.
+    // Match fixed signatures and never return text taken from stderr.
+    const raw = result.stderr || "";
+    const loaderCode = raw.match(/^\s*code: '(ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND|ERR_UNKNOWN_FILE_EXTENSION|ERR_DLOPEN_FAILED|ERR_PACKAGE_PATH_NOT_EXPORTED)'[,]?$/m)?.[1];
+    if (loaderCode) return { ...exit, stage: "child_startup", category: "module_load_failed", code: loaderCode };
+    if (/^SyntaxError:/m.test(raw)) {
+      return { ...exit, stage: "child_startup", category: "module_load_failed", message: "Node reported a syntax error" };
+    }
+    const configurationMessage = ["Invalid arguments. Use --help for usage",
+      "Observation history generation must be exactly v2 or v3", "Selected profile needs complete v3 R2 configuration",
+      "Selected profile needs a dedicated-session PostgreSQL connection URL", "URI malformed", "Invalid URL"].find(message =>
+      raw.trim() === message);
+    if (configurationMessage) return { ...exit, stage: "utility_configuration", category: "invalid_configuration", message: configurationMessage };
+  }
+  if (reason !== "utility_failed") return { ...exit, stage, category: reason, message: "Unexpected utility result" };
+  return { ...exit, stage, category: "unexpected_utility_exit", message: "No recognised utility error signature" };
+}
+
 async function main(env) {
   assert(env.RUNNER_TEMP && env.GITHUB_ACTIONS === "true", "Run through the TEST Actions workflow");
   const directory = join(env.RUNNER_TEMP, "v3-latest-recovery-acceptance");
@@ -217,7 +255,9 @@ async function main(env) {
                 : raw.includes("Conditional PUT precondition failed") ? "r2_precondition_failed"
                   : raw.includes("Conditional PUT outcome unknown") || raw.includes("Conditional PUT transport failure") ? "r2_put_ambiguous"
                     : result.error?.code || (result.status === 0 ? "completed" : "utility_failed");
-      event({ stage: label, status: result.status, reason, writes: writes.length });
+      const reachedExpectedResult = !result.error && (expectedError ? result.status === 1 && reason === expectedError : result.status === 0);
+      const failure = reachedExpectedResult ? undefined : describeUtilityFailure(result, events, reason);
+      event({ stage: label, status: result.status, reason, writes: writes.length, failure });
       // Retain an ambiguous PUT reconciliation from the utility without copying its raw stderr.
       const reconciliationLine = raw.split("\n").find(line => line.startsWith("{\"plan_sha256\":"));
       if (reconciliationLine) {
@@ -225,8 +265,7 @@ async function main(env) {
         const live = reconciliation?.live;
         save(`${label}-reconciliation`, { status: reconciliation?.status, ...(live ? { live } : {}) });
       }
-      assert(expectedError ? result.status === 1 && reason === expectedError : result.status === 0,
-        `${label} did not reach the expected result (${reason})`);
+      assert(reachedExpectedResult, `${label} did not reach the expected result (${reason}): ${JSON.stringify(failure)}`);
       const acquired = events.filter(item => item.event === "lock_acquired");
       const assertions = events.filter(item => item.event === "lock_asserted");
       const backend = assertions[0]?.backend_pid;
