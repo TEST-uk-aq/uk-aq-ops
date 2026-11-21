@@ -174,6 +174,8 @@ function validateChildAliases(manifest, alias, identity) {
   if (!Array.isArray(children) || !Array.isArray(named) ||
       new Set(children.map((child) => child[identity])).size !== children.length ||
       new Set(named.map((child) => child[identity])).size !== named.length ||
+      children.some((child) => !Number.isSafeInteger(child.row_count) || child.row_count < 0) ||
+      children.reduce((rows, child) => rows + child.row_count, 0) !== manifest.row_count ||
       fingerprint([...children].sort((a, b) => String(a[identity]).localeCompare(String(b[identity])))) !==
         fingerprint([...named].sort((a, b) => String(a[identity]).localeCompare(String(b[identity]))))) {
     throw new Error(`Contradictory canonical child aliases: ${manifest.manifest_key}`);
@@ -214,6 +216,7 @@ export async function latestBcReporting(days, stations, readDay, sourceThroughDa
           row.pollutant_code !== "bc" || !Number.isFinite(row.value) ||
           !["P", "R"].includes(row.verification_status)) continue;
       const sourceDay = sourceSlot(row.observed_at_utc).source_day;
+      if (sourceDay < FROM_DAY) continue;
       if (sourceDay > sourceThroughDay) throw new Error("BC reporting day exceeds published source coverage");
       if (latestDay === null || sourceDay > latestDay) {
         latestDay = sourceDay;
@@ -241,12 +244,17 @@ export async function buildBcUvDiurnal({ env = process.env, fromDay = FROM_DAY, 
     "./uk_aq_ukair_bc_observation_reconciler_locked.mjs", "./uk_air_black_carbon_source.mjs",
     "../../workers/shared/uk_aq_observation_content_hash.mjs",
     "../../workers/shared/uk_aq_r2_history_manifest_validation.mjs",
+    "../../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs",
+    "../../workers/shared/uk_aq_r2_history_canonical.mjs",
+    "../../workers/shared/uk_aq_observation_history_generation.mjs",
     "../../workers/shared/uk_aq_observation_history_schema.mjs", "../../package-lock.json",
   ].map((path) => sha256(readFileSync(new URL(path, import.meta.url)))));
   const derivation = derivationIdentity({ connectorId, stations,
     prefix: generation.observations_prefix, implementationHash });
   const previous = await previousProduct(r2);
   const selected = await selectedDays(r2, generation.observations_prefix, fromDay.slice(0, 7));
+  let canonicalDayReads = 0;
+  let canonicalObservationObjectReads = 0;
   const readDay = async (day) => {
     const expectedKey = buildHistoryV2DayManifestKey(generation.observations_prefix, day.day_utc);
     if (day.manifest_key !== expectedKey) throw new Error("Canonical day key mismatch");
@@ -261,7 +269,16 @@ export async function buildBcUvDiurnal({ env = process.env, fromDay = FROM_DAY, 
     const connectorCache = new Map();
     const bc = await readCurrentPollutantState({ r2, generation, scope: { day_utc: day.day_utc, connector_id: connectorId, pollutant_code: "bc" }, dayCache, connectorCache });
     const uv = await readCurrentPollutantState({ r2, generation, scope: { day_utc: day.day_utc, connector_id: connectorId, pollutant_code: "uv370" }, dayCache, connectorCache });
-    if (bc.connector) validateChildAliases(bc.connector, "pollutant_manifests", "pollutant_code");
+    if (bc.connector) {
+      validateChildAliases(bc.connector, "pollutant_manifests", "pollutant_code");
+      const selectedConnector = selectedDay.payload.connector_manifests.find((child) => child.connector_id === connectorId);
+      if (selectedConnector.row_count !== bc.connector.row_count) throw new Error("Canonical connector row counts disagree");
+    }
+    if ([bc, uv].some((state) => state.child && state.child.row_count !== state.rows.length)) {
+      throw new Error("Canonical pollutant child row counts disagree");
+    }
+    canonicalDayReads++;
+    canonicalObservationObjectReads += (bc.manifest?.files.length ?? 0) + (uv.manifest?.files.length ?? 0);
     return { bcRows: bc.rows, uvRows: uv.rows };
   };
   const result = await deriveMonthlyProduct({ days: selected.days, previous, derivation, stations, readDay,
@@ -294,8 +311,12 @@ export async function buildBcUvDiurnal({ env = process.env, fromDay = FROM_DAY, 
     }
   };
   await verifySource();
+  const { generated_at: _generatedAt, incremental_provenance: _provenance, ...content } = result.product;
   const summary = { ...result, published: false, result: result.unchanged ? "unchanged" : "validated",
-    bytes: body.length, source_through_day: result.product.source_through_day, sensor_count: stations.length };
+    bytes: body.length, source_through_day: result.product.source_through_day, sensor_count: stations.length,
+    canonical_day_reads: canonicalDayReads, canonical_observation_object_reads: canonicalObservationObjectReads,
+    source_state_sha256: fingerprint({ root_sha256: selected.rootHash, metadata: currentMetadata }),
+    product_content_sha256: fingerprint(content) };
   if (publish && !result.unchanged) {
     const digest = sha256(body);
     const key = generationKey(digest);

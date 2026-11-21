@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { deriveMonthlyProduct, derivationIdentity, fingerprint, validatePrevious } from "../scripts/ukair_bc/bc_uv_diurnal_incremental.mjs";
+import { deriveMonthlyProduct, derivationIdentity, fingerprint, profilesForMonth, validatePrevious } from "../scripts/ukair_bc/bc_uv_diurnal_incremental.mjs";
 
 // Small deterministic checks for the stale-reuse/publication boundary. No R2 or
 // database operations: readDay stands in for the already-verified shared reader.
@@ -9,10 +9,10 @@ const station = { station_id: 1, station_ref: "UKA00001", name: "Example", latit
 const stations = [station];
 const identity = (selected = stations) => derivationIdentity({ connectorId: 7, stations: selected,
   prefix: "history/v3/observations", implementationHash: "a".repeat(64) });
-function pair(time, bc, uv, status = "R") {
-  const row = (property, value, id) => ({ station_id: 1, timeseries_id: id, pollutant_code: property,
+function pair(time, bc, uv, status = "R", selected = station) {
+  const row = (property, value) => ({ station_id: selected.station_id, timeseries_id: selected.timeseries_ids[property], pollutant_code: property,
     observed_at_utc: time, value, verification_status: status });
-  return { bcRows: [row("bc", bc, 11)], uvRows: [row("uv370", uv, 12)] };
+  return { bcRows: [row("bc", bc)], uvRows: [row("uv370", uv)] };
 }
 function source() {
   return new Map([
@@ -52,13 +52,13 @@ test("bootstrap binds full history; unchanged run reads no canonical day and ret
   assert.equal(JSON.stringify(second.product), JSON.stringify(first.product));
 });
 
-test("next-month midnight correction invalidates both adjacent dependencies and preserves old months", async () => {
+test("next-month midnight correction rechecks both dependencies but rebuilds only the affected source month", async () => {
   const data = source();
   const first = await build(data);
   data.set("2024-03-01", pair("2024-03-01T00:00:00.000Z", 3, 0, "P"));
   const next = await build(data, first.product);
-  assert.deepEqual(next.rebuilt_months, ["2024-02", "2024-03"]);
-  assert.equal(next.months_reused, 1);
+  assert.deepEqual(next.rebuilt_months, ["2024-02"]);
+  assert.equal(next.months_reused, 2);
   assert.deepEqual(next.reads, ["2024-02-01", "2024-02-05", "2024-03-01"]);
   const point = next.product.sensors[0].profiles.uvpm[1].points[23];
   assert.equal(point.mean_ugm3, -3);
@@ -103,19 +103,69 @@ test("historical P-to-R changes invalidate that month and recompute contributor 
   assert.equal(next.product.sensors[0].profiles.uvpm[0].points[0].source_validation_status, "R");
 });
 
-test("legacy, changed metadata and forced rebuild recompute all months; malformed provenance fails closed", async () => {
+test("population expansion reuses peers, reads historical rows for the added station and proves empty months", async () => {
+  const data = source();
+  const added = { ...station, station_id: 2, station_ref: "UKA00002", timeseries_ids: { bc: 21, uv370: 22 } };
+  const historical = pair("2024-02-05T02:00:00.000Z", 3, 1, "P", added);
+  for (const property of ["bcRows", "uvRows"]) data.get("2024-02-05")[property].push(...historical[property]);
+  const first = await build(data);
+  const expanded = await build(data, first.product, { stations: [added, station] });
+  assert.deepEqual(expanded.reads, ["2024-02-01", "2024-02-05", "2024-03-01"]);
+  assert.equal(expanded.newly_eligible_stations, 1);
+  assert.equal(expanded.station_months_reused, 3);
+  assert.equal(expanded.station_months_rebuilt, 3);
+  assert.equal(expanded.station_months_built_from_absence, 2);
+  assert.equal(expanded.months_reused, 0);
+  assert.ok(expanded.fallback_reasons.includes("unbaselined_series_present"));
+  assert.deepEqual(expanded.product, (await build(data, first.product, { stations: [added, station], fullRebuild: true })).product);
+
+  const boundary = pair("2024-03-01T00:00:00.000Z", 4, 1, "P", added);
+  for (const property of ["bcRows", "uvRows"]) data.get("2024-03-01")[property].push(...boundary[property]);
+  const corrected = await build(data, expanded.product, { stations: [added, station] });
+  assert.equal(corrected.station_months_rebuilt, 1);
+  assert.equal(corrected.station_months_reused, 5);
+  assert.deepEqual(corrected.rebuilt_months, ["2024-02"]);
+  assert.deepEqual(corrected.product, (await build(data, expanded.product, { stations: [added, station], fullRebuild: true })).product);
+
+  const retired = await build(data, corrected.product, { stations: [station] });
+  assert.equal(retired.retired_stations, 1);
+  assert.equal(retired.station_months_reused, 3);
+  assert.deepEqual(retired.reads, []);
+  assert.deepEqual(retired.product.sensors, first.product.sensors);
+});
+
+test("legacy and forced builds read all months, while metadata-only edits retain proven profiles", async () => {
   const data = source();
   const first = await build(data);
   const legacy = structuredClone(first.product);
   delete legacy.incremental_provenance;
   assert.equal(validatePrevious(legacy), null);
-  for (const options of [{ previous: legacy }, { stations: [{ ...station, name: "Renamed" }] }, { fullRebuild: true }]) {
+  const monthlyOnly = structuredClone(first.product);
+  monthlyOnly.incremental_provenance.schema_version = 1;
+  monthlyOnly.incremental_provenance.months = monthlyOnly.incremental_provenance.months.map(
+    ({ stations: _proofs, observed_timeseries_ids: _ids, ...record }) => ({
+      ...record, profiles_sha256: fingerprint(profilesForMonth(first.product, stations, record.month)),
+    }));
+  assert.equal(validatePrevious(monthlyOnly).schema_version, 1);
+  for (const options of [{ previous: legacy }, { previous: monthlyOnly }, { fullRebuild: true },
+    { derivation: { ...identity(), implementation_sha256: "b".repeat(64) } }]) {
     const { previous = first.product, ...rest } = options;
     const result = await build(data, previous, rest);
     assert.equal(result.months_rebuilt, 3);
     assert.equal(result.months_reused, 0);
     assert.equal(result.canonical_days, 5);
   }
+  const renamed = await build(data, first.product, { stations: [{ ...station, name: "Renamed" }] });
+  assert.equal(renamed.mode, "incremental");
+  assert.equal(renamed.station_months_reused, 3);
+  assert.equal(renamed.canonical_days, 0);
+  assert.equal(renamed.product.sensors[0].name, "Renamed");
+  assert.deepEqual(renamed.product.sensors[0].profiles, first.product.sensors[0].profiles);
+});
+
+test("contradictory prior station-month evidence fails closed, including on a forced rebuild", async () => {
+  const data = source();
+  const first = await build(data);
   const bad = structuredClone(first.product);
   bad.sensors[0].profiles.bc[0].points[0].mean_ugm3 = 999;
   await assert.rejects(build(data, bad, { fullRebuild: true }), /profile provenance mismatch/);
@@ -125,4 +175,7 @@ test("legacy, changed metadata and forced rebuild recompute all months; malforme
   const badComplete = structuredClone(first.product);
   badComplete.sensors[0].profiles.bc[0].complete = true;
   await assert.rejects(build(data, badComplete), /profile completeness/);
+  const badInventory = structuredClone(first.product);
+  badInventory.incremental_provenance.months[0].observed_timeseries_ids = [];
+  await assert.rejects(build(data, badInventory), /contradictory BC\/UV station-month observation evidence/i);
 });

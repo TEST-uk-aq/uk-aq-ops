@@ -1,0 +1,99 @@
+name: Publish BC/UV Diurnal Product
+
+on:
+  workflow_call:
+    outputs:
+      publication_summary:
+        description: "Compact verified publisher diagnostics, without product or observation data"
+        value: ${{ jobs.publish.outputs.publication_summary }}
+    inputs:
+      from_day:
+        type: string
+        default: "2024-01-01"
+      full_rebuild:
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      from_day:
+        description: "Historical start; must remain 2024-01-01"
+        required: true
+        default: "2024-01-01"
+        type: string
+      full_rebuild:
+        description: "Recompute all history from canonical observations (recovery/reprocessing)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-bc-uv-diurnal-publish-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    outputs:
+      publication_summary: ${{ steps.build.outputs.publication_summary }}
+    timeout-minutes: 360
+    # Select the repository's configured environment, not an input-selected
+    # GitHub environment that could expose another target's secrets.
+    environment: ${{ vars.UK_AQ_ENV_NAME }}
+    env:
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
+      UK_AQ_GITHUB_REPO: ${{ vars.UK_AQ_GITHUB_REPO }}
+      UK_AQ_R2_HISTORY_VERSION: ${{ vars.UK_AQ_R2_HISTORY_VERSION }}
+      SUPABASE_URL: ${{ vars.SUPABASE_URL }}
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CFLARE_R2_ENDPOINT: ${{ vars.CFLARE_R2_ENDPOINT }}
+      CFLARE_R2_BUCKET: ${{ vars.CFLARE_R2_BUCKET }}
+      CFLARE_R2_REGION: ${{ vars.CFLARE_R2_REGION || 'auto' }}
+      CFLARE_R2_ACCESS_KEY_ID: ${{ secrets.CFLARE_R2_ACCESS_KEY_ID }}
+      CFLARE_R2_SECRET_ACCESS_KEY: ${{ secrets.CFLARE_R2_SECRET_ACCESS_KEY }}
+      INPUT_FROM_DAY: ${{ inputs.from_day }}
+      INPUT_FULL_REBUILD: ${{ inputs.full_rebuild }}
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24.22.1"
+      - run: npm ci --ignore-scripts
+      - name: Validate configured target
+        run: |
+          set -euo pipefail
+          test -n "${GITHUB_REPOSITORY}"
+          test -n "${UK_AQ_GITHUB_REPO}"
+          test "${UK_AQ_GITHUB_REPO}" = "${GITHUB_REPOSITORY}"
+          case "${UK_AQ_ENV_NAME}" in TEST|LIVE) ;; *) exit 1 ;; esac
+          test "${UK_AQ_R2_HISTORY_VERSION}" = "v3"
+          test -n "${SUPABASE_URL}"
+          test -n "${SUPABASE_DB_URL}"
+          test -n "${CLOUDFLARE_ACCOUNT_ID}"
+          test -n "${CFLARE_R2_ENDPOINT}"
+          test -n "${CFLARE_R2_BUCKET}"
+          test -n "${CFLARE_R2_ACCESS_KEY_ID}"
+          test -n "${CFLARE_R2_SECRET_ACCESS_KEY}"
+          test "${CFLARE_R2_ENDPOINT}" = "https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          [[ "${CFLARE_R2_BUCKET}" == *-"${UK_AQ_ENV_NAME,,}" ]]
+      - name: Build, validate and atomically publish latest
+        id: build
+        run: |
+          set -euo pipefail
+          args=(--environment "${UK_AQ_ENV_NAME}" --from "${INPUT_FROM_DAY}" --publish)
+          if [[ "${INPUT_FULL_REBUILD}" == "true" ]]; then args+=(--full-rebuild); fi
+          node scripts/ukair_bc/build_bc_uv_diurnal.mjs "${args[@]}" | tee "${RUNNER_TEMP}/bc_uv_publish_result.jsonl"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          result = json.loads((Path(os.environ["RUNNER_TEMP"]) / "bc_uv_publish_result.jsonl").read_text().splitlines()[-1])
+          keys = ("mode", "rebuild_reason", "months_rebuilt", "months_reused", "canonical_days",
+                  "published", "result", "source_through_day")
+          summary = {key: result[key] for key in keys}
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("publication_summary=" + json.dumps(summary, separators=(",", ":")) + "\n")
+          PY
