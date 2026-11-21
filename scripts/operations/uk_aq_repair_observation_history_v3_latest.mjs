@@ -273,7 +273,7 @@ async function main() {
     assertOwned: lock.assertOwned,
     getObject: async ({ key }) => {
       lock.assertHeld();
-      const object = await r2GetObject({ r2, key });
+      const object = await r2GetObject({ r2, key, accept_encoding_identity: true });
       lock.assertHeld();
       exactObject(object, key);
       return object;
