@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { appendFileSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   r2GetObject, r2ListObjectsV2, r2PutObjectConditional, sha256Hex,
@@ -104,6 +104,12 @@ async function main(env) {
   let stage = "configuration";
   try {
     const settings = validateSettings(env);
+    const caFile = join(env.RUNNER_TEMP, "uk-aq-supabase-ca.pem");
+    assert(isAbsolute(caFile) && env.NODE_EXTRA_CA_CERTS === caFile,
+      "NODE_EXTRA_CA_CERTS must point to the Supabase CA configured in runner temp");
+    const ca = lstatSync(caFile, { throwIfNoEntry: false });
+    assert(ca?.isFile() && ca.size > 0 && (ca.mode & 0o777) === 0o600,
+      "The runner Supabase CA must be a non-empty regular file with permissions 0600");
     const { mode, approved, precreated, account, project, database, r2, bucket, invalidBucket } = settings;
     const destination = { ...r2, bucket };
     const invalid = { ...r2, bucket: invalidBucket };
@@ -241,7 +247,7 @@ async function main(env) {
         PATH: env.PATH, UK_AQ_ENV_NAME: "TEST", UK_AQ_R2_HISTORY_VERSION: "v3",
         CFLARE_R2_ENDPOINT: r2.endpoint, CFLARE_R2_BUCKET: target.bucket, CFLARE_R2_REGION: r2.region,
         CFLARE_R2_ACCESS_KEY_ID: r2.access_key_id, CFLARE_R2_SECRET_ACCESS_KEY: r2.secret_access_key,
-        SUPABASE_DB_URL: database.href, RECOVERY_AUDIT_FILE: report,
+        SUPABASE_DB_URL: database.href, NODE_EXTRA_CA_CERTS: caFile, RECOVERY_AUDIT_FILE: report,
         RECOVERY_EXPECTED_ETAG: pinned?.etag || "", RECOVERY_EXPECTED_SHA256: pinned ? original.sha256 : "",
       } });
       const events = readFileSync(report, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
