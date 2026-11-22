@@ -567,6 +567,9 @@ sync_repo() {
         --exclude='scripts/geography/*postcode*'
         --exclude='system_docs/geography/postcode_lookup.md'
         --exclude='.local/certs/TEST-ingestdb/'
+
+        # Local development work, not for LIVE.
+        --exclude='/work/'
       )
       ;;
     ingest)
