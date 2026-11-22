@@ -12,6 +12,28 @@ import { digest, IMPACT, LIMITATION, MAX_LOCK_MS, MAX_TRANSACTION_MS, POLLUTANTS
 const sha = /^[0-9a-f]{64}$/;
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const maxBundleBytes = 128 * 1024 * 1024;
+const phaseB = {
+  publication: "phase_b_history_connector_publication_complete",
+  batchStart: "phase_b_history_v3_run_finalization_batch_start",
+  batchFailure: "phase_b_history_v3_run_finalization_failed",
+  batchComplete: "phase_b_history_v3_run_finalization_complete",
+  gateComplete: "phase_b_history_candidate_complete",
+  summary: "phase_b_history_run_summary",
+};
+
+function originalPhaseBEvents(log, runId) {
+  const eventNames = new Set(Object.values(phaseB));
+  const events = [];
+  for (const line of log.toString("utf8").split(/\r?\n/)) {
+    // gh prefixes each JSON record with the job, step and display timestamp.
+    const json = line.indexOf("{");
+    if (json < 0) continue;
+    let event;
+    try { event = JSON.parse(line.slice(json)); } catch { continue; }
+    if (event?.run_id === runId && eventNames.has(event.event)) events.push(event);
+  }
+  return events;
+}
 
 export function readBounded(path, limit = maxBundleBytes) {
   const stat = lstatSync(path);
@@ -53,33 +75,50 @@ export function validateBaseline(baseline, workflow, log) {
   "Signed incident baseline is malformed or differs from its workflow evidence");
   const metadata = JSON.parse(workflow);
   requireFact(metadata.url === baseline.workflow_url && String(metadata.databaseId) === baseline.workflow_url.split("/").at(-1) &&
-    metadata.status === "completed" && ["failure", "cancelled", "timed_out"].includes(metadata.conclusion) &&
+    metadata.status === "completed" && ["success", "failure", "cancelled", "timed_out"].includes(metadata.conclusion) &&
     /^[a-f0-9]{40}$/.test(metadata.headSha) && metadata.headSha === baseline.writer_git_sha && Number.isFinite(Date.parse(metadata.startedAt)) &&
     Date.parse(metadata.startedAt) <= cutoff && Date.parse(metadata.updatedAt) >= cutoff &&
     typeof metadata.workflowName === "string" && /prune/i.test(metadata.workflowName) &&
     Array.isArray(metadata.jobs) && metadata.jobs.some((job) => job.status === "completed"),
-  "Original workflow metadata does not establish a completed interrupted Prune run");
-  let publications = 0;
-  for (const line of log.toString("utf8").split(/\r?\n/)) {
-    // gh prefixes each JSON record with the job, step and display timestamp.
-    if (!line.includes("phase_b_history_connector_publication_complete")) continue;
-    const json = line.indexOf("{");
-    if (json < 0) continue;
-    let event;
-    try { event = JSON.parse(line.slice(json)); } catch { continue; }
-    if (event.event !== "phase_b_history_connector_publication_complete" ||
-      event.run_id !== baseline.original_run_id || event.day_utc !== baseline.day_utc ||
-      event.connector_id !== baseline.connector_id) continue;
-    requireFact(Number(event.expected_row_count) === ROWS && Number(event.written_row_count) === ROWS &&
-      Number(event.source_identity_rows) === ROWS && event.source_identity_contract_version === 1 &&
-      event.source_content_hash === baseline.source_content_hash && event.source_identity_match === true &&
-      event.source_owner === "phase_b_export" && event.manifest_key === baseline.manifest_key &&
-      event.connector_gate_complete === false && event.awaiting_run_finalization === true &&
-      Math.floor(utc(event.timestamp) / 1000) === Math.floor(cutoff / 1000),
-    "Original connector publication event contradicts the baseline");
-    publications++;
-  }
-  requireFact(publications === 1, "Workflow log does not contain one matching original connector publication");
+  "Original workflow metadata does not identify the completed Prune workflow");
+
+  const events = originalPhaseBEvents(log, baseline.original_run_id);
+  const inScope = (event) => event.day_utc === baseline.day_utc && event.connector_id === baseline.connector_id;
+  const [publication, duplicatePublication] = events.filter((event) => event.event === phaseB.publication && inScope(event));
+  requireFact(publication && !duplicatePublication, "Workflow log does not contain one matching original connector publication");
+  requireFact(Number(publication.expected_row_count) === ROWS && Number(publication.written_row_count) === ROWS &&
+    Number(publication.source_identity_rows) === ROWS && publication.source_identity_contract_version === 1 &&
+    publication.source_content_hash === baseline.source_content_hash && publication.source_identity_match === true &&
+    publication.source_owner === "phase_b_export" && publication.manifest_key === baseline.manifest_key &&
+    publication.connector_gate_complete === false && publication.awaiting_run_finalization === true &&
+    Math.floor(utc(publication.timestamp) / 1000) === Math.floor(cutoff / 1000),
+  "Original connector publication event contradicts the baseline");
+
+  // The failure record is scoped to the batch, while its start records the
+  // affected days. Pair successive boundaries from the same Prune invocation.
+  const boundaryNames = new Set([phaseB.batchStart, phaseB.batchFailure, phaseB.batchComplete, phaseB.summary]);
+  const [batch, failure] = events.slice(events.indexOf(publication) + 1).filter((event) => boundaryNames.has(event.event));
+  requireFact(batch?.event === phaseB.batchStart && Array.isArray(batch.affected_days_utc) &&
+    batch.affected_days_utc.includes(baseline.day_utc) &&
+    Number.isSafeInteger(batch.connector_publication_count) && batch.connector_publication_count > 0 &&
+    typeof batch.finalization_batch_trigger === "string" && batch.finalization_batch_trigger.length > 0 &&
+    utc(batch.timestamp) >= utc(publication.timestamp) &&
+    failure?.event === phaseB.batchFailure && failure.finalization_batch_trigger === batch.finalization_batch_trigger &&
+    failure.connector_publication_count === batch.connector_publication_count && failure.stopped_for_budget === true &&
+    failure.connector_gate_completed_count === 0 && utc(failure.timestamp) >= utc(batch.timestamp),
+  "Original v3 finalization batch does not establish a budget failure with zero completed connector gates");
+
+  const [summary, duplicateSummary] = events.filter((event) => event.event === phaseB.summary);
+  requireFact(summary && !duplicateSummary && events.indexOf(summary) > events.indexOf(failure) &&
+    summary.status === "stopped_budget" && summary.stopped_for_budget === true && summary.dry_run === false &&
+    utc(summary.timestamp) >= utc(failure.timestamp) &&
+    Array.isArray(summary.blocked_preview) && summary.blocked_preview.some((day) =>
+      day?.day_utc === baseline.day_utc && day.history_done === false && day.reason === "phase_b_history_budget_exhausted"),
+  "Original Phase B summary does not confirm the budget stop and blocked observation day");
+  requireFact(!events.some((event) => event.event === phaseB.gateComplete && inScope(event)) &&
+    !events.slice(events.indexOf(failure) + 1).some((event) =>
+      event.event === phaseB.batchComplete && event.affected_days_utc?.includes(baseline.day_utc)),
+  "Original workflow contains contradictory finalization or connector gate completion evidence");
 }
 
 export function readApproval(path, signature, key, plan, planSha) {

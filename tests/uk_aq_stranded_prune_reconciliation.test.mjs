@@ -16,7 +16,7 @@ import {
   serializeR2HistoryV2ObservationsAggregateManifest,
 } from "../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs";
 import { sha256Hex } from "../workers/shared/r2_sigv4.mjs";
-import { readApproval } from "../scripts/operations/lib/stranded_prune_authority.mjs";
+import { readApproval, validateBaseline } from "../scripts/operations/lib/stranded_prune_authority.mjs";
 import { connectorManifestKey, readSelectedHistory } from "../scripts/operations/lib/stranded_prune_history.mjs";
 import {
   CommitOutcomeUnknown, encodeMultiset, executeTransaction, IMPACT, LIMITATION, readSource, ROWS,
@@ -154,6 +154,64 @@ test("lost commit response stays ambiguous and never retries or rolls back a pos
   assert.deepEqual(state, { deleted: true, receipt: true, writes: 1, rolledBack: false });
 });
 
+
+test("successful GitHub run requires the original connector publication, budget-failed batch and stopped summary", () => {
+  // Reconstruct the recorded incident pattern using the historical Phase B log fields.
+  const incident = {
+    version: 1, day_utc: "2026-11-14", connector_id: 1, row_count: 22543, pollutant_count: 37,
+    publication_cutoff: "2026-11-19T03:24:31.000Z", original_run_id: "452723ab-4504-40a0-bd0d-239107d7285f",
+    manifest_key: connectorManifestKey("2026-11-14", 1),
+    manifest_hash: "1ca74766cb6b48f369386af2aa09f93c220bd56b2fc45e72ebeded1fcf927848",
+    source_content_hash: "02193a5f12e8d3b3832401d3acc08b3814ecf0b1046438e5cbc33d168b1fbd78",
+    workflow_url: "https://github.com/UK-AQ/uk-aq-ops/actions/runs/44444834653",
+    writer_git_sha: targetWriterGitSha,
+  };
+  const workflow = Buffer.from(JSON.stringify({
+    url: incident.workflow_url, databaseId: 44444834653, status: "completed", conclusion: "success",
+    headSha: targetWriterGitSha, workflowName: "UK AQ Prune Daily", jobs: [{ status: "completed" }],
+    startedAt: "2026-11-19T02:30:00Z", updatedAt: "2026-11-19T03:25:00Z",
+  }));
+  const publication = {
+    event: "phase_b_history_connector_publication_complete", timestamp: "2026-11-19T03:24:31.253Z",
+    day_utc: incident.day_utc, connector_id: incident.connector_id, expected_row_count: "22543", written_row_count: "22543",
+    source_identity_rows: 22543, source_identity_contract_version: 1, source_identity_match: true,
+    source_content_hash: incident.source_content_hash, source_owner: "phase_b_export", manifest_key: incident.manifest_key,
+    connector_gate_complete: false, awaiting_run_finalization: true,
+  };
+  const batch = {
+    event: "phase_b_history_v3_run_finalization_batch_start", timestamp: "2026-11-19T03:24:32.000Z",
+    affected_days_utc: [incident.day_utc], connector_publication_count: 1,
+    finalization_batch_trigger: "utc_day_boundary",
+  };
+  const failure = {
+    event: "phase_b_history_v3_run_finalization_failed", timestamp: "2026-11-19T03:24:33.000Z",
+    stopped_for_budget: true, connector_gate_completed_count: 0, connector_publication_count: 1,
+    finalization_batch_trigger: batch.finalization_batch_trigger,
+  };
+  const summary = {
+    event: "phase_b_history_run_summary", timestamp: "2026-11-19T03:24:34.000Z",
+    status: "stopped_budget", stopped_for_budget: true, dry_run: false,
+    blocked_preview: [{ day_utc: incident.day_utc, history_done: false, reason: "phase_b_history_budget_exhausted" }],
+  };
+  const validate = (...events) => {
+    const log = Buffer.from(events.map((event) =>
+      `Prune\tRun worker\t${event.timestamp} ${JSON.stringify({ run_id: incident.original_run_id, ...event })}`).join("\n"));
+    validateBaseline({ ...incident, workflow_record_sha256: sha256Hex(workflow), workflow_log_sha256: sha256Hex(log) }, workflow, log);
+  };
+  assert.doesNotThrow(() => validate(publication, batch, failure, summary));
+  assert.throws(() => validate(publication, batch, {
+    ...failure, event: "phase_b_history_v3_run_finalization_complete", connector_gate_completed_count: 1,
+  }, { ...summary, status: "completed", stopped_for_budget: false }), /finalization batch/);
+  assert.throws(() => validate(publication, batch, { ...failure, run_id: baseline.original_run_id }, summary), /finalization batch/);
+  assert.throws(() => validate(publication, { ...batch, affected_days_utc: [dayUtc] }, failure, summary), /finalization batch/);
+  assert.throws(() => validate(publication, batch, { ...failure, connector_gate_completed_count: 1 }, summary), /finalization batch/);
+  assert.throws(() => validate(publication, batch, failure), /Phase B summary/);
+  assert.throws(() => validate(publication, batch, failure, { ...summary, status: "completed" }), /Phase B summary/);
+  assert.throws(() => validate(publication, batch, failure, {
+    event: "phase_b_history_candidate_complete", timestamp: failure.timestamp,
+    day_utc: incident.day_utc, connector_id: incident.connector_id,
+  }, summary), /contradictory/);
+});
 
 test("approval binds the plan digest, execution ID, window and all-connector impact", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "reconciliation-approval-"));

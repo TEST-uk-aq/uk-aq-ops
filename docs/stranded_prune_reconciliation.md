@@ -37,7 +37,7 @@ jq -n --arg day "$day" --argjson connector "$connector" --arg run "$invocation" 
     workflow_record_sha256:$record, workflow_log_sha256:$log}' > "$evidence/baseline.json"
 ```
 
-Review the complete original workflow and original attempt before signing. Confirm genuine first publication, 22,543 source and written rows and interruption of required v3 finalization without original gate completion. For a re-run, export the original attempt's complete log with `gh run view --attempt N --log` and confirm the record corresponds to that attempt. The program checks the signed hashes, workflow identity and matching structured publication event, including the original invocation, scope, cutoff second and source identity.
+Review the complete original workflow and attempt before signing. Confirm genuine first publication and 22,543 source and written rows. For the same Prune invocation, confirm the target-day v3 batch started after publication, failed for budget with zero connector gates completed, and was followed by a Phase B `stopped_budget` summary that lists the observation day as blocked. GitHub's `success` conclusion is compatible with this internal stop. The program verifies the signed log and record hashes, workflow identity, publication scope and cutoff second, batch and failure pairing, and matching stopped summary. A completed finalization or connector gate for the target is contradictory evidence. For a re-run, export the original attempt's complete log with `gh run view --attempt N --log` and confirm the record corresponds to that attempt.
 
 ```sh
 openssl pkeyutl -sign -rawin -inkey "$operator_private_key" \
@@ -109,7 +109,7 @@ Before any commit, failure rolls back deletion and receipt together. After commi
 
 ## Isolated TEST operational acceptance
 
-Perform these steps only with separate authority for an isolated IngestDB and selected-v3 R2 bucket. Use one real stranded connector-day of 22,543 raw/canonical rows, 24 UTC hours and 37 pollutants, with authentic first-publication logs and a failed blocked candidate / incomplete gate. The operator may stage that evidence only in the isolated rehearsal case. Record the actual connector, day, workflow, publication cutoff and committed manifest hash in the signed baseline. Independently derive the TEST source hash using the current source and existing v1 encoder. With `test_pg_url` pointing to the isolated database, `day` and `connector` set, the following prints the identity only.
+Perform these steps only with separate authority for an isolated IngestDB and selected-v3 R2 bucket. Use one real stranded connector-day of 22,543 raw/canonical rows, 24 UTC hours and 37 pollutants, with authentic first-publication and budget-stopped v3 finalization logs and a failed blocked candidate / incomplete gate. Any staging of the failed candidate and incomplete gate belongs in the isolated rehearsal. Record the actual connector, day, workflow, publication cutoff and committed manifest hash in the signed baseline. Independently derive the TEST source hash using the current source and existing v1 encoder. With `test_pg_url` pointing to the isolated database, `day` and `connector` set, the following prints the identity only.
 
 ```sh
 psql "$test_pg_url" -X -qAt -v ON_ERROR_STOP=1 -v day="$day" -v connector="$connector" <<'SQL' |
@@ -134,6 +134,8 @@ node --input-type=module -e '
 ## Future LIVE operator baseline
 
 Use `repo=UK-AQ/uk-aq-ops`, `run_number=44444834653`, `connector=1`, `day=2026-11-14`, `invocation=452723ab-4504-40a0-bd0d-239107d7285f`, and `cutoff=2026-11-19T03:24:31.000Z`.
+
+The workflow's GitHub conclusion is `success`. Its internal Phase B result is `stopped_budget` after the required v3 finalization failed. Preserve the complete original log so the validator can check both.
 
 - `source_sha=02193a5f12e8d3b3832401d3acc08b3814ecf0b1046438e5cbc33d168b1fbd78`
 - `manifest_sha=1ca74766cb6b48f369386af2aa09f93c220bd56b2fc45e72ebeded1fcf927848`
