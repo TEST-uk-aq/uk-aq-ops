@@ -94,22 +94,30 @@ export function validateBaseline(baseline, workflow, log) {
     Math.floor(utc(publication.timestamp) / 1000) === Math.floor(cutoff / 1000),
   "Original connector publication event contradicts the baseline");
 
-  // The failure record is scoped to the batch, while its start records the
-  // affected days. Pair successive boundaries from the same Prune invocation.
+  // The writer and its Prune batch caller emit the same failure event name.
+  // The writer records the days and outcome. The caller records the trigger
+  // and gate count. Require both in sequence without crossing a batch boundary.
   const boundaryNames = new Set([phaseB.batchStart, phaseB.batchFailure, phaseB.batchComplete, phaseB.summary]);
-  const [batch, failure] = events.slice(events.indexOf(publication) + 1).filter((event) => boundaryNames.has(event.event));
+  const [batch, writerFailure, failure, followingBoundary] = events.slice(events.indexOf(publication) + 1)
+    .filter((event) => boundaryNames.has(event.event));
   requireFact(batch?.event === phaseB.batchStart && Array.isArray(batch.affected_days_utc) &&
     batch.affected_days_utc.includes(baseline.day_utc) &&
     Number.isSafeInteger(batch.connector_publication_count) && batch.connector_publication_count > 0 &&
     typeof batch.finalization_batch_trigger === "string" && batch.finalization_batch_trigger.length > 0 &&
     utc(batch.timestamp) >= utc(publication.timestamp) &&
+    writerFailure?.event === phaseB.batchFailure && writerFailure.failure_outcome === "budget_stop" &&
+    isDeepStrictEqual(writerFailure.affected_days_utc, batch.affected_days_utc) &&
+    writerFailure.connector_count === batch.connector_publication_count &&
+    writerFailure.finalization_batch_trigger === undefined && writerFailure.connector_gate_completed_count === undefined &&
+    utc(writerFailure.timestamp) >= utc(batch.timestamp) &&
     failure?.event === phaseB.batchFailure && failure.finalization_batch_trigger === batch.finalization_batch_trigger &&
+    failure.failure_outcome === undefined &&
     failure.connector_publication_count === batch.connector_publication_count && failure.stopped_for_budget === true &&
-    failure.connector_gate_completed_count === 0 && utc(failure.timestamp) >= utc(batch.timestamp),
-  "Original v3 finalization batch does not establish a budget failure with zero completed connector gates");
+    failure.connector_gate_completed_count === 0 && utc(failure.timestamp) >= utc(writerFailure.timestamp),
+  "Original v3 finalization batch lacks matching writer and batch budget failures with zero completed connector gates");
 
   const [summary, duplicateSummary] = events.filter((event) => event.event === phaseB.summary);
-  requireFact(summary && !duplicateSummary && events.indexOf(summary) > events.indexOf(failure) &&
+  requireFact(summary && !duplicateSummary && followingBoundary === summary &&
     summary.status === "stopped_budget" && summary.stopped_for_budget === true && summary.dry_run === false &&
     utc(summary.timestamp) >= utc(failure.timestamp) &&
     Array.isArray(summary.blocked_preview) && summary.blocked_preview.some((day) =>

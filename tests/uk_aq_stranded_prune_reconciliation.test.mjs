@@ -155,7 +155,7 @@ test("lost commit response stays ambiguous and never retries or rolls back a pos
 });
 
 
-test("successful GitHub run requires the original connector publication, budget-failed batch and stopped summary", () => {
+test("successful GitHub run requires both original v3 failure records and the stopped summary", () => {
   // Reconstruct the recorded incident pattern using the historical Phase B log fields.
   const incident = {
     version: 1, day_utc: "2026-11-14", connector_id: 1, row_count: 22543, pollutant_count: 37,
@@ -168,28 +168,32 @@ test("successful GitHub run requires the original connector publication, budget-
   };
   const workflow = Buffer.from(JSON.stringify({
     url: incident.workflow_url, databaseId: 44444834653, status: "completed", conclusion: "success",
-    headSha: targetWriterGitSha, workflowName: "UK AQ Prune Daily", jobs: [{ status: "completed" }],
+    headSha: targetWriterGitSha, workflowName: "UK AQ Prune Daily", jobs: [{ databaseId: 135294349272, status: "completed" }],
     startedAt: "2026-11-19T02:30:00Z", updatedAt: "2026-11-19T03:25:00Z",
   }));
   const publication = {
-    event: "phase_b_history_connector_publication_complete", timestamp: "2026-11-19T03:24:31.253Z",
+    event: "phase_b_history_connector_publication_complete", timestamp: "2026-11-19T03:24:31.929Z",
     day_utc: incident.day_utc, connector_id: incident.connector_id, expected_row_count: "22543", written_row_count: "22543",
     source_identity_rows: 22543, source_identity_contract_version: 1, source_identity_match: true,
     source_content_hash: incident.source_content_hash, source_owner: "phase_b_export", manifest_key: incident.manifest_key,
     connector_gate_complete: false, awaiting_run_finalization: true,
   };
   const batch = {
-    event: "phase_b_history_v3_run_finalization_batch_start", timestamp: "2026-11-19T03:24:32.000Z",
+    event: "phase_b_history_v3_run_finalization_batch_start", timestamp: "2026-11-19T03:24:31.929Z",
     affected_days_utc: [incident.day_utc], connector_publication_count: 1,
-    finalization_batch_trigger: "utc_day_boundary",
+    finalization_batch_trigger: "candidate_loop_budget_stop",
+  };
+  const writerFailure = {
+    event: "phase_b_history_v3_run_finalization_failed", timestamp: "2026-11-19T03:24:59.110Z",
+    affected_days_utc: [incident.day_utc], connector_count: 1, failure_outcome: "budget_stop",
   };
   const failure = {
-    event: "phase_b_history_v3_run_finalization_failed", timestamp: "2026-11-19T03:24:33.000Z",
+    event: "phase_b_history_v3_run_finalization_failed", timestamp: "2026-11-19T03:24:59.524Z",
     stopped_for_budget: true, connector_gate_completed_count: 0, connector_publication_count: 1,
     finalization_batch_trigger: batch.finalization_batch_trigger,
   };
   const summary = {
-    event: "phase_b_history_run_summary", timestamp: "2026-11-19T03:24:34.000Z",
+    event: "phase_b_history_run_summary", timestamp: "2026-11-19T03:24:59.680Z",
     status: "stopped_budget", stopped_for_budget: true, dry_run: false,
     blocked_preview: [{ day_utc: incident.day_utc, history_done: false, reason: "phase_b_history_budget_exhausted" }],
   };
@@ -198,16 +202,23 @@ test("successful GitHub run requires the original connector publication, budget-
       `Prune\tRun worker\t${event.timestamp} ${JSON.stringify({ run_id: incident.original_run_id, ...event })}`).join("\n"));
     validateBaseline({ ...incident, workflow_record_sha256: sha256Hex(workflow), workflow_log_sha256: sha256Hex(log) }, workflow, log);
   };
-  assert.doesNotThrow(() => validate(publication, batch, failure, summary));
+  assert.doesNotThrow(() => validate(publication, batch, writerFailure, failure, summary));
   assert.throws(() => validate(publication, batch, {
     ...failure, event: "phase_b_history_v3_run_finalization_complete", connector_gate_completed_count: 1,
   }, { ...summary, status: "completed", stopped_for_budget: false }), /finalization batch/);
-  assert.throws(() => validate(publication, batch, { ...failure, run_id: baseline.original_run_id }, summary), /finalization batch/);
-  assert.throws(() => validate(publication, { ...batch, affected_days_utc: [dayUtc] }, failure, summary), /finalization batch/);
-  assert.throws(() => validate(publication, batch, { ...failure, connector_gate_completed_count: 1 }, summary), /finalization batch/);
-  assert.throws(() => validate(publication, batch, failure), /Phase B summary/);
-  assert.throws(() => validate(publication, batch, failure, { ...summary, status: "completed" }), /Phase B summary/);
-  assert.throws(() => validate(publication, batch, failure, {
+  assert.throws(() => validate(publication, batch, failure, summary), /finalization batch/);
+  assert.throws(() => validate(publication, batch, writerFailure, summary), /finalization batch/);
+  assert.throws(() => validate(publication, batch, writerFailure, { ...failure, run_id: baseline.original_run_id }, summary), /finalization batch/);
+  assert.throws(() => validate(publication, { ...batch, affected_days_utc: [dayUtc] }, writerFailure, failure, summary), /finalization batch/);
+  assert.throws(() => validate(publication, batch, { ...writerFailure, affected_days_utc: [dayUtc] }, failure, summary), /finalization batch/);
+  assert.throws(() => validate(publication, batch, { ...writerFailure, connector_count: 2 }, failure, summary), /finalization batch/);
+  assert.throws(() => validate(publication, batch, { ...writerFailure, failure_outcome: "failed_closed" }, failure, summary), /finalization batch/);
+  assert.throws(() => validate(publication, batch, writerFailure, { ...failure, finalization_batch_trigger: "utc_day_boundary" }, summary), /finalization batch/);
+  assert.throws(() => validate(publication, batch, writerFailure, { ...failure, timestamp: batch.timestamp }, summary), /finalization batch/);
+  assert.throws(() => validate(publication, batch, writerFailure, { ...failure, connector_gate_completed_count: 1 }, summary), /finalization batch/);
+  assert.throws(() => validate(publication, batch, writerFailure, failure), /Phase B summary/);
+  assert.throws(() => validate(publication, batch, writerFailure, failure, { ...summary, status: "completed" }), /Phase B summary/);
+  assert.throws(() => validate(publication, batch, writerFailure, failure, {
     event: "phase_b_history_candidate_complete", timestamp: failure.timestamp,
     day_utc: incident.day_utc, connector_id: incident.connector_id,
   }, summary), /contradictory/);
