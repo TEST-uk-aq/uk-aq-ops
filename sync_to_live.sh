@@ -568,8 +568,22 @@ sync_repo() {
         --exclude='system_docs/geography/postcode_lookup.md'
         --exclude='.local/certs/TEST-ingestdb/'
 
-        # Local development work, not for LIVE.
-        --exclude='/work/'
+		# TEST-only workspace and review material
+		--exclude='/work/'
+		--exclude='/promotion_candidates/'
+		--exclude='/reviews/'
+		--exclude='/artifacts/'
+
+		# Historical exports and reference data
+		--exclude='/ops_vars.txt'
+		--exclude='/test-r2-index-v2.json'
+		--exclude='/test-r2-v2.json'
+		--exclude='/who-old.json'
+
+		# Development and promotion utilities
+		--exclude='/archive_retired_index_v3_tooling.sh'
+		--exclude='/scripts/strip_public_robots_meta.py'
+		--exclude='*.patch'
       )
       ;;
     ingest)
