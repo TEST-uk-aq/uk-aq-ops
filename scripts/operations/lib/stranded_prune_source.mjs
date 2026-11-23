@@ -7,8 +7,6 @@ import {
 import { encodeCanonicalObservationRow } from "../../../workers/shared/uk_aq_observation_content_hash.mjs";
 import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
 
-export const ROWS = 22_543;
-export const POLLUTANTS = 37;
 export const MAX_TRANSACTION_MS = 120_000;
 export const MAX_LOCK_MS = 5_000;
 export const OBSERVATIONS = "uk_aq_core.observations";
@@ -49,7 +47,7 @@ function exactEvidence(evidence, baseline) {
   requireFact(candidate?.status === "failed" && candidate.last_error?.startsWith(BLOCKED) &&
     !candidate.last_error.includes("PRUNE_FIRST_DELETE_READY") &&
     !candidate.last_error.includes("PRUNE_FIRST_DELETE_CONSUMED") &&
-    Number(candidate.expected_row_count) === ROWS &&
+    Number(candidate.expected_row_count) === baseline.row_count &&
     !candidate.manifest_key && !candidate.source_content_hash &&
     candidate.source_content_hash_contract_version === null &&
     candidate.source_content_hash_row_count === null &&
@@ -109,7 +107,8 @@ export async function readPartitionLayout(client, requireFence = false) {
 }
 
 export async function readSource(client, baseline) {
-  const params = [...scopeArgs(baseline), baseline.publication_cutoff, ROWS + 1];
+  const expectedRows = baseline.row_count;
+  const scope = scopeArgs(baseline);
   const rawResult = await client.query(`
     select connector_id, timeseries_id, observed_at::text as instant, tableoid::oid::text as relation_oid,
       ctid::text as tuple_id, xmin::text as row_version,
@@ -117,17 +116,17 @@ export async function readSource(client, baseline) {
       to_jsonb(o) || jsonb_build_object('value_binary', encode(float8send(value), 'hex'),
         'value', value::text, 'observed_at', observed_at::text, 'created_at', created_at::text) as row_data
     from ${OBSERVATIONS} o where ${PREDICATE}
-    order by timeseries_id, observed_at limit $5::integer`, params);
+    order by timeseries_id, observed_at limit $5::bigint`, [...scope, baseline.publication_cutoff, expectedRows + 1]);
   const canonicalResult = await client.query(`
     select h.*, observed_at_utc::text as instant from uk_aq_ops.uk_aq_phase_b_history_rows_v2(
       $1::integer, $2::timestamptz, $3::timestamptz, null::integer, null::timestamptz) h
-    limit $4::integer`, [...params.slice(0, 3), ROWS + 1]);
+    limit $4::bigint`, [...scope, expectedRows + 1]);
   const raw = rawResult.rows;
   const canonical = canonicalResult.rows;
-  requireFact(raw.length === ROWS && canonical.length === ROWS && raw.every((row) => row.before_cutoff),
+  requireFact(raw.length === expectedRows && canonical.length === expectedRows && raw.every((row) => row.before_cutoff),
     "Raw/canonical row counts or publication-cutoff evidence disagree");
   const keys = new Set(raw.map((row) => rowKey(row, row.instant)));
-  requireFact(keys.size === ROWS && canonical.every((row) => keys.delete(rowKey(row, row.instant))) &&
+  requireFact(keys.size === expectedRows && canonical.every((row) => keys.delete(rowKey(row, row.instant))) &&
     keys.size === 0, "Raw and canonical primary-key scopes differ");
   const hours = Array(24).fill(0);
   const pollutants = new Set();
@@ -139,7 +138,9 @@ export async function readSource(client, baseline) {
     hours[row.observed_at_utc.getUTCHours()]++;
     pollutants.add(row.pollutant_code);
   }
-  requireFact(hours.every((count) => count > 0) && pollutants.size === POLLUTANTS, "Source does not cover 24 hours and 37 pollutants");
+  const pollutantCodes = [...pollutants].sort();
+  requireFact(isDeepStrictEqual(hours, baseline.hourly_counts) && isDeepStrictEqual(pollutantCodes, baseline.pollutants),
+    "Source hourly counts or pollutant codes differ from the baseline");
   requireFact(computePruneConnectorSourceIdentity(canonical).source_content_hash === baseline.source_content_hash,
     "Canonical Prune v1 source hash differs from the baseline");
   const rows = raw.map(({ row_data }) => row_data);
@@ -150,7 +151,7 @@ export async function readSource(client, baseline) {
     summary: { raw_sha256: digest(rows), canonical_multiset_sha256: digest(encodeMultiset(canonical)),
       current_row_witness_sha256: digest(raw.map(({ relation_oid, tuple_id, row_version }) =>
         [relation_oid, tuple_id, row_version])),
-      hourly_counts: hours, pollutants: [...pollutants].sort(), row_count: ROWS, after_cutoff_rows: 0 },
+      hourly_counts: hours, pollutants: pollutantCodes, row_count: raw.length, after_cutoff_rows: 0 },
   };
 }
 
@@ -211,19 +212,19 @@ export async function executeTransaction({ client, lock, plan, planSha, approval
       returning connector_id, timeseries_id, observed_at::text as instant, tableoid::oid::text as relation_oid`,
     scopeArgs(plan.baseline));
     const leafOids = new Set(layout.filter((row) => row.isleaf).map((row) => row.oid));
-    requireFact(deleted.rowCount === ROWS &&
+    requireFact(deleted.rowCount === plan.baseline.row_count &&
       deleted.rows.every((row) => leafOids.has(row.relation_oid) && expectedKeys.delete(`${row.relation_oid}|${rowKey(row, row.instant)}`)) &&
       expectedKeys.size === 0, "Deletion returned a different raw key set");
     const counts = await readCounts(client, plan.baseline);
     requireFact(counts.raw === 0 && counts.canonical === 0, "Source was not fully drained inside the transaction");
     const audit = await client.query(`insert into ${RECEIPTS} as r
       (day_utc, connector_id, operation_id, original_run_id, plan_sha256, source_sha256,
-       manifest_sha256, deleted_rows, approval_reference, backup, approval_sha256)
-      values ($1::date, $2::integer, $3::uuid, $4::uuid, $5, $6, $7, $8, $9, $10::jsonb, $11)
+       manifest_sha256, deleted_rows, approval_reference, backup, approval_sha256, approval)
+      values ($1::date, $2::integer, $3::uuid, $4::uuid, $5, $6, $7, $8, $9, $10::jsonb, $11, $12::jsonb)
       returning to_jsonb(r) as receipt`, [
       plan.baseline.day_utc, plan.baseline.connector_id, plan.operation_id, plan.baseline.original_run_id,
       planSha, plan.baseline.source_content_hash, plan.baseline.manifest_hash, deleted.rowCount,
-      approval.reference, JSON.stringify(approval.backup), digest(approval),
+      approval.reference, JSON.stringify(approval.backup), digest(approval), JSON.stringify(approval),
     ]);
     requireFact(audit.rowCount === 1 && audit.rows[0]?.receipt?.transaction_id,
       "Exceptional receipt was not recorded");

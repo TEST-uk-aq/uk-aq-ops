@@ -8,21 +8,21 @@ import { Client } from "pg";
 import { sha256Hex } from "../../workers/shared/r2_sigv4.mjs";
 import { withObservationsGlobalOperationLock } from "../../workers/shared/uk_aq_r2_history_writer.mjs";
 import {
-  maintenanceBudget, readApproval, readBounded, readSigned, utc, validateBaseline, verifyBackup, writePrivate,
+  askApproval, backupLocator, maintenanceBudget, readBounded, utc, validateApproval, validateBaseline, verifyBackup, writePrivate,
 } from "./lib/stranded_prune_authority.mjs";
 import { readSelectedHistory } from "./lib/stranded_prune_history.mjs";
 import {
   CommitOutcomeUnknown, CommittedNeedsInspection, digest, encodeMultiset, executeTransaction, IMPACT, LIMITATION,
   MAX_LOCK_MS, MAX_TRANSACTION_MS, PREDICATE, readCounts, readEvidence, readPartitionLayout, readReceipts,
-  readSource, requireFact, ROWS, scopeArgs,
+  readSource, requireFact, scopeArgs,
 } from "./lib/stranded_prune_source.mjs";
 
 const SESSION_HEARTBEAT_DISABLED_MS = 2_147_483_647;
 const TABLE_FENCE = "LOCK TABLE uk_aq_core.observations IN SHARE ROW EXCLUSIVE MODE";
 const helpText = `Usage
-  node scripts/operations/uk_aq_reconcile_stranded_prune.mjs [plan] --directory DIR --approval-key PUBLIC_PEM --expires-at UTC
-  node scripts/operations/uk_aq_reconcile_stranded_prune.mjs execute --directory DIR --approval-key PUBLIC_PEM
-  node scripts/operations/uk_aq_reconcile_stranded_prune.mjs inspect --directory DIR --approval-key PUBLIC_PEM
+  node scripts/operations/uk_aq_reconcile_stranded_prune.mjs [plan] --directory DIR --backup-prefix REMOTE:DIR --expires-at UTC
+  node scripts/operations/uk_aq_reconcile_stranded_prune.mjs execute --directory DIR
+  node scripts/operations/uk_aq_reconcile_stranded_prune.mjs inspect --directory DIR
 See docs/stranded_prune_reconciliation.md.`;
 
 function configuration(env) {
@@ -96,20 +96,17 @@ async function databaseIdentity(client, config) {
     database_name: row.datname, server_version: row.server_version };
 }
 
-function loadProvenance(directory, publicKey) {
-  const baseline = readSigned(join(directory, "baseline.json"), join(directory, "baseline.sig"), publicKey);
+function loadProvenance(directory) {
+  const baselineBody = readBounded(join(directory, "baseline.json"), 64 * 1024);
+  const baseline = JSON.parse(baselineBody);
   const workflow = readBounded(join(directory, "workflow.json"), 8 * 1024 * 1024);
   const log = readBounded(join(directory, "workflow.log"), 32 * 1024 * 1024);
-  validateBaseline(baseline.value, workflow, log);
-  return { baseline, workflow, log, anchors: {
-    operator_key_sha256: baseline.key_sha256,
-    baseline_document_sha256: sha256Hex(baseline.body),
-    baseline_signature_sha256: sha256Hex(baseline.signature),
-  } };
+  validateBaseline(baseline, workflow, log);
+  return { baseline, baselineBody, workflow, log, baselineSha: sha256Hex(baselineBody) };
 }
 
-async function createPlan({ client, lock, config, directory, operation, provenance, expires }) {
-  const { baseline: { value: baseline }, anchors } = provenance;
+async function createPlan({ client, lock, config, directory, operation, provenance, expires, locator }) {
+  const { baseline, baselineSha } = provenance;
   const db = await readOnly(client, async () => {
     const target = await databaseIdentity(client, config);
     requireFact((await readReceipts(client, { baseline, operation_id: operation })).length === 0, "Reconciliation has already been recorded");
@@ -122,26 +119,26 @@ async function createPlan({ client, lock, config, directory, operation, provenan
     "Selected R2 Parquet multiset differs from IngestDB");
   requireFact(Date.now() < utc(expires), "Repeated verification requires a new plan expiry");
   const plan = {
-    version: 1, operation_id: operation, created_at: new Date().toISOString(), expires_at: expires,
-    baseline, ...anchors, database: db.target, r2_target_sha256: config.r2_target_sha256,
+    version: 2, operation_id: operation, created_at: new Date().toISOString(), expires_at: expires,
+    baseline, baseline_document_sha256: baselineSha, database: db.target, r2_target_sha256: config.r2_target_sha256,
     layout: db.layout, evidence: db.evidence, source: db.source.summary, history: history.proof,
     deletion: { table: "uk_aq_core.observations", predicate: PREDICATE, parameters: scopeArgs(baseline),
       isolation: "REPEATABLE READ", fence: TABLE_FENCE, max_transaction_ms: MAX_TRANSACTION_MS, max_lock_ms: MAX_LOCK_MS },
     row_incarnation_limitation: LIMITATION, write_fence_impact: IMPACT,
-    backup: { storage: "private versioned AWS S3 Object Lock COMPLIANCE", key: `stranded-prune/${operation}.json`,
-      restore: "Use the exact raw row set in the verified backup only under a separately authorized restore procedure." },
+    backup: { locator, local_file: "backup-bundle.json",
+      restore: "Retain both private copies. See the runbook for exact-row restoration under separate approval." },
   };
   const planSha = digest(plan);
   writePrivate(join(directory, "backup-bundle.json"), {
-    version: 1, plan_sha256: planSha, plan, source_rows: db.source.rows,
-    signed_baseline: provenance.baseline.body.toString("base64"), baseline_signature: provenance.baseline.signature.toString("base64"),
+    version: 2, plan_sha256: planSha, plan, source_rows: db.source.rows,
+    baseline_document: provenance.baselineBody.toString("base64"),
     workflow_record: provenance.workflow.toString("base64"), workflow_log: provenance.log.toString("base64"),
   });
   writePrivate(join(directory, "plan.json"), { plan_sha256: planSha, plan });
-  return { result: "planned", operation_id: operation, plan_sha256: planSha };
+  return { result: "planned", operation_id: operation, plan_sha256: planSha, backup_locator: locator };
 }
 
-async function inspectOperation({ config, lock, plan, planSha, approval, expected = null, reportPath }) {
+async function inspectOperation({ config, lock, plan, planSha, approval = null, expected = null, reportPath }) {
   const report = await withDatabase(config, (client) => readOnly(client, async () => {
     requireFact(isDeepStrictEqual(await databaseIdentity(client, config), plan.database), "Inspection database differs from the plan");
     const receipts = await readReceipts(client, plan);
@@ -149,12 +146,20 @@ async function inspectOperation({ config, lock, plan, planSha, approval, expecte
     let evidenceMatches = false;
     try { evidenceMatches = isDeepStrictEqual(await readEvidence(client, plan.baseline), plan.evidence); } catch { /* report mismatch */ }
     const receipt = receipts[0] ?? null;
+    let approvalMatches = false;
+    if (receipt) {
+      try {
+        const recorded = validateApproval(receipt.approval, plan, planSha);
+        approvalMatches = (!approval || isDeepStrictEqual(recorded, approval)) &&
+          receipt.approval_sha256 === digest(recorded) && receipt.approval_reference === recorded.reference &&
+          isDeepStrictEqual(receipt.backup, recorded.backup);
+      } catch { /* report mismatch */ }
+    }
     const receiptMatches = receipts.length === 1 && receipt.day_utc === plan.baseline.day_utc &&
       receipt.connector_id === plan.baseline.connector_id && receipt.operation_id === plan.operation_id &&
       receipt.original_run_id === plan.baseline.original_run_id && receipt.plan_sha256 === planSha &&
       receipt.source_sha256 === plan.baseline.source_content_hash && receipt.manifest_sha256 === plan.baseline.manifest_hash &&
-      receipt.deleted_rows === ROWS && receipt.approval_sha256 === digest(approval) &&
-      receipt.approval_reference === approval.reference && isDeepStrictEqual(receipt.backup, approval.backup) &&
+      receipt.deleted_rows === plan.baseline.row_count && approvalMatches &&
       typeof receipt.transaction_id === "string" && /^\d+$/.test(receipt.transaction_id) &&
       (!expected || isDeepStrictEqual(receipt, expected));
     return { counts, evidence_matches: evidenceMatches, receipt, receipt_matches: receiptMatches,
@@ -178,41 +183,46 @@ async function inspectOperation({ config, lock, plan, planSha, approval, expecte
 
 export async function main(argv = process.argv.slice(2), env = process.env) {
   const { positionals, values } = parseArgs({ args: argv, allowPositionals: true, options: {
-    directory: { type: "string" }, "approval-key": { type: "string" },
+    directory: { type: "string" }, "backup-prefix": { type: "string" },
     "expires-at": { type: "string" }, help: { type: "boolean" },
   } });
   if (values.help) { console.log(helpText); return; }
   const command = positionals[0] ?? "plan";
   requireFact(positionals.length <= 1 && ["plan", "execute", "inspect"].includes(command), "Unknown operation");
-  requireFact(values.directory && values["approval-key"], "An evidence directory and trusted approval key are required");
+  requireFact(values.directory, "An evidence directory is required");
   const directory = values.directory;
   const stat = lstatSync(directory);
   requireFact(stat.isDirectory() && (stat.mode & 0o077) === 0 && stat.uid === process.getuid(),
     "Use an operator-owned evidence directory with mode 0700");
   const config = configuration(env);
-  const publicKey = values["approval-key"];
-  const provenance = loadProvenance(directory, publicKey);
+  const provenance = loadProvenance(directory);
   let operation = randomUUID();
   let plan;
   let planSha;
   let approval;
+  let locator;
+  const attemptPath = join(directory, "execution-attempt.json");
   if (command === "plan") {
     const expires = utc(values["expires-at"]);
     requireFact(expires > Date.now() && expires <= Date.now() + 86_400_000, "Plan expiry must be within 24 hours");
+    locator = backupLocator(values["backup-prefix"], operation);
   } else {
-    requireFact(!values["expires-at"], "Expiry can only be set during plan");
+    requireFact(!values["expires-at"] && !values["backup-prefix"], "Expiry and backup destination can only be set during plan");
     ({ plan, plan_sha256: planSha } = JSON.parse(readBounded(join(directory, "plan.json"))));
-    requireFact(plan?.version === 1 && planSha === digest(plan) &&
-      isDeepStrictEqual(plan.baseline, provenance.baseline.value) &&
-      Object.entries(provenance.anchors).every(([key, value]) => plan[key] === value) &&
+    requireFact(plan?.version === 2 && planSha === digest(plan) &&
+      isDeepStrictEqual(plan.baseline, provenance.baseline) && plan.baseline_document_sha256 === provenance.baselineSha &&
       plan.r2_target_sha256 === config.r2_target_sha256,
-    "Plan or its authenticated target and provenance changed");
+    "Plan or its target and original provenance changed");
     operation = plan.operation_id;
-    approval = readApproval(join(directory, "approval.json"), join(directory, "approval.sig"), publicKey, plan, planSha);
     if (command === "execute") {
-      requireFact(!existsSync(join(directory, "execution-attempt.json")), "Execution already attempted. Use read-only inspect.");
-      maintenanceBudget(approval);
-      verifyBackup(approval.backup, plan, planSha);
+      requireFact(!existsSync(attemptPath), "Execution already attempted. Use read-only inspect.");
+      const bundlePath = join(directory, "backup-bundle.json");
+      approval = await askApproval(plan, planSha, bundlePath);
+      verifyBackup(approval.backup, plan, planSha, bundlePath);
+    } else if (existsSync(attemptPath)) {
+      const attempt = JSON.parse(readBounded(attemptPath));
+      approval = validateApproval(attempt.approval, plan, planSha);
+      requireFact(attempt.approval_sha256 === digest(approval), "Saved execution-attempt approval differs from its digest");
     }
   }
   let committed = false;
@@ -225,7 +235,8 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       heartbeatMs: SESSION_HEARTBEAT_DISABLED_MS,
     }, async (_identity, lock) => {
       await lock.assertOwned();
-      if (command === "plan") return createPlan({ client, lock, config, directory, operation, provenance, expires: values["expires-at"] });
+      if (command === "plan") return createPlan({ client, lock, config, directory, operation, provenance,
+        expires: values["expires-at"], locator });
       if (command === "inspect") return inspectOperation({
         config, lock, plan, planSha, approval, reportPath: join(directory, `inspection-${randomUUID()}.json`),
       });
@@ -239,8 +250,8 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       "Selected R2 canonical or index authority changed since planning");
       await lock.assertOwned();
       assertWindow();
-      writePrivate(join(directory, "execution-attempt.json"), {
-        operation_id: operation, plan_sha256: planSha, approval_sha256: digest(approval), attempted_at: new Date().toISOString(),
+      writePrivate(attemptPath, {
+        operation_id: operation, plan_sha256: planSha, approval, approval_sha256: digest(approval), attempted_at: new Date().toISOString(),
       });
       const receipt = await executeTransaction({ client, lock, plan, planSha, approval, assertWindow });
       committed = true;

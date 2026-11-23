@@ -1,17 +1,16 @@
 import { execFileSync } from "node:child_process";
-import { createPublicKey, verify } from "node:crypto";
-import { lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { lstatSync, readFileSync, writeFileSync } from "node:fs";
+import { createInterface } from "node:readline/promises";
 import { isDeepStrictEqual } from "node:util";
 
 import { sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
 import { connectorManifestKey } from "./stranded_prune_history.mjs";
-import { digest, IMPACT, LIMITATION, MAX_LOCK_MS, MAX_TRANSACTION_MS, POLLUTANTS, requireFact, ROWS } from "./stranded_prune_source.mjs";
+import { digest, IMPACT, LIMITATION, MAX_LOCK_MS, MAX_TRANSACTION_MS, requireFact } from "./stranded_prune_source.mjs";
 
 const sha = /^[0-9a-f]{64}$/;
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const maxBundleBytes = 128 * 1024 * 1024;
+const backupAttestation = "I verified the destination is private and retains an independent durable copy of the exact local bundle.";
 const phaseB = {
   publication: "phase_b_history_connector_publication_complete",
   batchStart: "phase_b_history_v3_run_finalization_batch_start",
@@ -44,7 +43,9 @@ export function readBounded(path, limit = maxBundleBytes) {
 }
 
 export function writePrivate(path, value) {
-  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`, { flag: "wx", mode: 0o600, flush: true });
+  const body = Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
+  requireFact(body.length <= maxBundleBytes, "Evidence exceeds the supported size");
+  writeFileSync(path, body, { flag: "wx", mode: 0o600, flush: true });
 }
 
 export function utc(value) {
@@ -53,26 +54,24 @@ export function utc(value) {
   return Date.parse(value);
 }
 
-export function readSigned(path, signature, keyPath) {
-  const key = createPublicKey(readBounded(keyPath, 8_192));
-  requireFact(key.asymmetricKeyType === "ed25519", "The trusted operator public key must be Ed25519");
-  const body = readBounded(path, 64 * 1024);
-  const sig = readBounded(signature, 64);
-  requireFact(sig.length === 64 && verify(null, body, key, sig), "Operator signature verification failed");
-  return { value: JSON.parse(body), body, signature: sig, key_sha256: sha256Hex(key.export({ type: "spki", format: "der" })) };
-}
-
 export function validateBaseline(baseline, workflow, log) {
   const start = utc(`${baseline.day_utc}T00:00:00.000Z`);
   const cutoff = utc(baseline.publication_cutoff);
-  requireFact(baseline.version === 1 && Number.isSafeInteger(baseline.connector_id) && baseline.connector_id > 0 &&
-    baseline.row_count === ROWS && baseline.pollutant_count === POLLUTANTS &&
+  requireFact(baseline.version === 2 && Number.isInteger(baseline.connector_id) &&
+    baseline.connector_id > 0 && baseline.connector_id <= 2_147_483_647 &&
+    Number.isInteger(baseline.row_count) && baseline.row_count > 0 && baseline.row_count <= 2_147_483_647 &&
+    Array.isArray(baseline.hourly_counts) && baseline.hourly_counts.length === 24 &&
+    baseline.hourly_counts.every((count) => Number.isSafeInteger(count) && count >= 0) &&
+    baseline.hourly_counts.reduce((sum, count) => sum + count, 0) === baseline.row_count &&
+    Array.isArray(baseline.pollutants) && baseline.pollutants.length > 0 && baseline.pollutants.length <= baseline.row_count &&
+    baseline.pollutants.every((code, index) => typeof code === "string" && code.length > 0 &&
+      (index === 0 || baseline.pollutants[index - 1] < code)) &&
     baseline.manifest_key === connectorManifestKey(baseline.day_utc, baseline.connector_id) &&
     sha.test(baseline.manifest_hash) && sha.test(baseline.source_content_hash) && uuid.test(baseline.original_run_id) &&
     /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/actions\/runs\/[1-9]\d*$/.test(baseline.workflow_url) &&
     cutoff >= start + 86_400_000 && cutoff <= Date.now() &&
     baseline.workflow_record_sha256 === sha256Hex(workflow) && baseline.workflow_log_sha256 === sha256Hex(log),
-  "Signed incident baseline is malformed or differs from its workflow evidence");
+  "Incident baseline is malformed or differs from its workflow evidence");
   const metadata = JSON.parse(workflow);
   requireFact(metadata.url === baseline.workflow_url && String(metadata.databaseId) === baseline.workflow_url.split("/").at(-1) &&
     metadata.status === "completed" && ["success", "failure", "cancelled", "timed_out"].includes(metadata.conclusion) &&
@@ -86,8 +85,9 @@ export function validateBaseline(baseline, workflow, log) {
   const inScope = (event) => event.day_utc === baseline.day_utc && event.connector_id === baseline.connector_id;
   const [publication, duplicatePublication] = events.filter((event) => event.event === phaseB.publication && inScope(event));
   requireFact(publication && !duplicatePublication, "Workflow log does not contain one matching original connector publication");
-  requireFact(Number(publication.expected_row_count) === ROWS && Number(publication.written_row_count) === ROWS &&
-    Number(publication.source_identity_rows) === ROWS && publication.source_identity_contract_version === 1 &&
+  requireFact(Number(publication.expected_row_count) === baseline.row_count &&
+    Number(publication.written_row_count) === baseline.row_count &&
+    Number(publication.source_identity_rows) === baseline.row_count && publication.source_identity_contract_version === 1 &&
     publication.source_content_hash === baseline.source_content_hash && publication.source_identity_match === true &&
     publication.source_owner === "phase_b_export" && publication.manifest_key === baseline.manifest_key &&
     publication.connector_gate_complete === false && publication.awaiting_run_finalization === true &&
@@ -129,20 +129,63 @@ export function validateBaseline(baseline, workflow, log) {
   "Original workflow contains contradictory finalization or connector gate completion evidence");
 }
 
-export function readApproval(path, signature, key, plan, planSha) {
-  const signed = readSigned(path, signature, key);
-  const approval = signed.value;
-  requireFact(signed.key_sha256 === plan.operator_key_sha256 &&
-    approval.version === 1 && approval.operation_id === plan.operation_id && approval.plan_sha256 === planSha &&
+export function backupLocator(prefix, operation) {
+  requireFact(typeof prefix === "string" && /^[a-zA-Z0-9_][a-zA-Z0-9_.-]*:[a-zA-Z0-9][a-zA-Z0-9_. /-]*$/.test(prefix) &&
+    prefix.length <= 512 && prefix.trim() === prefix &&
+    prefix.split(":")[1].split("/").every((part) => part && part !== "." && part !== "..") &&
+    uuid.test(operation), "Use a configured private rclone remote and directory in remote:path form");
+  return `${prefix}/stranded-prune/${operation}.json`;
+}
+
+export function validateApproval(approval, plan, planSha) {
+  requireFact(approval?.version === 2 && approval.operation_id === plan.operation_id &&
+    approval.plan_sha256 === planSha && sha.test(planSha) &&
+    approval.connector_id === plan.baseline.connector_id && approval.day_utc === plan.baseline.day_utc &&
+    approval.row_count === plan.baseline.row_count &&
+    approval.backup?.locator === plan.backup.locator && sha.test(approval.backup.sha256) &&
+    Number.isInteger(approval.backup.bytes) && approval.backup.bytes > 0 && approval.backup.bytes <= maxBundleBytes &&
+    approval.accepted_private_durable_backup === backupAttestation &&
     typeof approval.reference === "string" && /^[\x20-\x7e]{1,256}$/.test(approval.reference) && approval.reference.trim() &&
-    approval.accepted_row_incarnation_limitation === LIMITATION && approval.accepted_cross_connector_impact === IMPACT &&
+    approval.accepted_row_incarnation_limitation === plan.row_incarnation_limitation && plan.row_incarnation_limitation === LIMITATION &&
+    approval.accepted_cross_connector_impact === plan.write_fence_impact && plan.write_fence_impact === IMPACT &&
     Number.isSafeInteger(approval.transaction_ms) && approval.transaction_ms > 0 && approval.transaction_ms <= MAX_TRANSACTION_MS &&
     Number.isSafeInteger(approval.lock_ms) && approval.lock_ms > 0 && approval.lock_ms <= MAX_LOCK_MS &&
     approval.lock_ms <= approval.transaction_ms &&
     utc(approval.window_start) >= utc(plan.created_at) && utc(approval.window_end) <= utc(plan.expires_at) &&
-    utc(approval.window_end) - utc(approval.window_start) >= approval.transaction_ms,
-  "Signed approval is invalid or does not bind the exact plan, risk and window");
+    utc(approval.window_end) - utc(approval.window_start) > approval.transaction_ms,
+  "Manual approval does not bind the exact plan, backup, risks and window");
   return approval;
+}
+
+export async function askApproval(plan, planSha, bundlePath) {
+  requireFact(process.stdin.isTTY && process.stdout.isTTY, "Execution requires interactive approval in a terminal");
+  const local = readBounded(bundlePath);
+  const { connector_id, day_utc, row_count } = plan.baseline;
+  const prompt = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const reference = await prompt.question("Operator name and approval reference: ");
+    const windowStart = await prompt.question("Maintenance window start (UTC, including milliseconds): ");
+    const windowEnd = await prompt.question("Maintenance window end (UTC, including milliseconds): ");
+    const transactionMs = Number(await prompt.question(`Maximum cross-connector write block in ms (up to ${MAX_TRANSACTION_MS}): `));
+    const lockMs = Number(await prompt.question(`Maximum recursive lock wait in ms (up to ${MAX_LOCK_MS}): `));
+    const backupSha = await prompt.question("SHA-256 reviewed for the independently retained backup: ");
+    requireFact(backupSha === sha256Hex(local), "Approved backup checksum differs from the local bundle");
+    const approval = validateApproval({
+      version: 2, operation_id: plan.operation_id, plan_sha256: planSha, connector_id, day_utc, row_count,
+      reference, window_start: windowStart, window_end: windowEnd, transaction_ms: transactionMs, lock_ms: lockMs,
+      backup: { locator: plan.backup.locator, sha256: backupSha, bytes: local.length },
+      accepted_private_durable_backup: backupAttestation,
+      accepted_row_incarnation_limitation: LIMITATION, accepted_cross_connector_impact: IMPACT,
+    }, plan, planSha);
+    maintenanceBudget(approval);
+    console.log(JSON.stringify(approval, null, 2));
+    const confirmation = `APPROVE ${planSha} ${plan.operation_id} ${connector_id}/${day_utc} ${row_count}`;
+    const answer = await prompt.question(`To accept these exact details and risks, enter:\n${confirmation}\n> `);
+    requireFact(answer === confirmation, "Operator did not confirm this exact plan and operation");
+    return approval;
+  } finally {
+    prompt.close();
+  }
 }
 
 export function maintenanceBudget(approval) {
@@ -152,57 +195,25 @@ export function maintenanceBudget(approval) {
   return approval.transaction_ms;
 }
 
-export function verifyBackup(backup, plan, planSha) {
-  requireFact(backup && /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(backup.bucket) &&
-    /^[0-9]{12}$/.test(backup.owner_account) && /^[a-z0-9-]{1,32}$/.test(backup.region) &&
-    /^stranded-prune\/[0-9a-f-]{36}\.json$/.test(backup.key) &&
-    backup.key === `stranded-prune/${plan.operation_id}.json` &&
-    typeof backup.version_id === "string" && /^[A-Za-z0-9._~+/=-]{1,1024}$/.test(backup.version_id) &&
-    backup.version_id !== "null" && sha.test(backup.sha256) &&
-    Number.isSafeInteger(backup.bytes) && backup.bytes > 0 && backup.bytes <= maxBundleBytes &&
-    utc(backup.retain_until) > utc(plan.expires_at),
-  "Backup identity, retention or size is invalid");
-
-  const aws = (request, args) => {
-    // Provider endpoint selection is fixed to AWS by this backup adapter.
-    // AWS_PROFILE and the standard credential chain remain operator-managed.
-    try {
-      return JSON.parse(execFileSync("aws", ["--no-cli-pager", "--no-cli-auto-prompt", "--region", backup.region,
-        "--cli-connect-timeout", "10", "--cli-read-timeout", "60", "s3api", request,
-        "--bucket", backup.bucket, "--expected-bucket-owner", backup.owner_account, "--output", "json", ...args],
-      { timeout: 90_000, maxBuffer: 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, AWS_IGNORE_CONFIGURED_ENDPOINT_URLS: "true" } }));
-    } catch {
-      throw new Error(`Private immutable backup check failed for AWS S3 ${request}`);
-    }
-  };
-  const pab = aws("get-public-access-block", []).PublicAccessBlockConfiguration;
-  requireFact(["BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"]
-    .every((name) => pab?.[name] === true) && aws("get-bucket-policy-status", []).PolicyStatus?.IsPublic === false &&
-    isDeepStrictEqual(aws("get-bucket-ownership-controls", []).OwnershipControls?.Rules,
-      [{ ObjectOwnership: "BucketOwnerEnforced" }]), "Backup bucket privacy cannot be verified");
-  const locator = ["--key", backup.key, "--version-id", backup.version_id];
-  const head = aws("head-object", locator);
-  requireFact(head.ContentLength === backup.bytes && head.VersionId === backup.version_id &&
-    head.ObjectLockMode === "COMPLIANCE" &&
-    Date.parse(head.ObjectLockRetainUntilDate) === utc(backup.retain_until),
-  "Backup version is missing, changed or lacks verified compliance retention");
-  const directory = mkdtempSync(join(tmpdir(), "stranded-prune-backup-"));
-  const file = join(directory, "readback.json");
+function readRemoteBackup(locator, expectedBytes) {
   try {
-    const get = aws("get-object", [...locator, file]);
-    const body = readBounded(file, backup.bytes);
-    requireFact(get.VersionId === backup.version_id && get.ContentLength === backup.bytes &&
-      body.length === backup.bytes && sha256Hex(body) === backup.sha256, "Immutable backup readback differs");
-    const bundle = JSON.parse(body);
-    requireFact(bundle.version === 1 && bundle.plan_sha256 === planSha && digest(bundle.plan) === planSha &&
-      Array.isArray(bundle.source_rows) && bundle.source_rows.length === ROWS && digest(bundle.source_rows) === plan.source.raw_sha256 &&
-      sha256Hex(Buffer.from(bundle.workflow_record, "base64")) === plan.baseline.workflow_record_sha256 &&
-      sha256Hex(Buffer.from(bundle.workflow_log, "base64")) === plan.baseline.workflow_log_sha256 &&
-      sha256Hex(Buffer.from(bundle.signed_baseline, "base64")) === plan.baseline_document_sha256 &&
-      sha256Hex(Buffer.from(bundle.baseline_signature, "base64")) === plan.baseline_signature_sha256,
-    "Backup does not contain the exact planned source and evidence bundle");
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
+    return execFileSync("rclone", ["cat", locator, "--retries", "1", "--low-level-retries", "1"],
+      { timeout: 90_000, maxBuffer: expectedBytes + 1, stdio: ["ignore", "pipe", "pipe"] });
+  } catch {
+    throw new Error("Independent readback from the configured private backup failed");
   }
+}
+
+export function verifyBackup(backup, plan, planSha, bundlePath, readRemote = readRemoteBackup) {
+  const body = readRemote(backup.locator, backup.bytes);
+  requireFact(body.length === backup.bytes && sha256Hex(body) === backup.sha256 &&
+    body.equals(readBounded(bundlePath, backup.bytes)), "Private backup readback differs from the approved local bundle");
+  const bundle = JSON.parse(body);
+  requireFact(bundle.version === 2 && bundle.plan_sha256 === planSha && digest(bundle.plan) === planSha &&
+    Array.isArray(bundle.source_rows) && bundle.source_rows.length === plan.baseline.row_count &&
+    digest(bundle.source_rows) === plan.source.raw_sha256 &&
+    sha256Hex(Buffer.from(bundle.workflow_record, "base64")) === plan.baseline.workflow_record_sha256 &&
+    sha256Hex(Buffer.from(bundle.workflow_log, "base64")) === plan.baseline.workflow_log_sha256 &&
+    sha256Hex(Buffer.from(bundle.baseline_document, "base64")) === plan.baseline_document_sha256,
+  "Backup does not contain the exact planned source and evidence bundle");
 }
