@@ -15,7 +15,7 @@ import {
 } from "../../../workers/shared/uk_aq_r2_history_canonical.mjs";
 import { OBSERVATION_HISTORY_COLUMNS_V3 } from "../../../workers/shared/uk_aq_observation_history_schema.mjs";
 import { r2GetObjectBounded, sha256Hex } from "../../../workers/shared/r2_sigv4.mjs";
-import { digest, encodeMultiset, POLLUTANTS, requireFact, ROWS } from "./stranded_prune_source.mjs";
+import { digest, encodeMultiset, requireFact } from "./stranded_prune_source.mjs";
 
 const generation = getObservationHistoryGeneration("v3");
 const observationsPrefix = generation.observations_prefix;
@@ -85,12 +85,13 @@ export async function readSelectedHistory({ r2, baseline, lock, getObject = r2Ge
   const dayManifest = await readManifest(dayKey, { manifest_kind: "day", day_utc: day }, dayRef.manifest_hash);
   children(dayManifest, "connector_manifests");
   const connectorRef = child(dayManifest, "connector_manifests", "connector_id", connector, baseline.manifest_key);
-  requireFact(connectorRef.manifest_hash === baseline.manifest_hash && connectorRef.row_count === ROWS,
+  requireFact(connectorRef.manifest_hash === baseline.manifest_hash && connectorRef.row_count === baseline.row_count,
     "Committed connector reference differs from the pinned publication");
   const connectorManifest = await readManifest(baseline.manifest_key,
     { manifest_kind: "connector", day_utc: day, connector_id: connector, writer_git_sha: baseline.writer_git_sha }, baseline.manifest_hash);
   const descriptors = children(connectorManifest, "pollutant_manifests");
-  requireFact(connectorManifest.row_count === ROWS && descriptors.length === POLLUTANTS,
+  requireFact(connectorManifest.row_count === baseline.row_count &&
+    isDeepStrictEqual(descriptors.map((descriptor) => descriptor.pollutant_code).sort(), baseline.pollutants),
     "Committed connector scope is incomplete");
 
   const { body: latestBody } = await get({ key: latestKey });
@@ -100,7 +101,8 @@ export async function readSelectedHistory({ r2, baseline, lock, getObject = r2Ge
   });
   const selected = roots.filter((entry) => entry.day_utc === day && entry.connector_id === connector);
   const byPollutant = new Map(selected.map((entry) => [entry.pollutant_code, entry]));
-  requireFact(byPollutant.size === POLLUTANTS, "Current v3 latest registry differs from connector scope");
+  requireFact(selected.length === baseline.pollutants.length && byPollutant.size === selected.length,
+    "Current v3 latest registry differs from connector scope");
 
   const physicalRows = [];
   const fileKeys = new Set();
@@ -138,12 +140,12 @@ export async function readSelectedHistory({ r2, baseline, lock, getObject = r2Ge
         (row.verification_status === null || typeof row.verification_status === "string")),
       "Physical Parquet contains an invalid, missing or out-of-scope row");
       partitionRows += rows.length;
-      requireFact(physicalRows.length + rows.length <= ROWS, "Parquet exceeds the authorized row count");
+      requireFact(physicalRows.length + rows.length <= baseline.row_count, "Parquet exceeds the authorized row count");
       physicalRows.push(...rows);
     }
     requireFact(partitionRows === descriptor.row_count, "Physical pollutant row count disagrees with selected authority");
   }
-  requireFact(byPollutant.size === 0 && physicalRows.length === ROWS &&
+  requireFact(byPollutant.size === 0 && physicalRows.length === baseline.row_count &&
     isDeepStrictEqual(selectedFiles, connectorManifest.files), "Physical connector multiset or file inventory is incomplete");
   // Recheck the two roots after the physical scan; mutating participants are
   // excluded throughout by the continuous observations operation lock.

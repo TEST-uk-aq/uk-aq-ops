@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { generateKeyPairSync, sign } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,10 +15,10 @@ import {
   serializeR2HistoryV2ObservationsAggregateManifest,
 } from "../workers/shared/uk_aq_r2_observations_manifest_hierarchy.mjs";
 import { sha256Hex } from "../workers/shared/r2_sigv4.mjs";
-import { readApproval, validateBaseline } from "../scripts/operations/lib/stranded_prune_authority.mjs";
+import { backupLocator, validateApproval, validateBaseline, verifyBackup } from "../scripts/operations/lib/stranded_prune_authority.mjs";
 import { connectorManifestKey, readSelectedHistory } from "../scripts/operations/lib/stranded_prune_history.mjs";
 import {
-  CommitOutcomeUnknown, encodeMultiset, executeTransaction, IMPACT, LIMITATION, readSource, ROWS,
+  CommitOutcomeUnknown, digest, encodeMultiset, executeTransaction, IMPACT, LIMITATION, readSource,
 } from "../scripts/operations/lib/stranded_prune_source.mjs";
 
 const dayUtc = "2026-10-22";
@@ -27,18 +26,23 @@ const cutoff = "2026-10-24T03:22:00.000Z";
 const connectorId = 7;
 const prefix = "history/v3/observations";
 const targetWriterGitSha = "a".repeat(40);
-const canonical = Array.from({ length: ROWS }, (_, index) => {
-  const pollutant = index % 37;
+const rowCount = 1_927;
+const pollutantCount = 5;
+const canonical = Array.from({ length: rowCount }, (_, index) => {
+  const pollutant = index % pollutantCount;
   return {
     connector_id: connectorId, timeseries_id: pollutant + 101, station_id: 30,
     pollutant_code: `p_${String(pollutant).padStart(2, "0")}`, value: index / 10,
     verification_status: ["P", "R", null][index % 3],
-    observed_at_utc: new Date(Date.parse(`${dayUtc}T00:00:00.000Z`) + Math.floor(index / 37) * 140_000),
+    observed_at_utc: new Date(Date.parse(`${dayUtc}T01:00:00.000Z`) + Math.floor(index / pollutantCount) * 180_000),
   };
 }).sort((a, b) => a.timeseries_id - b.timeseries_id || a.observed_at_utc - b.observed_at_utc)
   .map((row) => ({ ...row, instant: row.observed_at_utc.toISOString() }));
 const baseline = {
-  day_utc: dayUtc, connector_id: connectorId, publication_cutoff: cutoff, original_run_id: "b4c0a403-662b-4866-9392-9fdb6bdb4225",
+  version: 2, day_utc: dayUtc, connector_id: connectorId, publication_cutoff: cutoff,
+  original_run_id: "b4c0a403-662b-4866-9392-9fdb6bdb4225", row_count: rowCount,
+  hourly_counts: Array.from({ length: 24 }, (_, hour) => canonical.filter((row) => row.observed_at_utc.getUTCHours() === hour).length),
+  pollutants: [...new Set(canonical.map((row) => row.pollutant_code))].sort(),
   manifest_key: connectorManifestKey(dayUtc, connectorId), writer_git_sha: targetWriterGitSha, manifest_hash: "c".repeat(64),
   ...computePruneConnectorSourceIdentity(canonical),
 };
@@ -53,7 +57,7 @@ const gate = Object.fromEntries([
 ].map((key) => [key, null]));
 gate.history_done = false;
 const candidate = {
-  status: "failed", expected_row_count: ROWS, manifest_key: null, source_content_hash: null,
+  status: "failed", expected_row_count: rowCount, manifest_key: null, source_content_hash: null,
   source_content_hash_contract_version: null, source_content_hash_row_count: null, history_completed_at: null,
   history_row_count: null, history_file_count: null, history_total_bytes: null,
   last_error: 'PRUNE_HISTORY_AUTHORITY_BLOCKED:' + JSON.stringify({
@@ -74,7 +78,7 @@ function mockTransaction(failure) {
   let removed = false;
   let pendingReceipt = false;
   const state = { deleted: false, receipt: false, writes: 0, rolledBack: false };
-  const client = { async query(text) {
+  const client = { async query(text, params) {
     const sql = text.trim().toLowerCase();
     if (sql === "show server_version_num") return { rows: [{ server_version_num: "170006" }] };
     if (sql.startsWith("set ")) return {};
@@ -107,11 +111,15 @@ function mockTransaction(failure) {
     if (sql.startsWith("delete from")) {
       state.writes++;
       removed = true;
-      return { rowCount: ROWS, rows: failure === "wrong_key" ? [{ ...raw[0], timeseries_id: 5000 }, ...raw.slice(1)] : raw };
+      return { rowCount: failure === "wrong_count" ? rowCount - 1 : rowCount,
+        rows: failure === "wrong_key" ? [{ ...raw[0], timeseries_id: 5000 }, ...raw.slice(1)] : raw };
     }
-    if (sql.startsWith("select (select count")) return { rows: [{ raw: removed ? 0 : ROWS, canonical: removed ? 0 : ROWS }] };
+    if (sql.startsWith("select (select count")) return { rows: [{ raw: removed ? 0 : rowCount, canonical: removed ? 0 : rowCount }] };
     if (sql.startsWith("insert into")) {
       if (failure === "audit") throw new Error("audit unavailable");
+      assert.equal(params[7], rowCount);
+      assert.deepEqual(JSON.parse(params[11]), approval);
+      assert.equal(params[10], digest(approval));
       pendingReceipt = true;
       return { rowCount: 1, rows: [{ receipt: { transaction_id: "6" } }] };
     }
@@ -124,8 +132,9 @@ function mockTransaction(failure) {
     assert.fail(`Unexpected SQL: ${sql}`);
   } };
   const plan = { baseline, evidence: { candidate, gate }, layout, source, operation_id: "31b20b8a-6972-43cb-8599-d60b12d3c673" };
+  const approval = { lock_ms: 5_000, reference: "review", backup: {} };
   const run = () => executeTransaction({
-    client, plan, planSha: "a".repeat(64), approval: { lock_ms: 5_000, reference: "review", backup: {} },
+    client, plan, planSha: "a".repeat(64), approval,
     lock: { assertHeld() {}, assertOwned() { assert.ok(fenced); } }, assertWindow: () => 120_000,
   });
   return { run, state };
@@ -139,7 +148,8 @@ test("recursive fence precedes the snapshot and commits exact deletion with one 
 
 for (const [failure, writes, error] of [
   ["contention", 0, /contended/], ["coverage", 0, /coverage/], ["changed", 0, /changed since planning/],
-  ["replay", 0, /already recorded/], ["wrong_key", 1, /different raw key set/], ["audit", 1, /audit unavailable/],
+  ["replay", 0, /already recorded/], ["wrong_key", 1, /different raw key set/],
+  ["wrong_count", 1, /different raw key set/], ["audit", 1, /audit unavailable/],
 ]) {
   test(`${failure} aborts with no committed deletion or receipt`, async () => {
     const { run, state } = mockTransaction(failure);
@@ -158,7 +168,9 @@ test("lost commit response stays ambiguous and never retries or rolls back a pos
 test("successful GitHub run requires both original v3 failure records and the stopped summary", () => {
   // Reconstruct the recorded incident pattern using the historical Phase B log fields.
   const incident = {
-    version: 1, day_utc: "2026-11-14", connector_id: 1, row_count: 22543, pollutant_count: 37,
+    version: 2, day_utc: "2026-11-14", connector_id: 1, row_count: 22543,
+    hourly_counts: [...Array(23).fill(939), 946],
+    pollutants: Array.from({ length: 37 }, (_, index) => `fixture_${String(index).padStart(2, "0")}`),
     publication_cutoff: "2026-11-19T03:24:31.000Z", original_run_id: "452723ab-4504-40a0-bd0d-239107d7285f",
     manifest_key: connectorManifestKey("2026-11-14", 1),
     manifest_hash: "1ca74766cb6b48f369386af2aa09f93c220bd56b2fc45e72ebeded1fcf927848",
@@ -166,11 +178,12 @@ test("successful GitHub run requires both original v3 failure records and the st
     workflow_url: "https://github.com/UK-AQ/uk-aq-ops/actions/runs/44444834653",
     writer_git_sha: targetWriterGitSha,
   };
-  const workflow = Buffer.from(JSON.stringify({
+  const workflowRecord = {
     url: incident.workflow_url, databaseId: 44444834653, status: "completed", conclusion: "success",
     headSha: targetWriterGitSha, workflowName: "UK AQ Prune Daily", jobs: [{ databaseId: 135294349272, status: "completed" }],
     startedAt: "2026-11-19T02:30:00Z", updatedAt: "2026-11-19T03:25:00Z",
-  }));
+  };
+  const workflow = Buffer.from(JSON.stringify(workflowRecord));
   const publication = {
     event: "phase_b_history_connector_publication_complete", timestamp: "2026-11-19T03:24:31.929Z",
     day_utc: incident.day_utc, connector_id: incident.connector_id, expected_row_count: "22543", written_row_count: "22543",
@@ -212,6 +225,7 @@ test("successful GitHub run requires both original v3 failure records and the st
   assert.throws(() => validate(publication, { ...batch, affected_days_utc: [dayUtc] }, writerFailure, failure, summary), /finalization batch/);
   assert.throws(() => validate(publication, batch, { ...writerFailure, affected_days_utc: [dayUtc] }, failure, summary), /finalization batch/);
   assert.throws(() => validate(publication, batch, { ...writerFailure, connector_count: 2 }, failure, summary), /finalization batch/);
+  assert.throws(() => validate({ ...publication, written_row_count: rowCount }, batch, writerFailure, failure, summary), /contradicts the baseline/);
   assert.throws(() => validate(publication, batch, { ...writerFailure, failure_outcome: "failed_closed" }, failure, summary), /finalization batch/);
   assert.throws(() => validate(publication, batch, writerFailure, { ...failure, finalization_batch_trigger: "utc_day_boundary" }, summary), /finalization batch/);
   assert.throws(() => validate(publication, batch, writerFailure, { ...failure, timestamp: batch.timestamp }, summary), /finalization batch/);
@@ -222,35 +236,75 @@ test("successful GitHub run requires both original v3 failure records and the st
     event: "phase_b_history_candidate_complete", timestamp: failure.timestamp,
     day_utc: incident.day_utc, connector_id: incident.connector_id,
   }, summary), /contradictory/);
+
+  const rehearsal = { ...baseline, publication_cutoff: incident.publication_cutoff,
+    workflow_url: "https://github.com/TEST-uk-aq/uk-aq-ops/actions/runs/1234" };
+  const rehearsalWorkflow = Buffer.from(JSON.stringify({ ...workflowRecord, url: rehearsal.workflow_url, databaseId: 1234 }));
+  const rehearsalLog = Buffer.from([
+    { ...publication, day_utc: rehearsal.day_utc, connector_id: rehearsal.connector_id,
+      expected_row_count: rowCount, written_row_count: rowCount, source_identity_rows: rowCount,
+      source_content_hash: rehearsal.source_content_hash, manifest_key: rehearsal.manifest_key },
+    { ...batch, affected_days_utc: [rehearsal.day_utc] },
+    { ...writerFailure, affected_days_utc: [rehearsal.day_utc] },
+    failure,
+    { ...summary, blocked_preview: [{ ...summary.blocked_preview[0], day_utc: rehearsal.day_utc }] },
+  ].map((event) => JSON.stringify({ run_id: rehearsal.original_run_id, ...event })).join("\n"));
+  assert.doesNotThrow(() => validateBaseline({ ...rehearsal, workflow_record_sha256: sha256Hex(rehearsalWorkflow),
+    workflow_log_sha256: sha256Hex(rehearsalLog) }, rehearsalWorkflow, rehearsalLog));
 });
 
-test("approval binds the plan digest, execution ID, window and all-connector impact", (t) => {
-  const directory = mkdtempSync(join(tmpdir(), "reconciliation-approval-"));
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
-  const key = join(directory, "operator.pem");
-  const file = join(directory, "approval.json");
-  const signature = join(directory, "approval.sig");
-  writeFileSync(key, publicKey.export({ type: "spki", format: "pem" }));
-  const plan = { operation_id: "31b20b8a-6972-43cb-8599-d60b12d3c673",
-    operator_key_sha256: sha256Hex(publicKey.export({ type: "spki", format: "der" })),
-    created_at: cutoff, expires_at: "2026-10-24T04:22:00.000Z" };
-  const planSha = "a".repeat(64);
-  const approval = { version: 1, plan_sha256: planSha, operation_id: plan.operation_id, reference: "Operator approval",
+test("manual approval binds the exact reviewed operation, backup, maintenance window and risks", () => {
+  const plan = { baseline, operation_id: "31b20b8a-6972-43cb-8599-d60b12d3c673",
+    created_at: cutoff, expires_at: "2026-10-24T04:22:00.000Z",
+    row_incarnation_limitation: LIMITATION, write_fence_impact: IMPACT };
+  plan.backup = { locator: backupLocator("private:TEST/Operations", plan.operation_id) };
+  const planSha = digest(plan);
+  const approval = { version: 2, plan_sha256: planSha, operation_id: plan.operation_id, reference: "Operator approval",
+    connector_id: connectorId, day_utc: dayUtc, row_count: rowCount,
     window_start: cutoff, window_end: plan.expires_at, transaction_ms: 120000, lock_ms: 5000,
-    accepted_row_incarnation_limitation: LIMITATION, accepted_cross_connector_impact: IMPACT };
-  const signApproval = (value) => {
-    const bytes = Buffer.from(JSON.stringify(value));
-    writeFileSync(file, bytes);
-    writeFileSync(signature, sign(null, bytes, privateKey));
-  };
-  signApproval(approval);
-  assert.deepEqual(readApproval(file, signature, key, plan, planSha), approval);
-  assert.throws(() => readApproval(file, signature, key, plan, "b".repeat(64)), /exact plan/);
-  signApproval({ ...approval, accepted_cross_connector_impact: "connector only" });
-  assert.throws(() => readApproval(file, signature, key, plan, planSha), /risk and window/);
-  signApproval({ ...approval, transaction_ms: 120001 });
-  assert.throws(() => readApproval(file, signature, key, plan, planSha), /risk and window/);
+    accepted_row_incarnation_limitation: LIMITATION, accepted_cross_connector_impact: IMPACT,
+    accepted_private_durable_backup: "I verified the destination is private and retains an independent durable copy of the exact local bundle.",
+    backup: { locator: plan.backup.locator, sha256: "b".repeat(64), bytes: 100 } };
+  assert.deepEqual(validateApproval(approval, plan, planSha), approval);
+  for (const change of [
+    { plan_sha256: "b".repeat(64) }, { operation_id: baseline.original_run_id },
+    { row_count: rowCount - 1 }, { connector_id: connectorId + 1 }, { day_utc: "2026-10-23" },
+    { backup: { ...approval.backup, locator: "private:other-copy" } },
+    { window_end: "2026-10-24T04:22:01.000Z" }, { transaction_ms: 120001 }, { lock_ms: 5001 },
+    { accepted_cross_connector_impact: "connector only" }, { accepted_row_incarnation_limitation: "" },
+  ]) {
+    assert.throws(() => validateApproval({ ...approval, ...change }, plan, planSha), /exact plan, backup, risks and window/);
+  }
+});
+
+test("private backup requires independent readback of exact bytes and all planned source rows", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "reconciliation-backup-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "backup-bundle.json");
+  const original = Buffer.from("baseline file");
+  const workflow = Buffer.from("workflow record");
+  const log = Buffer.from("workflow log");
+  const plan = { baseline: { ...baseline, workflow_record_sha256: sha256Hex(workflow), workflow_log_sha256: sha256Hex(log) },
+    baseline_document_sha256: sha256Hex(original), source };
+  const planSha = digest(plan);
+  const bundle = { version: 2, plan_sha256: planSha, plan, source_rows: raw.map((row) => row.row_data),
+    baseline_document: original.toString("base64"), workflow_record: workflow.toString("base64"),
+    workflow_log: log.toString("base64") };
+  const body = Buffer.from(JSON.stringify(bundle));
+  writeFileSync(path, body);
+  const backup = { locator: "private:TEST/backup", sha256: sha256Hex(body), bytes: body.length };
+  verifyBackup(backup, plan, planSha, path, (locator, bytes) => {
+    assert.equal(locator, backup.locator);
+    assert.equal(bytes, body.length);
+    return Buffer.from(body);
+  });
+  const damaged = Buffer.from(body);
+  damaged[0] ^= 0xff;
+  assert.throws(() => verifyBackup(backup, plan, planSha, path, () => damaged), /readback differs/);
+  const partial = Buffer.from(JSON.stringify({ ...bundle, source_rows: bundle.source_rows.slice(1) }));
+  writeFileSync(path, partial);
+  assert.throws(() => verifyBackup({ ...backup, sha256: sha256Hex(partial), bytes: partial.length },
+    plan, planSha, path, () => Buffer.from(partial)), /exact planned source/);
 });
 
 test("selected v3 read checks all actual Parquet, status and index dependencies", async () => {
