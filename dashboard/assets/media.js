@@ -432,7 +432,7 @@
     return `<details class="media-ai-usage" data-ai-usage><summary>AI Usage</summary><p>Media’s local budget is enforced here; Cloudflare allowance values are estimates, not billing authority.</p><div class="media-stats">${entries.map(([value, label]) => `<div class="media-stat"><strong>${esc(value ?? 0)}</strong><span>${esc(label)}</span></div>`).join("")}</div></details>`;
   }
 
-  function inlineAiReview(article) {
+  function titleEditorHtml(article) {
     const pendingActions = article.ai_title_suggestion_state === "pending"
       ? `<button class="media-button media-button--primary" data-ai-action="accept-ai">Accept AI title</button><button class="media-button" data-ai-action="reject-ai">Reject AI / use original</button>` : "";
     const published = formatPublicationDate(article.published_at);
@@ -446,10 +446,52 @@
     const image = article.admin_preview_image_path && imageUrl
       ? `<img class="media-site-preview__image" loading="lazy" src="${esc(imageUrl)}" alt="" data-ai-preview-image>` : "";
     const savedMessage = state.titleMessages.get(String(article.id));
-    const homepagePublished = formatPublicationDate(article.published_at);
-    const homepageSourceRow = `${esc(article.publisher)}<span data-homepage-preview-date>${homepagePublished ? ` · ${esc(homepagePublished)}` : ""}</span>`;
+    const homepageSourceRow = `${esc(article.publisher)}<span data-homepage-preview-date>${published ? ` · ${esc(published)}` : ""}</span>`;
     const externalLinkIcon = `<svg class="media-homepage-mobile-preview__icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 5h5v5M19 5l-9 9M18 13v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
-    return `<section class="media-review" data-ai-id="${article.id}" data-publisher-title="${esc(article.title)}" data-ai-published="${published ? "true" : "false"}"><div class="media-review__layout"><div class="media-preview-stack"><div class="media-site-preview-wrap"><div class="media-site-preview" aria-label="Website image article card preview"><span class="media-site-preview__fallback">No permitted preview</span>${image}<div class="media-site-preview__gradient" aria-hidden="true"></div><div class="media-site-preview__overlay"><div class="media-site-preview__source-row">${sourceRow}</div><div class="media-site-preview__title" data-ai-preview-title>${esc(displayTitleWrapping(currentTitle))}</div></div></div></div><div class="media-homepage-mobile-preview-wrap"><div class="media-homepage-mobile-preview__label">Homepage mobile · 360px</div><div class="media-homepage-mobile-preview" aria-label="Homepage non-image article card at a 360 pixel viewport"><div class="media-homepage-mobile-preview__container"><div class="media-homepage-mobile-preview__card">${externalLinkIcon}<p class="media-homepage-mobile-preview__source">${homepageSourceRow}</p><h5 class="media-homepage-mobile-preview__headline"><span data-ai-preview-title>${esc(displayTitleWrapping(currentTitle))}</span></h5></div></div></div></div></div><div class="media-review__controls"><span class="media-subtext">${provenance}</span><div class="media-review__titles"><div class="media-review__title"><span>Publisher original</span>${esc(article.title)}</div><div class="media-review__title"><span>Current display title</span>${esc(currentTitle)}</div><div class="media-review__title"><span>Title origin / status</span>${esc(article.display_title_origin || "original")} · ${esc(titleStatus(article)[1])}</div><div class="media-review__title"><span>${esc(aiSuggestionLabel(article))}</span>${esc(article.ai_title_suggestion || "—")}</div></div><div class="media-actions"><button class="media-button" data-ai-action="generate">${generateLabel}</button>${pendingActions}<label class="media-field media-field--grow"><span>Edit as human title</span><input data-ai-edit value="${esc(article.display_title || "")}" maxlength="500"></label><button class="media-button" data-ai-action="edit">Save human title</button>${article.display_title ? `<button class="media-button" data-ai-action="clear">Clear display title</button>` : ""}</div><div data-ai-message>${savedMessage ? message(savedMessage.text, savedMessage.kind) : ""}</div></div></div></section>`;
+    return `<div class="media-review" data-ai-id="${article.id}" data-article-revision="${article.revision}" data-publisher-title="${esc(JSON.stringify(article.title))}" data-ai-published="${published ? "true" : "false"}">
+      <div class="media-review__layout">
+        <div class="media-preview-stack">
+          <div class="media-site-preview-wrap"><div class="media-site-preview" aria-label="Website image article card preview">
+            <span class="media-site-preview__fallback">No permitted preview</span>${image}
+            <div class="media-site-preview__gradient" aria-hidden="true"></div>
+            <div class="media-site-preview__overlay">
+              <div class="media-site-preview__source-row">${sourceRow}</div>
+              <div class="media-site-preview__title" data-ai-preview-title>${esc(displayTitleWrapping(currentTitle))}</div>
+            </div>
+          </div></div>
+          <div class="media-homepage-mobile-preview-wrap">
+            <div class="media-homepage-mobile-preview__label">Homepage mobile · 360px</div>
+            <div class="media-homepage-mobile-preview" aria-label="Homepage non-image article card at a 360 pixel viewport">
+              <div class="media-homepage-mobile-preview__container"><div class="media-homepage-mobile-preview__card">
+                ${externalLinkIcon}<p class="media-homepage-mobile-preview__source">${homepageSourceRow}</p>
+                <h5 class="media-homepage-mobile-preview__headline"><span data-ai-preview-title>${esc(displayTitleWrapping(currentTitle))}</span></h5>
+              </div></div>
+            </div>
+          </div>
+        </div>
+        <div class="media-review__controls">
+          <span class="media-subtext">${provenance}</span>
+          <div class="media-review__titles">
+            <div class="media-review__title"><span>Publisher original</span>${esc(article.title)}</div>
+            <div class="media-review__title"><span>Current display title</span>${esc(currentTitle)}</div>
+            <div class="media-review__title"><span>Title origin / status</span>${esc(article.display_title_origin || "original")} · ${esc(titleStatus(article)[1])}</div>
+            <div class="media-review__title"><span>${esc(aiSuggestionLabel(article))}</span>${esc(article.ai_title_suggestion || "—")}</div>
+          </div>
+          <div class="media-actions"><button class="media-button" data-ai-action="generate">${generateLabel}</button>${pendingActions}</div>
+          <form class="media-inline-form">
+            <label class="media-field media-field--grow"><span>Human display title</span><input data-ai-edit value="${esc(article.display_title || "")}" maxlength="500"></label>
+            <button type="submit" class="media-button" data-ai-action="edit">Save human title</button>
+            ${article.display_title ? `<button type="button" class="media-button" data-ai-action="clear">Clear display title</button>` : ""}
+          </form>
+          <p class="media-subtext">Use the publisher's headline to correct an extraction error.</p>
+          <form class="media-inline-form">
+            <label class="media-field media-field--grow"><span>Original title</span><input type="text" data-original-title value="${esc(article.title)}" maxlength="1000" required></label>
+            <button type="submit" class="media-button" data-ai-action="save-original">Save original title</button>
+          </form>
+          <div data-ai-message aria-live="polite">${savedMessage ? message(savedMessage.text, savedMessage.kind) : ""}</div>
+        </div>
+      </div>
+    </div>`;
   }
 
   function reviewEvidenceHtml(article) {
@@ -486,7 +528,7 @@
       <td class="media-title-cell"><button type="button" class="media-title-button" data-open-article>${esc(displayTitleWrapping(title))}</button>${reviewEvidenceHtml(article)}${article.display_title ? `<span class="media-subtext">Original: ${esc(article.title)}</span>` : ""}${possibleDuplicate}</td>
       <td>${esc(article.publisher)}</td><td>${esc(article.author || "—")}</td>
       <td>${esc(formatPublishedDateTime(article.published_at, false))}</td><td>${esc(formatUtcDateTime(article.approved_at, false))}</td>
-      <td><span class="media-title-status media-title-status--${esc(titleState)}">${esc(titleLabel)}</span><button type="button" class="media-ai-disclosure" data-toggle-ai aria-expanded="${isExpanded}">${isExpanded ? "▴ Title" : "▾ Title"}</button></td><td>${statusControl(article)}</td></tr>${isExpanded ? `<tr class="media-ai-expanded"><td colspan="9">${inlineAiReview(article)}</td></tr>` : ""}`;
+      <td><span class="media-title-status media-title-status--${esc(titleState)}">${esc(titleLabel)}</span><button type="button" class="media-ai-disclosure" data-toggle-ai aria-expanded="${isExpanded}">${isExpanded ? "▴ Title" : "▾ Title"}</button></td><td>${statusControl(article)}</td></tr>${isExpanded ? `<tr class="media-ai-expanded"><td colspan="9">${titleEditorHtml(article)}</td></tr>` : ""}`;
   }
 
   function bulkToolbarHtml() {
@@ -535,7 +577,7 @@
     }
   }
 
-  async function refreshArticleTable(append = false) {
+  async function refreshArticleTable(append = false, savedNotice = "") {
     const table = state.root.querySelector("[data-article-table]");
     if (!table) return;
     const refreshSequence = ++articleRefreshSequence;
@@ -556,7 +598,10 @@
       bindArticleTableEvents();
     } catch (error) {
       if (refreshSequence !== articleRefreshSequence) return;
-      table.innerHTML = articleTableHtml(error.message || "Media admin unavailable.");
+      const detail = error.message || "Media admin unavailable.";
+      table.innerHTML = articleTableHtml(savedNotice
+        ? `${savedNotice} The article list could not be refreshed. ${detail}`
+        : detail);
       bindArticleTableEvents();
     } finally {
       if (refreshSequence === articleRefreshSequence) table.removeAttribute("aria-busy");
@@ -826,7 +871,7 @@
       const table = state.root.querySelector("[data-article-table]"); table.innerHTML = articleTableHtml(); bindArticleTableEvents(); hydrateAiPreviewDetails();
     }));
     state.root.querySelectorAll("[data-media-thumb]").forEach(image => image.addEventListener("error", () => { image.outerHTML = `<span class="media-thumb-fallback">Image unavailable</span>`; }, { once: true }));
-    bindAiActions();
+    state.root.querySelectorAll("[data-ai-id]").forEach(editor => bindTitleEditor(editor));
     hydrateAiPreviewDetails();
     refreshSelectionControls();
   }
@@ -987,6 +1032,7 @@
   }
 
   async function addManualArticle(form, result, initialStatus) {
+    const detailSequence = articleDetailSequence;
     const values = new FormData(form);
     const published = String(values.get("published_at") || "");
     const status = initialStatus === "approved" ? "approved" : "pending";
@@ -1001,13 +1047,20 @@
       result.innerHTML = message(status === "approved"
         ? "Article added and approved with manual provenance."
         : "Article added as Pending.", "success");
-      await renderArticles(false); await openArticle(data.article.id);
+      await renderArticles(false);
+      if (detailSequence === articleDetailSequence) await openArticle(data.article.id);
     } catch (error) { result.insertAdjacentHTML("afterbegin", message(error.message, "error")); }
   }
 
   function detailDialog() {
     let dialog = document.getElementById("media-article-detail");
-    if (!dialog) { dialog = document.createElement("dialog"); dialog.id = "media-article-detail"; dialog.className = "media-detail"; document.body.appendChild(dialog); }
+    if (!dialog) {
+      dialog = document.createElement("dialog");
+      dialog.id = "media-article-detail";
+      dialog.className = "media-detail";
+      dialog.setAttribute("aria-labelledby", "media-article-detail-title");
+      document.body.appendChild(dialog);
+    }
     return dialog;
   }
 
@@ -1579,8 +1632,11 @@
     const sequence = ++articleDetailSequence;
     clearBulkSocialSelection();
     const dialog = detailDialog();
-    dialog.innerHTML = `<div class="media-detail__inner"><div class="media-loading">Loading article…</div></div>`;
+    dialog.innerHTML = `<div class="media-detail__inner"><div class="media-detail__header"><h3 id="media-article-detail-title">Loading article…</h3><button type="button" class="media-button" data-close-detail>Close</button></div></div>`;
+    const loadingClose = dialog.querySelector("[data-close-detail]");
+    loadingClose.addEventListener("click", () => dialog.close());
     if (!dialog.open) dialog.showModal();
+    else loadingClose.focus({ preventScroll: true });
     try {
       const [data, facebookData] = await Promise.all([
         request(`articles/${id}`), request("facebook/settings").catch(() => null),
@@ -1590,31 +1646,32 @@
       const guardianRouteKeys = article.source_key === "the-guardian"
         ? [...new Set((data.discovery_evidence || []).map(item => item.route_key).filter(Boolean))]
         : [];
-      const detailAiActions = article.ai_title_suggestion_state === "pending"
-        ? `<button type="button" class="media-button media-button--primary" data-detail-ai-decision="accept-ai">Accept AI title</button><button type="button" class="media-button" data-detail-ai-decision="reject-ai">Reject AI / use original</button>` : "";
       const publicationInputs = publicationDateInputs(article.published_at);
       const imageUrl = articleImageUrl(article);
       const imageState = articleImageState(article);
       const localImageControls = article.image_policy === "local_copy_permitted" &&
         article.source_image_policy === "local_copy_permitted"
         ? `<section><h4>Retained local image</h4><p class="media-image-state media-image-state--${esc(imageState[0])}">${esc(imageState[1])}</p>${article.local_image?.exists ? `<dl class="media-local-image-meta"><dt>Type</dt><dd>${esc(article.local_image.content_type)}</dd><dt>Size</dt><dd>${esc(Number(article.local_image.byte_size || 0).toLocaleString("en-GB"))} bytes</dd><dt>Stored</dt><dd>${esc(formatUtcDateTime(article.local_image.stored_at))}</dd><dt>Acquisition</dt><dd>${esc(article.local_image.acquisition_method)}</dd></dl>` : `<p class="media-subtext">A retained copy is required for reliable Bluesky posting. Upload only when copying permission has been recorded for both the source and article.</p>`}<form class="media-inline-form" data-local-image-upload><label class="media-field media-field--grow"><span>${article.local_image?.exists ? "Replacement image" : "Image file"}</span><input name="image" type="file" accept="image/jpeg,image/png,image/webp" required></label><button type="submit" class="media-button media-button--primary">${article.local_image?.exists ? "Replace retained image" : "Upload retained image"}</button>${article.local_image?.exists ? `<button type="button" class="media-button media-button--danger" data-remove-local-image>Remove retained image</button>` : ""}</form><p class="media-subtext">JPEG, PNG or WebP · maximum 5 MiB. The destination is fixed to this article.</p><div data-local-image-message></div></section>` : "";
-      dialog.innerHTML = `<div class="media-detail__inner"><div class="media-detail__header"><div><h3>${esc(article.display_title || article.title)}</h3><p>${esc(article.publisher)} · ${esc(STATUS_LABELS[article.status] || article.status)}</p></div><button class="media-button" data-close-detail>Close</button></div>${notice ? message(notice, "success") : ""}
+      const restoreCloseFocus = document.activeElement === loadingClose;
+      dialog.innerHTML = `<div class="media-detail__inner"><div class="media-detail__header"><div><h3 id="media-article-detail-title">${esc(article.display_title || article.title)}</h3><p>${esc(article.publisher)} · ${esc(STATUS_LABELS[article.status] || article.status)}</p></div><button type="button" class="media-button" data-close-detail>Close</button></div>${notice ? message(notice, "success") : ""}
         <div class="media-detail__grid"><div>${article.admin_preview_image_path && imageUrl ? `<img class="media-detail__preview" src="${esc(imageUrl)}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}<span class="media-image-state media-image-state--${esc(imageState[0])}">${esc(imageState[1])}</span></div>
-        <dl><dt>Original title</dt><dd>${esc(article.title)}</dd><dt>Display title</dt><dd>${esc(article.display_title || "Publisher original")}</dd><dt>Title Status</dt><dd>${esc(titleStatus(article)[1])}</dd><dt>Title origin</dt><dd>${esc(article.display_title_origin || "original")}</dd><dt>${esc(aiSuggestionLabel(article))}</dt><dd>${esc(article.ai_title_suggestion || "—")}</dd><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatPublishedDateTime(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatUtcDateTime(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatUtcDateTime(article.approved_at))}</dd><dt>Updated</dt><dd>${esc(formatUtcDateTime(article.updated_at))}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
-        <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div>${socialSelectionHtml("manual", articleSocialOptions(data, article, facebookData), true)}<div data-detail-status-message></div></section>
+        <dl><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatPublishedDateTime(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatUtcDateTime(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatUtcDateTime(article.approved_at))}</dd><dt>Updated</dt><dd data-detail-updated>${esc(formatUtcDateTime(article.updated_at))}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
+        <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div>${socialSelectionHtml("manual", articleSocialOptions(data, article, facebookData), true)}<div data-detail-status-message aria-live="polite"></div></section>
         ${possibleDuplicateDetailHtml(data.possible_duplicate)}
+        <section><h4>Title</h4>${titleEditorHtml(article)}</section>
         ${directPublishHtml(data, article)}
         ${blueskyHistoryHtml(data, article)}
         ${facebookHistoryHtml(data, article)}
         ${threadsHistoryHtml(data)}
         <section><h4>Author</h4><form class="media-inline-form" data-detail-author><label class="media-field media-field--grow"><span>Author</span><input name="author" maxlength="500" value="${esc(article.author || "")}" autocomplete="off"></label><button class="media-button media-button--primary">Save Author</button></form><p class="media-subtext">Single line, maximum 500 characters. Saving a blank value clears the authoritative Author.</p><div data-detail-author-message></div></section>
         <section><h4>Publication date</h4><form class="media-inline-form" data-detail-publication-date><label class="media-field media-field--grow"><span>Publication date</span><input name="publication_date" type="date" value="${esc(publicationInputs.date)}"></label><label class="media-field media-field--grow"><span>Publication time (UTC, optional)</span><input name="publication_time" type="time" value="${esc(publicationInputs.time)}"></label><button class="media-button media-button--primary" data-save-publication-date>Save publication date</button>${article.published_at ? `<button type="button" class="media-button" data-clear-publication-date>Clear publication date</button>` : ""}</form><div data-detail-publication-date-message></div></section>
-        <section><h4>Display title</h4><p>${esc(aiSuggestionLabel(article))}${article.ai_title_generated_at ? ` · ${esc(formatUtcDateTime(article.ai_title_generated_at))}${article.ai_title_model ? ` · ${esc(article.ai_title_model)}` : ""}` : ""}</p><p>${esc(article.ai_title_suggestion || "—")}</p><div class="media-actions"><button type="button" class="media-button" data-detail-generate-ai>${article.ai_title_suggestion ? "Refresh AI title" : "Generate AI title"}</button>${detailAiActions}</div><form class="media-inline-form" data-detail-title><label class="media-field media-field--grow"><span>Human display title</span><input name="display_title" maxlength="500" value="${esc(article.display_title || "")}"></label><button class="media-button media-button--primary">Save human title</button><button type="button" class="media-button" data-clear-title>Use publisher original</button></form><div data-detail-title-message></div></section>
         ${articleImagePolicyHtml(article)}
         ${localImageControls}
         <section><h4>Reload metadata</h4><p>Fetches only source-policy-permitted bounded presentation metadata. Preview happens before mutation.</p>${article.source_key === "the-guardian" ? `<label class="media-field"><span>Guardian RSS route</span><select data-guardian-route>${guardianRouteKeys.length ? guardianRouteKeys.map(route => `<option value="${esc(route)}">${esc(route)}</option>`).join("") : `<option value="">No stored route evidence</option>`}</select></label>` : ""}<button class="media-button" data-reload-metadata>Reload metadata</button><div data-metadata-result></div></section>
         <section><details><summary>Discovery evidence and recent events (raw ISO UTC)</summary><pre>${esc(JSON.stringify({ discovery_evidence: data.discovery_evidence, events: data.events }, null, 2))}</pre></details></section></div>`;
-      dialog.querySelector("[data-close-detail]")?.addEventListener("click", () => dialog.close());
+      const close = dialog.querySelector("[data-close-detail]");
+      close.addEventListener("click", () => dialog.close());
+      if (restoreCloseFocus) close.focus({ preventScroll: true });
       const detailStatus = dialog.querySelector("[data-detail-status]");
       detailStatus?.querySelector("select")?.addEventListener("change", event => {
         const button = detailStatus.querySelector("button");
@@ -1644,10 +1701,7 @@
       dialog.querySelector("[data-detail-author]")?.addEventListener("submit", event => { event.preventDefault(); void saveDetailAuthor(id, new FormData(event.currentTarget).get("author"), dialog); });
       dialog.querySelector("[data-detail-publication-date]")?.addEventListener("submit", event => { event.preventDefault(); void savePublicationDate(id, event.currentTarget, dialog); });
       dialog.querySelector("[data-clear-publication-date]")?.addEventListener("click", () => void clearPublicationDate(id, dialog));
-      dialog.querySelector("[data-detail-title]")?.addEventListener("submit", event => { event.preventDefault(); void saveDetailTitle(id, new FormData(event.currentTarget).get("display_title"), dialog); });
-      dialog.querySelector("[data-clear-title]")?.addEventListener("click", () => void saveDetailTitle(id, null, dialog));
-      dialog.querySelector("[data-detail-generate-ai]")?.addEventListener("click", event => void generateDetailAiTitle(id, event.currentTarget, dialog));
-      dialog.querySelectorAll("[data-detail-ai-decision]").forEach(button => button.addEventListener("click", () => void decideDetailAiTitle(id, button.dataset.detailAiDecision, dialog)));
+      bindDetailTitleEditor(dialog, article);
       dialog.querySelector("[data-reload-metadata]")?.addEventListener("click", () => void reloadMetadata(id, article, dialog));
       dialog.querySelector("[data-article-image-policy]")?.addEventListener("submit", event => {
         event.preventDefault(); void saveArticleImagePolicy(id, article, event.currentTarget, dialog);
@@ -1663,8 +1717,21 @@
       dialog.querySelector(".media-detail__preview[src]")?.addEventListener("error", event => { event.currentTarget.outerHTML = `<div class="media-thumb-fallback media-detail__preview">Image unavailable</div>`; }, { once: true });
     } catch (error) {
       if (!dialog.open || sequence !== articleDetailSequence) return;
-      dialog.innerHTML = `<div class="media-detail__inner">${message(error.message, "error")}<button class="media-button" onclick="this.closest('dialog').close()">Close</button></div>`;
+      dialog.innerHTML = `<div class="media-detail__inner"><h3 id="media-article-detail-title">Article details unavailable</h3>${message(error.message, "error")}<button type="button" class="media-button" data-close-detail>Close</button></div>`;
+      const close = dialog.querySelector("[data-close-detail]");
+      close.addEventListener("click", () => dialog.close());
+      close.focus({ preventScroll: true });
     }
+  }
+
+  function refreshOpenArticle(dialog, id, notice, output) {
+    const detail = output.closest(".media-detail__inner");
+    if (!dialog.open || dialog.firstElementChild !== detail) return;
+    if (detail.querySelector('[data-detail-status][aria-busy="true"]')) {
+      output.innerHTML = message(notice, "success");
+      return;
+    }
+    return openArticle(id, notice);
   }
 
   async function saveArticleImagePolicy(id, article, form, dialog) {
@@ -1685,11 +1752,11 @@
       await request(`articles/${id}/image-policy`, { method: "PUT", idempotent: "image_policy",
         revision: article.revision, body });
       await renderArticles(false);
-      await openArticle(id, imagePolicy === article.image_policy
+      await refreshOpenArticle(dialog, id, imagePolicy === article.image_policy
         ? imagePolicy === "local_copy_permitted"
           ? "Local-copy permission confirmed."
           : "Article image policy is unchanged."
-        : "Article image policy updated.");
+        : "Article image policy updated.", output);
     } catch (error) { button.disabled = false; output.innerHTML = message(error.message, "error"); }
   }
 
@@ -1715,8 +1782,8 @@
       await binaryRequest(`articles/${id}/local-image`, { method: "PUT", idempotent: "local_image",
         revision: article.revision, headers: { "Content-Type": file.type }, body: file });
       await renderArticles(false);
-      await openArticle(id, article.local_image?.exists
-        ? "Retained local image replaced." : "Retained local image uploaded.");
+      await refreshOpenArticle(dialog, id, article.local_image?.exists
+        ? "Retained local image replaced." : "Retained local image uploaded.", output);
     } catch (error) { button.disabled = false; output.innerHTML = message(error.message, "error"); }
   }
 
@@ -1728,24 +1795,42 @@
       await binaryRequest(`articles/${id}/local-image`, { method: "DELETE",
         idempotent: "local_image_remove", revision: article.revision });
       await renderArticles(false);
-      await openArticle(id, "Retained local image removed. Publisher provenance is unchanged.");
+      await refreshOpenArticle(dialog, id, "Retained local image removed. Publisher provenance is unchanged.", output);
     } catch (error) { button.disabled = false; output.innerHTML = message(error.message, "error"); }
   }
 
   async function saveDetailStatus(id, control, dialog) {
     const select = control.querySelector("select");
     const action = select.selectedOptions[0]?.dataset.action;
+    const button = control.querySelector("button");
     const output = dialog.querySelector("[data-detail-status-message]");
-    if (!action) return;
-    control.querySelector("button").disabled = true;
+    if (!action || button.disabled) return;
+    const body = socialSelectionBody(select.value === "approved" ? dialog.querySelector("[data-manual-social]") : null);
+    control.setAttribute("aria-busy", "true");
+    select.disabled = true;
+    button.disabled = true;
+    output.textContent = "";
+    let data;
     try {
-      const body = socialSelectionBody(select.value === "approved" ? dialog.querySelector("[data-manual-social]") : null);
-      await request(`articles/${id}/${action}`, { method: "POST", idempotent: "status", body });
-      await renderArticles(false);
-      await openArticle(id);
+      data = await request(`articles/${id}/${action}`, { method: "POST", idempotent: "status", body });
     } catch (error) {
-      control.querySelector("button").disabled = false;
+      control.removeAttribute("aria-busy");
+      select.disabled = false;
+      button.disabled = false;
       output.innerHTML = message(error.message, "error");
+      return;
+    }
+    let returnFocus;
+    if (dialog.open && dialog.contains(control)) {
+      ++articleDetailSequence;
+      dialog.close();
+      returnFocus = document.activeElement;
+    }
+    updateArticleFromMutation(id, data?.article);
+    await refreshArticleTable(false, "Article status saved.");
+    if (returnFocus && !returnFocus.isConnected && document.activeElement === document.body) {
+      const headline = state.root.querySelector(`[data-article-id="${id}"] [data-open-article]`);
+      (headline || state.root.querySelector("[data-table-search] input"))?.focus();
     }
   }
 
@@ -1758,17 +1843,11 @@
     try {
       await request(`articles/${id}/publish`, { method: "POST", idempotent: "publish", body });
       await renderArticles(false);
-      await openArticle(id, "Selected social publication request(s) accepted.");
+      await refreshOpenArticle(dialog, id, "Selected social publication request(s) accepted.", output);
     } catch (error) {
       button.disabled = false;
       output.innerHTML = message(error.message, "error");
     }
-  }
-
-  async function saveDetailTitle(id, value, dialog) {
-    const output = dialog.querySelector("[data-detail-title-message]");
-    try { await request(`articles/${id}/display-title`, { method: "PUT", body: { display_title: value === null ? null : String(value) } }); output.innerHTML = message(value === null ? "Publisher original restored." : "Human display title saved.", "success"); void renderArticles(false); }
-    catch (error) { output.innerHTML = message(error.message, "error"); }
   }
 
   async function saveDetailAuthor(id, value, dialog) {
@@ -1789,7 +1868,7 @@
       });
       state.selectors = { publications: [], authors: [] };
       await renderArticles(false);
-      await openArticle(id, author === null ? "Author cleared." : "Author saved.");
+      await refreshOpenArticle(dialog, id, author === null ? "Author cleared." : "Author saved.", output);
     } catch (error) {
       saveButton.disabled = false;
       output.innerHTML = message(error.message, "error");
@@ -1809,7 +1888,7 @@
       });
       updateArticleFromMutation(id, data?.article);
       await renderArticles(false);
-      await openArticle(id, successMessage);
+      await refreshOpenArticle(dialog, id, successMessage, output);
     } catch (error) {
       buttons.forEach(button => { button.disabled = false; });
       output.innerHTML = message(error.message, "error");
@@ -1835,35 +1914,6 @@
 
   async function clearPublicationDate(id, dialog) {
     await updatePublicationDate(id, null, dialog, "Publication date cleared.");
-  }
-
-  async function generateDetailAiTitle(id, button, dialog) {
-    const output = dialog.querySelector("[data-detail-title-message]");
-    button.disabled = true; button.textContent = "Generating AI title…";
-    output.innerHTML = message("Generating one accounted AI title suggestion…");
-    try {
-      const data = await request(`articles/${id}/display-title/generate-ai`, { method: "POST", idempotent: "ai-title" });
-      updateArticleFromMutation(id, data.article);
-      rerenderArticleTable();
-      void refreshAiUsage();
-      await openArticle(id, data.generation?.outcome === "no_change"
-        ? "AI found no useful title change; the matching suggestion is pending for review."
-        : "AI title suggestion generated and left pending for review.");
-    } catch (error) {
-      button.disabled = false;
-      button.textContent = "Generate / refresh AI title";
-      output.innerHTML = message(error.message, "error");
-    }
-  }
-
-  async function decideDetailAiTitle(id, action, dialog) {
-    const output = dialog.querySelector("[data-detail-title-message]");
-    try {
-      const data = await request(`articles/${id}/display-title/${action}`, { method: "POST" });
-      updateArticleFromMutation(id, data.article);
-      rerenderArticleTable();
-      await openArticle(id, "Title decision saved.");
-    } catch (error) { output.innerHTML = message(error.message, "error"); }
   }
 
   async function reloadMetadata(id, article, dialog) {
@@ -1966,46 +2016,105 @@
     current.outerHTML = aiUsageHtml();
   }
 
-  function bindAiActions() {
-    state.root.querySelectorAll("[data-ai-edit]").forEach(input => input.addEventListener("input", () => {
-      const row = input.closest("[data-ai-id]");
-      const title = input.value.trim() || row?.dataset.publisherTitle || "";
-      row?.querySelectorAll("[data-ai-preview-title]").forEach(preview => { preview.textContent = displayTitleWrapping(title); });
-    }));
-    state.root.querySelectorAll("[data-ai-preview-image]").forEach(image => image.addEventListener("error", () => image.remove(), { once: true }));
-    state.root.querySelectorAll("[data-ai-action]").forEach(button => button.addEventListener("click", async () => {
-      const row = button.closest("[data-ai-id]"); const id = row.dataset.aiId; const action = button.dataset.aiAction; const output = row.querySelector("[data-ai-message]");
-      const originalButtonText = button.textContent;
+  function bindDetailTitleEditor(dialog, article) {
+    const editor = dialog.querySelector("[data-ai-id]");
+    bindTitleEditor(editor, (changed, action) => {
+      if (!dialog.open || !editor.isConnected) return;
+      const restoreFocus = editor.contains(document.activeElement) ||
+        document.activeElement === dialog || document.activeElement === document.body;
+      Object.assign(article, changed);
+      dialog.querySelector("#media-article-detail-title").textContent = article.display_title || article.title;
+      dialog.querySelector("[data-detail-updated]").textContent = formatUtcDateTime(article.updated_at);
+      editor.outerHTML = titleEditorHtml(article);
+      bindDetailTitleEditor(dialog, article);
+      if (restoreFocus) {
+        const nextEditor = dialog.querySelector("[data-ai-id]");
+        const target = nextEditor.querySelector(`[data-ai-action="${action}"]`) || nextEditor.querySelector("[data-ai-edit]");
+        target.focus({ preventScroll: true });
+      }
+    });
+  }
+
+  function bindTitleEditor(editor, onSaved) {
+    const original = editor.querySelector("[data-original-title]");
+    const display = editor.querySelector("[data-ai-edit]");
+    const publisherTitle = JSON.parse(editor.dataset.publisherTitle);
+    const updatePreviews = () => {
+      const title = display.value.trim() || original.value.trim() || publisherTitle;
+      editor.querySelectorAll("[data-ai-preview-title]").forEach(preview => {
+        preview.textContent = displayTitleWrapping(title);
+      });
+    };
+    original.addEventListener("input", updatePreviews);
+    display.addEventListener("input", updatePreviews);
+    const image = editor.querySelector("[data-ai-preview-image]");
+    image?.addEventListener("error", () => image.remove(), { once: true });
+
+    const save = async button => {
+      if (button.disabled) return;
+      const id = editor.dataset.aiId;
+      const action = button.dataset.aiAction;
+      const output = editor.querySelector("[data-ai-message]");
+      const title = original.value.trim();
+      if (action === "save-original" &&
+          (!title || title.length > 1000 || /[\p{Cc}\u2028\u2029]/u.test(original.value))) {
+        output.innerHTML = message("Enter a single-line original title of 1 to 1,000 characters.", "error");
+        original.focus();
+        return;
+      }
+      const controls = editor.querySelectorAll("button, input");
+      const buttonText = button.textContent;
+      controls.forEach(control => { control.disabled = true; });
+      let data;
+      let notice;
       try {
-        let data;
-        if (action === "generate") {
-          button.disabled = true; button.textContent = "Generating AI title…";
+        if (action === "save-original") {
+          data = await request(`articles/${id}/original-title`, { method: "PUT", idempotent: "original-title",
+            revision: editor.dataset.articleRevision, body: { title: original.value, expected_title: publisherTitle } });
+          notice = data.changed ? "Original title saved." : "Original title is unchanged.";
+        } else if (action === "generate") {
+          button.textContent = "Generating AI title…";
           output.innerHTML = message("Generating one accounted AI title suggestion…");
           data = await request(`articles/${id}/display-title/generate-ai`, { method: "POST", idempotent: "ai-title" });
-          state.titleMessages.set(String(id), { text: data.generation?.outcome === "no_change"
+          notice = data.generation?.outcome === "no_change"
             ? "AI found no useful title change; the matching suggestion is pending for review."
-            : "AI title suggestion generated and left pending for review.", kind: "success" });
+            : "AI title suggestion generated and left pending for review.";
           void refreshAiUsage();
-        }
-        if (action === "accept-ai" || action === "reject-ai") {
+        } else if (action === "accept-ai" || action === "reject-ai") {
           data = await request(`articles/${id}/display-title/${action}`, { method: "POST" });
-          state.titleMessages.set(String(id), { text: "Title decision saved.", kind: "success" });
+          notice = "Title decision saved.";
+        } else {
+          const clear = action === "clear";
+          data = await request(`articles/${id}/display-title`, { method: "PUT",
+            body: { display_title: clear ? null : display.value } });
+          notice = clear ? "Publisher original restored." : "Human display title saved.";
         }
-        if (action === "edit") {
-          data = await request(`articles/${id}/display-title`, { method: "PUT", body: { display_title: row.querySelector("[data-ai-edit]").value } });
-          state.titleMessages.set(String(id), { text: "Human display title saved.", kind: "success" });
-        }
-        if (action === "clear") {
-          data = await request(`articles/${id}/display-title`, { method: "PUT", body: { display_title: null } });
-          state.titleMessages.set(String(id), { text: "Publisher original restored.", kind: "success" });
-        }
-        updateArticleFromMutation(id, data?.article);
-        rerenderArticleTable();
       } catch (error) {
-        button.disabled = false; button.textContent = originalButtonText;
-        output.innerHTML = message(error.message, "error");
+        const detail = action === "save-original" && error.message === "article_revision_changed"
+          ? "This article changed. Copy your correction, then refresh Articles or reopen the pop-up to load the current title."
+          : error.message;
+        output.innerHTML = message(detail, "error");
+        controls.forEach(control => { control.disabled = false; });
+        button.textContent = buttonText;
+        if (editor.contains(document.activeElement) || document.activeElement === document.body) {
+          button.focus({ preventScroll: true });
+        }
+        return;
       }
-    }));
+      state.titleMessages.set(id, { text: notice, kind: "success" });
+      updateArticleFromMutation(id, data.article);
+      onSaved?.(data.article, action);
+      if (action === "save-original") await refreshArticleTable(false, notice);
+      else rerenderArticleTable();
+    };
+    editor.addEventListener("submit", event => {
+      event.preventDefault();
+      void save(event.submitter || event.target.querySelector("button[type='submit']"));
+    });
+    editor.addEventListener("click", event => {
+      const button = event.target.closest("button[data-ai-action]:not([type='submit'])");
+      if (button) void save(button);
+    });
   }
 
   function runsState(kind) {
