@@ -16,7 +16,7 @@ export const WORKER_HTTP_SECRET_BINDING_PATTERN = /^UK_AQ_[A-Z0-9_]*WORKER_HTTP_
 const SCHEDULER_GRACE_MS = 10 * MINUTE_MS;
 const MAX_RECOVERY_LOOKBACK_MINUTES = 360;
 const RECOVERY_HTTP_TIMEOUT_MS = 5_000;
-const HEALTH_ROW_LIMIT = 100;
+const RECOVERY_HISTORY_ROW_LIMIT = 100;
 const MAX_RECORDED_FAILURES = 8;
 const SCHEDULER_TRIGGER_HEADER = "x-uk-aq-scheduler-trigger";
 const SCHEDULER_TRIGGER_SECRET_MAX_LENGTH = 512;
@@ -532,14 +532,6 @@ export function createSchedulerStore(db) {
       );
     },
 
-    listRecoveryJobs(context) {
-      return read(
-        `select job_key, cron_expr, enabled, dry_run, recovery_lookback_minutes, updated_at
-         from scheduler_jobs where recovery_lookback_minutes > 0 order by job_key`,
-        [], context, "list_recovery_jobs",
-      );
-    },
-
     async claimDispatch(claim, context, recoveryPolicy) {
       const values = [
         claim.job_key, claim.due_at, claim.claimed_at, claim.target_type, claim.dry_run,
@@ -585,40 +577,7 @@ export function createSchedulerStore(db) {
         `select id, due_at, claimed_at, dispatch_status, reason, response_status
          from scheduler_dispatches where job_key = ? and due_at >= ? and due_at < ?
          order by due_at limit ?`,
-        [jobKey, start, end, HEALTH_ROW_LIMIT + 1], context, "list_job_dispatches",
-      );
-    },
-
-    async countClaimedMinutes(start, end, context) {
-      const [row] = await read(
-        `select count(*) as minutes_claimed from scheduler_runs
-         where scheduler_name = ? and minute_slot >= ? and minute_slot < ?`,
-        [SCHEDULER_NAME, start, end], context, "count_claimed_minutes",
-      );
-      if (!Number.isSafeInteger(row?.minutes_claimed)) throw new Error("Scheduler minute coverage unavailable");
-      return row.minutes_claimed;
-    },
-
-    listUnhealthyRuns(start, end, grace, context) {
-      return read(
-        `select id, minute_slot, status, jobs_failed, error_message
-         from scheduler_runs
-         where scheduler_name = ? and minute_slot >= ? and minute_slot < ?
-           and (status = 'failed' or jobs_failed > 0 or (status = 'started' and minute_slot <= ?))
-         order by minute_slot limit ?`,
-        [SCHEDULER_NAME, start, end, grace, HEALTH_ROW_LIMIT + 1], context, "list_unhealthy_runs",
-      );
-    },
-
-    listUnhealthyDispatches(start, end, grace, context) {
-      return read(
-        `select id, job_key, due_at, claimed_at, dispatched_at, dispatch_status, reason, response_status
-         from scheduler_dispatches where due_at >= ? and due_at < ?
-           and (dispatch_status = 'failed'
-             or (dispatch_status = 'claimed' and julianday(claimed_at) <= julianday(?))
-             or (dispatch_status != 'claimed' and substr(reason, 1, 9) = 'recovery_'))
-         order by due_at, job_key limit ?`,
-        [start, end, grace, HEALTH_ROW_LIMIT + 1], context, "list_unhealthy_dispatches",
+        [jobKey, start, end, RECOVERY_HISTORY_ROW_LIMIT + 1], context, "list_job_dispatches",
       );
     },
   };
@@ -948,7 +907,7 @@ async function recoverMissedDispatch(store, jobs, env, context, failures, nowMs)
       phase = "list_job_dispatches";
       const prior = await store.listJobDispatches(job.job_key, slots.at(-1), nowIso(latestDueMs + 1), slotContext);
       // A truncated history must not make an existing row look absent.
-      if (prior.length > HEALTH_ROW_LIMIT) throw new Error("Scheduler dispatch history truncated");
+      if (prior.length > RECOVERY_HISTORY_ROW_LIMIT) throw new Error("Scheduler dispatch history truncated");
       const recorded = new Set(prior.map((row) => row.due_at));
       const dueAt = slots.find((slot) => !recorded.has(slot));
       if (!dueAt) continue;
@@ -1062,105 +1021,6 @@ export async function runScheduler(
   };
 }
 
-async function schedulerHealth(store, startMs, endMs) {
-  const nowMs = Date.now();
-  const start = nowIso(startMs);
-  const end = nowIso(Math.min(endMs, nowMs));
-  const grace = nowIso(nowMs - SCHEDULER_GRACE_MS);
-  const coverageEndMs = Math.min(endMs, nowMs - SCHEDULER_GRACE_MS + 1);
-  const expectedMinutes = Math.max(0, Math.ceil(coverageEndMs / MINUTE_MS) - Math.ceil(startMs / MINUTE_MS));
-  const context = { scheduler_name: SCHEDULER_NAME, window_start: start, window_end: end };
-  const [runs, dispatches, policies, claimedMinutes] = await Promise.all([
-    store.listUnhealthyRuns(start, end, grace, context),
-    store.listUnhealthyDispatches(start, end, grace, context),
-    store.listRecoveryJobs(context),
-    expectedMinutes ? store.countClaimedMinutes(start, nowIso(coverageEndMs), context) : 0,
-  ]);
-  let complete = runs.length <= HEALTH_ROW_LIMIT && dispatches.length <= HEALTH_ROW_LIMIT;
-  const diagnostics = [];
-  if (claimedMinutes < expectedMinutes) {
-    diagnostics.push({
-      slot: start, state: "minutes_without_claims", missing_minutes: expectedMinutes - claimedMinutes,
-    });
-  }
-  for (const run of runs.slice(0, HEALTH_ROW_LIMIT)) {
-    const base = { slot: run.minute_slot, run_id: run.id };
-    if (run.status === "started") {
-      diagnostics.push({ ...base, state: "minute_incomplete" });
-      continue;
-    }
-
-    let detail;
-    try {
-      detail = JSON.parse(run.error_message);
-    } catch {
-      // Legacy runs can contain arbitrary provider messages. Never return them.
-    }
-    const failures = Array.isArray(detail?.failures) ? detail.failures.slice(0, MAX_RECORDED_FAILURES) : [];
-    diagnostics.push({
-      ...base, state: "minute_errors", failures: detail?.total ?? run.jobs_failed,
-    });
-    for (const failure of failures) {
-      if (!/^[a-z_]{1,40}$/.test(failure?.phase) || !/^[a-z_]{1,40}$/.test(failure?.error_class)) continue;
-      diagnostics.push({
-        ...base,
-        slot: failure.due_at ?? base.slot,
-        state: failure.error_class,
-        job_key: failure.job_key,
-        phase: failure.phase,
-        error_reference: failure.error_reference,
-      });
-    }
-  }
-  for (const row of dispatches.slice(0, HEALTH_ROW_LIMIT)) {
-    let state;
-    if (row.dispatch_status === "claimed") {
-      state = "claim_past_grace_outcome_unknown";
-    } else if (/^recovery_[a-z_0-9]{1,80}$/.test(row.reason)) {
-      state = row.reason;
-    } else if (row.reason === "external_submission_outcome_unknown" || row.response_status >= 500
-        || row.response_status === 408 || (row.response_status === null
-          && !row.reason?.startsWith("Missing required Worker secret:"))) {
-      state = "submission_outcome_unknown";
-    } else {
-      state = "dispatch_failed";
-    }
-    diagnostics.push({
-      slot: row.due_at, job_key: row.job_key, state, dispatch_id: row.id,
-      http_status: row.response_status, dispatched_at: row.dispatched_at,
-    });
-  }
-  for (const job of policies) {
-    if (job.enabled !== 1 || job.dry_run !== 0) continue;
-    const stopMs = Math.min(endMs - 1, nowMs - SCHEDULER_GRACE_MS);
-    const dueSlots = cronDueTimes(job.cron_expr, startMs - 1, stopMs);
-    if (!dueSlots.length) continue;
-    const receipts = await store.listJobDispatches(job.job_key, start, end, {
-      ...context, job_key: job.job_key,
-    });
-    if (receipts.length > HEALTH_ROW_LIMIT) {
-      complete = false;
-      continue;
-    }
-    const recorded = new Set(receipts.map((row) => row.due_at));
-    for (const slot of dueSlots) {
-      if (recorded.has(slot)) continue;
-      const dueMs = Date.parse(slot);
-      const continuousPolicy = recoveryPolicyStart(job) < dueMs - DISPATCH_LEAD_MS;
-      const expired = nowMs - dueMs > job.recovery_lookback_minutes * MINUTE_MS;
-      const state = !continuousPolicy ? "review_policy_at_due_unconfirmed"
-        : expired ? "missed_recovery_window_expired" : "missed_dispatch_no_claim";
-      diagnostics.push({ slot, job_key: job.job_key, state });
-    }
-  }
-  diagnostics.sort((left, right) => left.slot.localeCompare(right.slot));
-  return {
-    complete: complete && diagnostics.length <= HEALTH_ROW_LIMIT,
-    grace_minutes: SCHEDULER_GRACE_MS / MINUTE_MS,
-    diagnostics: diagnostics.slice(0, HEALTH_ROW_LIMIT),
-  };
-}
-
 function getSchedulerStoreFromEnv(env) {
   return createSchedulerStore(env?.[D1_BINDING_NAME]);
 }
@@ -1206,25 +1066,6 @@ export default {
           trigger_source: TRIGGER_SOURCE_EXTERNAL_WATCHDOG,
           minute_slot: canonicalMinuteSlot(invokedAtMs),
         }, 500);
-      }
-    }
-    if (url.pathname === "/scheduler-health") {
-      if (request.method !== "GET") return new Response("Method not allowed", { status: 405 });
-      if (!await hasValidSchedulerTriggerSecret(request, env)) {
-        return jsonResponse({ ok: false, error: "unauthorized" }, 401);
-      }
-      const startMs = Date.parse(url.searchParams.get("start"));
-      const endMs = Date.parse(url.searchParams.get("end"));
-      if (!(startMs < endMs) || endMs - startMs > 24 * 60 * MINUTE_MS) {
-        return jsonResponse({ ok: false, error: "invalid_window" }, 400);
-      }
-      try {
-        const evidence = await schedulerHealth(getSchedulerStoreFromEnv(env), startMs, endMs);
-        return new Response(JSON.stringify({ ok: true, ...evidence }), {
-          headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
-        });
-      } catch {
-        return jsonResponse({ ok: false, error: "scheduler_evidence_unavailable" }, 503);
       }
     }
     if (url.pathname !== "/" && url.pathname !== "/health") {

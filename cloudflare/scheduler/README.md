@@ -244,10 +244,11 @@ existing deployment and job-sync workflows. Authorise the merge with that
 effect in mind. Authorise database changes, workflow dispatches, controlled
 fault injection and email sends separately.
 
-1. Record the deployed Worker version and current TEST job manifest. Confirm
-   TEST D1 has the historical Ops migrations 0001–0003, then apply the
-   companion TEST Schema migration once. From the Ops repository root, with
-   TEST Cloudflare credentials and a checkout of the approved Schema revision:
+1. Record the deployed Worker version and current TEST job manifest. The
+   operator has applied the additive migration from TEST Schema PR #32 and
+   verified that Black Carbon recovery is off in TEST D1. If provisioning a
+   separate existing TEST database that is still at historical Ops migrations
+   0001–0003, an authorised operator can apply the upgrade once with:
 
    ```bash
    npx --yes wrangler@4.130.0 d1 execute uk_aq_cron_scheduler_ops_db \
@@ -262,13 +263,8 @@ fault injection and email sends separately.
    is interrupted, inspect this state and apply only missing changes. Keep all
    existing minute and dispatch records.
 
-2. Set the Ops Actions variable `UK_AQ_OPS_SCHEDULER_URL` to the existing TEST
-   Worker's HTTPS origin, the same setting used by the watchdog. Use the
-   existing TEST `UK_AQ_SCHEDULER_TRIGGER_SECRET`. Confirm the existing GitHub
-   dispatch PAT can list runs for the configured Black Carbon workflow as
-   well as dispatch it. The health read requires the trigger secret and
-   returns only bounded scheduler diagnostics. A failed or truncated read
-   is identified in the email and report artifacts.
+2. Confirm the existing GitHub dispatch PAT can list runs for the configured
+   Black Carbon workflow as well as dispatch it.
 
 3. Before syncing the recovery opt-in, deploy the reviewed Ops PR branch
    through the existing `uk_aq_cloudflare_scheduler_ops_deploy.yml` workflow
@@ -326,14 +322,13 @@ fault injection and email sends separately.
 
 7. Inspect the private 10:00 UTC supplement or dispatch its existing preview
    from the reviewed revision with `report_type=supplement` and
-   `send_email=false`. Expect the same 07:00–10:00 task window, status
-   meanings and counts. Verify scheduler diagnostics for the recovered or
-   uncertain 08:00 slot, including time and D1 ID. For a genuinely unstarted
-   Black Carbon workflow, confirm the existing Missing entry and check that
-   scheduler evidence adds no task failure to the counts. With unavailable
-   scheduler evidence, the preview should explicitly say so and still
-   render the available task results. Confirm the normal authorised email
-   delivery through the existing SMTP workflow.
+   `send_email=false`. It uses the existing Supabase task definitions and
+   run records for the 07:00–10:00 UTC window. If Black Carbon has no
+   qualifying run for its expected 08:00 UTC execution, verify the existing
+   **Missing** entry in the Failed group. Investigate scheduler causes using
+   the D1 minute and dispatch records and structured Worker logs. The report
+   requires no scheduler API or additional email configuration. Confirm the
+   normal authorised email delivery through the existing SMTP workflow.
 
 ### Optional controlled TEST failures
 
