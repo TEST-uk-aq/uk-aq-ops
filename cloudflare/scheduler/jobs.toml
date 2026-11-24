@@ -191,4 +191,5 @@ github_repo = "TEST-uk-aq/uk-aq-ops"
 github_workflow_file = "uk_aq_ukair_bc_daily.yml"
 github_ref = "main"
 dry_run = false
+recovery_lookback_minutes = 360
 notes = "08:00 UTC BC/UV370 14-day R2 reconciliation followed by 2024-onwards diurnal publication"

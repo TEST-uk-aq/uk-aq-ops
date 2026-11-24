@@ -8,6 +8,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid
 import html
+from http.client import HTTPSConnection, HTTPException
 import json
 import os
 from pathlib import Path
@@ -17,7 +18,7 @@ import ssl
 import sys
 import tomllib
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 UTC = timezone.utc
@@ -27,6 +28,21 @@ SMTP_RELAY_HOST = "smtp-relay.gmail.com"  # Shared Google Workspace provider hos
 WHO_TASK_KEY = "ops.who_2021_daily"
 WHO_SCHEDULER_JOB = "uk_aq_who_2021_daily"
 SCHEDULER_MANIFEST = Path("cloudflare/scheduler/jobs.toml")
+SCHEDULER_RESPONSE_LIMIT = 96 * 1024
+SCHEDULER_STATES = {
+    "claim_past_grace_outcome_unknown": "Claim past grace period. Submission uncertain. Review required",
+    "dispatch_failed": "Dispatch attempt failed",
+    "minute_errors": "Scheduler minute recorded errors",
+    "minute_incomplete": "Scheduler minute still started after grace period",
+    "minutes_without_claims": "Reporting window has older minutes without a D1 claim",
+    "missed_dispatch_no_claim": "Confirmed missed dispatch. No claim recorded",
+    "missed_recovery_window_expired": "Confirmed missed dispatch. Recovery window expired. Review required",
+    "recovery_accepted": "Recovered dispatch accepted by GitHub",
+    "recovery_dispatch_failed": "Recovered dispatch request failed. Review required",
+    "recovery_outcome_unknown": "Recovered dispatch outcome uncertain. Review required",
+    "review_policy_at_due_unconfirmed": "Configuration at the due time could not be confirmed. Review required",
+    "submission_outcome_unknown": "Submission outcome uncertain. Review required",
+}
 MAILBOX = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_\x60{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
 
 
@@ -366,6 +382,71 @@ def period_title(period: dict) -> str:
             f"{period['end']:02d}:00 UTC")
 
 
+def fetch_scheduler_diagnostics(period: dict) -> list[str]:
+    unavailable = "Scheduler evidence unavailable. Check the private scheduler read path and Worker logs."
+    connection = None
+    try:
+        url = urlsplit(require_env("UK_AQ_OPS_SCHEDULER_URL"))
+        secret = require_env("UK_AQ_SCHEDULER_TRIGGER_SECRET")
+        if (url.scheme != "https" or not url.hostname or url.username or url.password
+                or url.path not in {"", "/"} or url.query or url.fragment):
+            return [unavailable]
+        midnight = datetime.combine(period["day"], time(), tzinfo=UTC)
+        start = (midnight + timedelta(hours=period["start"])).isoformat()
+        end = (midnight + timedelta(hours=period["end"])).isoformat()
+        connection = HTTPSConnection(url.hostname, port=url.port, timeout=12)
+        query = urlencode({"start": start, "end": end})
+        connection.request("GET", f"/scheduler-health?{query}", headers={
+            "Accept": "application/json", "x-uk-aq-scheduler-trigger": secret,
+        })
+        response = connection.getresponse()
+        if response.status != 200:
+            return [unavailable]
+        body = response.read(SCHEDULER_RESPONSE_LIMIT + 1)
+        if len(body) > SCHEDULER_RESPONSE_LIMIT:
+            return [unavailable]
+        evidence = json.loads(body)
+        if (not isinstance(evidence, dict) or evidence.get("ok") is not True
+                or type(evidence.get("complete")) is not bool
+                or not isinstance(evidence.get("diagnostics"), list)):
+            return [unavailable]
+    except (ValueError, OSError, RuntimeError, HTTPException):
+        return [unavailable]
+    finally:
+        if connection is not None:
+            connection.close()
+
+    lines = []
+    if not evidence["complete"]:
+        lines.append("Scheduler evidence incomplete. Diagnostic limit reached. Review D1 and Worker logs.")
+    for row in evidence["diagnostics"]:
+        if not isinstance(row, dict) or not utc_timestamp(row.get("slot")) or not isinstance(row.get("state"), str):
+            return [unavailable]
+        state = row["state"]
+        message = SCHEDULER_STATES.get(state, state.replace("_", " "))
+        if state.startswith("recovery_review_"):
+            message = f"Recovery held for operator review ({state.removeprefix('recovery_review_').replace('_', ' ')})"
+        fields = [f"{clock(row['slot'])} UTC", row.get("job_key") or "Ops scheduler", message]
+        if row.get("phase"):
+            fields.append(f"phase {row['phase']}")
+        if row.get("run_id"):
+            fields.append(f"D1 run #{row['run_id']}")
+        if row.get("dispatch_id"):
+            fields.append(f"D1 dispatch #{row['dispatch_id']}")
+        if row.get("http_status"):
+            fields.append(f"HTTP {row['http_status']}")
+        if row.get("dispatched_at"):
+            fields.append(f"request {clean(row['dispatched_at'], 30)}")
+        if row.get("error_reference"):
+            fields.append(f"reference {row['error_reference']}")
+        if row.get("missing_minutes"):
+            fields.append(f"{row['missing_minutes']} unrecorded minutes")
+        if row.get("failures"):
+            fields.append(f"{row['failures']} recorded errors")
+        lines.append(" | ".join(clean(field, 180) for field in fields))
+    return lines or ["No scheduler abnormalities recorded for slots past the grace period."]
+
+
 def plain_period(period: dict) -> str:
     lines = [period_title(period)]
     for group, title in (("failed", "FAILED"), ("warnings", "WARNINGS"), ("finished", "FINISHED")):
@@ -380,6 +461,9 @@ def plain_period(period: dict) -> str:
                 lines.append(f"  {entry['detail']}")
             if entry["link"]:
                 lines.append(f"  {entry['link']}")
+    if "scheduler_diagnostics" in period:
+        lines.append("\nSCHEDULER DIAGNOSTICS")
+        lines.extend(f"- {line}" for line in period["scheduler_diagnostics"])
     return "\n".join(lines)
 
 
@@ -414,6 +498,10 @@ def html_period(period: dict) -> str:
                 + "</td></tr>"
             )
         result.append("</table>")
+    if "scheduler_diagnostics" in period:
+        result.append('<h3 style="font-size:15px">Scheduler diagnostics</h3><ul>')
+        result.extend(f"<li>{html.escape(line)}</li>" for line in period["scheduler_diagnostics"])
+        result.append("</ul>")
     return "".join(result)
 
 
@@ -565,6 +653,9 @@ def main() -> int:
         )
         periods.append(build_period(report_day, 7, 10, rows, definitions,
                                     who_slots, check_missing=True, label="Today"))
+
+    for period in periods:
+        period["scheduler_diagnostics"] = fetch_scheduler_diagnostics(period)
 
     subject, plain, body = render(report_day, periods, args.report_type, environment)
     REPORT_DIR.mkdir(parents=True, exist_ok=True)

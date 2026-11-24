@@ -69,6 +69,9 @@ jobs:
         run: python3 -m py_compile scripts/daily_task_health_email.py
 
       - name: Generate report and optionally send via Google Workspace SMTP
+        env:
+          UK_AQ_OPS_SCHEDULER_URL: ${{ vars.UK_AQ_OPS_SCHEDULER_URL }}
+          UK_AQ_SCHEDULER_TRIGGER_SECRET: ${{ secrets.UK_AQ_SCHEDULER_TRIGGER_SECRET }}
         shell: bash
         run: |
           set -euo pipefail
