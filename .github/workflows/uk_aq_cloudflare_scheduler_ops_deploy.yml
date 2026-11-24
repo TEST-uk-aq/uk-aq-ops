@@ -9,7 +9,6 @@ on:
       - "cloudflare/scheduler/*.js"
       - "cloudflare/scheduler/*.cjs"
       - "cloudflare/scheduler/wrangler.toml"
-      - "cloudflare/scheduler/migrations/**"
       - "cloudflare/scheduler/seeds/**"
       - ".github/workflows/uk_aq_cloudflare_scheduler_ops_deploy.yml"
   workflow_dispatch:
@@ -66,12 +65,10 @@ jobs:
           set -euo pipefail
           for path in \
             cloudflare/scheduler/worker.mjs \
+            cloudflare/scheduler/d1.mjs \
             cloudflare/scheduler/shared.mjs \
             cloudflare/scheduler/wrangler.toml \
             cloudflare/scheduler/README.md \
-            cloudflare/scheduler/migrations/0001_scheduler_schema.sql \
-            cloudflare/scheduler/migrations/0002_scheduler_minute_slot_claim.sql \
-            cloudflare/scheduler/migrations/0003_worker_http_target.sql \
             cloudflare/scheduler/seeds/0001_github_jobs.sql
           do
             if [ ! -f "${path}" ]; then
@@ -103,11 +100,15 @@ jobs:
               raise SystemExit("Missing D1 database name uk_aq_cron_scheduler_ops_db")
           PY
 
-      - name: Apply scheduler D1 migrations
+      - name: Verify scheduler D1 schema prerequisites
         working-directory: cloudflare/scheduler
         run: |
           set -euo pipefail
-          npx --yes "wrangler@${WRANGLER_VERSION}" d1 migrations apply uk_aq_cron_scheduler_ops_db --remote
+          npx --yes "wrangler@${WRANGLER_VERSION}" d1 execute uk_aq_cron_scheduler_ops_db \
+            --remote --command "select recovery_lookback_minutes from scheduler_jobs limit 0;
+            select minute_slot, claim_token from scheduler_runs limit 0;
+            select worker_http_url from scheduler_jobs limit 0;
+            select claim_token from scheduler_dispatches limit 0;"
 
       - name: Deploy worker
         uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0

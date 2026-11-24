@@ -1,4 +1,5 @@
 import { jsonResponse, logJson, nowIso, readSecret } from "./shared.mjs";
+import { retryD1 } from "./d1.mjs";
 
 export const SCHEDULER_NAME = "uk-aq-cron-scheduler-ops";
 export const WORKER_NAME = "uk-aq-cron-scheduler-ops";
@@ -12,6 +13,11 @@ export const TRIGGER_SOURCE_CLOUDFLARE_CRON = "cloudflare_cron";
 export const TRIGGER_SOURCE_EXTERNAL_WATCHDOG = "external_watchdog";
 export const WORKER_HTTP_SECRET_BINDING_PATTERN = /^UK_AQ_[A-Z0-9_]*WORKER_HTTP_SECRET$/;
 
+const SCHEDULER_GRACE_MS = 10 * MINUTE_MS;
+const MAX_RECOVERY_LOOKBACK_MINUTES = 360;
+const RECOVERY_HTTP_TIMEOUT_MS = 5_000;
+const RECOVERY_HISTORY_ROW_LIMIT = 100;
+const MAX_RECORDED_FAILURES = 8;
 const SCHEDULER_TRIGGER_HEADER = "x-uk-aq-scheduler-trigger";
 const SCHEDULER_TRIGGER_SECRET_MAX_LENGTH = 512;
 const ALLOWED_TRIGGER_SOURCES = new Set([
@@ -418,268 +424,251 @@ function bindStatement(db, sql, params = []) {
 
 async function dbAll(db, sql, params = []) {
   const result = await bindStatement(db, sql, params).all();
-  return Array.isArray(result?.results) ? result.results : [];
+  if (result?.success === false || !Array.isArray(result?.results)) {
+    throw new Error(result?.error ?? "D1 returned no query results");
+  }
+  return result.results;
 }
 
 async function dbFirst(db, sql, params = []) {
-  const result = await bindStatement(db, sql, params).first();
-  return result ?? null;
+  return (await bindStatement(db, sql, params).first()) ?? null;
 }
 
 async function dbRun(db, sql, params = []) {
-  return bindStatement(db, sql, params).run();
+  const result = await bindStatement(db, sql, params).run();
+  if (result?.success === false || !Number.isInteger(result?.meta?.changes)) {
+    throw new Error(result?.error ?? "D1 returned no write receipt");
+  }
+  return result.meta;
 }
 
 export function createSchedulerStore(db) {
   const schedulerDb = requireD1Db(db);
+  const read = (sql, params, context, phase) => retryD1(
+    () => dbAll(schedulerDb, sql, params), { ...context, phase },
+  );
+
+  async function writeClaim(sql, params, lookup, lookupParams, context) {
+    const token = crypto.randomUUID();
+    const readClaim = () => dbFirst(schedulerDb, lookup, lookupParams);
+    return retryD1(
+      async () => {
+        const result = await dbRun(schedulerDb, sql, [...params, token]);
+        if (result.changes > 0 && result.last_row_id > 0) {
+          return { id: result.last_row_id, claim_token: token };
+        }
+        return readClaim();
+      },
+      context,
+      async () => (await readClaim()) ?? undefined,
+    ).then((row) => ({ row, owned: row?.claim_token === token }));
+  }
+
+  async function transition(table, id, statusColumn, initialStatus, patch, context) {
+    const fields = Object.keys(patch);
+    const values = Object.values(patch);
+    const verify = async () => {
+      const row = await dbFirst(schedulerDb, `select ${fields.join(", ")} from ${table} where id = ?`, [id]);
+      if (row?.[statusColumn] === initialStatus) {
+        return undefined;
+      }
+      if (!row || fields.some((field) => row[field] !== patch[field])) {
+        throw new Error("Scheduler D1 transition did not match durable state");
+      }
+      return true;
+    };
+    await retryD1(
+      async () => {
+        const result = await dbRun(
+          schedulerDb,
+          `update ${table} set ${fields.map((field) => `${field} = ?`).join(", ")}
+           where id = ? and ${statusColumn} = ?`,
+          [...values, id, initialStatus],
+        );
+        if (result.changes !== 1 && !await verify()) {
+          throw new Error("Scheduler D1 transition was not recorded");
+        }
+      },
+      context,
+      verify,
+    );
+  }
 
   return {
     async claimMinute(run) {
-      const result = await dbRun(
-        schedulerDb,
-        `
-          insert or ignore into scheduler_runs (
-            scheduler_name,
-            minute_slot,
-            trigger_source,
-            started_at,
-            status,
-            previous_run_started_at,
-            evaluation_window_start,
-            evaluation_window_end,
-            jobs_checked,
-            jobs_due,
-            jobs_claimed,
-            jobs_dispatched,
-            jobs_failed,
-            error_message
-          ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `,
+      const { row, owned } = await writeClaim(
+        `insert into scheduler_runs (
+          scheduler_name, minute_slot, trigger_source, started_at, status,
+          evaluation_window_start, evaluation_window_end, claim_token
+        ) values (?, ?, ?, ?, 'started', ?, ?, ?)
+        on conflict(scheduler_name, minute_slot) do nothing`,
         [
-          run.scheduler_name,
-          run.minute_slot,
-          run.trigger_source,
-          run.started_at,
-          run.status,
-          run.previous_run_started_at,
-          run.evaluation_window_start,
-          run.evaluation_window_end,
-          run.jobs_checked,
-          run.jobs_due,
-          run.jobs_claimed,
-          run.jobs_dispatched,
-          run.jobs_failed,
-          run.error_message,
+          run.scheduler_name, run.minute_slot, run.trigger_source, run.started_at,
+          run.evaluation_window_start, run.evaluation_window_end,
         ],
-      );
-      if (Number(result?.meta?.changes ?? 0) > 0) {
-        return {
-          claimed: true,
-          scheduler_run_id: Number(result?.meta?.last_row_id ?? 0) || null,
-          run_status: "started",
-          trigger_source: run.trigger_source,
-        };
-      }
-      const existing = await dbFirst(
-        schedulerDb,
-        `
-          select id, status, trigger_source
-          from scheduler_runs
-          where scheduler_name = ? and minute_slot = ?
-          limit 1
-        `,
+        `select id, status, trigger_source, claim_token from scheduler_runs
+         where scheduler_name = ? and minute_slot = ?`,
         [run.scheduler_name, run.minute_slot],
+        { scheduler_name: run.scheduler_name, minute_slot: run.minute_slot, phase: "claim_minute" },
       );
-      if (!existing) {
-        throw new Error("Scheduler minute claim was not recorded");
-      }
+      if (!row) throw new Error("Scheduler minute claim was not recorded");
       return {
-        claimed: false,
-        scheduler_run_id: Number(existing.id) || null,
-        run_status: boundedText(existing.status, 64) || "unknown",
-        trigger_source: boundedText(existing.trigger_source, 64) || null,
+        claimed: owned,
+        scheduler_run_id: row.id,
+        run_status: row.status ?? "started",
+        trigger_source: row.trigger_source ?? run.trigger_source,
       };
     },
 
-    async listEnabledJobs() {
-      return dbAll(
-        schedulerDb,
-        `
-          select
-            job_key,
-            enabled,
-            target_type,
-            cron_expr,
-            timezone,
-            github_repo,
-            github_workflow_file,
-            github_ref,
-            github_inputs_json,
-            cloud_run_url,
-            cloud_run_method,
-            cloud_run_headers_json,
-            cloud_run_body_json,
-            worker_http_url,
-            worker_http_secret_binding,
-            worker_http_body_json,
-            dry_run,
-            notes,
-            created_at,
-            updated_at
-          from scheduler_jobs
-          where enabled = 1
-          order by job_key
-        `,
+    listEnabledJobs(context) {
+      return read(
+        `select job_key, enabled, target_type, cron_expr, timezone,
+                github_repo, github_workflow_file, github_ref, github_inputs_json,
+                cloud_run_url, cloud_run_method, cloud_run_headers_json, cloud_run_body_json,
+                worker_http_url, worker_http_secret_binding, worker_http_body_json,
+                dry_run, recovery_lookback_minutes, updated_at
+         from scheduler_jobs where enabled = 1 order by job_key`,
+        [], context, "list_jobs",
       );
     },
 
-    async claimDispatch(claim) {
-      const result = await dbRun(
-        schedulerDb,
-        `
-          insert or ignore into scheduler_dispatches (
-            job_key,
-            due_at,
-            claimed_at,
-            dispatched_at,
-            target_type,
-            dry_run,
-            dispatch_status,
-            reason,
-            response_status,
-            response_preview
-          ) values (?, ?, ?, null, ?, ?, 'claimed', null, null, null)
-        `,
-        [
-          claim.job_key,
-          claim.due_at,
-          claim.claimed_at,
-          claim.target_type,
-          claim.dry_run,
-        ],
+    async claimDispatch(claim, context, recoveryPolicy) {
+      const values = [
+        claim.job_key, claim.due_at, claim.claimed_at, claim.target_type, claim.dry_run,
+      ];
+      // For recovery the policy read and claim can span a config sync. Recheck it
+      // in the INSERT itself so a stale policy cannot authorise a new claim.
+      const insertion = recoveryPolicy
+        ? `select ?, ?, ?, ?, ?, 'claimed', 'recovery_checking_history', input.token
+           from scheduler_jobs, (select ? as job_key, ? as updated_at, ? as lookback, ? as token) input
+           where scheduler_jobs.job_key = input.job_key and enabled = 1 and dry_run = 0
+             and scheduler_jobs.updated_at = input.updated_at
+             and recovery_lookback_minutes = input.lookback`
+        : "values (?, ?, ?, ?, ?, 'claimed', null, ?)";
+      if (recoveryPolicy) {
+        values.push(claim.job_key, recoveryPolicy.updated_at, recoveryPolicy.recovery_lookback_minutes);
+      }
+      const { row, owned } = await writeClaim(
+        `insert into scheduler_dispatches (
+          job_key, due_at, claimed_at, target_type, dry_run, dispatch_status, reason, claim_token
+        ) ${insertion}
+        on conflict(job_key, due_at) do nothing`,
+        values,
+        "select id, claim_token from scheduler_dispatches where job_key = ? and due_at = ?",
+        [claim.job_key, claim.due_at],
+        { ...context, phase: recoveryPolicy ? "claim_recovery" : "claim_dispatch" },
       );
-      const changes = Number(result?.meta?.changes ?? 0);
-      return changes > 0 ? Number(result?.meta?.last_row_id ?? 0) || null : null;
+      if (!row && !recoveryPolicy) throw new Error("Scheduler dispatch claim was not recorded");
+      return owned ? row.id : null;
     },
 
-    async updateDispatch(dispatchId, patch) {
-      await dbRun(
-        schedulerDb,
-        `
-          update scheduler_dispatches
-          set dispatched_at = ?,
-              dispatch_status = ?,
-              reason = ?,
-              response_status = ?,
-              response_preview = ?
-          where id = ?
-        `,
-        [
-          patch.dispatched_at ?? null,
-          patch.dispatch_status,
-          patch.reason ?? null,
-          patch.response_status ?? null,
-          patch.response_preview ?? null,
-          dispatchId,
-        ],
-      );
+    updateDispatch(dispatchId, patch, context) {
+      return transition("scheduler_dispatches", dispatchId, "dispatch_status", "claimed", patch, {
+        ...context, dispatch_id: dispatchId, phase: "update_dispatch",
+      });
     },
 
-    async finishRun(runId, patch) {
-      await dbRun(
-        schedulerDb,
-        `
-          update scheduler_runs
-          set status = ?,
-              finished_at = ?,
-              previous_run_started_at = ?,
-              evaluation_window_start = ?,
-              evaluation_window_end = ?,
-              jobs_checked = ?,
-              jobs_due = ?,
-              jobs_claimed = ?,
-              jobs_dispatched = ?,
-              jobs_failed = ?,
-              error_message = ?
-          where id = ?
-        `,
-        [
-          patch.status,
-          patch.finished_at,
-          patch.previous_run_started_at,
-          patch.evaluation_window_start,
-          patch.evaluation_window_end,
-          patch.jobs_checked,
-          patch.jobs_due,
-          patch.jobs_claimed,
-          patch.jobs_dispatched,
-          patch.jobs_failed,
-          patch.error_message ?? null,
-          runId,
-        ],
+    finishRun(runId, patch, context) {
+      return transition("scheduler_runs", runId, "status", "started", patch, { ...context, phase: "finish_run" });
+    },
+
+    listJobDispatches(jobKey, start, end, context) {
+      return read(
+        `select id, due_at, claimed_at, dispatch_status, reason, response_status
+         from scheduler_dispatches where job_key = ? and due_at >= ? and due_at < ?
+         order by due_at limit ?`,
+        [jobKey, start, end, RECOVERY_HISTORY_ROW_LIMIT + 1], context, "list_job_dispatches",
       );
     },
   };
 }
 
-async function dispatchGitHubWorkflow(job, env) {
+class DispatchConfigurationError extends Error {}
+
+async function githubWorkflowRequest(job, env) {
   const token = trimText(await readSecret(env.UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT));
   if (!token) {
-    throw new Error("Missing required Worker secret: UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT");
+    throw new DispatchConfigurationError("Missing required Worker secret: UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT");
   }
-
-  const repoParts = job.github_repo.split("/");
-
-  if (repoParts.length !== 2 || !repoParts[0] || !repoParts[1]) {
-    throw new Error(
-      `Invalid github_repo ${JSON.stringify(job.github_repo)}; expected owner/repo`,
-    );
+  const [owner, repo, extra] = job.github_repo.split("/");
+  if (!owner || !repo || extra !== undefined) {
+    throw new DispatchConfigurationError("Invalid github_repo; expected owner/repo");
   }
-
-  const [owner, repo] = repoParts;
-
-  const url =
-    `https://api.github.com/repos/${encodeURIComponent(owner)}` +
-    `/${encodeURIComponent(repo)}` +
-    `/actions/workflows/${encodeURIComponent(job.github_workflow_file)}` +
-    `/dispatches`;
-	
-  const response = await fetch(url, {
-    method: "POST",
+  return {
+    url: `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`
+      + `/actions/workflows/${encodeURIComponent(job.github_workflow_file)}`,
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github+json",
       "X-GitHub-Api-Version": "2022-11-28",
-      "Content-Type": "application/json",
       "User-Agent": GITHUB_USER_AGENT,
     },
-    body: JSON.stringify({
-      ref: job.github_ref,
-      inputs: job.github_inputs,
-    }),
-  });
+    token,
+  };
+}
 
-  if (response.status === 204) {
-    return {
-      ok: true,
-      response_status: 204,
-      response_preview: null,
-    };
+async function responsePreview(response, secret) {
+  try {
+    return truncatePreview((await response.text()).split(secret).join("[REDACTED]"));
+  } catch {
+    // The HTTP status was received even if the optional response body was lost.
+    return null;
   }
+}
 
-  const responsePreview = truncatePreview(await response.text());
+async function dispatchGitHubWorkflow(job, env, signal) {
+  const { url, headers, token } = await githubWorkflowRequest(job, env);
+  const response = await fetch(`${url}/dispatches`, {
+    method: "POST",
+    headers: { ...headers, "Content-Type": "application/json" },
+    body: JSON.stringify({ ref: job.github_ref, inputs: job.github_inputs }),
+    signal,
+  });
+  if (response.status === 204) {
+    return { ok: true, response_status: 204 };
+  }
   return {
     ok: false,
+    uncertain: response.ok,
     response_status: response.status,
-    response_preview: responsePreview,
+    response_preview: await responsePreview(response, token),
     reason: `GitHub dispatch failed with HTTP ${response.status}`,
   };
+}
+
+async function checkRecoveryWorkflowHistory(job, dueMs, env) {
+  try {
+    const { url, headers } = await githubWorkflowRequest(job, env);
+    // Include manual runs, all branches and queued or failed runs. Any recent
+    // run may already cover the slot. A single matching run is enough to hold.
+    const start = nowIso(dueMs - MAX_RECOVERY_LOOKBACK_MINUTES * MINUTE_MS).replace(".000Z", "Z");
+    const query = new URLSearchParams({ created: `>=${start}`, per_page: "1" });
+    const response = await fetch(`${url}/runs?${query}`, {
+      headers, signal: AbortSignal.timeout(RECOVERY_HTTP_TIMEOUT_MS), redirect: "error",
+    });
+    if (!response.ok) return `recovery_review_history_http_${response.status}`;
+    const history = await response.json();
+    const runs = history?.workflow_runs;
+    if (!Array.isArray(runs) || !Number.isSafeInteger(history.total_count)
+        || history.total_count < 0 || runs.length !== Math.min(1, history.total_count)) {
+      return "recovery_review_history_inconclusive";
+    }
+    if (history.total_count === 0) {
+      return response.headers.has("link") ? "recovery_review_history_inconclusive" : null;
+    }
+    const runId = runs[0]?.id;
+    return Number.isSafeInteger(runId) && runId > 0
+      ? `recovery_review_recent_workflow_run_${runId}`
+      : "recovery_review_recent_workflow_run";
+  } catch {
+    return "recovery_review_history_unavailable";
+  }
 }
 
 async function dispatchCloudRun(job, env) {
   const secret = trimText(await readSecret(env.UK_AQ_EDGE_UPSTREAM_SECRET));
   if (!secret) {
-    throw new Error("Missing required Worker secret: UK_AQ_EDGE_UPSTREAM_SECRET");
+    throw new DispatchConfigurationError("Missing required Worker secret: UK_AQ_EDGE_UPSTREAM_SECRET");
   }
 
   const headers = new Headers();
@@ -704,17 +693,17 @@ async function dispatchCloudRun(job, env) {
   }
 
   const response = await fetch(job.cloud_run_url, fetchOptions);
-  const responsePreview = truncatePreview(await response.text());
+  const preview = await responsePreview(response, secret);
   return response.ok
     ? {
         ok: true,
         response_status: response.status,
-        response_preview: responsePreview,
+        response_preview: preview,
       }
     : {
         ok: false,
         response_status: response.status,
-        response_preview: responsePreview,
+        response_preview: preview,
         reason: `Cloud Run dispatch failed with HTTP ${response.status}`,
       };
 }
@@ -723,7 +712,7 @@ async function dispatchWorkerHttp(job, env) {
   const binding = job.worker_http_secret_binding;
   const secret = trimText(await readSecret(env?.[binding]));
   if (!secret) {
-    throw new Error(`Missing required Worker secret: ${binding}`);
+    throw new DispatchConfigurationError(`Missing required Worker secret: ${binding}`);
   }
 
   const response = await fetch(job.worker_http_url, {
@@ -735,25 +724,24 @@ async function dispatchWorkerHttp(job, env) {
     },
     body: JSON.stringify(job.worker_http_body ?? {}),
   });
-  const responseText = await response.text();
-  const responsePreview = truncatePreview(responseText.split(secret).join("[REDACTED]"));
+  const preview = await responsePreview(response, secret);
   return response.ok
     ? {
         ok: true,
         response_status: response.status,
-        response_preview: responsePreview,
+        response_preview: preview,
       }
     : {
         ok: false,
         response_status: response.status,
-        response_preview: responsePreview,
+        response_preview: preview,
         reason: `Worker HTTP dispatch failed with HTTP ${response.status}`,
       };
 }
 
-async function dispatchTarget(job, env) {
+async function dispatchTarget(job, env, signal) {
   if (job.target_type === "github_workflow") {
-    return dispatchGitHubWorkflow(job, env);
+    return dispatchGitHubWorkflow(job, env, signal);
   }
   if (job.target_type === "cloud_run") {
     return dispatchCloudRun(job, env);
@@ -764,16 +752,6 @@ async function dispatchTarget(job, env) {
   throw new Error(`Unsupported target_type ${JSON.stringify(job.target_type)}`);
 }
 
-function formatLogJobPayload(job, dueAt) {
-  return {
-    scheduler_name: SCHEDULER_NAME,
-    job_key: job.job_key,
-    target_type: job.target_type,
-    due_at: dueAt,
-    dry_run: job.dry_run === 1,
-  };
-}
-
 export function dueSlotsForJob(job, windowStartMs, windowEndMs) {
   return cronDueTimes(
     job.cron_expr,
@@ -782,9 +760,83 @@ export function dueSlotsForJob(job, windowStartMs, windowEndMs) {
   );
 }
 
-export async function dispatchDueJobsForWindow(store, jobs, env, windowStartMs, windowEndMs, context = {}) {
+function schedulerFailure(error, context, phase) {
+  return {
+    phase,
+    ...(context.job_key && { job_key: context.job_key }),
+    ...(context.due_at && { due_at: context.due_at }),
+    error_class: error?.error_class ?? "scheduler_operation_failed",
+    ...(error?.error_reference && { error_reference: error.error_reference }),
+  };
+}
+
+function logSchedulerFailure(error, context, phase) {
+  const failure = schedulerFailure(error, context, phase);
+  logJson(WORKER_NAME, "scheduler_operation_failed", { ...context, ...failure });
+  return failure;
+}
+
+function dispatchClaim(job, dueAt) {
+  return {
+    job_key: job.job_key,
+    due_at: dueAt,
+    claimed_at: nowIso(),
+    target_type: job.target_type,
+    dry_run: job.dry_run,
+  };
+}
+
+async function submitDispatch(store, dispatchId, job, env, context, recovering = false) {
+  const dispatchedAt = nowIso();
+  let patch;
+  if (job.dry_run === 1) {
+    patch = { dispatch_status: "dry_run", reason: "dry_run_enabled", dispatched_at: dispatchedAt };
+  } else {
+    let result;
+    try {
+      result = await dispatchTarget(
+        job, env, recovering ? AbortSignal.timeout(RECOVERY_HTTP_TIMEOUT_MS) : undefined,
+      );
+    } catch (error) {
+      const knownNotSubmitted = error instanceof DispatchConfigurationError;
+      result = {
+        ok: false,
+        uncertain: !knownNotSubmitted,
+        reason: knownNotSubmitted ? error.message : "external_submission_outcome_unknown",
+      };
+    }
+    const uncertain = result.uncertain || result.response_status === 408 || result.response_status >= 500;
+    const reason = recovering
+      ? (result.ok ? "recovery_accepted" : uncertain ? "recovery_outcome_unknown" : "recovery_dispatch_failed")
+      : (uncertain ? "external_submission_outcome_unknown" : result.reason ?? null);
+    patch = {
+      dispatched_at: dispatchedAt,
+      dispatch_status: result.ok ? "dispatched" : "failed",
+      reason,
+      response_status: result.response_status ?? null,
+      response_preview: result.response_preview ?? null,
+    };
+  }
+
+  await store.updateDispatch(dispatchId, {
+    response_status: null, response_preview: null, ...patch,
+  }, context);
+  logJson(WORKER_NAME, "scheduler_dispatch_result", {
+    ...context,
+    dispatch_id: dispatchId,
+    target_type: job.target_type,
+    dispatch_status: patch.dispatch_status,
+    reason: patch.reason,
+    response_status: patch.response_status ?? null,
+  });
+  return patch.dispatch_status;
+}
+
+export async function dispatchDueJobsForWindow(
+  store, jobs, env, windowStartMs, windowEndMs, context = {}, failures = [],
+) {
   const summary = {
-    jobs_checked: 0,
+    jobs_checked: jobs.length,
     jobs_due: 0,
     jobs_claimed: 0,
     jobs_dispatched: 0,
@@ -792,144 +844,100 @@ export async function dispatchDueJobsForWindow(store, jobs, env, windowStartMs, 
   };
 
   for (const rawJob of jobs) {
-    summary.jobs_checked += 1;
-
+    const jobContext = { scheduler_name: SCHEDULER_NAME, ...context, job_key: trimText(rawJob?.job_key) };
     let job;
-    try {
-      job = parseSchedulerJobRow(rawJob);
-    } catch (error) {
-      summary.jobs_failed += 1;
-      const message = error instanceof Error ? error.message : String(error);
-      logJson(WORKER_NAME, "scheduler_job_invalid", {
-        scheduler_name: SCHEDULER_NAME,
-        scheduler_run_id: context.scheduler_run_id ?? null,
-        job_key: trimText(rawJob?.job_key) || null,
-        target_type: trimText(rawJob?.target_type) || null,
-        reason: message,
-      });
-      continue;
-    }
-
     let dueTimes;
     try {
+      job = parseSchedulerJobRow(rawJob);
       dueTimes = dueSlotsForJob(job, windowStartMs, windowEndMs);
-    } catch (error) {
+    } catch {
       summary.jobs_failed += 1;
-      const message = error instanceof Error ? error.message : String(error);
-      logJson(WORKER_NAME, "scheduler_job_invalid", {
-        scheduler_name: SCHEDULER_NAME,
-        scheduler_run_id: context.scheduler_run_id ?? null,
-        job_key: job.job_key,
-        target_type: job.target_type,
-        reason: message,
-      });
+      failures.push(logSchedulerFailure({ error_class: "invalid_job" }, jobContext, "evaluate_job"));
       continue;
     }
 
     summary.jobs_due += dueTimes.length;
-
     for (const dueAt of dueTimes) {
-      const claimedAt = nowIso(Date.now());
-      const dispatchId = await store.claimDispatch({
-        job_key: job.job_key,
-        due_at: dueAt,
-        claimed_at: claimedAt,
-        target_type: job.target_type,
-        dry_run: job.dry_run,
-      });
-
-      if (!dispatchId) {
-        logJson(WORKER_NAME, "scheduler_dispatch_duplicate", {
-          scheduler_name: SCHEDULER_NAME,
-          scheduler_run_id: context.scheduler_run_id ?? null,
-          job_key: job.job_key,
-          target_type: job.target_type,
-          due_at: dueAt,
-          dry_run: job.dry_run === 1,
-          dispatch_status: "skipped",
-          reason: "duplicate_claim",
-        });
-        continue;
-      }
-
-      summary.jobs_claimed += 1;
-
-      if (job.dry_run === 1) {
-        await store.updateDispatch(dispatchId, {
-          dispatched_at: nowIso(Date.now()),
-          dispatch_status: "dry_run",
-          reason: "dry_run_enabled",
-          response_status: null,
-          response_preview: null,
-        });
-        logJson(WORKER_NAME, "scheduler_dispatch_dry_run", {
-          scheduler_name: SCHEDULER_NAME,
-          scheduler_run_id: context.scheduler_run_id ?? null,
-          job_key: job.job_key,
-          target_type: job.target_type,
-          due_at: dueAt,
-          dry_run: true,
-          dispatch_status: "dry_run",
-          reason: "dry_run_enabled",
-        });
-        continue;
-      }
-
-      logJson(WORKER_NAME, "scheduler_dispatch_attempt", formatLogJobPayload(job, dueAt));
-
+      const slotContext = { ...jobContext, due_at: dueAt };
+      let phase = "claim_dispatch";
       try {
-        const result = await dispatchTarget(job, env);
-        const dispatchStatus = result.ok ? "dispatched" : "failed";
-        await store.updateDispatch(dispatchId, {
-          dispatched_at: nowIso(Date.now()),
-          dispatch_status: dispatchStatus,
-          reason: result.ok ? null : result.reason,
-          response_status: result.response_status ?? null,
-          response_preview: result.response_preview ?? null,
-        });
+        const dispatchId = await store.claimDispatch(dispatchClaim(job, dueAt), slotContext);
+        if (!dispatchId) continue;
 
-        if (result.ok) {
-          summary.jobs_dispatched += 1;
-        } else {
-          summary.jobs_failed += 1;
-        }
-
-        logJson(WORKER_NAME, "scheduler_dispatch_result", {
-          scheduler_name: SCHEDULER_NAME,
-          scheduler_run_id: context.scheduler_run_id ?? null,
-          job_key: job.job_key,
-          target_type: job.target_type,
-          due_at: dueAt,
-          dry_run: false,
-          dispatch_status: dispatchStatus,
-          reason: result.reason ?? null,
-          response_status: result.response_status ?? null,
-        });
+        summary.jobs_claimed += 1;
+        phase = "update_dispatch";
+        const status = await submitDispatch(store, dispatchId, job, env, slotContext);
+        if (status === "dispatched") summary.jobs_dispatched += 1;
+        if (status === "failed") summary.jobs_failed += 1;
       } catch (error) {
         summary.jobs_failed += 1;
-        const message = error instanceof Error ? error.message : String(error);
-        await store.updateDispatch(dispatchId, {
-          dispatched_at: nowIso(Date.now()),
-          dispatch_status: "failed",
-          reason: message,
-          response_status: null,
-          response_preview: null,
-        });
-        logJson(WORKER_NAME, "scheduler_dispatch_failed", {
-          scheduler_name: SCHEDULER_NAME,
-          scheduler_run_id: context.scheduler_run_id ?? null,
-          job_key: job.job_key,
-          target_type: job.target_type,
-          due_at: dueAt,
-          dry_run: false,
-          dispatch_status: "failed",
-          reason: message,
-        });
+        failures.push(logSchedulerFailure(error, slotContext, phase));
       }
     }
   }
-
   return summary;
+}
+
+function recoveryPolicyStart(job) {
+  // Older SQLite defaults have no time-zone suffix. Only an explicit ISO
+  // timestamp from the recovery-aware sync can prove continuous eligibility.
+  return typeof job.updated_at === "string" && job.updated_at.endsWith("Z")
+    ? Date.parse(job.updated_at) : NaN;
+}
+
+async function recoverMissedDispatch(store, jobs, env, context, failures, nowMs) {
+  for (const rawJob of jobs) {
+    const lookback = rawJob.recovery_lookback_minutes;
+    if (!(Number.isInteger(lookback) && lookback > 0 && lookback <= MAX_RECOVERY_LOOKBACK_MINUTES)
+        || rawJob.dry_run !== 0) continue;
+
+    let slotContext = { ...context, job_key: rawJob.job_key };
+    let phase = "evaluate_recovery";
+    try {
+      const job = parseSchedulerJobRow(rawJob);
+      if (job.target_type !== "github_workflow") continue;
+      const policyStartedMs = recoveryPolicyStart(rawJob);
+      if (!Number.isFinite(policyStartedMs)) continue;
+
+      const oldestDueMs = Math.max(nowMs - lookback * MINUTE_MS - 1, policyStartedMs + DISPATCH_LEAD_MS);
+      const latestDueMs = nowMs - SCHEDULER_GRACE_MS;
+      const slots = cronDueTimes(job.cron_expr, oldestDueMs, latestDueMs).reverse();
+      if (slots.length === 0) continue;
+
+      phase = "list_job_dispatches";
+      const prior = await store.listJobDispatches(job.job_key, slots.at(-1), nowIso(latestDueMs + 1), slotContext);
+      // A truncated history must not make an existing row look absent.
+      if (prior.length > RECOVERY_HISTORY_ROW_LIMIT) throw new Error("Scheduler dispatch history truncated");
+      const recorded = new Set(prior.map((row) => row.due_at));
+      const dueAt = slots.find((slot) => !recorded.has(slot));
+      if (!dueAt) continue;
+
+      slotContext = { ...slotContext, due_at: dueAt };
+      phase = "claim_recovery";
+      const dispatchId = await store.claimDispatch(dispatchClaim(job, dueAt), slotContext, rawJob);
+      if (!dispatchId) return;
+
+      // A claimed row blocks other invocations even if history or submission
+      // ends ambiguously. Release only through an explicit terminal transition.
+      phase = "update_recovery_dispatch";
+      const reviewReason = await checkRecoveryWorkflowHistory(job, Date.parse(dueAt), env);
+      if (reviewReason) {
+        await store.updateDispatch(dispatchId, {
+          dispatch_status: "skipped", dispatched_at: null, reason: reviewReason,
+          response_status: null, response_preview: null,
+        }, slotContext);
+        logJson(WORKER_NAME, "scheduler_recovery_held", {
+          ...slotContext, dispatch_id: dispatchId, reason: reviewReason,
+        });
+      } else {
+        await submitDispatch(store, dispatchId, job, env, slotContext, true);
+      }
+      return;
+    } catch (error) {
+      failures.push(logSchedulerFailure(error, slotContext, phase));
+      return;
+    }
+  }
 }
 
 export async function runScheduler(
@@ -939,19 +947,15 @@ export async function runScheduler(
   schedulerName = SCHEDULER_NAME,
   triggerSource = TRIGGER_SOURCE_CLOUDFLARE_CRON,
 ) {
-  const startedAtMs = Number(nowMs);
-  if (!Number.isFinite(startedAtMs)) {
-    throw new Error("Invalid scheduler invocation time");
-  }
-
-  const startedAt = nowIso(startedAtMs);
-  const minuteSlot = canonicalMinuteSlot(startedAtMs);
-  const evaluationWindow = currentMinuteEvaluationWindow(minuteSlot);
-  const minuteSlotMs = evaluationWindow.endMs;
+  const startedAt = nowIso(nowMs);
+  const minuteSlot = canonicalMinuteSlot(nowMs);
+  const window = currentMinuteEvaluationWindow(minuteSlot);
   const normalizedTriggerSource = normalizeTriggerSource(triggerSource);
-  const previousRunStartedAt = null;
-  const evaluationWindowStartMs = evaluationWindow.startMs;
-  const evaluationWindowStart = evaluationWindow.start;
+  const evaluationWindow = {
+    previous_run_started_at: null,
+    evaluation_window_start: window.start,
+    evaluation_window_end: minuteSlot,
+  };
 
   const minuteClaim = await store.claimMinute({
     scheduler_name: schedulerName,
@@ -959,139 +963,62 @@ export async function runScheduler(
     trigger_source: normalizedTriggerSource,
     started_at: startedAt,
     status: "started",
-    previous_run_started_at: previousRunStartedAt,
-    evaluation_window_start: evaluationWindowStart,
-    evaluation_window_end: minuteSlot,
-    jobs_checked: 0,
-    jobs_due: 0,
-    jobs_claimed: 0,
-    jobs_dispatched: 0,
-    jobs_failed: 0,
-    error_message: null,
+    ...evaluationWindow,
   });
+  const context = {
+    scheduler_name: schedulerName,
+    scheduler_run_id: minuteClaim.scheduler_run_id,
+    minute_slot: minuteSlot,
+    trigger_source: normalizedTriggerSource,
+  };
   if (!minuteClaim.claimed) {
-    logJson(WORKER_NAME, "scheduler_run_already_claimed", {
-      scheduler_name: schedulerName,
-      scheduler_run_id: minuteClaim.scheduler_run_id,
-      minute_slot: minuteSlot,
-      trigger_source: normalizedTriggerSource,
-      claimed_trigger_source: minuteClaim.trigger_source,
-      run_status: minuteClaim.run_status,
-    });
     return {
-      scheduler_run_id: minuteClaim.scheduler_run_id,
-      scheduler_name: schedulerName,
-      minute_slot: minuteSlot,
-      trigger_source: normalizedTriggerSource,
+      ...context,
       claimed_trigger_source: minuteClaim.trigger_source,
       run_status: minuteClaim.run_status,
       status: "already_claimed",
     };
   }
 
-  const runId = minuteClaim.scheduler_run_id;
-  if (runId === null || runId === undefined) {
-    throw new Error("Failed to claim scheduler minute");
+  const failures = [];
+  let summary = { jobs_checked: 0, jobs_due: 0, jobs_claimed: 0, jobs_dispatched: 0, jobs_failed: 0 };
+  let fatal;
+  try {
+    const jobs = await store.listEnabledJobs(context);
+    summary = await dispatchDueJobsForWindow(store, jobs, env, window.startMs, window.endMs, context, failures);
+    await recoverMissedDispatch(store, jobs, env, context, failures, Date.now());
+  } catch (error) {
+    fatal = error;
+    failures.push(logSchedulerFailure(error, context, "evaluate_minute"));
   }
 
-  logJson(WORKER_NAME, "scheduler_run_started", {
-    scheduler_name: schedulerName,
-    scheduler_run_id: runId,
-    minute_slot: minuteSlot,
-    trigger_source: normalizedTriggerSource,
-    previous_run_started_at: previousRunStartedAt,
-    evaluation_window_start: evaluationWindowStart,
-    evaluation_window_end: minuteSlot,
-  });
-
+  const status = failures.length ? "failed" : "finished";
+  const errorMessage = failures.length ? JSON.stringify({
+    total: failures.length, failures: failures.slice(0, MAX_RECORDED_FAILURES),
+  }) : null;
   try {
-    const jobs = await store.listEnabledJobs();
-    const summary = await dispatchDueJobsForWindow(
-      store,
-      jobs,
-      env,
-      evaluationWindowStartMs,
-      minuteSlotMs,
-      { scheduler_run_id: runId },
-    );
-
-    await store.finishRun(runId, {
-      status: "finished",
-      finished_at: nowIso(Date.now()),
-      previous_run_started_at: previousRunStartedAt,
-      evaluation_window_start: evaluationWindowStart,
-      evaluation_window_end: minuteSlot,
-      jobs_checked: summary.jobs_checked,
-      jobs_due: summary.jobs_due,
-      jobs_claimed: summary.jobs_claimed,
-      jobs_dispatched: summary.jobs_dispatched,
-      jobs_failed: summary.jobs_failed,
-      error_message: null,
-    });
-
-    logJson(WORKER_NAME, "scheduler_run_finished", {
-      scheduler_name: schedulerName,
-      scheduler_run_id: runId,
-      status: "finished",
-      minute_slot: minuteSlot,
-      trigger_source: normalizedTriggerSource,
-      previous_run_started_at: previousRunStartedAt,
-      evaluation_window_start: evaluationWindowStart,
-      evaluation_window_end: minuteSlot,
-      jobs_checked: summary.jobs_checked,
-      jobs_due: summary.jobs_due,
-      jobs_claimed: summary.jobs_claimed,
-      jobs_dispatched: summary.jobs_dispatched,
-      jobs_failed: summary.jobs_failed,
-    });
-
-    return {
-      scheduler_run_id: runId,
-      scheduler_name: schedulerName,
-      started_at: startedAt,
-      minute_slot: minuteSlot,
-      trigger_source: normalizedTriggerSource,
-      previous_run_started_at: previousRunStartedAt,
-      evaluation_window_start: evaluationWindowStart,
-      evaluation_window_end: minuteSlot,
+    await store.finishRun(context.scheduler_run_id, {
+      ...evaluationWindow,
       ...summary,
-      run_status: "finished",
-      status: "triggered",
-    };
+      status,
+      finished_at: nowIso(),
+      error_message: errorMessage,
+    }, context);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    try {
-      await store.finishRun(runId, {
-        status: "failed",
-        finished_at: nowIso(Date.now()),
-        previous_run_started_at: previousRunStartedAt,
-        evaluation_window_start: evaluationWindowStart,
-        evaluation_window_end: minuteSlot,
-        jobs_checked: 0,
-        jobs_due: 0,
-        jobs_claimed: 0,
-        jobs_dispatched: 0,
-        jobs_failed: 0,
-        error_message: truncatePreview(message, RESPONSE_PREVIEW_LIMIT),
-      });
-    } catch {
-      // Best effort: the run row may already be unavailable if the store failed.
-    }
-
-    logJson(WORKER_NAME, "scheduler_run_failed", {
-      scheduler_name: schedulerName,
-      scheduler_run_id: runId,
-      status: "failed",
-      minute_slot: minuteSlot,
-      trigger_source: normalizedTriggerSource,
-      previous_run_started_at: previousRunStartedAt,
-      evaluation_window_start: evaluationWindowStart,
-      evaluation_window_end: minuteSlot,
-      reason: message,
-    });
-
+    logSchedulerFailure(error, context, "finish_run");
+    // Preserve the existing started row if we cannot confirm its terminal write.
     throw error;
   }
+
+  if (fatal) throw fatal;
+  return {
+    ...context,
+    ...evaluationWindow,
+    ...summary,
+    started_at: startedAt,
+    run_status: status,
+    status: "triggered",
+  };
 }
 
 function getSchedulerStoreFromEnv(env) {
