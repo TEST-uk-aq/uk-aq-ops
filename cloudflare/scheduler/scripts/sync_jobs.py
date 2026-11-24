@@ -67,6 +67,7 @@ SQL_COLUMNS = [
     "worker_http_body_json",
     "dry_run",
     "notes",
+    "recovery_lookback_minutes",
 ]
 
 
@@ -277,6 +278,7 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
         "worker_http_body",
         "dry_run",
         "notes",
+        "recovery_lookback_minutes",
     }
     unknown_keys = sorted(set(raw_job) - allowed_keys)
     if unknown_keys:
@@ -292,6 +294,11 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
     timezone = require_timezone(raw_job.get("timezone"))
     dry_run = require_bool(raw_job.get("dry_run"), f"scheduler_jobs.dry_run for {job_key}")
     notes = optional_string(raw_job.get("notes"))
+    lookback = raw_job.get("recovery_lookback_minutes", 0)
+    if type(lookback) is not int or not 0 <= lookback <= 360:
+        raise JobsConfigError(f"Invalid recovery_lookback_minutes for {job_key}: expected 0–360")
+    if lookback and target_type != "github_workflow":
+        raise JobsConfigError(f"Recovery requires a GitHub workflow target for {job_key}")
 
     job = {
         "job_key": trim_text(job_key),
@@ -313,6 +320,7 @@ def validate_job(job_key: str, raw_job: Any) -> dict[str, Any]:
         "worker_http_body_json": None,
         "dry_run": dry_run,
         "notes": notes,
+        "recovery_lookback_minutes": lookback,
         "cloud_run_url_managed_by_deploy": False,
         "worker_http_url_managed_by_deploy": False,
     }
@@ -461,7 +469,8 @@ def sql_literal(value: Any) -> str:
 
 def render_upsert_statement(job: dict[str, Any]) -> str:
     columns = SQL_COLUMNS + ["updated_at"]
-    values = [job[column] for column in SQL_COLUMNS] + [SqlExpression("current_timestamp")]
+    timestamp = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')" if job["recovery_lookback_minutes"] else "current_timestamp"
+    values = [job[column] for column in SQL_COLUMNS] + [SqlExpression(timestamp)]
     insert_values = ",\n  ".join(sql_literal(value) for value in values)
 
     cloud_run_url_update = (
@@ -476,6 +485,14 @@ def render_upsert_statement(job: dict[str, Any]) -> str:
         "then scheduler_jobs.worker_http_url else excluded.worker_http_url end"
         if job.get("worker_http_url_managed_by_deploy")
         else "  worker_http_url = excluded.worker_http_url"
+    )
+    # Only uninterrupted matching policy is evidence that a past slot was eligible.
+    recovery_config = (
+        "enabled", "dry_run", "target_type", "cron_expr", "timezone", "github_repo",
+        "github_workflow_file", "github_ref", "github_inputs_json", "recovery_lookback_minutes",
+    )
+    same_recovery_config = " and ".join(
+        f"scheduler_jobs.{column} is excluded.{column}" for column in recovery_config
     )
     update_lines = [
         "  enabled = excluded.enabled",
@@ -495,7 +512,9 @@ def render_upsert_statement(job: dict[str, Any]) -> str:
         "  worker_http_body_json = excluded.worker_http_body_json",
         "  dry_run = excluded.dry_run",
         "  notes = excluded.notes",
-        "  updated_at = current_timestamp",
+        "  recovery_lookback_minutes = excluded.recovery_lookback_minutes",
+        "  updated_at = case when excluded.recovery_lookback_minutes > 0 and "
+        + same_recovery_config + " then scheduler_jobs.updated_at else excluded.updated_at end",
     ]
 
     statement_lines = [

@@ -192,18 +192,13 @@ python3 -m unittest discover -s tests -p 'test*.py'
 
 ## Manual deployment sequence
 
-1. Create the D1 database for the ops scheduler.
-2. Update `cloudflare/scheduler/wrangler.toml` with the new D1 database ID.
-3. Apply the scheduler migrations in order, including
-   `0002_scheduler_minute_slot_claim.sql` and
-   `0003_worker_http_target.sql`.
-4. Sync `cloudflare/scheduler/jobs.toml` into D1 with the config sync workflow or the local sync script.
-5. Seed `cloudflare/scheduler/seeds/0001_github_jobs.sql` only if you need a bootstrap snapshot for a brand-new D1 database.
-6. Install `UK_AQ_GITHUB_WORKFLOW_DISPATCH_PAT`,
-   `UK_AQ_EDGE_UPSTREAM_SECRET`, `UK_AQ_SCHEDULER_TRIGGER_SECRET`, and
-   `UK_AQ_MEDIA_WORKER_HTTP_SECRET` on the Worker.
-7. Deploy the Worker.
-8. Verify one-minute `scheduler_runs` rows and dry-run dispatch records.
+1. Create the D1 database for the Ops scheduler.
+2. Set its environment-owned database ID in `cloudflare/scheduler/wrangler.toml`.
+3. For a new database, apply `schemas/cloudflare_d1/ops_scheduler.sql` from
+   `uk-aq-schema`. The Ops numbered migrations are the historical deployed
+   baseline. For an existing database at 0001–0003, use the upgrade below.
+4. Sync its own `cloudflare/scheduler/jobs.toml` through the config sync workflow.
+5. Deploy the Worker and verify minute rows and dispatch receipts.
 
 Normal GitHub-managed deployment installs the four secrets above automatically.
 For manual bootstrap or recovery, an operator may still install a binding with
@@ -241,3 +236,157 @@ and upstream callers and must be rotated across all consumers together.
 - Each claimed ops minute evaluates only its preceding one-minute window. Ops
   does not replay missed maintenance, snapshot, or backup jobs after an outage;
   operators review and run missed work manually.
+
+## TEST scheduler reliability rollout
+
+These are operator steps. Merging the Ops change into `main` triggers its
+existing deployment and job-sync workflows. Authorise the merge with that
+effect in mind. Authorise database changes, workflow dispatches, controlled
+fault injection and email sends separately.
+
+1. Record the deployed Worker version and current TEST job manifest. The
+   operator has applied the additive migration from TEST Schema PR #32 and
+   verified that Black Carbon recovery is off in TEST D1. If provisioning a
+   separate existing TEST database that is still at historical Ops migrations
+   0001–0003, an authorised operator can apply the upgrade once with:
+
+   ```bash
+   npx --yes wrangler@4.130.0 d1 execute uk_aq_cron_scheduler_ops_db \
+     --remote --config cloudflare/scheduler/wrangler.toml \
+     --file ../uk-aq-schema/schemas/migrations/20261124_001_cloudflare_d1_ops_scheduler_reliability.sql
+   ```
+
+   Check `pragma table_info(scheduler_jobs)`, `pragma table_info(scheduler_runs)`
+   and `pragma table_info(scheduler_dispatches)`, and check
+   `pragma index_list(scheduler_dispatches)`. Expect the new look-back column
+   defaulting to 0, nullable claim tokens and the due-time index. If application
+   is interrupted, inspect this state and apply only missing changes. Keep all
+   existing minute and dispatch records.
+
+2. Confirm the existing GitHub dispatch PAT can list runs for the configured
+   Black Carbon workflow as well as dispatch it.
+
+3. Before syncing the recovery opt-in, deploy the reviewed Ops PR branch
+   through the existing `uk_aq_cloudflare_scheduler_ops_deploy.yml` workflow
+   using its branch ref. The additive D1 defaults keep recovery off. Observe
+   a real 08:00 UTC TEST minute. Check one `scheduler_runs` row, one receipt
+   per due job, and the independent outcomes of both Media jobs and Black
+   Carbon. For Black Carbon, expect one HTTP 204 receipt and one matching
+   Actions run. Confirm actual workflow and Task Health results separately.
+   Inspect the 14-day reconciliation, canonical R2 safety checks and the
+   2024-onwards diurnal publication in that run. Do not resend either email.
+
+4. After normal-dispatch acceptance and separate activation approval, merge
+   the reviewed Ops change. Verify the deployment and config-sync workflow
+   results and confirm that only `uk_aq_ukair_bc_daily` has
+   `recovery_lookback_minutes = 360`. Keep the policy enabled before the next
+   test slot. A config change around a slot can make it ineligible for
+   automatic recovery. Use the following query shapes with the selected UTC
+   day substituted for `YYYY-MM-DD`. The first query checks minute
+   ownership and errors. The second checks original due time and receipts.
+
+   ```sql
+   select id, minute_slot, trigger_source, status, jobs_due, jobs_claimed,
+          jobs_dispatched, jobs_failed, error_message
+   from scheduler_runs
+   where minute_slot >= 'YYYY-MM-DDT08:00:00.000Z'
+     and minute_slot < 'YYYY-MM-DDT08:15:00.000Z'
+   order by minute_slot;
+
+   select id, job_key, due_at, claimed_at, dispatched_at, dispatch_status,
+          response_status, reason
+   from scheduler_dispatches
+   where due_at = 'YYYY-MM-DDT08:00:00.000Z'
+   order by job_key;
+   ```
+
+5. Validate a genuine missed slot when one occurs, or use the separately
+   authorised TEST-only fault injection below. Pick a future 08:00 UTC slot.
+   Coordinate with anyone who can manually launch Black Carbon. Leave the
+   other 08:00 jobs on their regular paths. Observe the absent Black Carbon
+   receipt after the 08:00 minute and the other jobs' recorded outcomes.
+   Starting at 08:10 UTC, expect one recovery claim, one
+   `recovery_accepted` HTTP 204 receipt with the original 08:00 `due_at`
+   and a later `dispatched_at`, and a single real Actions run. Observe a later
+   minute and verify the same dispatch ID and no second run. If GitHub
+   history is inconclusive or shows a recent run, expect `skipped` with a
+   `recovery_review_*` reason and investigate before authorising a manual run.
+
+6. For a real outstanding claim, confirm the scheduler holds it past the
+   ten-minute grace period. To exercise this safely in TEST with authorisation,
+   use the second fixture below on a different day. It prevents the Black
+   Carbon terminal write after its ordinary request. Confirm the original
+   Actions run and one `claimed` D1 row. Past 08:10 and in subsequent
+   invocations, verify neither the scheduler nor watchdog submits it again.
+   Preserve the evidence for operator review.
+
+7. Inspect the private 10:00 UTC supplement or dispatch its existing preview
+   from the reviewed revision with `report_type=supplement` and
+   `send_email=false`. It uses the existing Supabase task definitions and
+   run records for the 07:00–10:00 UTC window. If Black Carbon has no
+   qualifying run for its expected 08:00 UTC execution, verify the existing
+   **Missing** entry in the Failed group. Investigate scheduler causes using
+   the D1 minute and dispatch records and structured Worker logs. The report
+   requires no scheduler API or additional email configuration. Confirm the
+   normal authorised email delivery through the existing SMTP workflow.
+
+### Optional controlled TEST failures
+
+With separate authorisation, save one fixture as `test-bc-fixture.sql` with
+the agreed future UTC date. Run from the Ops repository root:
+
+```bash
+npx --yes wrangler@4.130.0 d1 execute uk_aq_cron_scheduler_ops_db \
+  --remote --config cloudflare/scheduler/wrangler.toml --file ./test-bc-fixture.sql
+```
+
+Apply one fixture at a time. These triggers match one Black Carbon slot only.
+
+For a missing claim, install before 08:00 UTC. The trigger blocks the
+ordinary claim and allows a recovery claim.
+
+```sql
+create trigger test_bc_missed_slot
+before insert on scheduler_dispatches
+when new.job_key = 'uk_aq_ukair_bc_daily'
+ and new.due_at = 'YYYY-MM-DDT08:00:00.000Z'
+ and new.reason is null
+begin
+  select raise(abort, 'TEST Black Carbon normal claim blocked');
+end;
+```
+
+For an uncertain receipt, install before a different 08:00 UTC slot.
+
+```sql
+create trigger test_bc_uncertain_receipt
+before update on scheduler_dispatches
+when old.job_key = 'uk_aq_ukair_bc_daily'
+ and old.due_at = 'YYYY-MM-DDT08:00:00.000Z'
+ and old.dispatch_status = 'claimed'
+begin
+  select raise(abort, 'TEST Black Carbon terminal receipt blocked');
+end;
+```
+
+Drop the installed trigger after capturing the expected evidence, including
+when validation fails. Execute `drop trigger if exists test_bc_missed_slot;`
+or `drop trigger if exists test_bc_uncertain_receipt;` on the same TEST D1.
+Keep the dispatch rows. Treat GitHub visibility and dispatch as separate
+requests that cannot arbitrate concurrent manual starts. Before an operator
+dispatches a replacement, disable the recovery policy, allow in-flight
+scheduler work to settle and reconcile the D1 receipt against Actions
+history and existing task health. A failed workflow needs its normal
+operator recovery decision.
+
+### Rollback
+
+To stop recovery, use the current job sync with the TEST Black Carbon
+look-back set to zero. If a config sync is unavailable and the operator
+authorises a direct change, update just that job's
+`recovery_lookback_minutes` to `0` and `updated_at` to `current_timestamp`
+in D1, then align TEST `jobs.toml`. Confirm zero before another sync and
+allow any already claimed recovery to settle. If necessary, roll back to the
+recorded deployed Worker version and revert the Ops code/workflows through
+the normal TEST release process. Keep the additive columns and indexes,
+and retain all dispatch/minute receipts for operator reconciliation.

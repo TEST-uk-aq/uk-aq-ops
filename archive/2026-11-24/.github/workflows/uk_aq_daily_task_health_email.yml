@@ -1,0 +1,91 @@
+name: UK AQ Daily Task Health Email
+
+on:
+  workflow_dispatch:
+    inputs:
+      send_email:
+        description: "Send the report (requires explicit TEST enabled setting and SMTP credentials)"
+        required: true
+        default: false
+        type: boolean
+      report_type:
+        description: "07:00 UTC morning digest or 10:00 UTC supplement"
+        required: true
+        default: morning
+        type: choice
+        options:
+          - morning
+          - supplement
+      report_day_utc:
+        description: "Optional UTC report day YYYY-MM-DD (preview only if historical)"
+        required: false
+        default: ""
+        type: string
+      trigger_mode:
+        description: "Invocation source (central scheduler supplies scheduler)"
+        required: true
+        default: manual
+        type: choice
+        options:
+          - manual
+          - scheduler
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uk-aq-daily-task-health-email
+  cancel-in-progress: false
+
+jobs:
+  health-email:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OBS_AQIDB_SUPABASE_URL: ${{ vars.OBS_AQIDB_SUPABASE_URL }}
+      OBS_AQIDB_SECRET_KEY: ${{ secrets.OBS_AQIDB_SECRET_KEY }}
+      UK_AQ_OPS_SCHEMA: ${{ vars.UK_AQ_OPS_SCHEMA || 'uk_aq_ops' }}
+      UK_AQ_ENV_NAME: ${{ vars.UK_AQ_ENV_NAME }}
+      UK_AQ_HEALTH_EMAIL_TO: ${{ vars.UK_AQ_HEALTH_EMAIL_TO }}
+      UK_AQ_HEALTH_EMAIL_FROM: ${{ vars.UK_AQ_HEALTH_EMAIL_FROM }}
+      UK_AQ_HEALTH_EMAIL_SEND_ENABLED: ${{ vars.UK_AQ_HEALTH_EMAIL_SEND_ENABLED || 'false' }}
+      GOOGLE_SMTP_USERNAME: ${{ secrets.GOOGLE_SMTP_USERNAME }}
+      GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+      GOOGLE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
+      HEALTH_EMAIL_SEND_REQUESTED: ${{ inputs.send_email || 'false' }}
+      HEALTH_EMAIL_REPORT_DAY: ${{ inputs.report_day_utc || '' }}
+      HEALTH_EMAIL_REPORT_TYPE: ${{ inputs.report_type || 'morning' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Validate digest syntax
+        run: python3 -m py_compile scripts/daily_task_health_email.py
+
+      - name: Generate report and optionally send via Google Workspace SMTP
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--report-type "${HEALTH_EMAIL_REPORT_TYPE}")
+          if [ -n "${HEALTH_EMAIL_REPORT_DAY}" ]; then
+            args+=(--report-day "${HEALTH_EMAIL_REPORT_DAY}")
+          fi
+          if [ "${HEALTH_EMAIL_SEND_REQUESTED}" = "true" ]; then
+            args+=(--send)
+          fi
+          python3 scripts/daily_task_health_email.py "${args[@]}"
+
+      - name: Retain generated report
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: uk-aq-daily-task-health-email-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tmp/daily_task_health_email/
+          if-no-files-found: warn
+          retention-days: 14
