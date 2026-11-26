@@ -1009,6 +1009,7 @@
         return;
       }
       const metadata = data.metadata || {};
+      const proposedPublication = publicationDateInputs(metadata.published_at);
       result.innerHTML = `${data.metadata_error ? message(`Automatic metadata unavailable: ${data.metadata_error}. Supply the missing public fields manually.`) : message("New canonical article. Review metadata before adding.", "success")}
         <form class="media-inline-form" data-add-manual>
           <input type="hidden" name="url" value="${esc(data.canonical_url)}">
@@ -1016,7 +1017,8 @@
             <label class="media-field media-field--grow"><span>Publisher title</span><input name="title" required maxlength="1000" value="${esc(metadata.title || "")}"></label>
             <label class="media-field"><span>Publication</span><input name="publisher" required maxlength="200" value="${esc(metadata.publisher || data.source?.name || "")}"></label>
             <label class="media-field"><span>Author</span><input name="author" maxlength="500" value="${esc(metadata.author || "")}"></label>
-            <label class="media-field"><span>Published UTC</span><input name="published_at" type="datetime-local" value="${esc(formatUtcDateTimeInput(metadata.published_at))}"></label>
+            <label class="media-field"><span>Publication date</span><input name="publication_date" type="date" value="${esc(proposedPublication.date)}"></label>
+            <label class="media-field"><span>Publication time (UTC, optional)</span><input name="publication_time" type="time" value="${esc(proposedPublication.time)}"></label>
           </div>
           <input type="hidden" name="preview_image_url" value="${esc(metadata.image_url || "")}">
           <div class="media-actions media-manual-actions">
@@ -1034,13 +1036,21 @@
   async function addManualArticle(form, result, initialStatus) {
     const detailSequence = articleDetailSequence;
     const values = new FormData(form);
-    const published = String(values.get("published_at") || "");
+    const publicationDate = String(values.get("publication_date") || "");
+    const publicationTime = String(values.get("publication_time") || "");
+    if (publicationTime && !publicationDate) {
+      result.insertAdjacentHTML("afterbegin", message("Enter a publication date before adding a UTC time.", "error"));
+      return;
+    }
+    const published = publicationDate
+      ? publicationTime ? new Date(`${publicationDate}T${publicationTime}:00.000Z`).toISOString()
+        : publicationDate : null;
     const status = initialStatus === "approved" ? "approved" : "pending";
     try {
       const data = await request("articles", { method: "POST", idempotent: "add", body: {
         url: values.get("url"), title: values.get("title"), publisher: values.get("publisher"),
         author: String(values.get("author") || "").trim() || null,
-        published_at: published ? new Date(`${published}Z`).toISOString() : null,
+        published_at: published,
         preview_image_url: String(values.get("preview_image_url") || "").trim() || null,
         initial_status: status,
       } });
@@ -1943,19 +1953,70 @@
         return;
       }
       const data = await request(`articles/${id}/metadata/preview`, { method: "POST" });
-      if (!data.has_useful_change) { output.innerHTML = message("No useful metadata change found."); return; }
-      output.innerHTML = `<div class="media-message"><strong>Proposed changes (raw ISO UTC timestamps)</strong><pre>${esc(JSON.stringify(data.changes, null, 2))}</pre><button class="media-button media-button--primary" data-apply-metadata>Apply metadata${data.changes.image?.replacement_required ? " / replace image" : ""}</button></div>`;
-      output.querySelector("[data-apply-metadata]")?.addEventListener("click", async () => {
-        try { await request(`articles/${id}/metadata/apply`, { method: "PUT", idempotent: "metadata", body: {
-          expected_current_image_url: data.changes.image?.current ?? article.og_image_url ?? null,
-          expected_proposed_image_url: data.changes.image?.expected_proposed_image_url ?? null,
-          replace_existing_image: Boolean(data.changes.image?.replacement_required),
-          apply_publisher_display_title: true,
-          expected_current_published_at: data.changes.published_at?.current ?? null,
-          expected_proposed_published_at: data.changes.published_at?.proposed ?? null,
-          apply_publisher_published_at: Boolean(data.changes.published_at),
-        } }); output.innerHTML = message("Metadata applied without changing editorial state.", "success"); void renderArticles(false); }
-        catch (error) { output.innerHTML = message(error.message, "error"); }
+      const changes = data.changes || {};
+      const fields = [
+        ["exact_headline", "Original headline"], ["publication", "Publication"],
+        ["author", "Author"], ["published_at", "Publication date"],
+        ["image", "Preview image"], ["publisher_display_title", "Compact display title"],
+      ].filter(([key]) => changes[key]);
+      if (!fields.length) { output.innerHTML = message("No useful metadata change found."); return; }
+      const displayValue = (key, value) => key === "published_at"
+        ? formatPublishedDateTime(value) : value == null || value === "" ? "—" : String(value);
+      output.innerHTML = `<div class="media-message"><strong>Publisher metadata proposals</strong>
+        <p>Select each change to apply. Current values remain until Media accepts the save.</p>
+        <div class="media-metadata-choices">${fields.map(([key, label]) => {
+          const change = changes[key];
+          return `<label class="media-field"><span><input type="checkbox" data-metadata-field="${key}"> Apply ${label}${key === "image" && change.replacement_required ? " (replace existing image)" : ""}</span>
+            <span>Current: ${esc(displayValue(key, change.current))}</span>
+            <span>Proposed: ${esc(displayValue(key, change.proposed))}</span></label>`;
+        }).join("")}</div>
+        <button class="media-button media-button--primary" data-apply-metadata disabled>Apply selected changes</button>
+        <div data-metadata-apply-message aria-live="polite"></div></div>`;
+      const selections = [...output.querySelectorAll("[data-metadata-field]")];
+      const apply = output.querySelector("[data-apply-metadata]");
+      selections.forEach(choice => choice.addEventListener("change", () => {
+        apply.disabled = !selections.some(input => input.checked);
+      }));
+      apply.addEventListener("click", async () => {
+        const selected = new Set(selections.filter(input => input.checked).map(input => input.dataset.metadataField));
+        if (!selected.size) return;
+        const image = selected.has("image") ? changes.image : null;
+        if (image?.replacement_required && !confirm("Replace the current publisher preview image with the proposed image?")) return;
+        const body = {
+          expected_current_image_url: changes.image?.current ?? article.og_image_url ?? null,
+          expected_proposed_image_url: image?.expected_proposed_image_url ?? image?.proposed ?? null,
+          replace_existing_image: Boolean(image?.replacement_required),
+          apply_publisher_display_title: selected.has("publisher_display_title"),
+          expected_current_published_at: selected.has("published_at") ? changes.published_at.current : null,
+          expected_proposed_published_at: selected.has("published_at") ? changes.published_at.proposed : null,
+          apply_publisher_published_at: selected.has("published_at"),
+        };
+        if (Number.isSafeInteger(data.article?.revision)) body.expected_revision = data.article.revision;
+        for (const key of ["exact_headline", "publication", "author"]) {
+          if (selected.has(key)) body[key] = changes[key];
+        }
+        const status = output.querySelector("[data-metadata-apply-message]");
+        apply.disabled = true;
+        try {
+          const saved = await request(`articles/${id}/metadata/apply`, {
+            method: "PUT", idempotent: "metadata", body,
+          });
+          if (saved?.changed === false || !saved?.article) {
+            throw new Error("Media did not confirm a metadata change. Reload the article and review it again.");
+          }
+          const expected = { exact_headline: "title", publication: "publisher", author: "author",
+            published_at: "published_at", image: "og_image_url", publisher_display_title: "display_title" };
+          for (const key of selected) {
+            if (saved.article[expected[key]] !== changes[key].proposed) {
+              throw new Error("Media returned a different value. Reload the article and review it again.");
+            }
+          }
+          await renderArticles(false);
+          await refreshOpenArticle(dialog, id, "Selected metadata changes applied.", output);
+        } catch (error) {
+          apply.disabled = false;
+          status.innerHTML = message(error.message, "error");
+        }
       });
     } catch (error) { output.innerHTML = message(error.message, "error"); }
   }
