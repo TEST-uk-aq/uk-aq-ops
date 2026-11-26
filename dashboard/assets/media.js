@@ -2137,9 +2137,44 @@
     stalled_run: "Discovery appears stalled",
   };
 
+  const RSS_CONFIGURATION_REASONS = {
+    unsupported_source: "This source is outside the supported RSS publisher list",
+    source_disabled: "The source is disabled",
+    source_type: "The source type must be publisher",
+    canonical_domain: "The canonical domain does not match the supported publisher",
+    discovery_method: "The discovery method must be RSS",
+    unsupported_publication_policy: "The publication policy must be manual or auto-approve",
+    review_level: "The review level must be Standard",
+    content_fetch_policy: "The content-fetch policy must be discovery metadata only",
+    ai_content_policy: "The AI content policy does not match the supported publisher policy",
+    image_policy: "The image policy must be remote preview",
+    search_index_policy: "The search-index policy is unsupported",
+    route_count: "The number of configured RSS routes does not match the supported route count",
+    missing_route_key: "A required RSS route key is missing",
+    unexpected_route_key: "An RSS route key is invalid or unexpected",
+    duplicate_route_key: "An RSS route key is configured more than once",
+    feed_url: "The configured RSS feed URL does not match the supported route",
+    max_items: "The configured maximum items does not match the supported route limit",
+    invalid_source_schema: "The source settings fail schema validation",
+    invalid_discovery_config_json: "The discovery configuration contains invalid JSON",
+  };
+
+  function healthSourceReason(source) {
+    if (source.reason === "not_scheduled_configuration_mismatch" &&
+        Array.isArray(source.configuration_diagnostics)) {
+      const details = source.configuration_diagnostics.flatMap(diagnostic => {
+        if (!Object.hasOwn(RSS_CONFIGURATION_REASONS, diagnostic?.code)) return [];
+        const label = RSS_CONFIGURATION_REASONS[diagnostic.code];
+        return [label + (diagnostic.route_key ? " (" + diagnostic.route_key + ")" : "") + "."];
+      });
+      if (details.length) return "Enabled, but not scheduled. " + details.join(" ");
+    }
+    return HEALTH_REASONS[source.reason] || source.reason;
+  }
+
   function healthIssue(source) {
     const broken = (source.routes || []).filter(route => route.status !== "healthy");
-    const reason = source.reason ? (HEALTH_REASONS[source.reason] || source.reason)
+    const reason = source.reason ? healthSourceReason(source)
       : broken.slice(0, 4).map(route => (route.route_key || "Source-wide") + ": " +
           (HEALTH_REASONS[route.reason] || route.reason || "Unknown") +
           (route.latest_error_code ? " (" + route.latest_error_code + ")" : "")).join("; ") +
@@ -2187,7 +2222,7 @@
         '</td><td>' + esc(route.latest_error_code || "—") + '</td></tr>'));
       routeRows.push(...sources.filter(source => source.reason).map(source =>
         '<tr><td>' + esc(source.name) + '</td><td>Configuration</td><td>Critical</td>' +
-        '<td>—</td><td>—</td><td>' + esc(HEALTH_REASONS[source.reason] || source.reason) +
+        '<td>—</td><td>—</td><td>' + esc(healthSourceReason(source)) +
         '</td></tr>'));
       body += '<details class="media-health__details"><summary>All enabled publisher routes (' +
         routeRows.length + ')</summary><div class="media-table-wrap"><table class="media-table media-health__table">' +
