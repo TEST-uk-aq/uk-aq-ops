@@ -166,7 +166,7 @@
     const contentType = String(response.headers.get("Content-Type") || "");
     const payload = contentType.includes("json") ? await response.json().catch(() => null) : null;
     if (!response.ok) {
-      const error = new Error(String(payload?.error?.message || payload?.error || payload?.message || `Media request failed (${response.status})`));
+      const error = new Error(payload?.admission_hold ? `${admissionReason(payload.admission_hold)}. Recheck publisher availability.` : String(payload?.error?.message || payload?.error || payload?.message || `Media request failed (${response.status})`));
       error.payload = payload;
       throw error;
     }
@@ -367,9 +367,15 @@
     return parts.length ? `Active filters · ${parts.join(" · ")}` : "No active filters";
   }
 
-  function statusOptions(status) {
+  function availableStatusActions(article) {
+    return (STATUS_ACTIONS[article.status] || []).filter(([target]) =>
+      target !== "approved" || !article.admission_hold);
+  }
+
+  function statusOptions(article) {
+    const { status } = article;
     return [`<option value="${status}">${STATUS_LABELS[status]}</option>`]
-      .concat((STATUS_ACTIONS[status] || []).map(([target, label, action]) =>
+      .concat(availableStatusActions(article).map(([target, label, action]) =>
         `<option value="${target}" data-action="${action}">${label}</option>`)).join("");
   }
 
@@ -387,6 +393,7 @@
   }
 
   function bulkStatusTargetEligible(article, target) {
+    if (target === "approved" && article.admission_hold && article.status !== "approved") return false;
     return article.status === target || Boolean(statusActionForTarget(article.status, target));
   }
 
@@ -399,7 +406,7 @@
 
   function statusControl(article) {
     return `<div class="media-status-control" data-status-control data-id="${article.id}" data-current="${article.status}">
-      <select aria-label="Article Status for ${esc(article.title)}">${statusOptions(article.status)}</select>
+      <select aria-label="Article Status for ${esc(article.title)}">${statusOptions(article)}</select>
       <span class="media-save-state" title="Saved/current" aria-label="Saved/current">💾</span>
     </div>`;
   }
@@ -512,6 +519,50 @@
     return `<span class="media-subtext">${esc(label)}${counts}</span>`;
   }
 
+  function admissionReason(hold) {
+    const labels = { future_publication: "Future publication", publisher_restriction: "Publisher restriction" };
+    return (hold?.reasons || []).map(value => labels[value]).filter(Boolean).join(" and ") || "Publisher verification required";
+  }
+
+  function admissionHoldHtml(hold) {
+    if (!hold) return "";
+    const approvedAnomaly = hold.outcome === "approved_anomaly";
+    const next = hold.automatic_retries_exhausted ? "Automatic rechecks exhausted"
+      : hold.next_recheck_at ? `Next recheck ${formatUtcDateTime(hold.next_recheck_at)}`
+      : "No automatic recheck scheduled";
+    return `<section><h4>${approvedAnomaly ? "Publisher admission anomaly" : "Publisher admission hold"}</h4>
+      <p>${esc(admissionReason(hold))}. ${esc(next)}.${hold.last_checked_at
+        ? ` Last checked ${esc(formatUtcDateTime(hold.last_checked_at))}.` : ""}</p>
+      ${approvedAnomaly ? '<p>Review this approved article.</p>' :
+        '<button type="button" class="media-button" data-admission-recheck>Recheck publisher</button>'}
+      <div data-admission-message aria-live="polite"></div></section>`;
+  }
+
+  function bindAdmissionRecheck(container, hold, refreshed) {
+    const button = container.querySelector("[data-admission-recheck]");
+    if (!button) return;
+    button.addEventListener("click", async () => {
+      const output = container.querySelector("[data-admission-message]");
+      button.disabled = true;
+      output.innerHTML = message("Checking publisher evidence…");
+      try {
+        const data = await request(`articles/admission/${hold.canonical_url_hash}/recheck`, { method: "POST" });
+        await refreshed(data.released ? "Publisher hold cleared." : "", data);
+      } catch (error) {
+        output.innerHTML = message(error.message, "error");
+        button.disabled = false;
+      }
+    });
+  }
+
+  function showDeferredLookup(result, hold, submittedUrl) {
+    result.innerHTML = admissionHoldHtml(hold);
+    bindAdmissionRecheck(result, hold, async (_notice, data) => {
+      if (data.admission_hold) showDeferredLookup(result, data.admission_hold, submittedUrl);
+      else await lookupUrl(submittedUrl);
+    });
+  }
+
   function articleRow(article) {
     const title = article.display_title || article.title;
     const [titleState, titleLabel] = titleStatus(article);
@@ -525,7 +576,9 @@
       ? `<span class="media-possible-duplicate">Possible duplicate</span><span class="media-subtext">${esc(possibleDuplicateReasonLabel(article.possible_duplicate_reason_code))}</span>`
       : "";
     return `<tr data-article-id="${article.id}"><td class="media-select-cell"><input type="checkbox" data-select-article aria-label="Select ${esc(title)}"${state.selectedArticleIds.has(String(article.id)) ? " checked" : ""}></td><td>${thumb}<span class="media-image-state media-image-state--${esc(imageState[0])}">${esc(imageState[1])}</span></td>
-      <td class="media-title-cell"><button type="button" class="media-title-button" data-open-article>${esc(displayTitleWrapping(title))}</button>${reviewEvidenceHtml(article)}${article.display_title ? `<span class="media-subtext">Original: ${esc(article.title)}</span>` : ""}${possibleDuplicate}</td>
+      <td class="media-title-cell"><button type="button" class="media-title-button" data-open-article>${esc(displayTitleWrapping(title))}</button>${reviewEvidenceHtml(article)}${article.display_title ? `<span class="media-subtext">Original: ${esc(article.title)}</span>` : ""}${possibleDuplicate}${article.admission_hold
+        ? `<span class="media-subtext">${article.admission_hold.outcome === "approved_anomaly" ? "Review" : "Hold"} · ${esc(admissionReason(article.admission_hold))}</span>`
+        : ""}</td>
       <td>${esc(article.publisher)}</td><td>${esc(article.author || "—")}</td>
       <td>${esc(formatPublishedDateTime(article.published_at, false))}</td><td>${esc(formatUtcDateTime(article.approved_at, false))}</td>
       <td><span class="media-title-status media-title-status--${esc(titleState)}">${esc(titleLabel)}</span><button type="button" class="media-ai-disclosure" data-toggle-ai aria-expanded="${isExpanded}">${isExpanded ? "▴ Title" : "▾ Title"}</button></td><td>${statusControl(article)}</td></tr>${isExpanded ? `<tr class="media-ai-expanded"><td colspan="9">${titleEditorHtml(article)}</td></tr>` : ""}`;
@@ -936,7 +989,7 @@
       refreshSelectionControls();
       return;
     }
-    if (Object.values(social).some(Boolean)) {
+    if (target === "approved") {
       if (approvedCount > 0 && approvedCount < selected.length) {
         state.batchMessage = { text: "For social publishing, select either only articles already Approved or only articles being moved to Approved.", kind: "error" };
         refreshSelectionControls();
@@ -954,15 +1007,16 @@
         });
         state.batchMessage = directPublish
           ? { text: `Social publication requests accepted for ${selected.length} selected article${selected.length === 1 ? "" : "s"}.`, kind: "success" }
-          : { text: `${changes.length} changed. Social publication requests accepted.`, kind: "success" };
+          : { text: `${changes.length} changed.${Object.values(social).some(Boolean) ? " Social publication requests accepted." : ""}`, kind: "success" };
         await refreshArticleTable(false);
       } catch (error) {
         const failures = Array.isArray(error.payload?.failures) ? error.payload.failures : [];
         const detail = failures.slice(0, MAX_BATCH_SELECTION).map(failure => {
+          if (failure.admission_hold) return `Article ${boundedCode(failure.article_id)} · ${admissionReason(failure.admission_hold)}.`;
           const platform = SOCIAL_LABELS[failure.platform] || "Social";
           return `article ${boundedCode(failure.article_id)} (${platform}): ${directPublishUnavailableMessage(platform, failure.error)}`;
         }).join(" ");
-        state.batchMessage = { text: detail ? `Bulk publish rejected. ${detail}` : error.message, kind: "error" };
+        state.batchMessage = { text: detail ? `Bulk request rejected. ${detail}` : error.message, kind: "error" };
         refreshSelectionControls();
       }
       return;
@@ -1007,6 +1061,10 @@
       if (data.article) {
         result.innerHTML = `${message(`Existing ${STATUS_LABELS[data.article.status] || data.article.status} article found.`, "success")}<button class="media-button" data-open-found>Open article</button>`;
         result.querySelector("[data-open-found]")?.addEventListener("click", () => void openArticle(data.article.id));
+        return;
+      }
+      if (data.admission_hold) {
+        showDeferredLookup(result, data.admission_hold, submittedUrl);
         return;
       }
       const metadata = data.metadata || {};
@@ -1060,7 +1118,10 @@
         : "Article added as Pending.", "success");
       await renderArticles(false);
       if (detailSequence === articleDetailSequence) await openArticle(data.article.id);
-    } catch (error) { result.insertAdjacentHTML("afterbegin", message(error.message, "error")); }
+    } catch (error) {
+      if (error.payload?.admission_hold) showDeferredLookup(result, error.payload.admission_hold, String(values.get("url")));
+      else result.insertAdjacentHTML("afterbegin", message(error.message, "error"));
+    }
   }
 
   function detailDialog() {
@@ -1667,7 +1728,8 @@
       dialog.innerHTML = `<div class="media-detail__inner"><div class="media-detail__header"><div><h3 id="media-article-detail-title">${esc(article.display_title || article.title)}</h3><p>${esc(article.publisher)} · ${esc(STATUS_LABELS[article.status] || article.status)}</p></div><button type="button" class="media-button" data-close-detail>Close</button></div>${notice ? message(notice, "success") : ""}
         <div class="media-detail__grid"><div>${article.admin_preview_image_path && imageUrl ? `<img class="media-detail__preview" src="${esc(imageUrl)}" alt="">` : `<div class="media-thumb-fallback media-detail__preview">No permitted preview</div>`}<span class="media-image-state media-image-state--${esc(imageState[0])}">${esc(imageState[1])}</span></div>
         <dl><dt>Canonical URL</dt><dd><a href="${esc(article.canonical_url)}" target="_blank" rel="noopener noreferrer">Open publisher ↗</a></dd><dt>Author</dt><dd>${esc(article.author || "—")}</dd><dt>Published</dt><dd>${esc(formatPublishedDateTime(article.published_at))}</dd><dt>Discovered</dt><dd>${esc(formatUtcDateTime(article.discovered_at))}</dd><dt>Approved</dt><dd>${esc(formatUtcDateTime(article.approved_at))}</dd><dt>Updated</dt><dd data-detail-updated>${esc(formatUtcDateTime(article.updated_at))}</dd><dt>Approval</dt><dd>${esc(article.approval_method || "—")}${article.approval_author_rule_key ? ` · ${esc(article.approval_author_rule_key)}` : ""}</dd></dl></div>
-        <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${(STATUS_ACTIONS[article.status] || []).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div>${socialSelectionHtml("manual", articleSocialOptions(data, article, facebookData), true)}<div data-detail-status-message aria-live="polite"></div></section>
+        <section><h4>Article Status</h4><div class="media-inline-form" data-detail-status><label class="media-field"><span>Change to</span><select><option value="">Choose status…</option>${availableStatusActions(article).map(([next, label, action]) => `<option value="${next}" data-action="${action}">${esc(label)}</option>`).join("")}</select></label><button type="button" class="media-save-state" disabled aria-label="Saved/current" title="Saved/current">💾</button></div>${socialSelectionHtml("manual", articleSocialOptions(data, article, facebookData), true)}<div data-detail-status-message aria-live="polite"></div></section>
+        ${admissionHoldHtml(article.admission_hold)}
         ${possibleDuplicateDetailHtml(data.possible_duplicate)}
         <section><h4>Title</h4>${titleEditorHtml(article)}</section>
         ${directPublishHtml(data, article)}
@@ -1712,6 +1774,11 @@
       dialog.querySelector("[data-detail-author]")?.addEventListener("submit", event => { event.preventDefault(); void saveDetailAuthor(id, new FormData(event.currentTarget).get("author"), dialog); });
       dialog.querySelector("[data-detail-publication-date]")?.addEventListener("submit", event => { event.preventDefault(); void savePublicationDate(id, event.currentTarget, dialog); });
       dialog.querySelector("[data-clear-publication-date]")?.addEventListener("click", () => void clearPublicationDate(id, dialog));
+      bindAdmissionRecheck(dialog, article.admission_hold, async notice => {
+        await openArticle(id, notice);
+        void refreshArticleTable(false);
+        void refreshMediaHealth();
+      });
       bindDetailTitleEditor(dialog, article);
       dialog.querySelector("[data-reload-metadata]")?.addEventListener("click", () => void reloadMetadata(id, article, dialog));
       dialog.querySelector("[data-article-image-policy]")?.addEventListener("submit", event => {
@@ -1929,6 +1996,10 @@
 
   async function reloadMetadata(id, article, dialog) {
     const output = dialog.querySelector("[data-metadata-result]"); output.innerHTML = message("Reloading bounded publisher metadata…");
+    if (article.admission_hold && article.status === "pending") {
+      output.innerHTML = message(`${admissionReason(article.admission_hold)}. Use Recheck publisher to verify availability.`);
+      return;
+    }
     try {
       if (article.source_key === "the-guardian") {
         const routeKey = dialog.querySelector("[data-guardian-route]")?.value;
@@ -1954,6 +2025,10 @@
         return;
       }
       const data = await request(`articles/${id}/metadata/preview`, { method: "POST" });
+      if (data.admission_hold && article.status === "pending") {
+        await openArticle(id);
+        return;
+      }
       const changes = data.changes || {};
       const fields = [
         ["verified_headline", "verified original headline"], ["exact_headline", "Original headline"],
@@ -2089,6 +2164,11 @@
       dialog.querySelector("#media-article-detail-title").textContent = article.display_title || article.title;
       dialog.querySelector("[data-detail-updated]").textContent = formatUtcDateTime(article.updated_at);
       editor.outerHTML = titleEditorHtml(article);
+      bindAdmissionRecheck(dialog, article.admission_hold, async notice => {
+        await openArticle(id, notice);
+        void refreshArticleTable(false);
+        void refreshMediaHealth();
+      });
       bindDetailTitleEditor(dialog, article);
       if (restoreFocus) {
         const nextEditor = dialog.querySelector("[data-ai-id]");
@@ -2277,6 +2357,18 @@
           esc(row.article_id) + '</strong><span>' + esc(row.status) +
           (row.last_error_code ? " · " + esc(row.last_error_code) : "") +
           '</span></li>').join("") + '</ul>';
+      const admission = data.publisher_admission;
+      if (admission) {
+        const count = key => Number(admission[key]) >= admission.count_cap
+          ? `${admission.count_cap}+` : Number(admission[key] || 0);
+        body += '<p><strong>Publisher admission</strong> · ' + count("deferred") +
+          ' deferred · ' + count("due") + ' due · ' + count("exhausted") +
+          ' exhausted · ' + count("approved_anomalies") + ' approved for review · ' +
+          count("released_last_7_days") + ' released and ' + count("failed_last_7_days") + ' failed in the last 7 days</p>';
+        const rows = Array.isArray(admission.approved_review) ? admission.approved_review : [];
+        if (rows.length) body += '<p>Review approved articles ' + rows.map(row =>
+          `<button type="button" class="media-button" data-admission-review="${esc(row.article_id)}">${esc(row.article_id)}</button>`).join(" ") + '</p>';
+      }
       const routeRows = sources.flatMap(source => (source.routes || []).map(route =>
         '<tr><td>' + esc(source.name) + (source.auto_approval ? ' (Auto)' : '') +
         '</td><td>' + esc(route.route_key || "Source-wide") + '</td><td>' +
@@ -2294,6 +2386,9 @@
         routeRows.join("") + '</tbody></table></div></details>';
     }
     el.innerHTML = '<section class="media-card media-health">' + heading + body + '</section>';
+    for (const button of el.querySelectorAll("[data-admission-review]")) {
+      button.addEventListener("click", () => void openArticle(Number(button.dataset.admissionReview)));
+    }
     el.querySelector("[data-media-health-refresh]")?.addEventListener("click", () =>
       void refreshMediaHealth());
   }
