@@ -984,13 +984,14 @@
     const changes = selected.map(article => ({ article, action: statusActionForTarget(article.status, target) })).filter(item => item.action);
     const save = table.querySelector("[data-save-bulk]"); save.disabled = true;
     const social = socialSelectionBody(target === "approved" ? table.querySelector("[data-bulk-social]") : null);
+    const socialRequested = Object.values(social).some(Boolean);
     const approvedCount = selected.filter(article => article.status === "approved").length;
-    if (approvedCount === selected.length && target === "approved" && !Object.values(social).some(Boolean)) {
+    if (approvedCount === selected.length && target === "approved" && !socialRequested) {
       refreshSelectionControls();
       return;
     }
     if (target === "approved") {
-      if (approvedCount > 0 && approvedCount < selected.length) {
+      if (socialRequested && approvedCount > 0 && approvedCount < selected.length) {
         state.batchMessage = { text: "For social publishing, select either only articles already Approved or only articles being moved to Approved.", kind: "error" };
         refreshSelectionControls();
         return;
@@ -1007,7 +1008,7 @@
         });
         state.batchMessage = directPublish
           ? { text: `Social publication requests accepted for ${selected.length} selected article${selected.length === 1 ? "" : "s"}.`, kind: "success" }
-          : { text: `${changes.length} changed.${Object.values(social).some(Boolean) ? " Social publication requests accepted." : ""}`, kind: "success" };
+          : { text: `${changes.length} changed${approvedCount ? ` · ${approvedCount} already Approved` : ""}.${socialRequested ? " Social publication requests accepted." : ""}`, kind: "success" };
         await refreshArticleTable(false);
       } catch (error) {
         const failures = Array.isArray(error.payload?.failures) ? error.payload.failures : [];
