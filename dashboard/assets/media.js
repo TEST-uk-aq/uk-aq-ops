@@ -1001,8 +1001,9 @@
   async function lookupUrl(value) {
     const result = state.root.querySelector("[data-url-result]");
     result.innerHTML = message("Checking canonical Media identity…");
+    const submittedUrl = String(value);
     try {
-      const data = await request("articles/lookup", { method: "POST", body: { url: String(value) } });
+      const data = await request("articles/lookup", { method: "POST", body: { url: submittedUrl } });
       if (data.article) {
         result.innerHTML = `${message(`Existing ${STATUS_LABELS[data.article.status] || data.article.status} article found.`, "success")}<button class="media-button" data-open-found>Open article</button>`;
         result.querySelector("[data-open-found]")?.addEventListener("click", () => void openArticle(data.article.id));
@@ -1012,7 +1013,7 @@
       const proposedPublication = publicationDateInputs(metadata.published_at);
       result.innerHTML = `${data.metadata_error ? message(`Automatic metadata unavailable: ${data.metadata_error}. Supply the missing public fields manually.`) : message("New canonical article. Review metadata before adding.", "success")}
         <form class="media-inline-form" data-add-manual>
-          <input type="hidden" name="url" value="${esc(data.canonical_url)}">
+          <input type="hidden" name="url" value="${esc(data.original_url ?? submittedUrl)}">
           <div class="media-manual-fields">
             <label class="media-field media-field--grow"><span>Publisher title</span><input name="title" required maxlength="1000" value="${esc(metadata.title || "")}"></label>
             <label class="media-field"><span>Publication</span><input name="publisher" required maxlength="200" value="${esc(metadata.publisher || data.source?.name || "")}"></label>
