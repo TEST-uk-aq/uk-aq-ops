@@ -27,6 +27,7 @@ _ROUTES = (
     (re.compile(r"^/api/media/articles$"), {"GET", "POST"}),
     (re.compile(r"^/api/media/articles/selectors$"), {"GET"}),
     (re.compile(r"^/api/media/articles/lookup$"), {"POST"}),
+    (re.compile(r"^/api/media/articles/admission/[a-f0-9]{64}/recheck$"), {"POST"}),
     (re.compile(r"^/api/media/articles/bulk-approve$"), {"POST"}),
     (re.compile(r"^/api/media/articles/bulk-publish$"), {"POST"}),
     (re.compile(r"^/api/media/articles/[1-9]\d*$"), {"GET"}),

@@ -25,6 +25,7 @@ const ROUTES: Array<{ pattern: RegExp; methods: ReadonlySet<string> }> = [
   { pattern: /^\/api\/media\/articles$/, methods: new Set(['GET', 'POST']) },
   { pattern: /^\/api\/media\/articles\/selectors$/, methods: new Set(['GET']) },
   { pattern: /^\/api\/media\/articles\/lookup$/, methods: new Set(['POST']) },
+  { pattern: /^\/api\/media\/articles\/admission\/[a-f0-9]{64}\/recheck$/, methods: new Set(['POST']) },
   { pattern: /^\/api\/media\/articles\/bulk-approve$/, methods: new Set(['POST']) },
   { pattern: /^\/api\/media\/articles\/bulk-publish$/, methods: new Set(['POST']) },
   { pattern: /^\/api\/media\/articles\/[1-9]\d*$/, methods: new Set(['GET']) },
