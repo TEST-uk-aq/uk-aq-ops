@@ -1956,7 +1956,8 @@
       const data = await request(`articles/${id}/metadata/preview`, { method: "POST" });
       const changes = data.changes || {};
       const fields = [
-        ["exact_headline", "Original headline"], ["publication", "Publication"],
+        ["verified_headline", "verified original headline"], ["exact_headline", "Original headline"],
+        ["publication", "Publication"],
         ["author", "Author"], ["published_at", "Publication date"],
         ["image", "Preview image"], ["publisher_display_title", "Compact display title"],
       ].filter(([key]) => changes[key]);
@@ -1993,7 +1994,7 @@
           apply_publisher_published_at: selected.has("published_at"),
         };
         if (Number.isSafeInteger(data.article?.revision)) body.expected_revision = data.article.revision;
-        for (const key of ["exact_headline", "publication", "author"]) {
+        for (const key of ["verified_headline", "exact_headline", "publication", "author"]) {
           if (selected.has(key)) body[key] = changes[key];
         }
         const status = output.querySelector("[data-metadata-apply-message]");
@@ -2005,7 +2006,7 @@
           if (saved?.changed === false || !saved?.article) {
             throw new Error("Media did not confirm a metadata change. Reload the article and review it again.");
           }
-          const expected = { exact_headline: "title", publication: "publisher", author: "author",
+          const expected = { verified_headline: "title", exact_headline: "title", publication: "publisher", author: "author",
             published_at: "published_at", image: "og_image_url", publisher_display_title: "display_title" };
           for (const key of selected) {
             if (saved.article[expected[key]] !== changes[key].proposed) {
